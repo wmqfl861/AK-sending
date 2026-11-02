@@ -1,0 +1,10 @@
+[package]
+name = "ak-wire"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Bounded end-to-end wire codec between paired devices (frame v1)"
+
+[dependencies]
+ak-core = { workspace = true }
+thiserror = { workspace = true }

@@ -1,3 +1,48 @@
 [workspace]
-members = ["crates/ak-core"]
+members = [
+    "crates/ak-core",
+    "crates/ak-identity",
+    "crates/ak-wire",
+    "crates/ak-storage",
+    "crates/ak-net",
+    "crates/ak-discovery",
+    "crates/ak-store",
+    "crates/ak-signal",
+    "crates/ak-engine",
+    "crates/ak-cli",
+]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+ak-core = { path = "crates/ak-core" }
+ak-identity = { path = "crates/ak-identity" }
+ak-wire = { path = "crates/ak-wire" }
+ak-storage = { path = "crates/ak-storage" }
+ak-net = { path = "crates/ak-net" }
+ak-discovery = { path = "crates/ak-discovery" }
+ak-store = { path = "crates/ak-store" }
+ak-signal = { path = "crates/ak-signal" }
+ak-engine = { path = "crates/ak-engine" }
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+env_logger = "0.11"
+if-addrs = "0.13"
+log = "0.4"
+mdns-sd = "0.11"
+quinn = "0.11"
+rand = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+socket2 = "0.5"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+
+[profile.release]
+debug = false

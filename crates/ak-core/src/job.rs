@@ -3,14 +3,14 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Pending, Connecting, Transferring, WaitingDirect, Paused,
+    Pending, Connecting, AwaitingAccept, Transferring, WaitingDirect, Paused,
     Verifying, Saving, Completed, Cancelled, Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Begin, DirectReady, DirectUnavailable, Pause, Resume,
-    AllBytesReceived, VerificationPassed, SaveCommitted, Cancel, Fail,
+    Begin, DirectReady, OfferSent, OfferAccepted, OfferRejected, DirectUnavailable,
+    Pause, Resume, AllBytesReceived, VerificationPassed, SaveCommitted, Cancel, Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,12 @@ impl State {
             (_, Event::Fail) => Ok(Self::Failed),
             (Self::Pending, Event::Begin) => Ok(Self::Connecting),
             (Self::Connecting, Event::DirectReady) => Ok(Self::Transferring),
-            (Self::Connecting | Self::Transferring, Event::DirectUnavailable) => Ok(Self::WaitingDirect),
+            // Receiver consent is required before any file bytes move.
+            (Self::Connecting, Event::OfferSent) => Ok(Self::AwaitingAccept),
+            (Self::AwaitingAccept, Event::OfferAccepted) => Ok(Self::Transferring),
+            (Self::AwaitingAccept, Event::OfferRejected) => Ok(Self::Failed),
+            (Self::Connecting | Self::AwaitingAccept | Self::Transferring, Event::DirectUnavailable) => Ok(Self::WaitingDirect),
+            (Self::Connecting | Self::AwaitingAccept | Self::Transferring | Self::WaitingDirect, Event::Pause) => Ok(Self::Paused),
             (Self::Connecting | Self::Transferring | Self::WaitingDirect, Event::Pause) => Ok(Self::Paused),
             (Self::Paused | Self::WaitingDirect, Event::Resume) => Ok(Self::Connecting),
             (Self::Transferring, Event::AllBytesReceived) => Ok(Self::Verifying),
@@ -94,5 +99,30 @@ mod tests {
         let e = State::Pending.advance(Event::SaveCommitted).unwrap_err();
         assert_eq!(e, InvalidTransition { state: State::Pending, event: Event::SaveCommitted });
         assert!(e.to_string().contains("Pending"));
+    }
+
+    #[test]
+    fn receiver_consent_is_a_distinct_wait_state() {
+        let waiting = State::Connecting.advance(Event::OfferSent).unwrap();
+        assert_eq!(waiting, State::AwaitingAccept);
+        // No byte-level progress is allowed while consent is pending.
+        assert!(waiting.advance(Event::AllBytesReceived).is_err());
+        assert!(waiting.advance(Event::DirectReady).is_err());
+        assert_eq!(waiting.advance(Event::OfferAccepted).unwrap(), State::Transferring);
+    }
+
+    #[test]
+    fn offer_rejection_fails_and_never_transfers() {
+        let waiting = State::Connecting.advance(Event::OfferSent).unwrap();
+        assert_eq!(waiting.advance(Event::OfferRejected).unwrap(), State::Failed);
+        assert!(State::Failed.advance(Event::OfferAccepted).is_err());
+    }
+
+    #[test]
+    fn consent_wait_survives_connection_loss_and_pause() {
+        let waiting = State::Connecting.advance(Event::OfferSent).unwrap();
+        assert_eq!(waiting.advance(Event::DirectUnavailable).unwrap(), State::WaitingDirect);
+        assert_eq!(waiting.advance(Event::Pause).unwrap(), State::Paused);
+        assert_eq!(State::Paused.advance(Event::Resume).unwrap(), State::Connecting);
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "ak-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Task checkpoint persistence with atomic writes (SQLite backend is a later swap)"
+
+[dependencies]
+ak-identity = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

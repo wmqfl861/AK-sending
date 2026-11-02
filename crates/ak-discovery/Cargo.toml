@@ -1,0 +1,15 @@
+[package]
+name = "ak-discovery"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Peer candidate discovery: manual addresses, coordination-provided candidates, mDNS"
+
+[dependencies]
+ak-core = { workspace = true }
+ak-identity = { workspace = true }
+mdns-sd = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ak-net = { workspace = true }

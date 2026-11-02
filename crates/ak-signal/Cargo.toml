@@ -1,0 +1,15 @@
+[package]
+name = "ak-signal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Coordination plane: signaling server/client and minimal STUN; carries no file bytes"
+
+[dependencies]
+ak-identity = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

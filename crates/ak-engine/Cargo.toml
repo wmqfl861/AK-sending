@@ -1,0 +1,22 @@
+[package]
+name = "ak-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Transfer engine: drives the end-to-end protocol over authenticated direct channels"
+
+[dependencies]
+ak-core = { workspace = true }
+ak-identity = { workspace = true }
+ak-net = { workspace = true }
+ak-storage = { workspace = true }
+ak-store = { workspace = true }
+ak-wire = { workspace = true }
+blake3 = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

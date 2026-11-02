@@ -18,7 +18,7 @@ impl ChunkPlan {
 
     pub fn chunk_count(&self) -> u64 {
         let size = u64::from(self.chunk_bytes.get());
-        self.total_bytes / size + u64::from(self.total_bytes % size != 0)
+        self.total_bytes / size + u64::from(!self.total_bytes.is_multiple_of(size))
     }
 
     /// Return an inclusive-start/exclusive-end byte range, without allocation.

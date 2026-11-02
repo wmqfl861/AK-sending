@@ -1,0 +1,16 @@
+{
+  "base_commit": "eed9fc96d88725a18aad69aa61d4151583fd295b",
+  "scope": "documentation_delta_only",
+  "level": "L0",
+  "passed": true,
+  "changed_markdown_files": 16,
+  "local_links_checked_against_remote_manifest_and_delta": 52,
+  "utf8_and_code_fences_checked": true,
+  "required_decisions_and_product_constraints_checked": true,
+  "source_code_changed": false,
+  "rust_tests_rerun": false,
+  "real_network_or_device_tests_run": false,
+  "resource_budgets_measured": false,
+  "retained_file_sha256_source": "remote MANIFEST.sha256; retained bytes not all re-downloaded",
+  "errors": []
+}

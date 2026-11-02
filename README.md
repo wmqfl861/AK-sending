@@ -1,63 +1,39 @@
 # AK互传 · AK-sending
 
-跨 Windows、macOS、Linux、Android、iOS 的原文件互传项目。
+五端原文件互传：局域网优先，公网仅设备直连。服务器只用于发现、信令与 NAT 穿透协调，绝不承载文件数据或密文。
 
-> **架构已确定：允许服务器参与设备发现、信令和 NAT 穿透协调；绝不允许任何服务器参与文件数据传输，包括加密中继。**
+## 当前定稿
 
-目标仓库：`wmqfl861/AK-sending`。本包是 v0.1 项目初始化材料，不是五端可用软件。
+**开发蓝图 v0.2：轻量化、纯直连。** 已根据用户授权，对 Claude 2026-11-02 审计独立裁决 D1–D6；无需再次确认同一组设计选择。
+主路线为 Flutter + Rust + quinn/rustls，独立窄信令与 STUN/ICE 检查；iroh/relay/TURN 不进入首版产品栈。端口映射默认关闭，先命令行原型，手机关键风险同步前置。
 
-## 当前真实状态
+## 五个规范主入口
 
-- 已整理：需求、修订蓝图、ADR-001、协议草案、平台与存储方案、开发路线、验收规范和交接说明。
-- 新增代码：无第三方依赖的 Rust 核心骨架，包括纯直连路径策略、64 位分块计算和任务状态机；附测试源码。
-- 已执行的检查及其结果见 [本次验证报告](reports/BOOTSTRAP_VALIDATION.zh-CN.md)。不要把测试源码等同于测试通过。
-- 2026-11-02：23 项 Rust 单测与 clippy 已在 rustc 1.97.0 实际执行并通过（修复 1 处 clippy 报错），见 [Rust 验证记录](reports/rust-validation-2026-11-02.txt)。这只覆盖领域模型，不是网络或真机验证。
-- 2026-11-02：完成 [方案评审](docs/REVIEW_2026-11-02.zh-CN.md)，其中 D1–D6 待所有者确认；确认前现有决策文档不变。
-- 未实现：真实网络收发、密码学身份认证、NAT 穿透、自动发现、持久化续传、Flutter UI、移动原生适配。
-- 原始 38 个文件已提交到 GitHub 的 `main`，并核验目录树与本地原包一致；见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
-
-## 产品原则
-
-可达局域网优先；公网只直连；直连失败暂停/重试，不启用中继。
-不压缩、不转码、不重新编码；不设置商业限速或应用级文件大小、类型、总数量额度。
-支持默认保存位置、单次改选、文件夹、完整性校验和恢复；移动端遵守系统授权和生命周期。
-
-“服务器不传文件”包括自建与第三方服务。文件内容、分块、缩略图、清单、路径及内容摘要都不放入协调信令。
-普通路由器和 NAT 是网络基础设施；产品不使用应用层转发节点、VPN 中继或 HTTP 上传作为替代路线。
-无法仅凭应用代码证明用户网络中不存在透明代理，产品承诺边界详见 ADR-001。
-
-## 文档入口
-
-| 文档 | 用途 |
+| 文档 | 责任 |
 |---|---|
-| [项目蓝图](docs/BLUEPRINT.zh-CN.md) | 完整修订方案和阶段边界 |
-| [产品需求](docs/PRD.zh-CN.md) | 用户需求、范围和验收映射 |
-| [ADR-001](docs/adr/001-direct-only.zh-CN.md) | 无服务器文件传输的最高优先级约束 |
-| [系统架构](docs/ARCHITECTURE.zh-CN.md) | 控制面/数据面和模块责任 |
-| [开发路线](docs/ROADMAP.zh-CN.md) | P0–P4 阶段门槛 |
-| [实施清单](docs/BACKLOG.zh-CN.md) | 可分配任务和依赖 |
-| [协议草案](docs/PROTOCOL.zh-CN.md) | 协调信息与端对端文件协议 |
-| [存储与平台](docs/STORAGE_AND_PLATFORMS.zh-CN.md) | 目录授权、原件、后台和续传 |
-| [安全模型](docs/SECURITY.zh-CN.md) | 配对、威胁模型与无中继证据 |
-| [验收计划](docs/TEST_PLAN.zh-CN.md) | 真机/网络/大文件/无中继测试 |
-| [技术选型](docs/TECH_SELECTION.zh-CN.md) | 候选方案和必须验证的风险 |
-| [交接说明](docs/HANDOFF.zh-CN.md) | 当前状态和下一执行节点 |
-| [方案评审 2026-11-02](docs/REVIEW_2026-11-02.zh-CN.md) | 对 v0.1 方案的评审意见与待确认决策 |
+| 本 README | 项目入口和真实状态 |
+| [BLUEPRINT](docs/BLUEPRINT.zh-CN.md) | 产品、架构、协议边界、平台、轻量预算与技术依据 |
+| [ADR-001](docs/adr/001-direct-only.zh-CN.md) | 用户确认的无服务器文件传输硬约束 |
+| [ROADMAP](docs/ROADMAP.zh-CN.md) | M0–M4/V1.1 顺序、待办和完成定义 |
+| [TEST_PLAN](docs/TEST_PLAN.zh-CN.md) | 真实验证与发布门槛 |
 
-## 本地检查
+旧拆分设计页仅为兼容索引，不再独立维护第二套方案。历史审计和发布证据保留，不计作活跃规范。
+[Claude 审计原文](docs/REVIEW_2026-11-02.zh-CN.md) · [逐项采纳裁决](docs/REVIEW_DISPOSITION_2026-11-02.zh-CN.md) · [当前交接](docs/HANDOFF.zh-CN.md)。
 
-在装有 Rust 工具链及 Python 3.11+ 的环境中运行：
+## 当前实现状态
+
+现有代码只有 Rust 领域骨架：路径策略、64 位分块和任务状态机。Claude 的 [验证日志](reports/rust-validation-2026-11-02.txt)记录 23 项 Rust 测试及 clippy 修复后通过；不代表网络、手机或性能验证。
+本次是文档定稿，不是新增网络实现。真实收发、密码学身份、持久化续传、NAT 穿透、Flutter UI 与五端适配仍待开发。轻量预算是目标，不是已经测得的体积和内存。
+
+## 工程检查
 
 ```sh
 python scripts/check_repository.py
+python -m unittest discover -s scripts/tests
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`ak-core` 仅为领域/策略模型，不打开端口、不读写用户文件、不提供 UI。当前不能拿它进行文件传输。
-首次初始化空仓库可使用 [发布说明](docs/PUBLISHING.zh-CN.md) 及 `scripts/publish.ps1`；脚本不包含凭据、不强推，也不处理已有提交的仓库。
+现有 Python 脚本只做初始化静态一致性检查，其常量输出不代表其他执行者有没有运行 Rust。M0 要用真实命令与退出码建立证据；不得把配置相等视为无中继证明。
 
-## 开发规则
-
-阅读 [AGENTS.md](AGENTS.md) 后再修改。完成状态必须有证据；未实现和未测试事项保留为未完成。
-未经项目所有者选择，不擅自添加开源许可证。本次未增加第三方运行时依赖。
+修改前阅读 [AGENTS.md](AGENTS.md)和 HANDOFF。工作分支推进，不强推、不擅自合并/部署/采购；不提交凭据、真实文件路径和用户文件。暂未选择开源许可证。`scripts/publish.ps1` 是旧空仓库初始化工具，不能用于覆盖已有仓库。

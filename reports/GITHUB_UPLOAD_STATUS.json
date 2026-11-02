@@ -1,24 +1,39 @@
 {
   "repository": "wmqfl861/AK-sending",
-  "default_branch_name": "main",
-  "permissions": {
+  "branch": "main",
+  "result": "BOOTSTRAP_PUBLISHED_AND_VERIFIED",
+  "account": "wmqfl861",
+  "permissions_at_upload": {
     "pull": true,
-    "push": false
+    "push": true
   },
-  "root_read": {
-    "status": 404,
-    "message": "This repository is empty."
-  },
-  "write_attempt": {
-    "operation": "GitHub.create_file",
-    "path": "README.md",
-    "status": 403,
-    "message": "Resource not accessible by integration"
-  },
-  "remote_files_created": 0,
-  "remote_commit_sha": null,
-  "remote_branch_created": false,
+  "initialization_commit_sha": "4923b178860de198867f6de7b7d9cb7942200bb3",
+  "verified_bootstrap_commit_sha": "5ce974c279acac2bb27bd24ba4e703042dde2861",
+  "verified_bootstrap_tree_sha": "77170668460628edd36e3dff74877656d8a57fd8",
+  "bootstrap_file_count": 38,
+  "bootstrap_markdown_count": 22,
+  "bootstrap_tree_matches_local_package": true,
+  "branch_ref_readback": true,
+  "commit_and_tree_readback": true,
+  "adr_content_readback": true,
+  "force_push_used": false,
   "pull_request_created": false,
-  "result": "BLOCKED_BY_GITHUB_INTEGRATION_PERMISSIONS",
-  "scope": "Evidence summarized from actual GitHub tool responses in this conversation; not an independently signed server log."
+  "deployment_performed": false,
+  "previous_attempt": {
+    "result": "BLOCKED_BY_GITHUB_INTEGRATION_PERMISSIONS",
+    "write_http_status": 403,
+    "resolved": true
+  },
+  "tests": {
+    "python_repository_check": "passed",
+    "python_validator_tests_passed": 10,
+    "rust_tests_present": 23,
+    "rust_tests_executed": false,
+    "real_network_tests_executed": false
+  },
+  "independent_git_clone": {
+    "succeeded": false,
+    "reason": "Container could not resolve github.com; GitHub connector readback succeeded."
+  },
+  "scope": "This receipt verifies the original 38-file bootstrap commit. The receipt and handoff updates are subsequent documentation changes, not additional implemented product features."
 }

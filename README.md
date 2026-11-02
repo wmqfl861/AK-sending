@@ -12,7 +12,7 @@
 - 新增代码：无第三方依赖的 Rust 核心骨架，包括纯直连路径策略、64 位分块计算和任务状态机；附测试源码。
 - 已执行的检查及其结果见 [本次验证报告](reports/BOOTSTRAP_VALIDATION.zh-CN.md)。不要把测试源码等同于测试通过。
 - 未实现：真实网络收发、密码学身份认证、NAT 穿透、自动发现、持久化续传、Flutter UI、移动原生适配。
-- 远端上传状态见 [交接说明](docs/HANDOFF.zh-CN.md)。本地生成文件不代表已提交 GitHub。
+- 原始 38 个文件已提交到 GitHub 的 `main`，并核验目录树与本地原包一致；见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
 ## 产品原则
 

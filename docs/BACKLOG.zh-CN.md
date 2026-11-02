@@ -8,7 +8,7 @@
 - [x] 整理需求、架构、路线、协议和验收文档。
 - [x] 创建 Rust 策略/分块/任务状态模型与测试源码。
 - [ ] Rust 工具链实编译、测试和 clippy。
-- [ ] 取得目标仓库可写权限并验证远端提交。
+- [x] 取得目标仓库可写权限并验证远端提交；证据见 reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md。
 
 ## P0
 

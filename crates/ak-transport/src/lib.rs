@@ -32,7 +32,9 @@ mod session;
 pub use connection::{AuthenticatedDirectConnection, Candidate, DirectEndpoint};
 pub use identity::{LocalIdentity, PairedPeer};
 pub use receive::{ReceiveGrant, ReceiveSession};
-pub use session::{ReceivedBatch, SessionAbortHandle, SessionReceiver, SessionSender, MAX_BATCH_BYTES};
+pub use session::{
+    ReceivedBatch, SessionAbortHandle, SessionReceiver, SessionSender, MAX_BATCH_BYTES,
+};
 
 use ak_core::receive::ReceiveError;
 use std::fmt;

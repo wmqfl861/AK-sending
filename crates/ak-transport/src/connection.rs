@@ -181,6 +181,20 @@ impl AuthenticatedDirectConnection {
         &self.epoch
     }
 
+    // Private protocol bridge; never exported to callers or UI.
+    pub(crate) fn session_transport(&self) -> quinn::Connection {
+        self.connection.clone()
+    }
+
+    pub(crate) fn session_binding(&self, task: &[u8; 16]) -> Result<[u8; 32]> {
+        self.ensure_live()?;
+        let mut binding = [0; 32];
+        self.connection
+            .export_keying_material(&mut binding, b"EXPORTER-AK-session-v1", task)
+            .map_err(|_| Error::Protocol)?;
+        Ok(binding)
+    }
+
     /// A point-in-time check, NOT a grant to write files or a future I/O fence.
     pub fn ensure_live(&self) -> Result<()> {
         if self.connection.close_reason().is_some() {

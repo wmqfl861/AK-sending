@@ -1,11 +1,12 @@
-//! M0-02: paired mutual TLS over native UDP, not a file transfer implementation.
+//! Paired mutual TLS with bounded, locally authorized in-memory session batches.
+//! This is not a file engine: no filesystem writes, digest or durable-save ACK.
 //!
 //! Pairing inputs must originate from a trusted local confirmation flow, never
 //! from untrusted discovery/signaling. Full certificate pins include the public
 //! key; certificate renewal requires new pairing. No system CA or automatic TOFU.
 //! Manual socket addresses are not proof of LAN topology or absence of invisible
 //! network forwarding. There is no application relay, arbitrary socket injection,
-//! raw QUIC handle or file-data API here.
+//! raw QUIC handle or filesystem API here.
 //!
 //! Safe external code cannot fabricate the authenticated boundary:
 //! ```compile_fail
@@ -26,10 +27,14 @@
 mod connection;
 mod identity;
 mod receive;
+mod session;
 
 pub use connection::{AuthenticatedDirectConnection, Candidate, DirectEndpoint};
 pub use identity::{LocalIdentity, PairedPeer};
 pub use receive::{ReceiveGrant, ReceiveSession};
+pub use session::{
+    ReceivedBatch, SessionAbortHandle, SessionReceiver, SessionSender, MAX_BATCH_BYTES,
+};
 
 use ak_core::receive::ReceiveError;
 use std::fmt;

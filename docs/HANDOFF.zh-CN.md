@@ -2,38 +2,40 @@
 
 ## 目标与授权
 
-仓库：`wmqfl861/AK-sending`；默认分支：`main`。用户已授权上传本项目全部文档和代码，并完成目标账户连接。
+仓库：`wmqfl861/AK-sending`；默认分支：`main`；本地开发分支：`dev/local-parallel`（未推送）。
+用户已授权上传本项目全部文档和代码，并完成目标账户连接。
 服务器仅可用于设备发现、信令和 NAT 穿透协调，绝不承载文件数据或密文；ADR-001 不变。
-没有执行部署、采购、强推、合并 PR 或添加开源许可证。
-2026-11-02：用户授权 Claude 直接读写本仓库，并将方案评审意见推送到 main；本次为普通快进推送，没有强推或部署。
+2026-11-02（第二阶段）：用户指示"继续本地开发，多模块多子代理并行，直到项目完成，不用推送"；本地分支推进，未推送、未部署、未强推、未加许可证。
 
-## 已完成的远端发布
+## 2026-11-02 第二阶段完成内容（dev/local-parallel）
 
-此前只读连接导致的 403 已解决。使用目标账户的已授权连接完成真实写入。
+按 ADR-002（采纳评审 D1/D5/D6 路线）完成局域网 CLI 原型全栈：
+
+- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ 文档/报告提交。
+- 10 个 crate：ak-core（领域）、ak-identity、ak-wire、ak-storage、ak-net、ak-discovery、ak-store、ak-signal、ak-engine、ak-cli。
+- 数据面：QUIC（quinn 0.11）+ rustls/ring + 自签 Ed25519 证书双向钉扎；`DirectChannel` 无公开构造函数（类型约束）；无 relay/TURN 路径，Cargo.lock 依赖扫描锁定。
+- 引擎：完整端到端协议（见 ak-engine 文档），确定性任务 ID、窗口化确认、检查点续传、完成标记晚于校验+落盘。
+- 协调面：信令 TCP + STUN UDP 单进程（`ak-cli signal-server`），封闭消息集、限频、会话 TTL，无文件路由（测试锁定）。
+- 验证证据：[开发验证记录](../reports/dev-validation-2026-11-02.txt)——workspace 242 项测试、clippy `-D warnings`、仓库检查、12 项 Python 测试、5 GiB 稀疏 release 环回（74s）、真实双进程 CLI 传输逐字节一致。
+
+## 实现与验证边界（如实）
+
+- 已验证范围＝本机环回（L2 形态）：QUIC 握手、传输、续传、大文件、CLI 双进程。跨机器、跨网段、公网 NAT 穿透、抓包（L3/L4）未执行。
+- 打洞：holepunch 探测与 probe 命令已实现并有本地 UDP 互探测试；真实 NAT 环境成功率未测（P0-05）。
+- 移动端/Flutter、真机验收、性能调优（多流并发、千兆跑满）未开始。
+- 已知限制见各 crate 文档：接收端 available_bytes 返回 None（Windows std 无 API）、mtime 不回写、IPv6 前缀按 /64 简化、probe nonce 非密码学随机（身份由 QUIC 握手承担）。
+
+## 历史记录（第一阶段，main 分支）
+
 README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 完整原包提交：`5ce974c279acac2bb27bd24ba4e703042dde2861`。
-原包目录树：`77170668460628edd36e3dff74877656d8a57fd8`。
-原包 38 个文件与本地初始化包逐字节对应，包含 22 份 Markdown 文档、Rust 核心骨架、配置、脚本、测试源码及报告。
-已回读远端 main、提交树、目录条目和 ADR；不是仅创建未挂接的 Git 对象。
-本交接属于后续状态文档提交，当前最新提交应读取远端 main；不要把上面的原包提交误当永久最新版本。
-
-## 实现与验证边界
-
-已实现范围仍是 Rust 策略、64 位分块计算和任务状态机的领域骨架，没有真实网络收发。
-初始化阶段的环境没有 rustc/cargo，当时 23 项 Rust 测试未执行。
-2026-11-02 在 rustc 1.97.0 环境实际执行：23 项 Rust 单测全部通过；clippy `-D warnings` 报 1 处（`chunk.rs` 的 manual_is_multiple_of），修复后通过；Python 仓库检查与 10 项配置校验测试通过。记录见 [Rust 验证记录](../reports/rust-validation-2026-11-02.txt)。
-五端构建、真机、穿透、抓包、大文件与性能测试仍未完成。
-独立 git clone 因运行环境无法解析 github.com 失败；远端验证使用 GitHub 连接器成功完成，不声称本地克隆成功。
-旧 Space 页面未修改。当前项目蓝图以 docs/BLUEPRINT.zh-CN.md 和 ADR-001 为准。
-详见 [上传验收记录](../reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。
-
-## 2026-11-02 方案评审
-
-评审意见见 [方案评审](REVIEW_2026-11-02.zh-CN.md)。其中 D1–D6 待所有者确认；确认前 ADR-001、TECH_SELECTION、ROADMAP 等文档不变。
+2026-11-02 方案评审见 [方案评审](REVIEW_2026-11-02.zh-CN.md)；D1/D5/D6 已按所有者指示经 ADR-002 采纳，D2/D3 细节仍待确认。
+第一阶段验证记录见 [Rust 验证记录](../reports/rust-validation-2026-11-02.txt)、[上传验收记录](../reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。
 
 ## 下一工程节点
 
-Rust 编译、单测和 clippy 已完成（见上）。下一步先由所有者确认方案评审中的 D1–D6：若采纳 D5 的路线调整，先做局域网 Rust 命令行原型和公网直连探测工具；否则按 ROADMAP 进入 P0 网络库无中继可行性验证。
-验证 Windows/Android/iOS 最小真机收发，冻结五端系统和架构矩阵；不以本次上传完成代替 P0 通过。
-后续开发先读取远端最新 ref、AGENTS、ROADMAP 和现有源码，再创建工作分支；保留已有历史，禁止强推。
-领域模型观察标志不是密码学或网络证据，生产接入必须由可信传输适配器验证身份与真实直连路径。
+1. 两台真实机器（同网段）跑 `ak-cli receive`/`send`，验证非环回路径与防火墙行为；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。
+2. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
+3. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
+4. Flutter UI（Windows → Android 优先）与移动端后台/存储适配。
+后续开发先读取本文件、AGENTS、ROADMAP 和现有源码；保留已有历史，禁止强推。

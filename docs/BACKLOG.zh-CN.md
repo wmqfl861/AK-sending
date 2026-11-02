@@ -10,7 +10,22 @@
 - [x] Rust 工具链实编译、测试和 clippy（2026-11-02，rustc 1.97.0；修复 1 处 clippy 报错）；证据见 reports/rust-validation-2026-11-02.txt。
 - [x] 取得目标仓库可写权限并验证远端提交；证据见 reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md。
 - [x] 方案评审；见 docs/REVIEW_2026-11-02.zh-CN.md。
-- [ ] 所有者确认方案评审中的决策 D1–D6。
+- [x] 所有者指示"继续本地开发"后按评审建议路线推进，固化为 ADR-002（2026-11-02，本地分支）；D2/D3 的产品文案与端口映射默认值仍待所有者确认。
+
+## 局域网原型（ADR-002 / 评审第五节第 1 步，2026-11-02，分支 dev/local-parallel）
+
+- [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli 十 crate；workspace 242 项测试、clippy `-D warnings` 全绿；证据见 reports/dev-validation-2026-11-02.txt。
+- [x] 真实身份认证最小实现（P0-03 部分）：Ed25519 设备密钥、指纹、配对码、自签证书钉扎（含常量时间比较与严格 DER 校验）；错误钉扎/未授权路径发送前拒绝（T06 自动化，engine 测试）。
+- [x] QUIC 直连数据面（P0-02 部分）：quinn + rustls/ring，双向自签证书验证，`DirectChannel` 无公开构造（D6 类型约束）。
+- [x] 文件清单/目录分页扫描/源版本检测（P1-01）：LocalSource 扫描 + BLAKE3 全量/分块摘要 + mtime 版本 + SOURCE_CHANGED 检测。
+- [x] 有界分块读写、摘要验证、临时文件安全提交（P1-02）：路径越界/符号链接防护（Windows 实测）、.akpart 原子落盘、透明续传。
+- [x] 检查点与重启恢复（P1-03 的文件后端）：原子写任务记录；传输中断→检查点/半文件存活→二次运行续传（T04/T10 自动化，engine 测试）。
+- [x] >4 GiB 大文件（T12 自动化形态）：5 GiB 稀疏文件 release 环回通过（u64 偏移、内存有界、整体摘要一致），74 秒。
+- [x] 信令+STUN 协调面（P2-01 代码部分，未部署）：封闭消息集测试锁定、限频、会话 TTL；仓库检查脚本扫描 Cargo.lock 禁 relay/TURN/WebRTC/iroh 依赖（D6）。
+- [x] 公网直连探测工具（评审第 2 步的本地形态）：probe 命令（注册候选、STUN 映射、UDP 同时打开、钉扎 QUIC 握手）；跨网段实测仍属 P0-05，未执行。
+- [x] mDNS 发现（P0-04 部分）：本机组播环回实测可用；AP 隔离/防火墙场景未测。
+- [x] 局域网 CLI 双端传输：真实双进程环回传输逐字节一致（含空目录、嵌套、二进制大文件）。
+- [x] 方案评审第 6 节代码建议：job.rs 增加等待接收方确认状态；生产路径身份由类型保证。
 
 ## P0
 

@@ -1,10 +1,10 @@
 {
   "level": "L0_static_repository_only",
   "passed": true,
-  "markdown_files_checked": 22,
-  "local_links_checked": 16,
-  "rust_test_cases_present_not_executed": 23,
-  "rust_compilation_executed": false,
+  "markdown_files_checked": 25,
+  "local_links_checked": 31,
+  "rust_test_cases_present_not_executed": 209,
+  "banned_dependency_scan": "clean",
   "network_tests_executed": false,
   "errors": []
 }

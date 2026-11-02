@@ -8,13 +8,16 @@
 
 ## 当前真实状态
 
-- 已整理：需求、修订蓝图、ADR-001、协议草案、平台与存储方案、开发路线、验收规范和交接说明。
-- 新增代码：无第三方依赖的 Rust 核心骨架，包括纯直连路径策略、64 位分块计算和任务状态机；附测试源码。
-- 已执行的检查及其结果见 [本次验证报告](reports/BOOTSTRAP_VALIDATION.zh-CN.md)。不要把测试源码等同于测试通过。
-- 2026-11-02：23 项 Rust 单测与 clippy 已在 rustc 1.97.0 实际执行并通过（修复 1 处 clippy 报错），见 [Rust 验证记录](reports/rust-validation-2026-11-02.txt)。这只覆盖领域模型，不是网络或真机验证。
-- 2026-11-02：完成 [方案评审](docs/REVIEW_2026-11-02.zh-CN.md)，其中 D1–D6 待所有者确认；确认前现有决策文档不变。
-- 未实现：真实网络收发、密码学身份认证、NAT 穿透、自动发现、持久化续传、Flutter UI、移动原生适配。
-- 原始 38 个文件已提交到 GitHub 的 `main`，并核验目录树与本地原包一致；见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
+- 已整理：需求、修订蓝图、ADR-001/ADR-002、协议草案、平台与存储方案、开发路线、验收规范和交接说明。
+- 2026-11-02：完成 [方案评审](docs/REVIEW_2026-11-02.zh-CN.md)；按所有者"继续本地开发"指示采纳其 D1/D5/D6 路线，见 [ADR-002](docs/adr/002-protocol-stack-and-order.zh-CN.md)。
+- 2026-11-02（第二阶段，分支 `dev/local-parallel`，未推送）：完成局域网 CLI 原型全栈——10 个 crate 并行开发 + 集成：
+  - 真实 QUIC 直连通道（quinn + rustls/ring，自签 Ed25519 证书双向钉扎，无任何 relay 路径）；
+  - 端到端文件协议引擎（Hello/Offer/Accept/ManifestPage/Chunk/ChunkAck/ResumeRequest/Finalize/FinalAck，确定性任务 ID，窗口化确认，检查点续传，完成标记严格晚于校验与落盘）；
+  - 协调面信令服务器/客户端 + 最小 STUN（封闭消息集、限频、会话 TTL，无文件路由，测试锁定）；
+  - 命令行（keygen/receive/send/discover/signal-server/probe，公网直连探测工具）。
+- 已实际执行并通过：workspace 242 项 Rust 测试、clippy `-D warnings`、仓库检查与 12 项 Python 测试；5 GiB 稀疏文件 release 环回传输（74 秒，u64 偏移）；真实双进程 CLI 环回传输逐字节一致。证据见 [开发验证记录](reports/dev-validation-2026-11-02.txt)。
+- 仍未完成（如实标注）：跨机器/跨网段真实传输、NAT 穿透实测、抓包级无中继证明（L3）、Flutter 五端 UI、移动原生适配、真机验收。当前全部验证为本机环回（L2 形态）。
+- 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
 ## 产品原则
 
@@ -33,6 +36,7 @@
 | [项目蓝图](docs/BLUEPRINT.zh-CN.md) | 完整修订方案和阶段边界 |
 | [产品需求](docs/PRD.zh-CN.md) | 用户需求、范围和验收映射 |
 | [ADR-001](docs/adr/001-direct-only.zh-CN.md) | 无服务器文件传输的最高优先级约束 |
+| [ADR-002](docs/adr/002-protocol-stack-and-order.zh-CN.md) | QUIC+自建信令路线与先局域网原型顺序 |
 | [系统架构](docs/ARCHITECTURE.zh-CN.md) | 控制面/数据面和模块责任 |
 | [开发路线](docs/ROADMAP.zh-CN.md) | P0–P4 阶段门槛 |
 | [实施清单](docs/BACKLOG.zh-CN.md) | 可分配任务和依赖 |
@@ -54,7 +58,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`ak-core` 仅为领域/策略模型，不打开端口、不读写用户文件、不提供 UI。当前不能拿它进行文件传输。
+命令行原型（局域网，环回或同网段两台机器）：
+
+```sh
+cargo run -p ak-cli -- keygen            # 生成本机密钥并显示指纹/配对码
+cargo run -p ak-cli -- receive --out DIR --port 7100     # 接收端
+cargo run -p ak-cli -- send PATH --to IP:7100 --fp <接收端指纹>  # 发送端
+cargo run -p ak-cli -- signal-server     # 协调服务器（信令+STUN，无文件路由）
+cargo run -p ak-cli -- probe --server IP:7100 --peer <对端 device id>  # 公网直连探测
+```
+
 首次初始化空仓库可使用 [发布说明](docs/PUBLISHING.zh-CN.md) 及 `scripts/publish.ps1`；脚本不包含凭据、不强推，也不处理已有提交的仓库。
 
 ## 开发规则

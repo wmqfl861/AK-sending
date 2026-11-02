@@ -22,18 +22,19 @@
 
 ## 当前实现状态
 
-现有代码只有 Rust 领域骨架：路径策略、64 位分块和任务状态机。Claude 的 [验证日志](reports/rust-validation-2026-11-02.txt)记录 23 项 Rust 测试及 clippy 修复后通过；不代表网络、手机或性能验证。
-本次是文档定稿，不是新增网络实现。真实收发、密码学身份、持久化续传、NAT 穿透、Flutter UI 与五端适配仍待开发。轻量预算是目标，不是已经测得的体积和内存。
+**M0-01：工程基线与接收授权领域模块已开发、测试并审核。** [先行计划](docs/modules/M0-01_PLAN.zh-CN.md) · [审核记录](reports/M0-01_REVIEW.zh-CN.md) · [验证索引](reports/M0-01_VALIDATION.json)。
+新增接收确认、拒绝、过期、撤销、重连重授权，以及校验/保存阶段保留。Rust 核心仍无第三方运行时依赖，不进行实际网络或文件读写。
+代码提交 `8593a8d020a429b8441d6b88a4ae2b0fc8873ddf` 在 Linux、Windows、macOS 的核心 CI 均通过：每系统 46 项单测、3 项集成、1 项编译失败文档测试、17 项 Python 测试，以及 fmt/clippy。独立复审对象为 `98c21819fe`，之后仅有格式修正；详情见审核记录。
+真实收发、密码学身份、持久化续传、NAT 穿透、Flutter UI 与五端适配仍未实现。整个 M0 未完成，轻量预算尚未实测。PR #2 叠加在蓝图 PR #1 上，未自动合并 main。
 
-## 工程检查
+## 工程检查与模块流程
 
 ```sh
-python scripts/check_repository.py
-python -m unittest discover -s scripts/tests
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+python scripts/run_validation.py --output validation/attempt-001
 ```
 
-现有 Python 脚本只做初始化静态一致性检查，其常量输出不代表其他执行者有没有运行 Rust。M0 要用真实命令与退出码建立证据；不得把配置相等视为无中继证明。
+安装固定的 Rust 工具链及 Python 3.11+ 后运行；每次选用新的输出目录。执行器保存实际命令、退出码、日志和摘要，缺失/失败的必要检查使整体失败。`check_repository.py` 仅是 L0 静态检查，不证明密码学身份或无中继。
+
+**每模块必须先单独提交开发计划，再开发、实际测试、审核、修复复测和交接。** 计划存于 `docs/modules/`，审核存于 `reports/`；没有执行的检查不写通过，没有第二审查者参与不称独立审查。
 
 修改前阅读 [AGENTS.md](AGENTS.md)和 HANDOFF。工作分支推进，不强推、不擅自合并/部署/采购；不提交凭据、真实文件路径和用户文件。暂未选择开源许可证。`scripts/publish.ps1` 是旧空仓库初始化工具，不能用于覆盖已有仓库。

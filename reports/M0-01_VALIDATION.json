@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "module": "M0-01",
+  "status": "REVIEWED_SCOPE_ONLY",
+  "scope": "L0/L1 domain core and engineering checks, not network or mobile product",
+  "plan_commit": "e521313b0f06883cb4995d1ea8a9409b0d94a17a",
+  "initial_implementation_commit": "8d92877d6443409b42886ed927258f4a0463fcf9",
+  "reviewed_commit": "98c21819fe9fa2146a0ba38ecca76ce34bca06e2",
+  "tested_code_commit": "8593a8d020a429b8441d6b88a4ae2b0fc8873ddf",
+  "code_tree": "9e77ab66023c0211cfd9475f2831feb9ef3835dd",
+  "independent_review": {
+    "reviewer": "chatgpt-codex-connector[bot]",
+    "reviewer_id": 199175422,
+    "status_comment_id": 6570904697,
+    "receipt_comment_id": 6571071754,
+    "conclusion": "Did not find any major issues",
+    "fixed_p2_comment_ids": [
+      4439587577,
+      4439587586
+    ],
+    "formal_approved_review_claimed": false,
+    "final_code_difference": "one assertion formatting only; implementation author verified"
+  },
+  "ci": {
+    "run_id": 41403075331,
+    "run_url": "https://github.com/wmqfl861/AK-sending/actions/runs/41403075331",
+    "checkout_commit": "8593a8d020a429b8441d6b88a4ae2b0fc8873ddf",
+    "rust": "1.97.1",
+    "python": "3.13.1",
+    "jobs": [
+      {
+        "os": "ubuntu-24.04",
+        "job_id": 125138938149,
+        "conclusion": "success",
+        "artifact_id": 13121882639,
+        "artifact_sha256": "203b73902b4cec15e50f548b1455008a6befe9d1b7393ca96ef194d273066d0b"
+      },
+      {
+        "os": "windows-2022",
+        "job_id": 125138938467,
+        "conclusion": "success",
+        "artifact_id": 13121983337,
+        "artifact_sha256": "cf76e9dc2a81fa1168191e310a654b2bdd432ed9afc6a028e28c4d57a7a5da15"
+      },
+      {
+        "os": "macos-14",
+        "job_id": 125138938438,
+        "conclusion": "success",
+        "artifact_id": 13122153051,
+        "artifact_sha256": "db7fd4c7c813c179066510822f55ddb18051f076cfc86cbb729adf6f218bca41"
+      }
+    ],
+    "per_job": {
+      "rust_unit_passed": 46,
+      "rust_integration_passed": 3,
+      "rust_compile_fail_doctest_passed": 1,
+      "python_passed": 17,
+      "fmt": "passed",
+      "clippy": "passed",
+      "repository_check": "passed"
+    },
+    "artifact_retention_days": 14,
+    "prior_unsuccessful_runs": [
+      41401740552,
+      41402826046
+    ]
+  },
+  "local_rust_executed": false,
+  "local_python_tests_passed": 17,
+  "verified_source_subtrees": {
+    "crates": "29fe090d53f0d72008eeb37e9de7bcd01a1448db",
+    "scripts": "b7bf755526be16f20d2b3c19197c29b81dda7b50",
+    ".github": "377b55c6b457ccc26a7fbf6f769b3d62c1a5a5d6"
+  },
+  "not_covered": [
+    "cryptographic peer authentication",
+    "real network or file I/O",
+    "NAT and no-relay packet capture",
+    "mobile build or physical devices",
+    "large file throughput and resource budgets",
+    "MSRV 1.87 separate run",
+    "formal security audit"
+  ]
+}

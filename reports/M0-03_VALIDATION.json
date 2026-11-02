@@ -1,0 +1,24 @@
+{
+  "module": "M0-03",
+  "status": "REVIEWED_MODULE_ONLY",
+  "date": "2026-11-02",
+  "plan_commit": "02c6b55cc6d3b18c3f42609d5f426de7a35dd717",
+  "tested_and_reviewed_commit": "ed6778006a5837868bd4fc6f592254f2bf48d9db",
+  "tested_tree": "36a7fc7faaf39f78a4239b6e746366971ca56b5e",
+  "core_run": 41451061284,
+  "mobile_library_run": 41451061545,
+  "per_desktop": {"rust_tests":108,"python_tests":24,"recorded_commands":9,"all_exit_codes":0,"rust":"1.97.1","python":"3.13.1"},
+  "artifacts": [
+    {"platform":"ubuntu-24.04","job":125296090648,"id":13144995976,"zip_sha256":"21a278c8d6a1e37160b2de84323039275347cb4ab08d9eac98d3a6db5c901e13","results_sha256":"6f98bb8cc5093d66f0c879a48be16af5e43138eb66b2ec4096d62a297951ceca"},
+    {"platform":"windows-2022","job":125296091082,"id":13144701607,"zip_sha256":"0e49230e48e3c6dc0d912ae06d5fa767aaba6d8010850d90c9a9f3b96140268b","results_sha256":"e3aaad048eb3d0e1429d5ae5937fb725c370b2457b02af6d7d7b5adf431df6a2"},
+    {"platform":"macos-14","job":125296091044,"id":13145260219,"zip_sha256":"2ccb1e2c25cf0c43365c4166d0f8f5b68e120b6d5b89478762509ceea12bc30f","results_sha256":"b960e47cb60198b54297652e5ad48626256f14cb770bc81ee1f9228dd50b6eeb"}
+  ],
+  "verification": "Downloaded all three ZIPs; checked archive hashes, exact commit, 9 command exit codes, Rust counts and every raw-log hash against results.json. Windows worktree CRLF differences are not source modifications.",
+  "review": {"actor":"chatgpt-codex-connector[bot]","actor_id":199175422,"finding":4442711123,"severity":"P2","reproduced_before_fix":true,"fixed_in":"ed6778006a5837868bd4fc6f592254f2bf48d9db","receipt":6578073443,"summary":6577807804,"status":"completed_no_major_findings","formal_approved":false,"security_audit":false},
+  "retained_failure": {"run":41449496048,"commit":"a89b3179e83a8a1acd086372bbe9d94231865680","reason":"rustfmt public export wrapping","fixed_in":"97ce865bf0724b396f168a3fd9510b867f1a7887"},
+  "local": {"rust":"1.97.1","python":"3.13.5","rust_tests":108,"python_tests":24,"fmt":0,"clippy":0,"toolkit_run":41447593597,"toolkit_artifact":13143092346,"toolkit_zip_sha256":"453fc5ae3611463988d1285da7bba1b9b8b63474cf3602679d3f31eb7ed66050"},
+  "artifact_retention_days":14,
+  "not_proven":["whole M0 acceptance","file I/O or durable save","file integrity","physical devices","two-machine offline LAN","NAT","mobile App link/install","device performance"],
+  "merged":false,
+  "deployed":false
+}

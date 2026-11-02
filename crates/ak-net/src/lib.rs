@@ -353,6 +353,12 @@ pub struct DirectStream {
 }
 
 impl DirectStream {
+    /// Split into independent halves so protocol drivers can read and write
+    /// the same stream concurrently (chunks one way, acks the other).
+    pub fn split(self) -> (DirectSendStream, DirectRecvStream) {
+        (DirectSendStream { send: self.send }, DirectRecvStream { recv: self.recv })
+    }
+
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), StreamError> {
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
@@ -362,18 +368,9 @@ impl DirectStream {
     pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
         let mut header = [0u8; ak_wire::HEADER_LEN];
         self.recv_exact(&mut header).await?;
-        // Frozen layout: [version u8][type u16 BE][payload_len u32 BE].
-        let payload_len = u32::from_be_bytes([header[3], header[4], header[5], header[6]]);
-        // Reject before allocating anything: the hard cap bounds every frame
-        // (it is far below u32::MAX, so the cast is lossless).
-        if payload_len as usize > ak_wire::MAX_FRAME_BYTES {
-            return Err(StreamError::Wire(ak_wire::DecodeError::Oversized {
-                declared: payload_len,
-                budget: ak_wire::MAX_FRAME_BYTES as u32,
-            }));
-        }
+        let payload_len = payload_len_of(&header)?;
         let mut frame_bytes = header.to_vec();
-        frame_bytes.resize(header.len() + payload_len as usize, 0);
+        frame_bytes.resize(header.len() + payload_len, 0);
         self.recv_exact(&mut frame_bytes[header.len()..]).await?;
         Ok(Frame::decode(&frame_bytes, limits)?)
     }
@@ -400,6 +397,71 @@ impl DirectStream {
     pub fn finish_send(&mut self) -> Result<(), StreamError> {
         self.send.finish().map_err(|e| StreamError::Connection(e.to_string()))
     }
+}
+
+/// Send half of a split [`DirectStream`].
+pub struct DirectSendStream {
+    send: quinn::SendStream,
+}
+
+impl DirectSendStream {
+    pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), StreamError> {
+        let mut bytes = Vec::new();
+        frame.encode(&mut bytes);
+        self.send
+            .write_all(&bytes)
+            .await
+            .map_err(|e| StreamError::Connection(e.to_string()))
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) -> Result<(), StreamError> {
+        self.send
+            .write_all(data)
+            .await
+            .map_err(|e| StreamError::Connection(e.to_string()))
+    }
+
+    pub fn finish(&mut self) -> Result<(), StreamError> {
+        self.send.finish().map_err(|e| StreamError::Connection(e.to_string()))
+    }
+}
+
+/// Receive half of a split [`DirectStream`].
+pub struct DirectRecvStream {
+    recv: quinn::RecvStream,
+}
+
+impl DirectRecvStream {
+    pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
+        let mut header = [0u8; ak_wire::HEADER_LEN];
+        self.recv_exact(&mut header).await?;
+        let payload_len = payload_len_of(&header)?;
+        let mut frame_bytes = header.to_vec();
+        frame_bytes.resize(header.len() + payload_len, 0);
+        self.recv_exact(&mut frame_bytes[header.len()..]).await?;
+        Ok(Frame::decode(&frame_bytes, limits)?)
+    }
+
+    pub async fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), StreamError> {
+        self.recv
+            .read_exact(buf)
+            .await
+            .map_err(|e| StreamError::Connection(e.to_string()))
+    }
+}
+
+/// Frozen layout: [version u8][type u16 BE][payload_len u32 BE]. The hard cap
+/// bounds every frame before any allocation (it is far below u32::MAX, so the
+/// cast is lossless).
+fn payload_len_of(header: &[u8; ak_wire::HEADER_LEN]) -> Result<usize, StreamError> {
+    let declared = u32::from_be_bytes([header[3], header[4], header[5], header[6]]);
+    if declared as usize > ak_wire::MAX_FRAME_BYTES {
+        return Err(StreamError::Wire(ak_wire::DecodeError::Oversized {
+            declared,
+            budget: ak_wire::MAX_FRAME_BYTES as u32,
+        }));
+    }
+    Ok(declared as usize)
 }
 
 /// UDP simultaneous-open probing for NAT traversal (control plane coordinates

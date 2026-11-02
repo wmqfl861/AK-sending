@@ -366,7 +366,8 @@ pub mod tls {
     const MAX_CLOCK_DAYS: i64 = 2_500_000;
 
     /// A self-signed certificate plus its PKCS#8 key, ready for rustls/quinn.
-    #[derive(Clone)]
+    /// Debug never exposes key bytes beyond lengths.
+    #[derive(Debug, Clone)]
     pub struct TlsBundle {
         pub cert_der: Vec<u8>,
         pub key_pkcs8_der: Vec<u8>,

@@ -17,6 +17,9 @@ use codec::{Context, Header, Kind, HEADER_SIZE};
 use std::time::Duration;
 use tokio::time::timeout;
 
+// Only the sender issues this after consuming EndAck and its FIN.
+const NORMAL_CLOSE: u32 = 0xA301;
+
 /// Can only abort the connection that created it, including a pending receive.
 /// It cannot produce a grant, reconnect, or change the trusted peer.
 #[derive(Clone)]
@@ -207,6 +210,9 @@ impl SessionSender {
                 .await
                 .map_err(|_| Error::Protocol)?;
             self.connection.ensure_live()?;
+            self.abort
+                .connection
+                .close(NORMAL_CLOSE.into(), b"session complete");
             self.ended = true;
             Ok(())
         })
@@ -345,7 +351,15 @@ impl SessionReceiver {
                 self.authorization.check_receive(grant)?;
                 self.wire.write(Kind::EndAck, self.next, &[]).await?;
                 self.wire.send.finish().map_err(|_| Error::Closed)?;
-                self.authorization.check_receive(grant)?;
+                // finish() only queues bytes. Do not let Drop discard EndAck.
+                // The sender consumes EndAck/FIN before issuing this terminal
+                // close. All waits stay inside the operation's overall timeout.
+                match self.abort.connection.closed().await {
+                    quinn::ConnectionError::ApplicationClosed(reason)
+                        if reason.error_code == NORMAL_CLOSE.into() => {}
+                    _ => return Err(Error::Closed),
+                }
+                self.authorization.retire_after_protocol_close(grant)?;
                 self.ended = true;
                 Ok(ReceivedBatch::Ended)
             } else {

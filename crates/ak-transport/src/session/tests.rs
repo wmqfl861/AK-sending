@@ -185,3 +185,30 @@ async fn wrong_ready_and_wrong_ack_are_rejected_by_sender() {
         assert!(sender.abort_handle().is_closed());
     }
 }
+
+#[tokio::test]
+async fn wrong_terminal_close_does_not_report_ended() {
+    let (_owner, mut wire, mut receiver, grant) = raw_peer().await;
+    wire.read(&[Kind::Ready], 0).await.unwrap();
+    wire.write(Kind::End, 1, &[]).await.unwrap();
+    wire.send.finish().unwrap();
+    let raw = _owner.session_transport();
+    let (received, ()) = tokio::join!(receiver.receive_batch(&grant), async {
+        wire.read(&[Kind::EndAck], 1).await.unwrap();
+        raw.close(1_u32.into(), b"not normal completion");
+    });
+    assert_eq!(received, Err(Error::Closed));
+    assert!(receiver.abort_handle().is_closed());
+}
+
+#[tokio::test]
+async fn cancelled_terminal_wait_closes_instead_of_reporting_ended() {
+    let (_owner, mut wire, mut receiver, grant) = raw_peer().await;
+    wire.read(&[Kind::Ready], 0).await.unwrap();
+    wire.write(Kind::End, 1, &[]).await.unwrap();
+    wire.send.finish().unwrap();
+    let result = timeout(Duration::from_millis(30), receiver.receive_batch(&grant)).await;
+    assert!(result.is_err());
+    assert!(receiver.abort_handle().is_closed());
+    assert!(receiver.receive_batch(&grant).await.is_err());
+}

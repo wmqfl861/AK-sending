@@ -218,3 +218,26 @@ async fn task_mismatch_during_hello_is_rejected() {
     );
     assert!(matches!(receiver, Err(Error::Protocol)));
 }
+
+#[tokio::test]
+async fn receiver_can_drop_immediately_after_end_without_losing_final_ack() {
+    for _ in 0..12 {
+        let (mut sender, mut receiver) = sessions().await;
+        let grant = approve(&mut receiver);
+        receiver.ready(&grant).await.unwrap();
+        let (sent, received) = tokio::join!(
+            async move {
+                let result = sender.finish().await;
+                drop(sender);
+                result
+            },
+            async move {
+                let result = receiver.receive_batch(&grant).await;
+                drop(receiver);
+                result
+            }
+        );
+        assert_eq!(received.unwrap(), ReceivedBatch::Ended);
+        sent.unwrap();
+    }
+}

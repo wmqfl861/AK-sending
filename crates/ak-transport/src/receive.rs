@@ -162,12 +162,7 @@ impl ReceiveSession {
         result
     }
 
-    fn authorized(
-        &mut self,
-        grant: &ReceiveGrant,
-        operation: fn(&mut ReceiveJob) -> std::result::Result<(), ReceiveError>,
-    ) -> Result<()> {
-        self.ensure_live()?;
+    fn check_grant_scope(&self, grant: &ReceiveGrant) -> Result<()> {
         let matches =
             self.grant_scope
                 .as_ref()
@@ -178,6 +173,27 @@ impl ReceiveSession {
         if !matches {
             return Err(Error::InvalidGrant);
         }
+        Ok(())
+    }
+
+    // Called only after the framed protocol observes the authenticated peer's
+    // normal terminal close. Checks the local grant and deadline without treating
+    // that expected closure as a new data-write permission. Always retires it.
+    pub(crate) fn retire_after_protocol_close(&mut self, grant: &ReceiveGrant) -> Result<()> {
+        let result = self
+            .check_grant_scope(grant)
+            .and_then(|()| self.job.check_transfer().map_err(Error::from));
+        self.disconnected();
+        result
+    }
+
+    fn authorized(
+        &mut self,
+        grant: &ReceiveGrant,
+        operation: fn(&mut ReceiveJob) -> std::result::Result<(), ReceiveError>,
+    ) -> Result<()> {
+        self.ensure_live()?;
+        self.check_grant_scope(grant)?;
         let result = operation(&mut self.job);
         if result == Err(ReceiveError::PermissionExpired) || self.job.state().is_terminal() {
             self.clear_connection();

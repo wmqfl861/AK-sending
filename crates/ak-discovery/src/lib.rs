@@ -110,7 +110,11 @@ fn parse_manual_entry(item: &str) -> Result<PeerCandidate, DiscoveryError> {
                 .ok_or_else(|| DiscoveryError::Parse(format!("invalid fingerprint in '{item}'")))?,
         ),
     };
-    Ok(PeerCandidate { addr, fingerprint, source: CandidateSource::Manual })
+    Ok(PeerCandidate {
+        addr,
+        fingerprint,
+        source: CandidateSource::Manual,
+    })
 }
 
 /// mDNS advertise + browse over DNS-SD (mdns-sd crate, no relay).
@@ -123,7 +127,10 @@ impl MdnsDiscovery {
     pub fn new() -> Result<Self, DiscoveryError> {
         let daemon =
             mdns_sd::ServiceDaemon::new().map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
-        Ok(Self { daemon, announced: None })
+        Ok(Self {
+            daemon,
+            announced: None,
+        })
     }
 
     /// Advertise `port` with the device fingerprint (hex) and name in TXT.
@@ -143,11 +150,18 @@ impl MdnsDiscovery {
         let instance = short_hex(fingerprint.as_bytes());
         let host_name = format!("ak-{instance}.local.");
         let properties = [("fp", fp_hex.as_str()), ("name", device_name)];
-        let info = mdns_sd::ServiceInfo::new(SERVICE_TYPE, &instance, &host_name, "", port, &properties[..])
-            .map_err(|e| DiscoveryError::Mdns(e.to_string()))?
-            // No address is known at advertise time; let the daemon fill in
-            // the host's interface addresses when registering.
-            .enable_addr_auto();
+        let info = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            &instance,
+            &host_name,
+            "",
+            port,
+            &properties[..],
+        )
+        .map_err(|e| DiscoveryError::Mdns(e.to_string()))?
+        // No address is known at advertise time; let the daemon fill in
+        // the host's interface addresses when registering.
+        .enable_addr_auto();
         self.daemon
             .register(info.clone())
             .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
@@ -187,13 +201,20 @@ impl MdnsDiscovery {
             }
             // Err means timeout or the daemon closed the channel; either way
             // the browsing window is over.
-            let Ok(event) = receiver.recv_timeout(remaining) else { break };
-            let mdns_sd::ServiceEvent::ServiceResolved(info) = event else { continue };
+            let Ok(event) = receiver.recv_timeout(remaining) else {
+                break;
+            };
+            let mdns_sd::ServiceEvent::ServiceResolved(info) = event else {
+                continue;
+            };
             let port = info.get_port();
             let fingerprint = info.get_property_val_str("fp").and_then(decode_fingerprint);
             for ip in info.get_addresses() {
-                let candidate =
-                    PeerCandidate { addr: SocketAddr::new(*ip, port), fingerprint, source: CandidateSource::Mdns };
+                let candidate = PeerCandidate {
+                    addr: SocketAddr::new(*ip, port),
+                    fingerprint,
+                    source: CandidateSource::Mdns,
+                };
                 if !out.iter().any(|c| c.addr == candidate.addr) {
                     out.push(candidate);
                 }
@@ -233,7 +254,11 @@ fn family_rank(ip: IpAddr) -> u8 {
 }
 
 fn group_rank(ip: IpAddr, nets: &[ak_net_shim::Net]) -> u8 {
-    if is_lan(ip, nets) { 0 } else { 1 }
+    if is_lan(ip, nets) {
+        0
+    } else {
+        1
+    }
 }
 
 fn is_lan(ip: IpAddr, nets: &[ak_net_shim::Net]) -> bool {
@@ -248,15 +273,22 @@ fn same_net(ip: IpAddr, net: &ak_net_shim::Net) -> bool {
             if net.prefix_len > 32 {
                 return false;
             }
-            let mask = if net.prefix_len == 0 { 0 } else { !0u32 << (32 - u32::from(net.prefix_len)) };
+            let mask = if net.prefix_len == 0 {
+                0
+            } else {
+                !0u32 << (32 - u32::from(net.prefix_len))
+            };
             (u32::from(ip) & mask) == (u32::from(net_ip) & mask)
         }
         (IpAddr::V6(ip), IpAddr::V6(net_ip)) => {
             if net.prefix_len > 128 {
                 return false;
             }
-            let mask =
-                if net.prefix_len == 0 { 0 } else { !0u128 << (128 - u32::from(net.prefix_len)) };
+            let mask = if net.prefix_len == 0 {
+                0
+            } else {
+                !0u128 << (128 - u32::from(net.prefix_len))
+            };
             (u128::from(ip) & mask) == (u128::from(net_ip) & mask)
         }
         _ => false,
@@ -324,8 +356,16 @@ mod tests {
         text.parse().expect("test ip")
     }
 
-    fn cand(text: &str, fingerprint: Option<Fingerprint>, source: CandidateSource) -> PeerCandidate {
-        PeerCandidate { addr: text.parse().expect("test addr"), fingerprint, source }
+    fn cand(
+        text: &str,
+        fingerprint: Option<Fingerprint>,
+        source: CandidateSource,
+    ) -> PeerCandidate {
+        PeerCandidate {
+            addr: text.parse().expect("test addr"),
+            fingerprint,
+            source,
+        }
     }
 
     fn fp(byte: u8) -> Fingerprint {
@@ -333,7 +373,10 @@ mod tests {
     }
 
     fn net4(text: &str, prefix_len: u8) -> Net {
-        Net { addr: ip(text), prefix_len }
+        Net {
+            addr: ip(text),
+            prefix_len,
+        }
     }
 
     fn addr_strings(ranked: &[PeerCandidate]) -> Vec<String> {
@@ -356,7 +399,12 @@ mod tests {
         // then 192.168.1.55. Public tier: v6 before v4.
         assert_eq!(
             addr_strings(&ranked),
-            vec!["[fe80::1]:9000", "192.168.1.55:9000", "[2001:db8::1]:9000", "8.8.8.8:9000"]
+            vec![
+                "[fe80::1]:9000",
+                "192.168.1.55:9000",
+                "[2001:db8::1]:9000",
+                "8.8.8.8:9000"
+            ]
         );
     }
 
@@ -425,7 +473,10 @@ mod tests {
         // Out-of-range prefix lengths never match.
         assert!(!same_net(ip("10.0.0.1"), &net4("10.0.0.0", 33)));
         // IPv6 prefixes.
-        let net6 = Net { addr: ip("2001:db8:aa::"), prefix_len: 48 };
+        let net6 = Net {
+            addr: ip("2001:db8:aa::"),
+            prefix_len: 48,
+        };
         assert!(same_net(ip("2001:db8:aa::1"), &net6));
         assert!(!same_net(ip("2001:db8:bb::1"), &net6));
         assert!(!same_net(ip("2001:db8:aa::1"), &net24));
@@ -447,13 +498,19 @@ mod tests {
     fn parse_manual_list_accepts_valid_forms() {
         let parsed = parse_manual_list("192.168.1.5:9000").expect("single");
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].addr, cand("192.168.1.5:9000", None, CandidateSource::Manual).addr);
+        assert_eq!(
+            parsed[0].addr,
+            cand("192.168.1.5:9000", None, CandidateSource::Manual).addr
+        );
         assert_eq!(parsed[0].source, CandidateSource::Manual);
         assert_eq!(parsed[0].fingerprint, None);
 
         // Mixed separators and brackets.
         let parsed = parse_manual_list(" 10.0.0.1:1,\t[::1]:2\n[2001:db8::7]:3 ").expect("mixed");
-        assert_eq!(addr_strings(&parsed), vec!["10.0.0.1:1", "[::1]:2", "[2001:db8::7]:3"]);
+        assert_eq!(
+            addr_strings(&parsed),
+            vec!["10.0.0.1:1", "[::1]:2", "[2001:db8::7]:3"]
+        );
 
         // Fingerprint suffix, including uppercase hex.
         let bytes = [0xabu8; 32];
@@ -498,10 +555,16 @@ mod tests {
     #[test]
     fn decode_fingerprint_requires_64_hex_chars() {
         let bytes = [7u8; 32];
-        assert_eq!(decode_fingerprint(&fp_hex(&bytes)), Some(Fingerprint::from_bytes(bytes)));
+        assert_eq!(
+            decode_fingerprint(&fp_hex(&bytes)),
+            Some(Fingerprint::from_bytes(bytes))
+        );
         assert_eq!(decode_fingerprint(&fp_hex(&bytes)[..63]), None);
         assert_eq!(decode_fingerprint(&format!("{}0", fp_hex(&bytes))), None);
-        assert_eq!(decode_fingerprint(&fp_hex(&bytes).replacen('7', "z", 1)), None);
+        assert_eq!(
+            decode_fingerprint(&fp_hex(&bytes).replacen('7', "z", 1)),
+            None
+        );
     }
 
     // Best-effort integration test: mDNS requires multicast, which may be

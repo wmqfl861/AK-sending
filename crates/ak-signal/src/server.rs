@@ -105,7 +105,10 @@ pub(crate) async fn serve(
         .max(Duration::from_millis(100))
         / 2;
     let mut tick = tokio::time::interval(sweep_every);
-    log::info!("signaling server listening on tcp {}", listener.local_addr()?);
+    log::info!(
+        "signaling server listening on tcp {}",
+        listener.local_addr()?
+    );
     loop {
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
@@ -344,10 +347,7 @@ async fn connection_loop(
         conn_id: 0,
         close: Arc::new(Notify::new()),
     };
-    let mut bucket = TokenBucket::new(
-        shared.limits.frame_rate_per_sec,
-        shared.limits.frame_burst,
-    );
+    let mut bucket = TokenBucket::new(shared.limits.frame_rate_per_sec, shared.limits.frame_burst);
     log::debug!("signaling connection from {peer}");
     loop {
         let bytes = tokio::select! {
@@ -431,11 +431,17 @@ async fn process(
         };
         let now = util::now_unix_ms();
         if Duration::from_millis(now.abs_diff(timestamp)) > shared.limits.hello_max_age {
-            log::info!("hello from {} rejected: stale", util::hex_prefix(&device_id, 4));
+            log::info!(
+                "hello from {} rejected: stale",
+                util::hex_prefix(&device_id, 4)
+            );
             return Flow::Disconnect;
         }
         if let Err(e) = codec::verify_hello(&message, now) {
-            log::info!("hello from {} rejected: {e}", util::hex_prefix(&device_id, 4));
+            log::info!(
+                "hello from {} rejected: {e}",
+                util::hex_prefix(&device_id, 4)
+            );
             return Flow::Disconnect;
         }
         let conn_id = {
@@ -516,10 +522,7 @@ async fn process(
             handle_connect(shared, out, me, target).await;
             Flow::Continue
         }
-        CtrlMessage::Signal {
-            session,
-            signal,
-        } => {
+        CtrlMessage::Signal { session, signal } => {
             handle_signal(shared, out, me, session, signal).await;
             Flow::Continue
         }
@@ -558,7 +561,10 @@ async fn handle_connect(
             if let Some(entry) = inner.devices.get(&me) {
                 outbound.push((
                     entry.out.clone(),
-                    CtrlMessage::SessionOpened { session, peer: target },
+                    CtrlMessage::SessionOpened {
+                        session,
+                        peer: target,
+                    },
                 ));
             }
             if let Some(entry) = inner.devices.get(&target) {
@@ -601,7 +607,10 @@ async fn handle_connect(
                 if let Some(entry) = inner.devices.get(&me) {
                     outbound.push((
                         entry.out.clone(),
-                        CtrlMessage::SessionOpened { session, peer: target },
+                        CtrlMessage::SessionOpened {
+                            session,
+                            peer: target,
+                        },
                     ));
                 }
                 if let Some(entry) = inner.devices.get(&target) {
@@ -653,13 +662,7 @@ async fn handle_signal(
                 };
                 if let Some(device) = inner.devices.get(&other) {
                     // Verbatim relay of one bounded, structured signal.
-                    outbound.push((
-                        device.out.clone(),
-                        CtrlMessage::Signal {
-                            session,
-                            signal,
-                        },
-                    ));
+                    outbound.push((device.out.clone(), CtrlMessage::Signal { session, signal }));
                 }
             }
             // Unknown session id, or one this device is not part of. Both
@@ -780,7 +783,9 @@ mod tests {
         let a = client_support::connect(server.tcp, &key_a, "alpha").await;
         let b = client_support::connect(server.tcp, &key_b, "beta").await;
 
-        a.register(&["192.168.1.10:50000".parse().unwrap()]).await.unwrap();
+        a.register(&["192.168.1.10:50000".parse().unwrap()])
+            .await
+            .unwrap();
         b.register(&[
             "10.0.0.2:50001".parse().unwrap(),
             "[2001:db8::5]:50002".parse().unwrap(),
@@ -788,11 +793,21 @@ mod tests {
         .await
         .unwrap();
 
-        a.connect_peer(client_support::device(&key_b)).await.unwrap();
-        let CtrlMessage::SessionOpened { session: session_a, peer: peer_a } = next_msg(&a).await else {
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
+        let CtrlMessage::SessionOpened {
+            session: session_a,
+            peer: peer_a,
+        } = next_msg(&a).await
+        else {
             panic!("expected SessionOpened for a");
         };
-        let CtrlMessage::SessionOpened { session: session_b, peer: peer_b } = next_msg(&b).await else {
+        let CtrlMessage::SessionOpened {
+            session: session_b,
+            peer: peer_b,
+        } = next_msg(&b).await
+        else {
             panic!("expected SessionOpened for b");
         };
         assert_eq!(session_a, session_b);
@@ -870,21 +885,27 @@ mod tests {
         let b = client_support::connect(server.tcp, &key_b, "b").await;
         let c = client_support::connect(server.tcp, &key_c, "c").await;
 
-        a.connect_peer(client_support::device(&key_b)).await.unwrap();
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
         let CtrlMessage::SessionOpened { session: first, .. } = next_msg(&a).await else {
             panic!("expected SessionOpened");
         };
         let _ = next_msg(&b).await; // b's SessionOpened
 
         // a is now at its session limit; a second target is refused.
-        a.connect_peer(client_support::device(&key_c)).await.unwrap();
+        a.connect_peer(client_support::device(&key_c))
+            .await
+            .unwrap();
         match next_server_error(&a).await {
             CtrlMessage::ServerError { code, .. } => assert_eq!(code, ERR_SESSION_LIMIT),
             other => panic!("expected ServerError, got {other:?}"),
         }
 
         // Reconnecting the same pair reuses the existing session.
-        a.connect_peer(client_support::device(&key_b)).await.unwrap();
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
         match next_msg(&a).await {
             CtrlMessage::SessionOpened { session, peer } => {
                 assert_eq!(session, first);
@@ -897,9 +918,11 @@ mod tests {
             other => panic!("expected SessionOpened, got {other:?}"),
         }
         // c must have received nothing.
-        assert!(tokio::time::timeout(Duration::from_millis(100), next_msg(&c))
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next_msg(&c))
+                .await
+                .is_err()
+        );
         server.stop().await.unwrap();
     }
 
@@ -912,7 +935,9 @@ mod tests {
         };
         let server = test_support::start(limits).await;
         let a = client_support::connect(server.tcp, &client_support::key(1), "a").await;
-        a.register(&["10.0.0.1:6000".parse().unwrap()]).await.unwrap();
+        a.register(&["10.0.0.1:6000".parse().unwrap()])
+            .await
+            .unwrap();
         match next_msg(&a).await {
             CtrlMessage::ServerError { code, .. } => assert_eq!(code, ERR_RATE_LIMITED),
             other => panic!("expected rate-limit ServerError, got {other:?}"),
@@ -964,7 +989,10 @@ mod tests {
     async fn oversized_frame_is_disconnected() {
         let server = test_support::start(Limits::default()).await;
         let mut stream = TcpStream::connect(server.tcp).await.unwrap();
-        stream.write_all(&[codec::VERSION, 1, 0x0F, 0xFD]).await.unwrap(); // 4093 > cap
+        stream
+            .write_all(&[codec::VERSION, 1, 0x0F, 0xFD])
+            .await
+            .unwrap(); // 4093 > cap
         let mut byte = [0u8; 1];
         match stream.read(&mut byte).await {
             Ok(0) => {}
@@ -978,7 +1006,10 @@ mod tests {
         let server = test_support::start(Limits::default()).await;
         let mut stream = TcpStream::connect(server.tcp).await.unwrap();
         // Valid header (Hello, 1 payload byte), unusable payload.
-        stream.write_all(&[codec::VERSION, 1, 0, 1, 0]).await.unwrap();
+        stream
+            .write_all(&[codec::VERSION, 1, 0, 1, 0])
+            .await
+            .unwrap();
         let mut byte = [0u8; 1];
         match stream.read(&mut byte).await {
             Ok(0) => {}
@@ -998,7 +1029,9 @@ mod tests {
         let key_b = client_support::key(2);
         let a = client_support::connect(server.tcp, &key_a, "a").await;
         let b = client_support::connect(server.tcp, &key_b, "b").await;
-        a.connect_peer(client_support::device(&key_b)).await.unwrap();
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
         let CtrlMessage::SessionOpened { session, .. } = next_msg(&a).await else {
             panic!("expected SessionOpened");
         };
@@ -1019,7 +1052,9 @@ mod tests {
         let key_b = client_support::key(2);
         let a = client_support::connect(server.tcp, &key_a, "a").await;
         let b = client_support::connect(server.tcp, &key_b, "b").await;
-        a.connect_peer(client_support::device(&key_b)).await.unwrap();
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
         let CtrlMessage::SessionOpened { session, .. } = next_msg(&a).await else {
             panic!("expected SessionOpened");
         };

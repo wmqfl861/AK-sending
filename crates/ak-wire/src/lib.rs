@@ -306,8 +306,7 @@ impl Frame {
     /// builder's responsibility; encode takes no limits by design.
     pub fn encode(&self, out: &mut Vec<u8>) {
         debug_assert_eq!(
-            self.version,
-            VERSION,
+            self.version, VERSION,
             "ak-wire: this codec only encodes frame version 1"
         );
         let start = out.len();
@@ -1000,10 +999,11 @@ mod tests {
         let entries: Vec<WireEntry> = (0..limits.max_entries_per_page)
             .map(|i| file_entry(&format!("f{i}.dat"), (i % 256) as u8, 0))
             .collect();
-        let payload = 25 + entries
-            .iter()
-            .map(|e| MIN_ENTRY_BYTES + e.rel_path.len())
-            .sum::<usize>();
+        let payload = 25
+            + entries
+                .iter()
+                .map(|e| MIN_ENTRY_BYTES + e.rel_path.len())
+                .sum::<usize>();
         let message = Message::ManifestPage {
             job_id: [6; 16],
             page_index: 0,
@@ -1054,10 +1054,7 @@ mod tests {
             data: vec![0xAB; limits.max_chunk_bytes as usize],
         };
         let buf = encoded(&message);
-        assert_eq!(
-            buf.len(),
-            HEADER_LEN + 32 + limits.max_chunk_bytes as usize
-        );
+        assert_eq!(buf.len(), HEADER_LEN + 32 + limits.max_chunk_bytes as usize);
         assert_eq!(Frame::decode(&buf, &limits).unwrap().message, message);
     }
 
@@ -1308,7 +1305,10 @@ mod tests {
         buf[3..7].copy_from_slice(&17u32.to_be_bytes());
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
-            Err(DecodeError::Oversized { declared: 17, budget: 16 })
+            Err(DecodeError::Oversized {
+                declared: 17,
+                budget: 16
+            })
         ));
 
         // Even generous limits are clamped by the hard frame cap.
@@ -1417,7 +1417,15 @@ mod tests {
 
     #[test]
     fn rejects_bad_relative_paths() {
-        for bad in ["../up", "a\\b", "a\u{0}b", "/abs", "trailing/", "CON", "a/./b"] {
+        for bad in [
+            "../up",
+            "a\\b",
+            "a\u{0}b",
+            "/abs",
+            "trailing/",
+            "CON",
+            "a/./b",
+        ] {
             let entry = file_entry(bad, 1, 0);
             let buf = encoded(&Message::ManifestPage {
                 job_id: [1; 16],
@@ -1445,7 +1453,10 @@ mod tests {
         let buf = frame_of(TYPE_MANIFEST_PAGE, &payload);
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
-            Err(DecodeError::TooManyEntries { count: 257, limit: 256 })
+            Err(DecodeError::TooManyEntries {
+                count: 257,
+                limit: 256
+            })
         ));
     }
 
@@ -1497,7 +1508,10 @@ mod tests {
         let buf = frame_of(TYPE_RESUME_REQUEST, &payload);
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
-            Err(DecodeError::TooManyResumeEntries { count: 4097, limit: 4096 })
+            Err(DecodeError::TooManyResumeEntries {
+                count: 4097,
+                limit: 4096
+            })
         ));
     }
 
@@ -1584,9 +1598,7 @@ mod tests {
 
     fn random_string(r: &mut Lcg, max: usize) -> String {
         let len = r.below(max as u64 + 1) as usize;
-        (0..len)
-            .map(|_| (b'a' + r.byte() % 26) as char)
-            .collect()
+        (0..len).map(|_| (b'a' + r.byte() % 26) as char).collect()
     }
 
     fn random_message(r: &mut Lcg) -> Message {

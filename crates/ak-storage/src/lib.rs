@@ -87,7 +87,10 @@ fn escape_err() -> io::Error {
 }
 
 fn conflict_err(path: &Path) -> io::Error {
-    io::Error::new(ErrorKind::AlreadyExists, format!("conflict: {} already exists", path.display()))
+    io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!("conflict: {} already exists", path.display()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -134,10 +137,12 @@ impl LocalSource {
             scan_dir(root, "", chunk_size.get(), &mut entries)?;
         } else if file_type.is_file() {
             root_is_file = true;
-            let name = root
-                .file_name()
-                .and_then(OsStr::to_str)
-                .ok_or_else(|| OpenError::Io(invalid_input_io(format!("non-UTF-8 root file name: {}", root.display()))))?;
+            let name = root.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+                OpenError::Io(invalid_input_io(format!(
+                    "non-UTF-8 root file name: {}",
+                    root.display()
+                )))
+            })?;
             scan_file(root, name, chunk_size.get(), &mut entries)?;
         } else {
             return Err(OpenError::Io(invalid_input_io(format!(
@@ -145,7 +150,14 @@ impl LocalSource {
                 root.display()
             ))));
         }
-        Ok(Self { root: root.to_path_buf(), root_is_file, manifest: Manifest { chunk_size, entries } })
+        Ok(Self {
+            root: root.to_path_buf(),
+            root_is_file,
+            manifest: Manifest {
+                chunk_size,
+                entries,
+            },
+        })
     }
 
     /// Absolute path of an entry's content on the sender.
@@ -173,7 +185,12 @@ impl LocalSource {
 
 /// Pre-order walk: children sorted by name; a directory entry is emitted
 /// immediately before its own children.
-fn scan_dir(dir: &Path, prefix: &str, chunk_size: u32, entries: &mut Vec<FileEntry>) -> Result<(), OpenError> {
+fn scan_dir(
+    dir: &Path,
+    prefix: &str,
+    chunk_size: u32,
+    entries: &mut Vec<FileEntry>,
+) -> Result<(), OpenError> {
     let mut children: Vec<(OsString, PathBuf, fs::FileType)> = Vec::new();
     for child in fs::read_dir(dir)? {
         let child = child?;
@@ -183,10 +200,17 @@ fn scan_dir(dir: &Path, prefix: &str, chunk_size: u32, entries: &mut Vec<FileEnt
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, path, file_type) in children {
-        let name = name
-            .to_str()
-            .ok_or_else(|| OpenError::Io(invalid_input_io(format!("non-UTF-8 file name: {}", path.display()))))?;
-        let rel = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
+        let name = name.to_str().ok_or_else(|| {
+            OpenError::Io(invalid_input_io(format!(
+                "non-UTF-8 file name: {}",
+                path.display()
+            )))
+        })?;
+        let rel = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
         if file_type.is_symlink() {
             return Err(OpenError::SymlinkComponent(path));
         } else if file_type.is_dir() {
@@ -206,7 +230,12 @@ fn scan_dir(dir: &Path, prefix: &str, chunk_size: u32, entries: &mut Vec<FileEnt
 
 /// Stream one file once, computing the whole digest and per-chunk digests with
 /// a single chunk-sized buffer (bounded memory).
-fn scan_file(path: &Path, rel: &str, chunk_size: u32, entries: &mut Vec<FileEntry>) -> Result<(), OpenError> {
+fn scan_file(
+    path: &Path,
+    rel: &str,
+    chunk_size: u32,
+    entries: &mut Vec<FileEntry>,
+) -> Result<(), OpenError> {
     let meta = fs::symlink_metadata(path)?;
     let mtime = unix_ms(meta.modified()?);
     let mut file = File::open(path)?;
@@ -223,14 +252,22 @@ fn scan_file(path: &Path, rel: &str, chunk_size: u32, entries: &mut Vec<FileEntr
         chunk_digests.push(b3(&buf[..n]));
         size += n as u64;
     }
-    let entry = FileEntry::new(rel, size, mtime, *whole.finalize().as_bytes(), chunk_digests)
-        .map_err(|_| bad_rel_path(rel))?;
+    let entry = FileEntry::new(
+        rel,
+        size,
+        mtime,
+        *whole.finalize().as_bytes(),
+        chunk_digests,
+    )
+    .map_err(|_| bad_rel_path(rel))?;
     entries.push(entry);
     Ok(())
 }
 
 fn bad_rel_path(rel: &str) -> OpenError {
-    OpenError::Io(invalid_input_io(format!("file name not representable as a transfer path: {rel:?}")))
+    OpenError::Io(invalid_input_io(format!(
+        "file name not representable as a transfer path: {rel:?}"
+    )))
 }
 
 impl SourceHandle for LocalSource {
@@ -337,7 +374,9 @@ impl LocalSaveTarget {
         let parts = checked_rel_components(entry)?;
         if entry.is_dir {
             ensure_real_dirs(&self.root, &parts)?;
-            return Ok(LocalFileSink { kind: SinkKind::Directory });
+            return Ok(LocalFileSink {
+                kind: SinkKind::Directory,
+            });
         }
         if entry.digest_alg != DIGEST_ALG_BLAKE3 {
             return Err(invalid_input_io("unsupported digest algorithm"));
@@ -358,11 +397,19 @@ impl LocalSaveTarget {
         let part_path = with_part_suffix(&final_path);
         if let Ok(meta) = fs::symlink_metadata(&part_path) {
             if meta.file_type().is_symlink() {
-                return Err(io::Error::new(ErrorKind::InvalidInput, OpenError::SymlinkComponent(part_path)));
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    OpenError::SymlinkComponent(part_path),
+                ));
             }
         }
         // No truncate: an existing part is verified and resumed in place.
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&part_path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&part_path)?;
         let verified_prefix = verify_part_prefix(&mut file, entry, chunk_size)?;
         let state = PartState {
             file,
@@ -376,7 +423,9 @@ impl LocalSaveTarget {
             verified_prefix,
             finished: false,
         };
-        Ok(LocalFileSink { kind: SinkKind::File(state) })
+        Ok(LocalFileSink {
+            kind: SinkKind::File(state),
+        })
     }
 }
 
@@ -395,8 +444,16 @@ impl SaveTarget for LocalSaveTarget {
     /// Prepare the sink for one entry. If a `.akpart` file for this entry
     /// already exists, the sink re-reads it, re-verifies the chunk-digest
     /// prefix, and resumes from there (transparent resume).
-    fn prepare_file(&self, entry: &ak_core::manifest::FileEntry, conflict: ConflictPolicy) -> io::Result<Box<dyn FileSink>> {
-        Ok(Box::new(self.prepare_file_with_chunk_size(entry, conflict, default_chunk_size())?))
+    fn prepare_file(
+        &self,
+        entry: &ak_core::manifest::FileEntry,
+        conflict: ConflictPolicy,
+    ) -> io::Result<Box<dyn FileSink>> {
+        Ok(Box::new(self.prepare_file_with_chunk_size(
+            entry,
+            conflict,
+            default_chunk_size(),
+        )?))
     }
 }
 
@@ -437,10 +494,16 @@ fn ensure_real_dirs(root: &Path, parts: &[&OsStr]) -> io::Result<()> {
                 let meta = fs::symlink_metadata(&current).map_err(|_| e)?;
                 let ft = meta.file_type();
                 if ft.is_symlink() {
-                    return Err(io::Error::new(ErrorKind::InvalidInput, OpenError::SymlinkComponent(current)));
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        OpenError::SymlinkComponent(current),
+                    ));
                 }
                 if !ft.is_dir() {
-                    return Err(io::Error::new(ErrorKind::AlreadyExists, OpenError::NotDirectory(current)));
+                    return Err(io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        OpenError::NotDirectory(current),
+                    ));
                 }
             }
             Err(e) => return Err(e),
@@ -461,13 +524,19 @@ fn with_part_suffix(path: &Path) -> PathBuf {
 /// truncate at the first mismatch or truncation point, position the write
 /// cursor there, and return the verified chunk count. Bounded memory: one
 /// chunk-sized buffer, sequential reads.
-fn verify_part_prefix(file: &mut File, entry: &FileEntry, chunk_size: NonZeroU32) -> io::Result<u64> {
+fn verify_part_prefix(
+    file: &mut File,
+    entry: &FileEntry,
+    chunk_size: NonZeroU32,
+) -> io::Result<u64> {
     let plan = ChunkPlan::new(entry.size, chunk_size);
     let mut buf = vec![0u8; chunk_size.get() as usize];
     file.rewind()?;
     let mut verified = 0u64;
     for digest in &entry.chunk_digests {
-        let Some(range) = plan.range(verified) else { break };
+        let Some(range) = plan.range(verified) else {
+            break;
+        };
         let want = usize::try_from(range.end - range.start)
             .map_err(|_| invalid_input_io("chunk length out of usize range"))?;
         let n = read_fill(file, &mut buf[..want])?;
@@ -476,7 +545,11 @@ fn verify_part_prefix(file: &mut File, entry: &FileEntry, chunk_size: NonZeroU32
         }
         verified += 1;
     }
-    let verified_bytes = if verified == 0 { 0 } else { plan.range(verified - 1).map_or(0, |r| r.end) };
+    let verified_bytes = if verified == 0 {
+        0
+    } else {
+        plan.range(verified - 1).map_or(0, |r| r.end)
+    };
     let current_len = file.metadata()?.len();
     if current_len > verified_bytes {
         file.set_len(verified_bytes)?;
@@ -518,9 +591,12 @@ impl FileSink for LocalFileSink {
     fn write_chunk(&mut self, chunk_index: u64, data: &[u8]) -> io::Result<()> {
         let st = match &mut self.kind {
             SinkKind::File(st) => st,
-            SinkKind::Directory => return Err(invalid_input_io("directory entries accept no file chunks")),
+            SinkKind::Directory => {
+                return Err(invalid_input_io("directory entries accept no file chunks"))
+            }
         };
-        let idx = usize::try_from(chunk_index).map_err(|_| invalid_input_io("chunk index out of range"))?;
+        let idx = usize::try_from(chunk_index)
+            .map_err(|_| invalid_input_io("chunk index out of range"))?;
         let Some(expected) = st.chunk_digests.get(idx) else {
             return Err(invalid_input_io("chunk index out of range"));
         };
@@ -535,7 +611,9 @@ impl FileSink for LocalFileSink {
         let expected_len = usize::try_from(range.end - range.start)
             .map_err(|_| invalid_input_io("chunk length out of usize range"))?;
         if data.len() != expected_len {
-            return Err(invalid_input_io("chunk length does not match the manifest chunk plan"));
+            return Err(invalid_input_io(
+                "chunk length does not match the manifest chunk plan",
+            ));
         }
         if chunk_index == st.verified_prefix {
             st.file.seek(SeekFrom::Start(range.start))?;
@@ -638,7 +716,9 @@ pub fn conflict_free_name(existing: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_owned());
-    let ext = existing.extension().map(|e| e.to_string_lossy().into_owned());
+    let ext = existing
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned());
     for n in 2u64..=1_000_000 {
         let candidate = match &ext {
             Some(ext) => parent.join(format!("{stem} ({n}).{ext}")),
@@ -680,7 +760,11 @@ mod tests {
         match symlink_once(src, dst, dir_link) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("SKIP: cannot create symlink at {} ({}); test reduced", dst.display(), e);
+                eprintln!(
+                    "SKIP: cannot create symlink at {} ({}); test reduced",
+                    dst.display(),
+                    e
+                );
                 false
             }
         }
@@ -748,7 +832,18 @@ mod tests {
             .iter()
             .map(|e| e.rel_path.to_str().unwrap())
             .collect();
-        assert_eq!(rels, ["a", "a/b", "a/b/deep.txt", "a/z.txt", "empty", "multi1.txt", "multi2.txt"]);
+        assert_eq!(
+            rels,
+            [
+                "a",
+                "a/b",
+                "a/b/deep.txt",
+                "a/z.txt",
+                "empty",
+                "multi1.txt",
+                "multi2.txt"
+            ]
+        );
         let dirs: Vec<bool> = entries.iter().map(|e| e.is_dir).collect();
         assert_eq!(dirs, [true, true, false, false, true, false, false]);
 
@@ -778,7 +873,9 @@ mod tests {
     #[test]
     fn scan_missing_root_and_empty_file_edge_cases() {
         let tmp = TempDir::new().unwrap();
-        let err = LocalSource::open(&tmp.path().join("nope"), cs(8)).err().unwrap();
+        let err = LocalSource::open(&tmp.path().join("nope"), cs(8))
+            .err()
+            .unwrap();
         assert!(matches!(err, OpenError::NotFound(_)));
 
         let empty = tmp.path().join("empty.bin");
@@ -833,14 +930,23 @@ mod tests {
         wf(&tree.join("d/x"), b"x");
         wf(&tree.join("f"), b"x");
         let dir_source = LocalSource::open(&tree, cs(4)).unwrap();
-        assert_eq!(dir_source.manifest().entries[0].rel_path, PathBuf::from("d"));
-        assert!(dir_source.read_chunk(0, 0, &mut [0u8; 4]).is_err(), "dir entry is not readable");
+        assert_eq!(
+            dir_source.manifest().entries[0].rel_path,
+            PathBuf::from("d")
+        );
+        assert!(
+            dir_source.read_chunk(0, 0, &mut [0u8; 4]).is_err(),
+            "dir entry is not readable"
+        );
         assert!(dir_source.read_chunk(1, 0, &mut [0u8; 4]).is_ok());
 
         let empty = tmp.path().join("empty.bin");
         wf(&empty, b"");
         let empty_source = LocalSource::open(&empty, cs(4)).unwrap();
-        assert!(empty_source.read_chunk(0, 0, &mut [0u8; 4]).is_err(), "empty file has no chunks");
+        assert!(
+            empty_source.read_chunk(0, 0, &mut [0u8; 4]).is_err(),
+            "empty file has no chunks"
+        );
     }
 
     #[test]
@@ -893,7 +999,9 @@ mod tests {
     #[test]
     fn save_target_open_rejects_missing_file_and_symlink_roots() {
         let tmp = TempDir::new().unwrap();
-        let err = LocalSaveTarget::open(&tmp.path().join("missing")).err().unwrap();
+        let err = LocalSaveTarget::open(&tmp.path().join("missing"))
+            .err()
+            .unwrap();
         assert!(matches!(err, OpenError::NotFound(_)));
 
         let plain = tmp.path().join("plain.txt");
@@ -930,7 +1038,9 @@ mod tests {
 
     fn write_all_chunks(sink: &mut dyn FileSink, source: &LocalSource, entry: &FileEntry) {
         for i in 0..entry.chunk_digests.len() as u64 {
-            let range = ChunkPlan::new(entry.size, source.manifest().chunk_size).range(i).unwrap();
+            let range = ChunkPlan::new(entry.size, source.manifest().chunk_size)
+                .range(i)
+                .unwrap();
             let len = usize::try_from(range.end - range.start).unwrap();
             let mut buf = vec![0u8; len];
             assert_eq!(source.read_chunk(0, i, &mut buf).unwrap(), len);
@@ -947,7 +1057,9 @@ mod tests {
 
         let final_path = dst.path().join("payload.bin");
         let part_path = dst.path().join("payload.bin.akpart");
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         assert_eq!(sink.verified_prefix_chunks(), 0);
         write_all_chunks(&mut sink, &source, &entry);
         assert_eq!(sink.verified_prefix_chunks(), 3);
@@ -965,7 +1077,9 @@ mod tests {
         let (_src_tmp, _source, entry) = transfer_entry(b"abcdefgh12345678", 8);
         let dst = TempDir::new().unwrap();
         let target = LocalSaveTarget::open(dst.path()).unwrap();
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         let err = sink.write_chunk(1, b"12345678").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
@@ -981,12 +1095,18 @@ mod tests {
         let final_path = dst.path().join("payload.bin");
         let part_path = dst.path().join("payload.bin.akpart");
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         sink.write_chunk(0, b"abcdefgh").unwrap();
         let err = sink.write_chunk(1, b"12345678").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("HASH_MISMATCH"));
-        assert_eq!(fs::metadata(&part_path).unwrap().len(), 8, "bad chunk must not touch the disk");
+        assert_eq!(
+            fs::metadata(&part_path).unwrap().len(),
+            8,
+            "bad chunk must not touch the disk"
+        );
         let err = sink.finish().unwrap_err(); // incomplete
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(!final_path.exists(), "final must not appear");
@@ -1004,13 +1124,19 @@ mod tests {
         let final_path = dst.path().join("payload.bin");
         let part_path = dst.path().join("payload.bin.akpart");
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         write_all_chunks(&mut sink, &source, &entry);
         let err = sink.finish().err().unwrap();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("HASH_MISMATCH"));
         assert!(!final_path.exists());
-        assert_eq!(fs::read(&part_path).unwrap(), content, "verified prefix stays reusable");
+        assert_eq!(
+            fs::read(&part_path).unwrap(),
+            content,
+            "verified prefix stays reusable"
+        );
     }
 
     #[test]
@@ -1019,7 +1145,9 @@ mod tests {
         let dst = TempDir::new().unwrap();
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let final_path = dst.path().join("payload.bin");
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         assert_eq!(sink.verified_prefix_chunks(), 0);
         sink.finish().unwrap();
         assert_eq!(fs::read(&final_path).unwrap(), Vec::<u8>::new());
@@ -1034,25 +1162,45 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let final_path = dst.path().join("payload.bin");
 
-        let mut first = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut first = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         write_all_chunks(&mut first, &source, &entry);
         first.finish().unwrap();
         assert_eq!(fs::read(&final_path).unwrap(), content);
 
         // Second transfer of the same entry.
-        let mut second = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut second = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         write_all_chunks(&mut second, &source, &entry);
         let err = second.finish().err().unwrap();
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
-        assert!(dst.path().join("payload.bin.akpart").exists(), "part kept for retry");
+        assert!(
+            dst.path().join("payload.bin.akpart").exists(),
+            "part kept for retry"
+        );
         drop(second);
 
         // Retry with Rename: the part resumes fully verified and lands as (2).
-        let mut third = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(8)).unwrap();
-        assert_eq!(third.verified_prefix_chunks(), 2, "resume from the kept part");
+        let mut third = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(8))
+            .unwrap();
+        assert_eq!(
+            third.verified_prefix_chunks(),
+            2,
+            "resume from the kept part"
+        );
         third.finish().unwrap();
-        assert_eq!(fs::read(dst.path().join("payload (2).bin")).unwrap(), content);
-        assert_eq!(fs::read(&final_path).unwrap(), content, "original untouched");
+        assert_eq!(
+            fs::read(dst.path().join("payload (2).bin")).unwrap(),
+            content
+        );
+        assert_eq!(
+            fs::read(&final_path).unwrap(),
+            content,
+            "original untouched"
+        );
         assert!(!dst.path().join("payload.bin.akpart").exists());
     }
 
@@ -1060,13 +1208,27 @@ mod tests {
     fn conflict_free_name_increments_from_two_and_handles_extensions() {
         let tmp = TempDir::new().unwrap();
         let name = tmp.path().join("a.tar.gz");
-        assert_eq!(conflict_free_name(&name).file_name().unwrap(), "a.tar (2).gz");
+        assert_eq!(
+            conflict_free_name(&name).file_name().unwrap(),
+            "a.tar (2).gz"
+        );
         wf(&tmp.path().join("a.tar (2).gz"), b"x");
-        assert_eq!(conflict_free_name(&name).file_name().unwrap(), "a.tar (3).gz");
+        assert_eq!(
+            conflict_free_name(&name).file_name().unwrap(),
+            "a.tar (3).gz"
+        );
 
         let plain = tmp.path().join("README");
-        assert_eq!(conflict_free_name(&plain).file_name().unwrap(), "README (2)");
-        assert_eq!(conflict_free_name(Path::new("rel.txt")).file_name().unwrap(), "rel (2).txt");
+        assert_eq!(
+            conflict_free_name(&plain).file_name().unwrap(),
+            "README (2)"
+        );
+        assert_eq!(
+            conflict_free_name(Path::new("rel.txt"))
+                .file_name()
+                .unwrap(),
+            "rel (2).txt"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1081,12 +1243,16 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let final_path = dst.path().join("payload.bin");
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         sink.write_chunk(0, b"01234567").unwrap();
         sink.write_chunk(1, b"89abcdef").unwrap();
         drop(sink); // no discard: the part survives for resume
 
-        let mut resumed = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         assert_eq!(resumed.verified_prefix_chunks(), 2);
         // Wrong content for the next chunk is rejected without advancing.
         assert!(resumed.write_chunk(2, b"XXXX").is_err());
@@ -1104,7 +1270,9 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let part_path = dst.path().join("payload.bin.akpart");
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         sink.write_chunk(0, b"01234567").unwrap();
         sink.write_chunk(1, b"89abcdef").unwrap();
         drop(sink);
@@ -1115,9 +1283,19 @@ mod tests {
         part.write_all(&[0x00]).unwrap();
         drop(part);
 
-        let mut resumed = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
-        assert_eq!(resumed.verified_prefix_chunks(), 1, "chunk 1 no longer verifies");
-        assert_eq!(part_path.metadata().unwrap().len(), 8, "truncated at the bad chunk");
+        let mut resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(
+            resumed.verified_prefix_chunks(),
+            1,
+            "chunk 1 no longer verifies"
+        );
+        assert_eq!(
+            part_path.metadata().unwrap().len(),
+            8,
+            "truncated at the bad chunk"
+        );
         resumed.write_chunk(1, b"89abcdef").unwrap();
         resumed.write_chunk(2, b"GHIJ").unwrap();
         resumed.finish().unwrap();
@@ -1132,17 +1310,28 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let part_path = dst.path().join("payload.bin.akpart");
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         sink.write_chunk(0, b"01234567").unwrap();
         sink.write_chunk(1, b"89abcdef").unwrap();
         drop(sink);
-        let mut part = fs::OpenOptions::new().append(true).open(&part_path).unwrap();
+        let mut part = fs::OpenOptions::new()
+            .append(true)
+            .open(&part_path)
+            .unwrap();
         part.write_all(b"garbage").unwrap();
         drop(part);
 
-        let resumed = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8)).unwrap();
+        let resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
         assert_eq!(resumed.verified_prefix_chunks(), 2);
-        assert_eq!(part_path.metadata().unwrap().len(), 16, "stale tail dropped");
+        assert_eq!(
+            part_path.metadata().unwrap().len(),
+            16,
+            "stale tail dropped"
+        );
     }
 
     #[test]
@@ -1186,7 +1375,9 @@ mod tests {
         let dst = TempDir::new().unwrap();
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let part_path = dst.path().join("payload.bin.akpart");
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(4)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(4))
+            .unwrap();
         sink.write_chunk(0, b"0123").unwrap();
         assert!(part_path.exists());
         sink.discard();
@@ -1224,24 +1415,38 @@ mod tests {
         }
 
         // File entry below the symlinked component.
-        let entry = FileEntry::new("link/file.txt", 1, 0, [0; DIGEST_LEN], vec![[0; DIGEST_LEN]]).unwrap();
+        let entry = FileEntry::new(
+            "link/file.txt",
+            1,
+            0,
+            [0; DIGEST_LEN],
+            vec![[0; DIGEST_LEN]],
+        )
+        .unwrap();
         let err = target
             .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(4))
             .err()
             .unwrap();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(outside.path().read_dir().unwrap().next().is_none(), "nothing written through the link");
+        assert!(
+            outside.path().read_dir().unwrap().next().is_none(),
+            "nothing written through the link"
+        );
 
         // Directory entry below the symlinked component.
         let dir_entry = FileEntry::directory("link/sub").unwrap();
-        assert!(target.prepare_file_with_chunk_size(&dir_entry, ConflictPolicy::Fail, cs(4)).is_err());
+        assert!(target
+            .prepare_file_with_chunk_size(&dir_entry, ConflictPolicy::Fail, cs(4))
+            .is_err());
         assert!(outside.path().read_dir().unwrap().next().is_none());
 
         // A file entry whose final name IS the symlink: conflict, never a
         // write through the link.
         let digest = b3(b"x");
         let entry = FileEntry::new("link", 1, 0, digest, vec![digest]).unwrap();
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(1)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(1))
+            .unwrap();
         sink.write_chunk(0, b"x").unwrap();
         let err = sink.finish().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
@@ -1256,19 +1461,31 @@ mod tests {
 
         let mut escape = FileEntry::new("ok.txt", 1, 0, digest, vec![digest]).unwrap();
         escape.rel_path = PathBuf::from("../evil.txt");
-        assert!(target.prepare_file_with_chunk_size(&escape, ConflictPolicy::Fail, cs(4)).is_err());
+        assert!(target
+            .prepare_file_with_chunk_size(&escape, ConflictPolicy::Fail, cs(4))
+            .is_err());
 
         let mut absolute = FileEntry::new("ok.txt", 1, 0, digest, vec![digest]).unwrap();
-        absolute.rel_path = if cfg!(windows) { PathBuf::from("C:\\evil.txt") } else { PathBuf::from("/etc/evil.txt") };
-        assert!(target.prepare_file_with_chunk_size(&absolute, ConflictPolicy::Fail, cs(4)).is_err());
+        absolute.rel_path = if cfg!(windows) {
+            PathBuf::from("C:\\evil.txt")
+        } else {
+            PathBuf::from("/etc/evil.txt")
+        };
+        assert!(target
+            .prepare_file_with_chunk_size(&absolute, ConflictPolicy::Fail, cs(4))
+            .is_err());
 
         let mut rooted = FileEntry::new("ok.txt", 1, 0, digest, vec![digest]).unwrap();
         rooted.rel_path = PathBuf::from("/evil.txt");
-        assert!(target.prepare_file_with_chunk_size(&rooted, ConflictPolicy::Fail, cs(4)).is_err());
+        assert!(target
+            .prepare_file_with_chunk_size(&rooted, ConflictPolicy::Fail, cs(4))
+            .is_err());
 
         let mut empty = FileEntry::new("ok.txt", 1, 0, digest, vec![digest]).unwrap();
         empty.rel_path = PathBuf::new();
-        assert!(target.prepare_file_with_chunk_size(&empty, ConflictPolicy::Fail, cs(4)).is_err());
+        assert!(target
+            .prepare_file_with_chunk_size(&empty, ConflictPolicy::Fail, cs(4))
+            .is_err());
 
         assert!(!dst.path().join("ok.txt.akpart").exists());
         assert!(!dst.path().parent().unwrap().join("evil.txt").exists());
@@ -1280,7 +1497,9 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let entry = FileEntry::directory("a/b/c").unwrap();
 
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(4)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(4))
+            .unwrap();
         assert!(dst.path().join("a/b/c").is_dir());
         assert_eq!(sink.verified_prefix_chunks(), 0);
         assert!(sink.write_chunk(0, b"x").is_err());
@@ -1289,7 +1508,9 @@ mod tests {
         assert!(dst.path().join("a/b/c").is_dir());
 
         // Preparing the same directory entry again is an idempotent no-op.
-        let mut again = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(4)).unwrap();
+        let mut again = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(4))
+            .unwrap();
         again.finish().unwrap();
         assert!(dst.path().join("a/b/c").is_dir());
     }
@@ -1300,9 +1521,14 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let digest = b3(b"xy");
         let entry = FileEntry::new("docs/2026/note.txt", 2, 0, digest, vec![digest]).unwrap();
-        let mut sink = target.prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(2)).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(2))
+            .unwrap();
         sink.write_chunk(0, b"xy").unwrap();
         sink.finish().unwrap();
-        assert_eq!(fs::read(dst.path().join("docs/2026/note.txt")).unwrap(), b"xy");
+        assert_eq!(
+            fs::read(dst.path().join("docs/2026/note.txt")).unwrap(),
+            b"xy"
+        );
     }
 }

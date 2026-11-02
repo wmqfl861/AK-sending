@@ -98,11 +98,14 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 impl FileCheckpointStore {
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+        })
     }
 
     fn path_for(&self, job_id: &JobIdBytes) -> PathBuf {
-        self.dir.join(format!("{}.{}", hex_encode(job_id), EXTENSION))
+        self.dir
+            .join(format!("{}.{}", hex_encode(job_id), EXTENSION))
     }
 }
 
@@ -128,7 +131,8 @@ impl CheckpointStore for FileCheckpointStore {
             EXTENSION
         ));
         let final_path = self.path_for(&record.job_id);
-        let result = write_durable(&tmp, text.as_bytes()).and_then(|()| rename_replace(&tmp, &final_path));
+        let result =
+            write_durable(&tmp, text.as_bytes()).and_then(|()| rename_replace(&tmp, &final_path));
         if result.is_err() {
             // Best-effort cleanup so a failed save leaves no temp residue.
             let _ = fs::remove_file(&tmp);
@@ -145,7 +149,9 @@ impl CheckpointStore for FileCheckpointStore {
         };
         let record = decode_record(&text)?;
         if &record.job_id != job_id {
-            return Err(invalid_data("checkpoint job id does not match its file name"));
+            return Err(invalid_data(
+                "checkpoint job id does not match its file name",
+            ));
         }
         Ok(Some(record))
     }
@@ -161,10 +167,18 @@ impl CheckpointStore for FileCheckpointStore {
                 continue;
             }
             // Skip files whose name is not `<job hex>.akjob` to begin with.
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            let Some(name_job) = hex_decode_fixed::<16>(stem) else { continue };
-            let Ok(text) = fs::read_to_string(&path) else { continue };
-            let Ok(record) = decode_record(&text) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(name_job) = hex_decode_fixed::<16>(stem) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(record) = decode_record(&text) else {
+                continue;
+            };
             if record.job_id != name_job {
                 continue;
             }
@@ -236,7 +250,9 @@ fn encode_record(record: &TaskRecord) -> io::Result<String> {
         .to_str()
         .ok_or_else(|| invalid_data("root path is not valid UTF-8"))?;
     if !valid_state(&record.state) {
-        return Err(invalid_data("state must match [A-Za-z0-9_-]+ and be non-empty"));
+        return Err(invalid_data(
+            "state must match [A-Za-z0-9_-]+ and be non-empty",
+        ));
     }
     let mut out = String::with_capacity(192 + record.files.len() * 32);
     out.push_str(HEADER);
@@ -333,9 +349,16 @@ impl<'a> Lines<'a> {
             let size = parse_num(parts.next(), "file size", line)?;
             let prefix = parse_num(parts.next(), "file prefix", line)?;
             if parts.next().is_some() {
-                return Err(invalid_data(format!("extra field on file line '{}'", preview(line))));
+                return Err(invalid_data(format!(
+                    "extra field on file line '{}'",
+                    preview(line)
+                )));
             }
-            files.push(FileCheckpoint { file_index: index, size, verified_prefix_chunks: prefix });
+            files.push(FileCheckpoint {
+                file_index: index,
+                size,
+                verified_prefix_chunks: prefix,
+            });
             self.pos += 1;
         }
         Ok(files)
@@ -361,7 +384,8 @@ fn preview(line: &str) -> String {
 }
 
 fn parse_num<T: std::str::FromStr>(raw: Option<&str>, what: &str, line: &str) -> io::Result<T> {
-    let text = raw.ok_or_else(|| invalid_data(format!("missing {what} on line '{}'", preview(line))))?;
+    let text =
+        raw.ok_or_else(|| invalid_data(format!("missing {what} on line '{}'", preview(line))))?;
     text.parse::<T>()
         .map_err(|_| invalid_data(format!("bad {what} '{text}' on line '{}'", preview(line))))
 }
@@ -374,13 +398,17 @@ fn decode_record(text: &str) -> io::Result<TaskRecord> {
         .copied()
         .ok_or_else(|| invalid_data("empty checkpoint file"))?;
     if header != HEADER {
-        return Err(invalid_data(format!("unknown checkpoint version '{}'", preview(header))));
+        return Err(invalid_data(format!(
+            "unknown checkpoint version '{}'",
+            preview(header)
+        )));
     }
     lines.pos = 1;
 
     let job_hex = lines.field("job")?;
-    let job_id = hex_decode_fixed::<16>(job_hex)
-        .ok_or_else(|| invalid_data(format!("bad job id hex (expected {JOB_HEX_LEN} hex chars)")))?;
+    let job_id = hex_decode_fixed::<16>(job_hex).ok_or_else(|| {
+        invalid_data(format!("bad job id hex (expected {JOB_HEX_LEN} hex chars)"))
+    })?;
 
     let dir = lines.field("dir")?;
     let direction = match dir {
@@ -391,8 +419,8 @@ fn decode_record(text: &str) -> io::Result<TaskRecord> {
 
     let root_hex = lines.field("root")?;
     let root_bytes = hex_decode(root_hex).ok_or_else(|| invalid_data("bad root hex"))?;
-    let root_str = String::from_utf8(root_bytes)
-        .map_err(|_| invalid_data("root is not valid UTF-8"))?;
+    let root_str =
+        String::from_utf8(root_bytes).map_err(|_| invalid_data("root is not valid UTF-8"))?;
 
     let peer = lines.field("peer")?;
     let peer_fingerprint = if peer == "-" {
@@ -417,7 +445,9 @@ fn decode_record(text: &str) -> io::Result<TaskRecord> {
 
     let state = lines.field("state")?.to_string();
     if !valid_state(&state) {
-        return Err(invalid_data("state must match [A-Za-z0-9_-]+ and be non-empty"));
+        return Err(invalid_data(
+            "state must match [A-Za-z0-9_-]+ and be non-empty",
+        ));
     }
 
     let created_unix_ms = parse_num(Some(lines.field("created")?), "created time", "created")?;
@@ -516,9 +546,21 @@ mod tests {
             created_unix_ms: 1_730_000_000_000,
             updated_unix_ms: 1_730_000_500_000,
             files: vec![
-                FileCheckpoint { file_index: 0, size: 4_000_000, verified_prefix_chunks: 15 },
-                FileCheckpoint { file_index: 1, size: 4_000_000, verified_prefix_chunks: 0 },
-                FileCheckpoint { file_index: 2, size: 2_000_000, verified_prefix_chunks: 2 },
+                FileCheckpoint {
+                    file_index: 0,
+                    size: 4_000_000,
+                    verified_prefix_chunks: 15,
+                },
+                FileCheckpoint {
+                    file_index: 1,
+                    size: 4_000_000,
+                    verified_prefix_chunks: 0,
+                },
+                FileCheckpoint {
+                    file_index: 2,
+                    size: 2_000_000,
+                    verified_prefix_chunks: 2,
+                },
             ],
         }
     }
@@ -556,7 +598,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let s = store(dir.path());
         for byte in [9u8, 1, 5] {
-            s.save(&sample(job(byte), Direction::Send, None)).expect("save");
+            s.save(&sample(job(byte), Direction::Send, None))
+                .expect("save");
         }
         // A corrupt file, a bad-hex name, and a temp file must all be skipped.
         fs::write(dir.path().join("aaaa.akjob"), b"not a checkpoint").expect("write");
@@ -572,7 +615,8 @@ mod tests {
     fn remove_reports_presence() {
         let dir = tempfile::tempdir().expect("tempdir");
         let s = store(dir.path());
-        s.save(&sample(job(3), Direction::Send, None)).expect("save");
+        s.save(&sample(job(3), Direction::Send, None))
+            .expect("save");
         assert!(s.remove(&job(3)).expect("remove"));
         assert!(!s.remove(&job(3)).expect("remove again"));
         assert_eq!(s.load(&job(3)).expect("load"), None);
@@ -621,21 +665,54 @@ mod tests {
         let s = store(dir.path());
         let good = sample(job(21), Direction::Send, Some(fp(3)));
         s.save(&good).expect("save");
-        let original = fs::read_to_string(dir.path().join(format!("{}.akjob", hex_encode(&job(21)))))
-            .expect("read");
+        let original =
+            fs::read_to_string(dir.path().join(format!("{}.akjob", hex_encode(&job(21)))))
+                .expect("read");
 
         let bad_variants: Vec<(&str, String)> = vec![
-            ("bad header", format!("AKJOB2\n{}", original.lines().skip(1).collect::<Vec<_>>().join("\n"))),
+            (
+                "bad header",
+                format!(
+                    "AKJOB2\n{}",
+                    original.lines().skip(1).collect::<Vec<_>>().join("\n")
+                ),
+            ),
             ("unknown line", format!("{original}extra junk\n")),
-            ("bad peer hex", original.replacen(&hex_encode(fp(3).as_bytes()), "zz", 1)),
-            ("missing state line", original.lines().filter(|l| !l.starts_with("state ")).collect::<Vec<_>>().join("\n")),
-            ("bad state charset", original.replacen("state in_progress-1", "state has space", 1)),
-            ("truncated", original.split("updated ").next().expect("split").to_string()),
-            ("bad chunk number", original.replacen("chunk 262144", "chunk abc", 1)),
+            (
+                "bad peer hex",
+                original.replacen(&hex_encode(fp(3).as_bytes()), "zz", 1),
+            ),
+            (
+                "missing state line",
+                original
+                    .lines()
+                    .filter(|l| !l.starts_with("state "))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            (
+                "bad state charset",
+                original.replacen("state in_progress-1", "state has space", 1),
+            ),
+            (
+                "truncated",
+                original
+                    .split("updated ")
+                    .next()
+                    .expect("split")
+                    .to_string(),
+            ),
+            (
+                "bad chunk number",
+                original.replacen("chunk 262144", "chunk abc", 1),
+            ),
         ];
         for (what, text) in bad_variants {
-            fs::write(dir.path().join(format!("{}.akjob", hex_encode(&job(21)))), text.as_bytes())
-                .expect("write");
+            fs::write(
+                dir.path().join(format!("{}.akjob", hex_encode(&job(21)))),
+                text.as_bytes(),
+            )
+            .expect("write");
             let result = s.load(&job(21));
             assert!(result.is_err(), "expected parse failure for {what}");
         }
@@ -647,7 +724,10 @@ mod tests {
         let s = store(dir.path());
         let mut record = sample(job(31), Direction::Send, None);
         record.state = "not allowed!".to_string();
-        assert!(s.save(&record).is_err(), "state with spaces must be rejected");
+        assert!(
+            s.save(&record).is_err(),
+            "state with spaces must be rejected"
+        );
         // No residue after a rejected save either.
         let entries: Vec<_> = fs::read_dir(dir.path()).expect("read_dir").collect();
         assert!(entries.is_empty());

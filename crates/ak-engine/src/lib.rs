@@ -69,7 +69,12 @@ pub struct SendSpec {
 }
 
 impl SendSpec {
-    pub fn new(source_root: PathBuf, peer: SocketAddr, pinned: Fingerprint, identity: TlsBundle) -> Self {
+    pub fn new(
+        source_root: PathBuf,
+        peer: SocketAddr,
+        pinned: Fingerprint,
+        identity: TlsBundle,
+    ) -> Self {
         Self {
             source_root,
             peer,
@@ -119,19 +124,48 @@ impl ReceiveSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     Connecting,
-    Connected { peer: String },
-    Offered { files: u64, bytes: u64 },
-    Accepted { files: u64, bytes: u64 },
-    ManifestPageSent { page: u32 },
+    Connected {
+        peer: String,
+    },
+    Offered {
+        files: u64,
+        bytes: u64,
+    },
+    Accepted {
+        files: u64,
+        bytes: u64,
+    },
+    ManifestPageSent {
+        page: u32,
+    },
     ManifestReceived,
-    Resuming { chunks: u64 },
-    FileStarted { file_index: u32, path: String, bytes: u64 },
-    ChunkSent { file_index: u32, chunk_index: u64 },
-    ChunkReceived { file_index: u32, chunk_index: u64 },
-    FileVerified { file_index: u32 },
-    FileCommitted { file_index: u32, path: String },
+    Resuming {
+        chunks: u64,
+    },
+    FileStarted {
+        file_index: u32,
+        path: String,
+        bytes: u64,
+    },
+    ChunkSent {
+        file_index: u32,
+        chunk_index: u64,
+    },
+    ChunkReceived {
+        file_index: u32,
+        chunk_index: u64,
+    },
+    FileVerified {
+        file_index: u32,
+    },
+    FileCommitted {
+        file_index: u32,
+        path: String,
+    },
     Verifying,
-    FinalAck { verified: bool },
+    FinalAck {
+        verified: bool,
+    },
     Done,
 }
 
@@ -183,7 +217,13 @@ pub fn job_id_for(root_name: &str, manifest: &Manifest) -> JobId {
     hasher.update(&manifest.chunk_size.get().to_be_bytes());
     for entry in &manifest.entries {
         hasher.update(&[u8::from(entry.is_dir)]);
-        hasher.update(entry.rel_path.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update(
+            entry
+                .rel_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .as_bytes(),
+        );
         hasher.update(&entry.size.to_be_bytes());
         hasher.update(&entry.mtime_unix_ms.to_be_bytes());
         hasher.update(&entry.whole_digest);
@@ -221,7 +261,10 @@ async fn expect_hello(
     identity: &TlsBundle,
 ) -> Result<(), EngineError> {
     match rx.recv_frame(limits).await? {
-        Frame { message: Message::Hello { proto_version, .. }, .. } => {
+        Frame {
+            message: Message::Hello { proto_version, .. },
+            ..
+        } => {
             if proto_version != PROTO_VERSION {
                 return Err(EngineError::PeerError {
                     code: ErrorCode::ProtocolUnsupported,
@@ -231,13 +274,19 @@ async fn expect_hello(
             let _ = (our_name, identity);
             Ok(())
         }
-        Frame { message: Message::Error { code, message }, .. } => Err(EngineError::PeerError { code, message }),
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => Err(EngineError::PeerError { code, message }),
         other => Err(unexpected(other.message)),
     }
 }
 
 fn unexpected(message: Message) -> EngineError {
-    EngineError::PeerError { code: ErrorCode::ProtocolUnsupported, message: format!("unexpected frame: {message:?}") }
+    EngineError::PeerError {
+        code: ErrorCode::ProtocolUnsupported,
+        message: format!("unexpected frame: {message:?}"),
+    }
 }
 
 /// Assemble manifest pages under the byte budget.
@@ -249,7 +298,8 @@ fn assemble_pages(manifest: &Manifest, limits: &Limits) -> Vec<Vec<WireEntry>> {
         let wire = WireEntry::from(entry);
         let size = 128 + wire.rel_path.len() + 32 * wire.chunk_digests.len();
         let cap = usize::from(limits.max_entries_per_page);
-        if !current.is_empty() && (current_bytes + size > PAGE_BUDGET_BYTES || current.len() >= cap) {
+        if !current.is_empty() && (current_bytes + size > PAGE_BUDGET_BYTES || current.len() >= cap)
+        {
             pages.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
@@ -301,7 +351,11 @@ async fn read_chunk_via(
         Ok(buf)
     })
     .await
-    .unwrap_or_else(|join| Err(std::io::Error::other(format!("chunk read task failed: {join}"))))
+    .unwrap_or_else(|join| {
+        Err(std::io::Error::other(format!(
+            "chunk read task failed: {join}"
+        )))
+    })
 }
 
 async fn drain_acks(
@@ -313,11 +367,22 @@ async fn drain_acks(
 ) -> Result<u32, EngineError> {
     while outstanding > wanted {
         match rx.recv_frame(limits).await? {
-            Frame { message: Message::ChunkAck { .. }, .. } => outstanding -= 1,
-            Frame { message: Message::Control { control: Control::Cancel, .. }, .. } => {
-                return Err(EngineError::Cancelled)
-            }
-            Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+            Frame {
+                message: Message::ChunkAck { .. },
+                ..
+            } => outstanding -= 1,
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Cancel,
+                        ..
+                    },
+                ..
+            } => return Err(EngineError::Cancelled),
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
             other => return Err(unexpected(other.message)),
         }
         let _ = progress;
@@ -345,11 +410,14 @@ pub async fn send(
     progress(Progress::Connecting);
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
     let channel = endpoint.connect(spec.peer, &spec.pinned).await?;
-    progress(Progress::Connected { peer: channel.peer_fingerprint().to_hex() });
+    progress(Progress::Connected {
+        peer: channel.peer_fingerprint().to_hex(),
+    });
     let stream = channel.open_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
-    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity)).await?;
+    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity))
+        .await?;
     expect_hello(&mut rx, &limits, &spec.device_name, &spec.identity).await?;
 
     // Offer -> Accept/Reject (receiver consent is mandatory).
@@ -364,14 +432,29 @@ pub async fn send(
         },
     })
     .await?;
-    progress(Progress::Offered { files: manifest.file_count(), bytes: manifest.total_bytes() });
+    progress(Progress::Offered {
+        files: manifest.file_count(),
+        bytes: manifest.total_bytes(),
+    });
     match rx.recv_frame(&limits).await? {
-        Frame { message: Message::Accept { .. }, .. } => {}
-        Frame { message: Message::Reject { reason, .. }, .. } => return Err(EngineError::Rejected(reason)),
-        Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+        Frame {
+            message: Message::Accept { .. },
+            ..
+        } => {}
+        Frame {
+            message: Message::Reject { reason, .. },
+            ..
+        } => return Err(EngineError::Rejected(reason)),
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
         other => return Err(unexpected(other.message)),
     }
-    progress(Progress::Accepted { files: manifest.file_count(), bytes: manifest.total_bytes() });
+    progress(Progress::Accepted {
+        files: manifest.file_count(),
+        bytes: manifest.total_bytes(),
+    });
 
     // Manifest pages.
     let pages = assemble_pages(&manifest, &limits);
@@ -391,8 +474,14 @@ pub async fn send(
 
     // ResumeRequest: skip the receiver's verified prefixes.
     let resume: Vec<ResumeEntry> = match rx.recv_frame(&limits).await? {
-        Frame { message: Message::ResumeRequest { files, .. }, .. } => files,
-        Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+        Frame {
+            message: Message::ResumeRequest { files, .. },
+            ..
+        } => files,
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
         other => return Err(unexpected(other.message)),
     };
     let mut skip = vec![0u64; manifest.entries.len()];
@@ -404,7 +493,9 @@ pub async fn send(
         }
     }
     if resumed_chunks > 0 {
-        progress(Progress::Resuming { chunks: resumed_chunks });
+        progress(Progress::Resuming {
+            chunks: resumed_chunks,
+        });
     }
 
     // Chunk transfer with a bounded ack window on the same stream.
@@ -423,7 +514,8 @@ pub async fn send(
         for chunk_index in skip[file_index]..plan.chunk_count() {
             let range = plan.range(chunk_index).ok_or(EngineError::SourceChanged)?;
             let len = (range.end - range.start) as usize;
-            let data = read_chunk_via(Arc::clone(&source), file_index as u32, chunk_index, len).await?;
+            let data =
+                read_chunk_via(Arc::clone(&source), file_index as u32, chunk_index, len).await?;
             if data.len() != len {
                 return Err(EngineError::SourceChanged);
             }
@@ -438,9 +530,13 @@ pub async fn send(
             })
             .await?;
             outstanding += 1;
-            progress(Progress::ChunkSent { file_index: file_index as u32, chunk_index });
+            progress(Progress::ChunkSent {
+                file_index: file_index as u32,
+                chunk_index,
+            });
             if outstanding >= window {
-                outstanding = drain_acks(&mut rx, &limits, outstanding, window - 1, progress).await?;
+                outstanding =
+                    drain_acks(&mut rx, &limits, outstanding, window - 1, progress).await?;
             }
         }
         // Keep checkpointed progress roughly current per file.
@@ -452,11 +548,23 @@ pub async fn send(
     drain_acks(&mut rx, &limits, outstanding, 0, progress).await?;
 
     // Final integrity gate on the source, then Finalize.
-    source.verify_stable().map_err(|_| EngineError::SourceChanged)?;
-    tx.send_frame(&Frame { version: ak_wire::VERSION, message: Message::Finalize { job_id } }).await?;
+    source
+        .verify_stable()
+        .map_err(|_| EngineError::SourceChanged)?;
+    tx.send_frame(&Frame {
+        version: ak_wire::VERSION,
+        message: Message::Finalize { job_id },
+    })
+    .await?;
     let verified = match rx.recv_frame(&limits).await? {
-        Frame { message: Message::FinalAck { verified, .. }, .. } => verified,
-        Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+        Frame {
+            message: Message::FinalAck { verified, .. },
+            ..
+        } => verified,
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
         other => return Err(unexpected(other.message)),
     };
     progress(Progress::FinalAck { verified });
@@ -502,31 +610,63 @@ pub async fn receive_with_addr(
     let local = endpoint.local_addr()?;
     let _ = addr_tx.send(local);
     let channel = endpoint.accept(&spec.authorize).await?;
-    progress(Progress::Connected { peer: channel.peer_fingerprint().to_hex() });
+    progress(Progress::Connected {
+        peer: channel.peer_fingerprint().to_hex(),
+    });
     let stream = channel.accept_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
-    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity)).await?;
+    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity))
+        .await?;
     expect_hello(&mut rx, &limits, &spec.device_name, &spec.identity).await?;
 
     // Offer -> consent -> Accept. Channel-level consent already happened via
     // the authorize callback; the offer is accepted per current product copy.
     let (job_id, file_count, total_bytes, chunk_size) = match rx.recv_frame(&limits).await? {
-        Frame { message: Message::Offer { job_id, file_count, total_bytes, chunk_size, .. }, .. } => {
-            (job_id, file_count, total_bytes, chunk_size)
-        }
-        Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+        Frame {
+            message:
+                Message::Offer {
+                    job_id,
+                    file_count,
+                    total_bytes,
+                    chunk_size,
+                    ..
+                },
+            ..
+        } => (job_id, file_count, total_bytes, chunk_size),
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
         other => return Err(unexpected(other.message)),
     };
-    progress(Progress::Offered { files: file_count, bytes: total_bytes });
-    tx.send_frame(&Frame { version: ak_wire::VERSION, message: Message::Accept { job_id } }).await?;
-    progress(Progress::Accepted { files: file_count, bytes: total_bytes });
+    progress(Progress::Offered {
+        files: file_count,
+        bytes: total_bytes,
+    });
+    tx.send_frame(&Frame {
+        version: ak_wire::VERSION,
+        message: Message::Accept { job_id },
+    })
+    .await?;
+    progress(Progress::Accepted {
+        files: file_count,
+        bytes: total_bytes,
+    });
 
     // Manifest pages.
     let mut entries: Vec<ak_core::manifest::FileEntry> = Vec::new();
     loop {
         match rx.recv_frame(&limits).await? {
-            Frame { message: Message::ManifestPage { entries: page, last_page, .. }, .. } => {
+            Frame {
+                message:
+                    Message::ManifestPage {
+                        entries: page,
+                        last_page,
+                        ..
+                    },
+                ..
+            } => {
                 for wire in page {
                     entries.push(wire.try_into().map_err(|_| EngineError::PeerError {
                         code: ErrorCode::ProtocolUnsupported,
@@ -537,7 +677,10 @@ pub async fn receive_with_addr(
                     break;
                 }
             }
-            Frame { message: Message::Error { code, message }, .. } => return Err(EngineError::PeerError { code, message }),
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
             other => return Err(unexpected(other.message)),
         }
     }
@@ -545,28 +688,40 @@ pub async fn receive_with_addr(
         code: ErrorCode::ProtocolUnsupported,
         message: "peer offered a zero chunk size".into(),
     })?;
-    let manifest = Manifest { chunk_size, entries: entries.clone() };
+    let manifest = Manifest {
+        chunk_size,
+        entries: entries.clone(),
+    };
     progress(Progress::ManifestReceived);
     let job = ReceiverJob { manifest };
 
     // Prepare sinks (transparent resume from .akpart files) and answer.
-    let mut sinks: Vec<Option<ak_storage::LocalFileSink>> = Vec::with_capacity(job.manifest.entries.len());
+    let mut sinks: Vec<Option<ak_storage::LocalFileSink>> =
+        Vec::with_capacity(job.manifest.entries.len());
     let mut resume: Vec<ResumeEntry> = Vec::new();
     for (index, entry) in job.manifest.entries.iter().enumerate() {
         let sink = target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?;
         let prefix = sink.verified_prefix_chunks();
         if !entry.is_dir {
-            resume.push(ResumeEntry { file_index: index as u32, verified_prefix_chunks: prefix });
+            resume.push(ResumeEntry {
+                file_index: index as u32,
+                verified_prefix_chunks: prefix,
+            });
         }
         sinks.push(Some(sink));
     }
     let resumed_chunks: u64 = resume.iter().map(|r| r.verified_prefix_chunks).sum();
     if resumed_chunks > 0 {
-        progress(Progress::Resuming { chunks: resumed_chunks });
+        progress(Progress::Resuming {
+            chunks: resumed_chunks,
+        });
     }
     tx.send_frame(&Frame {
         version: ak_wire::VERSION,
-        message: Message::ResumeRequest { job_id, files: resume },
+        message: Message::ResumeRequest {
+            job_id,
+            files: resume,
+        },
     })
     .await?;
 
@@ -605,13 +760,26 @@ pub async fn receive_with_addr(
             Err(e) => return Err(e.into()),
         };
         match frame.message {
-            Message::Chunk { file_index, chunk_index, data, .. } => {
-                let sink = sinks[file_index as usize].as_mut().ok_or(EngineError::PeerClosed)?;
-                sink.write_chunk(chunk_index, &data).map_err(EngineError::Io)?;
-                record.files[file_index as usize].verified_prefix_chunks = sink.verified_prefix_chunks();
+            Message::Chunk {
+                file_index,
+                chunk_index,
+                data,
+                ..
+            } => {
+                let sink = sinks[file_index as usize]
+                    .as_mut()
+                    .ok_or(EngineError::PeerClosed)?;
+                sink.write_chunk(chunk_index, &data)
+                    .map_err(EngineError::Io)?;
+                record.files[file_index as usize].verified_prefix_chunks =
+                    sink.verified_prefix_chunks();
                 tx.send_frame(&Frame {
                     version: ak_wire::VERSION,
-                    message: Message::ChunkAck { job_id, file_index, chunk_index },
+                    message: Message::ChunkAck {
+                        job_id,
+                        file_index,
+                        chunk_index,
+                    },
                 })
                 .await?;
                 if file_index != current_file {
@@ -621,9 +789,16 @@ pub async fn receive_with_addr(
                         .to_string_lossy()
                         .replace('\\', "/");
                     let bytes = job.manifest.entries[file_index as usize].size;
-                    progress(Progress::FileStarted { file_index, path, bytes });
+                    progress(Progress::FileStarted {
+                        file_index,
+                        path,
+                        bytes,
+                    });
                 }
-                progress(Progress::ChunkReceived { file_index, chunk_index });
+                progress(Progress::ChunkReceived {
+                    file_index,
+                    chunk_index,
+                });
                 acks_since_checkpoint += 1;
                 if acks_since_checkpoint >= CHECKPOINT_EVERY_ACKS {
                     acks_since_checkpoint = 0;
@@ -632,8 +807,13 @@ pub async fn receive_with_addr(
                 }
             }
             Message::Finalize { .. } => break 'transfer,
-            Message::Control { control: Control::Cancel, .. } => return Err(EngineError::Cancelled),
-            Message::Error { code, message } => return Err(EngineError::PeerError { code, message }),
+            Message::Control {
+                control: Control::Cancel,
+                ..
+            } => return Err(EngineError::Cancelled),
+            Message::Error { code, message } => {
+                return Err(EngineError::PeerError { code, message })
+            }
             other => return Err(unexpected(other)),
         }
     }
@@ -649,10 +829,15 @@ pub async fn receive_with_addr(
             sink.finish().map_err(EngineError::Io)?;
             record.files[index].verified_prefix_chunks =
                 job.manifest.entries[index].chunk_digests.len() as u64;
-            progress(Progress::FileVerified { file_index: index as u32 });
+            progress(Progress::FileVerified {
+                file_index: index as u32,
+            });
             progress(Progress::FileCommitted {
                 file_index: index as u32,
-                path: job.manifest.entries[index].rel_path.to_string_lossy().replace('\\', "/"),
+                path: job.manifest.entries[index]
+                    .rel_path
+                    .to_string_lossy()
+                    .replace('\\', "/"),
             });
         }
     }
@@ -662,7 +847,10 @@ pub async fn receive_with_addr(
     store.save(&record).map_err(EngineError::Checkpoint)?;
     tx.send_frame(&Frame {
         version: ak_wire::VERSION,
-        message: Message::FinalAck { job_id, verified: true },
+        message: Message::FinalAck {
+            job_id,
+            verified: true,
+        },
     })
     .await?;
     tx.finish()?;
@@ -722,7 +910,11 @@ mod tests {
                 let meta = entry.metadata().unwrap();
                 if meta.is_dir() {
                     walk(&entry.path(), files, bytes);
-                } else if !entry.path().to_string_lossy().ends_with(ak_storage::PART_SUFFIX) {
+                } else if !entry
+                    .path()
+                    .to_string_lossy()
+                    .ends_with(ak_storage::PART_SUFFIX)
+                {
                     *files += 1;
                     *bytes += meta.len();
                 }
@@ -761,7 +953,10 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         write(&src.path().join("a.txt"), b"hello ak");
-        write(&src.path().join("nested/deep/b.bin"), &(0..50_000u32).map(|i| i as u8).collect::<Vec<_>>());
+        write(
+            &src.path().join("nested/deep/b.bin"),
+            &(0..50_000u32).map(|i| i as u8).collect::<Vec<_>>(),
+        );
         fs::create_dir_all(src.path().join("empty/dir")).unwrap();
 
         let (mut send_spec, recv, _) = specs(src.path(), dst.path(), 16);
@@ -806,7 +1001,9 @@ mod tests {
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let source_probe = LocalSource::open(&send_spec.source_root, send_spec.chunk_size).unwrap();
         let entry = &source_probe.manifest().entries[0];
-        let mut sink = target.prepare_file_with_chunk_size(entry, ConflictPolicy::Fail, send_spec.chunk_size).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(entry, ConflictPolicy::Fail, send_spec.chunk_size)
+            .unwrap();
         for chunk in 0..3u64 {
             let mut buf = vec![0u8; 1024];
             let len = source_probe.read_chunk(0, chunk, &mut buf).unwrap();
@@ -820,7 +1017,10 @@ mod tests {
         let report = send(send_spec, &noop).await.expect("send should complete");
         let recv_report = receiver.await.unwrap().expect("receive should complete");
 
-        assert_eq!(report.resumed_chunks, 3, "sender should skip 3 verified chunks");
+        assert_eq!(
+            report.resumed_chunks, 3,
+            "sender should skip 3 verified chunks"
+        );
         assert_eq!(recv_report.resumed_chunks, 3);
         assert_eq!(fs::read(dst.path().join("resume.bin")).unwrap(), payload);
         let _ = FileCheckpointStore::open(&checkpoint).map(|s| s.remove(&report.job_id));
@@ -837,7 +1037,9 @@ mod tests {
         write(&src.path().join("mid.bin"), &payload);
         let (send_spec, recv, _) = specs(src.path(), dst.path(), 1); // 16 chunks of 1 KiB
         let checkpoint_dir = send_spec.checkpoint_dir.clone();
-        let part_path = dst.path().join(format!("mid.bin{}", ak_storage::PART_SUFFIX));
+        let part_path = dst
+            .path()
+            .join(format!("mid.bin{}", ak_storage::PART_SUFFIX));
 
         let (chunks_tx, mut chunks_rx) = tokio::sync::watch::channel(0u64);
         let progress = std::sync::Arc::new(move |event: Progress| {
@@ -861,22 +1063,37 @@ mod tests {
         receiver.abort();
         let send_result = sender.await.unwrap();
         assert!(
-            matches!(send_result, Err(EngineError::Stream(_) | EngineError::PeerClosed | EngineError::Connect(_))),
+            matches!(
+                send_result,
+                Err(EngineError::Stream(_) | EngineError::PeerClosed | EngineError::Connect(_))
+            ),
             "sender must fail without any fallback, got {send_result:?}"
         );
         assert!(part_path.exists(), "part file must survive the disconnect");
         let store = FileCheckpointStore::open(&checkpoint_dir).unwrap();
-        assert!(!store.list().unwrap().is_empty(), "checkpoint must survive the disconnect");
+        assert!(
+            !store.list().unwrap().is_empty(),
+            "checkpoint must survive the disconnect"
+        );
 
         // Second run: same deterministic job id resumes and completes.
         let (mut send_spec, recv, _) = specs(src.path(), dst.path(), 1);
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
         send_spec.peer = addr_rx.await.unwrap();
-        let report = send(send_spec, &noop).await.expect("resumed send should complete");
-        receiver.await.unwrap().expect("resumed receive should complete");
+        let report = send(send_spec, &noop)
+            .await
+            .expect("resumed send should complete");
+        receiver
+            .await
+            .unwrap()
+            .expect("resumed receive should complete");
 
-        assert!(report.resumed_chunks >= 1, "second run should resume, got {}", report.resumed_chunks);
+        assert!(
+            report.resumed_chunks >= 1,
+            "second run should resume, got {}",
+            report.resumed_chunks
+        );
         assert_eq!(fs::read(dst.path().join("mid.bin")).unwrap(), payload);
         assert!(!part_path.exists(), "committed file leaves no part behind");
     }
@@ -892,7 +1109,9 @@ mod tests {
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
         send_spec.peer = addr_rx.await.unwrap();
-        let err = send(send_spec, &noop).await.expect_err("wrong pin must fail");
+        let err = send(send_spec, &noop)
+            .await
+            .expect_err("wrong pin must fail");
         assert!(matches!(err, EngineError::Connect(_)), "got: {err:?}");
         // Nothing may be written even though the offer was never reached.
         assert_eq!(count_entries(dst.path()), (0, 0));
@@ -910,7 +1129,9 @@ mod tests {
         let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
         let addr = addr_rx.await.unwrap();
         send_spec.peer = addr;
-        let err = send(send_spec, &noop).await.expect_err("unauthorized sender must fail");
+        let err = send(send_spec, &noop)
+            .await
+            .expect_err("unauthorized sender must fail");
         // The TLS handshake itself succeeds (client cert is validly
         // self-signed); rejection surfaces on first use as a lost stream.
         assert!(
@@ -918,7 +1139,10 @@ mod tests {
             "got: {err:?}"
         );
         let recv_err = receiver.await.unwrap().expect_err("receiver must reject");
-        assert!(matches!(recv_err, EngineError::Connect(ak_net::ConnectError::Unauthorized)));
+        assert!(matches!(
+            recv_err,
+            EngineError::Connect(ak_net::ConnectError::Unauthorized)
+        ));
         assert_eq!(count_entries(dst.path()), (0, 0));
     }
 
@@ -963,7 +1187,13 @@ mod tests {
         let report = send(send_spec, &noop).await.expect("5 GiB send");
         receiver.await.unwrap().expect("5 GiB receive");
         assert_eq!(report.bytes, 5 * 1024 * 1024 * 1024 + 13 + 17); // big.bin + tail.txt (17 bytes)
-        assert_eq!(fs::metadata(dst.path().join("big.bin")).unwrap().len(), 5 * 1024 * 1024 * 1024 + 13);
-        assert_eq!(fs::read(dst.path().join("tail.txt")).unwrap(), b"after the big one");
+        assert_eq!(
+            fs::metadata(dst.path().join("big.bin")).unwrap().len(),
+            5 * 1024 * 1024 * 1024 + 13
+        );
+        assert_eq!(
+            fs::read(dst.path().join("tail.txt")).unwrap(),
+            b"after the big one"
+        );
     }
 }

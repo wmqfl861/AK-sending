@@ -149,7 +149,10 @@ fn load_identity(id: &Path) -> Result<(DeviceKeyPair, TlsBundle)> {
     let (key, created) = DeviceKeyPair::load_or_create(&id.join("device.key"))
         .with_context(|| format!("cannot load device key in {}", id.display()))?;
     if created {
-        eprintln!("created new device key in {}", id.join("device.key").display());
+        eprintln!(
+            "created new device key in {}",
+            id.join("device.key").display()
+        );
     }
     let bundle = ak_identity::tls::make_self_signed(&key);
     Ok((key, bundle))
@@ -174,12 +177,20 @@ fn print_progress(direction: &str, progress: &Progress) {
     match progress {
         Progress::Connected { peer } => println!("[{direction}] connected; peer {peer}"),
         Progress::Offered { files, bytes } => {
-            println!("[{direction}] offered {files} entries, {}", human_bytes(*bytes))
+            println!(
+                "[{direction}] offered {files} entries, {}",
+                human_bytes(*bytes)
+            )
         }
         Progress::Accepted { files, bytes } => {
-            println!("[{direction}] accepted {files} entries, {}", human_bytes(*bytes))
+            println!(
+                "[{direction}] accepted {files} entries, {}",
+                human_bytes(*bytes)
+            )
         }
-        Progress::Resuming { chunks } => println!("[{direction}] resuming after {chunks} verified chunks"),
+        Progress::Resuming { chunks } => {
+            println!("[{direction}] resuming after {chunks} verified chunks")
+        }
         Progress::FileStarted { path, bytes, .. } => {
             println!("[{direction}] {path} ({})", human_bytes(*bytes))
         }
@@ -202,7 +213,11 @@ fn progress_printer(direction: &'static str) -> Arc<dyn Fn(Progress) + Send + Sy
 fn report_summary(report: &Report) {
     println!(
         "job {} complete: {} entries, {}, resumed {} chunks, peer {}",
-        report.job_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        report
+            .job_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
         report.files,
         human_bytes(report.bytes),
         report.resumed_chunks,
@@ -231,7 +246,12 @@ async fn main() -> Result<()> {
             println!("pairing code: {}", ak_identity::pairing_code(&fp));
             Ok(())
         }
-        Command::Receive { out, port, expect, conflict } => {
+        Command::Receive {
+            out,
+            port,
+            expect,
+            conflict,
+        } => {
             let (key, bundle) = load_identity(&id)?;
             let fp = key.fingerprint();
             let matcher = expect_matcher(expect.as_deref())?;
@@ -262,13 +282,21 @@ async fn main() -> Result<()> {
             report_summary(&report);
             Ok(())
         }
-        Command::Send { paths, to, fp, port, conflict } => {
+        Command::Send {
+            paths,
+            to,
+            fp,
+            port,
+            conflict,
+        } => {
             let (key, bundle) = load_identity(&id)?;
             let pinned = parse_fingerprint(&fp)?;
             if paths.len() > 1 {
                 bail!("send exactly one file or one directory per run in this prototype");
             }
-            let root = paths[0].canonicalize().with_context(|| paths[0].display().to_string())?;
+            let root = paths[0]
+                .canonicalize()
+                .with_context(|| paths[0].display().to_string())?;
             let mut spec = SendSpec::new(root, to, pinned, bundle);
             spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
             spec.conflict = conflict_policy(&conflict)?;
@@ -288,7 +316,10 @@ async fn main() -> Result<()> {
                 .context("mDNS advertise failed (multicast may be blocked)")?;
             let nets: Vec<_> = ak_net::classify::local_nets()?
                 .into_iter()
-                .map(|net| ak_discovery::ak_net_shim::Net { addr: net.addr, prefix_len: net.prefix_len })
+                .map(|net| ak_discovery::ak_net_shim::Net {
+                    addr: net.addr,
+                    prefix_len: net.prefix_len,
+                })
                 .collect();
             let found = mdns.browse(Duration::from_secs(seconds))?;
             let ranked = ak_discovery::rank(found, &nets);
@@ -296,29 +327,41 @@ async fn main() -> Result<()> {
                 println!(
                     "{}\t{}\t{:?}",
                     candidate.addr,
-                    candidate.fingerprint.map(|f| f.to_hex()).unwrap_or_else(|| "-".into()),
+                    candidate
+                        .fingerprint
+                        .map(|f| f.to_hex())
+                        .unwrap_or_else(|| "-".into()),
                     candidate.source
                 );
             }
             Ok(())
         }
-        Command::SignalServer { tcp_port, stun_port } => {
+        Command::SignalServer {
+            tcp_port,
+            stun_port,
+        } => {
             let config = ak_signal::server::Config {
                 tcp: SocketAddr::from(([0, 0, 0, 0], tcp_port)),
                 stun_udp: SocketAddr::from(([0, 0, 0, 0], stun_port)),
                 ..ak_signal::server::Config::default()
             };
-            println!("signaling on {} (STUN {}); no file routes exist", config.tcp, config.stun_udp);
+            println!(
+                "signaling on {} (STUN {}); no file routes exist",
+                config.tcp, config.stun_udp
+            );
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let server = tokio::spawn(async move { ak_signal::server::run(config, shutdown_rx).await });
+            let server =
+                tokio::spawn(async move { ak_signal::server::run(config, shutdown_rx).await });
             tokio::signal::ctrl_c().await.ok();
             let _ = shutdown_tx.send(true);
             server.await??;
             Ok(())
         }
-        Command::Probe { server, peer, no_stun } => {
-            probe_command(&id, server, peer, no_stun).await
-        }
+        Command::Probe {
+            server,
+            peer,
+            no_stun,
+        } => probe_command(&id, server, peer, no_stun).await,
     }
 }
 
@@ -353,11 +396,22 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
     let local = socket.local_addr()?;
     println!("transfer socket: {local}");
 
-    // 2. STUN mapping via the same socket (coordination plane, no data).
-    let mut candidates: Vec<SocketAddr> = vec![local];
+    // 2. Local candidates: real interface addresses plus loopback (never the
+    //    unspecified 0.0.0.0 bind address, which is not dialable), then the
+    //    STUN mapping via the same socket (coordination plane, no data).
+    let mut candidates: Vec<SocketAddr> = ak_net::classify::local_nets()?
+        .into_iter()
+        .map(|net| SocketAddr::new(net.addr, local.port()))
+        .collect();
+    candidates.push(SocketAddr::from(([127, 0, 0, 1], local.port())));
     if !no_stun {
         let stun_addr = SocketAddr::new(server.ip(), server.port() + 1);
-        match tokio::time::timeout(Duration::from_secs(6), ak_signal::stun::query_on(&socket, stun_addr, Duration::from_secs(5))).await {
+        match tokio::time::timeout(
+            Duration::from_secs(6),
+            ak_signal::stun::query_on(&socket, stun_addr, Duration::from_secs(5)),
+        )
+        .await
+        {
             Ok(Ok(mapped)) => {
                 println!("STUN mapped address: {mapped}");
                 candidates.push(mapped);
@@ -371,43 +425,49 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
     let client = ak_signal::client::SignalClient::connect(server, &key, &whoami())
         .await
         .context("signaling connect failed")?;
+    candidates.sort();
+    candidates.dedup();
     client.register(&candidates).await?;
     println!("registered {} candidates", candidates.len());
     client.connect_peer(target).await?;
 
     // 4. Exchange signals until we see the peer's candidates, then punch.
     let mut peer_candidates: Vec<SocketAddr> = Vec::new();
-    let mut punched = false;
+    let mut reachable: Option<SocketAddr> = None;
     let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
+    'signal: while Instant::now() < deadline {
         let message = tokio::time::timeout(Duration::from_secs(5), client.next()).await??;
         match message {
             ak_signal::codec::CtrlMessage::SessionOpened { session, peer } => {
                 println!("session open with peer {}", hex_of(&peer));
                 client
-                    .send_signal(session, ak_signal::codec::PeerSignal::Candidates(candidates.clone()))
+                    .send_signal(
+                        session,
+                        ak_signal::codec::PeerSignal::Candidates(candidates.clone()),
+                    )
                     .await?;
             }
             ak_signal::codec::CtrlMessage::Signal { signal, .. } => match signal {
                 ak_signal::codec::PeerSignal::Candidates(list) => {
                     peer_candidates = list;
                     println!("peer candidates: {peer_candidates:?}");
-                    let report = ak_net::holepunch::probe(&socket, &peer_candidates, Duration::from_millis(200), Duration::from_secs(5)).await?;
+                    let report = ak_net::holepunch::probe(
+                        &socket,
+                        &peer_candidates,
+                        Duration::from_millis(200),
+                        Duration::from_secs(5),
+                    )
+                    .await?;
                     println!(
                         "punch: sent {} recv {} reachable {:?} from {:?}",
-                        report.packets_sent, report.packets_received, report.reachable, report.peer_observed_from
+                        report.packets_sent,
+                        report.packets_received,
+                        report.reachable,
+                        report.peer_observed_from
                     );
-                    if !report.reachable.is_empty() {
-                        punched = true;
-                        // 5. Real verification: QUIC handshake with pinned identity.
-                        let endpoint = ak_net::DirectEndpoint::bind(local, &bundle).await?;
-                        match endpoint.connect(report.reachable[0], &Fingerprint::from_public_key(&target)).await {
-                            Ok(channel) => {
-                                println!("QUIC handshake OK on {:?} path={:?} peer={}", report.reachable[0], channel.path(), channel.peer_fingerprint().to_hex());
-                            }
-                            Err(error) => println!("QUIC handshake failed after punch: {error}"),
-                        }
-                        break;
+                    if let Some(first) = report.reachable.first() {
+                        reachable = Some(*first);
+                        break 'signal;
                     }
                 }
                 other => println!("signal: {other:?}"),
@@ -415,8 +475,42 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
             other => println!("server: {other:?}"),
         }
     }
-    if !punched && peer_candidates.is_empty() {
-        println!("no peer candidates received; peer may be offline or behind an unreachable network");
+    if let Some(target_addr) = reachable {
+        // 5. Real verification: QUIC handshake with pinned identity on the
+        //    SAME socket that punched (keeps NAT pinholes valid). Role is
+        //    assigned deterministically from the two device ids so both sides
+        //    agree without extra signaling: smaller key connects.
+        let our_key = key.public_key();
+        let pinned = Fingerprint::from_public_key(&target);
+        let std_socket = socket.into_std()?;
+        let endpoint = ak_net::DirectEndpoint::bind_with_socket(std_socket, &bundle).await?;
+        let handshake = if our_key < target {
+            println!("role: client, dialing {target_addr}");
+            endpoint.connect(target_addr, &pinned).await
+        } else {
+            println!("role: server, waiting on the punched path");
+            let authorize = move |fp: &Fingerprint| fp == &pinned;
+            match tokio::time::timeout(Duration::from_secs(15), endpoint.accept(&authorize)).await {
+                Ok(result) => result,
+                Err(_) => Err(ak_net::ConnectError::Timeout(Duration::from_secs(15))),
+            }
+        };
+        match handshake {
+            Ok(channel) => {
+                println!(
+                    "QUIC handshake OK path={:?} peer={}",
+                    channel.path(),
+                    channel.peer_fingerprint().to_hex()
+                );
+            }
+            Err(error) => println!("QUIC handshake failed after punch: {error}"),
+        }
+    } else if peer_candidates.is_empty() {
+        println!(
+            "no peer candidates received; peer may be offline or behind an unreachable network"
+        );
+    } else {
+        println!("no candidate answered probes; this network pair may not support direct connections (no relay fallback exists)");
     }
     let _ = client.close().await;
     println!("probe finished (direct-only: no relay fallback exists)");
@@ -430,8 +524,10 @@ fn hex_to_bytes(text: &str) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 2);
     let bytes = text.as_bytes();
     for pair in bytes.chunks(2) {
-        let high = hex_digit(pair[0]).with_context(|| format!("invalid hex digit '{}'", pair[0] as char))?;
-        let low = hex_digit(pair[1]).with_context(|| format!("invalid hex digit '{}'", pair[1] as char))?;
+        let high = hex_digit(pair[0])
+            .with_context(|| format!("invalid hex digit '{}'", pair[0] as char))?;
+        let low = hex_digit(pair[1])
+            .with_context(|| format!("invalid hex digit '{}'", pair[1] as char))?;
         out.push(high * 16 + low);
     }
     Ok(out)

@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use ak_identity::tls::TlsBundle;
 use ak_identity::Fingerprint;
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
 use rustls::DigitallySignedStruct;
-use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 
 use crate::ALPN;
 

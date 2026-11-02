@@ -26,9 +26,8 @@ impl std::error::Error for InvalidRelPath {}
 
 /// Windows-reserved device names; files with these stems cannot exist portably.
 const RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate a `/`-separated relative path and return it unchanged.
@@ -43,7 +42,10 @@ pub fn validate_rel_path(path: &str) -> Result<&str, InvalidRelPath> {
     if path.starts_with('/') || path.ends_with('/') {
         return Err(InvalidRelPath);
     }
-    if path.as_bytes().iter().any(|&b| b == 0 || b == b'\\' || b == b':' || b < 0x20 || b == 0x7f)
+    if path
+        .as_bytes()
+        .iter()
+        .any(|&b| b == 0 || b == b'\\' || b == b':' || b < 0x20 || b == 0x7f)
     {
         return Err(InvalidRelPath);
     }
@@ -152,8 +154,8 @@ mod tests {
     #[test]
     fn rejects_traversal_absolute_and_separator_attacks() {
         for bad in [
-            "", "/", "a/", "/a", "a//b", ".", "..", "a/..", "../a", "a/../b",
-            "a/./b", "C:/x", "c:\\x", "a\\b", "a\u{0}b",
+            "", "/", "a/", "/a", "a//b", ".", "..", "a/..", "../a", "a/../b", "a/./b", "C:/x",
+            "c:\\x", "a\\b", "a\u{0}b",
         ] {
             assert!(validate_rel_path(bad).is_err(), "accepted: {bad:?}");
         }
@@ -161,7 +163,9 @@ mod tests {
 
     #[test]
     fn rejects_windows_unfriendly_components() {
-        for bad in ["CON", "con.txt", "NUL.dat", "aux", "lpt1.log", "a/b:c", "a/b ", "a/b.", "name\t"] {
+        for bad in [
+            "CON", "con.txt", "NUL.dat", "aux", "lpt1.log", "a/b:c", "a/b ", "a/b.", "name\t",
+        ] {
             assert!(validate_rel_path(bad).is_err(), "accepted: {bad:?}");
         }
         assert!(validate_rel_path("console.txt").is_ok());
@@ -186,10 +190,21 @@ mod tests {
     fn manifest_pages_are_bounded_and_ordered() {
         let chunk = NonZeroU32::new(4).unwrap();
         let entries: Vec<FileEntry> = (0..10)
-            .map(|i| FileEntry::new(&format!("f{i}"), 4, 0, [0; DIGEST_LEN], vec![[0; DIGEST_LEN]])
-                .unwrap())
+            .map(|i| {
+                FileEntry::new(
+                    &format!("f{i}"),
+                    4,
+                    0,
+                    [0; DIGEST_LEN],
+                    vec![[0; DIGEST_LEN]],
+                )
+                .unwrap()
+            })
             .collect();
-        let manifest = Manifest { chunk_size: chunk, entries };
+        let manifest = Manifest {
+            chunk_size: chunk,
+            entries,
+        };
         let pages = manifest.pages(4);
         assert_eq!(pages.len(), 3);
         assert_eq!(pages[0].len(), 4);
@@ -205,13 +220,19 @@ mod tests {
         assert!(dir.is_dir);
         assert_eq!(dir.size, 0);
         assert!(dir.chunk_digests.is_empty());
-        let manifest = Manifest { chunk_size: NonZeroU32::new(4).unwrap(), entries: vec![dir] };
+        let manifest = Manifest {
+            chunk_size: NonZeroU32::new(4).unwrap(),
+            entries: vec![dir],
+        };
         assert_eq!(manifest.total_bytes(), 0);
     }
 
     #[test]
     fn empty_manifest_has_one_empty_page() {
-        let manifest = Manifest { chunk_size: NonZeroU32::new(4).unwrap(), entries: vec![] };
+        let manifest = Manifest {
+            chunk_size: NonZeroU32::new(4).unwrap(),
+            entries: vec![],
+        };
         assert_eq!(manifest.pages(4).len(), 1);
         assert!(manifest.pages(4)[0].is_empty());
     }

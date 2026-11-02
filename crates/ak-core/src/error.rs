@@ -88,8 +88,14 @@ mod tests {
 
     #[test]
     fn display_uses_protocol_names() {
-        assert_eq!(ErrorCode::DirectUnavailable.to_string(), "DIRECT_UNAVAILABLE");
+        assert_eq!(
+            ErrorCode::DirectUnavailable.to_string(),
+            "DIRECT_UNAVAILABLE"
+        );
         assert_eq!(ErrorCode::HashMismatch.to_string(), "HASH_MISMATCH");
-        assert_eq!(ErrorCode::ProtocolUnsupported.to_string(), "PROTOCOL_UNSUPPORTED");
+        assert_eq!(
+            ErrorCode::ProtocolUnsupported.to_string(),
+            "PROTOCOL_UNSUPPORTED"
+        );
     }
 }

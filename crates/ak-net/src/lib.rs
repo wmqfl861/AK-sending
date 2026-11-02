@@ -178,11 +178,24 @@ impl DirectEndpoint {
     /// fingerprint per `connect` call. The endpoint-level default client
     /// config carries no pin and therefore refuses every peer, so only
     /// `connect` can produce a channel.
-    pub async fn bind(addr: SocketAddr, identity: &ak_identity::tls::TlsBundle) -> io::Result<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        identity: &ak_identity::tls::TlsBundle,
+    ) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
-        let runtime = quinn::default_runtime().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "no async runtime found")
-        })?;
+        Self::bind_with_socket(socket, identity).await
+    }
+
+    /// Adopt a caller-owned UDP socket (already bound, e.g. the very socket
+    /// used for hole-punch probing, so the NAT pinhole stays valid) and run
+    /// QUIC on it. The socket must not be shared afterwards.
+    pub async fn bind_with_socket(
+        socket: std::net::UdpSocket,
+        identity: &ak_identity::tls::TlsBundle,
+    ) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no async runtime found"))?;
         let server_config = tls::quinn_server_config(identity)?;
         let mut endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -248,11 +261,14 @@ impl DirectEndpoint {
         &self,
         authorize: &(dyn Fn(&Fingerprint) -> bool + Send + Sync),
     ) -> Result<DirectChannel, ConnectError> {
-        let incoming = self.endpoint.accept().await.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "endpoint closed")
-        })?;
-        let connecting =
-            incoming.accept().map_err(|e| ConnectError::Transport(e.to_string()))?;
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "endpoint closed"))?;
+        let connecting = incoming
+            .accept()
+            .map_err(|e| ConnectError::Transport(e.to_string()))?;
         let conn = connecting.await.map_err(handshake_error)?;
         let fingerprint = peer_fingerprint(&conn).map_err(ConnectError::PeerIdentity)?;
         if !authorize(&fingerprint) {
@@ -260,7 +276,11 @@ impl DirectEndpoint {
             return Err(ConnectError::Unauthorized);
         }
         let path = classify::classify(conn.remote_address().ip(), &self.nets);
-        Ok(DirectChannel { conn, fingerprint, path })
+        Ok(DirectChannel {
+            conn,
+            fingerprint,
+            path,
+        })
     }
 }
 
@@ -356,7 +376,10 @@ impl DirectStream {
     /// Split into independent halves so protocol drivers can read and write
     /// the same stream concurrently (chunks one way, acks the other).
     pub fn split(self) -> (DirectSendStream, DirectRecvStream) {
-        (DirectSendStream { send: self.send }, DirectRecvStream { recv: self.recv })
+        (
+            DirectSendStream { send: self.send },
+            DirectRecvStream { recv: self.recv },
+        )
     }
 
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), StreamError> {
@@ -395,7 +418,9 @@ impl DirectStream {
 
     /// Half-close: finish sending, keep receiving. Synchronous in quinn 0.11.
     pub fn finish_send(&mut self) -> Result<(), StreamError> {
-        self.send.finish().map_err(|e| StreamError::Connection(e.to_string()))
+        self.send
+            .finish()
+            .map_err(|e| StreamError::Connection(e.to_string()))
     }
 }
 
@@ -422,7 +447,9 @@ impl DirectSendStream {
     }
 
     pub fn finish(&mut self) -> Result<(), StreamError> {
-        self.send.finish().map_err(|e| StreamError::Connection(e.to_string()))
+        self.send
+            .finish()
+            .map_err(|e| StreamError::Connection(e.to_string()))
     }
 }
 
@@ -531,6 +558,18 @@ pub mod holepunch {
         let start = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + duration;
         let packet = probe_packet(&probe_nonce());
+        // Unspecified bind addresses (0.0.0.0/::) are not dialable peers, and
+        // an IPv4 socket cannot reach IPv6 candidates (or vice versa).
+        let socket_is_v4 = socket
+            .local_addr()
+            .map(|addr| addr.is_ipv4())
+            .unwrap_or(true);
+        let dialable: Vec<SocketAddr> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| !candidate.ip().is_unspecified())
+            .filter(|candidate| candidate.is_ipv4() == socket_is_v4)
+            .collect();
         let mut send_ticker = tokio::time::interval(interval);
         send_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buffer = [0u8; 1500];
@@ -539,7 +578,7 @@ pub mod holepunch {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = send_ticker.tick() => {
-                    for candidate in candidates {
+                    for candidate in &dialable {
                         match socket.send_to(&packet, candidate).await {
                             Ok(_) => report.packets_sent += 1,
                             Err(e) if transient_udp_error(&e) => continue,
@@ -556,7 +595,7 @@ pub mod holepunch {
                     if is_probe_packet(&buffer[..len]) {
                         report.packets_received += 1;
                         report.peer_observed_from.get_or_insert(source);
-                        if candidates.contains(&source) && !report.reachable.contains(&source) {
+                        if dialable.contains(&source) && !report.reachable.contains(&source) {
                             report.reachable.push(source);
                         }
                     }
@@ -599,7 +638,10 @@ mod tests {
     }
 
     fn net4(a: u8, b: u8, c: u8, d: u8, prefix: u8) -> classify::Net {
-        classify::Net { addr: v4(a, b, c, d), prefix_len: prefix }
+        classify::Net {
+            addr: v4(a, b, c, d),
+            prefix_len: prefix,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -609,16 +651,29 @@ mod tests {
     #[test]
     fn classify_same_subnet_is_local() {
         let nets = [net4(192, 168, 1, 10, 24)];
-        assert_eq!(classify::classify(v4(192, 168, 1, 200), &nets), PathKind::LocalDirect);
-        assert!(classify::same_net(v4(192, 168, 1, 10), v4(192, 168, 1, 200), nets[0]));
+        assert_eq!(
+            classify::classify(v4(192, 168, 1, 200), &nets),
+            PathKind::LocalDirect
+        );
+        assert!(classify::same_net(
+            v4(192, 168, 1, 10),
+            v4(192, 168, 1, 200),
+            nets[0]
+        ));
     }
 
     #[test]
     fn classify_public_v4_other_subnet_is_internet() {
         let nets = [net4(192, 168, 1, 10, 24)];
-        assert_eq!(classify::classify(v4(203, 0, 113, 5), &nets), PathKind::InternetDirect);
+        assert_eq!(
+            classify::classify(v4(203, 0, 113, 5), &nets),
+            PathKind::InternetDirect
+        );
         // even another private range that is not our subnet
-        assert_eq!(classify::classify(v4(10, 1, 2, 3), &nets), PathKind::InternetDirect);
+        assert_eq!(
+            classify::classify(v4(10, 1, 2, 3), &nets),
+            PathKind::InternetDirect
+        );
     }
 
     #[test]
@@ -626,20 +681,30 @@ mod tests {
         let nets = [];
         let fe80 = v6([0xfe80, 0, 0, 0, 0, 0, 0, 0x1]);
         assert_eq!(classify::classify(fe80, &nets), PathKind::LocalDirect);
-        assert!(classify::is_ipv6_link_local(Ipv6Addr::from([0xfe80, 0xabcd, 0, 0, 0, 0, 0, 1])));
-        assert!(!classify::is_ipv6_link_local(Ipv6Addr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])));
+        assert!(classify::is_ipv6_link_local(Ipv6Addr::from([
+            0xfe80, 0xabcd, 0, 0, 0, 0, 0, 1
+        ])));
+        assert!(!classify::is_ipv6_link_local(Ipv6Addr::from([
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ])));
     }
 
     #[test]
     fn classify_same_ula_prefix_is_local() {
-        let nets = [classify::Net { addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]), prefix_len: 64 }];
+        let nets = [classify::Net {
+            addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]),
+            prefix_len: 64,
+        }];
         let peer = v6([0xfd00, 0, 0, 0, 0x1111, 0x2222, 0x3333, 0x4444]);
         assert_eq!(classify::classify(peer, &nets), PathKind::LocalDirect);
     }
 
     #[test]
     fn classify_different_v6_prefix_is_internet() {
-        let nets = [classify::Net { addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]), prefix_len: 64 }];
+        let nets = [classify::Net {
+            addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]),
+            prefix_len: 64,
+        }];
         let peer = v6([0xfd00, 0, 0, 0x0001, 0, 0, 0, 1]); // different /64
         assert_eq!(classify::classify(peer, &nets), PathKind::InternetDirect);
         let global = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]);
@@ -649,21 +714,44 @@ mod tests {
     #[test]
     fn classify_loopback_is_local() {
         let nets = [];
-        assert_eq!(classify::classify(v4(127, 0, 0, 1), &nets), PathKind::LocalDirect);
-        assert_eq!(classify::classify(v6([0, 0, 0, 0, 0, 0, 0, 1]), &nets), PathKind::LocalDirect);
+        assert_eq!(
+            classify::classify(v4(127, 0, 0, 1), &nets),
+            PathKind::LocalDirect
+        );
+        assert_eq!(
+            classify::classify(v6([0, 0, 0, 0, 0, 0, 0, 1]), &nets),
+            PathKind::LocalDirect
+        );
     }
 
     #[test]
     fn same_net_rejects_family_mismatch_and_edge_prefixes() {
         let n4 = net4(10, 0, 0, 1, 8);
-        let n6 = classify::Net { addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]), prefix_len: 64 };
-        assert!(!classify::same_net(v4(10, 1, 2, 3), v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]), n4));
-        assert!(!classify::same_net(v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]), v4(10, 1, 2, 3), n6));
+        let n6 = classify::Net {
+            addr: v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]),
+            prefix_len: 64,
+        };
+        assert!(!classify::same_net(
+            v4(10, 1, 2, 3),
+            v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]),
+            n4
+        ));
+        assert!(!classify::same_net(
+            v6([0xfd00, 0, 0, 0, 0, 0, 0, 2]),
+            v4(10, 1, 2, 3),
+            n6
+        ));
         // /0 IPv4 matches everything in-family
-        let any = classify::Net { addr: v4(0, 0, 0, 0), prefix_len: 0 };
+        let any = classify::Net {
+            addr: v4(0, 0, 0, 0),
+            prefix_len: 0,
+        };
         assert!(classify::same_net(v4(1, 2, 3, 4), v4(5, 6, 7, 8), any));
         // out-of-range prefix lengths are clamped to the family width (/32)
-        let host = classify::Net { addr: v4(10, 1, 2, 3), prefix_len: 200 };
+        let host = classify::Net {
+            addr: v4(10, 1, 2, 3),
+            prefix_len: 200,
+        };
         assert!(classify::same_net(v4(10, 1, 2, 3), v4(10, 1, 2, 3), host));
         assert!(!classify::same_net(v4(10, 1, 2, 4), v4(10, 1, 2, 3), host));
     }
@@ -684,7 +772,10 @@ mod tests {
     fn local_nets_excludes_loopback_interfaces() {
         let nets = classify::local_nets().expect("interface enumeration");
         for net in &nets {
-            assert!(!net.addr.is_loopback(), "loopback leaked into local_nets: {net:?}");
+            assert!(
+                !net.addr.is_loopback(),
+                "loopback leaked into local_nets: {net:?}"
+            );
         }
     }
 
@@ -701,7 +792,9 @@ mod tests {
         let certificate = params.self_signed(&key_pair).expect("self-signed cert");
         let spki = key_pair.public_key_der();
         // Ed25519 SPKI is a 12-byte header followed by the raw 32-byte key.
-        let public: [u8; 32] = spki[spki.len() - 32..].try_into().expect("ed25519 public key");
+        let public: [u8; 32] = spki[spki.len() - 32..]
+            .try_into()
+            .expect("ed25519 public key");
         let bundle = TlsBundle {
             cert_der: certificate.der().to_vec(),
             key_pkcs8_der: key_pair.serialized_der().to_vec(),
@@ -768,13 +861,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bind_reports_address_and_classifies() {
         let (bundle, _) = test_identity();
-        let endpoint = DirectEndpoint::bind(loopback_addr(), &bundle).await.expect("bind");
+        let endpoint = DirectEndpoint::bind(loopback_addr(), &bundle)
+            .await
+            .expect("bind");
         let local = endpoint.local_addr().expect("local addr");
         assert_eq!(local.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_ne!(local.port(), 0);
-        assert_eq!(endpoint.classify_peer(v4(127, 0, 0, 1)), PathKind::LocalDirect);
+        assert_eq!(
+            endpoint.classify_peer(v4(127, 0, 0, 1)),
+            PathKind::LocalDirect
+        );
         // RFC 5737 documentation range is never a local subnet in practice.
-        assert_eq!(endpoint.classify_peer(v4(192, 0, 2, 10)), PathKind::InternetDirect);
+        assert_eq!(
+            endpoint.classify_peer(v4(192, 0, 2, 10)),
+            PathKind::InternetDirect
+        );
         let _ = endpoint.local_nets();
     }
 
@@ -782,8 +883,12 @@ mod tests {
     async fn connect_accept_roundtrip_and_streams() {
         let (client_id, client_public) = test_identity();
         let (server_id, _) = test_identity();
-        let server = DirectEndpoint::bind(loopback_addr(), &server_id).await.expect("server bind");
-        let client = DirectEndpoint::bind(loopback_addr(), &client_id).await.expect("client bind");
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
         let server_addr = server.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
@@ -812,14 +917,20 @@ mod tests {
         // Send before awaiting accept_bi: a QUIC stream only becomes visible
         // to the peer once it carries data (or FIN).
         let mut cstream = client_channel.open_bi().await.expect("client open_bi");
-        cstream.send_bytes(b"hello from client").await.expect("client send");
+        cstream
+            .send_bytes(b"hello from client")
+            .await
+            .expect("client send");
         let mut sstream = server_channel.accept_bi().await.expect("server accept_bi");
 
         let mut buf = [0u8; 17];
         sstream.recv_exact(&mut buf).await.expect("server recv");
         assert_eq!(&buf, b"hello from client");
 
-        sstream.send_bytes(b"hi from server").await.expect("server send");
+        sstream
+            .send_bytes(b"hi from server")
+            .await
+            .expect("server send");
         let mut buf = [0u8; 14];
         cstream.recv_exact(&mut buf).await.expect("client recv");
         assert_eq!(&buf, b"hi from server");
@@ -834,7 +945,10 @@ mod tests {
 
         // Half-close keeps the receiving side usable.
         cstream.finish_send().expect("finish");
-        cstream.send_bytes(b"after finish").await.expect_err("write after finish");
+        cstream
+            .send_bytes(b"after finish")
+            .await
+            .expect_err("write after finish");
         let tail = sstream.recv.read_to_end(1024).await.expect("read_to_end");
         assert!(tail.is_empty());
     }
@@ -843,8 +957,12 @@ mod tests {
     async fn wrong_pin_fails_closed() {
         let (client_id, _) = test_identity();
         let (server_id, _) = test_identity();
-        let server = DirectEndpoint::bind(loopback_addr(), &server_id).await.expect("server bind");
-        let client = DirectEndpoint::bind(loopback_addr(), &client_id).await.expect("client bind");
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
         let server_addr = server.local_addr().expect("server addr");
 
         // Let the server consume (and reject) the aborted handshake instead of
@@ -859,7 +977,10 @@ mod tests {
         match result {
             Err(ConnectError::PeerIdentity(_)) | Err(ConnectError::Transport(_)) => {}
             Err(other) => panic!("unexpected error class: {other:?}"),
-            Ok(channel) => panic!("channel must not exist on pin mismatch: {:?}", channel.path()),
+            Ok(channel) => panic!(
+                "channel must not exist on pin mismatch: {:?}",
+                channel.path()
+            ),
         }
         // The server side must also fail: no channel is ever produced.
         assert!(server_task.await.expect("join").is_err());
@@ -869,8 +990,12 @@ mod tests {
     async fn unauthorized_accept_closes_connection() {
         let (client_id, _) = test_identity();
         let (server_id, _) = test_identity();
-        let server = DirectEndpoint::bind(loopback_addr(), &server_id).await.expect("server bind");
-        let client = DirectEndpoint::bind(loopback_addr(), &client_id).await.expect("client bind");
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
         let server_addr = server.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move { server.accept(&|_| false).await });
@@ -896,8 +1021,12 @@ mod tests {
     async fn recv_frame_rejects_oversized_header_before_allocating() {
         let (client_id, _) = test_identity();
         let (server_id, _) = test_identity();
-        let server = DirectEndpoint::bind(loopback_addr(), &server_id).await.expect("server bind");
-        let client = DirectEndpoint::bind(loopback_addr(), &client_id).await.expect("client bind");
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
         let server_addr = server.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
@@ -930,8 +1059,12 @@ mod tests {
     async fn send_frame_recv_frame_roundtrip() {
         let (client_id, _) = test_identity();
         let (server_id, _) = test_identity();
-        let server = DirectEndpoint::bind(loopback_addr(), &server_id).await.expect("server bind");
-        let client = DirectEndpoint::bind(loopback_addr(), &client_id).await.expect("client bind");
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
         let server_addr = server.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
@@ -964,16 +1097,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn holepunch_probe_reports_reachable_peer() {
-        let a = tokio::net::UdpSocket::bind(loopback_addr()).await.expect("bind a");
-        let b = tokio::net::UdpSocket::bind(loopback_addr()).await.expect("bind b");
+        let a = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind a");
+        let b = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind b");
         let a_addr = a.local_addr().expect("addr a");
         let b_addr = b.local_addr().expect("addr b");
 
         let b_task = tokio::spawn(async move {
             // B listens slightly longer than A so B's socket outlives A's
             // probes (Windows reports resets against dropped peers).
-            holepunch::probe(&b, &[a_addr], Duration::from_millis(25), Duration::from_millis(800))
-                .await
+            holepunch::probe(
+                &b,
+                &[a_addr],
+                Duration::from_millis(25),
+                Duration::from_millis(800),
+            )
+            .await
         });
         let a_report = holepunch::probe(
             &a,
@@ -987,9 +1129,15 @@ mod tests {
 
         assert!(a_report.packets_sent > 0, "A sent no probes");
         assert!(a_report.packets_received > 0, "A received no peer probes");
-        assert!(a_report.reachable.contains(&b_addr), "B not reachable: {a_report:?}");
+        assert!(
+            a_report.reachable.contains(&b_addr),
+            "B not reachable: {a_report:?}"
+        );
         assert_eq!(a_report.peer_observed_from, Some(b_addr));
-        assert!(b_report.reachable.contains(&a_addr), "A not reachable: {b_report:?}");
+        assert!(
+            b_report.reachable.contains(&a_addr),
+            "A not reachable: {b_report:?}"
+        );
         assert!(a_report.elapsed >= Duration::from_millis(500));
     }
 

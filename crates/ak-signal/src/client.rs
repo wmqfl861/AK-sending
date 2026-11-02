@@ -73,7 +73,9 @@ impl SignalClient {
         client.send(hello).await?;
         match client.next().await? {
             CtrlMessage::Welcome { .. } => Ok(client),
-            CtrlMessage::ServerError { code, message } => Err(SignalError::Server { code, message }),
+            CtrlMessage::ServerError { code, message } => {
+                Err(SignalError::Server { code, message })
+            }
             other => Err(SignalError::Unexpected(other)),
         }
     }
@@ -206,9 +208,7 @@ pub(crate) mod test_support {
         name: &str,
     ) -> SignalClient {
         let hello = hello_with_timestamp(signing, name, util::now_unix_ms());
-        SignalClient::connect_hello(server, hello)
-            .await
-            .unwrap()
+        SignalClient::connect_hello(server, hello).await.unwrap()
     }
 
     /// Connect with a properly signed but stale Hello.
@@ -296,8 +296,9 @@ mod tests {
         let server = server_support::start(crate::server::Limits::default()).await;
         let client = test_support::connect(server.tcp, &test_support::key(3), "solo").await;
         client.close().await.unwrap();
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.next()).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap();
         assert!(matches!(result, Err(SignalError::Closed)));
         server.stop().await.unwrap();
     }

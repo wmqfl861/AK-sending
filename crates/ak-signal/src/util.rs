@@ -52,9 +52,8 @@ pub(crate) fn unique_bytes(n: usize) -> Vec<u8> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut state = nanos
-        ^ count.wrapping_mul(0x51ED_2701_2183_2749)
-        ^ ((std::process::id() as u64) << 32);
+    let mut state =
+        nanos ^ count.wrapping_mul(0x51ED_2701_2183_2749) ^ ((std::process::id() as u64) << 32);
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
         let chunk = splitmix64(&mut state).to_be_bytes();

@@ -117,7 +117,10 @@ pub fn parse_binding_request(packet: &[u8]) -> Result<[u8; 12], StunError> {
 
 /// Parse a binding response, verifying cookie and transaction id, extracting
 /// the XOR-mapped address.
-pub fn parse_binding_response(packet: &[u8], transaction_id: [u8; 12]) -> Result<SocketAddr, StunError> {
+pub fn parse_binding_response(
+    packet: &[u8],
+    transaction_id: [u8; 12],
+) -> Result<SocketAddr, StunError> {
     if packet.len() < HEADER_LEN {
         return Err(StunError::TooShort);
     }
@@ -132,7 +135,8 @@ pub fn parse_binding_response(packet: &[u8], transaction_id: [u8; 12]) -> Result
     if packet[8..20] != transaction_id {
         return Err(StunError::TransactionMismatch);
     }
-    let body_end = (HEADER_LEN + u16::from_be_bytes([packet[2], packet[3]]) as usize).min(packet.len());
+    let body_end =
+        (HEADER_LEN + u16::from_be_bytes([packet[2], packet[3]]) as usize).min(packet.len());
     let mut xor_mapped: Option<SocketAddr> = None;
     let mut plain_mapped: Option<SocketAddr> = None;
     let mut pos = HEADER_LEN;
@@ -271,8 +275,15 @@ pub async fn query_on(
 }
 
 /// Convenience wrapper: bind an ephemeral UDP socket and query once.
-pub async fn query(server: SocketAddr, timeout: Duration) -> Result<(SocketAddr, SocketAddr), StunError> {
-    let bind_addr: &str = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+pub async fn query(
+    server: SocketAddr,
+    timeout: Duration,
+) -> Result<(SocketAddr, SocketAddr), StunError> {
+    let bind_addr: &str = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let socket = UdpSocket::bind(bind_addr).await?;
     let local = socket.local_addr()?;
     let mapped = query_on(&socket, server, timeout).await?;
@@ -351,7 +362,9 @@ mod tests {
     #[test]
     fn response_v6_xor_encoding_is_correct() {
         let mapped = SocketAddr::V6(SocketAddrV6::new(
-            Ipv6Addr::new(0x2001, 0xdb8, 0x1234, 0x5678, 0x9abc, 0xdef0, 0x1122, 0x3344),
+            Ipv6Addr::new(
+                0x2001, 0xdb8, 0x1234, 0x5678, 0x9abc, 0xdef0, 0x1122, 0x3344,
+            ),
             44444,
             0,
             0,
@@ -363,10 +376,7 @@ mod tests {
         // Attribute header at 20, value at 24: [0][family][xport][xaddr(16)].
         assert_eq!(packet[24], 0);
         assert_eq!(packet[25], FAMILY_IPV6);
-        assert_eq!(
-            u16::from_be_bytes([packet[26], packet[27]]),
-            44444 ^ 0x2112
-        );
+        assert_eq!(u16::from_be_bytes([packet[26], packet[27]]), 44444 ^ 0x2112);
         let octets = match mapped {
             SocketAddr::V6(v6) => v6.ip().octets(),
             SocketAddr::V4(_) => unreachable!("test constructs v6"),
@@ -503,9 +513,7 @@ mod tests {
             let reply = binding_response(txid, fake_mapped);
             responder.send_to(&reply, from).await.unwrap();
         });
-        let (local, mapped) = query(server_addr, Duration::from_secs(3))
-            .await
-            .unwrap();
+        let (local, mapped) = query(server_addr, Duration::from_secs(3)).await.unwrap();
         assert!(local.is_ipv4());
         assert_ne!(local.port(), 0);
         assert_eq!(mapped, fake_mapped);

@@ -44,7 +44,10 @@ pub enum PeerSignal {
     /// Connection candidates, LAN and public, IP:port only.
     Candidates(Vec<SocketAddr>),
     /// Agreed simultaneous-open epoch (ms) plus a nonce to match probes.
-    PunchAt { epoch_unix_ms: u64, nonce: [u8; 8] },
+    PunchAt {
+        epoch_unix_ms: u64,
+        nonce: [u8; 8],
+    },
     Bye,
 }
 
@@ -58,17 +61,34 @@ pub enum CtrlMessage {
         timestamp_unix_ms: u64,
         signature: [u8; 64],
     },
-    Welcome { session_ttl_secs: u32 },
+    Welcome {
+        session_ttl_secs: u32,
+    },
     /// Replace this device's published candidates.
-    Register { candidates: Vec<SocketAddr> },
+    Register {
+        candidates: Vec<SocketAddr>,
+    },
     /// Ask the server to open (or reuse) a session toward `target`.
-    ConnectRequest { target: DeviceId },
+    ConnectRequest {
+        target: DeviceId,
+    },
     /// Sent to both endpoints when a session exists.
-    SessionOpened { session: SessionId, peer: DeviceId },
+    SessionOpened {
+        session: SessionId,
+        peer: DeviceId,
+    },
     /// Relay one bounded peer signal within a session.
-    Signal { session: SessionId, signal: PeerSignal },
-    Cancel { session: SessionId },
-    ServerError { code: u16, message: String },
+    Signal {
+        session: SessionId,
+        signal: PeerSignal,
+    },
+    Cancel {
+        session: SessionId,
+    },
+    ServerError {
+        code: u16,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,7 +687,10 @@ mod tests {
     #[test]
     fn err_bad_version() {
         let mut bytes = Vec::new();
-        frame(CtrlMessage::Welcome { session_ttl_secs: 1 }).encode(&mut bytes);
+        frame(CtrlMessage::Welcome {
+            session_ttl_secs: 1,
+        })
+        .encode(&mut bytes);
         bytes[0] = VERSION + 1;
         assert!(matches!(
             CtrlFrame::decode(&bytes),
@@ -690,7 +713,10 @@ mod tests {
         // 4093-byte payload, one over the 4092 cap.
         assert!(matches!(
             CtrlFrame::decode(&[VERSION, 1, 0x0F, 0xFD]),
-            Err(DecodeError::Oversized { declared: 4093, cap: 4092 })
+            Err(DecodeError::Oversized {
+                declared: 4093,
+                cap: 4092
+            })
         ));
         assert!(matches!(
             CtrlFrame::decode(&[VERSION, 1, 0xFF, 0xFF]),
@@ -727,7 +753,10 @@ mod tests {
     #[test]
     fn err_trailing_bytes() {
         let mut bytes = Vec::new();
-        frame(CtrlMessage::Welcome { session_ttl_secs: 1 }).encode(&mut bytes);
+        frame(CtrlMessage::Welcome {
+            session_ttl_secs: 1,
+        })
+        .encode(&mut bytes);
         bytes.push(0);
         assert!(matches!(
             CtrlFrame::decode(&bytes),
@@ -739,7 +768,10 @@ mod tests {
     fn err_too_many_candidates() {
         assert!(matches!(
             CtrlFrame::decode(&wrap(3, &[17])),
-            Err(DecodeError::TooManyCandidates { count: 17, limit: 16 })
+            Err(DecodeError::TooManyCandidates {
+                count: 17,
+                limit: 16
+            })
         ));
     }
 
@@ -749,7 +781,9 @@ mod tests {
         frame(hello_message(&"n".repeat(MAX_NAME_BYTES + 1))).encode(&mut bytes);
         assert!(matches!(
             CtrlFrame::decode(&bytes),
-            Err(DecodeError::StringTooLong { limit: MAX_NAME_BYTES })
+            Err(DecodeError::StringTooLong {
+                limit: MAX_NAME_BYTES
+            })
         ));
     }
 
@@ -763,7 +797,9 @@ mod tests {
         .encode(&mut bytes);
         assert!(matches!(
             CtrlFrame::decode(&bytes),
-            Err(DecodeError::StringTooLong { limit: MAX_ERROR_BYTES })
+            Err(DecodeError::StringTooLong {
+                limit: MAX_ERROR_BYTES
+            })
         ));
     }
 
@@ -910,14 +946,25 @@ mod tests {
     fn verify_hello_freshness_window() {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let now = 100_000u64;
-        assert!(verify_hello(&signed_hello_from(&key, 1, "n", now - HELLO_MAX_AGE_MS), now).is_ok());
-        assert!(verify_hello(&signed_hello_from(&key, 1, "n", now + HELLO_MAX_AGE_MS), now).is_ok());
+        assert!(verify_hello(
+            &signed_hello_from(&key, 1, "n", now - HELLO_MAX_AGE_MS),
+            now
+        )
+        .is_ok());
+        assert!(verify_hello(
+            &signed_hello_from(&key, 1, "n", now + HELLO_MAX_AGE_MS),
+            now
+        )
+        .is_ok());
         assert!(matches!(
             verify_hello(&signed_hello_from(&key, 1, "n", now - HELLO_MAX_AGE_MS - 1), now),
             Err(DecodeError::Freshness { age_ms, max_ms }) if age_ms == HELLO_MAX_AGE_MS + 1 && max_ms == HELLO_MAX_AGE_MS
         ));
         assert!(matches!(
-            verify_hello(&signed_hello_from(&key, 1, "n", now + HELLO_MAX_AGE_MS + 1), now),
+            verify_hello(
+                &signed_hello_from(&key, 1, "n", now + HELLO_MAX_AGE_MS + 1),
+                now
+            ),
             Err(DecodeError::Freshness { .. })
         ));
     }

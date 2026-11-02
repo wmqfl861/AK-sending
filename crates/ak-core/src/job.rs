@@ -3,22 +3,49 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Pending, Connecting, AwaitingAccept, Transferring, WaitingDirect, Paused,
-    Verifying, Saving, Completed, Cancelled, Failed,
+    Pending,
+    Connecting,
+    AwaitingAccept,
+    Transferring,
+    WaitingDirect,
+    Paused,
+    Verifying,
+    Saving,
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Begin, DirectReady, OfferSent, OfferAccepted, OfferRejected, DirectUnavailable,
-    Pause, Resume, AllBytesReceived, VerificationPassed, SaveCommitted, Cancel, Fail,
+    Begin,
+    DirectReady,
+    OfferSent,
+    OfferAccepted,
+    OfferRejected,
+    DirectUnavailable,
+    Pause,
+    Resume,
+    AllBytesReceived,
+    VerificationPassed,
+    SaveCommitted,
+    Cancel,
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidTransition { pub state: State, pub event: Event }
+pub struct InvalidTransition {
+    pub state: State,
+    pub event: Event,
+}
 
 impl fmt::Display for InvalidTransition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid task transition: {:?} + {:?}", self.state, self.event)
+        write!(
+            f,
+            "invalid task transition: {:?} + {:?}",
+            self.state, self.event
+        )
     }
 }
 impl std::error::Error for InvalidTransition {}
@@ -38,8 +65,14 @@ impl State {
             (Self::Connecting, Event::OfferSent) => Ok(Self::AwaitingAccept),
             (Self::AwaitingAccept, Event::OfferAccepted) => Ok(Self::Transferring),
             (Self::AwaitingAccept, Event::OfferRejected) => Ok(Self::Failed),
-            (Self::Connecting | Self::AwaitingAccept | Self::Transferring, Event::DirectUnavailable) => Ok(Self::WaitingDirect),
-            (Self::Connecting | Self::AwaitingAccept | Self::Transferring | Self::WaitingDirect, Event::Pause) => Ok(Self::Paused),
+            (
+                Self::Connecting | Self::AwaitingAccept | Self::Transferring,
+                Event::DirectUnavailable,
+            ) => Ok(Self::WaitingDirect),
+            (
+                Self::Connecting | Self::AwaitingAccept | Self::Transferring | Self::WaitingDirect,
+                Event::Pause,
+            ) => Ok(Self::Paused),
             (Self::Paused | Self::WaitingDirect, Event::Resume) => Ok(Self::Connecting),
             (Self::Transferring, Event::AllBytesReceived) => Ok(Self::Verifying),
             (Self::Verifying, Event::VerificationPassed) => Ok(Self::Saving),
@@ -55,23 +88,37 @@ mod tests {
 
     #[test]
     fn success_requires_verification_then_save() {
-        let events = [Event::Begin, Event::DirectReady, Event::AllBytesReceived,
-                      Event::VerificationPassed, Event::SaveCommitted];
+        let events = [
+            Event::Begin,
+            Event::DirectReady,
+            Event::AllBytesReceived,
+            Event::VerificationPassed,
+            Event::SaveCommitted,
+        ];
         let mut state = State::Pending;
-        for event in events { state = state.advance(event).unwrap(); }
+        for event in events {
+            state = state.advance(event).unwrap();
+        }
         assert_eq!(state, State::Completed);
     }
 
     #[test]
     fn bytes_received_is_not_completion() {
-        assert_eq!(State::Transferring.advance(Event::AllBytesReceived).unwrap(), State::Verifying);
+        assert_eq!(
+            State::Transferring
+                .advance(Event::AllBytesReceived)
+                .unwrap(),
+            State::Verifying
+        );
         assert!(State::Verifying.advance(Event::SaveCommitted).is_err());
         assert!(State::Transferring.advance(Event::SaveCommitted).is_err());
     }
 
     #[test]
     fn connection_loss_waits_without_relay_fallback() {
-        let state = State::Transferring.advance(Event::DirectUnavailable).unwrap();
+        let state = State::Transferring
+            .advance(Event::DirectUnavailable)
+            .unwrap();
         assert_eq!(state, State::WaitingDirect);
         assert_eq!(state.advance(Event::Resume).unwrap(), State::Connecting);
     }
@@ -87,7 +134,12 @@ mod tests {
     #[test]
     fn terminal_states_do_not_restart_or_accept_success() {
         for state in [State::Completed, State::Cancelled, State::Failed] {
-            for event in [Event::Begin, Event::Resume, Event::SaveCommitted, Event::Cancel] {
+            for event in [
+                Event::Begin,
+                Event::Resume,
+                Event::SaveCommitted,
+                Event::Cancel,
+            ] {
                 assert!(state.advance(event).is_err());
             }
         }
@@ -96,7 +148,13 @@ mod tests {
     #[test]
     fn invalid_transition_reports_state_and_event() {
         let e = State::Pending.advance(Event::SaveCommitted).unwrap_err();
-        assert_eq!(e, InvalidTransition { state: State::Pending, event: Event::SaveCommitted });
+        assert_eq!(
+            e,
+            InvalidTransition {
+                state: State::Pending,
+                event: Event::SaveCommitted
+            }
+        );
         assert!(e.to_string().contains("Pending"));
     }
 
@@ -107,21 +165,33 @@ mod tests {
         // No byte-level progress is allowed while consent is pending.
         assert!(waiting.advance(Event::AllBytesReceived).is_err());
         assert!(waiting.advance(Event::DirectReady).is_err());
-        assert_eq!(waiting.advance(Event::OfferAccepted).unwrap(), State::Transferring);
+        assert_eq!(
+            waiting.advance(Event::OfferAccepted).unwrap(),
+            State::Transferring
+        );
     }
 
     #[test]
     fn offer_rejection_fails_and_never_transfers() {
         let waiting = State::Connecting.advance(Event::OfferSent).unwrap();
-        assert_eq!(waiting.advance(Event::OfferRejected).unwrap(), State::Failed);
+        assert_eq!(
+            waiting.advance(Event::OfferRejected).unwrap(),
+            State::Failed
+        );
         assert!(State::Failed.advance(Event::OfferAccepted).is_err());
     }
 
     #[test]
     fn consent_wait_survives_connection_loss_and_pause() {
         let waiting = State::Connecting.advance(Event::OfferSent).unwrap();
-        assert_eq!(waiting.advance(Event::DirectUnavailable).unwrap(), State::WaitingDirect);
+        assert_eq!(
+            waiting.advance(Event::DirectUnavailable).unwrap(),
+            State::WaitingDirect
+        );
         assert_eq!(waiting.advance(Event::Pause).unwrap(), State::Paused);
-        assert_eq!(State::Paused.advance(Event::Resume).unwrap(), State::Connecting);
+        assert_eq!(
+            State::Paused.advance(Event::Resume).unwrap(),
+            State::Connecting
+        );
     }
 }

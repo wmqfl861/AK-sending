@@ -68,7 +68,11 @@ pub trait SaveTarget: Send + Sync {
 
     /// Prepare a sink for one entry. Must reject path escapes and symlink races
     /// (see AGENTS.md) before any file is created.
-    fn prepare_file(&self, entry: &FileEntry, conflict: ConflictPolicy) -> io::Result<Box<dyn FileSink>>;
+    fn prepare_file(
+        &self,
+        entry: &FileEntry,
+        conflict: ConflictPolicy,
+    ) -> io::Result<Box<dyn FileSink>>;
 }
 
 /// Default chunk size for local transfers: 1 MiB. Not a product quota.

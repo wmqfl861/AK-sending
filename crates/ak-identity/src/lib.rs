@@ -131,11 +131,15 @@ pub struct DeviceKeyPair {
 
 impl DeviceKeyPair {
     pub fn generate() -> Self {
-        Self { signing: SigningKey::generate(&mut OsRng) }
+        Self {
+            signing: SigningKey::generate(&mut OsRng),
+        }
     }
 
     fn from_seed(seed: [u8; SEED_LEN]) -> Self {
-        Self { signing: SigningKey::from_bytes(&seed) }
+        Self {
+            signing: SigningKey::from_bytes(&seed),
+        }
     }
 
     /// Load the seed file, or create and persist a new key. The bool says
@@ -185,11 +189,17 @@ impl DeviceKeyPair {
     }
 
     /// Stateless Ed25519 verification used by peers and the coordination plane.
-    pub fn verify(public: &[u8; PUBLIC_KEY_LEN], message: &[u8], signature: &[u8; SIGNATURE_LEN]) -> bool {
+    pub fn verify(
+        public: &[u8; PUBLIC_KEY_LEN],
+        message: &[u8],
+        signature: &[u8; SIGNATURE_LEN],
+    ) -> bool {
         let Ok(verifying) = VerifyingKey::from_bytes(public) else {
             return false;
         };
-        verifying.verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature)).is_ok()
+        verifying
+            .verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+            .is_ok()
     }
 }
 
@@ -222,7 +232,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         };
         #[cfg(not(unix))]
         let mut options = fs::OpenOptions::new();
-        let mut file = options.write(true).create(true).truncate(true).open(&temp_path)?;
+        let mut file = options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()
     };
@@ -277,7 +291,10 @@ impl PeerBook {
         let text = fs::read_to_string(path)?;
         let mut lines = text.lines();
         let header = lines.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("{}: peer book is empty", path.display()))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: peer book is empty", path.display()),
+            )
         })?;
         if header.trim_end_matches('\r') != PEERBOOK_MAGIC {
             return Err(io::Error::new(
@@ -300,16 +317,21 @@ impl PeerBook {
                 )
             };
             let mut fields = line.split('\t');
-            let (fp_hex, name, ts) = match (fields.next(), fields.next(), fields.next(), fields.next()) {
-                (Some(fp), Some(name), Some(ts), None) => (fp, name, ts),
-                _ => return Err(invalid("expected fingerprint, name, timestamp fields")),
-            };
+            let (fp_hex, name, ts) =
+                match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                    (Some(fp), Some(name), Some(ts), None) => (fp, name, ts),
+                    _ => return Err(invalid("expected fingerprint, name, timestamp fields")),
+                };
             let fingerprint = Fingerprint::from_hex(fp_hex)
                 .ok_or_else(|| invalid("fingerprint must be 64 hex characters"))?;
             let paired_unix_ms: u64 = ts
                 .parse()
                 .map_err(|_| invalid("paired timestamp must be an unsigned integer"))?;
-            book.upsert(PeerRecord { fingerprint, name: name.to_owned(), paired_unix_ms });
+            book.upsert(PeerRecord {
+                fingerprint,
+                name: name.to_owned(),
+                paired_unix_ms,
+            });
         }
         Ok(book)
     }
@@ -330,14 +352,20 @@ impl PeerBook {
     }
 
     pub fn upsert(&mut self, record: PeerRecord) {
-        match self.peers.iter_mut().find(|peer| peer.fingerprint == record.fingerprint) {
+        match self
+            .peers
+            .iter_mut()
+            .find(|peer| peer.fingerprint == record.fingerprint)
+        {
             Some(slot) => *slot = record,
             None => self.peers.push(record),
         }
     }
 
     pub fn get(&self, fingerprint: &Fingerprint) -> Option<&PeerRecord> {
-        self.peers.iter().find(|peer| &peer.fingerprint == fingerprint)
+        self.peers
+            .iter()
+            .find(|peer| &peer.fingerprint == fingerprint)
     }
 
     pub fn remove(&mut self, fingerprint: &Fingerprint) -> bool {
@@ -379,8 +407,8 @@ pub mod tls {
     /// `30 2E 02 01 00 30 05 06 03 2B 65 70 04 22 04 20 <seed32>`.
     fn seed_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
         const PREFIX: [u8; 16] = [
-            0x30, 0x2E, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x04, 0x22, 0x04,
-            0x20,
+            0x30, 0x2E, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
         ];
         let mut der = Vec::with_capacity(PREFIX.len() + seed.len());
         der.extend_from_slice(&PREFIX);
@@ -490,8 +518,11 @@ pub mod tls {
         /// Read the next element starting at `self.pos`, advancing past it.
         fn next(&mut self) -> Result<Tlv<'a>, CertError> {
             let start = self.pos;
-            let (&tag, rest) =
-                self.input.get(start..).and_then(|s| s.split_first()).ok_or(CertError::Malformed)?;
+            let (&tag, rest) = self
+                .input
+                .get(start..)
+                .and_then(|s| s.split_first())
+                .ok_or(CertError::Malformed)?;
             let (&len_byte, mut rest) = rest.split_first().ok_or(CertError::Malformed)?;
             let mut header_len = 2usize;
             let len = if len_byte & 0x80 == 0 {
@@ -524,7 +555,11 @@ pub mod tls {
                 .ok_or(CertError::Malformed)?;
             let content = &self.input[content_start..end];
             self.pos = end;
-            Ok(Tlv { tag, content, full: &self.input[start..end] })
+            Ok(Tlv {
+                tag,
+                content,
+                full: &self.input[start..end],
+            })
         }
     }
 
@@ -544,8 +579,7 @@ pub mod tls {
             return Err(CertError::Malformed);
         }
         let bits = bit_string_content(&sig)?;
-        let signature: [u8; 64] =
-            bits.try_into().map_err(|_| CertError::Malformed)?; // Ed25519 signatures are 64 bytes
+        let signature: [u8; 64] = bits.try_into().map_err(|_| CertError::Malformed)?; // Ed25519 signatures are 64 bytes
         Ok((tbs, signature))
     }
 
@@ -599,7 +633,11 @@ pub mod tls {
         diff == 0
     }
 
-    fn verify_self_signature(public: &[u8; 32], tbs_der: &[u8], signature: &[u8; 64]) -> Result<(), CertError> {
+    fn verify_self_signature(
+        public: &[u8; 32],
+        tbs_der: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), CertError> {
         let verifying = VerifyingKey::from_bytes(public).map_err(|_| CertError::Malformed)?;
         verifying
             .verify_strict(tbs_der, &Signature::from_bytes(signature))
@@ -609,7 +647,10 @@ pub mod tls {
     /// Verify a peer certificate against a pinned Ed25519 public key:
     /// parse minimal DER, require the SPKI key to equal `pinned_public`
     /// (constant-time compare) and the self-signature to verify.
-    pub fn verify_pinned_certificate(cert_der: &[u8], pinned_public: &[u8; 32]) -> Result<(), CertError> {
+    pub fn verify_pinned_certificate(
+        cert_der: &[u8],
+        pinned_public: &[u8; 32],
+    ) -> Result<(), CertError> {
         let (tbs, signature) = split_certificate(cert_der)?;
         let public = spki_ed25519_public_key(tbs.content)?;
         if !constant_time_eq(&public, pinned_public) {
@@ -637,7 +678,9 @@ pub mod tls {
         fn lcg_bytes(seed: &mut u64, len: usize) -> Vec<u8> {
             let mut out = vec![0u8; len];
             for slot in out.iter_mut() {
-                *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 *slot = (*seed >> 33) as u8;
             }
             out
@@ -696,7 +739,10 @@ pub mod tls {
                 verify_pinned_certificate(&tampered, &public),
                 Err(CertError::BadSignature)
             ));
-            assert!(matches!(self_signed_public_key(&tampered), Err(CertError::BadSignature)));
+            assert!(matches!(
+                self_signed_public_key(&tampered),
+                Err(CertError::BadSignature)
+            ));
         }
 
         #[test]
@@ -728,12 +774,12 @@ pub mod tls {
                 Vec::new(),
                 vec![0x30],
                 vec![0x30, 0x00],
-                vec![0x30, 0x80],                          // indefinite length
-                vec![0x30, 0x81, 0x00],                    // non-minimal length
-                vec![0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF],  // huge length
-                vec![0x30, 0x84, 0x7F, 0xFF, 0xFF, 0xFF],  // length beyond input
-                vec![0x31, 0x00],                          // wrong outer tag
-                vec![0xFF; 512],                           // garbage
+                vec![0x30, 0x80],                         // indefinite length
+                vec![0x30, 0x81, 0x00],                   // non-minimal length
+                vec![0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF], // huge length
+                vec![0x30, 0x84, 0x7F, 0xFF, 0xFF, 0xFF], // length beyond input
+                vec![0x31, 0x00],                         // wrong outer tag
+                vec![0xFF; 512],                          // garbage
                 truncated,
                 trailing,
                 deep_nesting,
@@ -741,12 +787,18 @@ pub mod tls {
             ];
             for input in &hostile {
                 assert!(
-                    matches!(verify_pinned_certificate(input, &public), Err(CertError::Malformed)),
+                    matches!(
+                        verify_pinned_certificate(input, &public),
+                        Err(CertError::Malformed)
+                    ),
                     "input accepted: {} bytes starting {:02x?}",
                     input.len(),
                     input.iter().take(8).collect::<Vec<_>>()
                 );
-                assert!(matches!(self_signed_public_key(input), Err(CertError::Malformed)));
+                assert!(matches!(
+                    self_signed_public_key(input),
+                    Err(CertError::Malformed)
+                ));
             }
 
             // Larger pseudo-random blobs never validate either.
@@ -830,7 +882,8 @@ pub(crate) mod test_util {
     impl TempDir {
         pub(crate) fn new(tag: &str) -> Self {
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("ak-identity-{tag}-{}-{id}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("ak-identity-{tag}-{}-{id}", std::process::id()));
             std::fs::create_dir_all(&path).expect("create temp dir");
             TempDir(path)
         }
@@ -855,7 +908,14 @@ mod tests {
 
     fn peer(name: &str, paired_unix_ms: u64) -> (Fingerprint, PeerRecord) {
         let fingerprint = DeviceKeyPair::generate().fingerprint();
-        (fingerprint, PeerRecord { fingerprint, name: name.to_owned(), paired_unix_ms })
+        (
+            fingerprint,
+            PeerRecord {
+                fingerprint,
+                name: name.to_owned(),
+                paired_unix_ms,
+            },
+        )
     }
 
     #[test]
@@ -884,7 +944,10 @@ mod tests {
         let mut with_nul = hex.clone();
         with_nul.replace_range(0..1, "\0");
         assert_eq!(Fingerprint::from_hex(&with_nul), None);
-        assert_eq!(Fingerprint::from_hex(&format!("{} {}", &hex[..32], &hex[32..])), None);
+        assert_eq!(
+            Fingerprint::from_hex(&format!("{} {}", &hex[..32], &hex[32..])),
+            None
+        );
     }
 
     #[test]
@@ -932,9 +995,18 @@ mod tests {
 
         assert!(verify_pairing_code(&fp, &code));
         assert!(verify_pairing_code(&fp, &digits));
-        assert!(verify_pairing_code(&fp, &format!("{} {}", &digits[..3], &digits[3..])));
-        assert!(verify_pairing_code(&fp, &format!("{}-{}", &digits[..3], &digits[3..])));
-        assert!(verify_pairing_code(&fp, &format!(" {}-{}  ", &digits[..3], &digits[3..])));
+        assert!(verify_pairing_code(
+            &fp,
+            &format!("{} {}", &digits[..3], &digits[3..])
+        ));
+        assert!(verify_pairing_code(
+            &fp,
+            &format!("{}-{}", &digits[..3], &digits[3..])
+        ));
+        assert!(verify_pairing_code(
+            &fp,
+            &format!(" {}-{}  ", &digits[..3], &digits[3..])
+        ));
     }
 
     #[test]
@@ -963,15 +1035,31 @@ mod tests {
         let signature = key.sign(message);
 
         assert_eq!(signature.len(), SIGNATURE_LEN);
-        assert!(DeviceKeyPair::verify(&key.public_key(), message, &signature));
-        assert!(!DeviceKeyPair::verify(&key.public_key(), b"coordinate but never relaY", &signature));
+        assert!(DeviceKeyPair::verify(
+            &key.public_key(),
+            message,
+            &signature
+        ));
+        assert!(!DeviceKeyPair::verify(
+            &key.public_key(),
+            b"coordinate but never relaY",
+            &signature
+        ));
 
         let other = DeviceKeyPair::generate();
-        assert!(!DeviceKeyPair::verify(&other.public_key(), message, &signature));
+        assert!(!DeviceKeyPair::verify(
+            &other.public_key(),
+            message,
+            &signature
+        ));
 
         let mut tampered = signature;
         tampered[0] ^= 0x01;
-        assert!(!DeviceKeyPair::verify(&key.public_key(), message, &tampered));
+        assert!(!DeviceKeyPair::verify(
+            &key.public_key(),
+            message,
+            &tampered
+        ));
 
         // Invalid public key encodings must not panic.
         let _ = DeviceKeyPair::verify(&[0xFFu8; PUBLIC_KEY_LEN], message, &signature);
@@ -1020,8 +1108,14 @@ mod tests {
                 Err(err) => err,
             };
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len}");
-            assert!(err.to_string().contains(&len.to_string()), "reason lacks size: {err}");
-            assert!(err.to_string().contains("seed"), "reason lacks context: {err}");
+            assert!(
+                err.to_string().contains(&len.to_string()),
+                "reason lacks size: {err}"
+            );
+            assert!(
+                err.to_string().contains("seed"),
+                "reason lacks context: {err}"
+            );
         }
     }
 
@@ -1034,7 +1128,10 @@ mod tests {
         key.save(&path).unwrap();
         key.save(&path).unwrap(); // destination now exists
 
-        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].to_string_lossy(), "device.seed");
 
@@ -1055,7 +1152,11 @@ mod tests {
         book.upsert(phone.clone());
         assert_eq!(book.iter().count(), 2);
 
-        book.upsert(PeerRecord { fingerprint: fp1, name: "Laptop Pro".to_owned(), paired_unix_ms: 3_000 });
+        book.upsert(PeerRecord {
+            fingerprint: fp1,
+            name: "Laptop Pro".to_owned(),
+            paired_unix_ms: 3_000,
+        });
         assert_eq!(book.iter().count(), 2); // replace, not append
         assert_eq!(book.get(&fp1).map(|r| r.name.as_str()), Some("Laptop Pro"));
         assert_eq!(book.get(&fp1).map(|r| r.paired_unix_ms), Some(3_000));
@@ -1090,7 +1191,10 @@ mod tests {
 
         let loaded = PeerBook::load(&path).unwrap();
         assert_eq!(loaded.iter().count(), 3);
-        assert_eq!(loaded.get(&fp1).map(|r| r.name.as_str()), Some("desk top laptop"));
+        assert_eq!(
+            loaded.get(&fp1).map(|r| r.name.as_str()),
+            Some("desk top laptop")
+        );
         assert_eq!(loaded.get(&fp2).map(|r| r.paired_unix_ms), Some(42));
         assert_eq!(loaded.get(&fp3).map(|r| r.name.as_str()), Some(""));
     }
@@ -1108,7 +1212,10 @@ mod tests {
         book.upsert(rec2);
         book.save(&path).unwrap(); // rewrite over existing destination
 
-        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(entries.len(), 1);
         let loaded = PeerBook::load(&path).unwrap();
         assert_eq!(loaded.iter().count(), 2);
@@ -1126,25 +1233,61 @@ mod tests {
             ("empty", String::new()),
             ("wrong header", "NOTPEERS\n".to_owned()),
             ("missing header", format!("{fp_hex}\t{SENTINEL}\t1\n")),
-            ("bad fingerprint", format!("AKPEERS1\nzz..\t{SENTINEL}\t1\n")),
-            ("short fingerprint", format!("AKPEERS1\n{}\t{SENTINEL}\t1\n", "ab".repeat(31))),
-            ("uppercase fp but bad ts", format!("AKPEERS1\n{}\t{SENTINEL}\tnope\n", fp_hex.to_uppercase())),
-            ("negative timestamp", format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t-5\n")),
-            ("overflow timestamp", format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t99999999999999999999999\n")),
-            ("too few fields", format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\n")),
-            ("too many fields", format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t1\textra\n")),
+            (
+                "bad fingerprint",
+                format!("AKPEERS1\nzz..\t{SENTINEL}\t1\n"),
+            ),
+            (
+                "short fingerprint",
+                format!("AKPEERS1\n{}\t{SENTINEL}\t1\n", "ab".repeat(31)),
+            ),
+            (
+                "uppercase fp but bad ts",
+                format!("AKPEERS1\n{}\t{SENTINEL}\tnope\n", fp_hex.to_uppercase()),
+            ),
+            (
+                "negative timestamp",
+                format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t-5\n"),
+            ),
+            (
+                "overflow timestamp",
+                format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t99999999999999999999999\n"),
+            ),
+            (
+                "too few fields",
+                format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\n"),
+            ),
+            (
+                "too many fields",
+                format!("AKPEERS1\n{fp_hex}\t{SENTINEL}\t1\textra\n"),
+            ),
             ("no fields", "AKPEERS1\n\n\nnope\n".to_owned()),
         ];
         for (label, content) in cases {
-            let path = dir.path().join(format!("case-{}.txt", label.replace(' ', "-")));
+            let path = dir
+                .path()
+                .join(format!("case-{}.txt", label.replace(' ', "-")));
             fs::write(&path, content).unwrap();
             let err = PeerBook::load(&path).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "case {label}: {err}");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "case {label}: {err}"
+            );
             // Whole-file errors mention the file; line errors add a line number.
             let message = err.to_string();
-            assert!(message.contains("peer book") || message.contains("line"), "case {label}: {message}");
-            assert!(!message.contains(SENTINEL), "case {label} leaks field content: {message}");
-            assert!(!message.contains(&fp_hex), "case {label} leaks fingerprint: {message}");
+            assert!(
+                message.contains("peer book") || message.contains("line"),
+                "case {label}: {message}"
+            );
+            assert!(
+                !message.contains(SENTINEL),
+                "case {label} leaks field content: {message}"
+            );
+            assert!(
+                !message.contains(&fp_hex),
+                "case {label} leaks fingerprint: {message}"
+            );
         }
     }
 
@@ -1158,7 +1301,11 @@ mod tests {
         book.upsert(rec);
         book.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, format!("AKPEERS1\r\n\r\n{}\r\n", text.lines().nth(1).unwrap())).unwrap();
+        fs::write(
+            &path,
+            format!("AKPEERS1\r\n\r\n{}\r\n", text.lines().nth(1).unwrap()),
+        )
+        .unwrap();
 
         let loaded = PeerBook::load(&path).unwrap();
         assert_eq!(loaded.iter().count(), 1);

@@ -65,3 +65,16 @@ $ python -m unittest discover -s scripts/tests
 Ran 12 tests in 0.012s
 
 OK
+
+## 补充：真实双进程 probe 全链路（信令+STUN+打洞+同socket QUIC 握手）
+# 两个独立 ak-cli probe 进程 + signal-server（127.0.0.1:17340/17341），2026-11-02
+# A 侧（server 角色）：
+punch: sent 78 recv 75 reachable [10.0.37.2:55201, 100.64.164.2:55201, 127.0.0.1:55201]
+role: server, waiting on the punched path
+QUIC handshake OK path=LocalDirect peer=5dc5dad6a632d606bfc4eaf0bc20be57ff34676305a119302ed1d06c6b021a17
+# B 侧（client 角色）：
+punch: sent 75 recv 75 reachable [10.0.37.2:55199, ...]
+role: client, dialing 10.0.37.2:55199
+QUIC handshake OK path=LocalDirect peer=cce53fb54f6db5e4a7764234e4038a1a2dfc0aaf131efdd64cd5f322db55434a
+# 结论：协调面（信令/STUN/候选中继）与数据面（打洞 + 钉扎 QUIC 握手）全部工作；
+# 该验证在单机环回+本机网卡上进行，跨网段/真实 NAT 仍属 P0-05 未执行。

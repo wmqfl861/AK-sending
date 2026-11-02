@@ -1,0 +1,8 @@
+[package]
+name = "ak-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "AK-sending direct-only policy and transfer domain models; not a network implementation"
+
+[dependencies]

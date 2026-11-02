@@ -1,0 +1,15 @@
+/target/
+/.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.pcap
+*.pcapng
+.DS_Store
+Thumbs.db

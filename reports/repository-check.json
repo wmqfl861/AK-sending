@@ -1,0 +1,10 @@
+{
+  "level": "L0_static_repository_only",
+  "passed": true,
+  "markdown_files_checked": 22,
+  "local_links_checked": 16,
+  "rust_test_cases_present_not_executed": 23,
+  "rust_compilation_executed": false,
+  "network_tests_executed": false,
+  "errors": []
+}

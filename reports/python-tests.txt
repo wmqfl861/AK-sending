@@ -1,0 +1,15 @@
+test_compression_rejected (test_repository_checks.ArchitectureConfigTests.test_compression_rejected) ... ok
+test_control_plane_cannot_gain_blob_messages (test_repository_checks.ArchitectureConfigTests.test_control_plane_cannot_gain_blob_messages) ... ok
+test_forbidden_features_are_rejected (test_repository_checks.ArchitectureConfigTests.test_forbidden_features_are_rejected) ... ok
+test_integer_zero_is_not_false (test_repository_checks.ArchitectureConfigTests.test_integer_zero_is_not_false) ... ok
+test_known_baseline_is_valid (test_repository_checks.ArchitectureConfigTests.test_known_baseline_is_valid) ... ok
+test_lan_preference_cannot_be_disabled (test_repository_checks.ArchitectureConfigTests.test_lan_preference_cannot_be_disabled) ... ok
+test_missing_keys_fail_closed (test_repository_checks.ArchitectureConfigTests.test_missing_keys_fail_closed) ... ok
+test_relay_failure_action_rejected (test_repository_checks.ArchitectureConfigTests.test_relay_failure_action_rejected) ... ok
+test_unknown_bypass_key_rejected (test_repository_checks.ArchitectureConfigTests.test_unknown_bypass_key_rejected) ... ok
+test_wrong_container_rejected (test_repository_checks.ArchitectureConfigTests.test_wrong_container_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.001s
+
+OK

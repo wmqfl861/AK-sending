@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "project": "AK-sending",
+  "architecture_decision": "ADR-001",
+  "data_plane": "authenticated_endpoint_direct_only",
+  "server_file_bytes_allowed": false,
+  "relay_allowed": false,
+  "turn_allowed": false,
+  "cloud_spooling_allowed": false,
+  "lan_preferred": true,
+  "direct_failure_action": "pause_retry_or_wait",
+  "compression": "none",
+  "transcoding": false,
+  "control_plane_allowed": ["device_discovery", "presence", "signaling", "stun", "nat_coordination"],
+  "file_metadata_via_server": false,
+  "implementation_stage": "domain_scaffold_only"
+}

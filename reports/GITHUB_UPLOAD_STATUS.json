@@ -1,0 +1,24 @@
+{
+  "repository": "wmqfl861/AK-sending",
+  "default_branch_name": "main",
+  "permissions": {
+    "pull": true,
+    "push": false
+  },
+  "root_read": {
+    "status": 404,
+    "message": "This repository is empty."
+  },
+  "write_attempt": {
+    "operation": "GitHub.create_file",
+    "path": "README.md",
+    "status": 403,
+    "message": "Resource not accessible by integration"
+  },
+  "remote_files_created": 0,
+  "remote_commit_sha": null,
+  "remote_branch_created": false,
+  "pull_request_created": false,
+  "result": "BLOCKED_BY_GITHUB_INTEGRATION_PERMISSIONS",
+  "scope": "Evidence summarized from actual GitHub tool responses in this conversation; not an independently signed server log."
+}

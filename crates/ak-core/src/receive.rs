@@ -549,7 +549,10 @@ mod tests {
         assert!(j.permission.is_none());
         j.resume().unwrap();
         j.direct_ready_at(PEER, deadline).unwrap();
-        assert_eq!(j.approve_at(&r, TTL, deadline), Err(ReceiveError::StaleRequest));
+        assert_eq!(
+            j.approve_at(&r, TTL, deadline),
+            Err(ReceiveError::StaleRequest)
+        );
         let fresh = j.consent_request().unwrap();
         j.approve_at(&fresh, TTL, deadline).unwrap();
         assert_eq!(j.state(), State::Transferring);

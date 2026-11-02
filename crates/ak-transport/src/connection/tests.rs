@@ -47,16 +47,25 @@ fn rejects_relay_unknown_and_invalid_addresses() {
     assert_eq!(relay.address(), Err(Error::UntrustedPath));
     assert_eq!(Candidate::Unknown.address(), Err(Error::UntrustedPath));
     let invalid = [
-        "0.0.0.0:12", "0.1.2.3:12", "224.0.0.1:12", "255.255.255.255:12",
-        "240.0.0.1:12", "127.0.0.1:0", "[::]:12", "[ff02::1]:12",
-        "[::ffff:127.0.0.1]:12", "[fe80::1]:12",
+        "0.0.0.0:12",
+        "0.1.2.3:12",
+        "224.0.0.1:12",
+        "255.255.255.255:12",
+        "240.0.0.1:12",
+        "127.0.0.1:0",
+        "[::]:12",
+        "[ff02::1]:12",
+        "[::ffff:127.0.0.1]:12",
+        "[fe80::1]:12",
     ];
     for address in invalid {
         let candidate = Candidate::ManualDirect(address.parse().unwrap());
         assert_eq!(candidate.address(), Err(Error::InvalidAddress));
     }
     assert!(validate_address("127.0.0.1:0".parse().unwrap(), true).is_ok());
-    assert!(Candidate::ManualDirect("[::1]:12".parse().unwrap()).address().is_ok());
+    assert!(Candidate::ManualDirect("[::1]:12".parse().unwrap())
+        .address()
+        .is_ok());
 }
 
 #[test]
@@ -170,12 +179,18 @@ async fn raw_client_rejected(no_certificate: bool) {
         roots.add(CertificateDer::from(bm.0.clone())).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-            .with_root_certificates(roots).with_no_client_auth()
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
     } else {
         tls_configs(&local(&am), &peer(&bm)).unwrap().1
     };
-    tls.alpn_protocols = vec![if no_certificate { ALPN.to_vec() } else { b"wrong/alpn".to_vec() }];
+    tls.alpn_protocols = vec![if no_certificate {
+        ALPN.to_vec()
+    } else {
+        b"wrong/alpn".to_vec()
+    }];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(transport_config());
@@ -215,7 +230,10 @@ async fn closed_connection_cannot_create_receive_session() {
     let (ca, cb) = connections(&mut a, &mut b).await;
     cb.close();
     ca.wait_closed().await.unwrap();
-    assert!(matches!(ca.into_receive_session([1; 16]), Err(Error::Closed)));
+    assert!(matches!(
+        ca.into_receive_session([1; 16]),
+        Err(Error::Closed)
+    ));
 }
 
 #[tokio::test]

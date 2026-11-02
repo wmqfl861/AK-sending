@@ -1,6 +1,8 @@
 use ak_core::job::State;
 use ak_core::receive::ReceiveError;
-use ak_transport::{AuthenticatedDirectConnection, Candidate, DirectEndpoint, Error, LocalIdentity, PairedPeer};
+use ak_transport::{
+    AuthenticatedDirectConnection, Candidate, DirectEndpoint, Error, LocalIdentity, PairedPeer,
+};
 use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(60);
@@ -8,18 +10,29 @@ const TTL: Duration = Duration::from_secs(60);
 fn endpoints() -> (DirectEndpoint, DirectEndpoint) {
     let a = rcgen::generate_simple_self_signed(vec!["ak-peer.invalid".into()]).unwrap();
     let b = rcgen::generate_simple_self_signed(vec!["ak-peer.invalid".into()]).unwrap();
-    let aid = LocalIdentity::from_der(a.cert.der().to_vec(), a.signing_key.serialize_der()).unwrap();
-    let bid = LocalIdentity::from_der(b.cert.der().to_vec(), b.signing_key.serialize_der()).unwrap();
+    let aid =
+        LocalIdentity::from_der(a.cert.der().to_vec(), a.signing_key.serialize_der()).unwrap();
+    let bid =
+        LocalIdentity::from_der(b.cert.der().to_vec(), b.signing_key.serialize_der()).unwrap();
     let ap = PairedPeer::from_certificate_der(a.cert.der().to_vec()).unwrap();
     let bp = PairedPeer::from_certificate_der(b.cert.der().to_vec()).unwrap();
     let address = "127.0.0.1:0".parse().unwrap();
-    (DirectEndpoint::bind(address, aid, bp).unwrap(), DirectEndpoint::bind(address, bid, ap).unwrap())
+    (
+        DirectEndpoint::bind(address, aid, bp).unwrap(),
+        DirectEndpoint::bind(address, bid, ap).unwrap(),
+    )
 }
 
-async fn pair(a: &mut DirectEndpoint, b: &mut DirectEndpoint) -> (AuthenticatedDirectConnection, AuthenticatedDirectConnection) {
+async fn pair(
+    a: &mut DirectEndpoint,
+    b: &mut DirectEndpoint,
+) -> (AuthenticatedDirectConnection, AuthenticatedDirectConnection) {
     let aa = a.local_addr().unwrap();
     let ba = b.local_addr().unwrap();
-    let (ca, cb) = tokio::join!(a.connect(Candidate::ManualDirect(ba)), b.accept(Candidate::ManualDirect(aa)));
+    let (ca, cb) = tokio::join!(
+        a.connect(Candidate::ManualDirect(ba)),
+        b.accept(Candidate::ManualDirect(aa))
+    );
     (ca.unwrap(), cb.unwrap())
 }
 
@@ -33,7 +46,10 @@ async fn verified_connection_only_enters_awaiting_consent() {
     let request = session.consent_request().unwrap().unwrap();
     assert_eq!(request.task_id(), [1; 16]);
     assert_eq!(request.peer_id(), id);
-    assert!(matches!(session.approve(&request, Duration::ZERO), Err(Error::Consent(ReceiveError::InvalidLifetime))));
+    assert!(matches!(
+        session.approve(&request, Duration::ZERO),
+        Err(Error::Consent(ReceiveError::InvalidLifetime))
+    ));
     assert_eq!(session.state(), State::AwaitingConsent);
     let grant = session.approve(&request, TTL).unwrap();
     session.check_receive(&grant).unwrap();
@@ -111,7 +127,10 @@ async fn expired_grant_cannot_be_used() {
     let request = session.consent_request().unwrap().unwrap();
     let grant = session.approve(&request, Duration::from_millis(1)).unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(session.check_receive(&grant), Err(Error::Consent(ReceiveError::PermissionExpired)));
+    assert_eq!(
+        session.check_receive(&grant),
+        Err(Error::Consent(ReceiveError::PermissionExpired))
+    );
     assert_eq!(session.state(), State::Paused);
 }
 
@@ -159,7 +178,10 @@ async fn verification_and_save_resume_without_reopening_receive() {
         session.reconnect(receiver).unwrap();
         let request = session.consent_request().unwrap().unwrap();
         let fresh = session.approve(&request, TTL).unwrap();
-        assert_eq!(session.check_receive(&fresh), Err(Error::Consent(ReceiveError::WrongStage)));
+        assert_eq!(
+            session.check_receive(&fresh),
+            Err(Error::Consent(ReceiveError::WrongStage))
+        );
         assert!(session.check_receive(&grant).is_err());
         if !saving {
             session.verification_passed(&fresh).unwrap();

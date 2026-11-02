@@ -28,7 +28,12 @@ impl ReceiveSession {
         let mut job = ReceiveJob::new(task, peer_id);
         job.begin()?;
         job.direct_ready(peer_id)?;
-        Ok(Self { connection: Some(connection), peer_id, job, grant_scope: None })
+        Ok(Self {
+            connection: Some(connection),
+            peer_id,
+            job,
+            grant_scope: None,
+        })
     }
 
     /// Domain state; network loss is observed on checked operations/disconnect wait.
@@ -42,7 +47,11 @@ impl ReceiveSession {
     }
 
     /// Trusted receiver UI/policy only. Never dispatch a network message here.
-    pub fn approve(&mut self, request: &ConsentRequest, lifetime: Duration) -> Result<ReceiveGrant> {
+    pub fn approve(
+        &mut self,
+        request: &ConsentRequest,
+        lifetime: Duration,
+    ) -> Result<ReceiveGrant> {
         self.ensure_live()?;
         if let Err(error) = self.job.approve(request, lifetime) {
             if error == ReceiveError::RequestExpired {
@@ -51,9 +60,17 @@ impl ReceiveSession {
             return Err(error.into());
         }
         let scope = Arc::new(());
-        let epoch = self.connection.as_ref().ok_or(Error::Closed)?.epoch().clone();
+        let epoch = self
+            .connection
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .epoch()
+            .clone();
         self.grant_scope = Some(scope.clone());
-        Ok(ReceiveGrant { scope, connection_epoch: epoch })
+        Ok(ReceiveGrant {
+            scope,
+            connection_epoch: epoch,
+        })
     }
 
     pub fn check_receive(&mut self, grant: &ReceiveGrant) -> Result<()> {
@@ -112,7 +129,11 @@ impl ReceiveSession {
 
     /// Observe actual closure and invalidate the domain authorization.
     pub async fn wait_for_disconnect(&mut self) -> Result<()> {
-        self.connection.as_ref().ok_or(Error::Closed)?.wait_closed().await?;
+        self.connection
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .wait_closed()
+            .await?;
         self.disconnected();
         Ok(())
     }
@@ -130,7 +151,10 @@ impl ReceiveSession {
     }
 
     fn ensure_live(&mut self) -> Result<()> {
-        let result = self.connection.as_ref().ok_or(Error::Closed)
+        let result = self
+            .connection
+            .as_ref()
+            .ok_or(Error::Closed)
             .and_then(AuthenticatedDirectConnection::ensure_live);
         if result.is_err() {
             self.disconnected();
@@ -144,10 +168,13 @@ impl ReceiveSession {
         operation: fn(&mut ReceiveJob) -> std::result::Result<(), ReceiveError>,
     ) -> Result<()> {
         self.ensure_live()?;
-        let matches = self.grant_scope.as_ref()
-            .is_some_and(|scope| Arc::ptr_eq(scope, &grant.scope))
-            && self.connection.as_ref()
-                .is_some_and(|connection| Arc::ptr_eq(connection.epoch(), &grant.connection_epoch));
+        let matches =
+            self.grant_scope
+                .as_ref()
+                .is_some_and(|scope| Arc::ptr_eq(scope, &grant.scope))
+                && self.connection.as_ref().is_some_and(|connection| {
+                    Arc::ptr_eq(connection.epoch(), &grant.connection_epoch)
+                });
         if !matches {
             return Err(Error::InvalidGrant);
         }

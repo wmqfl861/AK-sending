@@ -46,7 +46,9 @@ impl PairedPeer {
         id.copy_from_slice(digest(&SHA256, &certificate).as_ref());
         let certificate = CertificateDer::from(certificate);
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(certificate.clone()).map_err(|_| Error::Configuration)?;
+        roots
+            .add(certificate.clone())
+            .map_err(|_| Error::Configuration)?;
         Ok(Self { certificate, id })
     }
 
@@ -66,7 +68,9 @@ pub(crate) fn tls_configs(
 ) -> Result<(rustls::ServerConfig, rustls::ClientConfig)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(peer.certificate.clone()).map_err(|_| Error::Configuration)?;
+    roots
+        .add(peer.certificate.clone())
+        .map_err(|_| Error::Configuration)?;
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots.clone()),
         provider.clone(),

@@ -35,16 +35,25 @@ fn validate_address(address: SocketAddr, bind: bool) -> Result<()> {
     }
     let valid = match address.ip() {
         IpAddr::V4(ip) => {
-            !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
-                && ip.octets()[0] != 0 && ip.octets()[0] < 240
+            !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && ip.octets()[0] != 0
+                && ip.octets()[0] < 240
         }
         IpAddr::V6(ip) => {
-            !ip.is_unspecified() && !ip.is_multicast() && ip.to_ipv4_mapped().is_none()
+            !ip.is_unspecified()
+                && !ip.is_multicast()
+                && ip.to_ipv4_mapped().is_none()
                 && (!ip.is_unicast_link_local()
                     || matches!(address, SocketAddr::V6(a) if a.scope_id() != 0))
         }
     };
-    if valid { Ok(()) } else { Err(Error::InvalidAddress) }
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidAddress)
+    }
 }
 
 /// Owns a concrete native UDP endpoint, with one locally configured paired peer.
@@ -59,8 +68,8 @@ impl DirectEndpoint {
     pub fn bind(address: SocketAddr, identity: LocalIdentity, peer: PairedPeer) -> Result<Self> {
         validate_address(address, true)?;
         let (server, client) = quic_configs(&identity, &peer)?;
-        let mut endpoint = quinn::Endpoint::server(server, address)
-            .map_err(|_| Error::Configuration)?;
+        let mut endpoint =
+            quinn::Endpoint::server(server, address).map_err(|_| Error::Configuration)?;
         endpoint.set_default_client_config(client);
         Ok(Self { endpoint, peer })
     }
@@ -72,10 +81,13 @@ impl DirectEndpoint {
 
     pub async fn connect(&mut self, candidate: Candidate) -> Result<AuthenticatedDirectConnection> {
         let address = candidate.address()?;
-        let connecting = self.endpoint.connect(address, crate::SERVER_NAME)
+        let connecting = self
+            .endpoint
+            .connect(address, crate::SERVER_NAME)
             .map_err(|_| Error::Handshake)?;
         let connection = timeout(OPERATION_TIMEOUT, connecting)
-            .await.map_err(|_| Error::Timeout)?
+            .await
+            .map_err(|_| Error::Timeout)?
             .map_err(|_| Error::Handshake)?;
         self.authenticate(connection, address)
     }
@@ -93,7 +105,9 @@ impl DirectEndpoint {
             let connection = incoming.await.map_err(|_| Error::Handshake)?;
             self.authenticate(connection, expected)
         };
-        timeout(OPERATION_TIMEOUT, operation).await.map_err(|_| Error::Timeout)?
+        timeout(OPERATION_TIMEOUT, operation)
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 
     fn authenticate(
@@ -106,13 +120,15 @@ impl DirectEndpoint {
                 return Err(Error::UnexpectedAddress);
             }
             let identity = connection.peer_identity().ok_or(Error::PeerMismatch)?;
-            let certificates = identity.downcast::<Vec<CertificateDer<'static>>>()
+            let certificates = identity
+                .downcast::<Vec<CertificateDer<'static>>>()
                 .map_err(|_| Error::PeerMismatch)?;
             if !self.peer.matches(&certificates) {
                 return Err(Error::PeerMismatch);
             }
             let handshake = connection.handshake_data().ok_or(Error::Protocol)?;
-            let handshake = handshake.downcast::<quinn::crypto::rustls::HandshakeData>()
+            let handshake = handshake
+                .downcast::<quinn::crypto::rustls::HandshakeData>()
                 .map_err(|_| Error::Protocol)?;
             if handshake.protocol.as_deref() != Some(ALPN) {
                 return Err(Error::Protocol);
@@ -178,13 +194,16 @@ impl AuthenticatedDirectConnection {
     }
 
     pub fn close(&self) {
-        self.connection.close(0_u32.into(), b"direct connection closed");
+        self.connection
+            .close(0_u32.into(), b"direct connection closed");
     }
 
     /// Bounded observation of peer/transport closure; does not send keep-alives.
     pub async fn wait_closed(&self) -> Result<()> {
         timeout(OPERATION_TIMEOUT, self.connection.closed())
-            .await.map(|_| ()).map_err(|_| Error::Timeout)
+            .await
+            .map(|_| ())
+            .map_err(|_| Error::Timeout)
     }
 
     pub fn into_receive_session(self, task: [u8; 16]) -> Result<ReceiveSession> {
@@ -205,9 +224,14 @@ impl AuthenticatedDirectConnection {
         self.ensure_live()?;
         let operation = async {
             if responder {
-                let (mut send, mut receive) = self.connection.accept_bi().await
+                let (mut send, mut receive) = self
+                    .connection
+                    .accept_bi()
+                    .await
                     .map_err(|_| Error::Closed)?;
-                let request = receive.read_to_end(PING.len()).await
+                let request = receive
+                    .read_to_end(PING.len())
+                    .await
                     .map_err(|_| Error::Protocol)?;
                 if request != PING {
                     return Err(Error::Protocol);
@@ -216,11 +240,13 @@ impl AuthenticatedDirectConnection {
                 send.write_all(PONG).await.map_err(|_| Error::Closed)?;
                 send.finish().map_err(|_| Error::Closed)?;
             } else {
-                let (mut send, mut receive) = self.connection.open_bi().await
-                    .map_err(|_| Error::Closed)?;
+                let (mut send, mut receive) =
+                    self.connection.open_bi().await.map_err(|_| Error::Closed)?;
                 send.write_all(PING).await.map_err(|_| Error::Closed)?;
                 send.finish().map_err(|_| Error::Closed)?;
-                let reply = receive.read_to_end(PONG.len()).await
+                let reply = receive
+                    .read_to_end(PONG.len())
+                    .await
                     .map_err(|_| Error::Protocol)?;
                 if reply != PONG {
                     return Err(Error::Protocol);
@@ -229,7 +255,8 @@ impl AuthenticatedDirectConnection {
             self.ensure_live()
         };
         let result = timeout(OPERATION_TIMEOUT, operation)
-            .await.unwrap_or(Err(Error::Timeout));
+            .await
+            .unwrap_or(Err(Error::Timeout));
         if result.is_err() {
             self.close();
         }

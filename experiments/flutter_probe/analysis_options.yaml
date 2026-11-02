@@ -1,0 +1,4 @@
+analyzer:
+  errors:
+    unused_import: error
+    dead_code: error

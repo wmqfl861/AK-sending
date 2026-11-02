@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "status": "NOT_MEASURED",
+  "commit": null,
+  "device_model": null,
+  "os_build": null,
+  "build_type": "release",
+  "artifact_sha256": null,
+  "download_bytes": null,
+  "installed_bytes": null,
+  "idle_memory_metric": null,
+  "idle_memory_bytes": null,
+  "idle_cpu_single_core_percent_10_minutes": null,
+  "cold_start_ms_10_samples": [],
+  "active_total_buffer_bytes": null,
+  "ui_updates_per_second": null,
+  "raw_evidence_files": [],
+  "notes": "Use desktop process-tree RSS, Android PSS or iOS physical footprint. Do not substitute native-library size for App download/install size. Null is unmeasured, not zero or passed."
+}

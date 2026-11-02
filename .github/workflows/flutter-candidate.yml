@@ -1,0 +1,64 @@
+name: Flutter scaffold candidate (not acceptance)
+on:
+  push:
+    branches: ["dev/m0-05-flutter-risk-harness-20261102"]
+    paths: [".github/workflows/flutter-candidate.yml"]
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch exact public Flutter SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 3.47.0 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          test "$(git -C "$RUNNER_TEMP/flutter" rev-parse HEAD)" = '4cf24164269a5ebf0c16a028a00727d0e77bbb05'
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - name: Generate candidate only, never commit from CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p candidate
+          flutter config --no-analytics
+          flutter --version --machine > candidate/flutter-version.json
+          flutter create --platforms=android,ios,linux,macos,windows --org=dev.ak --project-name=ak_m0_probe --empty --no-pub candidate/project
+          cat > candidate/project/pubspec.yaml <<'EOF'
+          name: ak_m0_probe
+          description: Synthetic native and mobile permission risk harness, not file transfer.
+          publish_to: none
+          version: 0.1.0+1
+          environment:
+            sdk: '>=3.13.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+          flutter:
+            uses-material-design: true
+          EOF
+          (cd candidate/project && flutter pub get)
+          cp candidate/project/pubspec.lock candidate/pubspec.lock
+          git rev-parse HEAD > candidate/source-commit.txt
+          rm -rf candidate/project/.dart_tool candidate/project/build
+          tar -czf flutter-scaffold-candidate.tar.gz candidate
+          tar -czf flutter-dart-kit.tar.gz -C "$RUNNER_TEMP/flutter/bin/cache" dart-sdk
+          sha256sum flutter-scaffold-candidate.tar.gz flutter-dart-kit.tar.gz > candidate-digests.txt
+      - name: Preserve scaffold and formatting tools, not acceptance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-candidate-${{ github.sha }}
+          path: |
+            flutter-scaffold-candidate.tar.gz
+            flutter-dart-kit.tar.gz
+            candidate-digests.txt
+          compression-level: 0
+          retention-days: 3

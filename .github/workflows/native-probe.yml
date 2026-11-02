@@ -80,9 +80,12 @@ jobs:
       - name: Fixed Android NDK and API26 linker
         if: matrix.target == 'aarch64-linux-android'
         run: |
-          sdkmanager 'ndk;29.0.14206865'
-          NDK="$ANDROID_HOME/ndk/29.0.14206865"
           mkdir -p validation/toolchain
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          "$SDKMANAGER" --version | tee validation/toolchain/sdkmanager.txt
+          "$SDKMANAGER" 'ndk;29.0.14206865' 2>&1 | tee validation/toolchain/ndk-install.txt
+          NDK="$ANDROID_HOME/ndk/29.0.14206865"
           cat "$NDK/source.properties" | tee validation/toolchain/ndk.txt
           BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           test -x "$BIN/aarch64-linux-android26-clang"

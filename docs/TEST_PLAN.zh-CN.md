@@ -23,6 +23,31 @@
 
 100 GB/十万文件是测试样本，不是产品上限；手机按实际容量安排大文件样本。
 
+## 自动化覆盖映射（2026-11-02，环回 L2 形态）
+
+本节如实记录截至 2026-11-02 各 T 编号落入自动化测试的位置，执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)（workspace 全部测试通过、clippy 零警告、5 GiB 稀疏文件 release 测试通过）。所有自动化测试均为进程内环回形态：单机、QUIC over UDP 环回/本机网卡、真实文件系统。上表中的通过标准凡未列入下表"已自动化"的部分仍是计划。跨 crate 场景测试统一规划在 `crates/ak-itests`（每个测试文件对应若干 T 编号），其 `tests/` 目录正由并行代理编写（如 `t11_names_and_paths.rs`），下表按 crate 内单测/集成测现状标注。
+
+| 编号 | 自动化状态 | 测试位置 | 层级 |
+|---|---|---|---|
+| T01 | 部分 | 数据面不依赖协调面：`ak-engine` `loopback_directory_transfer_is_byte_identical` 等全部环回传输测试自始至终不经信令服务器；离线配对资料落盘：`ak-identity` `peerbook_save_load_roundtrip_sanitizes_names` | L1＋L2（环回） |
+| T02 | 部分 | 本地优先：`ak-net` `classify_*` 系列、`ak-discovery` `rank_orders_lan_then_public_with_v6_first`；服务器不承载文件：`ak-signal` `closed_message_set_is_bounded`、`ak-wire` `message_type_constants_form_the_closed_set`（封闭消息集、无 blob 字段）。本地/公网双候选并存的端到端选择未见自动化 | L1 |
+| T03 | 未覆盖 | 无自动化。[dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 的双进程 probe（信令＋STUN＋打洞＋钉扎握手）为单机环回＋本机网卡形态，跨网段/真实 NAT 未执行 | —（补充验证为 L2 环回） |
+| T04 | 部分 | `ak-core` `connection_loss_waits_without_relay_fallback`、`relay_and_unknown_are_never_accepted`、`no_candidates_means_no_connection`；`ak-engine` `mid_transfer_disconnect_keeps_checkpoint_and_resumes`（数据路径中断→进度停止、无回退）。[ADR-002](adr/002-protocol-stack-and-order.zh-CN.md) D6 指明后者为 T04 的自动化形态 | L1＋L2（环回） |
+| T05 | 已自动化 | `ak-core` `relay_and_unknown_are_never_accepted`、`changed_path_is_rejected_on_reassessment`、`incomplete_local_probe_prevents_premature_public_selection` | L1 |
+| T06 | 已自动化 | `ak-engine` `wrong_pin_fails_closed_before_any_transfer`、`receiver_authorize_false_rejects_the_sender`；`ak-identity` `cert_with_wrong_pin_is_key_mismatch`、`malformed_and_hostile_certificates_are_rejected_without_panicking`；`ak-signal` `bad_signature_hello_is_disconnected` | L1＋L2（环回） |
+| T07 | 部分 | 无"连接建立后停协调"的故障注入测试；间接证据：`ak-engine` 环回传输全程不依赖协调面（同 T01） | L2（环回，间接） |
+| T08 | 部分 | `ak-core` `changed_path_is_rejected_on_reassessment`、`pause_resume_rechecks_connection`；真实路径切换（网络变更）注入未自动化 | L1 |
+| T09 | 部分 | `ak-core` `bytes_received_is_not_completion`、`success_requires_verification_then_save`；`ak-storage` `whole_digest_mismatch_keeps_part_and_blocks_final`、`corrupted_part_prefix_truncates_and_retransmits`（不误报完成、可恢复）。目录撤权/满盘注入未自动化；Windows 上 `available_bytes` 返回 None，空间不足以真实写错误暴露 | L1 |
+| T10 | 部分 | `ak-engine` `mid_transfer_disconnect_keeps_checkpoint_and_resumes`、`resume_skips_verified_prefix_without_resending`；`ak-store` `save_load_roundtrip_with_peer_and_files`；`ak-storage` `dropped_sink_resumes_from_verified_prefix`（跨 sink 实例续传）。真实双进程重启未自动化 | L1＋L2（环回） |
+| T11 | 已自动化 | `ak-core` `rejects_traversal_absolute_and_separator_attacks`、`rejects_windows_unfriendly_components`、`rejects_overlong_paths`；`ak-storage` `hand_built_escaping_entries_are_rejected`、`symlink_component_inside_save_path_is_rejected`、`source_tree_containing_symlink_is_rejected`、`conflict_fail_errors_and_rename_generates_free_name`。跨 crate 场景测试规划于 `crates/ak-itests/tests/t11_names_and_paths.rs`（并行开发中） | L1 |
+| T12 | 已自动化 | `ak-core` `handles_more_than_four_gibibytes`、`maximum_u64_does_not_overflow`、`exact_multiple_and_last_partial`；`ak-engine` `five_gib_sparse_file_transfers_with_u64_offsets`（`#[ignore]`、仅 release，2026-11-02 已执行通过，耗时 73.68s）。100 GB 样本待实测 | L1＋L2（环回） |
+| T13 | 部分 | `ak-core` `manifest_pages_are_bounded_and_ordered`、`empty_manifest_has_one_empty_page`、`directory_entries_carry_no_digests_and_do_not_count_bytes`；`ak-wire` `manifest_page_round_trip_*` 系列、`rejects_entry_count_over_limit`。十万文件规模与端到端取消未自动化（引擎 v1 无带内 Pause，见 `ak-engine` 文档已知限制） | L1 |
+| T14 | 部分 | 通用字节保真：`ak-engine` `loopback_directory_transfer_is_byte_identical`、`ak-storage` `write_all_chunks_then_finish_commits_identical_file`。相册原件/HEVC/HDR/Live Photo 及跨系统元数据保留未测（无平台适配层） | L2（环回，仅通用字节） |
+| T15 | 未覆盖 | 无平台生命周期代码 | — |
+| T16 | 未覆盖 | 仅 Windows 本机环回（`ak-cli` 命令行原型）；五端矩阵未开始 | — |
+
+明确声明：截至 2026-11-02，**没有任何 L3/L4 验证被执行**——无真机、无跨网段/真实 NAT、无服务器端抓包；dev-validation 中的双进程 probe 也是单机环回＋本机网卡形态。"部分"表示场景仅局部或间接自动化，不等于场景通过。
+
 ## 证明服务器不传文件
 
 在客户端和所有控制服务入口同时记录受控实验。准备随机合成文件，不用真实用户隐私文件。

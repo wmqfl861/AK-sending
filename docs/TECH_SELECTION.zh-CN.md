@@ -1,5 +1,13 @@
 # 技术选型与验证门槛
 
+## 状态更新（2026-11-02）
+
+网络路线已按 [ADR-002](adr/002-protocol-stack-and-order.zh-CN.md)（已接受）收敛，不再处于"未冻结"状态：
+
+- 数据面＝QUIC（quinn）＋rustls（ring 后端）＋自签 Ed25519 证书＋指纹钉扎；控制面＝自建信令（TCP、定长有界消息）＋内置最小 STUN（RFC 5389 子集）。iroh 已排除（打洞依赖 relay，与 ADR-001 冲突），下表中的候选对比保留作为决策记录。
+- 依赖已从"仅标准库"放宽为受控清单（tokio、quinn、rustls、ring 系、ed25519-dalek、blake3、rcgen、mdns-sd、if-addrs、clap 等，均锁定于 Cargo.lock），仓库检查脚本持续做禁依赖扫描（relay/TURN/WebRTC/iroh，2026-11-02 结果 clean）。
+- 验证现状：环回 L2 原型验证已执行（workspace 测试、clippy、5 GiB 稀疏文件 release 测试、双进程 probe 全链路，见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)）；跨网段/真实 NAT、真机与服务器端抓包（L3/L4）未执行。下文"冻结门槛"中的各项仍为计划。
+
 ## 已选方向与未冻结部分
 
 Flutter 作为五端 UI 候选，Rust 共享核心、SQLite 本地持久化、Swift/Kotlin 原生适配。

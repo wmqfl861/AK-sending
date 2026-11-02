@@ -7,11 +7,13 @@ description = "Cross-module integration tests (TEST_PLAN mapping lives in tests;
 
 [dependencies]
 ak-core = { workspace = true }
+ak-discovery = { workspace = true }
 ak-engine = { workspace = true }
 ak-identity = { workspace = true }
 ak-net = { workspace = true }
 ak-storage = { workspace = true }
 ak-store = { workspace = true }
+ak-wire = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

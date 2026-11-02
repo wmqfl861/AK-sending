@@ -8,6 +8,11 @@ description = "Local source scanning and save targets with path-safety and atomi
 [dependencies]
 ak-core = { workspace = true }
 blake3 = { workspace = true }
+# Maintenance-only deps (ADR-002 controlled additions): fs2 -> real free-space
+# query (GetDiskFreeSpaceExW / statvfs); filetime -> set the sender's mtime on
+# committed files. Both are small, widely used, and unsafe-free for our paths.
+filetime = "0.2"
+fs2 = "0.4"
 thiserror = { workspace = true }
 
 [dev-dependencies]

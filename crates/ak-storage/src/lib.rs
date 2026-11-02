@@ -12,7 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use filetime::FileTime;
 
 use ak_core::chunk::ChunkPlan;
 use ak_core::error::ErrorCode;
@@ -78,6 +80,14 @@ fn unix_ms(t: SystemTime) -> i64 {
     }
 }
 
+/// Manifest mtime (Unix ms, may be pre-epoch) as a `FileTime` stamp.
+fn mtime_file_time(ms: i64) -> FileTime {
+    FileTime::from_unix_time(
+        ms.div_euclid(1000),
+        (ms.rem_euclid(1000) as u32) * 1_000_000,
+    )
+}
+
 fn invalid_input_io(msg: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, msg.into())
 }
@@ -113,11 +123,12 @@ impl LocalSource {
     /// Empty directories become manifest entries with empty chunk digests only
     /// if representable; the caller decides how to page them.
     ///
-    /// Directory traversal is a pre-order walk with children sorted by name at
-    /// each level, so a parent directory entry always precedes its children
-    /// and the receiver can create entries in manifest order. Symlinks are
-    /// never followed: the root itself is rejected as [`OpenError::RootIsSymlink`]
-    /// and any symlink below it as [`OpenError::SymlinkComponent`].
+    /// Directory traversal is an iterative pre-order walk (explicit stack, no
+    /// recursion) with children sorted by name at each level, so a parent
+    /// directory entry always precedes its children and the receiver can
+    /// create entries in manifest order. Symlinks are never followed: the
+    /// root itself is rejected as [`OpenError::RootIsSymlink`] and any symlink
+    /// below it as [`OpenError::SymlinkComponent`].
     pub fn open(root: &Path, chunk_size: NonZeroU32) -> Result<Self, OpenError> {
         let meta = match fs::symlink_metadata(root) {
             Ok(m) => m,
@@ -134,7 +145,7 @@ impl LocalSource {
         let root_is_file;
         if file_type.is_dir() {
             root_is_file = false;
-            scan_dir(root, "", chunk_size.get(), &mut entries)?;
+            scan_tree(root, chunk_size.get(), &mut entries)?;
         } else if file_type.is_file() {
             root_is_file = true;
             let name = root.file_name().and_then(OsStr::to_str).ok_or_else(|| {
@@ -183,46 +194,83 @@ impl LocalSource {
     }
 }
 
-/// Pre-order walk: children sorted by name; a directory entry is emitted
-/// immediately before its own children.
-fn scan_dir(
-    dir: &Path,
-    prefix: &str,
-    chunk_size: u32,
-    entries: &mut Vec<FileEntry>,
-) -> Result<(), OpenError> {
-    let mut children: Vec<(OsString, PathBuf, fs::FileType)> = Vec::new();
-    for child in fs::read_dir(dir)? {
-        let child = child?;
-        let path = child.path();
-        let meta = fs::symlink_metadata(&path)?;
-        children.push((child.file_name(), path, meta.file_type()));
+/// Iterative pre-order walk over an explicit work stack: children are sorted
+/// by name at each level, and a directory entry is emitted immediately before
+/// its own children. No recursion, so arbitrarily deep trees cannot overflow
+/// the thread stack.
+fn scan_tree(root: &Path, chunk_size: u32, entries: &mut Vec<FileEntry>) -> Result<(), OpenError> {
+    /// One unit of pending scan work.
+    enum Frame {
+        /// Read the directory's children, sort them, queue them.
+        Dir {
+            path: PathBuf,
+            rel: String,
+            /// False only for the transfer root, which gets no entry.
+            emit_entry: bool,
+        },
+        /// Digest one regular file.
+        File { path: PathBuf, rel: String },
     }
-    children.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, path, file_type) in children {
-        let name = name.to_str().ok_or_else(|| {
-            OpenError::Io(invalid_input_io(format!(
-                "non-UTF-8 file name: {}",
-                path.display()
-            )))
-        })?;
-        let rel = if prefix.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        if file_type.is_symlink() {
-            return Err(OpenError::SymlinkComponent(path));
-        } else if file_type.is_dir() {
-            entries.push(FileEntry::directory(&rel).map_err(|_| bad_rel_path(&rel))?);
-            scan_dir(&path, &rel, chunk_size, entries)?;
-        } else if file_type.is_file() {
-            scan_file(&path, &rel, chunk_size, entries)?;
-        } else {
-            return Err(OpenError::Io(invalid_input_io(format!(
-                "unsupported file type in source tree: {}",
-                path.display()
-            ))));
+    let mut stack = vec![Frame::Dir {
+        path: root.to_path_buf(),
+        rel: String::new(),
+        emit_entry: false,
+    }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::File { path, rel } => scan_file(&path, &rel, chunk_size, entries)?,
+            Frame::Dir {
+                path,
+                rel,
+                emit_entry,
+            } => {
+                if emit_entry {
+                    entries.push(FileEntry::directory(&rel).map_err(|_| bad_rel_path(&rel))?);
+                }
+                let mut children: Vec<(OsString, PathBuf, fs::FileType)> = Vec::new();
+                for child in fs::read_dir(&path)? {
+                    let child = child?;
+                    let path = child.path();
+                    let meta = fs::symlink_metadata(&path)?;
+                    children.push((child.file_name(), path, meta.file_type()));
+                }
+                children.sort_by(|a, b| a.0.cmp(&b.0));
+                // Push in reverse so the stack pops children in sorted order;
+                // each directory's whole subtree drains before the next
+                // sibling, which keeps parents ahead of their children.
+                for (name, path, file_type) in children.into_iter().rev() {
+                    let name = name.to_str().ok_or_else(|| {
+                        OpenError::Io(invalid_input_io(format!(
+                            "non-UTF-8 file name: {}",
+                            path.display()
+                        )))
+                    })?;
+                    let child_rel = if rel.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    if file_type.is_symlink() {
+                        return Err(OpenError::SymlinkComponent(path));
+                    } else if file_type.is_dir() {
+                        stack.push(Frame::Dir {
+                            path,
+                            rel: child_rel,
+                            emit_entry: true,
+                        });
+                    } else if file_type.is_file() {
+                        stack.push(Frame::File {
+                            path,
+                            rel: child_rel,
+                        });
+                    } else {
+                        return Err(OpenError::Io(invalid_input_io(format!(
+                            "unsupported file type in source tree: {}",
+                            path.display()
+                        ))));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -417,6 +465,7 @@ impl LocalSaveTarget {
             part_path,
             conflict,
             size: entry.size,
+            mtime_unix_ms: entry.mtime_unix_ms,
             chunk_size,
             whole_digest: entry.whole_digest,
             chunk_digests: entry.chunk_digests.clone(),
@@ -434,11 +483,13 @@ impl SaveTarget for LocalSaveTarget {
         &self.root
     }
 
-    /// `std` has no stable free-space API on Windows; the `Option` design
-    /// exists exactly for platforms that cannot report it. Space exhaustion is
-    /// surfaced as a real write error instead of a fake capacity figure.
+    /// Real free space on the destination volume (`fs2::available_space`:
+    /// GetDiskFreeSpaceExW on Windows, statvfs on Unix). Any platform error
+    /// maps to `None`, keeping the trait contract: unknown capacity is
+    /// reported as unknown, never faked, and exhaustion is still surfaced by
+    /// real write errors (see docs/STORAGE_AND_PLATFORMS.zh-CN.md).
     fn available_bytes(&self) -> Option<u64> {
-        None
+        fs2::available_space(&self.root).ok()
     }
 
     /// Prepare the sink for one entry. If a `.akpart` file for this entry
@@ -580,6 +631,7 @@ struct PartState {
     part_path: PathBuf,
     conflict: ConflictPolicy,
     size: u64,
+    mtime_unix_ms: i64,
     chunk_size: NonZeroU32,
     whole_digest: [u8; DIGEST_LEN],
     chunk_digests: Vec<[u8; DIGEST_LEN]>,
@@ -657,6 +709,11 @@ impl FileSink for LocalFileSink {
             return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
         }
         st.file.sync_all()?;
+        // Best-effort metadata fidelity: stamp the sender's real mtime onto
+        // the part file so it survives the rename. Byte fidelity is the hard
+        // guarantee of finish(); a failed mtime stamp must not fail the
+        // transfer, so its error is deliberately dropped.
+        let _ = filetime::set_file_mtime(&st.part_path, mtime_file_time(st.mtime_unix_ms));
         // Pre-check the target so ConflictPolicy::Fail can never silently
         // replace an existing file (POSIX rename would do so). A concurrent
         // create between check and rename is still caught by the AlreadyExists
@@ -731,6 +788,52 @@ pub fn conflict_free_name(existing: &Path) -> PathBuf {
     // Pathological destination with a million conflicts: hand back the base
     // candidate; the rename will surface the real error.
     parent.join(format!("{stem} (2)"))
+}
+
+// ---------------------------------------------------------------------------
+// Orphan part cleanup
+// ---------------------------------------------------------------------------
+
+/// True when the path's file name ends with [`PART_SUFFIX`].
+fn has_part_suffix(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.as_encoded_bytes().ends_with(PART_SUFFIX.as_bytes()))
+}
+
+/// Delete stale `*.akpart` temp files anywhere under `root`: a part whose last
+/// modification is older than `older_than` counts as an orphan left behind by
+/// an interrupted transfer, so orphan detection is purely mtime-based.
+/// Returns how many files were removed. The walk is iterative, never follows
+/// symlinks, and never touches files without the part suffix. A part that is
+/// still being written by a live sink keeps a fresh mtime and survives.
+pub fn discard_orphan_parts(root: &Path, older_than: Duration) -> io::Result<u64> {
+    let now = SystemTime::now();
+    let mut removed = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for child in fs::read_dir(&dir)? {
+            let child = child?;
+            let path = child.path();
+            // symlink_metadata classifies the link itself; never follow it.
+            let meta = fs::symlink_metadata(&path)?;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                continue;
+            } else if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && has_part_suffix(&path) {
+                // Unreadable or future mtimes count as age zero: keep the file.
+                let age = now
+                    .duration_since(meta.modified().unwrap_or(now))
+                    .unwrap_or_default();
+                if age > older_than {
+                    fs::remove_file(&path)?;
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -859,6 +962,48 @@ mod tests {
         // Deterministic order on repeated scans.
         let again = LocalSource::open(&root, cs(4)).unwrap();
         assert_eq!(source.manifest(), again.manifest());
+    }
+
+    #[test]
+    fn scan_handles_two_hundred_level_deep_chain() {
+        let tmp = TempDir::new().unwrap();
+        // Canonicalize: on Windows the returned \\?\ verbatim path lifts the
+        // 260-char MAX_PATH limit, which a 200-level chain of 3-char names
+        // would otherwise exceed.
+        let root = tmp.path().canonicalize().unwrap();
+        let names: Vec<String> = (0..200).map(|i| format!("d{:02}", i % 100)).collect();
+        let mut deep = root.clone();
+        for name in &names {
+            deep.push(name);
+            fs::create_dir(&deep).unwrap();
+        }
+        wf(&deep.join("leaf.txt"), b"leaf");
+
+        let source = LocalSource::open(&root, cs(4)).unwrap();
+        let entries = &source.manifest().entries;
+        assert_eq!(entries.len(), 201);
+        // Parents strictly before children, in chain order.
+        let mut prefix = String::new();
+        for (i, entry) in entries.iter().enumerate().take(names.len()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&names[i]);
+            assert!(entry.is_dir);
+            assert_eq!(entry.rel_path, PathBuf::from(&prefix));
+        }
+        let leaf = &entries[names.len()];
+        assert!(!leaf.is_dir);
+        assert_eq!(leaf.rel_path, PathBuf::from(format!("{prefix}/leaf.txt")));
+        assert_eq!(leaf.whole_digest, b3(b"leaf"));
+        assert!(source.verify_stable().is_ok());
+
+        // Unwind deepest-first so TempDir cleanup stays within normal paths.
+        fs::remove_file(deep.join("leaf.txt")).unwrap();
+        while deep != root {
+            fs::remove_dir(&deep).unwrap();
+            deep.pop();
+        }
     }
 
     #[test]
@@ -1020,7 +1165,17 @@ mod tests {
 
         let target = LocalSaveTarget::open(&real).unwrap();
         assert_eq!(target.root(), real.canonicalize().unwrap());
-        assert_eq!(target.available_bytes(), None);
+        assert!(target.available_bytes().is_some());
+    }
+
+    #[test]
+    fn available_bytes_reports_positive_free_space_for_real_volume() {
+        let tmp = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(tmp.path()).unwrap();
+        assert!(
+            target.available_bytes().is_some_and(|free| free > 0),
+            "a mounted temp volume must report positive free space"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1070,6 +1225,42 @@ mod tests {
 
         assert_eq!(fs::read(&final_path).unwrap(), content);
         assert!(!part_path.exists(), "part file must disappear after finish");
+    }
+
+    #[test]
+    fn finish_preserves_source_mtime_on_committed_file() {
+        let content = b"mtime-payload";
+        let src_tmp = TempDir::new().unwrap();
+        let src_path = src_tmp.path().join("payload.bin");
+        wf(&src_path, content);
+        // A distinctive time one day in the past: a default "now" stamp on
+        // the receiver would not pass the comparison below.
+        let past = unix_ms(SystemTime::now()) - 86_400_000;
+        filetime::set_file_mtime(&src_path, mtime_file_time(past)).unwrap();
+
+        let source = LocalSource::open(&src_path, cs(8)).unwrap();
+        let entry = source.manifest().entries[0].clone();
+        assert!(
+            (entry.mtime_unix_ms - past).abs() < 2_000,
+            "source mtime should round-trip within fs precision"
+        );
+
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink, &source, &entry);
+        sink.finish().unwrap();
+
+        let final_path = dst.path().join("payload.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), content);
+        let got = mtime_ms(&final_path);
+        assert!(
+            (got - entry.mtime_unix_ms).abs() < 2_000,
+            "final mtime {got} must match manifest {} within fs precision",
+            entry.mtime_unix_ms
+        );
     }
 
     #[test]
@@ -1202,6 +1393,33 @@ mod tests {
             "original untouched"
         );
         assert!(!dst.path().join("payload.bin.akpart").exists());
+    }
+
+    #[test]
+    fn rename_conflict_in_deep_dir_handles_multi_dot_extension() {
+        let content = b"deep-archive-bytes";
+        let (_src_tmp, source, entry) = transfer_entry(content, 8);
+        let mut deep = entry.clone();
+        deep.rel_path = PathBuf::from("l1/l2/l3/l4/a.tar.gz");
+
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let dir = dst.path().join("l1/l2/l3/l4");
+        fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("a.tar.gz");
+        wf(&existing, b"old-archive");
+
+        let mut sink = target
+            .prepare_file_with_chunk_size(&deep, ConflictPolicy::Rename, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink, &source, &deep);
+        sink.finish().unwrap();
+
+        // Multi-dot names rename on the last extension only: a.tar.gz ->
+        // a.tar (2).gz, inside the same deep directory.
+        assert_eq!(fs::read(dir.join("a.tar (2).gz")).unwrap(), content);
+        assert_eq!(fs::read(&existing).unwrap(), b"old-archive");
+        assert!(!dir.join("a.tar.gz.akpart").exists());
     }
 
     #[test]
@@ -1383,6 +1601,32 @@ mod tests {
         sink.discard();
         assert!(!part_path.exists());
         assert!(!dst.path().join("payload.bin").exists());
+    }
+
+    #[test]
+    fn discard_orphan_parts_removes_only_stale_parts() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        let stale = tmp.path().join("stale.bin.akpart");
+        let fresh = tmp.path().join("fresh.bin.akpart");
+        let nested_stale = tmp.path().join("sub/nested.bin.akpart");
+        let old_plain = tmp.path().join("old-regular.txt");
+        wf(&stale, b"s");
+        wf(&fresh, b"f");
+        wf(&nested_stale, b"n");
+        wf(&old_plain, b"o");
+        // One hour old (fresh parts keep their just-written mtime).
+        let hour_ago = mtime_file_time(unix_ms(SystemTime::now()) - 3_600_000);
+        filetime::set_file_mtime(&stale, hour_ago).unwrap();
+        filetime::set_file_mtime(&nested_stale, hour_ago).unwrap();
+        filetime::set_file_mtime(&old_plain, hour_ago).unwrap();
+
+        let removed = discard_orphan_parts(tmp.path(), Duration::from_secs(600)).unwrap();
+        assert_eq!(removed, 2, "only the two stale parts");
+        assert!(!stale.exists());
+        assert!(!nested_stale.exists());
+        assert!(fresh.exists(), "recent part survives");
+        assert!(old_plain.exists(), "non-part files are never touched");
     }
 
     // -----------------------------------------------------------------------

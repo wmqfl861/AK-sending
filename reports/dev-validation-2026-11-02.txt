@@ -78,3 +78,33 @@ role: client, dialing 10.0.37.2:55199
 QUIC handshake OK path=LocalDirect peer=cce53fb54f6db5e4a7764234e4038a1a2dfc0aaf131efdd64cd5f322db55434a
 # 结论：协调面（信令/STUN/候选中继）与数据面（打洞 + 钉扎 QUIC 握手）全部工作；
 # 该验证在单机环回+本机网卡上进行，跨网段/真实 NAT 仍属 P0-05 未执行。
+
+## 第二轮并行开发验证（2026-11-02，dev/local-parallel）
+# 5 个并行子代理：引擎增强/CLI 配对管理/存储补强/场景测试/文档映射
+
+$ cargo test --workspace
+     11 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+      1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+      1 test result: ok. 13 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.94s
+      1 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+      1 test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 50.39s
+      1 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+      1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+      1 test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+      1 test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+      1 test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+      1 test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.48s
+
+# 场景测试（ak-itests，环回 L2）：11 项非 ignored 通过；20k 文件 release 变体通过（328s）
+# 缺陷修复：ResumeRequest 4096 条目上限（场景测试发现，引擎代理修复，4,097 边界实测转完整路径）
+# 新能力实测：双进程多流传输 7 文件字节一致；配对簿准入（未配对拒绝）；TOFU；jobs 列表/清理；接收循环
+# 5 GiB release 回归：95.96s 通过

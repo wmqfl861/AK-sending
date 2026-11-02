@@ -20,10 +20,22 @@
 //! The engine consumes `DirectChannel` values only — there is no API that
 //! accepts an unverified connection or a relay-ish transport.
 //!
-//! Known v1 limitations (deliberate, documented): no in-band Pause, no idle
-//! timeouts, receiver accepts one job per `receive()` call.
+//! v2 additions over the frozen v1 flow (all capability-negotiated):
+//! - idle timeouts: any receive wait longer than `idle_timeout` aborts with
+//!   [`EngineError::IdleTimeout`]; checkpoints and part files survive;
+//! - in-band Pause/Resume: the receiver may send `Control::Pause` while
+//!   chunks flow; the sender stops issuing new chunks until `Control::Resume`
+//!   (or the idle timeout fires);
+//! - optional multistream: when both Hellos carry `CAP_MULTISTREAM` and the
+//!   sender opts in, every file rides its own QUIC bidirectional stream (at
+//!   most `min(in_flight_window, 4)` concurrent), with per-file windowed
+//!   acks. Otherwise the single-stream v1 path runs unchanged.
+//!
+//! Known v1 limitations still true (deliberate, documented): receiver accepts
+//! one job per `receive()` call.
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -35,10 +47,13 @@ use ak_core::handle::{ConflictPolicy, FileSink, SourceHandle};
 use ak_core::manifest::Manifest;
 use ak_identity::tls::TlsBundle;
 use ak_identity::Fingerprint;
-use ak_net::{DirectEndpoint, DirectRecvStream};
+use ak_net::{DirectChannel, DirectEndpoint, DirectRecvStream, DirectSendStream, DirectStream};
 use ak_storage::{LocalSaveTarget, LocalSource};
 use ak_store::{CheckpointStore, Direction, FileCheckpoint, FileCheckpointStore, TaskRecord};
-use ak_wire::{Control, Frame, JobId, Limits, Message, ResumeEntry, WireEntry, CAP_RESUME};
+use ak_wire::{
+    Control, Frame, JobId, Limits, Message, ResumeEntry, WireEntry, CAP_MULTISTREAM,
+    CAP_PAUSE_RESUME, CAP_RESUME,
+};
 
 /// Manifest pages are assembled under this byte budget so every page fits a
 /// frame comfortably below `ak_wire::MAX_FRAME_BYTES`.
@@ -47,6 +62,27 @@ const PAGE_BUDGET_BYTES: usize = 4 << 20;
 const CHECKPOINT_EVERY_ACKS: u64 = 16;
 /// Wire protocol version this engine speaks.
 const PROTO_VERSION: u16 = 1;
+
+/// The one decode-limits profile used by every engine receive site in both
+/// roles. Encoding has no limits, so the decoder budget must cover whatever
+/// the peer's encoder produces: the receiver answers with a single
+/// ResumeRequest frame for every non-directory entry, which is why
+/// `max_resume_entries` matches [`ak_wire::MAX_RESUME_ENTRIES`] (the old
+/// 4,096 default made any larger job fail with `Oversized` on the sender).
+fn engine_limits() -> Limits {
+    Limits {
+        max_chunk_bytes: 8 << 20,
+        max_entries_per_page: 256,
+        max_string_bytes: 1024,
+        max_error_message_bytes: 256,
+        max_resume_entries: ak_wire::MAX_RESUME_ENTRIES,
+        max_chunk_digests: 65536,
+    }
+}
+/// Default idle timeout applied to every frame receive wait.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on concurrent per-file streams in multistream mode.
+const MAX_PARALLEL_STREAMS: usize = 4;
 
 /// Sender-side configuration.
 #[derive(Debug, Clone)]
@@ -66,6 +102,13 @@ pub struct SendSpec {
     pub checkpoint_dir: PathBuf,
     /// Maximum unacknowledged chunks in flight.
     pub in_flight_window: u32,
+    /// Abort when no frame arrives within this budget on any receive wait
+    /// (including while paused or waiting for acks).
+    pub idle_timeout: Duration,
+    /// Opt into parallel per-file streams. Takes effect only when the peer
+    /// also advertises `CAP_MULTISTREAM`; otherwise the single-stream path
+    /// runs. Also caps concurrent streams at `min(in_flight_window, 4)`.
+    pub multistream: bool,
 }
 
 impl SendSpec {
@@ -86,6 +129,8 @@ impl SendSpec {
             device_name: String::new(),
             checkpoint_dir: std::env::temp_dir().join("ak-sending-checkpoints"),
             in_flight_window: 8,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            multistream: false,
         }
     }
 }
@@ -103,6 +148,8 @@ pub struct ReceiveSpec {
     pub authorize: Box<dyn Fn(&Fingerprint) -> bool + Send + Sync>,
     pub device_name: String,
     pub checkpoint_dir: PathBuf,
+    /// Abort when no frame arrives within this budget on any receive wait.
+    pub idle_timeout: Duration,
 }
 
 impl ReceiveSpec {
@@ -116,6 +163,7 @@ impl ReceiveSpec {
             authorize: Box::new(|_| true),
             device_name: String::new(),
             checkpoint_dir: std::env::temp_dir().join("ak-sending-checkpoints"),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 }
@@ -155,6 +203,16 @@ pub enum Progress {
         file_index: u32,
         chunk_index: u64,
     },
+    /// Cumulative verified bytes of one file, piggybacked on the checkpoint
+    /// cadence (every [`CHECKPOINT_EVERY_ACKS`] acknowledged chunks).
+    BytesAcked {
+        file_index: u32,
+        cumulative_bytes: u64,
+    },
+    /// The peer asked us to stop sending; we hold until Resume or timeout.
+    Paused,
+    /// The peer let us continue after a Pause.
+    Resumed,
     FileVerified {
         file_index: u32,
     },
@@ -195,6 +253,8 @@ pub enum EngineError {
     PeerError { code: ErrorCode, message: String },
     #[error("peer vanished mid-transfer (checkpoint kept)")]
     PeerClosed,
+    #[error("idle timeout: no frame within {0:?} (checkpoint kept)")]
+    IdleTimeout(Duration),
     #[error("source changed during transfer")]
     SourceChanged,
     #[error("storage error: {0}")]
@@ -238,7 +298,7 @@ fn now_ms() -> u64 {
     ak_store::now_unix_ms()
 }
 
-fn hello_frame(name: &str, identity: &TlsBundle) -> Frame {
+fn hello_frame(name: &str, identity: &TlsBundle, capabilities: u16) -> Frame {
     let mut public = [0u8; 32];
     public.copy_from_slice(identity.fingerprint.as_bytes());
     // The peer verifies the certificate itself; the key field is a hint for
@@ -249,20 +309,28 @@ fn hello_frame(name: &str, identity: &TlsBundle) -> Frame {
             proto_version: PROTO_VERSION,
             device_name: name.chars().take(64).collect(),
             public_key: public,
-            capabilities: CAP_RESUME,
+            capabilities,
         },
     }
 }
 
+/// Capabilities this receiver advertises: it can always resume, honor
+/// Pause/Resume, and accept per-file parallel streams.
+const RECV_CAPABILITIES: u16 = CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM;
+
 async fn expect_hello(
     rx: &mut DirectRecvStream,
     limits: &Limits,
-    our_name: &str,
-    identity: &TlsBundle,
-) -> Result<(), EngineError> {
-    match rx.recv_frame(limits).await? {
+    idle: Duration,
+) -> Result<u16, EngineError> {
+    match recv_within(rx, limits, idle).await? {
         Frame {
-            message: Message::Hello { proto_version, .. },
+            message:
+                Message::Hello {
+                    proto_version,
+                    capabilities,
+                    ..
+                },
             ..
         } => {
             if proto_version != PROTO_VERSION {
@@ -271,14 +339,26 @@ async fn expect_hello(
                     message: format!("peer speaks protocol version {proto_version}"),
                 });
             }
-            let _ = (our_name, identity);
-            Ok(())
+            Ok(capabilities)
         }
         Frame {
             message: Message::Error { code, message },
             ..
         } => Err(EngineError::PeerError { code, message }),
         other => Err(unexpected(other.message)),
+    }
+}
+
+/// One frame receive under an idle deadline; silence past `idle` is fatal
+/// with [`EngineError::IdleTimeout`].
+async fn recv_within(
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+) -> Result<Frame, EngineError> {
+    match tokio::time::timeout(idle, rx.recv_frame(limits)).await {
+        Ok(result) => result.map_err(EngineError::Stream),
+        Err(_) => Err(EngineError::IdleTimeout(idle)),
     }
 }
 
@@ -358,19 +438,87 @@ async fn read_chunk_via(
     })
 }
 
+/// Sender-side ack window state, shared across drain calls of one transfer.
+struct AckWindow {
+    outstanding: u32,
+    paused: bool,
+    acks_since_progress: u64,
+}
+
+impl AckWindow {
+    fn new() -> Self {
+        AckWindow {
+            outstanding: 0,
+            paused: false,
+            acks_since_progress: 0,
+        }
+    }
+}
+
+/// Wait until the window has room again. While paused, no ack expectation is
+/// enforced: the loop only returns after a Resume (or fails on Cancel/Error/
+/// idle). Every ack also feeds byte-level progress at checkpoint cadence.
 async fn drain_acks(
     rx: &mut DirectRecvStream,
     limits: &Limits,
-    mut outstanding: u32,
     wanted: u32,
+    idle: Duration,
+    window: &mut AckWindow,
+    manifest: &Manifest,
     progress: &(dyn Fn(Progress) + Send + Sync),
-) -> Result<u32, EngineError> {
-    while outstanding > wanted {
-        match rx.recv_frame(limits).await? {
+) -> Result<(), EngineError> {
+    while window.outstanding > wanted || window.paused {
+        match recv_within(rx, limits, idle).await? {
             Frame {
-                message: Message::ChunkAck { .. },
+                message:
+                    Message::ChunkAck {
+                        file_index,
+                        chunk_index,
+                        ..
+                    },
                 ..
-            } => outstanding -= 1,
+            } => {
+                window.outstanding = window.outstanding.saturating_sub(1);
+                window.acks_since_progress += 1;
+                if window.acks_since_progress >= CHECKPOINT_EVERY_ACKS {
+                    window.acks_since_progress = 0;
+                    if let Some(entry) = manifest.entries.get(file_index as usize) {
+                        let cumulative = (chunk_index + 1)
+                            .saturating_mul(u64::from(manifest.chunk_size.get()))
+                            .min(entry.size);
+                        progress(Progress::BytesAcked {
+                            file_index,
+                            cumulative_bytes: cumulative,
+                        });
+                    }
+                }
+            }
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Pause,
+                        ..
+                    },
+                ..
+            } => {
+                if !window.paused {
+                    window.paused = true;
+                    progress(Progress::Paused);
+                }
+            }
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Resume,
+                        ..
+                    },
+                ..
+            } => {
+                if window.paused {
+                    window.paused = false;
+                    progress(Progress::Resumed);
+                }
+            }
             Frame {
                 message:
                     Message::Control {
@@ -385,9 +533,318 @@ async fn drain_acks(
             } => return Err(EngineError::PeerError { code, message }),
             other => return Err(unexpected(other.message)),
         }
-        let _ = progress;
     }
-    Ok(outstanding)
+    Ok(())
+}
+
+/// Sender-side progress relay from per-file stream tasks to the driver.
+enum SendEvent {
+    ChunkSent {
+        file_index: u32,
+        chunk_index: u64,
+    },
+    BytesAcked {
+        file_index: u32,
+        cumulative_bytes: u64,
+    },
+    Paused,
+    Resumed,
+}
+
+/// Send every file on its own QUIC bidirectional stream, at most
+/// `min(in_flight_window, 4)` at a time. Files fully covered by resume are
+/// skipped: no stream is opened for them.
+#[allow(clippy::too_many_arguments)]
+async fn multistream_send_files(
+    channel: &Arc<DirectChannel>,
+    source: &Arc<LocalSource>,
+    manifest: &Manifest,
+    skip: &[u64],
+    in_flight_window: u32,
+    idle: Duration,
+    job_id: JobId,
+    record: &mut TaskRecord,
+    store: &FileCheckpointStore,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<(), EngineError> {
+    let limits = engine_limits();
+    let window = in_flight_window.max(1);
+    let concurrency = (window as usize).min(MAX_PARALLEL_STREAMS);
+    let mut work: VecDeque<u32> = manifest
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            !entry.is_dir
+                && skip
+                    .get(*index)
+                    .is_some_and(|skip| *skip < entry.chunk_digests.len() as u64)
+        })
+        .map(|(index, _)| index as u32)
+        .collect();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<SendEvent>(64);
+    let mut set: tokio::task::JoinSet<Result<u32, EngineError>> = tokio::task::JoinSet::new();
+    let mut events_alive = true;
+    loop {
+        while set.len() < concurrency {
+            let Some(file_index) = work.pop_front() else {
+                break;
+            };
+            let entry = &manifest.entries[file_index as usize];
+            progress(Progress::FileStarted {
+                file_index,
+                path: entry.rel_path.to_string_lossy().replace('\\', "/"),
+                bytes: entry.size,
+            });
+            set.spawn(multistream_file_send(
+                Arc::clone(channel),
+                Arc::clone(source),
+                job_id,
+                file_index,
+                entry.size,
+                skip[file_index as usize],
+                manifest.chunk_size,
+                window,
+                idle,
+                limits,
+                events_tx.clone(),
+            ));
+        }
+        if set.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            event = events_rx.recv(), if events_alive => {
+                match event {
+                    Some(SendEvent::ChunkSent { file_index, chunk_index }) => {
+                        progress(Progress::ChunkSent { file_index, chunk_index })
+                    }
+                    Some(SendEvent::BytesAcked {
+                        file_index,
+                        cumulative_bytes,
+                    }) => progress(Progress::BytesAcked {
+                        file_index,
+                        cumulative_bytes,
+                    }),
+                    Some(SendEvent::Paused) => progress(Progress::Paused),
+                    Some(SendEvent::Resumed) => progress(Progress::Resumed),
+                    None => events_alive = false,
+                }
+            }
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(Ok(file_index))) => {
+                        if let (Some(entry), Some(checkpoint)) = (
+                            manifest.entries.get(file_index as usize),
+                            record.files.get_mut(file_index as usize),
+                        ) {
+                            checkpoint.verified_prefix_chunks = entry.chunk_digests.len() as u64;
+                        }
+                        record.updated_unix_ms = now_ms();
+                        store.save(record).map_err(EngineError::Checkpoint)?;
+                    }
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(join)) => {
+                        return Err(EngineError::Io(std::io::Error::other(format!(
+                            "file stream task failed: {join}"
+                        ))))
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// One file over one dedicated stream: sequential chunks with a per-stream
+/// windowed acks, Pause/Resume honored mid-stream, then a half-close after
+/// the last ack. Returns the file index for checkpoint bookkeeping.
+#[allow(clippy::too_many_arguments)]
+async fn multistream_file_send(
+    channel: Arc<DirectChannel>,
+    source: Arc<LocalSource>,
+    job_id: JobId,
+    file_index: u32,
+    file_size: u64,
+    skip: u64,
+    chunk_size: NonZeroU32,
+    window: u32,
+    idle: Duration,
+    limits: Limits,
+    events: tokio::sync::mpsc::Sender<SendEvent>,
+) -> Result<u32, EngineError> {
+    let stream = channel.open_bi().await?;
+    let (mut tx, mut rx) = stream.split();
+    let plan = ak_core::chunk::ChunkPlan::new(file_size, chunk_size);
+    let mut outstanding: u32 = 0;
+    let mut paused = false;
+    let mut acks_since_progress: u64 = 0;
+    for chunk_index in skip..plan.chunk_count() {
+        if paused {
+            drain_file_acks(
+                &mut rx,
+                &limits,
+                0,
+                idle,
+                &mut outstanding,
+                &mut paused,
+                file_index,
+                file_size,
+                chunk_size,
+                &mut acks_since_progress,
+                &events,
+            )
+            .await?;
+        }
+        let range = plan.range(chunk_index).ok_or(EngineError::SourceChanged)?;
+        let len = (range.end - range.start) as usize;
+        let data = read_chunk_via(Arc::clone(&source), file_index, chunk_index, len).await?;
+        if data.len() != len {
+            return Err(EngineError::SourceChanged);
+        }
+        tx.send_frame(&Frame {
+            version: ak_wire::VERSION,
+            message: Message::Chunk {
+                job_id,
+                file_index,
+                chunk_index,
+                data,
+            },
+        })
+        .await?;
+        outstanding += 1;
+        if events
+            .send(SendEvent::ChunkSent {
+                file_index,
+                chunk_index,
+            })
+            .await
+            .is_err()
+        {
+            return Err(EngineError::Cancelled);
+        }
+        if outstanding >= window {
+            drain_file_acks(
+                &mut rx,
+                &limits,
+                window - 1,
+                idle,
+                &mut outstanding,
+                &mut paused,
+                file_index,
+                file_size,
+                chunk_size,
+                &mut acks_since_progress,
+                &events,
+            )
+            .await?;
+        }
+    }
+    drain_file_acks(
+        &mut rx,
+        &limits,
+        0,
+        idle,
+        &mut outstanding,
+        &mut paused,
+        file_index,
+        file_size,
+        chunk_size,
+        &mut acks_since_progress,
+        &events,
+    )
+    .await?;
+    tx.finish()?;
+    Ok(file_index)
+}
+
+/// Per-file variant of [`drain_acks`] for multistream tasks: progress goes
+/// through an event channel because the driver owns the progress callback.
+#[allow(clippy::too_many_arguments)]
+async fn drain_file_acks(
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    wanted: u32,
+    idle: Duration,
+    outstanding: &mut u32,
+    paused: &mut bool,
+    file_index: u32,
+    file_size: u64,
+    chunk_size: NonZeroU32,
+    acks_since_progress: &mut u64,
+    events: &tokio::sync::mpsc::Sender<SendEvent>,
+) -> Result<(), EngineError> {
+    while *outstanding > wanted || *paused {
+        match recv_within(rx, limits, idle).await? {
+            Frame {
+                message: Message::ChunkAck { chunk_index, .. },
+                ..
+            } => {
+                *outstanding = outstanding.saturating_sub(1);
+                *acks_since_progress += 1;
+                if *acks_since_progress >= CHECKPOINT_EVERY_ACKS {
+                    *acks_since_progress = 0;
+                    let cumulative = (chunk_index + 1)
+                        .saturating_mul(u64::from(chunk_size.get()))
+                        .min(file_size);
+                    if events
+                        .send(SendEvent::BytesAcked {
+                            file_index,
+                            cumulative_bytes: cumulative,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err(EngineError::Cancelled);
+                    }
+                }
+            }
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Pause,
+                        ..
+                    },
+                ..
+            } => {
+                if !*paused {
+                    *paused = true;
+                    if events.send(SendEvent::Paused).await.is_err() {
+                        return Err(EngineError::Cancelled);
+                    }
+                }
+            }
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Resume,
+                        ..
+                    },
+                ..
+            } => {
+                if *paused {
+                    *paused = false;
+                    if events.send(SendEvent::Resumed).await.is_err() {
+                        return Err(EngineError::Cancelled);
+                    }
+                }
+            }
+            Frame {
+                message:
+                    Message::Control {
+                        control: Control::Cancel,
+                        ..
+                    },
+                ..
+            } => return Err(EngineError::Cancelled),
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        }
+    }
+    Ok(())
 }
 
 /// Run one send to completion. Progress callbacks are synchronous and must
@@ -397,7 +854,7 @@ pub async fn send(
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, EngineError> {
     let started = Instant::now();
-    let limits = Limits::default();
+    let limits = engine_limits();
     let source = Arc::new(LocalSource::open(&spec.source_root, spec.chunk_size)?);
     let manifest = source.manifest().clone();
     let root_name = source.root_name();
@@ -409,16 +866,25 @@ pub async fn send(
 
     progress(Progress::Connecting);
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
-    let channel = endpoint.connect(spec.peer, &spec.pinned).await?;
+    let channel = Arc::new(endpoint.connect(spec.peer, &spec.pinned).await?);
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
     });
     let stream = channel.open_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
-    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity))
-        .await?;
-    expect_hello(&mut rx, &limits, &spec.device_name, &spec.identity).await?;
+    let mut capabilities = CAP_RESUME | CAP_PAUSE_RESUME;
+    if spec.multistream {
+        capabilities |= CAP_MULTISTREAM;
+    }
+    tx.send_frame(&hello_frame(
+        &spec.device_name,
+        &spec.identity,
+        capabilities,
+    ))
+    .await?;
+    let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
+    let multistream = spec.multistream && (peer_caps & CAP_MULTISTREAM) != 0;
 
     // Offer -> Accept/Reject (receiver consent is mandatory).
     tx.send_frame(&Frame {
@@ -436,7 +902,7 @@ pub async fn send(
         files: manifest.file_count(),
         bytes: manifest.total_bytes(),
     });
-    match rx.recv_frame(&limits).await? {
+    match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
         Frame {
             message: Message::Accept { .. },
             ..
@@ -473,7 +939,7 @@ pub async fn send(
     }
 
     // ResumeRequest: skip the receiver's verified prefixes.
-    let resume: Vec<ResumeEntry> = match rx.recv_frame(&limits).await? {
+    let resume: Vec<ResumeEntry> = match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
         Frame {
             message: Message::ResumeRequest { files, .. },
             ..
@@ -498,54 +964,100 @@ pub async fn send(
         });
     }
 
-    // Chunk transfer with a bounded ack window on the same stream.
-    let window = spec.in_flight_window.max(1);
-    let mut outstanding: u32 = 0;
-    for (file_index, entry) in manifest.entries.iter().enumerate() {
-        if entry.is_dir {
-            continue;
-        }
-        progress(Progress::FileStarted {
-            file_index: file_index as u32,
-            path: entry.rel_path.to_string_lossy().replace('\\', "/"),
-            bytes: entry.size,
-        });
-        let plan = ak_core::chunk::ChunkPlan::new(entry.size, spec.chunk_size);
-        for chunk_index in skip[file_index]..plan.chunk_count() {
-            let range = plan.range(chunk_index).ok_or(EngineError::SourceChanged)?;
-            let len = (range.end - range.start) as usize;
-            let data =
-                read_chunk_via(Arc::clone(&source), file_index as u32, chunk_index, len).await?;
-            if data.len() != len {
-                return Err(EngineError::SourceChanged);
+    // Chunk transfer. Multistream mode rides one QUIC stream per file; the
+    // single-stream path keeps the frozen v1 wire behavior.
+    if multistream {
+        multistream_send_files(
+            &channel,
+            &source,
+            &manifest,
+            &skip,
+            spec.in_flight_window,
+            spec.idle_timeout,
+            job_id,
+            &mut record,
+            &store,
+            progress,
+        )
+        .await?;
+    } else {
+        let window_size = spec.in_flight_window.max(1);
+        let mut acks = AckWindow::new();
+        for (file_index, entry) in manifest.entries.iter().enumerate() {
+            if entry.is_dir {
+                continue;
             }
-            tx.send_frame(&Frame {
-                version: ak_wire::VERSION,
-                message: Message::Chunk {
-                    job_id,
+            progress(Progress::FileStarted {
+                file_index: file_index as u32,
+                path: entry.rel_path.to_string_lossy().replace('\\', "/"),
+                bytes: entry.size,
+            });
+            let plan = ak_core::chunk::ChunkPlan::new(entry.size, spec.chunk_size);
+            for chunk_index in skip[file_index]..plan.chunk_count() {
+                if acks.paused {
+                    drain_acks(
+                        &mut rx,
+                        &limits,
+                        window_size - 1,
+                        spec.idle_timeout,
+                        &mut acks,
+                        &manifest,
+                        progress,
+                    )
+                    .await?;
+                }
+                let range = plan.range(chunk_index).ok_or(EngineError::SourceChanged)?;
+                let len = (range.end - range.start) as usize;
+                let data = read_chunk_via(Arc::clone(&source), file_index as u32, chunk_index, len)
+                    .await?;
+                if data.len() != len {
+                    return Err(EngineError::SourceChanged);
+                }
+                tx.send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::Chunk {
+                        job_id,
+                        file_index: file_index as u32,
+                        chunk_index,
+                        data,
+                    },
+                })
+                .await?;
+                acks.outstanding += 1;
+                progress(Progress::ChunkSent {
                     file_index: file_index as u32,
                     chunk_index,
-                    data,
-                },
-            })
-            .await?;
-            outstanding += 1;
-            progress(Progress::ChunkSent {
-                file_index: file_index as u32,
-                chunk_index,
-            });
-            if outstanding >= window {
-                outstanding =
-                    drain_acks(&mut rx, &limits, outstanding, window - 1, progress).await?;
+                });
+                if acks.outstanding >= window_size {
+                    drain_acks(
+                        &mut rx,
+                        &limits,
+                        window_size - 1,
+                        spec.idle_timeout,
+                        &mut acks,
+                        &manifest,
+                        progress,
+                    )
+                    .await?;
+                }
             }
+            // Keep checkpointed progress roughly current per file.
+            record.files[file_index].verified_prefix_chunks =
+                manifest.entries[file_index].chunk_digests.len() as u64;
+            record.updated_unix_ms = now_ms();
+            store.save(&record).map_err(EngineError::Checkpoint)?;
         }
-        // Keep checkpointed progress roughly current per file.
-        record.files[file_index].verified_prefix_chunks =
-            manifest.entries[file_index].chunk_digests.len() as u64;
-        record.updated_unix_ms = now_ms();
-        store.save(&record).map_err(EngineError::Checkpoint)?;
+        drain_acks(
+            &mut rx,
+            &limits,
+            0,
+            spec.idle_timeout,
+            &mut acks,
+            &manifest,
+            progress,
+        )
+        .await?;
     }
-    drain_acks(&mut rx, &limits, outstanding, 0, progress).await?;
 
     // Final integrity gate on the source, then Finalize.
     source
@@ -556,16 +1068,23 @@ pub async fn send(
         message: Message::Finalize { job_id },
     })
     .await?;
-    let verified = match rx.recv_frame(&limits).await? {
-        Frame {
-            message: Message::FinalAck { verified, .. },
-            ..
-        } => verified,
-        Frame {
-            message: Message::Error { code, message },
-            ..
-        } => return Err(EngineError::PeerError { code, message }),
-        other => return Err(unexpected(other.message)),
+    // Pause/Resume is tolerated at the gate; only the verdict matters here.
+    let verified = loop {
+        match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
+            Frame {
+                message: Message::FinalAck { verified, .. },
+                ..
+            } => break verified,
+            Frame {
+                message: Message::Control { .. },
+                ..
+            } => continue,
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        }
     };
     progress(Progress::FinalAck { verified });
     if !verified {
@@ -602,7 +1121,7 @@ pub async fn receive_with_addr(
     addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> Result<Report, EngineError> {
     let started = Instant::now();
-    let limits = Limits::default();
+    let limits = engine_limits();
     let target = LocalSaveTarget::open(&spec.out_dir)?;
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
 
@@ -616,30 +1135,36 @@ pub async fn receive_with_addr(
     let stream = channel.accept_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
-    tx.send_frame(&hello_frame(&spec.device_name, &spec.identity))
-        .await?;
-    expect_hello(&mut rx, &limits, &spec.device_name, &spec.identity).await?;
+    tx.send_frame(&hello_frame(
+        &spec.device_name,
+        &spec.identity,
+        RECV_CAPABILITIES,
+    ))
+    .await?;
+    let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
+    let multistream = (peer_caps & CAP_MULTISTREAM) != 0;
 
     // Offer -> consent -> Accept. Channel-level consent already happened via
     // the authorize callback; the offer is accepted per current product copy.
-    let (job_id, file_count, total_bytes, chunk_size) = match rx.recv_frame(&limits).await? {
-        Frame {
-            message:
-                Message::Offer {
-                    job_id,
-                    file_count,
-                    total_bytes,
-                    chunk_size,
-                    ..
-                },
-            ..
-        } => (job_id, file_count, total_bytes, chunk_size),
-        Frame {
-            message: Message::Error { code, message },
-            ..
-        } => return Err(EngineError::PeerError { code, message }),
-        other => return Err(unexpected(other.message)),
-    };
+    let (job_id, file_count, total_bytes, chunk_size) =
+        match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
+            Frame {
+                message:
+                    Message::Offer {
+                        job_id,
+                        file_count,
+                        total_bytes,
+                        chunk_size,
+                        ..
+                    },
+                ..
+            } => (job_id, file_count, total_bytes, chunk_size),
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        };
     progress(Progress::Offered {
         files: file_count,
         bytes: total_bytes,
@@ -657,7 +1182,7 @@ pub async fn receive_with_addr(
     // Manifest pages.
     let mut entries: Vec<ak_core::manifest::FileEntry> = Vec::new();
     loop {
-        match rx.recv_frame(&limits).await? {
+        match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
             Frame {
                 message:
                     Message::ManifestPage {
@@ -716,14 +1241,6 @@ pub async fn receive_with_addr(
             chunks: resumed_chunks,
         });
     }
-    tx.send_frame(&Frame {
-        version: ak_wire::VERSION,
-        message: Message::ResumeRequest {
-            job_id,
-            files: resume,
-        },
-    })
-    .await?;
 
     let mut record = TaskRecord {
         job_id,
@@ -748,16 +1265,184 @@ pub async fn receive_with_addr(
             })
             .collect(),
     };
-    store.save(&record).map_err(EngineError::Checkpoint)?;
 
-    // Chunk loop: write, verify, ack, checkpoint periodically.
+    // Everything below can fail mid-transfer; the outcome wrapper then
+    // discards empty part files so a failed receive leaves no litter.
+    // Parts holding verified chunks always survive for resume.
+    let outcome = async {
+        tx.send_frame(&Frame {
+            version: ak_wire::VERSION,
+            message: Message::ResumeRequest {
+                job_id,
+                files: resume,
+            },
+        })
+        .await?;
+        store.save(&record).map_err(EngineError::Checkpoint)?;
+
+        // Chunk phase: the frozen single-stream loop, or per-file streams
+        // when both sides announced CAP_MULTISTREAM.
+        let tail = if multistream {
+            TailHold::Events(
+                multistream_receive(
+                    &channel,
+                    rx,
+                    job_id,
+                    chunk_size,
+                    &job.manifest,
+                    &mut sinks,
+                    &mut record,
+                    &store,
+                    spec.idle_timeout,
+                    progress,
+                )
+                .await?,
+            )
+        } else {
+            TailHold::Stream(
+                receive_single_stream(
+                    rx,
+                    &mut tx,
+                    job_id,
+                    chunk_size,
+                    &job.manifest,
+                    &mut sinks,
+                    &mut record,
+                    &store,
+                    spec.idle_timeout,
+                    progress,
+                )
+                .await?,
+            )
+        };
+
+        // Verify and commit every file; only then report completion.
+        progress(Progress::Verifying);
+        for (index, sink_slot) in sinks.iter_mut().enumerate() {
+            if let Some(mut sink) = sink_slot.take() {
+                if job.manifest.entries[index].is_dir {
+                    sink.finish().map_err(EngineError::Io)?;
+                    continue;
+                }
+                sink.finish().map_err(EngineError::Io)?;
+                record.files[index].verified_prefix_chunks =
+                    job.manifest.entries[index].chunk_digests.len() as u64;
+                progress(Progress::FileVerified {
+                    file_index: index as u32,
+                });
+                progress(Progress::FileCommitted {
+                    file_index: index as u32,
+                    path: job.manifest.entries[index]
+                        .rel_path
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                });
+            }
+        }
+        // Completion marker strictly after verification and commit (PROTOCOL).
+        record.state = "completed".into();
+        record.updated_unix_ms = now_ms();
+        store.save(&record).map_err(EngineError::Checkpoint)?;
+        tx.send_frame(&Frame {
+            version: ak_wire::VERSION,
+            message: Message::FinalAck {
+                job_id,
+                verified: true,
+            },
+        })
+        .await?;
+        tx.finish()?;
+        progress(Progress::FinalAck { verified: true });
+        // Hold the connection until the sender observes the FinalAck:
+        // dropping this endpoint on return would close the QUIC connection
+        // immediately and could discard the FinalAck before the peer reads
+        // it.
+        match tail {
+            TailHold::Events(mut events) => {
+                // The control-reader task drains until the sender
+                // half-closes its side after reading the FinalAck; that
+                // closes this channel.
+                let _ = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
+            }
+            TailHold::Stream(mut rx_tail) => {
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if rx_tail.recv_frame(&limits).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+        progress(Progress::Done);
+
+        Ok(Report {
+            job_id,
+            files: job.manifest.file_count(),
+            bytes: job.manifest.total_bytes(),
+            duration: started.elapsed(),
+            resumed_chunks,
+            peer_fingerprint: Some(channel.peer_fingerprint().to_hex()),
+        })
+    }
+    .await;
+
+    match outcome {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            // Sinks consumed by multistream tasks are already gone; every
+            // sink still held here with no verified chunk is pure litter.
+            for slot in sinks.iter_mut() {
+                let empty = slot
+                    .as_ref()
+                    .is_some_and(|sink| sink.verified_prefix_chunks() == 0);
+                if empty {
+                    if let Some(sink) = slot.take() {
+                        sink.discard();
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// How to hold the connection open until the sender observed the FinalAck.
+enum TailHold {
+    /// Single-stream mode: drain the control stream receive half.
+    Stream(DirectRecvStream),
+    /// Multistream mode: the control-reader task drains; its exit closes
+    /// the event channel, which is what we await.
+    Events(tokio::sync::mpsc::Receiver<StreamEvent>),
+}
+
+/// Frozen v1 chunk loop: one stream, chunks one way, windowed acks the
+/// other way. Returns the receive half so the caller can hold the
+/// connection for the FinalAck.
+#[allow(clippy::too_many_arguments)]
+async fn receive_single_stream(
+    mut rx: DirectRecvStream,
+    tx: &mut DirectSendStream,
+    job_id: JobId,
+    chunk_size: NonZeroU32,
+    manifest: &Manifest,
+    sinks: &mut [Option<ak_storage::LocalFileSink>],
+    record: &mut TaskRecord,
+    store: &FileCheckpointStore,
+    idle: Duration,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<DirectRecvStream, EngineError> {
+    let limits = engine_limits();
     let mut acks_since_checkpoint: u64 = 0;
     let mut current_file: u32 = u32::MAX;
     'transfer: loop {
-        let frame = match rx.recv_frame(&limits).await {
+        let frame = match recv_within(&mut rx, &limits, idle).await {
             Ok(frame) => frame,
-            Err(ak_net::StreamError::Connection(_)) => return Err(EngineError::PeerClosed),
-            Err(e) => return Err(e.into()),
+            Err(EngineError::Stream(ak_net::StreamError::Connection(_))) => {
+                return Err(EngineError::PeerClosed)
+            }
+            Err(e) => return Err(e),
         };
         match frame.message {
             Message::Chunk {
@@ -766,13 +1451,15 @@ pub async fn receive_with_addr(
                 data,
                 ..
             } => {
-                let sink = sinks[file_index as usize]
-                    .as_mut()
+                let sink = sinks
+                    .get_mut(file_index as usize)
+                    .and_then(Option::as_mut)
                     .ok_or(EngineError::PeerClosed)?;
                 sink.write_chunk(chunk_index, &data)
                     .map_err(EngineError::Io)?;
-                record.files[file_index as usize].verified_prefix_chunks =
-                    sink.verified_prefix_chunks();
+                if let Some(slot) = record.files.get_mut(file_index as usize) {
+                    slot.verified_prefix_chunks = sink.verified_prefix_chunks();
+                }
                 tx.send_frame(&Frame {
                     version: ak_wire::VERSION,
                     message: Message::ChunkAck {
@@ -784,16 +1471,13 @@ pub async fn receive_with_addr(
                 .await?;
                 if file_index != current_file {
                     current_file = file_index;
-                    let path = job.manifest.entries[file_index as usize]
-                        .rel_path
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let bytes = job.manifest.entries[file_index as usize].size;
-                    progress(Progress::FileStarted {
-                        file_index,
-                        path,
-                        bytes,
-                    });
+                    if let Some(entry) = manifest.entries.get(file_index as usize) {
+                        progress(Progress::FileStarted {
+                            file_index,
+                            path: entry.rel_path.to_string_lossy().replace('\\', "/"),
+                            bytes: entry.size,
+                        });
+                    }
                 }
                 progress(Progress::ChunkReceived {
                     file_index,
@@ -803,7 +1487,17 @@ pub async fn receive_with_addr(
                 if acks_since_checkpoint >= CHECKPOINT_EVERY_ACKS {
                     acks_since_checkpoint = 0;
                     record.updated_unix_ms = now_ms();
-                    store.save(&record).map_err(EngineError::Checkpoint)?;
+                    store.save(record).map_err(EngineError::Checkpoint)?;
+                    if let Some(entry) = manifest.entries.get(file_index as usize) {
+                        let cumulative = sink
+                            .verified_prefix_chunks()
+                            .saturating_mul(u64::from(chunk_size.get()))
+                            .min(entry.size);
+                        progress(Progress::BytesAcked {
+                            file_index,
+                            cumulative_bytes: cumulative,
+                        });
+                    }
                 }
             }
             Message::Finalize { .. } => break 'transfer,
@@ -817,65 +1511,292 @@ pub async fn receive_with_addr(
             other => return Err(unexpected(other)),
         }
     }
+    Ok(rx)
+}
 
-    // Verify and commit every file; only then report completion.
-    progress(Progress::Verifying);
-    for (index, sink_slot) in sinks.iter_mut().enumerate() {
-        if let Some(mut sink) = sink_slot.take() {
-            if job.manifest.entries[index].is_dir {
-                sink.finish().map_err(EngineError::Io)?;
-                continue;
+/// Event from a receiver-side stream task back to the driver loop.
+enum StreamEvent {
+    Chunk {
+        file_index: u32,
+        chunk_index: u64,
+    },
+    /// The file's stream FINed after the last ack; the sink travels back for
+    /// the shared verify/commit phase.
+    FileDone {
+        file_index: u32,
+        sink: ak_storage::LocalFileSink,
+    },
+    /// A stream task or the control stream failed.
+    Failed(EngineError),
+    /// Finalize observed on the control stream.
+    Finalize,
+    Cancelled,
+}
+
+/// Receive a multistream job: accept per-file streams until Finalize, drive
+/// each stream in its own task (write/verify/ack), keep the checkpoint
+/// current at the same cadence as the single-stream path. Returns the event
+/// channel tail for the FinalAck hold (the control task keeps draining).
+#[allow(clippy::too_many_arguments)]
+async fn multistream_receive(
+    channel: &DirectChannel,
+    control_rx: DirectRecvStream,
+    job_id: JobId,
+    chunk_size: NonZeroU32,
+    manifest: &Manifest,
+    sinks: &mut [Option<ak_storage::LocalFileSink>],
+    record: &mut TaskRecord,
+    store: &FileCheckpointStore,
+    idle: Duration,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, EngineError> {
+    let limits = engine_limits();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+
+    // Control-stream reader: forwards Finalize/Cancel/Error, then keeps
+    // draining silently so the connection is held until the sender
+    // half-closes after reading the FinalAck.
+    let control_tx = events_tx.clone();
+    tokio::spawn(async move {
+        let mut rx = control_rx;
+        let mut finalized = false;
+        loop {
+            let frame = match tokio::time::timeout(idle, rx.recv_frame(&limits)).await {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(ak_net::StreamError::Connection(_))) | Err(_) => break,
+                Ok(Err(e)) => {
+                    let _ = control_tx.send(StreamEvent::Failed(e.into())).await;
+                    break;
+                }
+            };
+            match frame.message {
+                Message::Finalize { .. } if !finalized => {
+                    finalized = true;
+                    if control_tx.send(StreamEvent::Finalize).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Control {
+                    control: Control::Cancel,
+                    ..
+                } => {
+                    let _ = control_tx.send(StreamEvent::Cancelled).await;
+                    break;
+                }
+                Message::Error { code, message } => {
+                    let _ = control_tx
+                        .send(StreamEvent::Failed(EngineError::PeerError {
+                            code,
+                            message,
+                        }))
+                        .await;
+                    break;
+                }
+                other => {
+                    let _ = control_tx
+                        .send(StreamEvent::Failed(unexpected(other)))
+                        .await;
+                    break;
+                }
             }
-            sink.finish().map_err(EngineError::Io)?;
-            record.files[index].verified_prefix_chunks =
-                job.manifest.entries[index].chunk_digests.len() as u64;
-            progress(Progress::FileVerified {
-                file_index: index as u32,
-            });
-            progress(Progress::FileCommitted {
-                file_index: index as u32,
-                path: job.manifest.entries[index]
-                    .rel_path
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            });
+        }
+    });
+
+    let mut finalized = false;
+    let mut open_streams = 0usize;
+    let mut acks_since_checkpoint: u64 = 0;
+    let mut last_activity = Instant::now();
+    loop {
+        if finalized && open_streams == 0 {
+            break;
+        }
+        // Accept waits share the idle budget: any chunk or ack event on an
+        // already-open stream refreshes it.
+        let budget = idle.saturating_sub(last_activity.elapsed());
+        if budget.is_zero() {
+            return Err(EngineError::IdleTimeout(idle));
+        }
+        tokio::select! {
+            event = events_rx.recv() => {
+                let Some(event) = event else {
+                    // Every producer ended. Without Finalize nothing more can
+                    // arrive; with Finalize all streams already finished.
+                    if finalized {
+                        break;
+                    }
+                    return Err(EngineError::PeerClosed);
+                };
+                last_activity = Instant::now();
+                match event {
+                    StreamEvent::Chunk { file_index, chunk_index } => {
+                        let Some(slot) = record.files.get_mut(file_index as usize) else {
+                            return Err(EngineError::PeerClosed);
+                        };
+                        slot.verified_prefix_chunks =
+                            slot.verified_prefix_chunks.max(chunk_index + 1);
+                        progress(Progress::ChunkReceived { file_index, chunk_index });
+                        acks_since_checkpoint += 1;
+                        if acks_since_checkpoint >= CHECKPOINT_EVERY_ACKS {
+                            acks_since_checkpoint = 0;
+                            record.updated_unix_ms = now_ms();
+                            let prefix = slot.verified_prefix_chunks;
+                            store.save(record).map_err(EngineError::Checkpoint)?;
+                            if let Some(entry) = manifest.entries.get(file_index as usize) {
+                                let cumulative = prefix
+                                    .saturating_mul(u64::from(chunk_size.get()))
+                                    .min(entry.size);
+                                progress(Progress::BytesAcked {
+                                    file_index,
+                                    cumulative_bytes: cumulative,
+                                });
+                            }
+                        }
+                    }
+                    StreamEvent::FileDone { file_index, sink } => {
+                        open_streams = open_streams.saturating_sub(1);
+                        if let Some(slot) = sinks.get_mut(file_index as usize) {
+                            *slot = Some(sink);
+                        }
+                        if let Some(entry) = manifest.entries.get(file_index as usize) {
+                            if let Some(checkpoint) = record.files.get_mut(file_index as usize) {
+                                checkpoint.verified_prefix_chunks =
+                                    entry.chunk_digests.len() as u64;
+                            }
+                        }
+                    }
+                    StreamEvent::Failed(error) => return Err(error),
+                    StreamEvent::Finalize => finalized = true,
+                    StreamEvent::Cancelled => return Err(EngineError::Cancelled),
+                }
+            }
+            accepted = tokio::time::timeout(budget, channel.accept_bi()), if !finalized => {
+                match accepted {
+                    Err(_elapsed) => return Err(EngineError::IdleTimeout(idle)),
+                    Ok(Err(e)) => return Err(EngineError::Stream(e)),
+                    Ok(Ok(mut stream)) => {
+                        last_activity = Instant::now();
+                        // The first frame on a new stream names its file.
+                        let first = match tokio::time::timeout(idle, stream.recv_frame(&limits)).await {
+                            Ok(Ok(frame)) => frame,
+                            Ok(Err(e)) => return Err(EngineError::Stream(e)),
+                            Err(_) => return Err(EngineError::IdleTimeout(idle)),
+                        };
+                        let Message::Chunk { file_index, .. } = first.message else {
+                            return Err(unexpected(first.message));
+                        };
+                        let sink = sinks
+                            .get_mut(file_index as usize)
+                            .and_then(Option::take)
+                            .ok_or(EngineError::PeerClosed)?;
+                        if let Some(entry) = manifest.entries.get(file_index as usize) {
+                            progress(Progress::FileStarted {
+                                file_index,
+                                path: entry.rel_path.to_string_lossy().replace('\\', "/"),
+                                bytes: entry.size,
+                            });
+                        }
+                        open_streams += 1;
+                        receive_stream_task(
+                            stream,
+                            sink,
+                            file_index,
+                            first,
+                            job_id,
+                            idle,
+                            events_tx.clone(),
+                        );
+                    }
+                }
+            }
         }
     }
-    // Completion marker strictly after verification and commit (PROTOCOL).
-    record.state = "completed".into();
-    record.updated_unix_ms = now_ms();
-    store.save(&record).map_err(EngineError::Checkpoint)?;
-    tx.send_frame(&Frame {
-        version: ak_wire::VERSION,
-        message: Message::FinalAck {
-            job_id,
-            verified: true,
-        },
-    })
-    .await?;
-    tx.finish()?;
-    progress(Progress::FinalAck { verified: true });
-    // Hold the connection until the sender observes the FinalAck: dropping
-    // this endpoint on return would close the QUIC connection immediately
-    // and could discard the FinalAck before the peer reads it.
-    let _ = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if rx.recv_frame(&limits).await.is_err() {
-                break;
-            }
-        }
-    })
-    .await;
-    progress(Progress::Done);
+    Ok(events_rx)
+}
 
-    Ok(Report {
-        job_id,
-        files: job.manifest.file_count(),
-        bytes: job.manifest.total_bytes(),
-        duration: started.elapsed(),
-        resumed_chunks,
-        peer_fingerprint: Some(channel.peer_fingerprint().to_hex()),
-    })
+/// Drive one accepted per-file stream: write/verify/ack every chunk until
+/// the sender half-closes, then hand the sink back to the driver.
+fn receive_stream_task(
+    mut stream: DirectStream,
+    mut sink: ak_storage::LocalFileSink,
+    file_index: u32,
+    first: Frame,
+    job_id: JobId,
+    idle: Duration,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+) {
+    tokio::spawn(async move {
+        let limits = engine_limits();
+        let mut current = Some(first);
+        let result: Result<(), EngineError> = loop {
+            let frame = match current.take() {
+                Some(frame) => frame,
+                None => match tokio::time::timeout(idle, stream.recv_frame(&limits)).await {
+                    Ok(Ok(frame)) => frame,
+                    // The sender half-closes only after every ack, so a clean
+                    // early end means the file is complete.
+                    Ok(Err(ak_net::StreamError::Connection(message)))
+                        if message.starts_with("stream finished early") =>
+                    {
+                        break Ok(());
+                    }
+                    Ok(Err(ak_net::StreamError::Connection(_))) => {
+                        break Err(EngineError::PeerClosed)
+                    }
+                    Ok(Err(e)) => break Err(EngineError::Stream(e)),
+                    Err(_) => break Err(EngineError::IdleTimeout(idle)),
+                },
+            };
+            match frame.message {
+                Message::Chunk {
+                    chunk_index, data, ..
+                } => {
+                    if let Err(e) = sink.write_chunk(chunk_index, &data) {
+                        break Err(EngineError::Io(e));
+                    }
+                    if let Err(e) = stream
+                        .send_frame(&Frame {
+                            version: ak_wire::VERSION,
+                            message: Message::ChunkAck {
+                                job_id,
+                                file_index,
+                                chunk_index,
+                            },
+                        })
+                        .await
+                    {
+                        break Err(EngineError::Stream(e));
+                    }
+                    if events
+                        .send(StreamEvent::Chunk {
+                            file_index,
+                            chunk_index,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Err(EngineError::Cancelled);
+                    }
+                }
+                Message::Control {
+                    control: Control::Cancel,
+                    ..
+                } => break Err(EngineError::Cancelled),
+                Message::Error { code, message } => {
+                    break Err(EngineError::PeerError { code, message })
+                }
+                other => break Err(unexpected(other)),
+            }
+        };
+        // Best-effort half-close of the ack side; the peer already read all
+        // acks before it half-closed ours.
+        let _ = stream.finish_send();
+        let _ = events
+            .send(match result {
+                Ok(()) => StreamEvent::FileDone { file_index, sink },
+                Err(error) => StreamEvent::Failed(error),
+            })
+            .await;
+    });
 }
 
 /// Run one receive to completion (see [`receive_with_addr`]).
@@ -1195,5 +2116,540 @@ mod tests {
             fs::read(dst.path().join("tail.txt")).unwrap(),
             b"after the big one"
         );
+    }
+
+    /// Drive a raw v1 receiver through Hello/Offer/Accept/Manifest and reply
+    /// with an empty ResumeRequest; returns the job id. Used by the pause and
+    /// fallback tests.
+    async fn fake_receiver_preamble(
+        stream: &mut ak_net::DirectStream,
+        identity: &TlsBundle,
+        capabilities: u16,
+    ) -> JobId {
+        let limits = engine_limits();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // sender Hello
+        stream
+            .send_frame(&hello_frame("fake", identity, capabilities))
+            .await
+            .unwrap();
+        let job_id = match stream.recv_frame(&limits).await.unwrap().message {
+            Message::Offer { job_id, .. } => job_id,
+            other => panic!("expected Offer, got {other:?}"),
+        };
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Accept { job_id },
+            })
+            .await
+            .unwrap();
+        loop {
+            match stream.recv_frame(&limits).await.unwrap().message {
+                Message::ManifestPage { last_page, .. } => {
+                    if last_page {
+                        break;
+                    }
+                }
+                other => panic!("expected ManifestPage, got {other:?}"),
+            }
+        }
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::ResumeRequest {
+                    job_id,
+                    files: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+        job_id
+    }
+
+    /// Ack every remaining chunk on the stream, answer Finalize with a
+    /// positive FinalAck, and return the number of chunks acked.
+    async fn fake_ack_until_finalize(stream: &mut ak_net::DirectStream, job_id: JobId) -> u64 {
+        let limits = engine_limits();
+        let mut acked = 0u64;
+        loop {
+            match stream.recv_frame(&limits).await.unwrap().message {
+                Message::Chunk {
+                    file_index,
+                    chunk_index,
+                    ..
+                } => {
+                    stream
+                        .send_frame(&Frame {
+                            version: ak_wire::VERSION,
+                            message: Message::ChunkAck {
+                                job_id,
+                                file_index,
+                                chunk_index,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    acked += 1;
+                }
+                Message::Finalize { .. } => {
+                    stream
+                        .send_frame(&Frame {
+                            version: ak_wire::VERSION,
+                            message: Message::FinalAck {
+                                job_id,
+                                verified: true,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    // Hold the connection like the real receiver does: the
+                    // sender reads the FinalAck and then half-closes. Dropping
+                    // the endpoint now could discard the FinalAck in flight.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if stream.recv_frame(&limits).await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                    return acked;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    }
+
+    /// The peer completes the handshake then goes silent: the sender must
+    /// fail with IdleTimeout (never hang), keeping its checkpoint.
+    #[tokio::test]
+    async fn idle_timeout_when_peer_goes_silent_after_handshake() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(&src.path().join("idle.bin"), b"payload");
+        let (mut send_spec, recv_spec, receiver_fp) = specs(src.path(), dst.path(), 16);
+        send_spec.idle_timeout = Duration::from_millis(300);
+        let checkpoint = send_spec.checkpoint_dir.clone();
+
+        let bundle = recv_spec.identity;
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &bundle)
+            .await
+            .unwrap();
+        send_spec.peer = endpoint.local_addr().unwrap();
+        send_spec.pinned = receiver_fp;
+        let fake = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let mut stream = channel.accept_bi().await.unwrap();
+            let limits = engine_limits();
+            let _ = stream.recv_frame(&limits).await; // sender Hello
+            stream
+                .send_frame(&hello_frame("stall", &bundle, RECV_CAPABILITIES))
+                .await
+                .unwrap();
+            let _ = stream.recv_frame(&limits).await; // Offer
+                                                      // Silent from here; hold the stream open so the sender observes
+                                                      // silence rather than a close.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let err = send(send_spec, &noop)
+            .await
+            .expect_err("silent peer must time out");
+        assert!(matches!(err, EngineError::IdleTimeout(_)), "got {err:?}");
+        assert!(
+            !FileCheckpointStore::open(&checkpoint)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty(),
+            "checkpoint must survive the idle abort"
+        );
+        fake.abort();
+    }
+
+    /// The sender stalls right after Hello: the receiver must fail with
+    /// IdleTimeout while waiting for the Offer.
+    #[tokio::test]
+    async fn idle_timeout_on_receive_when_sender_stalls() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+        let sender_key = DeviceKeyPair::generate();
+        let sender_bundle = ak_identity::tls::make_self_signed(&sender_key);
+        let mut recv = ReceiveSpec::new(dst.path().to_path_buf(), receiver_bundle);
+        recv.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        recv.idle_timeout = Duration::from_millis(300);
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        let addr = addr_rx.await.unwrap();
+
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_bundle)
+            .await
+            .unwrap();
+        let channel = endpoint
+            .connect(addr, &receiver_key.fingerprint())
+            .await
+            .unwrap();
+        let mut stream = channel.open_bi().await.unwrap();
+        stream
+            .send_frame(&hello_frame("stall", &sender_bundle, CAP_RESUME))
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&engine_limits()).await; // receiver Hello
+
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("stalled sender must time out");
+        assert!(matches!(err, EngineError::IdleTimeout(_)), "got {err:?}");
+    }
+
+    /// The receiver sends Pause mid-transfer: the sender stops issuing
+    /// chunks until Resume, then finishes the job.
+    #[tokio::test]
+    async fn pause_holds_sender_until_resume() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        write(&src.path().join("pause.bin"), &payload);
+        let (mut send_spec, recv_spec, receiver_fp) = specs(src.path(), dst.path(), 1); // 8 chunks
+        send_spec.in_flight_window = 1;
+        send_spec.idle_timeout = Duration::from_secs(20);
+        let bundle = recv_spec.identity;
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &bundle)
+            .await
+            .unwrap();
+        send_spec.peer = endpoint.local_addr().unwrap();
+        send_spec.pinned = receiver_fp;
+
+        let fake = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let mut stream = channel.accept_bi().await.unwrap();
+            let job_id = fake_receiver_preamble(&mut stream, &bundle, CAP_RESUME).await;
+            let limits = engine_limits();
+            let (file_index, chunk_index) = match stream.recv_frame(&limits).await.unwrap().message
+            {
+                Message::Chunk {
+                    file_index,
+                    chunk_index,
+                    ..
+                } => (file_index, chunk_index),
+                other => panic!("expected Chunk, got {other:?}"),
+            };
+            // Pause, ack the in-flight chunk, then hold.
+            stream
+                .send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::Control {
+                        job_id,
+                        control: Control::Pause,
+                    },
+                })
+                .await
+                .unwrap();
+            stream
+                .send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::ChunkAck {
+                        job_id,
+                        file_index,
+                        chunk_index,
+                    },
+                })
+                .await
+                .unwrap();
+            let leaked =
+                tokio::time::timeout(Duration::from_millis(800), stream.recv_frame(&limits)).await;
+            assert!(leaked.is_err(), "sender sent a chunk while paused");
+            stream
+                .send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::Control {
+                        job_id,
+                        control: Control::Resume,
+                    },
+                })
+                .await
+                .unwrap();
+            1 + fake_ack_until_finalize(&mut stream, job_id).await
+        });
+
+        let events: Arc<std::sync::Mutex<Vec<Progress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&events);
+        let progress = move |event: Progress| log.lock().unwrap().push(event);
+        let report = send(send_spec, &progress)
+            .await
+            .expect("send completes after Resume");
+        let acked = fake.await.unwrap();
+        assert_eq!(acked, 8, "all chunks must be acked after resume");
+        assert_eq!(report.files, 1);
+
+        let events = events.lock().unwrap();
+        let paused = events
+            .iter()
+            .position(|e| matches!(e, Progress::Paused))
+            .expect("Paused progress event");
+        let resumed = events
+            .iter()
+            .position(|e| matches!(e, Progress::Resumed))
+            .expect("Resumed progress event");
+        let sent_while_paused = events[paused..=resumed]
+            .iter()
+            .filter(|e| matches!(e, Progress::ChunkSent { .. }))
+            .count();
+        assert_eq!(
+            sent_while_paused, 0,
+            "no chunk may be sent while paused (events: {events:?})"
+        );
+    }
+
+    /// The sender opts into multistream but the peer does not advertise the
+    /// capability: the transfer must run over the frozen single-stream path.
+    #[tokio::test]
+    async fn multistream_sender_falls_back_when_peer_lacks_capability() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 249) as u8).collect();
+        write(&src.path().join("fallback.bin"), &payload);
+        let (mut send_spec, recv_spec, receiver_fp) = specs(src.path(), dst.path(), 1);
+        send_spec.multistream = true;
+        send_spec.in_flight_window = 2;
+        let bundle = recv_spec.identity;
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &bundle)
+            .await
+            .unwrap();
+        send_spec.peer = endpoint.local_addr().unwrap();
+        send_spec.pinned = receiver_fp;
+
+        let fake = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let mut stream = channel.accept_bi().await.unwrap();
+            // A v1-only receiver: no CAP_MULTISTREAM bit in its Hello.
+            let job_id = fake_receiver_preamble(&mut stream, &bundle, CAP_RESUME).await;
+            fake_ack_until_finalize(&mut stream, job_id).await
+        });
+        let report = send(send_spec, &noop)
+            .await
+            .expect("fallback send completes");
+        assert_eq!(fake.await.unwrap(), 8);
+        assert_eq!(report.files, 1);
+    }
+
+    /// Both sides advertise CAP_MULTISTREAM and the sender opts in: every
+    /// file rides its own stream, interleaved, and the result is identical.
+    #[tokio::test]
+    async fn multistream_loopback_transfer_is_byte_identical() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(&src.path().join("a.txt"), b"hello ak");
+        let deep: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+        write(&src.path().join("nested/deep/b.bin"), &deep);
+        let third: Vec<u8> = (0..20_000u32).map(|i| (i % 199) as u8).collect();
+        write(&src.path().join("nested/c.bin"), &third);
+        fs::create_dir_all(src.path().join("empty/dir")).unwrap();
+
+        let (mut send_spec, recv, _) = specs(src.path(), dst.path(), 1); // 1 KiB chunks
+        send_spec.multistream = true;
+        send_spec.in_flight_window = 4; // up to 4 concurrent file streams
+
+        let sent: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bytes_seen: Arc<std::sync::Mutex<Vec<(u32, u64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sender_log = Arc::clone(&sent);
+        let sender_progress = move |event: Progress| {
+            if let Progress::ChunkSent { file_index, .. } = event {
+                sender_log.lock().unwrap().push(file_index);
+            }
+        };
+        let recv_log = Arc::clone(&bytes_seen);
+        let recv_progress = move |event: Progress| {
+            if let Progress::BytesAcked {
+                file_index,
+                cumulative_bytes,
+            } = event
+            {
+                recv_log
+                    .lock()
+                    .unwrap()
+                    .push((file_index, cumulative_bytes));
+            }
+        };
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver =
+            tokio::spawn(async move { receive_with_addr(recv, &recv_progress, addr_tx).await });
+        send_spec.peer = addr_rx.await.unwrap();
+        let report = send(send_spec, &sender_progress)
+            .await
+            .expect("multistream send completes");
+        let recv_report = receiver
+            .await
+            .unwrap()
+            .expect("multistream receive completes");
+
+        assert_eq!(report.files, 7); // 3 files + 4 directory entries
+        assert_eq!(report.bytes, recv_report.bytes);
+        assert_eq!(fs::read(dst.path().join("a.txt")).unwrap(), b"hello ak");
+        assert_eq!(
+            fs::read(dst.path().join("nested/deep/b.bin")).unwrap(),
+            deep
+        );
+        assert_eq!(fs::read(dst.path().join("nested/c.bin")).unwrap(), third);
+        assert!(dst.path().join("empty/dir").is_dir());
+        let (files, bytes) = count_entries(dst.path());
+        assert_eq!((files, bytes), (3, 8 + 40_000 + 20_000));
+
+        // Streams ran in parallel: file indexes interleave in ChunkSent.
+        // Manifest order: a.txt=0, empty=1, empty/dir=2, nested=3,
+        // nested/c.bin=4 (20 chunks), nested/deep=5, nested/deep/b.bin=6 (40).
+        let sent = sent.lock().unwrap();
+        let file_b = sent.iter().filter(|f| **f == 6).count();
+        assert_eq!(file_b, 40, "b.bin must send all 40 chunks");
+        let first_b = sent.iter().position(|f| *f == 6).unwrap();
+        let last_b = sent.iter().rposition(|f| *f == 6).unwrap();
+        assert!(
+            sent[first_b..=last_b].contains(&4),
+            "file streams did not interleave: {sent:?}"
+        );
+
+        // Byte-level progress fired at checkpoint cadence, chunk-aligned.
+        let seen = bytes_seen.lock().unwrap();
+        assert!(!seen.is_empty(), "no BytesAcked events observed");
+        assert!(
+            seen.iter().all(|(_, b)| b % 1024 == 0),
+            "unaligned: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .map(|(_, b)| *b)
+                .max()
+                .is_some_and(|m| m >= 16 * 1024),
+            "expected at least one cadence event past 16 chunks: {seen:?}"
+        );
+    }
+
+    /// The sender vanishes after the manifest: the receiver fails, and no
+    /// empty `.akpart` litter remains in the destination.
+    #[tokio::test]
+    async fn failed_receive_discards_empty_part_files() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+        let sender_key = DeviceKeyPair::generate();
+        let sender_bundle = ak_identity::tls::make_self_signed(&sender_key);
+        let mut recv = ReceiveSpec::new(dst.path().to_path_buf(), receiver_bundle);
+        recv.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        recv.idle_timeout = Duration::from_secs(5);
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        let addr = addr_rx.await.unwrap();
+
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_bundle)
+            .await
+            .unwrap();
+        let channel = endpoint
+            .connect(addr, &receiver_key.fingerprint())
+            .await
+            .unwrap();
+        let mut stream = channel.open_bi().await.unwrap();
+        let limits = engine_limits();
+        stream
+            .send_frame(&hello_frame("ghost", &sender_bundle, CAP_RESUME))
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // receiver Hello
+        let data = b"hello";
+        let digest: [u8; 32] = *blake3::hash(data).as_bytes();
+        let entry = WireEntry {
+            rel_path: "ghost.txt".to_owned(),
+            is_dir: false,
+            size: data.len() as u64,
+            mtime_unix_ms: 0,
+            digest_alg: ak_core::manifest::DIGEST_ALG_BLAKE3,
+            whole_digest: digest,
+            chunk_digests: vec![digest],
+        };
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Offer {
+                    job_id: [1; 16],
+                    root_name: "ghost".to_owned(),
+                    file_count: 1,
+                    total_bytes: data.len() as u64,
+                    chunk_size: 1024,
+                },
+            })
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // Accept
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::ManifestPage {
+                    job_id: [1; 16],
+                    page_index: 0,
+                    last_page: true,
+                    entries: vec![entry],
+                },
+            })
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // ResumeRequest: sinks exist now
+                                                           // Vanish before any chunk.
+        drop(stream);
+        channel.close(0, b"test done");
+        drop(endpoint);
+
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("receiver must fail after the sender vanished");
+        assert!(
+            matches!(err, EngineError::PeerClosed | EngineError::Stream(_)),
+            "got {err:?}"
+        );
+        let parts: Vec<_> = fs::read_dir(dst.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .to_string_lossy()
+                    .ends_with(ak_storage::PART_SUFFIX)
+            })
+            .collect();
+        assert!(parts.is_empty(), "empty part files survived: {parts:?}");
+    }
+
+    /// Regression for the 4,097-file defect: a ResumeRequest covering every
+    /// non-directory entry must decode on the sender under engine limits.
+    #[test]
+    fn engine_limits_fit_resume_requests_for_maximum_jobs() {
+        let limits = engine_limits();
+        assert_eq!(limits.max_resume_entries, ak_wire::MAX_RESUME_ENTRIES);
+        // One frame with the worst-case entry count the engine supports.
+        let files: Vec<ResumeEntry> = (0..limits.max_resume_entries as u32)
+            .map(|file_index| ResumeEntry {
+                file_index,
+                verified_prefix_chunks: 0,
+            })
+            .collect();
+        let mut buf = Vec::new();
+        Frame {
+            version: ak_wire::VERSION,
+            message: Message::ResumeRequest {
+                job_id: [7; 16],
+                files,
+            },
+        }
+        .encode(&mut buf);
+        assert!(buf.len() < ak_wire::MAX_FRAME_BYTES);
+        let decoded = Frame::decode(&buf, &limits).expect("max-size ResumeRequest decodes");
+        match decoded.message {
+            Message::ResumeRequest { files, .. } => assert_eq!(files.len(), 65_535),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }

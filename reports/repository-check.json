@@ -2,8 +2,8 @@
   "level": "L0_static_repository_only",
   "passed": true,
   "markdown_files_checked": 25,
-  "local_links_checked": 31,
-  "rust_test_cases_present_not_executed": 209,
+  "local_links_checked": 37,
+  "rust_test_cases_present_not_executed": 234,
   "banned_dependency_scan": "clean",
   "network_tests_executed": false,
   "errors": []

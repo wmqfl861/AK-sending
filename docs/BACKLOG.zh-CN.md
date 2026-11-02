@@ -14,18 +14,23 @@
 
 ## 局域网原型（ADR-002 / 评审第五节第 1 步，2026-11-02，分支 dev/local-parallel）
 
-- [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli 十 crate；workspace 242 项测试、clippy `-D warnings` 全绿；证据见 reports/dev-validation-2026-11-02.txt。
+- [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli/ak-itests 十一 crate（两轮并行子代理开发）；workspace 281 项测试、clippy `-D warnings` 全绿；证据见 reports/dev-validation-2026-11-02.txt。
 - [x] 真实身份认证最小实现（P0-03 部分）：Ed25519 设备密钥、指纹、配对码、自签证书钉扎（含常量时间比较与严格 DER 校验）；错误钉扎/未授权路径发送前拒绝（T06 自动化，engine 测试）。
 - [x] QUIC 直连数据面（P0-02 部分）：quinn + rustls/ring，双向自签证书验证，`DirectChannel` 无公开构造（D6 类型约束）。
-- [x] 文件清单/目录分页扫描/源版本检测（P1-01）：LocalSource 扫描 + BLAKE3 全量/分块摘要 + mtime 版本 + SOURCE_CHANGED 检测。
-- [x] 有界分块读写、摘要验证、临时文件安全提交（P1-02）：路径越界/符号链接防护（Windows 实测）、.akpart 原子落盘、透明续传。
+- [x] 文件清单/目录分页扫描/源版本检测（P1-01）：LocalSource 扫描 + BLAKE3 全量/分块摘要 + mtime 版本 + SOURCE_CHANGED 检测；迭代式深目录扫描（200 层实测）。
+- [x] 有界分块读写、摘要验证、临时文件安全提交（P1-02）：路径越界/符号链接防护（Windows 实测）、.akpart 原子落盘、透明续传、接收端 mtime 保真（尽力而为）、磁盘余量查询、孤儿 part 清理工具。
 - [x] 检查点与重启恢复（P1-03 的文件后端）：原子写任务记录；传输中断→检查点/半文件存活→二次运行续传（T04/T10 自动化，engine 测试）。
-- [x] >4 GiB 大文件（T12 自动化形态）：5 GiB 稀疏文件 release 环回通过（u64 偏移、内存有界、整体摘要一致），74 秒。
+- [x] >4 GiB 大文件（T12 自动化形态）：5 GiB 稀疏文件 release 环回通过（u64 偏移、内存有界、整体摘要一致），回归 96 秒。
+- [x] 海量文件（T13 缩样）：2,000 文件通过；**20,000 文件 release 通过（328s）**；过程中发现并修复 ResumeRequest 4,096 条目上限缺陷（场景测试发现→引擎代理修复→4,097 边界实测转完整路径）。单 job 上限现为 65,535 条目（u16 字段，分页为协议演进项）。
+- [x] 引擎增强：空闲超时（30s 默认，IdleTimeout 错误、检查点保留）、Pause/Resume 协议（对端暂停→发送端挂起，无任何回退）、可选多流并行（能力协商，每文件一 QUIC 流，默认 opt-in，单流回退有测试钉死）、字节级进度事件。
+- [x] CLI 产品化：配对簿（pair add/list/remove、簿内准入、未配对拒绝、TOFU 记录）、任务管理（jobs list/clean，不动 .akpart）、接收循环（Ctrl-C 退出、断点可续传）、发现集成（配对状态列、--json）、防火墙提示、--multistream 开关。
+- [x] 场景测试套件（ak-itests）：T02/T05/T06/T09/T10/T11/T13 的环回 L2 形态映射（11 项测试 + 20k release 变体）；TEST_PLAN 文档含逐项映射表。
 - [x] 信令+STUN 协调面（P2-01 代码部分，未部署）：封闭消息集测试锁定、限频、会话 TTL；仓库检查脚本扫描 Cargo.lock 禁 relay/TURN/WebRTC/iroh 依赖（D6）。
-- [x] 公网直连探测工具（评审第 2 步的本地形态）：probe 命令（注册候选、STUN 映射、UDP 同时打开、钉扎 QUIC 握手）；跨网段实测仍属 P0-05，未执行。
+- [x] 公网直连探测工具（评审第 2 步的本地形态）：probe 命令（注册候选、STUN 映射、UDP 同时打开、同 socket 钉扎 QUIC 握手、按 device id 字典序定角色）；跨网段实测仍属 P0-05，未执行。
 - [x] mDNS 发现（P0-04 部分）：本机组播环回实测可用；AP 隔离/防火墙场景未测。
-- [x] 局域网 CLI 双端传输：真实双进程环回传输逐字节一致（含空目录、嵌套、二进制大文件）。
+- [x] 局域网 CLI 双端传输：真实双进程环回传输逐字节一致（含空目录、嵌套、二进制大文件、多流模式、配对簿准入）。
 - [x] 方案评审第 6 节代码建议：job.rs 增加等待接收方确认状态；生产路径身份由类型保证。
+- [x] 文档对照：TEST_PLAN 自动化映射、ARCHITECTURE 模块现状、SECURITY 已实现机制与已知限制、TECH_SELECTION 状态更新。
 
 ## P0
 

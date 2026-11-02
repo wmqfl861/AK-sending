@@ -14,7 +14,7 @@
 //! - string: `[len u16 BE][UTF-8 bytes]`;
 //! - fixed-size arrays (`[u8; 16]`, `[u8; 32]`): raw bytes;
 //! - vector: `[count u32 BE][items in order]`;
-//! - enum tag: one byte; Control uses Pause = 1, Cancel = 2;
+//! - enum tag: one byte; Control uses Pause = 1, Cancel = 2, Resume = 3;
 //! - ErrorCode: u16;
 //! - WireEntry: rel_path string, is_dir bool, size u64, mtime i64
 //!   (two's complement as-is), digest_alg u8, whole_digest (32 raw bytes),
@@ -57,6 +57,18 @@ pub const HEADER_LEN: usize = 7;
 pub const MAX_FRAME_BYTES: usize = (8 << 20) + 1024;
 /// Capability bit: receiver supports resume from checkpoints.
 pub const CAP_RESUME: u16 = 0x0001;
+/// Capability bit: the sender honors in-band Pause/Resume flow control.
+pub const CAP_PAUSE_RESUME: u16 = 0x0002;
+/// Capability bit: parallel per-file QUIC streams are supported.
+pub const CAP_MULTISTREAM: u16 = 0x0004;
+
+/// Default ceiling for resume entries in one ResumeRequest frame. The
+/// receiver answers with one frame covering every non-directory entry, so
+/// this must not be smaller than the largest job the engine supports. At
+/// `u16::MAX` (65,535 entries) the worst-case payload is 20 + 12 × 65,535
+/// ≈ 768 KiB, comfortably below [`MAX_FRAME_BYTES`], and decode still
+/// validates the budget before allocating.
+pub const MAX_RESUME_ENTRIES: u16 = u16::MAX;
 
 /// Message type value for [`Message::Hello`].
 pub const TYPE_HELLO: u16 = 1;
@@ -87,6 +99,8 @@ pub const TYPE_ERROR: u16 = 12;
 pub const CONTROL_PAUSE: u8 = 1;
 /// Control tag for [`Control::Cancel`].
 pub const CONTROL_CANCEL: u8 = 2;
+/// Control tag for [`Control::Resume`].
+pub const CONTROL_RESUME: u8 = 3;
 
 /// Every message type value; keeps the set closed and iterable.
 const TYPE_VALUES: [u16; 12] = [
@@ -131,7 +145,7 @@ impl Default for Limits {
             max_entries_per_page: 256,
             max_string_bytes: 1024,
             max_error_message_bytes: 256,
-            max_resume_entries: 4096,
+            max_resume_entries: MAX_RESUME_ENTRIES,
             max_chunk_digests: 65536,
         }
     }
@@ -142,6 +156,7 @@ impl Default for Limits {
 pub enum Control {
     Pause,
     Cancel,
+    Resume,
 }
 
 /// Manifest entry as it appears on the wire.
@@ -568,6 +583,7 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             let tag = match control {
                 Control::Pause => CONTROL_PAUSE,
                 Control::Cancel => CONTROL_CANCEL,
+                Control::Resume => CONTROL_RESUME,
             };
             out.push(tag);
         }
@@ -810,6 +826,7 @@ fn decode_message(
             let control = match cursor.u8()? {
                 CONTROL_PAUSE => Control::Pause,
                 CONTROL_CANCEL => Control::Cancel,
+                CONTROL_RESUME => Control::Resume,
                 _ => return Err(DecodeError::Malformed("unknown control tag")),
             };
             Message::Control { job_id, control }
@@ -1073,6 +1090,10 @@ mod tests {
             job_id: [3; 16],
             control: Control::Cancel,
         });
+        assert_round_trips(Message::Control {
+            job_id: [3; 16],
+            control: Control::Resume,
+        });
         assert_round_trips(Message::FinalAck {
             job_id: [4; 16],
             verified: true,
@@ -1153,6 +1174,29 @@ mod tests {
             assert_eq!(*message_type, index as u16 + 1);
         }
         assert_eq!(TYPE_VALUES.len(), 12);
+    }
+
+    #[test]
+    fn capability_bits_are_disjoint() {
+        assert_eq!(CAP_RESUME, 0x0001);
+        assert_eq!(CAP_PAUSE_RESUME, 0x0002);
+        assert_eq!(CAP_MULTISTREAM, 0x0004);
+        assert_eq!(CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM, 0x0007);
+    }
+
+    #[test]
+    fn control_resume_uses_tag_three() {
+        assert_eq!(CONTROL_RESUME, 3);
+        let mut payload = vec![0u8; 16];
+        payload.push(CONTROL_RESUME);
+        let buf = frame_of(TYPE_CONTROL, &payload);
+        assert_eq!(
+            Frame::decode(&buf, &Limits::default()).unwrap().message,
+            Message::Control {
+                job_id: [0; 16],
+                control: Control::Resume
+            }
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1502,16 +1546,15 @@ mod tests {
 
     #[test]
     fn rejects_resume_count_over_limit() {
+        let over = u32::from(MAX_RESUME_ENTRIES) + 1;
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0u8; 16]); // job_id
-        payload.extend_from_slice(&4097u32.to_be_bytes()); // count > 4096
+        payload.extend_from_slice(&over.to_be_bytes()); // count > limit
         let buf = frame_of(TYPE_RESUME_REQUEST, &payload);
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
-            Err(DecodeError::TooManyResumeEntries {
-                count: 4097,
-                limit: 4096
-            })
+            Err(DecodeError::TooManyResumeEntries { count, limit })
+                if count == u64::from(over) && limit == MAX_RESUME_ENTRIES
         ));
     }
 
@@ -1560,7 +1603,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_control_tags() {
-        for bad in [0u8, 3, 255] {
+        for bad in [0u8, 4, 255] {
             let mut payload = vec![0u8; 16];
             payload.push(bad);
             let buf = frame_of(TYPE_CONTROL, &payload);
@@ -1686,10 +1729,10 @@ mod tests {
             }
             8 => Message::Control {
                 job_id: job,
-                control: if r.byte().is_multiple_of(2) {
-                    Control::Pause
-                } else {
-                    Control::Cancel
+                control: match r.below(3) {
+                    0 => Control::Pause,
+                    1 => Control::Cancel,
+                    _ => Control::Resume,
                 },
             },
             9 => Message::Finalize { job_id: job },

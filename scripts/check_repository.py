@@ -27,6 +27,7 @@ WORKSPACE_MEMBERS = [
     "crates/ak-signal",
     "crates/ak-engine",
     "crates/ak-cli",
+    "crates/ak-itests",
 ]
 
 # ADR-001/ADR-002: no relay/TURN/WebRTC/iroh may enter the dependency graph.
@@ -99,7 +100,7 @@ def check(root: Path) -> dict:
         "crates/ak-storage/src/lib.rs", "crates/ak-net/src/lib.rs",
         "crates/ak-discovery/src/lib.rs", "crates/ak-store/src/lib.rs",
         "crates/ak-signal/src/lib.rs", "crates/ak-engine/src/lib.rs",
-        "crates/ak-cli/src/main.rs",
+        "crates/ak-cli/src/main.rs", "crates/ak-itests/src/lib.rs",
     ]
     for name in required:
         if not (root / name).is_file():

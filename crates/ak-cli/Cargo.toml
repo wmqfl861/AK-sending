@@ -24,4 +24,6 @@ name = "ak-cli"
 path = "src/main.rs"
 
 [dev-dependencies]
+# Test-only: builds real AKJOB1 checkpoint fixtures that the jobs parser reads.
+ak-store = { workspace = true }
 tempfile = "3"

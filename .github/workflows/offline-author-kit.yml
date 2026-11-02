@@ -1,0 +1,41 @@
+name: Offline authoring kit (not acceptance)
+on:
+  push:
+    branches: ["dev/m0-03-session-control-20261102"]
+    paths: [".github/workflows/offline-author-kit.yml"]
+permissions:
+  contents: read
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned public toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Package only toolchain and locked public dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kit
+          cargo vendor --locked kit/vendor > kit/cargo-config.toml
+          cp -a "$(rustc --print sysroot)" kit/toolchain
+          rm -rf kit/toolchain/share/doc kit/toolchain/share/man
+          rustc --version --verbose > kit/rustc-version.txt
+          cargo --version > kit/cargo-version.txt
+          git rev-parse HEAD > kit/source-commit.txt
+          git diff --exit-code -- Cargo.toml Cargo.lock crates
+          tar -czf offline-author-kit.tar.gz kit
+          sha256sum offline-author-kit.tar.gz > offline-author-kit.sha256
+      - name: Preserve development tools (not project test results)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: offline-author-kit-${{ github.sha }}
+          path: |
+            offline-author-kit.tar.gz
+            offline-author-kit.sha256
+          compression-level: 0
+          retention-days: 3

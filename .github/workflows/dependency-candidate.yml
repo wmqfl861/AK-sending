@@ -1,0 +1,44 @@
+name: M0-02 dependency candidate (not acceptance)
+on:
+  push:
+    branches: ["dev/m0-02-authenticated-direct-20261102"]
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Emit candidate only when dependency lock is missing
+        shell: python
+        run: |
+          import pathlib, subprocess
+          lock = pathlib.Path('Cargo.lock')
+          if 'name = "ak-transport"' in lock.read_text():
+              print('Committed transport lock already present; no candidate generated.')
+              raise SystemExit(0)
+          subprocess.run(['cargo', 'generate-lockfile'], check=True)
+          subprocess.run(['cargo', 'fmt', '--all'], check=True)
+          print('BEGIN_LOCKFILE', flush=True)
+          print(lock.read_text(), flush=True)
+          print('END_LOCKFILE', flush=True)
+          print('BEGIN_FORMAT_PATCH', flush=True)
+          subprocess.run(['git', 'diff', '--', 'crates'], check=True)
+          print('END_FORMAT_PATCH', flush=True)
+          print('CANDIDATE_TESTS_ONLY: generated working tree, not committed acceptance evidence', flush=True)
+          subprocess.run(['cargo', 'test', '--workspace', '--locked'], check=True)
+      - name: Preserve candidate lock and formatted files
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: m0-02-candidate-${{ github.sha }}
+          path: |
+            Cargo.lock
+            crates/ak-transport/
+          retention-days: 14

@@ -11,6 +11,7 @@ ak-discovery = { workspace = true }
 ak-engine = { workspace = true }
 ak-identity = { workspace = true }
 ak-net = { workspace = true }
+ak-signal = { workspace = true }
 ak-storage = { workspace = true }
 ak-store = { workspace = true }
 ak-wire = { workspace = true }

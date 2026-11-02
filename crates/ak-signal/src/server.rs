@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -164,12 +164,16 @@ async fn stun_responder(socket: UdpSocket, mut shutdown: watch::Receiver<bool>) 
 
 /// One connected device. `conn_id` distinguishes generations of the same
 /// device id so a replaced connection cannot tear down the new one.
+/// `peer_ip` is the TCP peer address sampled once at Hello time; a device
+/// reconnecting (possibly from a new network) replaces the whole entry,
+/// refreshing the record.
 struct DeviceEntry {
     conn_id: u64,
     out: mpsc::Sender<CtrlMessage>,
     close: Arc<Notify>,
     #[allow(dead_code)] // validated and stored for near-term connect enrichment
     candidates: Vec<SocketAddr>,
+    peer_ip: IpAddr,
 }
 
 #[derive(Clone)]
@@ -325,6 +329,9 @@ struct ConnState {
     device: Option<DeviceId>,
     conn_id: u64,
     close: Arc<Notify>,
+    /// Remote IP of this TCP connection, sampled once at accept time; a
+    /// TCP peer address never changes over the life of the connection.
+    peer_ip: IpAddr,
 }
 
 enum Flow {
@@ -346,6 +353,7 @@ async fn connection_loop(
         device: None,
         conn_id: 0,
         close: Arc::new(Notify::new()),
+        peer_ip: peer.ip(),
     };
     let mut bucket = TokenBucket::new(shared.limits.frame_rate_per_sec, shared.limits.frame_burst);
     log::debug!("signaling connection from {peer}");
@@ -459,6 +467,7 @@ async fn process(
                     out: out.clone(),
                     close: state.close.clone(),
                     candidates: Vec::new(),
+                    peer_ip: state.peer_ip,
                 },
             );
             conn_id
@@ -533,6 +542,62 @@ async fn process(
     }
 }
 
+/// Pure decision behind the SameEgress hint: both endpoints' recorded
+/// control-plane TCP peer IPs are known and identical. An unknown
+/// (`None`) address never matches, so the hint is never guessed.
+pub(crate) fn same_egress(ip_a: Option<IpAddr>, ip_b: Option<IpAddr>) -> bool {
+    match (ip_a, ip_b) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Queue `SessionOpened` for both endpoints and, when both currently live
+/// behind the same observed TCP peer IP, a `SameEgress` hint to each after
+/// their `SessionOpened`. Distinct or unknown IPs send no hint.
+fn announce_session(
+    inner: &Inner,
+    outbound: &mut Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)>,
+    session: SessionId,
+    me: DeviceId,
+    target: DeviceId,
+) {
+    let me_ip = inner.devices.get(&me).map(|entry| entry.peer_ip);
+    let target_ip = inner.devices.get(&target).map(|entry| entry.peer_ip);
+    if let Some(entry) = inner.devices.get(&me) {
+        outbound.push((
+            entry.out.clone(),
+            CtrlMessage::SessionOpened {
+                session,
+                peer: target,
+            },
+        ));
+    }
+    if let Some(entry) = inner.devices.get(&target) {
+        outbound.push((
+            entry.out.clone(),
+            CtrlMessage::SessionOpened { session, peer: me },
+        ));
+    }
+    if same_egress(me_ip, target_ip) {
+        log::info!(
+            "session {}: endpoints share one egress, hinting LAN-first",
+            util::hex_prefix(&session, 4)
+        );
+        for device in [me, target] {
+            if let Some(entry) = inner.devices.get(&device) {
+                outbound.push((
+                    entry.out.clone(),
+                    CtrlMessage::Signal {
+                        session,
+                        signal: PeerSignal::SameEgress,
+                    },
+                ));
+            }
+        }
+    }
+}
+
 async fn handle_connect(
     shared: &Shared,
     out: &mpsc::Sender<CtrlMessage>,
@@ -558,21 +623,7 @@ async fn handle_connect(
             .map(|(id, _)| *id)
         {
             // Existing pair session: re-announce to both endpoints.
-            if let Some(entry) = inner.devices.get(&me) {
-                outbound.push((
-                    entry.out.clone(),
-                    CtrlMessage::SessionOpened {
-                        session,
-                        peer: target,
-                    },
-                ));
-            }
-            if let Some(entry) = inner.devices.get(&target) {
-                outbound.push((
-                    entry.out.clone(),
-                    CtrlMessage::SessionOpened { session, peer: me },
-                ));
-            }
+            announce_session(&inner, &mut outbound, session, me, target);
         } else {
             let my_count = inner
                 .sessions
@@ -604,21 +655,7 @@ async fn handle_connect(
                     util::hex_prefix(&target, 4),
                     shared.limits.session_ttl
                 );
-                if let Some(entry) = inner.devices.get(&me) {
-                    outbound.push((
-                        entry.out.clone(),
-                        CtrlMessage::SessionOpened {
-                            session,
-                            peer: target,
-                        },
-                    ));
-                }
-                if let Some(entry) = inner.devices.get(&target) {
-                    outbound.push((
-                        entry.out.clone(),
-                        CtrlMessage::SessionOpened { session, peer: me },
-                    ));
-                }
+                announce_session(&inner, &mut outbound, session, me, target);
             }
         }
     }
@@ -763,15 +800,31 @@ mod tests {
             .expect("connection closed unexpectedly")
     }
 
-    /// Drain until a ServerError shows up (TTL sweep Cancel frames may
-    /// arrive first); fails on timeout.
+    /// Drain until a ServerError shows up (TTL sweep Cancel frames and
+    /// SameEgress hints may arrive first); fails on timeout.
     async fn next_server_error(client: &SignalClient) -> CtrlMessage {
         loop {
             match next_msg(client).await {
                 msg @ CtrlMessage::ServerError { .. } => return msg,
                 CtrlMessage::Cancel { .. } | CtrlMessage::SessionOpened { .. } => continue,
+                CtrlMessage::Signal {
+                    signal: PeerSignal::SameEgress,
+                    ..
+                } => continue,
                 other => panic!("unexpected message: {other:?}"),
             }
+        }
+    }
+
+    /// Consume the SameEgress hint that follows `SessionOpened` when both
+    /// test clients share one address (loopback is always 127.0.0.1).
+    async fn expect_same_egress(client: &SignalClient, session: SessionId) {
+        match next_msg(client).await {
+            CtrlMessage::Signal {
+                session: hinted,
+                signal: PeerSignal::SameEgress,
+            } => assert_eq!(hinted, session),
+            other => panic!("expected SameEgress, got {other:?}"),
         }
     }
 
@@ -813,6 +866,11 @@ mod tests {
         assert_eq!(session_a, session_b);
         assert_eq!(peer_a, client_support::device(&key_b));
         assert_eq!(peer_b, client_support::device(&key_a));
+
+        // Both endpoints dialed in from 127.0.0.1, so after the paired
+        // SessionOpened each must receive the SameEgress hint.
+        expect_same_egress(&a, session_a).await;
+        expect_same_egress(&b, session_b).await;
 
         // Candidates flow A -> B.
         let candidates = vec![
@@ -892,6 +950,8 @@ mod tests {
             panic!("expected SessionOpened");
         };
         let _ = next_msg(&b).await; // b's SessionOpened
+        expect_same_egress(&a, first).await; // loopback: same egress hint
+        expect_same_egress(&b, first).await;
 
         // a is now at its session limit; a second target is refused.
         a.connect_peer(client_support::device(&key_c))
@@ -1036,6 +1096,7 @@ mod tests {
             panic!("expected SessionOpened");
         };
         let _ = next_msg(&b).await;
+        expect_same_egress(&a, session).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         a.send_signal(session, PeerSignal::Bye).await.unwrap();
         match next_server_error(&a).await {
@@ -1059,6 +1120,7 @@ mod tests {
             panic!("expected SessionOpened");
         };
         let _ = next_msg(&b).await;
+        expect_same_egress(&b, session).await;
         drop(a); // abrupt disconnect: server must clean up and notify b
         match next_msg(&b).await {
             CtrlMessage::Cancel { session: cancelled } => assert_eq!(cancelled, session),
@@ -1104,5 +1166,149 @@ mod tests {
             .unwrap();
         drop(second);
         server.stop().await.unwrap();
+    }
+
+    // ---- SameEgress hint (review 4.1) ----
+
+    /// Forge a registry entry with the given observed peer IP.
+    fn device_entry(ip: IpAddr) -> (DeviceEntry, mpsc::Receiver<CtrlMessage>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            DeviceEntry {
+                conn_id: 1,
+                out: tx,
+                close: Arc::new(Notify::new()),
+                candidates: Vec::new(),
+                peer_ip: ip,
+            },
+            rx,
+        )
+    }
+
+    fn shared_registry() -> Arc<Shared> {
+        Arc::new(Shared {
+            limits: Limits::default(),
+            inner: Mutex::new(Inner::default()),
+        })
+    }
+
+    /// Nothing else was queued on this device's outbound channel. A
+    /// dropped sender side (retired connection) counts as empty too.
+    fn assert_empty(rx: &mut mpsc::Receiver<CtrlMessage>) {
+        if let Ok(message) = rx.try_recv() {
+            panic!("expected an empty outbound queue, got {message:?}");
+        }
+    }
+
+    #[test]
+    fn same_egress_decision_branches() {
+        let a: IpAddr = "192.168.1.5".parse().unwrap();
+        let b: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(same_egress(Some(a), Some(a)));
+        assert!(!same_egress(Some(a), Some(b)));
+        // An unknown address on either side never produces a hint.
+        assert!(!same_egress(None, Some(a)));
+        assert!(!same_egress(Some(a), None));
+        assert!(!same_egress(None, None));
+        // v4 and v6 loopback are distinct addresses, not a shared egress.
+        let v6: IpAddr = "::1".parse().unwrap();
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!same_egress(Some(v4), Some(v6)));
+    }
+
+    /// Forged internal state (no sockets): distinct recorded peer IPs get
+    /// SessionOpened for both endpoints and no SameEgress, no error.
+    #[tokio::test]
+    async fn same_egress_not_sent_when_ips_differ() {
+        let shared = shared_registry();
+        let me = [1u8; 32];
+        let target = [2u8; 32];
+        let (entry_me, mut rx_me) = device_entry("198.51.100.1".parse().unwrap());
+        let (entry_target, mut rx_target) = device_entry("203.0.113.7".parse().unwrap());
+        {
+            let mut inner = shared.lock();
+            inner.devices.insert(me, entry_me);
+            inner.devices.insert(target, entry_target);
+        }
+        let (requester, mut rx_requester) = mpsc::channel(8);
+        handle_connect(&shared, &requester, me, target).await;
+
+        match rx_me.try_recv() {
+            Ok(CtrlMessage::SessionOpened { peer, .. }) => assert_eq!(peer, target),
+            other => panic!("expected SessionOpened for requester, got {other:?}"),
+        }
+        match rx_target.try_recv() {
+            Ok(CtrlMessage::SessionOpened { peer, .. }) => assert_eq!(peer, me),
+            other => panic!("expected SessionOpened for target, got {other:?}"),
+        }
+        assert_empty(&mut rx_me); // no SameEgress for distinct IPs
+        assert_empty(&mut rx_target);
+        assert_empty(&mut rx_requester); // and no ServerError
+    }
+
+    /// Forged internal state: a same-IP pair is hinted, and a device
+    /// reconnecting from a new IP (whole entry replaced, like the Hello
+    /// path does) flips the pair-reuse announcement back to no hint.
+    #[tokio::test]
+    async fn same_egress_refreshes_when_device_reconnects() {
+        let shared = shared_registry();
+        let me = [1u8; 32];
+        let target = [2u8; 32];
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let (entry_me, mut rx_me) = device_entry(loopback);
+        let (entry_target, mut rx_target) = device_entry(loopback);
+        {
+            let mut inner = shared.lock();
+            inner.devices.insert(me, entry_me);
+            inner.devices.insert(target, entry_target);
+        }
+        let (requester, mut rx_requester) = mpsc::channel(8);
+        handle_connect(&shared, &requester, me, target).await;
+
+        let session = match rx_me.try_recv() {
+            Ok(CtrlMessage::SessionOpened { session, .. }) => session,
+            other => panic!("expected SessionOpened, got {other:?}"),
+        };
+        assert!(matches!(
+            rx_target.try_recv(),
+            Ok(CtrlMessage::SessionOpened { .. })
+        ));
+        assert!(matches!(
+            rx_me.try_recv(),
+            Ok(CtrlMessage::Signal {
+                session: s,
+                signal: PeerSignal::SameEgress
+            }) if s == session
+        ));
+        assert!(matches!(
+            rx_target.try_recv(),
+            Ok(CtrlMessage::Signal {
+                session: s,
+                signal: PeerSignal::SameEgress
+            }) if s == session
+        ));
+
+        // target reconnects from a different network: its whole entry,
+        // peer IP included, is replaced.
+        let (replacement, mut rx_replacement) = device_entry("203.0.113.7".parse().unwrap());
+        shared.lock().devices.insert(target, replacement);
+
+        // Pair reuse re-announces from the current records: no hint now.
+        handle_connect(&shared, &requester, me, target).await;
+        match rx_me.try_recv() {
+            Ok(CtrlMessage::SessionOpened { session: s, peer }) => {
+                assert_eq!(s, session); // reused, not a new session
+                assert_eq!(peer, target);
+            }
+            other => panic!("expected reused SessionOpened, got {other:?}"),
+        }
+        assert!(matches!(
+            rx_replacement.try_recv(),
+            Ok(CtrlMessage::SessionOpened { .. })
+        ));
+        assert_empty(&mut rx_me);
+        assert_empty(&mut rx_replacement);
+        assert_empty(&mut rx_target); // retired connection gets nothing
+        assert_empty(&mut rx_requester);
     }
 }

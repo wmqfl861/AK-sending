@@ -1,7 +1,7 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
 //! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `send`, `discover`,
-//! `jobs`, `signal-server`, `probe`. The binary never talks to any
+//! `jobs`, `signal-server`, `probe`, `bench`. The binary never talks to any
 //! file-carrying server; servers started here are coordination-only (ADR-001).
 //!
 //! Pairing model: the local peer book (`peers.book` in the id directory)
@@ -9,7 +9,9 @@
 //! fingerprints; a successful `send` records the receiver trust-on-first-use.
 #![forbid(unsafe_code)]
 
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -72,6 +74,11 @@ enum Command {
         /// Handle exactly one transfer, then exit (default: loop until Ctrl-C).
         #[arg(long, default_value_t = false)]
         once: bool,
+        /// Idle timeout in seconds: abort when no frame arrives within this
+        /// budget (idle timeout, not total run time). Applies to every loop
+        /// iteration.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
     },
     /// Send one file or one directory to a peer. On success the peer's
     /// fingerprint is recorded in peers.book (trust on first use).
@@ -95,6 +102,10 @@ enum Command {
         /// Transfer files on parallel QUIC streams when the peer supports it.
         #[arg(long, default_value_t = false)]
         multistream: bool,
+        /// Idle timeout in seconds: abort when no frame arrives within this
+        /// budget (idle timeout, not total run time).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
     },
     /// Discover peers on the local network via mDNS (bounded browse) and show
     /// pairing status for each candidate.
@@ -129,6 +140,32 @@ enum Command {
         /// Skip the STUN mapping query.
         #[arg(long, default_value_t = false)]
         no_stun: bool,
+    },
+    /// In-process loopback benchmark: generate files, then push them through
+    /// the real engine over 127.0.0.1 QUIC (evidence generator; no server
+    /// carries file data). Default runs a single-stream and a multistream
+    /// round and compares them.
+    Bench {
+        /// Total bytes to transfer, split evenly across --files files.
+        #[arg(long, default_value_t = 268_435_456, value_parser = clap::value_parser!(u64).range(1..))]
+        bytes: u64,
+        /// Number of source files the data is split across.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..))]
+        files: u32,
+        /// Chunk size in KiB (1..=8192, the engine decode budget).
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        chunk_kb: u32,
+        /// Select the multistream round with --once; without --once both
+        /// rounds always run and this flag has no extra effect.
+        #[arg(long, default_value_t = false)]
+        multistream: bool,
+        /// Run exactly one round (single-stream by default, multistream with
+        /// --multistream) instead of both plus a comparison.
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -613,6 +650,12 @@ fn conflict_policy(text: &str) -> Result<ConflictPolicy> {
     }
 }
 
+/// Map the `--timeout` flag (seconds) onto the engine idle timeout. The flag
+/// is an idle budget, not a total run time; clap already rejects 0.
+fn idle_timeout_from_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs)
+}
+
 fn checkpoint_dir(id: &Path) -> PathBuf {
     id.join("checkpoints")
 }
@@ -661,10 +704,6 @@ fn print_progress(direction: &str, progress: &Progress) {
         Progress::FileCommitted { path, .. } => println!("[{direction}] committed {path}"),
         Progress::Paused => println!("[{direction}] paused by peer; holding (no fallback exists)"),
         Progress::Resumed => println!("[{direction}] resumed"),
-        Progress::BytesAcked { cumulative_bytes, .. } => println!(
-            "[{direction}] progress: {} acknowledged",
-            human_bytes(*cumulative_bytes)
-        ),
         Progress::FinalAck { verified } => println!("[{direction}] final ack verified={verified}"),
         Progress::Done => println!("[{direction}] done"),
         Progress::ManifestReceived => println!("[{direction}] manifest received"),
@@ -672,10 +711,76 @@ fn print_progress(direction: &str, progress: &Progress) {
     }
 }
 
+/// Terminal width the byte-progress line is clipped/padded to (80-col
+/// friendly; the padding also erases leftovers of a previous, longer line).
+const PROGRESS_LINE_WIDTH: usize = 79;
+
+/// Clip text to `width` display columns on a char boundary, marking the cut
+/// with "..." when the width allows it.
+fn clip_line(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width >= 3 {
+        let mut clipped: String = text.chars().take(width - 3).collect();
+        clipped.push_str("...");
+        clipped
+    } else {
+        text.chars().take(width).collect()
+    }
+}
+
+/// Byte-level progress renders as one `\r`-refreshed line instead of one
+/// println per event (the engine emits BytesAcked every 16 acks, which used
+/// to flood the terminal). Whole-line events (Done, file-level, ...) first
+/// erase an open progress line so log lines stay readable.
+struct ProgressLine {
+    direction: &'static str,
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl ProgressLine {
+    fn new(direction: &'static str) -> Self {
+        ProgressLine {
+            direction,
+            open: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn show(&self, progress: &Progress) {
+        if let Progress::BytesAcked {
+            file_index,
+            cumulative_bytes,
+            ..
+        } = progress
+        {
+            let text = clip_line(
+                &format!(
+                    "[{}] file {file_index}: {} acknowledged",
+                    self.direction,
+                    human_bytes(*cumulative_bytes)
+                ),
+                PROGRESS_LINE_WIDTH,
+            );
+            let pad = " ".repeat(PROGRESS_LINE_WIDTH.saturating_sub(text.chars().count()));
+            print!("\r{text}{pad}");
+            let _ = std::io::stdout().flush();
+            self.open.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // Whole-line event: clear any open progress line, keep it whole.
+        if self.open.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            print!("\r{}\r", " ".repeat(PROGRESS_LINE_WIDTH));
+        }
+        print_progress(self.direction, progress);
+    }
+}
+
 fn progress_printer(direction: &'static str) -> Arc<dyn Fn(Progress) + Send + Sync> {
+    let line = Arc::new(ProgressLine::new(direction));
     Arc::new(move |progress: Progress| {
         if std::env::var_os("AK_QUIET").is_none() {
-            print_progress(direction, &progress);
+            line.show(&progress);
         }
     })
 }
@@ -702,6 +807,343 @@ fn report_summary(report: &Report) {
 }
 
 // ---------------------------------------------------------------------------
+// bench: in-process loopback throughput measurement (evidence generator)
+// ---------------------------------------------------------------------------
+
+/// Fixed PRNG seed: identical bench runs generate identical bytes, so
+/// numbers are comparable across runs and machines.
+const BENCH_SEED: u64 = 0x00C0_FFEE_1234_5678;
+/// Printed with every bench result so nobody mistakes loopback for a NIC.
+const BENCH_DISCLAIMER: &str = "loopback throughput; real-NIC measurement needs two machines";
+/// Idle budget for the bench engine runs; generous because a bench must
+/// measure throughput, not trigger timeouts on a busy machine.
+const BENCH_IDLE: Duration = Duration::from_secs(120);
+
+/// Deterministic xorshift64 filler (Marsaglia). Fast and dependency-free;
+/// NOT cryptographic -- it only needs pseudo-random bytes to exercise the
+/// hashing, framing and QUIC paths.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    /// A zero state would freeze the generator; map it to a fixed nonzero
+    /// seed so every input produces a working stream.
+    fn new(seed: u64) -> Self {
+        Xorshift64 {
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Fill `buf` with little-endian words of the generator stream; a
+    /// trailing partial word takes the low bytes.
+    fn fill(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let word = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+}
+
+/// Split `total` bytes into exactly `files` sizes: even quotient, remainder
+/// spread one byte at a time over the first files. Always sums to `total`.
+fn bench_file_sizes(total: u64, files: u32) -> Vec<u64> {
+    let base = total / u64::from(files);
+    let mut rem = total % u64::from(files);
+    (0..files)
+        .map(|_| {
+            if rem > 0 {
+                rem -= 1;
+                base + 1
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
+/// Best-effort scoped temp directory for bench artifacts (source tree,
+/// per-round destinations and checkpoints). The tempfile crate is a
+/// dev-dependency of this crate and cannot be used here, hence the manual
+/// guard.
+struct BenchTempDir(PathBuf);
+
+impl BenchTempDir {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "ak-cli-bench-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("cannot create bench dir {}", path.display()))?;
+        Ok(BenchTempDir(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for BenchTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Stream `size` bytes of PRNG output into one file in 1 MiB steps (the
+/// default 256 MiB must never be materialized in memory as a whole).
+fn write_bench_file(path: &Path, size: u64, prng: &mut Xorshift64) -> Result<()> {
+    let mut file =
+        std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let step = remaining.min(buf.len() as u64) as usize;
+        prng.fill(&mut buf[..step]);
+        file.write_all(&buf[..step])?;
+        remaining -= step as u64;
+    }
+    Ok(())
+}
+
+/// Generate the flat bench source tree (bench-0000.bin, ...). Per-file seeds
+/// are distinct so files do not share prefixes.
+fn write_bench_source(src: &Path, sizes: &[u64]) -> Result<()> {
+    std::fs::create_dir_all(src).with_context(|| format!("cannot create {}", src.display()))?;
+    for (index, size) in sizes.iter().enumerate() {
+        let path = src.join(format!("bench-{index:04}.bin"));
+        let seed = BENCH_SEED
+            ^ (index as u64)
+                .wrapping_add(1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut prng = Xorshift64::new(seed);
+        write_bench_file(&path, *size, &mut prng)?;
+    }
+    Ok(())
+}
+
+fn bench_quiet_progress(_: Progress) {}
+
+/// One completed bench round. `duration` is the engine's own Report.duration
+/// (send side), so the measurement covers exactly what the engine measured.
+#[derive(Debug, Clone)]
+struct BenchRound {
+    mode: &'static str,
+    duration: Duration,
+    bytes: u64,
+}
+
+/// Throughput of a round in decimal MB/s and binary GiB/s.
+fn throughput(bytes: u64, duration: Duration) -> (f64, f64) {
+    let secs = duration.as_secs_f64().max(1e-9);
+    (
+        bytes as f64 / 1_000_000.0 / secs,
+        bytes as f64 / 1_073_741_824.0 / secs,
+    )
+}
+
+/// Run one full sender->receiver transfer of `src` through the real engine
+/// over loopback QUIC (fresh key pair, destination and checkpoint dirs per
+/// round so nothing resumes from a previous round). Both sides run inside
+/// this process; the data path is still the full QUIC + TLS + engine stack.
+async fn bench_round(
+    src: &Path,
+    dst: &Path,
+    checkpoints: &Path,
+    chunk_kb: u32,
+    multistream: bool,
+) -> Result<BenchRound> {
+    let sender_key = DeviceKeyPair::generate();
+    let receiver_key = DeviceKeyPair::generate();
+    let sender_bundle = ak_identity::tls::make_self_signed(&sender_key);
+    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    let receiver_fp = receiver_key.fingerprint();
+    let chunk = NonZeroU32::new(chunk_kb.saturating_mul(1024))
+        .context("chunk size must be at least 1 KiB")?;
+
+    let mut recv_spec = ReceiveSpec::new(dst.to_path_buf(), receiver_bundle);
+    recv_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    recv_spec.chunk_size = chunk;
+    recv_spec.checkpoint_dir = checkpoints.to_path_buf();
+    recv_spec.device_name = "ak-bench".into();
+    recv_spec.idle_timeout = BENCH_IDLE;
+    // Loopback still pins both identities: only our own sender may connect.
+    let sender_fp = sender_key.fingerprint();
+    recv_spec.authorize = Box::new(move |fp: &Fingerprint| *fp == sender_fp);
+
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(async move {
+        ak_engine::receive_with_addr(recv_spec, &bench_quiet_progress, addr_tx).await
+    });
+    let addr = addr_rx
+        .await
+        .context("bench receiver failed to bind its loopback port")?;
+
+    let mut send_spec = SendSpec::new(src.to_path_buf(), addr, receiver_fp, sender_bundle);
+    send_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    send_spec.chunk_size = chunk;
+    send_spec.checkpoint_dir = checkpoints.to_path_buf();
+    send_spec.device_name = "ak-bench".into();
+    send_spec.idle_timeout = BENCH_IDLE;
+    send_spec.multistream = multistream;
+    let report = ak_engine::send(send_spec, &bench_quiet_progress)
+        .await
+        .context("bench send failed")?;
+    let recv_report = receiver
+        .await
+        .context("bench receiver task failed")?
+        .context("bench receive failed")?;
+
+    // A Report already implies whole-digest verification on the receive
+    // side; the byte totals must also agree between both ends.
+    if report.bytes != recv_report.bytes {
+        bail!(
+            "bench integrity mismatch: sent {} bytes but received {}",
+            report.bytes,
+            recv_report.bytes
+        );
+    }
+    Ok(BenchRound {
+        mode: if multistream { "multistream" } else { "single" },
+        duration: report.duration,
+        bytes: report.bytes,
+    })
+}
+
+/// Machine-readable bench result (reuses the JSON string escaper).
+fn bench_json(
+    bytes: u64,
+    files: u32,
+    chunk_kb: u32,
+    rounds: &[BenchRound],
+    ratio: Option<f64>,
+) -> String {
+    let mut out = String::from("{\n");
+    out.push_str(&format!("  \"bytes\": {bytes},\n"));
+    out.push_str(&format!("  \"files\": {files},\n"));
+    out.push_str(&format!("  \"chunk_kb\": {chunk_kb},\n"));
+    out.push_str("  \"rounds\": [\n");
+    for (index, round) in rounds.iter().enumerate() {
+        let (mb_per_s, gib_per_s) = throughput(round.bytes, round.duration);
+        let comma = if index + 1 < rounds.len() { "," } else { "" };
+        out.push_str(&format!(
+            "    {{\"mode\": \"{}\", \"duration_ms\": {:.3}, \"bytes\": {}, \
+             \"mb_per_s\": {:.3}, \"gib_per_s\": {:.6}}}{}\n",
+            json_escape(round.mode),
+            round.duration.as_secs_f64() * 1000.0,
+            round.bytes,
+            mb_per_s,
+            gib_per_s,
+            comma
+        ));
+    }
+    out.push_str("  ],\n");
+    match ratio {
+        Some(ratio) => out.push_str(&format!("  \"ratio\": {ratio:.4},\n")),
+        None => out.push_str("  \"ratio\": null,\n"),
+    }
+    out.push_str(&format!(
+        "  \"note\": \"{}\"\n}}",
+        json_escape(BENCH_DISCLAIMER)
+    ));
+    out
+}
+
+async fn bench_command(
+    bytes: u64,
+    files: u32,
+    chunk_kb: u32,
+    multistream: bool,
+    once: bool,
+    json: bool,
+) -> Result<()> {
+    // Default: both rounds plus a comparison. --once runs exactly one round
+    // (single-stream, or multistream when --multistream is also given).
+    let run_single = !once || !multistream;
+    let run_multi = !once || multistream;
+    let mut plan: Vec<(&'static str, bool)> = Vec::new();
+    if run_single {
+        plan.push(("single-stream", false));
+    }
+    if run_multi {
+        plan.push(("multistream", true));
+    }
+
+    let dir = BenchTempDir::new()?;
+    let src = dir.path().join("src");
+    let sizes = bench_file_sizes(bytes, files);
+    eprintln!(
+        "ak-cli bench: {} across {} files, chunk {chunk_kb} KiB; \
+         generating deterministic source into {}",
+        human_bytes(bytes),
+        sizes.len(),
+        src.display()
+    );
+    write_bench_source(&src, &sizes)?;
+
+    let total = plan.len();
+    let mut rounds: Vec<BenchRound> = Vec::new();
+    for (index, (label, round_multistream)) in plan.iter().enumerate() {
+        let dst = dir.path().join(format!("dst-{index}"));
+        let checkpoints = dir.path().join(format!("ckpt-{index}"));
+        std::fs::create_dir_all(&dst)
+            .with_context(|| format!("cannot create {}", dst.display()))?;
+        std::fs::create_dir_all(&checkpoints)
+            .with_context(|| format!("cannot create {}", checkpoints.display()))?;
+        eprintln!("round {}/{total} ({label}): running...", index + 1);
+        let round = bench_round(&src, &dst, &checkpoints, chunk_kb, *round_multistream).await?;
+        let (mb_per_s, gib_per_s) = throughput(round.bytes, round.duration);
+        eprintln!(
+            "round {}/{total} ({label}): {} in {:.3} s -> {:.2} MB/s ({:.4} GiB/s)",
+            index + 1,
+            human_bytes(round.bytes),
+            round.duration.as_secs_f64(),
+            mb_per_s,
+            gib_per_s
+        );
+        rounds.push(round);
+    }
+
+    // Compare only when both modes ran (rounds[0]=single, rounds[1]=multi).
+    let ratio = if rounds.len() == 2 {
+        let (single_mb, _) = throughput(rounds[0].bytes, rounds[0].duration);
+        let (multi_mb, _) = throughput(rounds[1].bytes, rounds[1].duration);
+        Some(multi_mb / single_mb.max(1e-9))
+    } else {
+        None
+    };
+
+    if json {
+        println!("{}", bench_json(bytes, files, chunk_kb, &rounds, ratio));
+        return Ok(());
+    }
+    if let Some(ratio) = ratio {
+        let (single_mb, _) = throughput(rounds[0].bytes, rounds[0].duration);
+        let (multi_mb, _) = throughput(rounds[1].bytes, rounds[1].duration);
+        println!(
+            "comparison: multistream {ratio:.2}x single-stream \
+             ({multi_mb:.2} vs {single_mb:.2} MB/s)"
+        );
+    }
+    println!("note: {BENCH_DISCLAIMER}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -716,7 +1158,10 @@ fn pair_command(id: &Path, cmd: PairCommand) -> Result<()> {
             if added {
                 println!("paired {shown} ({})", fp.short_id());
             } else {
-                println!("updated {shown} ({}) -- entry already existed", fp.short_id());
+                println!(
+                    "updated {shown} ({}) -- entry already existed",
+                    fp.short_id()
+                );
             }
             println!("fingerprint (full): {}", fp.to_hex());
             println!(
@@ -799,7 +1244,9 @@ fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
             } else if completed {
                 CleanScope::Completed
             } else {
-                bail!("jobs clean needs --all or --completed (part files .akpart are never touched)");
+                bail!(
+                    "jobs clean needs --all or --completed (part files .akpart are never touched)"
+                );
             };
             let (removed, kept) = clean_job_records(&dir, scope)?;
             println!(
@@ -819,6 +1266,7 @@ async fn receive_command(
     expect: Option<String>,
     conflict: String,
     once: bool,
+    timeout: u64,
 ) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
     let fp = key.fingerprint();
@@ -826,6 +1274,7 @@ async fn receive_command(
     let conflict = conflict_policy(&conflict)?;
     let checkpoints = checkpoint_dir(id);
     let device_name = whoami();
+    let idle = idle_timeout_from_secs(timeout);
 
     match &policy {
         ExpectPolicy::Any => println!(
@@ -866,12 +1315,14 @@ async fn receive_command(
         spec.conflict = conflict;
         spec.checkpoint_dir = checkpoints.clone();
         spec.device_name = device_name.clone();
+        spec.idle_timeout = idle;
         spec.authorize = policy.authorize();
         let printer = progress_printer("recv");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-        let receiver = tokio::spawn(async move {
-            ak_engine::receive_with_addr(spec, &*printer, addr_tx).await
-        });
+        let receiver =
+            tokio::spawn(
+                async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
+            );
         if first {
             let addr = addr_rx.await.context("receiver failed to bind")?;
             println!("receiving into {}", out.display());
@@ -900,9 +1351,7 @@ async fn receive_command(
                 rebind_retries = 0;
                 println!("waiting for next sender (Ctrl-C stops)...");
             }
-            Ok(Err(EngineError::Connect(ak_net::ConnectError::Unauthorized)))
-                if !once =>
-            {
+            Ok(Err(EngineError::Connect(ak_net::ConnectError::Unauthorized))) if !once => {
                 println!("rejected a peer outside the accept policy; still waiting (Ctrl-C stops)");
             }
             Ok(Err(EngineError::Io(err)))
@@ -919,6 +1368,9 @@ async fn receive_command(
     }
 }
 
+// Options arrive flat from clap; grouping them into a struct here would only
+// mirror the enum variant one-to-one (same allowance as the engine drivers).
+#[allow(clippy::too_many_arguments)]
 async fn send_command(
     id: &Path,
     paths: Vec<PathBuf>,
@@ -927,6 +1379,7 @@ async fn send_command(
     port: u16,
     conflict: String,
     multistream: bool,
+    timeout: u64,
 ) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
     let pinned = parse_fingerprint(&fp_text)?;
@@ -946,6 +1399,7 @@ async fn send_command(
     spec.conflict = conflict_policy(&conflict)?;
     spec.checkpoint_dir = checkpoint_dir(id);
     spec.device_name = whoami();
+    spec.idle_timeout = idle_timeout_from_secs(timeout);
     spec.multistream = multistream;
     let _ = key;
     let printer = progress_printer("send");
@@ -1066,7 +1520,8 @@ async fn main() -> Result<()> {
             expect,
             conflict,
             once,
-        } => receive_command(&id, out, port, expect, conflict, once).await,
+            timeout,
+        } => receive_command(&id, out, port, expect, conflict, once, timeout).await,
         Command::Send {
             paths,
             to,
@@ -1074,7 +1529,8 @@ async fn main() -> Result<()> {
             port,
             conflict,
             multistream,
-        } => send_command(&id, paths, to, fp, port, conflict, multistream).await,
+            timeout,
+        } => send_command(&id, paths, to, fp, port, conflict, multistream, timeout).await,
         Command::Discover { seconds, json } => discover_command(&id, seconds, json).await,
         Command::Jobs { cmd } => jobs_command(&id, cmd),
         Command::SignalServer {
@@ -1103,6 +1559,14 @@ async fn main() -> Result<()> {
             peer,
             no_stun,
         } => probe_command(&id, server, peer, no_stun).await,
+        Command::Bench {
+            bytes,
+            files,
+            chunk_kb,
+            multistream,
+            once,
+            json,
+        } => bench_command(bytes, files, chunk_kb, multistream, once, json).await,
     }
 }
 
@@ -1558,7 +2022,11 @@ mod tests {
         assert_eq!(entry.updated_unix_ms, 1_730_000_500_000);
 
         // Corrupt and foreign files are skipped, never fatal.
-        std::fs::write(dir.path().join("beef00112233445566778899aabbccdd.akjob"), b"junk").unwrap();
+        std::fs::write(
+            dir.path().join("beef00112233445566778899aabbccdd.akjob"),
+            b"junk",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("keep.akpart"), b"parts").unwrap();
         assert_eq!(list_job_files(dir.path()).len(), 2);
     }
@@ -1568,10 +2036,8 @@ mod tests {
         let dir = TempDir::new("jobs-tamper");
         let store = FileCheckpointStore::open(dir.path()).unwrap();
         store.save(&stored_record(1, "transferring")).unwrap();
-        let original = std::fs::read_to_string(
-            dir.path().join(format!("{}.akjob", "01".repeat(16))),
-        )
-        .unwrap();
+        let original =
+            std::fs::read_to_string(dir.path().join(format!("{}.akjob", "01".repeat(16)))).unwrap();
         assert!(parse_job_record(&original).is_some());
 
         let variants = [
@@ -1596,15 +2062,25 @@ mod tests {
         store.save(&stored_record(1, "completed")).unwrap();
         store.save(&stored_record(2, "transferring")).unwrap();
         // A corrupt record file still counts for --all but not --completed.
-        std::fs::write(dir.path().join("beef00112233445566778899aabbccdd.akjob"), b"junk").unwrap();
+        std::fs::write(
+            dir.path().join("beef00112233445566778899aabbccdd.akjob"),
+            b"junk",
+        )
+        .unwrap();
         // Part files must survive every clean scope.
         std::fs::write(dir.path().join("0001.akpart"), b"partial data").unwrap();
 
         let (removed, kept) = clean_job_records(dir.path(), CleanScope::Completed).unwrap();
         assert_eq!((removed, kept), (1, 1));
         assert!(dir.path().join("0001.akpart").exists());
-        assert!(dir.path().join(format!("{}.akjob", "02".repeat(16))).exists());
-        assert!(!dir.path().join(format!("{}.akjob", "01".repeat(16))).exists());
+        assert!(dir
+            .path()
+            .join(format!("{}.akjob", "02".repeat(16)))
+            .exists());
+        assert!(!dir
+            .path()
+            .join(format!("{}.akjob", "01".repeat(16)))
+            .exists());
 
         let (removed, kept) = clean_job_records(dir.path(), CleanScope::All).unwrap();
         assert_eq!(removed, 2); // remaining valid record + corrupt file
@@ -1619,8 +2095,7 @@ mod tests {
         );
 
         // Cleaning a missing directory is a no-op, not an error.
-        let (removed, kept) =
-            clean_job_records(&dir.path().join("nope"), CleanScope::All).unwrap();
+        let (removed, kept) = clean_job_records(&dir.path().join("nope"), CleanScope::All).unwrap();
         assert_eq!((removed, kept), (0, 0));
     }
 
@@ -1699,5 +2174,222 @@ mod tests {
         assert!(json.contains("\"source\": \"mdns\""));
         assert!(json.contains("\"source\": \"manual\""));
         assert_eq!(json.matches('\n').count(), 4); // no trailing junk
+    }
+
+    // -- bench ---------------------------------------------------------------
+
+    /// Parse a Cli from argv (tests may use expect/unwrap).
+    fn cli_of(args: &[&str]) -> Cli {
+        let mut argv = vec!["ak-cli"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("argv must parse")
+    }
+
+    #[test]
+    fn bench_args_defaults_and_overrides() {
+        let cli = cli_of(&["bench"]);
+        let Command::Bench {
+            bytes,
+            files,
+            chunk_kb,
+            multistream,
+            once,
+            json,
+        } = cli.command
+        else {
+            panic!("expected bench subcommand");
+        };
+        assert_eq!((bytes, files, chunk_kb), (268_435_456, 8, 1024));
+        assert!(!multistream && !once && !json);
+
+        let cli = cli_of(&[
+            "bench",
+            "--bytes",
+            "1000",
+            "--files",
+            "4",
+            "--chunk-kb",
+            "64",
+            "--multistream",
+            "--once",
+            "--json",
+        ]);
+        let Command::Bench {
+            bytes,
+            files,
+            chunk_kb,
+            multistream,
+            once,
+            json,
+        } = cli.command
+        else {
+            panic!("expected bench subcommand");
+        };
+        assert_eq!((bytes, files, chunk_kb), (1000, 4, 64));
+        assert!(multistream && once && json);
+    }
+
+    #[test]
+    fn bench_args_reject_out_of_range_values() {
+        for bad in [
+            vec!["bench", "--bytes", "0"],
+            vec!["bench", "--files", "0"],
+            vec!["bench", "--chunk-kb", "0"],
+            vec!["bench", "--chunk-kb", "8193"], // above the engine decode budget
+        ] {
+            let mut argv = vec!["ak-cli"];
+            argv.extend_from_slice(&bad);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "unexpectedly accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_flag_maps_to_idle_timeout_on_both_verbs() {
+        // send: default 30, explicit override 5.
+        let fp = "a".repeat(64);
+        let send_args = |extra: &[&str]| -> Vec<String> {
+            let mut argv: Vec<String> = vec![
+                "ak-cli".into(),
+                "send".into(),
+                "x.bin".into(),
+                "--to".into(),
+                "127.0.0.1:7100".into(),
+                "--fp".into(),
+                fp.clone(),
+            ];
+            argv.extend(extra.iter().map(|arg| String::from(*arg)));
+            argv
+        };
+        let cli = Cli::try_parse_from(send_args(&[])).unwrap();
+        let Command::Send { timeout, .. } = cli.command else {
+            panic!("expected send subcommand");
+        };
+        assert_eq!(timeout, 30);
+        assert_eq!(idle_timeout_from_secs(timeout), Duration::from_secs(30));
+
+        let cli = Cli::try_parse_from(send_args(&["--timeout", "5"])).unwrap();
+        let Command::Send { timeout, .. } = cli.command else {
+            panic!("expected send subcommand");
+        };
+        assert_eq!(timeout, 5);
+        assert_eq!(idle_timeout_from_secs(timeout), Duration::from_secs(5));
+
+        // receive: same default and override.
+        let recv_args = |extra: &[&str]| -> Vec<String> {
+            let mut argv: Vec<String> = vec!["ak-cli".into(), "receive".into()];
+            argv.extend(extra.iter().map(|arg| String::from(*arg)));
+            argv
+        };
+        let cli = Cli::try_parse_from(recv_args(&[])).unwrap();
+        let Command::Receive { timeout, .. } = cli.command else {
+            panic!("expected receive subcommand");
+        };
+        assert_eq!(timeout, 30);
+        let cli = Cli::try_parse_from(recv_args(&["--timeout", "17"])).unwrap();
+        let Command::Receive { timeout, .. } = cli.command else {
+            panic!("expected receive subcommand");
+        };
+        assert_eq!(timeout, 17);
+        assert_eq!(idle_timeout_from_secs(timeout), Duration::from_secs(17));
+
+        // Zero is an idle budget of nothing; rejected for both verbs.
+        assert!(Cli::try_parse_from(send_args(&["--timeout", "0"])).is_err());
+        assert!(Cli::try_parse_from(recv_args(&["--timeout", "0"])).is_err());
+    }
+
+    #[test]
+    fn xorshift_filler_is_deterministic_and_distinct() {
+        // Same seed, same stream.
+        let mut a = Xorshift64::new(42);
+        let mut b = Xorshift64::new(42);
+        let (mut buf_a, mut buf_b, mut buf_c) = ([0u8; 20], [0u8; 20], [0u8; 20]);
+        a.fill(&mut buf_a);
+        b.fill(&mut buf_b);
+        Xorshift64::new(43).fill(&mut buf_c);
+        assert_eq!(buf_a, buf_b);
+        assert_ne!(buf_a, buf_c);
+        assert!(buf_a.iter().any(|byte| *byte != 0), "degenerate stream");
+
+        // Zero seed recovers instead of freezing.
+        let mut zero = Xorshift64::new(0);
+        let mut buf_zero = [0u8; 8];
+        zero.fill(&mut buf_zero);
+        assert!(buf_zero.iter().any(|byte| *byte != 0), "zero seed froze");
+
+        // Word-stream continuity: one 16-byte fill equals two 8-byte fills.
+        let mut once = Xorshift64::new(7);
+        let mut twice = Xorshift64::new(7);
+        let (mut whole, mut left, mut right) = ([0u8; 16], [0u8; 8], [0u8; 8]);
+        once.fill(&mut whole);
+        twice.fill(&mut left);
+        twice.fill(&mut right);
+        assert_eq!(&whole[..8], &left);
+        assert_eq!(&whole[8..], &right);
+    }
+
+    #[test]
+    fn bench_file_sizes_split_evenly_and_sum_to_total() {
+        assert_eq!(bench_file_sizes(10, 3), vec![4, 3, 3]);
+        assert_eq!(bench_file_sizes(8, 8), vec![1; 8]);
+        assert_eq!(bench_file_sizes(3, 5), vec![1, 1, 1, 0, 0]);
+        for (total, files) in [(1u64, 1u32), (1_000_001, 7), (268_435_456, 8)] {
+            let sizes = bench_file_sizes(total, files);
+            assert_eq!(sizes.len(), files as usize);
+            assert_eq!(sizes.iter().sum::<u64>(), total);
+        }
+    }
+
+    #[test]
+    fn bench_json_has_machine_readable_shape() {
+        let rounds = vec![
+            BenchRound {
+                mode: "single",
+                duration: Duration::from_millis(2000),
+                bytes: 100_000_000,
+            },
+            BenchRound {
+                mode: "multistream",
+                duration: Duration::from_millis(1000),
+                bytes: 100_000_000,
+            },
+        ];
+        let json = bench_json(100_000_000, 8, 1024, &rounds, Some(2.0));
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\"bytes\": 100000000"));
+        assert!(json.contains("\"files\": 8"));
+        assert!(json.contains("\"chunk_kb\": 1024"));
+        assert!(json.contains("\"mode\": \"single\""));
+        assert!(json.contains("\"mode\": \"multistream\""));
+        assert!(json.contains("\"duration_ms\": 2000.000"));
+        assert!(json.contains("\"mb_per_s\": 50.000"));
+        assert!(json.contains("\"gib_per_s\": 0.046566"));
+        assert!(json.contains("\"ratio\": 2.0000"));
+        assert!(json.contains(BENCH_DISCLAIMER));
+        assert!(!json.contains("\"ratio\": null"));
+
+        let one = vec![BenchRound {
+            mode: "single",
+            duration: Duration::from_millis(500),
+            bytes: 1000,
+        }];
+        let json = bench_json(1000, 1, 1, &one, None);
+        assert!(json.contains("\"ratio\": null"));
+        assert!(!json.contains("inf") && !json.contains("NaN"));
+    }
+
+    #[test]
+    fn clip_line_truncates_on_char_boundary_within_width() {
+        assert_eq!(clip_line("short", 10), "short");
+        let clipped = clip_line(&"x".repeat(100), 79);
+        assert_eq!(clipped.chars().count(), 79);
+        assert!(clipped.ends_with("..."));
+        // Unicode path characters never split a char.
+        let clipped = clip_line(&"设".repeat(100), 79);
+        assert_eq!(clipped.chars().count(), 79);
+        // Tiny widths degrade to a plain truncation, never wider than width.
+        assert_eq!(clip_line("abc", 2), "ab");
     }
 }

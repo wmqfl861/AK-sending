@@ -85,6 +85,7 @@ dependencies = [
  "ak-engine",
  "ak-identity",
  "ak-net",
+ "ak-signal",
  "ak-storage",
  "ak-store",
  "ak-wire",

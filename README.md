@@ -61,11 +61,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 命令行原型（局域网，环回或同网段两台机器）：
 
 ```sh
-cargo run -p ak-cli -- keygen            # 生成本机密钥并显示指纹/配对码
-cargo run -p ak-cli -- receive --out DIR --port 7100     # 接收端
-cargo run -p ak-cli -- send PATH --to IP:7100 --fp <接收端指纹>  # 发送端
-cargo run -p ak-cli -- signal-server     # 协调服务器（信令+STUN，无文件路由）
+cargo run -p ak-cli -- keygen            # 生成本机密钥并显示 device id/指纹/配对码
+cargo run -p ak-cli -- pair add <64hex> --name NAME   # 配对簿：添加对端
+cargo run -p ak-cli -- pair list | pair remove <64hex>
+cargo run -p ak-cli -- receive --out DIR --port 7100  # 接收端（默认仅接受已配对指纹，循环接单）
+cargo run -p ak-cli -- send PATH --to IP:7100 --fp <接收端指纹> [--multistream]
+cargo run -p ak-cli -- jobs | jobs clean --completed  # 传输检查点查看/清理
+cargo run -p ak-cli -- discover [--json]  # mDNS 发现（带配对状态）
+cargo run -p ak-cli -- signal-server      # 协调服务器（信令+STUN，无文件路由）
 cargo run -p ak-cli -- probe --server IP:7100 --peer <对端 device id>  # 公网直连探测
+cargo run -p ak-cli -- bench              # 进程内环回吞吐基准（单流 vs 多流）
 ```
 
 首次初始化空仓库可使用 [发布说明](docs/PUBLISHING.zh-CN.md) 及 `scripts/publish.ps1`；脚本不包含凭据、不强推，也不处理已有提交的仓库。
@@ -73,4 +78,4 @@ cargo run -p ak-cli -- probe --server IP:7100 --peer <对端 device id>  # 公�
 ## 开发规则
 
 阅读 [AGENTS.md](AGENTS.md) 后再修改。完成状态必须有证据；未实现和未测试事项保留为未完成。
-未经项目所有者选择，不擅自添加开源许可证。本次未增加第三方运行时依赖。
+未经项目所有者选择，不擅自添加开源许可证。受控依赖新增须经 ADR-002 复核（当前：quinn/rustls(ring)/ed25519-dalek/blake3/rcgen/mdns-sd/if-addrs/tokio/clap/fs2/filetime 等，全部无 relay/TURN 类）。

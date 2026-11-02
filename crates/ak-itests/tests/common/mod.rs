@@ -189,23 +189,55 @@ pub struct TransferOutcome {
 }
 
 /// Like [`TransferOutcome`] but carrying each side's raw result so callers can
-/// match on protocol-level errors (used to pin known engine defects).
+/// match on protocol-level errors (used to pin known engine defects), plus the
+/// address the receiver actually bound (its family follows `recv_bind`, which
+/// is how the T03 IPv6 run proves the data plane really rode ::1).
 pub struct RawOutcome {
     pub send: Result<Report, ak_engine::EngineError>,
     pub recv: Result<Report, ak_engine::EngineError>,
     pub events: Vec<Progress>,
+    pub recv_local_addr: SocketAddr,
 }
 
-/// Run one full loopback transfer: fresh Ed25519 identities for both sides,
-/// port-0 binds, isolated per-run checkpoint dirs, real QUIC on 127.0.0.1.
-/// Returns both sides' raw results; never panics on transfer errors (only on
-/// task panics or a `budget_secs` overrun).
-pub async fn try_run_transfer_full(
+/// Address-family and stream-shape knobs for [`try_run_transfer_opts`].
+/// Defaults reproduce the historical shape used by every other test in this
+/// crate: sender on the unspecified v4 bind (0.0.0.0:0, `SendSpec::new`'s
+/// default), receiver explicitly on 127.0.0.1:0, single-stream, window of 8.
+pub struct TransferOpts {
+    /// Sender's UDP bind (`SendSpec.bind`; port 0 = ephemeral). NOT the peer
+    /// address — that is always the receiver's reported address.
+    pub send_bind: SocketAddr,
+    /// Receiver's UDP bind (`ReceiveSpec.bind`); its family decides the whole
+    /// data path's address family.
+    pub recv_bind: SocketAddr,
+    /// Sender-side opt-in; effective only when the peer also advertises it.
+    pub multistream: bool,
+    /// Maximum unacknowledged chunks in flight (sender side).
+    pub in_flight_window: u32,
+}
+
+impl Default for TransferOpts {
+    fn default() -> Self {
+        Self {
+            send_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            recv_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            multistream: false,
+            in_flight_window: 8,
+        }
+    }
+}
+
+/// Run one full loopback transfer with explicit [`TransferOpts`]: fresh
+/// Ed25519 identities for both sides, port-0 binds, isolated per-run
+/// checkpoint dirs, real QUIC. Returns both sides' raw results; never panics
+/// on transfer errors (only on task panics or a `budget_secs` overrun).
+pub async fn try_run_transfer_opts(
     src: &Path,
     dst: &Path,
     chunk_kb: u32,
     conflict: ConflictPolicy,
     budget_secs: u64,
+    opts: TransferOpts,
 ) -> RawOutcome {
     let sender_key = DeviceKeyPair::generate();
     let receiver_key = DeviceKeyPair::generate();
@@ -217,19 +249,23 @@ pub async fn try_run_transfer_full(
 
     let mut send_spec = SendSpec::new(
         src.to_path_buf(),
+        // Peer placeholder; replaced by the receiver's reported address below.
         SocketAddr::from(([127, 0, 0, 1], 0)),
         receiver_key.fingerprint(),
         sender_bundle,
     );
     send_spec.device_name = "ak-itests-sender".into();
+    send_spec.bind = opts.send_bind;
     send_spec.chunk_size = NonZeroU32::new(chunk_kb * 1024).expect("chunk_kb must be nonzero");
     send_spec.checkpoint_dir = send_ckpt.path().to_path_buf();
+    send_spec.multistream = opts.multistream;
+    send_spec.in_flight_window = opts.in_flight_window;
 
     let mut recv_spec = ReceiveSpec::new(dst.to_path_buf(), receiver_bundle);
     recv_spec.device_name = "ak-itests-receiver".into();
     // Port 0 and loopback only: never touch the default 0.0.0.0:7100 (tests
     // run in parallel and would collide).
-    recv_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    recv_spec.bind = opts.recv_bind;
     recv_spec.chunk_size = send_spec.chunk_size;
     recv_spec.conflict = conflict;
     recv_spec.checkpoint_dir = recv_ckpt.path().to_path_buf();
@@ -248,7 +284,8 @@ pub async fn try_run_transfer_full(
     let recv_callback = Arc::clone(&callback);
     let receiver =
         tokio::spawn(async move { receive_with_addr(recv_spec, &*recv_callback, addr_tx).await });
-    send_spec.peer = addr_rx.await.expect("receiver must report its address");
+    let recv_local_addr = addr_rx.await.expect("receiver must report its address");
+    send_spec.peer = recv_local_addr;
     let send_callback = Arc::clone(&callback);
     let sender = tokio::spawn(async move { send(send_spec, &*send_callback).await });
 
@@ -265,7 +302,31 @@ pub async fn try_run_transfer_full(
         .lock()
         .map(|mut log| std::mem::take(&mut *log))
         .unwrap_or_default();
-    RawOutcome { send, recv, events }
+    RawOutcome {
+        send,
+        recv,
+        events,
+        recv_local_addr,
+    }
+}
+
+/// Historical default-shaped raw run: 127.0.0.1 both sides, single stream.
+pub async fn try_run_transfer_full(
+    src: &Path,
+    dst: &Path,
+    chunk_kb: u32,
+    conflict: ConflictPolicy,
+    budget_secs: u64,
+) -> RawOutcome {
+    try_run_transfer_opts(
+        src,
+        dst,
+        chunk_kb,
+        conflict,
+        budget_secs,
+        TransferOpts::default(),
+    )
+    .await
 }
 
 /// Panicking variant of [`try_run_transfer_full`]: both sides must succeed.

@@ -112,6 +112,11 @@ impl SignalClient {
     }
 
     /// Receive the next server message (SessionOpened, Signal, errors).
+    /// After `SessionOpened`, the server may deliver
+    /// `Signal { signal: SameEgress, .. }`: both endpoints were observed
+    /// behind the same network egress, so callers should rank LAN
+    /// candidates ahead of public ones (`ak_discovery::rank` already
+    /// imposes that order; the hint is for UI and as a fallback).
     pub async fn next(&self) -> Result<CtrlMessage, SignalError> {
         let mut inbox = self.inbox.lock().await;
         inbox.recv().await.ok_or(SignalError::Closed)

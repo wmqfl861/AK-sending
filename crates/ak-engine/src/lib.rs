@@ -31,6 +31,16 @@
 //!   most `min(in_flight_window, 4)` concurrent), with per-file windowed
 //!   acks. Otherwise the single-stream v1 path runs unchanged.
 //!
+//! v3 additions (append-only, no wire-format change):
+//! - storage-full precheck: before the receiver answers with a ResumeRequest
+//!   it compares the destination's reported free space against the job's
+//!   total bytes ([`check_headroom`]); a shortage aborts with
+//!   [`EngineError::StorageFull`] after telling the peer over the wire;
+//! - multi-root send jobs: [`SendSpec::extra_roots`] merges several
+//!   files/directories into one manifest, each entry prefixed with its
+//!   root's name; the receiver side is unchanged (the tree simply grows a
+//!   top-level directory per root).
+//!
 //! Known v1 limitations still true (deliberate, documented): receiver accepts
 //! one job per `receive()` call.
 #![forbid(unsafe_code)]
@@ -43,8 +53,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ak_core::error::ErrorCode;
-use ak_core::handle::{ConflictPolicy, FileSink, SourceHandle};
-use ak_core::manifest::Manifest;
+use ak_core::handle::{ConflictPolicy, FileSink, SaveTarget, SourceHandle};
+use ak_core::manifest::{FileEntry, Manifest};
 use ak_identity::tls::TlsBundle;
 use ak_identity::Fingerprint;
 use ak_net::{DirectChannel, DirectEndpoint, DirectRecvStream, DirectSendStream, DirectStream};
@@ -89,6 +99,13 @@ const MAX_PARALLEL_STREAMS: usize = 4;
 pub struct SendSpec {
     /// File or directory to send.
     pub source_root: PathBuf,
+    /// Additional files/directories sent in the same job. Empty (the
+    /// default) keeps the frozen single-root behavior; otherwise every
+    /// root's manifest entries are prefixed with that root's name
+    /// (`<root_name>/<rel_path>`) and merged into one manifest. Root names
+    /// must be unique; duplicates fail the send with an `InvalidInput` io
+    /// error before any connection is made.
+    pub extra_roots: Vec<PathBuf>,
     pub peer: SocketAddr,
     /// Expected peer fingerprint; the connection aborts on mismatch.
     pub pinned: Fingerprint,
@@ -120,6 +137,7 @@ impl SendSpec {
     ) -> Self {
         Self {
             source_root,
+            extra_roots: Vec::new(),
             peer,
             pinned,
             identity,
@@ -132,6 +150,12 @@ impl SendSpec {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             multistream: false,
         }
+    }
+
+    /// Append another file or directory to this send job (multi-root send).
+    /// Root names must be unique across the job; see [`SendSpec::extra_roots`].
+    pub fn add_root(&mut self, path: PathBuf) {
+        self.extra_roots.push(path);
     }
 }
 
@@ -239,6 +263,9 @@ pub struct Report {
     /// Chunks not re-sent/re-received thanks to verified part files.
     pub resumed_chunks: u64,
     pub peer_fingerprint: Option<String>,
+    /// Root names of the job on the sender (primary first, then extras in
+    /// the order they were added). Empty on the receiver side.
+    pub roots: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,6 +286,13 @@ pub enum EngineError {
     SourceChanged,
     #[error("storage error: {0}")]
     Storage(#[from] ak_storage::OpenError),
+    #[error("destination storage full: {available} bytes available, {needed} needed")]
+    StorageFull {
+        /// Free bytes the destination reported at precheck time.
+        available: u64,
+        /// Total payload bytes the job needs.
+        needed: u64,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("checkpoint store error: {0}")]
@@ -292,6 +326,21 @@ pub fn job_id_for(root_name: &str, manifest: &Manifest) -> JobId {
     let mut id = JobId::default();
     id.copy_from_slice(&digest.as_bytes()[..16]);
     id
+}
+
+/// Pure storage-headroom decision for the receive side. Unknown capacity
+/// (`None`: the platform cannot report free space) passes — exhaustion is
+/// still caught later by real write errors, never faked here. An exact fit
+/// passes; any shortage fails with [`EngineError::StorageFull`] carrying the
+/// real reported numbers.
+pub fn check_headroom(available: Option<u64>, total_needed: u64) -> Result<(), EngineError> {
+    match available {
+        Some(available) if available < total_needed => Err(EngineError::StorageFull {
+            available,
+            needed: total_needed,
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -369,6 +418,34 @@ fn unexpected(message: Message) -> EngineError {
     }
 }
 
+/// Connect with a fast family check and a hard deadline. A v4 socket dialing
+/// a v6 peer (or vice versa) would otherwise hang in QUIC's retry loop with
+/// no error (found by the IPv6 scenario tests); the idle budget bounds every
+/// other unreachable-peer case too.
+async fn connect_bounded(
+    endpoint: &DirectEndpoint,
+    peer: SocketAddr,
+    pinned: &Fingerprint,
+    idle: Duration,
+) -> Result<DirectChannel, EngineError> {
+    let local = endpoint.local_addr()?;
+    if local.is_ipv4() != peer.is_ipv4() {
+        return Err(EngineError::Connect(ak_net::ConnectError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "address family mismatch: endpoint bound on {local} cannot reach {peer}; \
+                     use a matching-family --to/--port or an [::] bind"
+                ),
+            ),
+        )));
+    }
+    match tokio::time::timeout(idle, endpoint.connect(peer, pinned)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(EngineError::IdleTimeout(idle)),
+    }
+}
+
 /// Assemble manifest pages under the byte budget.
 fn assemble_pages(manifest: &Manifest, limits: &Limits) -> Vec<Vec<WireEntry>> {
     let mut pages: Vec<Vec<WireEntry>> = Vec::new();
@@ -417,9 +494,165 @@ fn sender_record(spec: &SendSpec, job_id: JobId, manifest: &Manifest) -> TaskRec
     }
 }
 
+/// Sender-side source set: the primary root plus any extra roots, exposed to
+/// the transfer loops as one manifest. With no extra roots this is an
+/// identity wrapper, so the single-root wire behavior (manifest, job id,
+/// Offer root name) is byte-for-byte the frozen one. With extras, every
+/// entry of root `r` is re-pathed as `<root_name>/<rel_path>`; root names
+/// must be unique or the job is refused up front.
+struct SourceSet {
+    sources: Vec<Arc<LocalSource>>,
+    /// Display name of each root, in the same order as `sources`.
+    names: Vec<String>,
+    /// Merged manifest the wire protocol speaks.
+    manifest: Manifest,
+    /// Merged entry index -> (root ordinal, per-root entry index). Synthesized
+    /// entries for entirely empty roots carry `u32::MAX` as their local index;
+    /// they are directories and are never read.
+    index_map: Vec<(u32, u32)>,
+    /// True when more than one root was merged.
+    multi: bool,
+}
+
+/// Map a manifest-construction failure (root name unusable as a transfer
+/// path component, e.g. a Windows-reserved stem) to a clear invalid-input
+/// error, before any connection is made.
+fn invalid_root_name(name: &str) -> EngineError {
+    EngineError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("root name not usable as a transfer directory name: {name:?}"),
+    ))
+}
+
+impl SourceSet {
+    fn open(spec: &SendSpec) -> Result<Self, EngineError> {
+        let mut sources = vec![Arc::new(LocalSource::open(
+            &spec.source_root,
+            spec.chunk_size,
+        )?)];
+        for extra in &spec.extra_roots {
+            sources.push(Arc::new(LocalSource::open(extra, spec.chunk_size)?));
+        }
+        let names: Vec<String> = sources.iter().map(|s| s.root_name()).collect();
+        let multi = !spec.extra_roots.is_empty();
+        if multi {
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != names.len() {
+                return Err(EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("duplicate transfer root names: [{}]", names.join(", ")),
+                )));
+            }
+        }
+        let (manifest, index_map) = if multi {
+            let mut entries = Vec::new();
+            let mut index_map = Vec::new();
+            for (ordinal, source) in sources.iter().enumerate() {
+                let local = source.manifest();
+                if local.entries.is_empty() {
+                    // An entirely empty directory root still appears on the
+                    // receiver as its own top-level directory.
+                    entries.push(
+                        FileEntry::directory(&names[ordinal])
+                            .map_err(|_| invalid_root_name(&names[ordinal]))?,
+                    );
+                    index_map.push((ordinal as u32, u32::MAX));
+                    continue;
+                }
+                for (local_index, entry) in local.entries.iter().enumerate() {
+                    let rel = format!(
+                        "{}/{}",
+                        names[ordinal],
+                        entry.rel_path.to_string_lossy().replace('\\', "/")
+                    );
+                    let merged = if entry.is_dir {
+                        FileEntry::directory(&rel)
+                    } else {
+                        FileEntry::new(
+                            &rel,
+                            entry.size,
+                            entry.mtime_unix_ms,
+                            entry.whole_digest,
+                            entry.chunk_digests.clone(),
+                        )
+                    }
+                    .map_err(|_| invalid_root_name(&names[ordinal]))?;
+                    entries.push(merged);
+                    index_map.push((ordinal as u32, local_index as u32));
+                }
+            }
+            (
+                Manifest {
+                    chunk_size: spec.chunk_size,
+                    entries,
+                },
+                index_map,
+            )
+        } else {
+            let manifest = sources[0].manifest().clone();
+            let index_map = (0..manifest.entries.len() as u32).map(|i| (0, i)).collect();
+            (manifest, index_map)
+        };
+        Ok(Self {
+            sources,
+            names,
+            manifest,
+            index_map,
+            multi,
+        })
+    }
+
+    /// Read a merged-index chunk through the owning root's source.
+    fn read_chunk(
+        &self,
+        file_index: u32,
+        chunk_index: u64,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let (ordinal, local_index) = self
+            .index_map
+            .get(file_index as usize)
+            .copied()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "file index out of range")
+            })?;
+        let source = self.sources.get(ordinal as usize).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "root index out of range")
+        })?;
+        source.read_chunk(local_index, chunk_index, buf)
+    }
+
+    /// Re-check every root against its manifest.
+    fn verify_stable(&self) -> Result<(), EngineError> {
+        for source in &self.sources {
+            source
+                .verify_stable()
+                .map_err(|_| EngineError::SourceChanged)?;
+        }
+        Ok(())
+    }
+
+    /// Name used for the Offer and the job id: the single root's name, or
+    /// `"multi"` when several roots were merged.
+    fn display_name(&self) -> &str {
+        if self.multi {
+            "multi"
+        } else {
+            &self.names[0]
+        }
+    }
+
+    /// Root names for the report (primary first, extras in add order).
+    fn roots(&self) -> Vec<String> {
+        self.names.clone()
+    }
+}
+
 /// Read one chunk through the blocking pool, returning exactly the chunk bytes.
 async fn read_chunk_via(
-    source: Arc<LocalSource>,
+    source: Arc<SourceSet>,
     file_index: u32,
     chunk_index: u64,
     len: usize,
@@ -557,7 +790,7 @@ enum SendEvent {
 #[allow(clippy::too_many_arguments)]
 async fn multistream_send_files(
     channel: &Arc<DirectChannel>,
-    source: &Arc<LocalSource>,
+    source: &Arc<SourceSet>,
     manifest: &Manifest,
     skip: &[u64],
     in_flight_window: u32,
@@ -662,7 +895,7 @@ async fn multistream_send_files(
 #[allow(clippy::too_many_arguments)]
 async fn multistream_file_send(
     channel: Arc<DirectChannel>,
-    source: Arc<LocalSource>,
+    source: Arc<SourceSet>,
     job_id: JobId,
     file_index: u32,
     file_size: u64,
@@ -855,9 +1088,9 @@ pub async fn send(
 ) -> Result<Report, EngineError> {
     let started = Instant::now();
     let limits = engine_limits();
-    let source = Arc::new(LocalSource::open(&spec.source_root, spec.chunk_size)?);
-    let manifest = source.manifest().clone();
-    let root_name = source.root_name();
+    let sources = Arc::new(SourceSet::open(&spec)?);
+    let manifest = sources.manifest.clone();
+    let root_name = sources.display_name().to_owned();
     let job_id = job_id_for(&root_name, &manifest);
 
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
@@ -866,7 +1099,7 @@ pub async fn send(
 
     progress(Progress::Connecting);
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
-    let channel = Arc::new(endpoint.connect(spec.peer, &spec.pinned).await?);
+    let channel = Arc::new(connect_bounded(&endpoint, spec.peer, &spec.pinned, spec.idle_timeout).await?);
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
     });
@@ -969,7 +1202,7 @@ pub async fn send(
     if multistream {
         multistream_send_files(
             &channel,
-            &source,
+            &sources,
             &manifest,
             &skip,
             spec.in_flight_window,
@@ -1008,8 +1241,9 @@ pub async fn send(
                 }
                 let range = plan.range(chunk_index).ok_or(EngineError::SourceChanged)?;
                 let len = (range.end - range.start) as usize;
-                let data = read_chunk_via(Arc::clone(&source), file_index as u32, chunk_index, len)
-                    .await?;
+                let data =
+                    read_chunk_via(Arc::clone(&sources), file_index as u32, chunk_index, len)
+                        .await?;
                 if data.len() != len {
                     return Err(EngineError::SourceChanged);
                 }
@@ -1059,10 +1293,8 @@ pub async fn send(
         .await?;
     }
 
-    // Final integrity gate on the source, then Finalize.
-    source
-        .verify_stable()
-        .map_err(|_| EngineError::SourceChanged)?;
+    // Final integrity gate on the sources, then Finalize.
+    sources.verify_stable()?;
     tx.send_frame(&Frame {
         version: ak_wire::VERSION,
         message: Message::Finalize { job_id },
@@ -1106,6 +1338,7 @@ pub async fn send(
         duration: started.elapsed(),
         resumed_chunks,
         peer_fingerprint: Some(spec.pinned.to_hex()),
+        roots: sources.roots(),
     })
 }
 
@@ -1220,28 +1453,6 @@ pub async fn receive_with_addr(
     progress(Progress::ManifestReceived);
     let job = ReceiverJob { manifest };
 
-    // Prepare sinks (transparent resume from .akpart files) and answer.
-    let mut sinks: Vec<Option<ak_storage::LocalFileSink>> =
-        Vec::with_capacity(job.manifest.entries.len());
-    let mut resume: Vec<ResumeEntry> = Vec::new();
-    for (index, entry) in job.manifest.entries.iter().enumerate() {
-        let sink = target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?;
-        let prefix = sink.verified_prefix_chunks();
-        if !entry.is_dir {
-            resume.push(ResumeEntry {
-                file_index: index as u32,
-                verified_prefix_chunks: prefix,
-            });
-        }
-        sinks.push(Some(sink));
-    }
-    let resumed_chunks: u64 = resume.iter().map(|r| r.verified_prefix_chunks).sum();
-    if resumed_chunks > 0 {
-        progress(Progress::Resuming {
-            chunks: resumed_chunks,
-        });
-    }
-
     let mut record = TaskRecord {
         job_id,
         direction: Direction::Receive,
@@ -1265,6 +1476,52 @@ pub async fn receive_with_addr(
             })
             .collect(),
     };
+
+    // Storage-full precheck: refuse the job before any part file is created.
+    // Unknown capacity passes (see [`check_headroom`]); a shortage is told to
+    // the peer over the wire, checkpointed as "failed_storage_full", and
+    // returned as the local verdict. The sender already maps a peer Error at
+    // its ResumeRequest wait into `EngineError::PeerError` — numbers are not
+    // invented on either side.
+    if let Err(error) = check_headroom(target.available_bytes(), job.manifest.total_bytes()) {
+        // Best effort: the job dies of a local condition regardless of
+        // whether the peer still hears us.
+        let _ = tx
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Error {
+                    code: ErrorCode::StorageFull,
+                    message: "insufficient free space at destination".into(),
+                },
+            })
+            .await;
+        record.state = "failed_storage_full".into();
+        record.updated_unix_ms = now_ms();
+        store.save(&record).map_err(EngineError::Checkpoint)?;
+        return Err(error);
+    }
+
+    // Prepare sinks (transparent resume from .akpart files) and answer.
+    let mut sinks: Vec<Option<ak_storage::LocalFileSink>> =
+        Vec::with_capacity(job.manifest.entries.len());
+    let mut resume: Vec<ResumeEntry> = Vec::new();
+    for (index, entry) in job.manifest.entries.iter().enumerate() {
+        let sink = target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?;
+        let prefix = sink.verified_prefix_chunks();
+        if !entry.is_dir {
+            resume.push(ResumeEntry {
+                file_index: index as u32,
+                verified_prefix_chunks: prefix,
+            });
+        }
+        sinks.push(Some(sink));
+    }
+    let resumed_chunks: u64 = resume.iter().map(|r| r.verified_prefix_chunks).sum();
+    if resumed_chunks > 0 {
+        progress(Progress::Resuming {
+            chunks: resumed_chunks,
+        });
+    }
 
     // Everything below can fail mid-transfer; the outcome wrapper then
     // discards empty part files so a failed receive leaves no litter.
@@ -1384,6 +1641,7 @@ pub async fn receive_with_addr(
             duration: started.elapsed(),
             resumed_chunks,
             peer_fingerprint: Some(channel.peer_fingerprint().to_hex()),
+            roots: Vec::new(),
         })
     }
     .await;
@@ -2019,6 +2277,28 @@ mod tests {
         assert!(!part_path.exists(), "committed file leaves no part behind");
     }
 
+    /// A v4 endpoint dialing a v6 peer must fail fast instead of hanging in
+    /// QUIC's retry loop (defect found by the IPv6 scenario tests).
+    #[tokio::test]
+    async fn connect_family_mismatch_fails_fast_instead_of_hanging() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.txt"), b"x");
+        let (mut send_spec, _, _) = specs(src.path(), dst.path(), 16);
+        send_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0)); // IPv4 endpoint
+        send_spec.peer = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9)); // IPv6 peer, nothing listening
+        let started = Instant::now();
+        let err = send(send_spec, &noop).await.expect_err("family mismatch must fail");
+        assert!(
+            matches!(
+                &err,
+                EngineError::Connect(ak_net::ConnectError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+            ),
+            "got: {err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "must fail fast, took {:?}", started.elapsed());
+    }
+
     #[tokio::test]
     async fn wrong_pin_fails_closed_before_any_transfer() {
         let src = tempfile::tempdir().unwrap();
@@ -2085,6 +2365,265 @@ mod tests {
             .manifest()
             .clone();
         assert_ne!(id_a, job_id_for("f.bin", &manifest2));
+    }
+
+    // ------------------------------------------------------------------
+    // Storage-full precheck (pure decision)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn check_headroom_passes_unknown_available() {
+        assert!(check_headroom(None, 0).is_ok());
+        assert!(check_headroom(None, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn check_headroom_passes_exact_fit() {
+        assert!(check_headroom(Some(0), 0).is_ok());
+        assert!(check_headroom(Some(1000), 1000).is_ok());
+    }
+
+    #[test]
+    fn check_headroom_rejects_shortage_with_the_real_numbers() {
+        assert!(matches!(
+            check_headroom(Some(999), 1000),
+            Err(EngineError::StorageFull {
+                available: 999,
+                needed: 1000
+            })
+        ));
+        assert!(matches!(
+            check_headroom(Some(0), 1),
+            Err(EngineError::StorageFull {
+                available: 0,
+                needed: 1
+            })
+        ));
+    }
+
+    // The receive-path integration (a real volume reporting less free space
+    // than the job size) cannot be constructed on a real local disk in this
+    // environment: Windows temp directories have no quota mechanism and the
+    // free-space probe reads the live volume. Only the pure decision above
+    // is covered by automated tests; the Error-frame and
+    // "failed_storage_full" checkpoint wiring is untested here by design
+    // (no faked numbers, no faked filesystems). See the round-3 report.
+
+    // ------------------------------------------------------------------
+    // Multi-root send
+    // ------------------------------------------------------------------
+
+    /// Three-root fixture: two directory trees (nesting plus empty dirs) and
+    /// one standalone file. Returns (tree_a, tree_b, loose, deep_payload).
+    fn three_root_fixture(
+        base: &Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Vec<u8>,
+    ) {
+        let tree_a = base.join("photos");
+        write(&tree_a.join("a.txt"), b"hello ak");
+        let deep: Vec<u8> = (0..30_000u32).map(|i| i as u8).collect();
+        write(&tree_a.join("nested/deep/b.bin"), &deep);
+        fs::create_dir_all(tree_a.join("empty/dir")).unwrap();
+        let tree_b = base.join("docs");
+        write(&tree_b.join("notes.md"), b"notes");
+        fs::create_dir_all(tree_b.join("solo")).unwrap();
+        let loose = base.join("readme.txt");
+        write(&loose, b"loose file");
+        (tree_a, tree_b, loose, deep)
+    }
+
+    #[tokio::test]
+    async fn multi_root_transfer_merges_three_roots_byte_identical() {
+        let base = tempfile::tempdir().unwrap();
+        let (tree_a, tree_b, loose, deep) = three_root_fixture(base.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        let (mut send_spec, recv, _) = specs(&tree_a, dst.path(), 16);
+        send_spec.add_root(tree_b.clone());
+        send_spec.add_root(loose.clone());
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        send_spec.peer = addr_rx.await.unwrap();
+        let report = send(send_spec, &noop)
+            .await
+            .expect("multi-root send completes");
+        let recv_report = receiver
+            .await
+            .unwrap()
+            .expect("multi-root receive completes");
+
+        // Primary root first, extras in add order; the receiver reports none.
+        assert_eq!(report.roots, vec!["photos", "docs", "readme.txt"]);
+        assert_eq!(recv_report.roots, Vec::<String>::new());
+        // 4 files + 5 directory entries (photos/{empty,empty/dir,nested,
+        // nested/deep} + docs/solo); a single-file root adds no directory.
+        assert_eq!(report.files, 9);
+        assert_eq!(report.bytes, 8 + 30_000 + 5 + 10);
+        assert_eq!(report.bytes, recv_report.bytes);
+
+        assert_eq!(
+            fs::read(dst.path().join("photos/a.txt")).unwrap(),
+            b"hello ak"
+        );
+        assert_eq!(
+            fs::read(dst.path().join("photos/nested/deep/b.bin")).unwrap(),
+            deep
+        );
+        assert!(dst.path().join("photos/empty/dir").is_dir());
+        assert_eq!(
+            fs::read(dst.path().join("docs/notes.md")).unwrap(),
+            b"notes"
+        );
+        assert!(dst.path().join("docs/solo").is_dir());
+        // A single-file root lands under a top-level directory of its own name.
+        assert_eq!(
+            fs::read(dst.path().join("readme.txt/readme.txt")).unwrap(),
+            b"loose file"
+        );
+        let (files, bytes) = count_entries(dst.path());
+        assert_eq!((files, bytes), (4, 8 + 30_000 + 5 + 10));
+    }
+
+    #[tokio::test]
+    async fn multi_root_multistream_transfer_is_byte_identical() {
+        let base = tempfile::tempdir().unwrap();
+        let (tree_a, tree_b, loose, deep) = three_root_fixture(base.path());
+        let dst = tempfile::tempdir().unwrap();
+
+        let (mut send_spec, recv, _) = specs(&tree_a, dst.path(), 1);
+        send_spec.add_root(tree_b.clone());
+        send_spec.add_root(loose.clone());
+        send_spec.multistream = true;
+        send_spec.in_flight_window = 4;
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        send_spec.peer = addr_rx.await.unwrap();
+        let report = send(send_spec, &noop)
+            .await
+            .expect("multi-root multistream send completes");
+        let recv_report = receiver
+            .await
+            .unwrap()
+            .expect("multi-root multistream receive completes");
+
+        assert_eq!(report.roots, vec!["photos", "docs", "readme.txt"]);
+        assert_eq!(report.files, 9);
+        assert_eq!(report.bytes, recv_report.bytes);
+        assert_eq!(
+            fs::read(dst.path().join("photos/a.txt")).unwrap(),
+            b"hello ak"
+        );
+        assert_eq!(
+            fs::read(dst.path().join("photos/nested/deep/b.bin")).unwrap(),
+            deep
+        );
+        assert!(dst.path().join("photos/empty/dir").is_dir());
+        assert_eq!(
+            fs::read(dst.path().join("docs/notes.md")).unwrap(),
+            b"notes"
+        );
+        assert!(dst.path().join("docs/solo").is_dir());
+        assert_eq!(
+            fs::read(dst.path().join("readme.txt/readme.txt")).unwrap(),
+            b"loose file"
+        );
+        let (files, bytes) = count_entries(dst.path());
+        assert_eq!((files, bytes), (4, 8 + 30_000 + 5 + 10));
+    }
+
+    #[tokio::test]
+    async fn multi_root_rejects_duplicate_root_names() {
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("data");
+        let b = base.path().join("other").join("data");
+        write(&a.join("one.txt"), b"one");
+        write(&b.join("two.txt"), b"two");
+
+        let dst = tempfile::tempdir().unwrap();
+        let (mut send_spec, _recv, _) = specs(&a, dst.path(), 16);
+        send_spec.add_root(b);
+        // No receiver is spawned: the job must fail before any connect.
+        let err = send(send_spec, &noop)
+            .await
+            .expect_err("duplicate root names must fail the job");
+        assert!(
+            matches!(&err, EngineError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "got: {err:?}"
+        );
+        assert_eq!(count_entries(dst.path()), (0, 0));
+    }
+
+    #[test]
+    fn multi_root_manifest_is_deterministic_and_prefixed() {
+        let base = tempfile::tempdir().unwrap();
+        let (tree_a, tree_b, loose, _) = three_root_fixture(base.path());
+        let dst = tempfile::tempdir().unwrap();
+        let (mut spec, _, _) = specs(&tree_a, dst.path(), 16);
+        spec.add_root(tree_b.clone());
+        spec.add_root(loose.clone());
+
+        let first = SourceSet::open(&spec).unwrap();
+        let second = SourceSet::open(&spec).unwrap();
+        assert!(first.multi);
+        assert_eq!(first.display_name(), "multi");
+        assert_eq!(first.manifest, second.manifest);
+        assert_eq!(
+            job_id_for("multi", &first.manifest),
+            job_id_for("multi", &second.manifest)
+        );
+        let rels: Vec<String> = first
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.rel_path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(rels.len(), 9);
+        assert!(rels.iter().all(|r| {
+            r.starts_with("photos/") || r.starts_with("docs/") || r.starts_with("readme.txt/")
+        }));
+        // Roots stay contiguous so parents always precede children.
+        let first_docs = rels.iter().position(|r| r.starts_with("docs/")).unwrap();
+        assert!(rels[..first_docs].iter().all(|r| r.starts_with("photos/")));
+    }
+
+    #[test]
+    fn single_root_source_set_is_the_frozen_manifest() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("a.txt"), b"x");
+        let plain = LocalSource::open(src.path(), NonZeroU32::new(1024).unwrap()).unwrap();
+        let (spec, _, _) = specs(src.path(), src.path(), 1);
+        let set = SourceSet::open(&spec).unwrap();
+        assert!(!set.multi);
+        assert_eq!(set.manifest, plain.manifest().clone());
+        assert_eq!(set.display_name(), plain.root_name());
+    }
+
+    #[test]
+    fn empty_root_directory_becomes_a_top_level_entry() {
+        let base = tempfile::tempdir().unwrap();
+        let tree_a = base.path().join("photos");
+        write(&tree_a.join("a.txt"), b"hello ak");
+        let empty_root = base.path().join("nothing");
+        fs::create_dir_all(&empty_root).unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let (mut spec, _, _) = specs(&tree_a, dst.path(), 16);
+        spec.add_root(empty_root.clone());
+        let set = SourceSet::open(&spec).unwrap();
+        let rels: Vec<String> = set
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.rel_path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(rels, vec!["photos/a.txt", "nothing"]);
+        assert!(set.manifest.entries[1].is_dir);
     }
 
     /// T12 analog: >4 GiB via a sparse file. Release-only (debug hashing is

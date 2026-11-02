@@ -33,10 +33,12 @@ const TYPE_SIGNAL: u8 = 6;
 const TYPE_CANCEL: u8 = 7;
 const TYPE_SERVER_ERROR: u8 = 8;
 
-// PeerSignal three-state tag bytes.
+// PeerSignal tag bytes. The set is closed: get_signal rejects every other
+// tag and tests lock the mapping.
 const TAG_CANDIDATES: u8 = 1;
 const TAG_PUNCH_AT: u8 = 2;
 const TAG_BYE: u8 = 3;
+const TAG_SAME_EGRESS: u8 = 4;
 
 /// Structured peer-to-peer signal payloads relayed by the server verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,10 @@ pub enum PeerSignal {
         nonce: [u8; 8],
     },
     Bye,
+    /// Server-generated hint: both session endpoints were observed on the
+    /// same control-plane TCP peer IP, so they likely share one egress/NAT
+    /// and should try LAN candidates before public ones. Carries no data.
+    SameEgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +269,7 @@ fn put_signal(out: &mut Vec<u8>, signal: &PeerSignal) {
             out.extend_from_slice(nonce);
         }
         PeerSignal::Bye => out.push(TAG_BYE),
+        PeerSignal::SameEgress => out.push(TAG_SAME_EGRESS),
     }
 }
 
@@ -366,6 +373,7 @@ fn get_signal(cur: &mut Cur<'_>) -> Result<PeerSignal, DecodeError> {
             nonce: cur.fixed::<8>()?,
         }),
         TAG_BYE => Ok(PeerSignal::Bye),
+        TAG_SAME_EGRESS => Ok(PeerSignal::SameEgress),
         _ => Err(DecodeError::Malformed("signal tag")),
     }
 }
@@ -640,6 +648,10 @@ mod tests {
             session: [3; 16],
             signal: PeerSignal::Bye,
         });
+        roundtrip(CtrlMessage::Signal {
+            session: [3; 16],
+            signal: PeerSignal::SameEgress,
+        });
     }
 
     #[test]
@@ -838,11 +850,28 @@ mod tests {
 
     #[test]
     fn err_bad_signal_tag() {
+        for tag in [0u8, 5, 9, 255] {
+            let mut payload = vec![0u8; 16];
+            payload.push(tag);
+            assert!(
+                matches!(
+                    CtrlFrame::decode(&wrap(6, &payload)),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "tag {tag} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn err_same_egress_rejects_trailing_bytes() {
+        // SameEgress carries no data; a tag-4 signal with extra payload
+        // must be refused.
         let mut payload = vec![0u8; 16];
-        payload.push(9);
+        payload.extend_from_slice(&[4, 1, 2, 3]);
         assert!(matches!(
             CtrlFrame::decode(&wrap(6, &payload)),
-            Err(DecodeError::Malformed(_))
+            Err(DecodeError::Trailing(3))
         ));
     }
 
@@ -1056,13 +1085,17 @@ mod tests {
                 session: [1; 16],
                 signal: PeerSignal::Bye,
             },
+            CtrlMessage::Signal {
+                session: [1; 16],
+                signal: PeerSignal::SameEgress,
+            },
             CtrlMessage::Cancel { session: [4; 16] },
             CtrlMessage::ServerError {
                 code: u16::MAX,
                 message: "e".repeat(MAX_ERROR_BYTES),
             },
         ];
-        assert_eq!(all.len(), 8 + 2); // 8 types, Signal exercised 3 ways
+        assert_eq!(all.len(), 8 + 3); // 8 types, Signal exercised 4 ways
         for message in all {
             let expected_type = type_byte(&message);
             let mut bytes = Vec::new();

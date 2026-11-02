@@ -7,3 +7,6 @@
 pub mod chunk;
 pub mod job;
 pub mod policy;
+
+/// Receiver-local consent lifecycle. Not a network or cryptographic verifier.
+pub mod receive;

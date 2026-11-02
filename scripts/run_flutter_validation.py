@@ -104,6 +104,9 @@ def main() -> int:
             if not product.is_dir(): raise ValueError('Release product missing')
             if platform in ['ios', 'macos']:
                 binary = product / ('Runner' if platform == 'ios' else 'Contents/MacOS/ak_m0_probe')
+                if not run('native-architecture', ['lipo', '-archs', str(binary)]): return 1
+                architecture = (output / 'native-architecture.log').read_text(encoding='utf-8').strip()
+                if architecture != 'arm64': raise ValueError('Declared arm64 ABI mismatch')
                 if not run('native-symbols', ['nm', '-gU', str(binary)]): return 1
                 symbols = (output / 'native-symbols.log').read_text(encoding='utf-8')
                 if not all('_ak_m0_probe_' + symbol in symbols for symbol in SYMBOLS):

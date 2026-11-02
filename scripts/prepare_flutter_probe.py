@@ -74,6 +74,9 @@ def prepare(project: Path, native: Path, platform: str) -> None:
             update_plist(project / 'ios/Runner/Info.plist', {
                 'NSLocalNetworkUsageDescription': '仅用于用户主动启动的本地连接实验。拒绝不会绕过权限。'})
         else:
+            # M0's declared macOS ABI is arm64, not a universal x86_64 promise.
+            with config.open('a', encoding='utf-8') as stream:
+                stream.write('ARCHS = arm64\nEXCLUDED_ARCHS = x86_64\n')
             pbx = project / 'macos/Runner.xcodeproj/project.pbxproj'
             replace_exact(pbx, 'MACOSX_DEPLOYMENT_TARGET = 12.0;',
                           'MACOSX_DEPLOYMENT_TARGET = 13.0;', 3)

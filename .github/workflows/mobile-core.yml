@@ -51,8 +51,8 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
-      - name: Locked dependency prefetch
-        run: cargo fetch --locked --target ${{ matrix.target }}
+      - name: Locked dependency prefetch including build-host dependencies
+        run: cargo fetch --locked
       - name: Compile core library for mobile target
         run: cargo check --package ak-transport --lib --target ${{ matrix.target }} --locked --offline
       - name: Ensure source and lock are unchanged

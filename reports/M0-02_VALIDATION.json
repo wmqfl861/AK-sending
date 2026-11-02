@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "module": "M0-02",
+  "status": "REVIEWED_SCOPE_ONLY",
+  "scope": "Paired native-UDP/TLS adapter and receiver authorization, real same-host tests; not file transfer or device acceptance",
+  "baseline_commit": "f727edcaf7d164a7940c7d57e4d317b63b5acd54",
+  "plan_commit": "25252ab3fe833e148bf132a4c80516cadcc920b9",
+  "initial_implementation_commit": "7f1bb8e459a145fe2ee2ade9cabe1b33b328b5ab",
+  "cargo_generated_lock_commit": "17c21410d5dcc48a24c4f7ffff77e4eab2c07ea5",
+  "cancellation_fix_commit": "76d818effdcb38307ce2fb8a84a523cc6847af26",
+  "android_prefetch_fix_commit": "bfc29a200f13ce03a163c4f5537018ee4fbded83",
+  "unicode_console_fix_commit": "d28402186207cd1ed47749615984a730cb32ebde",
+  "tested_and_reviewed_commit": "f0daac8aa464e645483920adc4f51188891a17bb",
+  "tested_tree": "e8f3e7a4777e9864d9b6aea9eeab6a5f290ba7bc",
+  "independent_review": {
+    "reviewer": "chatgpt-codex-connector[bot]",
+    "reviewer_id": 199175422,
+    "summary_comment_id": 6573217263,
+    "receipt_comment_id": 6573677421,
+    "reviewed_commit": "f0daac8aa464e645483920adc4f51188891a17bb",
+    "conclusion": "Did not find any major issues",
+    "fixed_p2_comment_ids": [
+      4440551574
+    ],
+    "formal_approved_review_claimed": false,
+    "formal_security_audit_claimed": false
+  },
+  "desktop_ci": {
+    "run_id": 41420861725,
+    "run_url": "https://github.com/wmqfl861/AK-sending/actions/runs/41420861725",
+    "checkout_commit": "f0daac8aa464e645483920adc4f51188891a17bb",
+    "rust": "1.97.1",
+    "python": "3.13.1",
+    "jobs": [
+      {
+        "os": "ubuntu-24.04",
+        "job_id": 125195790671,
+        "conclusion": "success",
+        "artifact_id": 13128923596,
+        "artifact_sha256": "455c0a8e1abc12709e1518356a7dca5856ef07cc36a902c227039fa7b479a1a6",
+        "results_json_sha256": "bd7ab4a9124eaa580b650745b5ecd5443fa8ff2a2c1af5b5c9c51c8dd01d03b2",
+        "checks": {
+          "rustc-version": {
+            "exit_code": 0,
+            "log_sha256": "69df918d4e04609512eff72a6a39540e0e74b004adbbac569d92c16ecde14ef0"
+          },
+          "cargo-version": {
+            "exit_code": 0,
+            "log_sha256": "6428bf2c60e237fb35e15ff33217007dd39ec787247ad72bff63775aebb1d18e"
+          },
+          "static": {
+            "exit_code": 0,
+            "log_sha256": "6c14cdc1a413f99e3f6c0ecc612d672b3811dd1776fe4272e26928760fae3b36"
+          },
+          "python-tests": {
+            "exit_code": 0,
+            "log_sha256": "8b9e89ad9fcac0f129f76522a22289f3630c0949fa0eeaa347bdcf8f38fb6775"
+          },
+          "fmt": {
+            "exit_code": 0,
+            "log_sha256": "82f9d06f2a52f0067a9da7d85a6327e289afd9e95e0615fa63c2b8ccfcbcb12d"
+          },
+          "rust-tests": {
+            "exit_code": 0,
+            "log_sha256": "c42994dc4e174ace74ce5ea689b14f078b80f0259e2d9b1d7923ee17525e0896"
+          },
+          "clippy": {
+            "exit_code": 0,
+            "log_sha256": "eecadf745f92b0ca00611504c604929a507271bb4f83a140d42332b672974dd7"
+          },
+          "features": {
+            "exit_code": 0,
+            "log_sha256": "e9595ee74c86144adfdd3c35f3f046f63607b89e76a68df7109e3ba93876e1c0"
+          },
+          "clean-sources": {
+            "exit_code": 0,
+            "log_sha256": "3e43559a23cf1e1a97c030bfdeeddcdb6c037c690956566bfbd3cedbaa5648ad"
+          }
+        }
+      },
+      {
+        "os": "windows-2022",
+        "job_id": 125195791328,
+        "conclusion": "success",
+        "artifact_id": 13129906798,
+        "artifact_sha256": "f0f1a4045fb26d9b9afe9f94e74b4bba70b52c1d7e5b5d42c20c7bd70e882aeb",
+        "results_json_sha256": "a161bebb9897594d9219c873f7c8521c799d8b9ade83e9a17b67ba1a4b6f3b3d",
+        "checks": {
+          "rustc-version": {
+            "exit_code": 0,
+            "log_sha256": "ecc4fc7c36efa36a510b3dedbcb00a69f6a9ae90b59212c9a23f0ec833ed900a"
+          },
+          "cargo-version": {
+            "exit_code": 0,
+            "log_sha256": "670397bf6af55127212e1ce21e0b3d2607339dbfb96f9f6846cde7d8ede52939"
+          },
+          "static": {
+            "exit_code": 0,
+            "log_sha256": "e9accf4cfbc0e65d835fa30f842159a8df12e8545ad3bc7b5b730ff6da038cd3"
+          },
+          "python-tests": {
+            "exit_code": 0,
+            "log_sha256": "f0d981c2048e765822b26e4d4997950f1b878b6d9f8835f398dc7e60816cdd19"
+          },
+          "fmt": {
+            "exit_code": 0,
+            "log_sha256": "ccb48a3caf8205f1deaeae1ed8dc1b275bde7f94061689c7c0b252022fc30545"
+          },
+          "rust-tests": {
+            "exit_code": 0,
+            "log_sha256": "03082d41be25fdc2dec0eb9153b86223540ffa38ba278c78aff30e0bcd7fd75d"
+          },
+          "clippy": {
+            "exit_code": 0,
+            "log_sha256": "ab60b0fae881d28ee2076867867607b1b51f1314cfba5108f138a47663ad564c"
+          },
+          "features": {
+            "exit_code": 0,
+            "log_sha256": "94347d40a65b6549a71487e2050d34c9ccd74d2eb93062e1fcef028633a640c0"
+          },
+          "clean-sources": {
+            "exit_code": 0,
+            "log_sha256": "2c700ec4da24030c819c6955ef442e759f0b574fbcb7265135cd44df2268935d"
+          }
+        }
+      },
+      {
+        "os": "macos-14",
+        "job_id": 125195791101,
+        "conclusion": "success",
+        "artifact_id": 13129033395,
+        "artifact_sha256": "943df38c71119d7e951bb42d7a10d305360aea5cd5d8a2ffc1b05d83520df9a7",
+        "results_json_sha256": "e8d43f33604c65be4ec7272150caf610a1dc91401a7e99f1bcc8b23f1a89982c",
+        "checks": {
+          "rustc-version": {
+            "exit_code": 0,
+            "log_sha256": "a2cbdafb9a7420cec96dfa896689fe89bc1a02d4855544d33bc249b35c38ea35"
+          },
+          "cargo-version": {
+            "exit_code": 0,
+            "log_sha256": "6428bf2c60e237fb35e15ff33217007dd39ec787247ad72bff63775aebb1d18e"
+          },
+          "static": {
+            "exit_code": 0,
+            "log_sha256": "54de6e5a4aa8f17f002046aa646c9a1520cfdcb9a2cb51418226b70becb83c1a"
+          },
+          "python-tests": {
+            "exit_code": 0,
+            "log_sha256": "231ae1928078d2bbafed0265c2d9d905ec1aaa7a8cadbed7d564ab31e5ecb620"
+          },
+          "fmt": {
+            "exit_code": 0,
+            "log_sha256": "82f9d06f2a52f0067a9da7d85a6327e289afd9e95e0615fa63c2b8ccfcbcb12d"
+          },
+          "rust-tests": {
+            "exit_code": 0,
+            "log_sha256": "f84bcdff0f42f8c4725484ae5a4c032ce01ab5bdf85be1bf1a3d83f80f4abe58"
+          },
+          "clippy": {
+            "exit_code": 0,
+            "log_sha256": "61e108cb381e67fb8c6c31c4ed76873c0954caf39ee2134c959796bdb7d255e0"
+          },
+          "features": {
+            "exit_code": 0,
+            "log_sha256": "c400de1455f9fee630a07c49362183417d1201652e75c1969bb4a6a3ed3908ac"
+          },
+          "clean-sources": {
+            "exit_code": 0,
+            "log_sha256": "3e43559a23cf1e1a97c030bfdeeddcdb6c037c690956566bfbd3cedbaa5648ad"
+          }
+        }
+      }
+    ],
+    "per_job": {
+      "core_unit": 46,
+      "core_integration": 3,
+      "core_compile_fail_doctest": 1,
+      "transport_unit": 18,
+      "transport_probe_cancellation_integration": 2,
+      "transport_receive_integration": 8,
+      "transport_compile_fail_doctest": 3,
+      "rust_total": 81,
+      "python_total": 24,
+      "all_nine_validation_commands_exit_zero": true
+    },
+    "artifact_retention_days": 14,
+    "downloaded_zip_and_log_hashes_verified": true
+  },
+  "mobile_compile_probes": {
+    "run_id": 41420861650,
+    "checkout_commit": "f0daac8aa464e645483920adc4f51188891a17bb",
+    "command": "cargo check --package ak-transport --lib --target TARGET --locked --offline",
+    "prefetch": "cargo fetch --locked",
+    "jobs": [
+      {
+        "target": "aarch64-linux-android",
+        "job_id": 125195790645,
+        "conclusion": "success"
+      },
+      {
+        "target": "aarch64-apple-ios",
+        "job_id": 125195790096,
+        "conclusion": "success"
+      }
+    ],
+    "rust": "1.97.1",
+    "sdk_policy": "Runner-installed NDK/Xcode; versions recorded in job logs, not a pinned release SDK chain",
+    "full_app_linked": false,
+    "physical_devices_tested": false
+  },
+  "dependency_bootstrap": {
+    "run_id": 41417370236,
+    "artifact_id": 13128072479,
+    "artifact_sha256": "6e25640dfcb4e3bfb3349cece217d245f783424a62462e3a9818e4fe964f34f0",
+    "candidate_only_not_acceptance": true,
+    "candidate_files_matched_git_blobs": 8
+  },
+  "prior_unsuccessful_runs": [
+    {
+      "run_id": 41417415395,
+      "reason": "Initial desktop acceptance before generated transport lock was committed"
+    },
+    {
+      "run_id": 41417415081,
+      "reason": "Initial mobile acceptance before generated transport lock was committed"
+    },
+    {
+      "run_id": 41418768262,
+      "reason": "Android target-only prefetch omitted build-host dependency; iOS passed"
+    },
+    {
+      "run_id": 41419227868,
+      "reason": "Windows cp1252 console failed while mirroring Unicode feature tree; not full acceptance"
+    },
+    {
+      "run_id": 41420426147,
+      "reason": "Windows new console regression assumed LF instead of CRLF; not full acceptance"
+    }
+  ],
+  "local_validation": {
+    "rust_executed": false,
+    "python_version": "3.13.5",
+    "python_tests_passed": 24,
+    "static_repository_check_passed": true
+  },
+  "dependency_scope": {
+    "ak_core_external_runtime_dependencies": 0,
+    "lock_packages_including_workspace": 100,
+    "lock_external_packages_all_targets_and_dev": 98,
+    "lock_count_is_not_runtime_count": true
+  },
+  "not_covered": [
+    "cross-device LAN/WAN or NAT traversal",
+    "user file I/O and durable save",
+    "pairing UI and secret persistence",
+    "asynchronous file-write revocation fence",
+    "mobile runtime and app linking",
+    "mobile permissions/background lifecycle",
+    "throughput, memory and package size budgets",
+    "packet capture proving no relay",
+    "separate MSRV build",
+    "formal security audit"
+  ],
+  "handoff_commit_scope": "Documentation, evidence index and MANIFEST only; tested/reviewed code SHA is not the later documentation HEAD"
+}

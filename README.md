@@ -22,18 +22,24 @@
 
 ## 当前实现状态
 
-**M0-01：工程基线与接收授权领域模块已开发、测试并审核。** [先行计划](docs/modules/M0-01_PLAN.zh-CN.md) · [审核记录](reports/M0-01_REVIEW.zh-CN.md) · [验证索引](reports/M0-01_VALIDATION.json)。
-新增接收确认、拒绝、过期、撤销、重连重授权，以及校验/保存阶段保留。Rust 核心仍无第三方运行时依赖，不进行实际网络或文件读写。
-代码提交 `8593a8d020a429b8441d6b88a4ae2b0fc8873ddf` 在 Linux、Windows、macOS 的核心 CI 均通过：每系统 46 项单测、3 项集成、1 项编译失败文档测试、17 项 Python 测试，以及 fmt/clippy。独立复审对象为 `98c21819fe`，之后仅有格式修正；详情见审核记录。
-真实收发、密码学身份、持久化续传、NAT 穿透、Flutter UI 与五端适配仍未实现。整个 M0 未完成，轻量预算尚未实测。PR #2 叠加在蓝图 PR #1 上，未自动合并 main。
+**M0-02：最小认证直连适配器已开发、测试并审核；整个 M0 尚未完成。** [先行计划](docs/modules/M0-02_PLAN.zh-CN.md) · [审核记录](reports/M0-02_REVIEW.zh-CN.md) · [验证索引](reports/M0-02_VALIDATION.json)。
+
+`ak-core` 仍无第三方运行时依赖，负责接收授权领域状态机；新增独立 `ak-transport`，以原生 UDP + quinn/rustls TLS 1.3 实现手工地址的双向认证连接、完整已配对证书固定、私有接收许可及有界固定探测。连接就绪不等于接收确认，旧会话/连接许可不能复用。取消未完成探测会关闭连接。
+
+最终受测代码 `f0daac8aa464e645483920adc4f51188891a17bb`；Linux、Windows、macOS 每系统 81 项 Rust 用例、24 项 Python 测试及 fmt/clippy/依赖特性/源码无变更检查通过。Android arm64、iOS arm64 通过最小 library `cargo check`，不是完整 App 编译、安装或真机验收。具体 CI、失败修复及独立审查 SHA 见审核记录。
+
+**尚不能传输用户文件。** 当前网络实测为同机 loopback 上的真实 UDP/TLS，不证明双机局域网或公网可达；未实现配对 UI/密钥持久化、文件协议/磁盘保存、持久化续传、NAT 穿透、自动选路、Flutter UI、手机权限与生命周期。无中继是实现约束，尚无跨网络抓包验收。性能与轻量预算尚未实测。
+
+PR #3 叠加在 M0-01 PR #2 上，均未自动合并 main。M0-01 历史验收保留在 [原审核](reports/M0-01_REVIEW.zh-CN.md) 中，不将旧测试证据改写为新提交结果。
 
 ## 工程检查与模块流程
 
 ```sh
-python scripts/run_validation.py --output validation/attempt-001
+cargo fetch --locked
+python scripts/run_validation.py --output validation/attempt-001 --timeout 600
 ```
 
-安装固定的 Rust 工具链及 Python 3.11+ 后运行；每次选用新的输出目录。执行器保存实际命令、退出码、日志和摘要，缺失/失败的必要检查使整体失败。`check_repository.py` 仅是 L0 静态检查，不证明密码学身份或无中继。
+安装固定的 Rust 工具链及 Python 3.11+ 后运行；先按已提交锁文件预取依赖，再离线测试；每次选用新的输出目录。执行器保存实际命令、退出码、日志和摘要，缺失/失败的必要检查使整体失败。`check_repository.py` 仅是 L0 静态检查，不证明密码学身份或无中继。
 
 **每模块必须先单独提交开发计划，再开发、实际测试、审核、修复复测和交接。** 计划存于 `docs/modules/`，审核存于 `reports/`；没有执行的检查不写通过，没有第二审查者参与不称独立审查。
 

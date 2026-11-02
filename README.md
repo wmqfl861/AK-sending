@@ -11,6 +11,8 @@
 - 已整理：需求、修订蓝图、ADR-001、协议草案、平台与存储方案、开发路线、验收规范和交接说明。
 - 新增代码：无第三方依赖的 Rust 核心骨架，包括纯直连路径策略、64 位分块计算和任务状态机；附测试源码。
 - 已执行的检查及其结果见 [本次验证报告](reports/BOOTSTRAP_VALIDATION.zh-CN.md)。不要把测试源码等同于测试通过。
+- 2026-11-02：23 项 Rust 单测与 clippy 已在 rustc 1.97.0 实际执行并通过（修复 1 处 clippy 报错），见 [Rust 验证记录](reports/rust-validation-2026-11-02.txt)。这只覆盖领域模型，不是网络或真机验证。
+- 2026-11-02：完成 [方案评审](docs/REVIEW_2026-11-02.zh-CN.md)，其中 D1–D6 待所有者确认；确认前现有决策文档不变。
 - 未实现：真实网络收发、密码学身份认证、NAT 穿透、自动发现、持久化续传、Flutter UI、移动原生适配。
 - 原始 38 个文件已提交到 GitHub 的 `main`，并核验目录树与本地原包一致；见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
@@ -40,6 +42,7 @@
 | [验收计划](docs/TEST_PLAN.zh-CN.md) | 真机/网络/大文件/无中继测试 |
 | [技术选型](docs/TECH_SELECTION.zh-CN.md) | 候选方案和必须验证的风险 |
 | [交接说明](docs/HANDOFF.zh-CN.md) | 当前状态和下一执行节点 |
+| [方案评审 2026-11-02](docs/REVIEW_2026-11-02.zh-CN.md) | 对 v0.1 方案的评审意见与待确认决策 |
 
 ## 本地检查
 

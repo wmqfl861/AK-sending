@@ -7,8 +7,10 @@
 - [x] 将纯直连决策固化为 ADR-001。
 - [x] 整理需求、架构、路线、协议和验收文档。
 - [x] 创建 Rust 策略/分块/任务状态模型与测试源码。
-- [ ] Rust 工具链实编译、测试和 clippy。
+- [x] Rust 工具链实编译、测试和 clippy（2026-11-02，rustc 1.97.0；修复 1 处 clippy 报错）；证据见 reports/rust-validation-2026-11-02.txt。
 - [x] 取得目标仓库可写权限并验证远端提交；证据见 reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md。
+- [x] 方案评审；见 docs/REVIEW_2026-11-02.zh-CN.md。
+- [ ] 所有者确认方案评审中的决策 D1–D6。
 
 ## P0
 

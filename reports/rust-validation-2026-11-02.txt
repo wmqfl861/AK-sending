@@ -1,0 +1,65 @@
+# Rust 验证记录（L1 领域模型单测 + 静态检查）
+# 执行时间: 2026-11-02 12:18（UTC+08:00）
+# 环境: Linux x86_64; rustc 1.97.0 (2d8144b78 2026-07-07); cargo 1.97.0 (c980f4866 2026-06-30); clippy 0.1.97 (2d8144b788 2026-07-07)
+
+## 1. 修复前：基线提交 01da172
+$ cargo clippy --workspace --all-targets -- -D warnings
+error: manual implementation of `.is_multiple_of()`
+  --> crates/ak-core/src/chunk.rs:21:45
+   |
+21 |         self.total_bytes / size + u64::from(self.total_bytes % size != 0)
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!self.total_bytes.is_multiple_of(size)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_is_multiple_of
+   = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: could not compile `ak-core` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `ak-core` (lib test) due to 1 previous error
+exit status: 101
+
+$ cargo test --workspace   (基线，修复前)
+running 23 tests
+test chunk::tests::empty_file_has_no_chunks ... ok
+test chunk::tests::exact_multiple_and_last_partial ... ok
+test chunk::tests::handles_more_than_four_gibibytes ... ok
+test chunk::tests::maximum_count_and_index_do_not_overflow ... ok
+test chunk::tests::maximum_u64_does_not_overflow ... ok
+test chunk::tests::one_partial_chunk ... ok
+test job::tests::bytes_received_is_not_completion ... ok
+test job::tests::connection_loss_waits_without_relay_fallback ... ok
+test job::tests::invalid_transition_reports_state_and_event ... ok
+test job::tests::pause_resume_rechecks_connection ... ok
+test job::tests::success_requires_verification_then_save ... ok
+test job::tests::terminal_states_do_not_restart_or_accept_success ... ok
+test policy::tests::cellular_requires_explicit_permission ... ok
+test policy::tests::changed_path_is_rejected_on_reassessment ... ok
+test policy::tests::identity_encryption_authentication_and_consent_are_each_required ... ok
+test policy::tests::incomplete_local_probe_prevents_premature_public_selection ... ok
+test policy::tests::local_only_disallows_internet_but_not_local ... ok
+test policy::tests::local_precedes_internet_even_when_internet_is_listed_first ... ok
+test policy::tests::no_candidates_means_no_connection ... ok
+test policy::tests::public_direct_is_accepted_after_local_probe ... ok
+test policy::tests::relay_and_unknown_are_never_accepted ... ok
+test policy::tests::verified_local_does_not_wait_for_other_candidates ... ok
+test chunk::tests::ranges_are_contiguous_and_cover_small_inputs ... ok
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit status: 0
+
+## 2. 修复后：提交 f548adf（chunk.rs 第 21 行改用 is_multiple_of，行为不变）
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+exit status: 0
+
+$ cargo test --workspace
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit status: 0
+
+## 范围说明
+仅为 L1 领域模型单测与 clippy 静态检查。未执行：真实网络收发、NAT 穿透、五端构建、真机、抓包、大文件与性能测试。

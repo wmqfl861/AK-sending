@@ -13,5 +13,5 @@
   "transcoding": false,
   "control_plane_allowed": ["device_discovery", "presence", "signaling", "stun", "nat_coordination"],
   "file_metadata_via_server": false,
-  "implementation_stage": "domain_scaffold_only"
+  "implementation_stage": "authenticated_direct_adapter_experiment"
 }

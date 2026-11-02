@@ -1,0 +1,18 @@
+[package]
+name = "ak-transport"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+description = "AK-sending paired mutual-TLS direct UDP adapter; no file transport yet"
+
+[dependencies]
+ak-core = { path = "../ak-core" }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+ring = { version = "=0.17.14", default-features = false, features = ["std"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time", "macros"] }

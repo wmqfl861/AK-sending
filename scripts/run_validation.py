@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real checks and preserve evidence. Missing/failed required checks fail the run.
-No network/product claim is made by this L0/L1 runner. Python >=3.11.
+Includes domain and local UDP/TLS tests; no cross-device/product claim. Python >=3.11.
+Run cargo fetch --locked before invoking this offline validation runner.
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +19,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def configure_console(stream=None) -> None:
+    """Keep Unicode command evidence printable under Windows redirected stdout."""
+    stream = sys.stdout if stream is None else stream
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def file_sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -29,7 +38,6 @@ def run_one(name: str, argv: list[str], cwd: Path, output: Path, timeout: float 
     tick = time.monotonic()
     log = output / f"{name}.log"
     status, exit_code = "failed", None
-    # File-backed output avoids buffering an unbounded compiler log in memory.
     with log.open("w", encoding="utf-8") as stream:
         stream.write(f"command={json.dumps(argv)}\n")
         stream.flush()
@@ -66,13 +74,13 @@ def git_value(*args: str) -> str | None:
 
 
 def main() -> int:
+    configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "validation" / "local")
     parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be positive")
-    # Refuse overwrite: preserve failed attempts and their original evidence.
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         parser.error("output directory is not empty; choose a new attempt directory")
@@ -84,13 +92,15 @@ def main() -> int:
         ("fmt", ["cargo", "fmt", "--all", "--", "--check"]),
         ("rust-tests", ["cargo", "test", "--workspace", "--locked", "--offline"]),
         ("clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--offline", "--", "-D", "warnings"]),
+        ("features", ["cargo", "tree", "--workspace", "--locked", "--offline", "--edges", "features"]),
+        ("clean-sources", ["git", "diff", "--exit-code", "--", "Cargo.toml", "Cargo.lock",
+                           "crates", "scripts", "config", ".github"]),
     ]
     results = []
     for name, argv in commands:
         row = run_one(name, argv, ROOT, output, args.timeout)
         results.append(row)
         print(f"\n=== {name}: {row['status']} ===", flush=True)
-        # Stream logs without loading the whole file into RAM.
         with (output / row["log"]).open(encoding="utf-8", errors="replace") as log:
             for line in log:
                 print(line, end="")
@@ -98,16 +108,17 @@ def main() -> int:
                      set((ROOT / "crates").rglob("*.rs")) |
                      set((ROOT / "crates").rglob("Cargo.toml")) |
                      set((ROOT / "scripts").rglob("*.py")))
-    report = {"scope": "L0/L1: static checks and domain model only",
+    report = {"scope": "L0/L1 plus real same-host UDP/TLS integration; not cross-device acceptance",
               "commit": git_value("rev-parse", "HEAD"),
               "working_tree": git_value("status", "--porcelain"),
               "platform": platform.platform(), "python": platform.python_version(),
               "ci_run_id": os.getenv("GITHUB_RUN_ID"), "results": results,
               "source_sha256": {str(p.relative_to(ROOT)).replace("\\", "/"):
-                                hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
+                                file_sha256(p) for p in sources},
               "passed": all_passed(results),
-              "not_covered": ["real networking", "cryptographic identity", "file IO",
-                              "NAT", "mobile devices", "performance"]}
+              "not_covered": ["cross-device/LAN/WAN reachability", "user file IO", "NAT",
+                              "mobile physical devices", "performance", "no-relay packet capture",
+                              "separate MSRV build", "formal security audit"]}
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return 0 if report["passed"] else 1
 

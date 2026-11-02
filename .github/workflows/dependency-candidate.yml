@@ -15,6 +15,15 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Preserve exact committed source for evidence and handoff
+        shell: python
+        run: |
+          import hashlib, json, pathlib, subprocess
+          subprocess.run(['git', 'archive', '--format=zip', '--output=source.zip', 'HEAD'], check=True)
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with pathlib.Path('source.zip').open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          pathlib.Path('source.json').write_text(json.dumps({'commit': sha, 'archive_sha256': digest}) + '\n')
       - name: Emit candidate only when dependency lock is missing
         shell: python
         run: |
@@ -33,7 +42,7 @@ jobs:
           print('END_FORMAT_PATCH', flush=True)
           print('CANDIDATE_TESTS_ONLY: generated working tree, not committed acceptance evidence', flush=True)
           subprocess.run(['cargo', 'test', '--workspace', '--locked'], check=True)
-      - name: Preserve candidate lock and formatted files
+      - name: Preserve candidate lock and committed source archive
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -41,4 +50,6 @@ jobs:
           path: |
             Cargo.lock
             crates/ak-transport/
+            source.zip
+            source.json
           retention-days: 14

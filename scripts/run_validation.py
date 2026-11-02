@@ -19,6 +19,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def configure_console(stream=None) -> None:
+    """Keep Unicode command evidence printable under Windows redirected stdout."""
+    stream = sys.stdout if stream is None else stream
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def file_sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -66,6 +74,7 @@ def git_value(*args: str) -> str | None:
 
 
 def main() -> int:
+    configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "validation" / "local")
     parser.add_argument("--timeout", type=float, default=300)

@@ -1,6 +1,8 @@
 //! Pure transition model, not permission to write a file or evidence of authentication.
 //! Production callers must additionally use the receiver-local consent controller
 //! and, in the next transport module, an authenticated direct connection.
+//! Resume-grant events are selected by the controller's private retained phase,
+//! never by a network field or an untrusted caller.
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,8 @@ pub enum Event {
     Begin,
     DirectReady,
     ConsentGranted,
+    ConsentGrantedForVerification,
+    ConsentGrantedForSaving,
     ConsentDenied,
     ConsentRevoked,
     DirectUnavailable,
@@ -44,14 +48,21 @@ pub struct InvalidTransition {
 
 impl fmt::Display for InvalidTransition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid task transition: {:?} + {:?}", self.state, self.event)
+        write!(
+            f,
+            "invalid task transition: {:?} + {:?}",
+            self.state, self.event
+        )
     }
 }
 impl std::error::Error for InvalidTransition {}
 
 impl State {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Rejected | Self::Cancelled | Self::Failed)
+        matches!(
+            self,
+            Self::Completed | Self::Rejected | Self::Cancelled | Self::Failed
+        )
     }
 
     pub fn advance(self, event: Event) -> Result<Self, InvalidTransition> {
@@ -65,13 +76,30 @@ impl State {
             (Self::Pending, Event::Begin) => Ok(Self::Connecting),
             (Self::Connecting, Event::DirectReady) => Ok(Self::AwaitingConsent),
             (Self::AwaitingConsent, Event::ConsentGranted) => Ok(Self::Transferring),
+            (Self::AwaitingConsent, Event::ConsentGrantedForVerification) => Ok(Self::Verifying),
+            (Self::AwaitingConsent, Event::ConsentGrantedForSaving) => Ok(Self::Saving),
             (Self::AwaitingConsent, Event::ConsentDenied) => Ok(Self::Rejected),
-            (Self::AwaitingConsent | Self::Transferring | Self::Verifying | Self::Saving,
-             Event::ConsentRevoked) => Ok(Self::Paused),
-            (Self::Connecting | Self::AwaitingConsent | Self::Transferring |
-             Self::Verifying | Self::Saving, Event::DirectUnavailable) => Ok(Self::WaitingDirect),
-            (Self::Connecting | Self::AwaitingConsent | Self::Transferring |
-             Self::WaitingDirect | Self::Verifying | Self::Saving, Event::Pause) => Ok(Self::Paused),
+            (
+                Self::AwaitingConsent | Self::Transferring | Self::Verifying | Self::Saving,
+                Event::ConsentRevoked,
+            ) => Ok(Self::Paused),
+            (
+                Self::Connecting
+                | Self::AwaitingConsent
+                | Self::Transferring
+                | Self::Verifying
+                | Self::Saving,
+                Event::DirectUnavailable,
+            ) => Ok(Self::WaitingDirect),
+            (
+                Self::Connecting
+                | Self::AwaitingConsent
+                | Self::Transferring
+                | Self::WaitingDirect
+                | Self::Verifying
+                | Self::Saving,
+                Event::Pause,
+            ) => Ok(Self::Paused),
             (Self::Paused | Self::WaitingDirect, Event::Resume) => Ok(Self::Connecting),
             (Self::Transferring, Event::AllBytesReceived) => Ok(Self::Verifying),
             (Self::Verifying, Event::VerificationPassed) => Ok(Self::Saving),
@@ -86,22 +114,48 @@ mod tests {
     use super::*;
 
     const STATES: [State; 12] = [
-        State::Pending, State::Connecting, State::AwaitingConsent, State::Transferring,
-        State::WaitingDirect, State::Paused, State::Verifying, State::Saving,
-        State::Completed, State::Rejected, State::Cancelled, State::Failed,
+        State::Pending,
+        State::Connecting,
+        State::AwaitingConsent,
+        State::Transferring,
+        State::WaitingDirect,
+        State::Paused,
+        State::Verifying,
+        State::Saving,
+        State::Completed,
+        State::Rejected,
+        State::Cancelled,
+        State::Failed,
     ];
-    const EVENTS: [Event; 13] = [
-        Event::Begin, Event::DirectReady, Event::ConsentGranted, Event::ConsentDenied,
-        Event::ConsentRevoked, Event::DirectUnavailable, Event::Pause, Event::Resume,
-        Event::AllBytesReceived, Event::VerificationPassed, Event::SaveCommitted,
-        Event::Cancel, Event::Fail,
+    const EVENTS: [Event; 15] = [
+        Event::Begin,
+        Event::DirectReady,
+        Event::ConsentGranted,
+        Event::ConsentGrantedForVerification,
+        Event::ConsentGrantedForSaving,
+        Event::ConsentDenied,
+        Event::ConsentRevoked,
+        Event::DirectUnavailable,
+        Event::Pause,
+        Event::Resume,
+        Event::AllBytesReceived,
+        Event::VerificationPassed,
+        Event::SaveCommitted,
+        Event::Cancel,
+        Event::Fail,
     ];
 
     #[test]
     fn success_requires_consent_verification_and_save() {
         let mut s = State::Pending;
-        for e in [Event::Begin, Event::DirectReady, Event::ConsentGranted,
-                  Event::AllBytesReceived, Event::VerificationPassed, Event::SaveCommitted] {
+        for e in [
+            Event::Begin,
+            Event::DirectReady,
+            Event::ConsentGranted,
+            Event::AllBytesReceived,
+            Event::VerificationPassed,
+            Event::SaveCommitted,
+        ] {
             s = s.advance(e).unwrap();
         }
         assert_eq!(s, State::Completed);
@@ -109,9 +163,17 @@ mod tests {
 
     #[test]
     fn direct_ready_never_means_consent() {
-        assert_eq!(State::Connecting.advance(Event::DirectReady), Ok(State::AwaitingConsent));
-        assert!(State::AwaitingConsent.advance(Event::AllBytesReceived).is_err());
-        assert_eq!(State::AwaitingConsent.advance(Event::ConsentDenied), Ok(State::Rejected));
+        assert_eq!(
+            State::Connecting.advance(Event::DirectReady),
+            Ok(State::AwaitingConsent)
+        );
+        assert!(State::AwaitingConsent
+            .advance(Event::AllBytesReceived)
+            .is_err());
+        assert_eq!(
+            State::AwaitingConsent.advance(Event::ConsentDenied),
+            Ok(State::Rejected)
+        );
     }
 
     #[test]
@@ -147,8 +209,16 @@ mod tests {
 
     #[test]
     fn loss_and_pause_resume_recheck_connection() {
-        for s in [State::AwaitingConsent, State::Transferring, State::Verifying, State::Saving] {
-            assert_eq!(s.advance(Event::DirectUnavailable), Ok(State::WaitingDirect));
+        for s in [
+            State::AwaitingConsent,
+            State::Transferring,
+            State::Verifying,
+            State::Saving,
+        ] {
+            assert_eq!(
+                s.advance(Event::DirectUnavailable),
+                Ok(State::WaitingDirect)
+            );
             assert_eq!(s.advance(Event::Pause), Ok(State::Paused));
             assert_eq!(s.advance(Event::ConsentRevoked), Ok(State::Paused));
         }
@@ -161,7 +231,13 @@ mod tests {
     #[test]
     fn invalid_transition_reports_context() {
         let e = State::Pending.advance(Event::SaveCommitted).unwrap_err();
-        assert_eq!(e, InvalidTransition { state: State::Pending, event: Event::SaveCommitted });
+        assert_eq!(
+            e,
+            InvalidTransition {
+                state: State::Pending,
+                event: Event::SaveCommitted
+            }
+        );
         assert!(e.to_string().contains("Pending"));
     }
 }

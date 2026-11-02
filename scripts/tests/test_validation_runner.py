@@ -4,6 +4,8 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import hashlib
 
 path = Path(__file__).resolve().parents[1] / "run_validation.py"
 spec = importlib.util.spec_from_file_location("validation", path)
@@ -55,3 +57,11 @@ class ValidationRunnerTests(unittest.TestCase):
         for status in ["failed", "skipped_missing_tool", "timed_out", "execution_error"]:
             self.assertFalse(runner.all_passed([{"status": "passed"}, {"status": status}]))
         self.assertTrue(runner.all_passed([{"status": "passed"}]))
+
+    def test_log_hash_streams_without_read_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "log.txt"
+            data = b"synthetic log\n" * 100_000
+            target.write_bytes(data)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read")):
+                self.assertEqual(runner.file_sha256(target), hashlib.sha256(data).hexdigest())

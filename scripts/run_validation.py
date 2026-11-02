@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -15,6 +16,11 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def run_one(name: str, argv: list[str], cwd: Path, output: Path, timeout: float = 300) -> dict:
@@ -43,7 +49,7 @@ def run_one(name: str, argv: list[str], cwd: Path, output: Path, timeout: float 
             stream.write(f"Cannot execute command: {exc}\n")
     return {"name": name, "argv": argv, "started_at": started, "status": status,
             "exit_code": exit_code, "elapsed_seconds": round(time.monotonic() - tick, 3),
-            "log": log.name, "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest()}
+            "log": log.name, "log_sha256": file_sha256(log)}
 
 
 def all_passed(results: list[dict]) -> bool:
@@ -64,7 +70,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "validation" / "local")
     parser.add_argument("--timeout", type=float, default=300)
     args = parser.parse_args()
-    if args.timeout <= 0:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be positive")
     # Refuse overwrite: preserve failed attempts and their original evidence.
     output = args.output.resolve()

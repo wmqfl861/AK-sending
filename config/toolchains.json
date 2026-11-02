@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "rust": "1.97.1",
+  "flutter": {
+    "version": "3.47.0",
+    "commit": "4cf24164269a5ebf0c16a028a00727d0e77bbb05",
+    "engine": "5f77625673248ee5846fbcaf5d3e1a3878386fd7"
+  },
+  "android": {
+    "ndk": "29.0.14206865",
+    "min_api": 26,
+    "compile_api": 37,
+    "target_api": 37,
+    "build_tools": "36.0.0",
+    "jdk_major": 17,
+    "abi": "arm64-v8a"
+  },
+  "apple": {
+    "xcode": "26.6",
+    "iphoneos_sdk": "26.5",
+    "ios_min": "15.0",
+    "macos_min": "13.0"
+  },
+  "targets": [
+    {"platform": "windows", "rust": "x86_64-pc-windows-msvc", "minimum_goal": "Windows 11"},
+    {"platform": "linux", "rust": "x86_64-unknown-linux-gnu", "minimum_goal": "Ubuntu 24.04"},
+    {"platform": "macos", "rust": "aarch64-apple-darwin", "minimum_goal": "macOS 13"},
+    {"platform": "android", "rust": "aarch64-linux-android", "minimum_goal": "Android 8/API26"},
+    {"platform": "ios", "rust": "aarch64-apple-ios", "minimum_goal": "iOS 15"}
+  ],
+  "support_note": "Minimums are engineering targets, not tested-support claims. Hosted images are recorded, not byte-pinned."
+}

@@ -1,0 +1,24 @@
+[package]
+name = "ak-m0-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+publish = false
+description = "Isolated synthetic loopback/FFI experiment, not a file-transfer API"
+
+[workspace]
+resolver = "2"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+ak-transport = { path = "../../../crates/ak-transport" }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time", "macros"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

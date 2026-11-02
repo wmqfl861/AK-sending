@@ -67,7 +67,9 @@ def check(root: Path) -> dict:
     except (OSError, ValueError) as exc:
         errors.append(f"invalid Cargo manifest: {exc}")
     checked_links = 0
-    markdowns = sorted(root.rglob("*.md"))
+    markdowns = sorted(p for p in root.rglob("*.md")
+                       if not any(part in {"target", ".git", ".venv", "validation"}
+                                  for part in p.relative_to(root).parts))
     for path in markdowns:
         text = path.read_text(encoding="utf-8")
         for link in re.findall(r"\[[^\]]*\]\(([^\s)]+)\)", text):
@@ -84,9 +86,8 @@ def check(root: Path) -> dict:
         "passed": not errors,
         "markdown_files_checked": len(markdowns),
         "local_links_checked": checked_links,
-        "rust_test_cases_present_not_executed": rust_tests,
-        "rust_compilation_executed": False,
-        "network_tests_executed": False,
+        "rust_test_functions_detected": rust_tests,
+        "execution_scope": "This invocation only: static files/configuration; no other test status asserted.",
         "errors": errors,
     }
 

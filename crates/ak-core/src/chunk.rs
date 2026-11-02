@@ -11,10 +11,15 @@ pub struct ChunkPlan {
 impl ChunkPlan {
     /// The API requires a nonzero chunk size. This is not a file-size quota.
     pub fn new(total_bytes: u64, chunk_bytes: NonZeroU32) -> Self {
-        Self { total_bytes, chunk_bytes }
+        Self {
+            total_bytes,
+            chunk_bytes,
+        }
     }
 
-    pub fn total_bytes(&self) -> u64 { self.total_bytes }
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
 
     pub fn chunk_count(&self) -> u64 {
         let size = u64::from(self.chunk_bytes.get());
@@ -24,7 +29,9 @@ impl ChunkPlan {
     /// Return an inclusive-start/exclusive-end byte range, without allocation.
     /// Avoid (length + chunk_size - 1), which can overflow at u64::MAX.
     pub fn range(&self, index: u64) -> Option<Range<u64>> {
-        if index >= self.chunk_count() { return None; }
+        if index >= self.chunk_count() {
+            return None;
+        }
         let size = u64::from(self.chunk_bytes.get());
         let start = index.checked_mul(size)?;
         let length = size.min(self.total_bytes.checked_sub(start)?);

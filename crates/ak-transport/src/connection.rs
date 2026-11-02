@@ -222,6 +222,10 @@ impl AuthenticatedDirectConnection {
 
     async fn run_probe(&mut self, responder: bool) -> Result<()> {
         self.ensure_live()?;
+        let mut guard = ProbeGuard {
+            connection: self,
+            complete: false,
+        };
         let operation = async {
             if responder {
                 let (mut send, mut receive) = self
@@ -257,10 +261,23 @@ impl AuthenticatedDirectConnection {
         let result = timeout(OPERATION_TIMEOUT, operation)
             .await
             .unwrap_or(Err(Error::Timeout));
-        if result.is_err() {
-            self.close();
-        }
+        guard.complete = result.is_ok();
         result
+    }
+}
+
+// The guard lives across every probe await. Dropping a polled future closes the
+// borrowed connection too; dropping an unpolled future has no network effects.
+struct ProbeGuard<'a> {
+    connection: &'a AuthenticatedDirectConnection,
+    complete: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.connection.close();
+        }
     }
 }
 

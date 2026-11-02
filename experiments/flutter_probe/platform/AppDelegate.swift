@@ -26,9 +26,10 @@ private final class DirectoryProbe: NSObject, UIDocumentPickerDelegate {
   private var pickerResult: FlutterResult?
   private var busy = false // Accessed only on the main queue.
   private var coordinator: NSFileCoordinator?
+  private var cancellation: DirectoryCancellation?
   private let queue = DispatchQueue(label: "ak.m0.directory")
   private let key = "ak.m0.directory.bookmark"
-  func cancel() { coordinator?.cancel() }
+  func cancel() { cancellation?.cancel(); coordinator?.cancel() }
   func handle(_ method: String, result: @escaping FlutterResult) {
     guard !busy && pickerResult == nil else { result("busy"); return }
     switch method {
@@ -65,17 +66,20 @@ private final class DirectoryProbe: NSObject, UIDocumentPickerDelegate {
     guard let data = UserDefaults.standard.data(forKey: key) else { result("select-required"); return }
     busy = true
     let coordinator = NSFileCoordinator()
+    let cancellation = DirectoryCancellation()
     self.coordinator = coordinator
+    self.cancellation = cancellation
     // Main-queue result gate. A timeout does not free the worker slot prematurely.
     var replied = false
     let timeout = DispatchWorkItem {
-      coordinator.cancel()
+      cancellation.cancel(); coordinator.cancel()
       if !replied { replied = true; result("timeout-restart-required") }
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
     queue.async {
       var outcome = "permission-or-provider-failed"
       do {
+        try cancellation.check()
         var stale = false
         let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
             bookmarkDataIsStale: &stale)
@@ -85,30 +89,20 @@ private final class DirectoryProbe: NSObject, UIDocumentPickerDelegate {
           var error: NSError?
           coordinator.coordinate(writingItemAt: url, options: [], error: &error) { directory in
             let file = directory.appendingPathComponent("ak-m0-probe-\(UUID().uuidString).tmp")
-            var created = false
-            defer {
-              if created {
-                do { try FileManager.default.removeItem(at: file) }
-                catch { outcome = "cleanup-failed" }
-              }
-            }
-            do {
-              let expected = Data(repeating: 0x42, count: 64)
-              try expected.write(to: file, options: .withoutOverwriting)
-              created = true
-              let input = try FileHandle(forReadingFrom: file)
-              defer { try? input.close() }
-              let actual = try input.read(upToCount: 65)
-              outcome = actual == expected ? "synthetic-file-verified" : "verification-failed"
-            } catch { outcome = "file-probe-failed" }
+            outcome = runOwnedDirectoryProbe(file: file, cancellation: cancellation)
           }
           if error != nil { outcome = "coordination-failed" }
         }
-      } catch { outcome = "bookmark-invalid" }
+      } catch DirectoryProbeFailure.cancelled { outcome = "cancelled" }
+      catch { outcome = "bookmark-invalid" }
       let completed = outcome
       DispatchQueue.main.async {
-        timeout.cancel(); self.busy = false; self.coordinator = nil
-        if !replied { replied = true; result(completed) }
+        timeout.cancel(); self.busy = false; self.coordinator = nil; self.cancellation = nil
+        if !replied {
+          replied = true
+          do { try cancellation.check(); result(completed) }
+          catch { result(completed == "cleanup-failed" ? completed : "cancelled") }
+        }
       }
     }
   }

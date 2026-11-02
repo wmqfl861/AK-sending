@@ -68,7 +68,9 @@ def prepare(project: Path, native: Path, platform: str) -> None:
                          f'-framework Security -framework SystemConfiguration -lresolv -liconv {flags} -Wl,-export_dynamic\n'
                          'DEAD_CODE_STRIPPING = NO\nSTRIP_STYLE = non-global\n')
         if platform == 'ios':
-            shutil.copy2(SOURCE / 'platform/AppDelegate.swift', project / 'ios/Runner/AppDelegate.swift')
+            (project / 'ios/Runner/AppDelegate.swift').write_text(
+                (SOURCE / 'platform/AppDelegate.swift').read_text(encoding='utf-8') + '\n' +
+                (SOURCE / 'platform/DirectoryOperation.swift').read_text(encoding='utf-8'), encoding='utf-8')
             update_plist(project / 'ios/Runner/Info.plist', {
                 'NSLocalNetworkUsageDescription': '仅用于用户主动启动的本地连接实验。拒绝不会绕过权限。'})
         else:

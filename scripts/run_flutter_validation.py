@@ -64,6 +64,12 @@ def main() -> int:
         release = native_dir / (target or '') / 'release'
         native = release / {'linux':'libak_m0_probe.so', 'windows':'ak_m0_probe.dll',
                             'android':'libak_m0_probe.so', 'ios':'libak_m0_probe.a', 'macos':'libak_m0_probe.a'}[platform]
+        if platform in ['ios', 'macos']:
+            regression = output / 'directory-regressions'
+            if not run('directory-test-compile', ['swiftc', '-warnings-as-errors',
+                    'experiments/flutter_probe/platform/DirectoryOperation.swift',
+                    'experiments/flutter_probe/platform/tests/main.swift', '-o', str(regression)]): return 1
+            if not run('directory-tests', [str(regression)]): return 1
         if not run('create', command('flutter', 'create', '--platforms=' + platform, '--org=dev.ak',
                 '--project-name=ak_m0_probe', '--empty', '--no-pub', str(project))): return 1
         prepare(project, native, platform)

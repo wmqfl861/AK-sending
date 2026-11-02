@@ -40,7 +40,6 @@ impl State {
             (Self::AwaitingAccept, Event::OfferRejected) => Ok(Self::Failed),
             (Self::Connecting | Self::AwaitingAccept | Self::Transferring, Event::DirectUnavailable) => Ok(Self::WaitingDirect),
             (Self::Connecting | Self::AwaitingAccept | Self::Transferring | Self::WaitingDirect, Event::Pause) => Ok(Self::Paused),
-            (Self::Connecting | Self::Transferring | Self::WaitingDirect, Event::Pause) => Ok(Self::Paused),
             (Self::Paused | Self::WaitingDirect, Event::Resume) => Ok(Self::Connecting),
             (Self::Transferring, Event::AllBytesReceived) => Ok(Self::Verifying),
             (Self::Verifying, Event::VerificationPassed) => Ok(Self::Saving),

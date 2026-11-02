@@ -14,9 +14,4 @@ pub mod codec;
 pub mod server;
 pub mod stun;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore = "replaced by the ak-signal agent"]
-    fn placeholder() {}
-}
+mod util;

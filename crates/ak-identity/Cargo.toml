@@ -11,4 +11,7 @@ blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
+# Already in the workspace graph via rcgen/rustls; needed for the
+# PrivatePkcs8KeyDer argument of rcgen::KeyPair::from_pkcs8_der_and_sign_algo.
+rustls-pki-types = "1"
 thiserror = { workspace = true }

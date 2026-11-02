@@ -12,4 +12,7 @@ mdns-sd = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-ak-net = { workspace = true }
+# tempfile is intentionally NOT needed here yet; ak-net was removed from
+# dev-dependencies because nothing in this crate's tests uses it and it
+# coupled this crate's clippy gate to unrelated work-in-progress crates.
+

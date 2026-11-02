@@ -10,6 +10,7 @@ members = [
     "crates/ak-signal",
     "crates/ak-engine",
     "crates/ak-cli",
+    "crates/ak-itests",
 ]
 resolver = "2"
 

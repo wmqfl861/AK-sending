@@ -1,0 +1,18 @@
+[package]
+name = "ak-itests"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Cross-module integration tests (TEST_PLAN mapping lives in tests; see also reports)"
+
+[dependencies]
+ak-core = { workspace = true }
+ak-engine = { workspace = true }
+ak-identity = { workspace = true }
+ak-net = { workspace = true }
+ak-storage = { workspace = true }
+ak-store = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

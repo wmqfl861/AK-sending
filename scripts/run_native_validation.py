@@ -66,9 +66,13 @@ def main() -> int:
         artifact = release / 'libak_m0_probe.dylib'
     if not args.target:
         commands.append(('ffi-smoke', [sys.executable, 'scripts/probe_ffi_smoke.py', str(artifact)]))
+        commands.append(('independent-processes', [sys.executable, 'scripts/lan_process_smoke.py', str(artifact)]))
+        if os.environ.get('AK_TEST_NETNS') == '1':
+            commands.append(('isolated-stacks', ['sudo', 'bash', 'scripts/lan_namespace_smoke.sh', sys.executable, str(artifact)]))
     elif 'android' in args.target:
         readelf = os.environ.get('AK_READELF', 'llvm-readelf')
         commands.append(('elf', [readelf, '--wide', '--file-header', '--program-headers', str(artifact)]))
+        commands.append(('lan-exports', [readelf, '--wide', '--dyn-syms', str(artifact)]))
     elif 'ios' in args.target:
         commands += [('sdk', ['xcrun', '--sdk', 'iphoneos', '--show-sdk-version']),
                      ('native-link', ['xcrun', '--sdk', 'iphoneos', 'clang',
@@ -89,6 +93,14 @@ def main() -> int:
         aligned, count = elf_has_16k_alignment(text)
         results.append({'name': 'elf-16k-alignment', 'status': 'passed' if aligned else 'failed',
                         'exit_code': 0 if aligned else 1, 'load_segments': count})
+    if args.target and 'android' in args.target:
+        text = (output / 'lan-exports.log').read_text(encoding='utf-8')
+        exports = {fields[-1] for line in text.splitlines() if len(fields := line.split()) >= 8
+                   and fields[3:5] == ['FUNC', 'GLOBAL'] and fields[6] != 'UND'}
+        exported = all('ak_m0_lan_' + name in exports for name in
+                       ['version','prepare','poll','read','push','configure','start','cancel','release'])
+        results.append({'name':'lan-exports-defined', 'status':'passed' if exported else 'failed',
+                        'exit_code':0 if exported else 1})
     passed = all_passed(results) and artifact.is_file()
     report = {
         'module': 'M0-04', 'level': 'native-link' if args.target else 'host-ffi-loopback',

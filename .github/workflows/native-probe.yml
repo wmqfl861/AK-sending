@@ -37,6 +37,9 @@ jobs:
           echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"
       - name: Locked public dependency prefetch
         run: cargo fetch --manifest-path experiments/platform_probe/native/Cargo.toml --locked
+      - name: Enable isolated network-stack test on Linux only
+        if: runner.os == 'Linux'
+        run: echo 'AK_TEST_NETNS=1' >> "$GITHUB_ENV"
       - name: Actual native tests, release link and dynamic ABI load
         run: python scripts/run_native_validation.py --output validation/native
       - name: Archive exact committed source

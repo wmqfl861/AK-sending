@@ -12,7 +12,7 @@
 - [x] 方案评审；见 docs/REVIEW_2026-11-02.zh-CN.md。
 - [x] 所有者指示"继续本地开发"后按评审建议路线推进，固化为 ADR-002（2026-11-02，本地分支）；D2/D3 的产品文案与端口映射默认值仍待所有者确认。
 
-## 局域网原型（ADR-002 / 评审第五节第 1 步，2026-11-02，分支 dev/local-parallel）
+## 局域网原型（ADR-002 / 评审第五节第 1 步，2026-11-02/03，分支 dev/local-parallel）
 
 - [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli/ak-itests 十一 crate（两轮并行子代理开发）；workspace 281 项测试、clippy `-D warnings` 全绿；证据见 reports/dev-validation-2026-11-02.txt。
 - [x] 真实身份认证最小实现（P0-03 部分）：Ed25519 设备密钥、指纹、配对码、自签证书钉扎（含常量时间比较与严格 DER 校验）；错误钉扎/未授权路径发送前拒绝（T06 自动化，engine 测试）。
@@ -31,6 +31,39 @@
 - [x] 局域网 CLI 双端传输：真实双进程环回传输逐字节一致（含空目录、嵌套、二进制大文件、多流模式、配对簿准入）。
 - [x] 方案评审第 6 节代码建议：job.rs 增加等待接收方确认状态；生产路径身份由类型保证。
 - [x] 文档对照：TEST_PLAN 自动化映射、ARCHITECTURE 模块现状、SECURITY 已实现机制与已知限制、TECH_SELECTION 状态更新。
+
+第三轮（2026-11-03，提交 `5ac6f2a`，4 个并行子代理＋集成者修复；证据见 reports/dev-validation-2026-11-02.txt"第三轮并行开发验证"节）：
+
+- [x] 存储满预检（T09 相关）：`ak-engine::check_headroom` 纯决策函数（余量未知→放行、恰好放行、不足→`EngineError::StorageFull` 携真实数字）；接收端在应答 ResumeRequest 前实测目的目录余量并经协议 `ErrorCode::StorageFull` 告知对端；耗尽仍由真实写错误兜底，不伪造成功。
+- [x] 多根合并发送：`SendSpec::extra_roots`/`SourceSet` 将多个文件/目录合并为一个清单（每根条目加 `<根名>/` 前缀），根名重复在建立连接前拒绝；无额外根时单根行为字节级不变；`Report.roots` 记录各根名；CLI `send` 直接接受多路径。
+- [x] 同出口提示（评审 4.1）：会话两端在协调面的 TCP 对端 IP 一致时，服务器在 SessionOpened 后向双方各发一条 `PeerSignal::SameEgress`（仅候选排序提示，非信任判定；IP 未知不发提示；设备重连后按新 IP 刷新）；封闭消息集测试同步更新（ak-signal）。
+- [x] T07 场景环回自动化：真实进程内信令服务器完成完整会话时序后关停（传输前/传输中两变体；传输中变体断言关停后仍有新 chunk 事件），直连传输照常完成、字节一致（ak-itests t07_coordination_down.rs）。
+- [x] T03 场景 IPv6 环回形态自动化：`classify(::1)`/`fe80::/10` 判定、双端绑 `[::1]:0` 的 QUIC+TLS 握手互钉、引擎双绑定 `[::1]:0` 传输字节一致且接收端实际绑定地址为 ::1（ak-itests t03_ipv6_loopback.rs）；跨网段/公网 IPv6 直连仍属 T03 未覆盖部分。
+- [x] T04 数据面零信令依赖证明对：先证明死端口上协调面确实不存在（连接拒绝），随后在从未启动任何信令服务的机器上引擎传输照常完成（ak-itests t04_signal_irrelevant_to_data.rs）；与 T07 构成证明对——协调面可有可无，从未处于文件数据路径（ADR-001 不变量）。
+- [x] 环回吞吐基准（信息性，非验收门槛）：release、64×8 MiB＝512 MiB 确定性载荷，单流 97.9 MiB/s、多流 103.3 MiB/s（仅 1.06x，环回收益有限；真实网卡吞吐未测）；`ak-cli bench`（进程内环回、--bytes/--files/--chunk_kb、固定种子可复现）＋ ak-itests bench_throughput.rs（只断言正确性，不断言速度下限）。
+- [x] connect 族缺陷修复（场景测试发现→集成者修复→回归钉死）：IPv4 socket 拨 IPv6 对端原本会无限悬挂于 QUIC 重试（IPv6 场景测试发现）→ `connect_bounded` 地址族不匹配快速失败（InvalidInput）＋连接期空闲预算包裹，回归测试 `connect_family_mismatch_fails_fast_instead_of_hanging` 钉死。
+- [x] CLI 第三轮：`--timeout` 空闲预算透传（send/receive，默认 30s，非总运行时长）、单行刷新进度渲染（`\r` 刷新＋79 列裁剪，AK_QUIET 静默）；第三轮后 workspace 308 项测试通过（第二轮后为 281 项）、clippy `-D warnings` 全绿、5 GiB release 回归 84.3s。
+
+第四轮（2026-11-03，7 个并行子代理；证据见 reports/dev-validation-2026-11-02.txt"第四轮并行开发验证"节）：
+
+- [x] ResumeRequest 多帧分页（协议演进）：每帧携带 more 标志，接收端分片发送、发送端逐帧累积并校验 job_id；单任务条目数不再受单帧 65,535 上限约束；100,000 条目分片单元验证（2 片 65,535+34,465 全量按序到达），65,537 文件 release 边界实测（t13 ignored 变体）；PROTOCOL 文档已对齐。
+- [x] SQLite 检查点后端（P1-03 正式项）：`SqliteCheckpointStore`（可选特性 sqlite，rusqlite bundled，默认依赖图零泄漏）；事务原子性、双连接 WAL 并发、与文件后端语义等价（ak-store 默认 10 + 特性 23 测试）。
+- [x] 连接统计 API（无中继运行时旁证）：`DirectChannel::stats()` 暴露 tx/rx 字节与帧数、丢包计数；真实环回对账测试（帧数跨端一致、字节差 ≤10%）；`accept_within` 超时辅助。
+- [x] T06 深化（身份替换攻击面）：mid-transfer 端口被他人密钥抢占→钉扎拒绝且零落盘；正确指纹对第三方证书→握手期拒绝；配对簿准入端到端（簿内传输/簿外拒绝）（ak-itests t06_identity_swap.rs）。
+- [x] T08 可行形态：端口变更→旧地址有界拒绝→同身份新地址重钉扎→同 job_id 续传完成（ak-itests t08_reconnect_recheck.rs；QUIC 连接迁移不在范围，已注明）。
+- [x] T10 多流扩展：多流模式中断→part/checkpoint 存活→二次多流续传一致；多流+多根组合一次通过（ak-itests t10_multistream_resume.rs）。
+- [x] CLI 第四轮：多路径发送（send p1 p2 dir）、指纹 8–63 位唯一前缀解析（查配对簿）、probe SameEgress 提示（一次性）；真实双进程冒烟（3 根多流 + 前缀端到端）通过。
+- [x] 发现模块第四轮：候选携带设备名（TXT 清洗：控制字符替换、UTF-8 边界截断 64B）、browse_with 实时回调（addr+fp 去重）、watch 持续发现模式；本机真实组播回环验证。
+- [x] 第四轮后 workspace 338 项测试通过（含 sqlite 特性 +23）、clippy 双配置全绿。
+
+第五轮（2026-11-03，4 个并行子代理＋集成者接线；证据见 reports/dev-validation-2026-11-02.txt"第五轮并行开发验证"节）：
+
+- [x] 策略模型接入真实通道（架构闭环）：`authorize_path` 闸门在 send/receive 拿到 DirectChannel 后、任何协议帧之前执行——LocalDirect 恒过、InternetDirect 按 `DirectPolicy::allow_internet`、Relay/Unknown 防御性拒绝（`EngineError::RouteForbidden`，连接以专用码关闭）；Observation 布尔的等价物由类型保证（DirectChannel=已认证直连），不重复填写；CLI `send/receive --no-internet` 旗标接线，LAN-only 环回冒烟通过。
+- [x] `ak-cli doctor` 环境自检：身份/配对簿、本地网络（v4/v6 分列）、双栈 UDP 绑定、mDNS 尽力探测（本机回环 ok）、可选 STUN（--stun）、磁盘余量；每项 ok/warn/skip＋结论建议（防火墙弹窗/AP 隔离指引）；--json。
+- [x] 发送端友好错误映射：14 个错误码全量中文建议（StorageFull 双数值、IdleTimeout 续传指引、RouteForbidden 策略说明等），anyhow context 保留完整错误链。
+- [x] 块尺寸扫描基准（信息性）：256MiB×{64KiB,256KiB,1MiB,4MiB}×{单流,多流} 实测——64KiB 显著最差（-23%），256KiB–1MiB 平台期 ~99 MiB/s，4MiB+多流本轮 108 MiB/s（单轮无中位数，结论仅 64KiB 劣势可靠；真实网卡最优值待双机数据）。
+- [x] 文档现状化：README 快速上手全旗标核对、UX"CLI 已实现交互"现状节（配对三形态/接收循环/进度渲染，与原文分歧以现状注记对冲）、OPERATIONS 协调服务器运维节（限额默认、无文件路由三层验证、SameEgress 误报场景、日志边界）。
+- [x] 第五轮后 workspace 364 项测试通过、clippy 全绿、5 GiB release 回归 111.49s。
 
 ## P0
 

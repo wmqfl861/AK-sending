@@ -1,13 +1,17 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
 //! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `send`, `discover`,
-//! `jobs`, `signal-server`, `probe`, `bench`. The binary never talks to any
-//! file-carrying server; servers started here are coordination-only (ADR-001).
+//! `jobs`, `signal-server`, `probe`, `bench`, `doctor`. The binary never
+//! talks to any file-carrying server; servers started here are
+//! coordination-only (ADR-001).
 //!
 //! Pairing model: the local peer book (`peers.book` in the id directory)
 //! holds fingerprint/name pairs. `receive` defaults to accepting only paired
 //! fingerprints; a successful `send` records the receiver trust-on-first-use.
 #![forbid(unsafe_code)]
+
+mod doctor;
+mod errors;
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -29,7 +33,7 @@ use ak_identity::{DeviceKeyPair, Fingerprint, PeerBook, PeerRecord};
     name = "ak-cli",
     version,
     about = "AK-sending direct-only prototype",
-    after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> --to <ip:7100> --fp <64-hex fingerprint>\n\nAll transfers are direct device-to-device; no server ever carries file data."
+    after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> [more paths...] --to <ip:7100> --fp <fingerprint>\n\nFingerprints accept the full 64 hex characters or a unique 8-63 character\nprefix of a peer already in peers.book. Multiple send paths travel in one\njob; each keeps its own top-level name on the receiver (paths with the same\nname must be sent in separate runs).\nAll transfers are direct device-to-device; no server ever carries file data."
 )]
 struct Cli {
     /// Identity directory holding device.key, peers.book, checkpoints
@@ -64,7 +68,8 @@ enum Command {
         port: u16,
         /// Accept policy: omitted = only fingerprints in peers.book;
         /// 'any' = accept every peer (warning: unauthenticated);
-        /// 64-hex fingerprint = pin that one peer;
+        /// 64-hex fingerprint (or unique 8-63 character peers.book prefix)
+        /// = pin that one peer;
         /// 6-digit pairing code = accept the peer whose code matches.
         #[arg(long)]
         expect: Option<String>,
@@ -74,22 +79,30 @@ enum Command {
         /// Handle exactly one transfer, then exit (default: loop until Ctrl-C).
         #[arg(long, default_value_t = false)]
         once: bool,
+        /// LAN-only mode: refuse non-local paths (no internet direct transfer).
+        #[arg(long, default_value_t = false)]
+        no_internet: bool,
         /// Idle timeout in seconds: abort when no frame arrives within this
         /// budget (idle timeout, not total run time). Applies to every loop
         /// iteration.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
     },
-    /// Send one file or one directory to a peer. On success the peer's
-    /// fingerprint is recorded in peers.book (trust on first use).
+    /// Send files and/or directories to a peer. The first path is the
+    /// primary root; further paths join the same job, each keeping its own
+    /// top-level name on the receiver (root names must be unique per run).
+    /// On success the peer's fingerprint is recorded in peers.book (trust on
+    /// first use).
     Send {
-        /// Files or one directory to send.
+        /// Files/directories to send: the first is the primary root, any
+        /// further paths are extra roots in the same job.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Peer address ip:port.
         #[arg(long)]
         to: SocketAddr,
-        /// Peer fingerprint (64 hex characters), pinned for this transfer.
+        /// Peer fingerprint pinned for this transfer: 64 hex characters, or
+        /// a unique 8-63 character prefix of a peer already in peers.book.
         /// Get it from the peer device via `ak-cli pair code`.
         #[arg(long)]
         fp: String,
@@ -102,6 +115,9 @@ enum Command {
         /// Transfer files on parallel QUIC streams when the peer supports it.
         #[arg(long, default_value_t = false)]
         multistream: bool,
+        /// LAN-only mode: refuse non-local paths (no internet direct transfer).
+        #[arg(long, default_value_t = false)]
+        no_internet: bool,
         /// Idle timeout in seconds: abort when no frame arrives within this
         /// budget (idle timeout, not total run time).
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
@@ -122,6 +138,22 @@ enum Command {
     Jobs {
         #[command(subcommand)]
         cmd: Option<JobsCommand>,
+    },
+    /// Environment self-check for two-machine LAN debugging (REVIEW 4.3):
+    /// identity, local networks, UDP bind, mDNS, optional STUN, disk space.
+    /// Every probe is timeout-bounded; failures are reported (ok/warn/skip),
+    /// never fatal.
+    Doctor {
+        /// STUN server ip:port to query (3s timeout). Omitted = skip the
+        /// check (the default; LAN debugging does not need it).
+        #[arg(long)]
+        stun: Option<SocketAddr>,
+        /// mDNS advertise+browse window in seconds (best effort).
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=30))]
+        mdns_seconds: u64,
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Run the coordination server (signaling + STUN; no file routes).
     SignalServer {
@@ -183,7 +215,8 @@ enum PairCommand {
     List,
     /// Remove a paired peer from peers.book.
     Remove {
-        /// Peer fingerprint, 64 hex characters.
+        /// Peer fingerprint: 64 hex characters, or a unique 8-63 character
+        /// prefix of a peers.book entry.
         fingerprint: String,
     },
     /// Print this device's fingerprint and pairing code so the peer side can
@@ -231,11 +264,63 @@ fn parse_fingerprint(text: &str) -> Result<Fingerprint> {
     }
 }
 
+/// One accepted fingerprint-argument shape for [`resolve_fingerprint_arg`].
+const FP_MIN_PREFIX: usize = 8;
+
+/// Resolve a fingerprint argument shared by `send --fp`, `pair remove` and
+/// `receive --expect`: a full 64-hex value parses directly (no book access
+/// needed); an 8..63 hex-character prefix must match exactly one peers.book
+/// entry and is completed to that entry. Zero matches, ambiguity and
+/// malformed input are explicit errors.
+fn resolve_fingerprint_arg(text: &str, book_path: &Path) -> Result<Fingerprint> {
+    let trimmed = text.trim();
+    let is_hex = !trimmed.is_empty() && trimmed.bytes().all(|b: u8| b.is_ascii_hexdigit());
+    if !is_hex {
+        bail!(
+            "unknown fingerprint format: expected 64 hex characters \
+             (print it on the peer device with `ak-cli pair code`)"
+        );
+    }
+    if trimmed.len() == 64 {
+        return Fingerprint::from_hex(trimmed).context("fingerprint must be 64 hex characters");
+    }
+    if (FP_MIN_PREFIX..64).contains(&trimmed.len()) {
+        let prefix = trimmed.to_ascii_lowercase();
+        let book = load_peer_book(book_path)?;
+        let hits: Vec<&PeerRecord> = book
+            .iter()
+            .filter(|record| record.fingerprint.to_hex().starts_with(&prefix))
+            .collect();
+        return match hits.as_slice() {
+            [only] => Ok(only.fingerprint),
+            [] => bail!(
+                "fingerprint prefix {prefix} not found in the peer book {}; the sending \
+                 side needs the full 64-hex fingerprint (see `ak-cli pair list`)",
+                book_path.display()
+            ),
+            many => bail!(
+                "fingerprint prefix {prefix} is ambiguous: matches {} peers ({}); add more \
+                 hex characters or use the full 64-hex fingerprint",
+                many.len(),
+                many.iter()
+                    .map(|record| record.fingerprint.short_id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    }
+    bail!(
+        "fingerprint must be the full 64 hex characters or a unique prefix of \
+         {FP_MIN_PREFIX} to 63 characters (got {})",
+        trimmed.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Peer book helpers
 // ---------------------------------------------------------------------------
 
-fn peer_book_path(id: &Path) -> PathBuf {
+pub(crate) fn peer_book_path(id: &Path) -> PathBuf {
     id.join("peers.book")
 }
 
@@ -247,7 +332,7 @@ fn now_unix_ms() -> u64 {
 }
 
 /// Load peers.book; a missing file means "no peers yet", corruption is fatal.
-fn load_peer_book(path: &Path) -> Result<PeerBook> {
+pub(crate) fn load_peer_book(path: &Path) -> Result<PeerBook> {
     match PeerBook::load(path) {
         Ok(book) => Ok(book),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PeerBook::default()),
@@ -287,10 +372,11 @@ fn pair_add(id: &Path, fingerprint_text: &str, name: Option<&str>) -> Result<(Fi
     Ok((fingerprint, added))
 }
 
-/// `pair remove`: drop the fingerprint; error when it was never paired.
+/// `pair remove`: drop the fingerprint (full 64-hex or a unique peers.book
+/// prefix); error when it was never paired.
 fn pair_remove(id: &Path, fingerprint_text: &str) -> Result<Fingerprint> {
-    let fingerprint = parse_fingerprint(fingerprint_text)?;
     let path = peer_book_path(id);
+    let fingerprint = resolve_fingerprint_arg(fingerprint_text, &path)?;
     let mut book = load_peer_book(&path)?;
     if !book.remove(&fingerprint) {
         bail!(
@@ -332,15 +418,10 @@ enum ExpectPolicy {
 }
 
 impl ExpectPolicy {
-    fn parse(text: &str) -> Result<Self> {
+    fn parse(text: &str, book_path: &Path) -> Result<Self> {
         let trimmed = text.trim();
         if trimmed.eq_ignore_ascii_case("any") {
             return Ok(ExpectPolicy::Any);
-        }
-        if trimmed.len() == 64 {
-            let pinned = Fingerprint::from_hex(trimmed)
-                .context("invalid --expect fingerprint (expected 64 hex characters)")?;
-            return Ok(ExpectPolicy::Pinned(pinned));
         }
         let all_code_chars = trimmed
             .bytes()
@@ -352,10 +433,10 @@ impl ExpectPolicy {
         if all_code_chars && digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()) {
             return Ok(ExpectPolicy::PairingCode(trimmed.to_owned()));
         }
-        bail!(
-            "invalid --expect {trimmed:?}: use 'any', a 64-hex fingerprint, \
-             or a 6-digit pairing code"
-        )
+        // Full 64-hex values and unique peers.book prefixes share one path.
+        let pinned = resolve_fingerprint_arg(trimmed, book_path)
+            .with_context(|| format!("invalid --expect {trimmed:?}"))?;
+        Ok(ExpectPolicy::Pinned(pinned))
     }
 
     fn allows(&self, peer: &Fingerprint) -> bool {
@@ -381,7 +462,7 @@ impl ExpectPolicy {
 /// hold at least one peer; otherwise the user must authorize explicitly.
 fn resolve_expect(text: Option<&str>, book_path: &Path) -> Result<ExpectPolicy> {
     match text {
-        Some(text) => ExpectPolicy::parse(text),
+        Some(text) => ExpectPolicy::parse(text, book_path),
         None => {
             let book = load_peer_book(book_path)?;
             if book.iter().next().is_none() {
@@ -596,7 +677,7 @@ fn peer_display_name(name: &str) -> &str {
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
     let mut unit = 0usize;
@@ -612,7 +693,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// Escape a string for embedding in a JSON string literal.
-fn json_escape(text: &str) -> String {
+pub(crate) fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -635,6 +716,32 @@ fn source_name(source: ak_discovery::CandidateSource) -> &'static str {
         ak_discovery::CandidateSource::Manual => "manual",
         ak_discovery::CandidateSource::Signaling => "signaling",
         ak_discovery::CandidateSource::Mdns => "mdns",
+    }
+}
+
+/// The fixed text printed for the probe SameEgress hint.
+const SAME_EGRESS_NOTICE: &str = "same egress detected: prefer LAN candidates first";
+
+/// One-shot guard for repeated events that should be announced exactly once:
+/// [`OnceNotice::take`] returns the notice text the first time and None for
+/// every later hit.
+#[derive(Debug, Default)]
+struct OnceNotice {
+    shown: bool,
+}
+
+impl OnceNotice {
+    fn new() -> Self {
+        OnceNotice { shown: false }
+    }
+
+    fn take(&mut self) -> Option<&'static str> {
+        if self.shown {
+            None
+        } else {
+            self.shown = true;
+            Some(SAME_EGRESS_NOTICE)
+        }
     }
 }
 
@@ -791,6 +898,16 @@ fn short_of(peer: &Option<String>) -> String {
         .unwrap_or_else(|| "?".to_owned())
 }
 
+/// One-line root listing for the summary: `roots: a, b, c` (primary first,
+/// then extras in add order). None when the report carries no roots.
+fn roots_line(report: &Report) -> Option<String> {
+    if report.roots.is_empty() {
+        None
+    } else {
+        Some(format!("roots: {}", report.roots.join(", ")))
+    }
+}
+
 fn report_summary(report: &Report) {
     println!(
         "job {} complete: {} entries, {}, resumed {} chunks, peer {}",
@@ -804,6 +921,9 @@ fn report_summary(report: &Report) {
         report.resumed_chunks,
         short_of(&report.peer_fingerprint)
     );
+    if let Some(line) = roots_line(report) {
+        println!("{line}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,6 +1379,7 @@ fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_command(
     id: &Path,
     out: PathBuf,
@@ -1266,6 +1387,7 @@ async fn receive_command(
     expect: Option<String>,
     conflict: String,
     once: bool,
+    no_internet: bool,
     timeout: u64,
 ) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
@@ -1316,6 +1438,7 @@ async fn receive_command(
         spec.checkpoint_dir = checkpoints.clone();
         spec.device_name = device_name.clone();
         spec.idle_timeout = idle;
+        spec.policy.allow_internet = !no_internet;
         spec.authorize = policy.authorize();
         let printer = progress_printer("recv");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
@@ -1368,6 +1491,41 @@ async fn receive_command(
     }
 }
 
+/// Canonicalize the send paths: the first is the primary root, the rest
+/// become extra roots in the order given (the engine enforces unique root
+/// names across the whole job).
+fn send_roots(paths: &[PathBuf]) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let Some(first) = paths.first() else {
+        bail!("send needs at least one file or directory");
+    };
+    let primary = first
+        .canonicalize()
+        .with_context(|| first.display().to_string())?;
+    let extras = paths[1..]
+        .iter()
+        .map(|path| {
+            path.canonicalize()
+                .with_context(|| path.display().to_string())
+        })
+        .collect::<Result<Vec<PathBuf>>>()?;
+    Ok((primary, extras))
+}
+
+/// The engine's duplicate-root refusal as an io error, so the CLI can reword
+/// it into a friendly hint. Any other InvalidInput (e.g. an unusable root
+/// name) passes through untouched.
+fn duplicate_roots_error(err: &EngineError) -> Option<&std::io::Error> {
+    match err {
+        EngineError::Io(io)
+            if io.kind() == std::io::ErrorKind::InvalidInput
+                && io.to_string().starts_with("duplicate transfer root names") =>
+        {
+            Some(io)
+        }
+        _ => None,
+    }
+}
+
 // Options arrive flat from clap; grouping them into a struct here would only
 // mirror the enum variant one-to-one (same allowance as the engine drivers).
 #[allow(clippy::too_many_arguments)]
@@ -1379,31 +1537,45 @@ async fn send_command(
     port: u16,
     conflict: String,
     multistream: bool,
+    no_internet: bool,
     timeout: u64,
 ) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
-    let pinned = parse_fingerprint(&fp_text)?;
-    let Some(first) = paths.first() else {
-        bail!("send needs exactly one file or one directory per run in this prototype");
-    };
-    let root = first
-        .canonicalize()
-        .with_context(|| first.display().to_string())?;
+    let pinned = resolve_fingerprint_arg(&fp_text, &peer_book_path(id))?;
+    let (root, extras) = send_roots(&paths)?;
     println!(
-        "sending to peer {} (its pairing code must be {})",
+        "sending {} path(s) to peer {} (its pairing code must be {})",
+        1 + extras.len(),
         pinned.short_id(),
         ak_identity::pairing_code(&pinned)
     );
     let mut spec = SendSpec::new(root, to, pinned, bundle);
+    for extra in extras {
+        spec.add_root(extra);
+    }
     spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
     spec.conflict = conflict_policy(&conflict)?;
     spec.checkpoint_dir = checkpoint_dir(id);
     spec.device_name = whoami();
     spec.idle_timeout = idle_timeout_from_secs(timeout);
     spec.multistream = multistream;
+    spec.policy.allow_internet = !no_internet;
     let _ = key;
     let printer = progress_printer("send");
-    let report = ak_engine::send(spec, &*printer).await?;
+    let report = match ak_engine::send(spec, &*printer).await {
+        Ok(report) => report,
+        Err(err) => {
+            if let Some(io) = duplicate_roots_error(&err) {
+                bail!("two paths have the same name: please send them in separate runs ({io})");
+            }
+            // Friendly copy for the common failure shapes; the hint rides as
+            // an anyhow context so the original error chain stays visible.
+            if let Some(hint) = errors::friendly_send_hint(&err) {
+                return Err(anyhow::Error::from(err).context(hint));
+            }
+            return Err(err.into());
+        }
+    };
     report_summary(&report);
     // TOFU: remember a successfully reached receiver.
     if record_peer_after_send(id, &pinned)? {
@@ -1520,8 +1692,11 @@ async fn main() -> Result<()> {
             expect,
             conflict,
             once,
+            no_internet,
             timeout,
-        } => receive_command(&id, out, port, expect, conflict, once, timeout).await,
+        } => {
+            receive_command(&id, out, port, expect, conflict, once, no_internet, timeout).await
+        }
         Command::Send {
             paths,
             to,
@@ -1529,10 +1704,19 @@ async fn main() -> Result<()> {
             port,
             conflict,
             multistream,
+            no_internet,
             timeout,
-        } => send_command(&id, paths, to, fp, port, conflict, multistream, timeout).await,
+        } => {
+            send_command(&id, paths, to, fp, port, conflict, multistream, no_internet, timeout)
+                .await
+        }
         Command::Discover { seconds, json } => discover_command(&id, seconds, json).await,
         Command::Jobs { cmd } => jobs_command(&id, cmd),
+        Command::Doctor {
+            stun,
+            mdns_seconds,
+            json,
+        } => doctor::doctor_command(&id, stun, mdns_seconds, json).await,
         Command::SignalServer {
             tcp_port,
             stun_port,
@@ -1574,7 +1758,7 @@ fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn whoami() -> String {
+pub(crate) fn whoami() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "ak-device".into())
@@ -1639,6 +1823,7 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
     // 4. Exchange signals until we see the peer's candidates, then punch.
     let mut peer_candidates: Vec<SocketAddr> = Vec::new();
     let mut reachable: Option<SocketAddr> = None;
+    let mut same_egress = OnceNotice::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     'signal: while Instant::now() < deadline {
         let message = tokio::time::timeout(Duration::from_secs(5), client.next()).await??;
@@ -1673,6 +1858,12 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
                     if let Some(first) = report.reachable.first() {
                         reachable = Some(*first);
                         break 'signal;
+                    }
+                }
+                ak_signal::codec::PeerSignal::SameEgress => {
+                    // The server may repeat the hint; announce it once.
+                    if let Some(text) = same_egress.take() {
+                        println!("{text}");
                     }
                 }
                 other => println!("signal: {other:?}"),
@@ -1815,36 +2006,38 @@ mod tests {
 
     #[test]
     fn expect_policy_parses_all_forms() {
+        let dir = TempDir::new("expect-forms");
+        let book_path = dir.path().join("peers.book");
         let fp = random_fp();
         assert!(matches!(
-            ExpectPolicy::parse("any").unwrap(),
+            ExpectPolicy::parse("any", &book_path).unwrap(),
             ExpectPolicy::Any
         ));
         assert!(matches!(
-            ExpectPolicy::parse("ANY").unwrap(),
+            ExpectPolicy::parse("ANY", &book_path).unwrap(),
             ExpectPolicy::Any
         ));
         assert!(matches!(
-            ExpectPolicy::parse(&fp.to_hex()).unwrap(),
+            ExpectPolicy::parse(&fp.to_hex(), &book_path).unwrap(),
             ExpectPolicy::Pinned(parsed) if parsed == fp
         ));
         assert!(matches!(
-            ExpectPolicy::parse("123-456").unwrap(),
+            ExpectPolicy::parse("123-456", &book_path).unwrap(),
             ExpectPolicy::PairingCode(code) if code == "123-456"
         ));
         assert!(matches!(
-            ExpectPolicy::parse(" 123 456 ").unwrap(),
+            ExpectPolicy::parse(" 123 456 ", &book_path).unwrap(),
             ExpectPolicy::PairingCode(_)
         ));
         // Separator placement is lenient (ak-identity filters separators);
         // "123-45-6" means the same code as "123456".
         assert!(matches!(
-            ExpectPolicy::parse("123-45-6").unwrap(),
+            ExpectPolicy::parse("123-45-6", &book_path).unwrap(),
             ExpectPolicy::PairingCode(code) if code == "123-45-6"
         ));
         for junk in ["junk", "", "12345", "1234567", "12a456", &"x".repeat(63)] {
             assert!(
-                ExpectPolicy::parse(junk).is_err(),
+                ExpectPolicy::parse(junk, &book_path).is_err(),
                 "unexpectedly accepted {junk:?}"
             );
         }
@@ -1852,19 +2045,40 @@ mod tests {
 
     #[test]
     fn expect_policy_allows_only_matching_peers() {
+        let dir = TempDir::new("expect-allows");
+        let book_path = dir.path().join("peers.book");
         let pinned = random_fp();
         let stranger = random_fp();
-        let policy = ExpectPolicy::parse(&pinned.to_hex()).unwrap();
+        let policy = ExpectPolicy::parse(&pinned.to_hex(), &book_path).unwrap();
         assert!(policy.allows(&pinned));
         assert!(!policy.allows(&stranger));
 
-        let any = ExpectPolicy::parse("any").unwrap();
+        let any = ExpectPolicy::parse("any", &book_path).unwrap();
         assert!(any.allows(&pinned) && any.allows(&stranger));
 
         let code = ak_identity::pairing_code(&pinned);
-        let policy = ExpectPolicy::parse(&code).unwrap();
+        let policy = ExpectPolicy::parse(&code, &book_path).unwrap();
         assert!(policy.allows(&pinned));
         assert!(!policy.allows(&stranger));
+    }
+
+    #[test]
+    fn expect_policy_completes_unique_book_prefix() {
+        let dir = TempDir::new("expect-prefix");
+        let book_path = dir.path().join("peers.book");
+        let pinned = random_fp();
+        let mut book = PeerBook::default();
+        upsert_peer(&mut book, &pinned, Some("laptop"));
+        book.save(&book_path).unwrap();
+
+        // A unique prefix pins the same peer as the full fingerprint.
+        let policy = ExpectPolicy::parse(&pinned.to_hex()[..12], &book_path).unwrap();
+        assert!(matches!(
+            policy,
+            ExpectPolicy::Pinned(parsed) if parsed == pinned
+        ));
+        assert!(policy.allows(&pinned));
+        assert!(!policy.allows(&random_fp()));
     }
 
     #[test]
@@ -1914,6 +2128,250 @@ mod tests {
             resolve_expect(Some("any"), &book_path).unwrap(),
             ExpectPolicy::Any
         ));
+    }
+
+    // -- fingerprint prefix resolution ---------------------------------------
+
+    /// Deterministic fingerprint with a controlled hex head (first 4 bytes)
+    /// and a distinguishing tail byte, for prefix-collision tests.
+    fn fp_with_head(head: [u8; 4], tail: u8) -> Fingerprint {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&head);
+        bytes[31] = tail;
+        Fingerprint::from_bytes(bytes)
+    }
+
+    #[test]
+    fn resolve_fingerprint_arg_completes_unique_prefix() {
+        let dir = TempDir::new("fp-unique");
+        let book_path = dir.path().join("peers.book");
+        let a = fp_with_head([0xab, 0xcd, 0xef, 0x01], 0x11); // hex head abcdef01
+        let b = fp_with_head([0x12, 0x34, 0x56, 0x78], 0x22); // hex head 12345678
+        let mut book = PeerBook::default();
+        upsert_peer(&mut book, &a, Some("alpha"));
+        upsert_peer(&mut book, &b, Some("beta"));
+        book.save(&book_path).unwrap();
+
+        // Minimum length (8), longer, and uppercase input all complete.
+        assert_eq!(resolve_fingerprint_arg("abcdef01", &book_path).unwrap(), a);
+        assert_eq!(
+            resolve_fingerprint_arg(&a.to_hex()[..16], &book_path).unwrap(),
+            a
+        );
+        assert_eq!(
+            resolve_fingerprint_arg(&b.to_hex()[..20].to_uppercase(), &book_path).unwrap(),
+            b
+        );
+        // Whitespace is trimmed like everywhere else.
+        assert_eq!(
+            resolve_fingerprint_arg(" 12345678 ", &book_path).unwrap(),
+            b
+        );
+    }
+
+    #[test]
+    fn resolve_fingerprint_arg_rejects_ambiguous_and_unknown_prefixes() {
+        let dir = TempDir::new("fp-ambiguous");
+        let book_path = dir.path().join("peers.book");
+        let a = fp_with_head([0xab, 0xcd, 0xef, 0x01], 0x11);
+        let b = fp_with_head([0xab, 0xcd, 0xef, 0x01], 0x33); // same head
+        let mut book = PeerBook::default();
+        upsert_peer(&mut book, &a, Some("alpha"));
+        upsert_peer(&mut book, &b, Some("beta"));
+        book.save(&book_path).unwrap();
+
+        let ambiguous = resolve_fingerprint_arg("abcdef01", &book_path)
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(ambiguous.contains("matches 2 peers"), "{ambiguous}");
+        // A longer prefix disambiguates again (tails differ at hex char 62+).
+        assert_eq!(
+            resolve_fingerprint_arg(&a.to_hex()[..63], &book_path).unwrap(),
+            a
+        );
+
+        let unknown = resolve_fingerprint_arg("ffffffffff", &book_path)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("not found in the peer book"), "{unknown}");
+        assert!(
+            unknown.contains("needs the full 64-hex fingerprint"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn resolve_fingerprint_arg_full_value_skips_the_book() {
+        let dir = TempDir::new("fp-full");
+        // No peers.book exists in this directory at all.
+        let book_path = dir.path().join("peers.book");
+        let fp = random_fp();
+        assert_eq!(
+            resolve_fingerprint_arg(&fp.to_hex(), &book_path).unwrap(),
+            fp
+        );
+        assert!(resolve_fingerprint_arg(&fp.to_hex()[..63], &book_path).is_err());
+
+        // Malformed shapes keep their explicit errors.
+        for bad in ["nope", "", "abcd", &"a".repeat(65), &"z".repeat(64)] {
+            assert!(
+                resolve_fingerprint_arg(bad, &book_path).is_err(),
+                "unexpectedly accepted {bad:?}"
+            );
+        }
+        let short = resolve_fingerprint_arg("abcdef0", &book_path)
+            .unwrap_err()
+            .to_string();
+        assert!(short.contains("8 to 63"), "{short}");
+    }
+
+    #[test]
+    fn pair_remove_accepts_unique_prefix() {
+        let dir = TempDir::new("pair-rm-prefix");
+        let fp = random_fp();
+        pair_add(dir.path(), &fp.to_hex(), Some("laptop")).unwrap();
+        // A unique 8-char prefix removes the entry.
+        let removed = pair_remove(dir.path(), &fp.to_hex()[..8]).unwrap();
+        assert_eq!(removed, fp);
+        // Afterwards the prefix matches nothing.
+        let err = pair_remove(dir.path(), &fp.to_hex()[..8])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found in the peer book"), "{err}");
+    }
+
+    // -- multi-path send ------------------------------------------------------
+
+    #[test]
+    fn send_roots_keeps_primary_and_extra_order() {
+        let dir = TempDir::new("send-roots");
+        let file1 = dir.path().join("file1.bin");
+        let file2 = dir.path().join("file2.bin");
+        let sub = dir.path().join("dir1");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&file1, b"one").unwrap();
+        std::fs::write(&file2, b"two").unwrap();
+
+        let (primary, extras) = send_roots(&[file1.clone(), file2.clone(), sub.clone()]).unwrap();
+        assert_eq!(primary, file1.canonicalize().unwrap());
+        assert_eq!(
+            extras,
+            vec![file2.canonicalize().unwrap(), sub.canonicalize().unwrap()]
+        );
+
+        // Single path: primary only, no extras. No path: explicit error.
+        let (primary, extras) = send_roots(&[file1]).unwrap();
+        assert!(extras.is_empty());
+        assert_eq!(
+            primary,
+            dir.path().join("file1.bin").canonicalize().unwrap()
+        );
+        assert!(send_roots(&[]).is_err());
+        // A missing path fails naming the path.
+        let err = send_roots(&[dir.path().join("missing.bin")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing.bin"), "{err}");
+    }
+
+    #[test]
+    fn send_spec_extra_roots_follow_add_root_order() {
+        let dir = TempDir::new("send-spec-order");
+        let file1 = dir.path().join("file1.bin");
+        let file2 = dir.path().join("file2.bin");
+        let sub = dir.path().join("dir1");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&file1, b"1").unwrap();
+        std::fs::write(&file2, b"2").unwrap();
+
+        let (primary, extras) = send_roots(&[file1, file2, sub]).unwrap();
+        let key = DeviceKeyPair::generate();
+        let bundle = ak_identity::tls::make_self_signed(&key);
+        let mut spec = SendSpec::new(
+            primary.clone(),
+            "127.0.0.1:7100".parse().unwrap(),
+            key.fingerprint(),
+            bundle,
+        );
+        for extra in extras {
+            spec.add_root(extra);
+        }
+        assert_eq!(spec.source_root, primary);
+        assert_eq!(spec.extra_roots.len(), 2);
+        // add_root order must survive: file2 first, then dir1.
+        assert!(spec.extra_roots[0].ends_with("file2.bin"));
+        assert!(spec.extra_roots[1].ends_with("dir1"));
+    }
+
+    #[test]
+    fn send_args_accept_multiple_paths_in_order() {
+        let fp = "a".repeat(64);
+        let cli = cli_of(&[
+            "send",
+            "file1.bin",
+            "file2.bin",
+            "dir1",
+            "--to",
+            "127.0.0.1:7100",
+            "--fp",
+            &fp,
+        ]);
+        let Command::Send { paths, .. } = cli.command else {
+            panic!("expected send subcommand");
+        };
+        let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(names, vec!["file1.bin", "file2.bin", "dir1"]);
+    }
+
+    #[test]
+    fn duplicate_roots_error_is_recognized_for_a_friendly_hint() {
+        let dup = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "duplicate transfer root names: [photos, photos]",
+        ));
+        let io = duplicate_roots_error(&dup).expect("duplicate recognized");
+        assert!(io.to_string().contains("photos"));
+
+        // Other InvalidInput messages and other kinds are not misdetected.
+        let bad_name = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "root name not usable as a transfer directory name: \"com1\"",
+        ));
+        assert!(duplicate_roots_error(&bad_name).is_none());
+        let not_found = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "duplicate transfer root names: [x]",
+        ));
+        assert!(duplicate_roots_error(&not_found).is_none());
+    }
+
+    #[test]
+    fn roots_line_joins_report_roots_and_hides_when_empty() {
+        let report = |roots: Vec<&str>| Report {
+            job_id: [0u8; 16],
+            files: 3,
+            bytes: 10,
+            duration: Duration::from_millis(1),
+            resumed_chunks: 0,
+            peer_fingerprint: Some("ab".repeat(32)),
+            roots: roots.into_iter().map(str::to_owned).collect(),
+        };
+        assert_eq!(roots_line(&report(Vec::new())), None);
+        assert_eq!(
+            roots_line(&report(vec!["file1.bin", "file2.bin", "dir1"])),
+            Some("roots: file1.bin, file2.bin, dir1".to_owned())
+        );
+    }
+
+    // -- probe same-egress notice ---------------------------------------------
+
+    #[test]
+    fn same_egress_notice_fires_exactly_once() {
+        let mut notice = OnceNotice::new();
+        assert_eq!(notice.take(), Some(SAME_EGRESS_NOTICE));
+        assert_eq!(notice.take(), None);
+        assert_eq!(notice.take(), None);
     }
 
     // -- pair book round trip ------------------------------------------------
@@ -2152,16 +2610,19 @@ mod tests {
                 addr: "192.168.1.9:7100".parse().expect("addr"),
                 fingerprint: Some(peer),
                 source: ak_discovery::CandidateSource::Mdns,
+                device_name: None,
             },
             ak_discovery::PeerCandidate {
                 addr: "192.168.1.10:7100".parse().expect("addr"),
                 fingerprint: Some(random_fp()),
                 source: ak_discovery::CandidateSource::Mdns,
+                device_name: None,
             },
             ak_discovery::PeerCandidate {
                 addr: "192.168.1.11:7100".parse().expect("addr"),
                 fingerprint: None,
                 source: ak_discovery::CandidateSource::Manual,
+                device_name: None,
             },
         ];
         let json = discover_json(&candidates, &book);
@@ -2236,6 +2697,59 @@ mod tests {
             vec!["bench", "--files", "0"],
             vec!["bench", "--chunk-kb", "0"],
             vec!["bench", "--chunk-kb", "8193"], // above the engine decode budget
+        ] {
+            let mut argv = vec!["ak-cli"];
+            argv.extend_from_slice(&bad);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "unexpectedly accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_args_defaults_overrides_and_ranges() {
+        // Defaults: STUN skipped, 3s mDNS window, text output.
+        let cli = cli_of(&["doctor"]);
+        let Command::Doctor {
+            stun,
+            mdns_seconds,
+            json,
+        } = cli.command
+        else {
+            panic!("expected doctor subcommand");
+        };
+        assert_eq!(stun, None);
+        assert_eq!(mdns_seconds, 3);
+        assert!(!json);
+
+        // Explicit server, window and JSON output.
+        let cli = cli_of(&[
+            "doctor",
+            "--stun",
+            "127.0.0.1:3478",
+            "--mdns-seconds",
+            "1",
+            "--json",
+        ]);
+        let Command::Doctor {
+            stun,
+            mdns_seconds,
+            json,
+        } = cli.command
+        else {
+            panic!("expected doctor subcommand");
+        };
+        assert_eq!(stun, Some("127.0.0.1:3478".parse().expect("stun addr")));
+        assert_eq!(mdns_seconds, 1);
+        assert!(json);
+
+        // The mDNS window is bounded on both ends; malformed servers reject.
+        for bad in [
+            vec!["doctor", "--mdns-seconds", "0"],
+            vec!["doctor", "--mdns-seconds", "31"],
+            vec!["doctor", "--stun", "not-an-addr"],
+            vec!["doctor", "--stun", "127.0.0.1"],
         ] {
             let mut argv = vec!["ak-cli"];
             argv.extend_from_slice(&bad);

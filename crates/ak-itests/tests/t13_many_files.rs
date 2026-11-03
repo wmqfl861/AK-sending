@@ -266,3 +266,15 @@ async fn twenty_thousand_files_release_scale_run() {
     let built = build_many_files(base.path(), 20_000, 400, 200, 0x713_0014_0000);
     run_scale_run(base.path(), built.files as u64, 3_600, "T13-20000").await;
 }
+
+/// Boundary just above the per-frame ResumeRequest cap (65,535 entries):
+/// since the 2026-11-03 paged exchange the surplus entries must arrive in a
+/// second frame and the transfer must complete. 1-byte flat files keep the
+/// run about per-entry overhead, not payload volume.
+#[tokio::test]
+#[ignore = "65,537-file boundary run; release only"]
+async fn sixty_five_thousand_five_hundred_thirty_seven_files_release_boundary_run() {
+    let base = tempfile::tempdir().unwrap();
+    build_flat(base.path(), 65_537);
+    run_scale_run(base.path(), 65_537, 10_800, "T13-65537").await;
+}

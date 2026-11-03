@@ -30,6 +30,9 @@ fn candidate(addr_text: &str, source: CandidateSource) -> PeerCandidate {
         addr: addr_text.parse().expect("test candidate address"),
         fingerprint: None,
         source,
+        // Display-only metadata added to the public struct later; ranking
+        // tests deliberately exercise the unnamed-peer shape.
+        device_name: None,
     }
 }
 

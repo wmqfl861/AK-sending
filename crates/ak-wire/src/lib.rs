@@ -32,7 +32,7 @@
 //! | ManifestPage | 5 | job_id 16B, page_index u32, last_page bool, entries vec\<WireEntry\> |
 //! | Chunk | 6 | job_id 16B, file_index u32, chunk_index u64, data_len u32, data |
 //! | ChunkAck | 7 | job_id 16B, file_index u32, chunk_index u64 |
-//! | ResumeRequest | 8 | job_id 16B, files vec\<ResumeEntry\> |
+//! | ResumeRequest | 8 | job_id 16B, files vec\<ResumeEntry\>, more bool |
 //! | Control | 9 | job_id 16B, tag u8 |
 //! | Finalize | 10 | job_id 16B |
 //! | FinalAck | 11 | job_id 16B, verified bool |
@@ -62,12 +62,14 @@ pub const CAP_PAUSE_RESUME: u16 = 0x0002;
 /// Capability bit: parallel per-file QUIC streams are supported.
 pub const CAP_MULTISTREAM: u16 = 0x0004;
 
-/// Default ceiling for resume entries in one ResumeRequest frame. The
-/// receiver answers with one frame covering every non-directory entry, so
-/// this must not be smaller than the largest job the engine supports. At
-/// `u16::MAX` (65,535 entries) the worst-case payload is 20 + 12 × 65,535
-/// ≈ 768 KiB, comfortably below [`MAX_FRAME_BYTES`], and decode still
-/// validates the budget before allocating.
+/// Per-frame ceiling for resume entries in one ResumeRequest frame. The
+/// receiver shards its resume answer into consecutive frames of at most
+/// `limits.max_resume_entries` entries each — `more = true` on every frame
+/// but the last, which carries `more = false` — so the per-job entry count
+/// is no longer bounded by what fits in a single frame. At `u16::MAX`
+/// (65,535 entries) the worst-case payload is 21 + 12 × 65,535 ≈ 768 KiB,
+/// comfortably below [`MAX_FRAME_BYTES`], and decode still validates the
+/// budget before allocating.
 pub const MAX_RESUME_ENTRIES: u16 = u16::MAX;
 
 /// Message type value for [`Message::Hello`].
@@ -253,6 +255,10 @@ pub enum Message {
     ResumeRequest {
         job_id: JobId,
         files: Vec<ResumeEntry>,
+        /// More resume frames follow this one; the final frame of the
+        /// exchange carries `false`. The receiver shards by
+        /// `Limits::max_resume_entries`.
+        more: bool,
     },
     Control {
         job_id: JobId,
@@ -441,8 +447,8 @@ fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
         TYPE_CHUNK => 32 + u64::from(limits.max_chunk_bytes),
         // job_id(16) + file_index(4) + chunk_index(8).
         TYPE_CHUNK_ACK => 28,
-        // job_id(16) + count(4) + 12 bytes per resume entry.
-        TYPE_RESUME_REQUEST => 20 + 12 * u64::from(limits.max_resume_entries),
+        // job_id(16) + count(4) + 12 bytes per resume entry + more flag(1).
+        TYPE_RESUME_REQUEST => 21 + 12 * u64::from(limits.max_resume_entries),
         // job_id(16) + tag/bool(1).
         TYPE_CONTROL | TYPE_FINAL_ACK => 17,
         TYPE_FINALIZE => 16,
@@ -570,13 +576,18 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             put_u32(out, *file_index);
             put_u64(out, *chunk_index);
         }
-        Message::ResumeRequest { job_id, files } => {
+        Message::ResumeRequest {
+            job_id,
+            files,
+            more,
+        } => {
             out.extend_from_slice(job_id);
             put_len32(out, files.len());
             for file in files {
                 put_u32(out, file.file_index);
                 put_u64(out, file.verified_prefix_chunks);
             }
+            put_bool(out, *more);
         }
         Message::Control { job_id, control } => {
             out.extend_from_slice(job_id);
@@ -819,7 +830,11 @@ fn decode_message(
                     verified_prefix_chunks: cursor.u64()?,
                 });
             }
-            Message::ResumeRequest { job_id, files }
+            Message::ResumeRequest {
+                job_id,
+                files,
+                more: cursor.boolean()?,
+            }
         }
         TYPE_CONTROL => {
             let job_id: JobId = cursor.array::<16>()?;
@@ -1109,6 +1124,7 @@ mod tests {
         assert_round_trips(Message::ResumeRequest {
             job_id: [2; 16],
             files: Vec::new(),
+            more: false,
         });
         assert_round_trips(Message::ResumeRequest {
             job_id: [2; 16],
@@ -1122,6 +1138,7 @@ mod tests {
                     verified_prefix_chunks: 0,
                 },
             ],
+            more: true,
         });
     }
 
@@ -1134,14 +1151,16 @@ mod tests {
                 verified_prefix_chunks: u64::from(i),
             })
             .collect();
+        // A full shard that announces a following frame: the worst case.
         let message = Message::ResumeRequest {
             job_id: [9; 16],
             files,
+            more: true,
         };
         let buf = encoded(&message);
         assert_eq!(
             buf.len(),
-            HEADER_LEN + 20 + 12 * limits.max_resume_entries as usize
+            HEADER_LEN + 21 + 12 * limits.max_resume_entries as usize
         );
         assert_eq!(Frame::decode(&buf, &limits).unwrap().message, message);
     }
@@ -1269,6 +1288,7 @@ mod tests {
                     file_index: 0,
                     verified_prefix_chunks: 1,
                 }],
+                more: false,
             },
             Message::Control {
                 job_id: [1; 16],
@@ -1550,6 +1570,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0u8; 16]); // job_id
         payload.extend_from_slice(&over.to_be_bytes()); // count > limit
+        payload.push(1); // more
         let buf = frame_of(TYPE_RESUME_REQUEST, &payload);
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
@@ -1595,6 +1616,17 @@ mod tests {
         payload.push(0xFF);
         payload.extend_from_slice(&0u32.to_be_bytes());
         let buf = frame_of(TYPE_MANIFEST_PAGE, &payload);
+        assert!(matches!(
+            Frame::decode(&buf, &Limits::default()),
+            Err(DecodeError::Malformed(_))
+        ));
+
+        // ResumeRequest.more = 2.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&0u32.to_be_bytes()); // files count
+        payload.push(2);
+        let buf = frame_of(TYPE_RESUME_REQUEST, &payload);
         assert!(matches!(
             Frame::decode(&buf, &Limits::default()),
             Err(DecodeError::Malformed(_))
@@ -1725,7 +1757,11 @@ mod tests {
                         verified_prefix_chunks: r.next_u64(),
                     });
                 }
-                Message::ResumeRequest { job_id: job, files }
+                Message::ResumeRequest {
+                    job_id: job,
+                    files,
+                    more: r.byte().is_multiple_of(2),
+                }
             }
             8 => Message::Control {
                 job_id: job,

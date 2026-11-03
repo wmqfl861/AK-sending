@@ -16,6 +16,7 @@
   - 协调面信令服务器/客户端 + 最小 STUN（封闭消息集、限频、会话 TTL，无文件路由，测试锁定）；
   - 命令行（keygen/receive/send/discover/signal-server/probe，公网直连探测工具）。
 - 已实际执行并通过：workspace 242 项 Rust 测试、clippy `-D warnings`、仓库检查与 12 项 Python 测试；5 GiB 稀疏文件 release 环回传输（74 秒，u64 偏移）；真实双进程 CLI 环回传输逐字节一致。证据见 [开发验证记录](reports/dev-validation-2026-11-02.txt)。
+- 2026-11-03（第四轮，同分支）：ResumeRequest 多帧分页解除单任务条目上限（65,537 文件 release 实测）、SQLite 检查点可选后端（特性 sqlite，默认依赖图零泄漏）、连接统计 API（tx/rx 字节/帧数/丢包，无中继运行时旁证）、T06 身份替换与 T08 端口变更重钉扎续传场景自动化。第四轮后 workspace 338 项测试通过（含 sqlite 特性 +23）、clippy 双配置全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第四轮节。
 - 仍未完成（如实标注）：跨机器/跨网段真实传输、NAT 穿透实测、抓包级无中继证明（L3）、Flutter 五端 UI、移动原生适配、真机验收。当前全部验证为本机环回（L2 形态）。
 - 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
@@ -61,16 +62,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 命令行原型（局域网，环回或同网段两台机器）：
 
 ```sh
-cargo run -p ak-cli -- keygen            # 生成本机密钥并显示 device id/指纹/配对码
-cargo run -p ak-cli -- pair add <64hex> --name NAME   # 配对簿：添加对端
-cargo run -p ak-cli -- pair list | pair remove <64hex>
-cargo run -p ak-cli -- receive --out DIR --port 7100  # 接收端（默认仅接受已配对指纹，循环接单）
-cargo run -p ak-cli -- send PATH --to IP:7100 --fp <接收端指纹> [--multistream]
-cargo run -p ak-cli -- jobs | jobs clean --completed  # 传输检查点查看/清理
-cargo run -p ak-cli -- discover [--json]  # mDNS 发现（带配对状态）
-cargo run -p ak-cli -- signal-server      # 协调服务器（信令+STUN，无文件路由）
-cargo run -p ak-cli -- probe --server IP:7100 --peer <对端 device id>  # 公网直连探测
-cargo run -p ak-cli -- bench              # 进程内环回吞吐基准（单流 vs 多流）
+cargo run -p ak-cli -- keygen            # 生成本机密钥并显示 device id/指纹/配对码（fingerprint 子命令同输出）
+cargo run -p ak-cli -- pair code         # 显示本机指纹与 6 位配对码（在对端设备上配对时引用）
+cargo run -p ak-cli -- pair add <64hex> --name NAME   # 配对簿：添加/改名对端
+cargo run -p ak-cli -- pair list | pair remove <64hex|唯一前缀>
+cargo run -p ak-cli -- receive --out DIR --port 7100 [--expect any|指纹|唯一前缀|配对码] [--once] [--conflict error|rename] [--timeout 30]  # 接收端（默认仅接受配对簿内指纹，循环接单）
+cargo run -p ak-cli -- send PATH [PATH...] --to IP:7100 --fp <完整指纹|唯一前缀> [--multistream] [--conflict error|rename] [--timeout 30]  # 多路径同任务，成功后 TOFU 记入配对簿
+cargo run -p ak-cli -- jobs [list] | jobs clean --all|--completed  # 检查点记录查看/清理（.akpart 分片永不删除，保持可续传）
+cargo run -p ak-cli -- discover [--seconds N] [--json]  # mDNS 发现（带配对状态与设备名）
+cargo run -p ak-cli -- signal-server [--tcp-port 7100] [--stun-port 7101]  # 协调服务器（信令+STUN，无文件路由）
+cargo run -p ak-cli -- probe --server IP:7100 --peer <对端指纹64hex> [--no-stun]  # 公网直连探测（STUN 隐含使用 server 端口+1）
+cargo run -p ak-cli -- bench [--bytes N] [--files N] [--chunk-kb N] [--multistream] [--once] [--json]  # 进程内环回吞吐基准（默认单流 vs 多流各一轮并对比）
+cargo run -p ak-cli -- doctor            # 环境诊断（开发中）
 ```
 
 首次初始化空仓库可使用 [发布说明](docs/PUBLISHING.zh-CN.md) 及 `scripts/publish.ps1`；脚本不包含凭据、不强推，也不处理已有提交的仓库。

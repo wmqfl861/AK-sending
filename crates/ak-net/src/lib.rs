@@ -8,6 +8,20 @@
 //!
 //! No relay exists in this stack: one UDP socket talks to one peer address;
 //! there is no fallback transport and no server data path.
+//!
+//! # Known limitations
+//!
+//! - [`ChannelStats`] byte counts are the QUIC bytes carried inside UDP
+//!   datagrams (quinn's `udp_tx`/`udp_rx`); UDP and IP header overhead is
+//!   not included, so they read lower than the on-wire byte count.
+//! - `ChannelStats::lost_packets` comes from quinn's internal loss
+//!   detection (retransmission-timeout and probe inference), not from wire
+//!   observation; treat it as a transport-health signal, not ground truth.
+//! - quinn never increments the transmitted-side counter for
+//!   CONNECTION_CLOSE frames, so `tx_frames` can read one lower than the
+//!   peer's `rx_frames` once a connection has closed (see
+//!   [`ChannelStats`] docs).
+//!
 #![forbid(unsafe_code)]
 
 mod tls;
@@ -282,6 +296,21 @@ impl DirectEndpoint {
             path,
         })
     }
+
+    /// [`Self::accept`] bounded by an overall deadline: returns
+    /// [`ConnectError::Timeout(timeout)`] when no authorized peer arrives in
+    /// time. Probe or engine code that coordinates a hole-punch window can
+    /// use this instead of hand-rolling a timeout around `accept`.
+    pub async fn accept_within(
+        &self,
+        authorize: &(dyn Fn(&Fingerprint) -> bool + Send + Sync),
+        timeout: Duration,
+    ) -> Result<DirectChannel, ConnectError> {
+        match tokio::time::timeout(timeout, self.accept(authorize)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConnectError::Timeout(timeout)),
+        }
+    }
 }
 
 /// Extract and verify the peer certificate chain from an established QUIC
@@ -311,6 +340,71 @@ fn handshake_error(err: quinn::ConnectionError) -> ConnectError {
     } else {
         ConnectError::Transport(text)
     }
+}
+
+/// Transport-level counters for one direct channel, extracted from quinn's
+/// `Connection::stats()`.
+///
+/// Field mapping (quinn 0.11 `ConnectionStats`):
+///
+/// | field | quinn source |
+/// |---|---|
+/// | `tx_bytes` / `rx_bytes` | `udp_tx.bytes` / `udp_rx.bytes` — total QUIC bytes inside sent/received UDP datagrams |
+/// | `tx_frames` / `rx_frames` | sum of every counter in `frame_tx` / `frame_rx` — all QUIC frame types |
+/// | `lost_packets` | `path.lost_packets` — packets declared lost by the transport |
+///
+/// Byte counts exclude UDP/IP header overhead (see the crate-level known
+/// limitations). Frame totals follow quinn's accounting quirks: PADDING is
+/// never counted and CONNECTION_CLOSE is only counted on the receive side,
+/// so after a close `tx_frames` may be one lower than the peer's `rx_frames`.
+///
+/// Operational use: compare these data-plane counters against the control
+/// plane's session records. A transfer that completed here with only
+/// loopback/local bytes on the QUIC channel is runtime evidence that the
+/// server never carried file data — corroborating, not proving, the
+/// no-relay architecture (it is not a cryptographic proof).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelStats {
+    /// QUIC payload bytes sent inside UDP datagrams.
+    pub tx_bytes: u64,
+    /// QUIC payload bytes received inside UDP datagrams.
+    pub rx_bytes: u64,
+    /// Frames of all QUIC types transmitted.
+    pub tx_frames: u64,
+    /// Frames of all QUIC types received.
+    pub rx_frames: u64,
+    /// Packets quinn's loss detection declared lost on the current path.
+    pub lost_packets: u64,
+}
+
+/// Sum every per-type counter of quinn's `FrameStats` into one frame total.
+/// `FrameStats` is `#[non_exhaustive]`, so frame types added by future quinn
+/// versions would not appear here (compile-time safe, just not counted).
+fn total_frames(frames: &quinn::FrameStats) -> u64 {
+    frames.acks
+        + frames.ack_frequency
+        + frames.crypto
+        + frames.connection_close
+        + frames.data_blocked
+        + frames.datagram
+        + u64::from(frames.handshake_done)
+        + frames.immediate_ack
+        + frames.max_data
+        + frames.max_stream_data
+        + frames.max_streams_bidi
+        + frames.max_streams_uni
+        + frames.new_connection_id
+        + frames.new_token
+        + frames.path_challenge
+        + frames.path_response
+        + frames.ping
+        + frames.reset_stream
+        + frames.retire_connection_id
+        + frames.stream_data_blocked
+        + frames.streams_blocked_bidi
+        + frames.streams_blocked_uni
+        + frames.stop_sending
+        + frames.stream
 }
 
 /// An authenticated direct connection. Constructible only by this crate after
@@ -359,6 +453,25 @@ impl DirectChannel {
     /// queryable after close and adds no signal here.
     pub fn healthy(&self) -> bool {
         self.conn.close_reason().is_none()
+    }
+
+    /// Snapshot of this channel's transport counters (see [`ChannelStats`]
+    /// for the exact quinn field mapping and its limits).
+    ///
+    /// Runtime-evidence use: after a transfer, operators can compare the
+    /// data-plane bytes on this channel against the control plane's session
+    /// records — bytes flowing only over this peer-to-peer QUIC connection
+    /// corroborate that the server did not carry the file. This is an
+    /// operational observation, not a cryptographic proof.
+    pub fn stats(&self) -> ChannelStats {
+        let stats = self.conn.stats();
+        ChannelStats {
+            tx_bytes: stats.udp_tx.bytes,
+            rx_bytes: stats.udp_rx.bytes,
+            tx_frames: total_frames(&stats.frame_tx),
+            rx_frames: total_frames(&stats.frame_rx),
+            lost_packets: stats.path.lost_packets,
+        }
     }
 }
 
@@ -1089,6 +1202,200 @@ mod tests {
             .await
             .expect("server recv_frame");
         assert_eq!(decoded, frame);
+    }
+
+    // ------------------------------------------------------------------
+    // stats / accept_within
+    // ------------------------------------------------------------------
+
+    /// Poll until both directions reach frame parity (every frame one side
+    /// transmitted has been received and counted by the peer) or the attempt
+    /// budget runs out; returns the last sample either way. Loopback delivery
+    /// is lossless, so parity is the quiescent fixed point; trailing ACKs
+    /// take a few ack-delay periods to drain, hence the polling.
+    async fn sample_at_parity(
+        client: &DirectChannel,
+        server: &DirectChannel,
+    ) -> (ChannelStats, ChannelStats) {
+        let mut last = (client.stats(), server.stats());
+        for _ in 0..100 {
+            let candidate = (client.stats(), server.stats());
+            let (c, s) = candidate;
+            if c.tx_frames == s.rx_frames && s.tx_frames == c.rx_frames {
+                // Require stability across one more period so a packet in
+                // flight cannot fake parity.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let (c2, s2) = (client.stats(), server.stats());
+                if c2.tx_frames == s2.rx_frames && s2.tx_frames == c2.rx_frames {
+                    return (c2, s2);
+                }
+            }
+            last = candidate;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        last
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stats_reflect_real_loopback_transfer() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+
+        // 48 KiB client -> server, 8 KiB echo back, both fully consumed. The
+        // client side runs in a task and hands the channel back so both
+        // channels stay available for sampling.
+        let payload: Vec<u8> = (0..48 * 1024).map(|i| (i % 251) as u8).collect();
+        let echo_len = 8 * 1024;
+        let payload_for_task = payload.clone();
+        let client_task = tokio::spawn(async move {
+            let mut cstream = client_channel.open_bi().await.expect("client open_bi");
+            cstream
+                .send_bytes(&payload_for_task)
+                .await
+                .expect("client send");
+            let mut echoed = vec![0u8; echo_len];
+            cstream
+                .recv_exact(&mut echoed)
+                .await
+                .expect("client recv echo");
+            (client_channel, echoed)
+        });
+        let mut sstream = server_channel.accept_bi().await.expect("server accept_bi");
+        let mut received = vec![0u8; 48 * 1024];
+        sstream
+            .recv_exact(&mut received)
+            .await
+            .expect("server recv");
+        sstream
+            .send_bytes(&received[..echo_len])
+            .await
+            .expect("server echo");
+        let (client_channel, echoed) = client_task.await.expect("join client");
+        assert_eq!(echoed.as_slice(), &payload[..echo_len]);
+        assert_eq!(received, payload);
+
+        // Sample only while the connection is open: quinn does not count the
+        // transmitted CONNECTION_CLOSE frame, so closing first would skew
+        // frame parity by one.
+        let (client_stats, server_stats) = sample_at_parity(&client_channel, &server_channel).await;
+
+        // Non-zero on both sides after a real transfer.
+        for stats in [client_stats, server_stats] {
+            assert!(stats.tx_bytes > 0, "tx_bytes zero: {stats:?}");
+            assert!(stats.rx_bytes > 0, "rx_bytes zero: {stats:?}");
+            assert!(stats.tx_frames > 0, "tx_frames zero: {stats:?}");
+            assert!(stats.rx_frames > 0, "rx_frames zero: {stats:?}");
+        }
+        // The client really pushed the payload through this channel.
+        assert!(client_stats.tx_bytes > payload.len() as u64);
+
+        // Frame counts agree across the wire (loopback is lossless, no
+        // retransmission double-counting).
+        assert_eq!(
+            client_stats.tx_frames, server_stats.rx_frames,
+            "client tx vs server rx: {client_stats:?} / {server_stats:?}"
+        );
+        assert_eq!(
+            server_stats.tx_frames, client_stats.rx_frames,
+            "server tx vs client rx: {client_stats:?} / {server_stats:?}"
+        );
+
+        // Bytes agree within +/-10% (header/padding overhead headroom; on a
+        // lossless loopback they should be near-identical).
+        let ten_percent = |a: u64| a / 10;
+        assert!(
+            client_stats.tx_bytes.abs_diff(server_stats.rx_bytes)
+                <= ten_percent(client_stats.tx_bytes.max(server_stats.rx_bytes)),
+            "client tx {} vs server rx {} bytes",
+            client_stats.tx_bytes,
+            server_stats.rx_bytes
+        );
+        assert!(
+            server_stats.tx_bytes.abs_diff(client_stats.rx_bytes)
+                <= ten_percent(server_stats.tx_bytes.max(client_stats.rx_bytes)),
+            "server tx {} vs client rx {} bytes",
+            server_stats.tx_bytes,
+            client_stats.rx_bytes
+        );
+
+        // A small loopback transfer should not register packet loss; this is
+        // the expected (not guaranteed) transport-health reading.
+        assert_eq!(
+            client_stats.lost_packets, 0,
+            "unexpected loss on loopback: {client_stats:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_within_succeeds_before_deadline() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move {
+            server
+                .accept_within(&|_| true, Duration::from_secs(5))
+                .await
+        });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task
+            .await
+            .expect("join")
+            .expect("accept_within success");
+        assert_eq!(server_channel.peer_fingerprint(), &client_id.fingerprint);
+        assert_eq!(client_channel.peer_fingerprint(), &server_id.fingerprint);
+        // Both ends of the pair must be healthy while both channels are alive.
+        assert!(client_channel.healthy() && server_channel.healthy());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_within_times_out_without_peer() {
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+
+        let started = std::time::Instant::now();
+        let result = server
+            .accept_within(&|_| true, Duration::from_millis(150))
+            .await;
+        match result {
+            Err(ConnectError::Timeout(requested)) => {
+                assert_eq!(requested, Duration::from_millis(150));
+            }
+            Err(other) => panic!("unexpected error class: {other:?}"),
+            Ok(channel) => panic!(
+                "channel must not exist without a peer: {:?}",
+                channel.path()
+            ),
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "returned before the deadline"
+        );
     }
 
     // ------------------------------------------------------------------

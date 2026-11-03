@@ -2,13 +2,23 @@
 //! channel, zero servers in the data path.
 //!
 //! Frozen protocol flow (see docs/PROTOCOL.zh-CN.md):
+//! 0. Policy gate (`authorize_path`): the freshly connected channel's path
+//!    is checked against the configured `DirectPolicy`
+//!    (`SendSpec::policy` / `ReceiveSpec::policy`). A path the policy does
+//!    not allow closes the connection (code `POLICY_GATE_CLOSE_CODE`)
+//!    before any protocol frame is sent or accepted — zero bytes of this
+//!    protocol enter a refused route.
 //! 1. Hello exchange (versions, capabilities, identities).
 //! 2. Offer with a deterministic job id: `blake3(root_name || per-file
 //!    rel_path/size/mtime/digests || chunk_size)[..16]`. Same source, same
 //!    id, so a resumed run continues the same job (no new content identity).
 //! 3. Accept (receiver consent; consent is required, never assumed).
-//! 4. Manifest pages (byte-budgeted, bounded), then ResumeRequest carrying
-//!    per-file verified prefixes taken from the receiver's part files.
+//! 4. Manifest pages (byte-budgeted, bounded), then a sharded ResumeRequest
+//!    exchange carrying per-file verified prefixes taken from the receiver's
+//!    part files: consecutive frames of at most `max_resume_entries` entries
+//!    each, `more = true` on every frame but the last (an empty job still
+//!    sends one empty frame with `more = false`). This removes the old
+//!    single-frame 65,535-entry cap on one job.
 //! 5. Per file, chunked send with windowed acks; the receiver verifies every
 //!    chunk digest on arrival and checkpoints the verified prefix.
 //! 6. Per file: receiver finish (whole digest, fsync, atomic rename).
@@ -55,6 +65,7 @@ use std::time::{Duration, Instant};
 use ak_core::error::ErrorCode;
 use ak_core::handle::{ConflictPolicy, FileSink, SaveTarget, SourceHandle};
 use ak_core::manifest::{FileEntry, Manifest};
+use ak_core::policy::{DirectPolicy, PathKind};
 use ak_identity::tls::TlsBundle;
 use ak_identity::Fingerprint;
 use ak_net::{DirectChannel, DirectEndpoint, DirectRecvStream, DirectSendStream, DirectStream};
@@ -75,10 +86,11 @@ const PROTO_VERSION: u16 = 1;
 
 /// The one decode-limits profile used by every engine receive site in both
 /// roles. Encoding has no limits, so the decoder budget must cover whatever
-/// the peer's encoder produces: the receiver answers with a single
-/// ResumeRequest frame for every non-directory entry, which is why
-/// `max_resume_entries` matches [`ak_wire::MAX_RESUME_ENTRIES`] (the old
-/// 4,096 default made any larger job fail with `Oversized` on the sender).
+/// the peer's encoder produces: the receiver shards its resume answer into
+/// ResumeRequest frames of at most `max_resume_entries` entries each
+/// ([`resume_request_frames`]), so matching
+/// [`ak_wire::MAX_RESUME_ENTRIES`] keeps a full shard decodable while the
+/// multi-frame exchange itself carries no per-job entry cap.
 fn engine_limits() -> Limits {
     Limits {
         max_chunk_bytes: 8 << 20,
@@ -93,6 +105,12 @@ fn engine_limits() -> Limits {
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on concurrent per-file streams in multistream mode.
 const MAX_PARALLEL_STREAMS: usize = 4;
+/// QUIC application-error code for a policy-gate refusal: `0xA0` marks the
+/// AK protocol family, `0x01` the policy gate. An application-space code
+/// (no IANA transport meaning), carried in the CONNECTION_CLOSE frame when
+/// [`authorize_path`] refuses a path so a peer's transport log can name
+/// the reason. No protocol frame precedes it.
+const POLICY_GATE_CLOSE_CODE: u32 = 0xA0_01;
 
 /// Sender-side configuration.
 #[derive(Debug, Clone)]
@@ -126,6 +144,11 @@ pub struct SendSpec {
     /// also advertises `CAP_MULTISTREAM`; otherwise the single-stream path
     /// runs. Also caps concurrent streams at `min(in_flight_window, 4)`.
     pub multistream: bool,
+    /// Route policy gate, applied to the connected channel's path before
+    /// any protocol frame is sent (see [`authorize_path`]). Default:
+    /// `DirectPolicy::default()` (`allow_internet = true`,
+    /// `allow_cellular = false`). A `LocalDirect` path always passes.
+    pub policy: DirectPolicy,
 }
 
 impl SendSpec {
@@ -149,6 +172,7 @@ impl SendSpec {
             in_flight_window: 8,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             multistream: false,
+            policy: DirectPolicy::default(),
         }
     }
 
@@ -174,6 +198,11 @@ pub struct ReceiveSpec {
     pub checkpoint_dir: PathBuf,
     /// Abort when no frame arrives within this budget on any receive wait.
     pub idle_timeout: Duration,
+    /// Route policy gate, applied to the accepted channel's path before
+    /// any protocol frame is received or sent (see [`authorize_path`]).
+    /// Default: `DirectPolicy::default()` (`allow_internet = true`,
+    /// `allow_cellular = false`). A `LocalDirect` path always passes.
+    pub policy: DirectPolicy,
 }
 
 impl ReceiveSpec {
@@ -188,6 +217,7 @@ impl ReceiveSpec {
             device_name: String::new(),
             checkpoint_dir: std::env::temp_dir().join("ak-sending-checkpoints"),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            policy: DirectPolicy::default(),
         }
     }
 }
@@ -301,6 +331,13 @@ pub enum EngineError {
     VerificationFailed,
     #[error("cancelled")]
     Cancelled,
+    /// The connected route's path kind is not allowed by the configured
+    /// [`DirectPolicy`] (internet refused by policy, or a Relay/Unknown
+    /// path that must never carry file data — see [`authorize_path`]).
+    /// The channel is closed with [`POLICY_GATE_CLOSE_CODE`] before any
+    /// protocol byte moves.
+    #[error("route refused by policy: {0:?}")]
+    RouteForbidden(PathKind),
 }
 
 /// Deterministic job id from source identity (see module docs).
@@ -340,6 +377,59 @@ pub fn check_headroom(available: Option<u64>, total_needed: u64) -> Result<(), E
             needed: total_needed,
         }),
         _ => Ok(()),
+    }
+}
+
+/// Pure pre-transport policy gate (ADR-001: a path that is unknown or not
+/// allowed by policy never enters the file-data channel):
+/// - `LocalDirect` always passes — local-first, no policy can lock out the
+///   loopback/LAN path;
+/// - `InternetDirect` passes only when `policy.allow_internet`;
+/// - `Relay` and `Unknown` are always refused: neither can be produced by
+///   the direct-only transport (`ak-net` classifies only LocalDirect /
+///   InternetDirect), so meeting one is a defect — refuse defensively.
+///
+/// Relation to [`DirectPolicy::choose`]'s `Observation` model: the facts
+/// `choose` re-checks per candidate (`peer_id` match, `authenticated`,
+/// `encrypted`, `receive_authorized`) are deliberately NOT re-filled as
+/// booleans here, because the transport already guarantees them **by
+/// type** — the ADR-002 D6 constraint landing point. A
+/// [`DirectChannel`] exists only after a TLS handshake that verified the
+/// peer's self-signed certificate against the pinned fingerprint (that is
+/// the identity/authentication/encryption triple), and the receiver's
+/// `authorize` callback supplied channel-level consent at accept time.
+/// Likewise `channel.path()` is the trusted `classify` product of
+/// `ak-net`, not a caller-asserted flag. This gate is therefore a purely
+/// permissive filter over the path kind — not a re-declaration of
+/// Observation booleans, which would only create a place for untrusted
+/// input to sneak back in. `Observation::cellular` has no
+/// transport-level equivalent (a QUIC connection does not expose the
+/// underlying network interface), so `allow_cellular` stays advisory in
+/// the engine until an interface-aware adapter exists; and `choose`'s
+/// local-probe sequencing (`WaitReason::LocalProbePending`) belongs to
+/// candidate selection *before* connecting, not to this per-connection
+/// gate.
+pub fn authorize_path(policy: &DirectPolicy, path: PathKind) -> Result<(), EngineError> {
+    match path {
+        PathKind::LocalDirect => Ok(()),
+        PathKind::InternetDirect if policy.allow_internet => Ok(()),
+        PathKind::InternetDirect | PathKind::Relay | PathKind::Unknown => {
+            Err(EngineError::RouteForbidden(path))
+        }
+    }
+}
+
+/// Gate a freshly obtained channel: refuse (and close with
+/// [`POLICY_GATE_CLOSE_CODE`]) before a single protocol byte is sent or
+/// accepted. Called at exactly two sites: `send` right after
+/// `connect_bounded`, and `receive_with_addr` right after `accept` — in
+/// both cases before the first stream is opened or the first frame moves.
+fn gate_channel(policy: &DirectPolicy, channel: &DirectChannel) -> Result<(), EngineError> {
+    if let Err(error) = authorize_path(policy, channel.path()) {
+        channel.close(POLICY_GATE_CLOSE_CODE, b"route refused by policy");
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 
@@ -467,6 +557,73 @@ fn assemble_pages(manifest: &Manifest, limits: &Limits) -> Vec<Vec<WireEntry>> {
         pages.push(current);
     }
     pages
+}
+
+/// Shard the receiver's resume answer into ResumeRequest frames of at most
+/// `max_per_frame` entries. Every frame but the last carries `more = true`;
+/// an empty answer still produces exactly one empty frame with
+/// `more = false`, so the exchange always terminates with a final frame the
+/// sender can wait for. A `max_per_frame` of 0 is clamped to 1 (a shard
+/// size, not a stall).
+fn resume_request_frames(
+    job_id: JobId,
+    files: &[ResumeEntry],
+    max_per_frame: usize,
+) -> Vec<Message> {
+    let max = max_per_frame.max(1);
+    let mut frames: Vec<Message> = files
+        .chunks(max)
+        .map(|shard| Message::ResumeRequest {
+            job_id,
+            files: shard.to_vec(),
+            more: true,
+        })
+        .collect();
+    if let Some(Message::ResumeRequest { more, .. }) = frames.last_mut() {
+        *more = false;
+    } else {
+        frames.push(Message::ResumeRequest {
+            job_id,
+            files: Vec::new(),
+            more: false,
+        });
+    }
+    frames
+}
+
+/// Sender-side accumulator for the sharded ResumeRequest exchange: folds in
+/// frames until one arrives with `more = false`. Every frame must name the
+/// expected job; a mismatch aborts with a protocol error.
+struct ResumeCollector {
+    job_id: JobId,
+    entries: Vec<ResumeEntry>,
+}
+
+impl ResumeCollector {
+    fn new(job_id: JobId) -> Self {
+        ResumeCollector {
+            job_id,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Fold one frame's entries in; returns `true` when the exchange is
+    /// complete (the frame carried `more = false`).
+    fn push(
+        &mut self,
+        frame_job_id: JobId,
+        files: Vec<ResumeEntry>,
+        more: bool,
+    ) -> Result<bool, EngineError> {
+        if frame_job_id != self.job_id {
+            return Err(EngineError::PeerError {
+                code: ErrorCode::ProtocolUnsupported,
+                message: "resume frame names a different job".into(),
+            });
+        }
+        self.entries.extend(files);
+        Ok(!more)
+    }
 }
 
 fn sender_record(spec: &SendSpec, job_id: JobId, manifest: &Manifest) -> TaskRecord {
@@ -1099,7 +1256,11 @@ pub async fn send(
 
     progress(Progress::Connecting);
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
-    let channel = Arc::new(connect_bounded(&endpoint, spec.peer, &spec.pinned, spec.idle_timeout).await?);
+    let channel = connect_bounded(&endpoint, spec.peer, &spec.pinned, spec.idle_timeout).await?;
+    // Policy gate (protocol step 0): a refused path closes the connection
+    // before any stream is opened or frame sent.
+    gate_channel(&spec.policy, &channel)?;
+    let channel = Arc::new(channel);
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
     });
@@ -1171,18 +1332,33 @@ pub async fn send(
         progress(Progress::ManifestPageSent { page: index as u32 });
     }
 
-    // ResumeRequest: skip the receiver's verified prefixes.
-    let resume: Vec<ResumeEntry> = match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
-        Frame {
-            message: Message::ResumeRequest { files, .. },
-            ..
-        } => files,
-        Frame {
-            message: Message::Error { code, message },
-            ..
-        } => return Err(EngineError::PeerError { code, message }),
-        other => return Err(unexpected(other.message)),
-    };
+    // ResumeRequest: skip the receiver's verified prefixes. The answer is
+    // sharded — frames accumulate (each wait under the idle budget) until
+    // one carries more = false, and every frame must name this job.
+    let mut resume = ResumeCollector::new(job_id);
+    loop {
+        match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
+            Frame {
+                message:
+                    Message::ResumeRequest {
+                        job_id: frame_job_id,
+                        files,
+                        more,
+                    },
+                ..
+            } => {
+                if resume.push(frame_job_id, files, more)? {
+                    break;
+                }
+            }
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        }
+    }
+    let resume = resume.entries;
     let mut skip = vec![0u64; manifest.entries.len()];
     let mut resumed_chunks = 0u64;
     for entry in &resume {
@@ -1362,6 +1538,9 @@ pub async fn receive_with_addr(
     let local = endpoint.local_addr()?;
     let _ = addr_tx.send(local);
     let channel = endpoint.accept(&spec.authorize).await?;
+    // Policy gate (protocol step 0): a refused path closes the connection
+    // before any stream is accepted or frame moves.
+    gate_channel(&spec.policy, &channel)?;
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
     });
@@ -1527,14 +1706,18 @@ pub async fn receive_with_addr(
     // discards empty part files so a failed receive leaves no litter.
     // Parts holding verified chunks always survive for resume.
     let outcome = async {
-        tx.send_frame(&Frame {
-            version: ak_wire::VERSION,
-            message: Message::ResumeRequest {
-                job_id,
-                files: resume,
-            },
-        })
-        .await?;
+        // ResumeRequest, sharded: each frame carries at most
+        // `max_resume_entries` entries; the last (the only one for an empty
+        // answer) carries more = false.
+        for message in
+            resume_request_frames(job_id, &resume, usize::from(limits.max_resume_entries))
+        {
+            tx.send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message,
+            })
+            .await?;
+        }
         store.save(&record).map_err(EngineError::Checkpoint)?;
 
         // Chunk phase: the frozen single-stream loop, or per-file streams
@@ -2127,6 +2310,9 @@ mod tests {
 
     fn noop(_progress: Progress) {}
 
+    /// Loopback transfer under the default policy: the step-0 gate passes
+    /// LocalDirect on both sides and the frozen flow runs unchanged — this
+    /// is the default-policy gate integration.
     #[tokio::test]
     async fn loopback_directory_transfer_is_byte_identical() {
         let src = tempfile::tempdir().unwrap();
@@ -2288,7 +2474,9 @@ mod tests {
         send_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0)); // IPv4 endpoint
         send_spec.peer = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9)); // IPv6 peer, nothing listening
         let started = Instant::now();
-        let err = send(send_spec, &noop).await.expect_err("family mismatch must fail");
+        let err = send(send_spec, &noop)
+            .await
+            .expect_err("family mismatch must fail");
         assert!(
             matches!(
                 &err,
@@ -2296,7 +2484,11 @@ mod tests {
             ),
             "got: {err:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "must fail fast, took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must fail fast, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -2408,6 +2600,104 @@ mod tests {
     // is covered by automated tests; the Error-frame and
     // "failed_storage_full" checkpoint wiring is untested here by design
     // (no faked numbers, no faked filesystems). See the round-3 report.
+
+    // ------------------------------------------------------------------
+    // Policy gate (pre-transport route authorization)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn authorize_path_local_direct_passes_even_with_local_only_policy() {
+        let local_only = DirectPolicy {
+            allow_internet: false,
+            allow_cellular: false,
+        };
+        assert!(authorize_path(&DirectPolicy::default(), PathKind::LocalDirect).is_ok());
+        assert!(authorize_path(&local_only, PathKind::LocalDirect).is_ok());
+    }
+
+    #[test]
+    fn authorize_path_internet_direct_follows_allow_internet() {
+        assert!(
+            authorize_path(&DirectPolicy::default(), PathKind::InternetDirect).is_ok(),
+            "the default policy allows internet"
+        );
+        let local_only = DirectPolicy {
+            allow_internet: false,
+            allow_cellular: false,
+        };
+        assert!(matches!(
+            authorize_path(&local_only, PathKind::InternetDirect),
+            Err(EngineError::RouteForbidden(PathKind::InternetDirect))
+        ));
+    }
+
+    #[test]
+    fn authorize_path_rejects_relay_and_unknown_even_when_permissive() {
+        for path in [PathKind::Relay, PathKind::Unknown] {
+            assert!(
+                matches!(
+                    authorize_path(&DirectPolicy::default(), path),
+                    Err(EngineError::RouteForbidden(refused)) if refused == path
+                ),
+                "Relay/Unknown must always be refused, got a pass for {path:?}"
+            );
+        }
+    }
+
+    /// The documented API contract for integrators (e.g. CLI flags):
+    /// untouched specs carry `allow_internet = true, allow_cellular = false`.
+    #[test]
+    fn specs_default_to_the_standard_direct_policy() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let (send_spec, recv_spec, _) = specs(src.path(), dst.path(), 16);
+        for policy in [send_spec.policy, recv_spec.policy] {
+            assert!(policy.allow_internet, "default must allow internet");
+            assert!(!policy.allow_cellular, "default must refuse cellular");
+        }
+    }
+
+    /// `allow_internet = false` must not affect a loopback transfer: the
+    /// loopback peer classifies `LocalDirect` (ak-net::classify treats
+    /// loopback as always local), which no policy can lock out. Both sides
+    /// carry the local-only policy here.
+    ///
+    /// The InternetDirect-refused branch of the wiring cannot be produced
+    /// naturally on a single machine: every address a test can actually
+    /// connect to here classifies LocalDirect, and `DirectChannel` exposes
+    /// no public constructor to forge a path (by design). That branch is
+    /// covered by the pure unit branches above instead.
+    #[tokio::test]
+    async fn local_only_policy_still_completes_loopback_transfer() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        write(&src.path().join("local-only.bin"), &payload);
+        let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 4);
+        let local_only = DirectPolicy {
+            allow_internet: false,
+            allow_cellular: false,
+        };
+        send_spec.policy = local_only;
+        recv.policy = local_only;
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        send_spec.peer = addr_rx.await.unwrap();
+        let report = send(send_spec, &noop)
+            .await
+            .expect("local-only policy must not affect a LocalDirect loopback");
+        let recv_report = receiver
+            .await
+            .unwrap()
+            .expect("local-only policy must not affect a LocalDirect loopback");
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, recv_report.bytes);
+        assert_eq!(
+            fs::read(dst.path().join("local-only.bin")).unwrap(),
+            payload
+        );
+    }
 
     // ------------------------------------------------------------------
     // Multi-root send
@@ -2698,6 +2988,7 @@ mod tests {
                 message: Message::ResumeRequest {
                     job_id,
                     files: Vec::new(),
+                    more: false,
                 },
             })
             .await
@@ -3162,13 +3453,15 @@ mod tests {
         assert!(parts.is_empty(), "empty part files survived: {parts:?}");
     }
 
-    /// Regression for the 4,097-file defect: a ResumeRequest covering every
-    /// non-directory entry must decode on the sender under engine limits.
+    /// Regression for the 4,097-file defect, now per frame: a ResumeRequest
+    /// frame covering a full shard of `max_resume_entries` entries must
+    /// decode on the sender under engine limits.
     #[test]
     fn engine_limits_fit_resume_requests_for_maximum_jobs() {
         let limits = engine_limits();
         assert_eq!(limits.max_resume_entries, ak_wire::MAX_RESUME_ENTRIES);
-        // One frame with the worst-case entry count the engine supports.
+        // One frame with the worst-case per-frame entry count, announcing a
+        // following frame.
         let files: Vec<ResumeEntry> = (0..limits.max_resume_entries as u32)
             .map(|file_index| ResumeEntry {
                 file_index,
@@ -3181,14 +3474,168 @@ mod tests {
             message: Message::ResumeRequest {
                 job_id: [7; 16],
                 files,
+                more: true,
             },
         }
         .encode(&mut buf);
         assert!(buf.len() < ak_wire::MAX_FRAME_BYTES);
         let decoded = Frame::decode(&buf, &limits).expect("max-size ResumeRequest decodes");
         match decoded.message {
-            Message::ResumeRequest { files, .. } => assert_eq!(files.len(), 65_535),
+            Message::ResumeRequest { files, more, .. } => {
+                assert_eq!(files.len(), 65_535);
+                assert!(more);
+            }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Sharded ResumeRequest exchange (single-frame job cap removed)
+    // ------------------------------------------------------------------
+
+    /// The shard function: every non-final frame carries more = true, no
+    /// frame exceeds the cap, an empty answer yields exactly one empty final
+    /// frame, and concatenation reproduces the input.
+    #[test]
+    fn resume_request_frames_shard_within_the_cap() {
+        let cap = engine_limits().max_resume_entries as usize;
+        for total in [0usize, 1, cap - 1, cap, cap + 1, 2 * cap + 7] {
+            let files: Vec<ResumeEntry> = (0..total as u32)
+                .map(|i| ResumeEntry {
+                    file_index: i,
+                    verified_prefix_chunks: u64::from(i) * 3,
+                })
+                .collect();
+            let frames = resume_request_frames([9; 16], &files, cap);
+            assert!(!frames.is_empty(), "total {total}: at least one frame");
+            let mut reunited = Vec::new();
+            for (n, message) in frames.iter().enumerate() {
+                let Message::ResumeRequest {
+                    job_id,
+                    files: shard,
+                    more,
+                } = message
+                else {
+                    panic!("total {total}: frame {n} is not a ResumeRequest");
+                };
+                assert_eq!(*job_id, [9; 16], "total {total}: frame {n} job id");
+                assert!(
+                    shard.len() <= cap,
+                    "total {total}: frame {n} holds {} > {cap}",
+                    shard.len()
+                );
+                assert_eq!(
+                    *more,
+                    n + 1 < frames.len(),
+                    "total {total}: frame {n} more flag"
+                );
+                reunited.extend_from_slice(shard);
+            }
+            assert_eq!(
+                reunited, files,
+                "total {total}: concatenation must reproduce the input"
+            );
+        }
+    }
+
+    /// A resume frame naming a different job aborts the exchange; the
+    /// matching job id accumulates until a more = false frame ends it.
+    #[test]
+    fn resume_collector_validates_job_ids_and_completion() {
+        let mut collector = ResumeCollector::new([1; 16]);
+        assert!(
+            !collector
+                .push(
+                    [1; 16],
+                    vec![ResumeEntry {
+                        file_index: 0,
+                        verified_prefix_chunks: 1,
+                    }],
+                    true
+                )
+                .unwrap(),
+            "more = true must not finish the exchange"
+        );
+        assert_eq!(collector.entries.len(), 1);
+        assert!(matches!(
+            collector.push([2; 16], Vec::new(), false),
+            Err(EngineError::PeerError { .. })
+        ));
+        assert!(
+            collector.push([1; 16], Vec::new(), false).unwrap(),
+            "more = false completes the exchange"
+        );
+        assert_eq!(collector.entries.len(), 1);
+    }
+
+    /// 100,000-entry job, unit level (no socket): shard, push every frame
+    /// through the real wire encode/decode, and fold the decoded frames into
+    /// the sender's accumulator loop. Every entry must arrive in order and
+    /// no frame may exceed the per-frame cap. Real 100k-file transfers are
+    /// deliberately not exercised here (I/O cost); release-time manual runs
+    /// own that boundary.
+    #[test]
+    fn one_hundred_thousand_resume_entries_arrive_sharded() {
+        const TOTAL: usize = 100_000;
+        let limits = engine_limits();
+        let cap = usize::from(limits.max_resume_entries);
+        let job_id = [0xA5; 16];
+        let files: Vec<ResumeEntry> = (0..TOTAL as u32)
+            .map(|i| ResumeEntry {
+                file_index: i,
+                verified_prefix_chunks: u64::from(i),
+            })
+            .collect();
+
+        let frames = resume_request_frames(job_id, &files, cap);
+        assert_eq!(
+            frames.len(),
+            TOTAL.div_ceil(cap),
+            "100k entries need two shards at cap {cap}"
+        );
+
+        // Simulated sender receive loop: decode each frame, fold it in.
+        let mut collector = ResumeCollector::new(job_id);
+        let mut final_frame = false;
+        for message in frames {
+            let mut buf = Vec::new();
+            Frame {
+                version: ak_wire::VERSION,
+                message,
+            }
+            .encode(&mut buf);
+            assert!(
+                buf.len() < ak_wire::MAX_FRAME_BYTES,
+                "shard frame must fit the frame cap"
+            );
+            match Frame::decode(&buf, &limits)
+                .expect("shard frame decodes under engine limits")
+                .message
+            {
+                Message::ResumeRequest {
+                    job_id: frame_job_id,
+                    files: shard,
+                    more,
+                } => {
+                    assert!(
+                        shard.len() <= cap,
+                        "single frame exceeded the per-frame cap"
+                    );
+                    if collector
+                        .push(frame_job_id, shard, more)
+                        .expect("frame accepted")
+                    {
+                        final_frame = true;
+                        break;
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert!(final_frame, "exchange must end with a more = false frame");
+        assert_eq!(
+            collector.entries, files,
+            "all 100,000 entries must arrive in order"
+        );
     }
 }

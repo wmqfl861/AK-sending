@@ -19,14 +19,9 @@
 mod common;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use ak_core::handle::ConflictPolicy;
-
-use common::{
-    assert_no_part_files, assert_trees_identical, try_run_transfer_opts, write_file, Lcg,
-    TransferOpts,
-};
+use common::{mib_per_sec, run_bench_pass, write_file, BenchPass, Lcg, TransferOpts};
 
 const FILE_COUNT: usize = 64;
 const FILE_MIB: usize = 8;
@@ -43,60 +38,25 @@ fn build_bench_tree(root: &Path) {
     }
 }
 
-fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON)
-}
-
-/// One full 512 MiB transfer in the given stream shape; asserts correctness
-/// only, prints the throughput numbers. Returns (wall, engine_send, engine_recv).
-async fn run_one_pass(
-    src: &Path,
-    label: &str,
-    multistream: bool,
-) -> (Duration, Duration, Duration) {
-    let dst = tempfile::tempdir().expect("dst tempdir");
+/// One full 512 MiB transfer in the given stream shape: engine-default
+/// 1 MiB chunk (no `chunk_size` override), in-flight window 32. Asserts
+/// correctness only; the timings are informational.
+async fn run_one_pass(src: &Path, label: &str, multistream: bool) -> BenchPass {
     let opts = TransferOpts {
         multistream,
         in_flight_window: 32,
         ..TransferOpts::default()
     };
-    let started = Instant::now();
-    let raw = try_run_transfer_opts(src, dst.path(), 1024, ConflictPolicy::Fail, 600, opts).await;
-    let wall = started.elapsed();
-
-    let send_report = raw
-        .send
-        .unwrap_or_else(|e| panic!("[bench {label}] send failed: {e:?}"));
-    let recv_report = raw
-        .recv
-        .unwrap_or_else(|e| panic!("[bench {label}] receive failed: {e:?}"));
-
-    // Correctness only — never speed.
-    assert_eq!(
-        send_report.files, FILE_COUNT as u64,
-        "[bench {label}] file count"
-    );
-    assert_eq!(send_report.bytes, TOTAL_BYTES, "[bench {label}] byte count");
-    assert_eq!(
-        recv_report.bytes, TOTAL_BYTES,
-        "[bench {label}] receiver byte count"
-    );
-    assert_eq!(send_report.job_id, recv_report.job_id);
-    assert_eq!(
-        send_report.resumed_chunks, 0,
-        "[bench {label}] fresh full transfer"
-    );
-    assert_trees_identical(src, dst.path());
-    assert_no_part_files(dst.path());
-
-    let wall_tp = mib_per_sec(TOTAL_BYTES, wall);
-    let send_tp = mib_per_sec(TOTAL_BYTES, send_report.duration);
-    let recv_tp = mib_per_sec(TOTAL_BYTES, recv_report.duration);
-    println!(
-        "[bench {label:>13}] {TOTAL_BYTES} bytes ({FILE_COUNT} x {FILE_MIB} MiB): wall {wall:.2?} ({wall_tp:.1} MiB/s) | engine send {:.2?} ({send_tp:.1} MiB/s) | engine recv {:.2?} ({recv_tp:.1} MiB/s)",
-        send_report.duration, recv_report.duration,
-    );
-    (wall, send_report.duration, recv_report.duration)
+    run_bench_pass(
+        src,
+        label,
+        &format!("{FILE_COUNT} x {FILE_MIB} MiB"),
+        FILE_COUNT as u64,
+        TOTAL_BYTES,
+        600,
+        opts,
+    )
+    .await
 }
 
 /// Informational throughput comparison, single stream vs multistream, on one
@@ -113,13 +73,15 @@ async fn single_vs_multistream_512mib_loopback_throughput() {
         "[bench] generated {FILE_COUNT} x {FILE_MIB} MiB deterministic tree in {gen_elapsed:.2?}"
     );
 
-    let (wall1, _send1, _recv1) = run_one_pass(&src, "single-stream", false).await;
-    let (wall2, _send2, _recv2) = run_one_pass(&src, "multistream", true).await;
+    let pass1 = run_one_pass(&src, "single-stream", false).await;
+    let pass2 = run_one_pass(&src, "multistream", true).await;
 
-    let single = mib_per_sec(TOTAL_BYTES, wall1);
-    let multi = mib_per_sec(TOTAL_BYTES, wall2);
+    let single = mib_per_sec(TOTAL_BYTES, pass1.wall);
+    let multi = mib_per_sec(TOTAL_BYTES, pass2.wall);
     println!(
-        "[bench summary] single-stream: {wall1:.2?} ({single:.1} MiB/s) | multistream: {wall2:.2?} ({multi:.1} MiB/s) | multistream/single ratio {:.2}x",
-        multi / single.max(f64::EPSILON),
+        "[bench summary] single-stream: {w1:.2?} ({single:.1} MiB/s) | multistream: {w2:.2?} ({multi:.1} MiB/s) | multistream/single ratio {ratio:.2}x",
+        w1 = pass1.wall,
+        w2 = pass2.wall,
+        ratio = multi / single.max(f64::EPSILON),
     );
 }

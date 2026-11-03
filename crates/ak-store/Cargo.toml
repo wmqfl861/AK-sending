@@ -3,10 +3,16 @@ name = "ak-store"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-description = "Task checkpoint persistence with atomic writes (SQLite backend is a later swap)"
+description = "Task checkpoint persistence with atomic writes (file backend by default, optional SQLite backend)"
+
+[features]
+# Keeps the default build free of any C dependency; the file backend stays
+# the default. SQLite is opt-in for mobile / multi-job hosts (BACKLOG P1-03).
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
 ak-identity = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

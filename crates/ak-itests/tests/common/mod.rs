@@ -18,11 +18,11 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ak_core::handle::ConflictPolicy;
+use ak_core::handle::{default_chunk_size, ConflictPolicy};
 use ak_engine::{receive_with_addr, send, Progress, ReceiveSpec, Report, SendSpec};
-use ak_identity::DeviceKeyPair;
+use ak_identity::{DeviceKeyPair, Fingerprint};
 
 /// Part suffix used by ak-storage for in-progress receive files.
 pub const PART_SUFFIX: &str = ".akpart";
@@ -214,6 +214,13 @@ pub struct TransferOpts {
     pub multistream: bool,
     /// Maximum unacknowledged chunks in flight (sender side).
     pub in_flight_window: u32,
+    /// Explicit chunk size override for BOTH endpoints (`SendSpec::chunk_size`
+    /// and `ReceiveSpec::chunk_size`), so benches can sweep the chunk size
+    /// without threading it through the legacy `chunk_kb` argument. `None`
+    /// (the default) keeps the historical behavior: the `chunk_kb` argument
+    /// of `try_run_transfer_opts` / `try_run_transfer_parties` decides; when
+    /// that is 0 as well, the specs keep the engine default (1 MiB).
+    pub chunk_size: Option<NonZeroU32>,
 }
 
 impl Default for TransferOpts {
@@ -223,6 +230,34 @@ impl Default for TransferOpts {
             recv_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             multistream: false,
             in_flight_window: 8,
+            chunk_size: None,
+        }
+    }
+}
+
+/// Receiver-side admission callback shape (mirrors `ReceiveSpec::authorize`).
+pub type AuthorizeFn = Box<dyn Fn(&Fingerprint) -> bool + Send + Sync>;
+
+/// Explicit transfer parties for scenario tests that must control WHO is
+/// talking: pre-generated device identities (so a test can pre-pair, pre-pin,
+/// or play an impostor) plus an optional receiver-side authorize callback
+/// (pairing-book admission semantics).
+pub struct TransferParties {
+    pub sender_key: DeviceKeyPair,
+    pub receiver_key: DeviceKeyPair,
+    /// When set, replaces the receiver's default accept-any authorize
+    /// callback (e.g. pairing-book membership).
+    pub authorize: Option<AuthorizeFn>,
+}
+
+impl TransferParties {
+    /// Fresh independent identities and an accept-any receiver: the
+    /// historical shape every opts-based run used.
+    pub fn fresh() -> Self {
+        Self {
+            sender_key: DeviceKeyPair::generate(),
+            receiver_key: DeviceKeyPair::generate(),
+            authorize: None,
         }
     }
 }
@@ -239,10 +274,32 @@ pub async fn try_run_transfer_opts(
     budget_secs: u64,
     opts: TransferOpts,
 ) -> RawOutcome {
-    let sender_key = DeviceKeyPair::generate();
-    let receiver_key = DeviceKeyPair::generate();
-    let sender_bundle = ak_identity::tls::make_self_signed(&sender_key);
-    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    try_run_transfer_parties(
+        src,
+        dst,
+        chunk_kb,
+        conflict,
+        budget_secs,
+        opts,
+        TransferParties::fresh(),
+    )
+    .await
+}
+
+/// [`try_run_transfer_opts`] with explicit [`TransferParties`]: the device
+/// identities (and optionally the receiver's authorize callback) are the
+/// caller's, so a scenario can pre-pair, pre-pin, or impersonate one side.
+pub async fn try_run_transfer_parties(
+    src: &Path,
+    dst: &Path,
+    chunk_kb: u32,
+    conflict: ConflictPolicy,
+    budget_secs: u64,
+    opts: TransferOpts,
+    parties: TransferParties,
+) -> RawOutcome {
+    let sender_bundle = ak_identity::tls::make_self_signed(&parties.sender_key);
+    let receiver_bundle = ak_identity::tls::make_self_signed(&parties.receiver_key);
     // Fresh checkpoint dirs per run so parallel tests never share job state.
     let send_ckpt = tempfile::tempdir().unwrap();
     let recv_ckpt = tempfile::tempdir().unwrap();
@@ -251,12 +308,18 @@ pub async fn try_run_transfer_opts(
         src.to_path_buf(),
         // Peer placeholder; replaced by the receiver's reported address below.
         SocketAddr::from(([127, 0, 0, 1], 0)),
-        receiver_key.fingerprint(),
+        parties.receiver_key.fingerprint(),
         sender_bundle,
     );
     send_spec.device_name = "ak-itests-sender".into();
     send_spec.bind = opts.send_bind;
-    send_spec.chunk_size = NonZeroU32::new(chunk_kb * 1024).expect("chunk_kb must be nonzero");
+    // Chunk precedence: explicit opts override > legacy chunk_kb argument
+    // (chunk_kb = 0 means "none given") > engine default (1 MiB). Historical
+    // callers pass a nonzero chunk_kb and no override, so they are unchanged.
+    send_spec.chunk_size = opts
+        .chunk_size
+        .or_else(|| NonZeroU32::new(chunk_kb.checked_mul(1024).unwrap_or(0)))
+        .unwrap_or_else(default_chunk_size);
     send_spec.checkpoint_dir = send_ckpt.path().to_path_buf();
     send_spec.multistream = opts.multistream;
     send_spec.in_flight_window = opts.in_flight_window;
@@ -269,6 +332,9 @@ pub async fn try_run_transfer_opts(
     recv_spec.chunk_size = send_spec.chunk_size;
     recv_spec.conflict = conflict;
     recv_spec.checkpoint_dir = recv_ckpt.path().to_path_buf();
+    if let Some(authorize) = parties.authorize {
+        recv_spec.authorize = authorize;
+    }
 
     let events: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
     let callback = {
@@ -370,4 +436,91 @@ pub async fn run_transfer_conflict(
 pub fn read_file(root: &Path, rel: &str) -> Vec<u8> {
     let path: PathBuf = root.join(rel);
     fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Bench plumbing shared by the informational benches (bench_throughput,
+// bench_chunk_sweep): a timed one-pass runner that checks correctness only
+// and never asserts speed.
+// ---------------------------------------------------------------------------
+
+/// Throughput in MiB/s for a byte count over an elapsed duration
+/// (zero-division guarded; informational only).
+pub fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON)
+}
+
+/// Timings of one bench pass: wall clock plus both engine-reported durations.
+pub struct BenchPass {
+    pub wall: Duration,
+    pub send: Duration,
+    pub recv: Duration,
+}
+
+/// One timed loopback pass shaped by `opts` (chunk override included).
+///
+/// Correctness checks only — file/byte counts, matching job ids, a fresh
+/// (non-resumed) transfer, byte-identical trees, no `.akpart` residue —
+/// never a speed assertion. `expected_files`/`expected_bytes` describe the
+/// caller's payload, `shape` is a human note for the printed line (e.g.
+/// "16 x 16 MiB"). Destination dir, device keys, and checkpoint dirs are
+/// fresh per call (inside `try_run_transfer_opts`), so successive passes
+/// never share transfer state.
+pub async fn run_bench_pass(
+    src: &Path,
+    label: &str,
+    shape: &str,
+    expected_files: u64,
+    expected_bytes: u64,
+    budget_secs: u64,
+    opts: TransferOpts,
+) -> BenchPass {
+    let dst = tempfile::tempdir().expect("dst tempdir");
+    let started = Instant::now();
+    // chunk_kb = 0: no legacy chunk argument; the chunk comes from
+    // `opts.chunk_size` or, when that is None too, the engine default.
+    let raw =
+        try_run_transfer_opts(src, dst.path(), 0, ConflictPolicy::Fail, budget_secs, opts).await;
+    let wall = started.elapsed();
+
+    let send_report = raw
+        .send
+        .unwrap_or_else(|e| panic!("[bench {label}] send failed: {e:?}"));
+    let recv_report = raw
+        .recv
+        .unwrap_or_else(|e| panic!("[bench {label}] receive failed: {e:?}"));
+
+    // Correctness only — never speed.
+    assert_eq!(
+        send_report.files, expected_files,
+        "[bench {label}] file count"
+    );
+    assert_eq!(
+        send_report.bytes, expected_bytes,
+        "[bench {label}] byte count"
+    );
+    assert_eq!(
+        recv_report.bytes, expected_bytes,
+        "[bench {label}] receiver byte count"
+    );
+    assert_eq!(send_report.job_id, recv_report.job_id);
+    assert_eq!(
+        send_report.resumed_chunks, 0,
+        "[bench {label}] fresh full transfer"
+    );
+    assert_trees_identical(src, dst.path());
+    assert_no_part_files(dst.path());
+
+    let wall_tp = mib_per_sec(expected_bytes, wall);
+    let send_tp = mib_per_sec(expected_bytes, send_report.duration);
+    let recv_tp = mib_per_sec(expected_bytes, recv_report.duration);
+    println!(
+        "[bench {label:>13}] {expected_bytes} bytes ({shape}): wall {wall:.2?} ({wall_tp:.1} MiB/s) | engine send {:.2?} ({send_tp:.1} MiB/s) | engine recv {:.2?} ({recv_tp:.1} MiB/s)",
+        send_report.duration, recv_report.duration,
+    );
+    BenchPass {
+        wall,
+        send: send_report.duration,
+        recv: recv_report.duration,
+    }
 }

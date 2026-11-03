@@ -9,8 +9,9 @@
 //! serves the Rust CLI prototype and non-Apple builds.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ak_identity::Fingerprint;
@@ -30,6 +31,15 @@ pub struct PeerCandidate {
     pub addr: SocketAddr,
     pub fingerprint: Option<Fingerprint>,
     pub source: CandidateSource,
+    /// Human-facing device name from the mDNS TXT `name` property, already
+    /// sanitized (control chars to spaces, at most 64 bytes). `None` for the
+    /// manual and signaling sources and when the peer published no usable
+    /// name.
+    ///
+    /// Display-only metadata: it takes no part in ranking, dedup identity, or
+    /// authorization. Two candidates with the same name but different
+    /// fingerprints remain two distinct candidates.
+    pub device_name: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +124,7 @@ fn parse_manual_entry(item: &str) -> Result<PeerCandidate, DiscoveryError> {
         addr,
         fingerprint,
         source: CandidateSource::Manual,
+        device_name: None,
     })
 }
 
@@ -149,7 +160,10 @@ impl MdnsDiscovery {
         let fp_hex = hex_encode(fingerprint.as_bytes());
         let instance = short_hex(fingerprint.as_bytes());
         let host_name = format!("ak-{instance}.local.");
-        let properties = [("fp", fp_hex.as_str()), ("name", device_name)];
+        // Publish the same sanitized form we accept from peers so a long or
+        // control-heavy local name cannot bloat or mangle our own TXT record.
+        let device_name = sanitize_device_name(device_name).unwrap_or_default();
+        let properties = [("fp", fp_hex.as_str()), ("name", device_name.as_str())];
         let info = mdns_sd::ServiceInfo::new(
             SERVICE_TYPE,
             &instance,
@@ -181,19 +195,44 @@ impl MdnsDiscovery {
 
     /// Browse for `duration`, returning discovered candidates (IPv4 and IPv6).
     ///
+    /// Delegates to [`MdnsDiscovery::browse_with`] and collects the callbacks
+    /// into a `Vec`; see that method for dedup semantics.
+    pub fn browse(&self, duration: Duration) -> Result<Vec<PeerCandidate>, DiscoveryError> {
+        let mut out: Vec<PeerCandidate> = Vec::new();
+        self.browse_with(duration, |candidate| out.push(candidate))?;
+        Ok(out)
+    }
+
+    /// Browse for `duration`, invoking `on_event` in real time for every
+    /// **new** candidate (IPv4 and IPv6).
+    ///
     /// Every resolved address of every service instance becomes a candidate
     /// with source [`CandidateSource::Mdns`]. A malformed or missing `fp` TXT
     /// property yields `fingerprint: None` rather than an error: a candidate
-    /// is only a hint and is authenticated before any transfer anyway.
-    /// Returns what it collected when the time budget ends or the event
-    /// channel closes.
-    pub fn browse(&self, duration: Duration) -> Result<Vec<PeerCandidate>, DiscoveryError> {
+    /// is only a hint and is authenticated before any transfer anyway. The
+    /// `name` TXT property becomes `device_name` after sanitizing.
+    ///
+    /// Dedup is by `(addr, fingerprint)`: the same peer re-resolving to the
+    /// same address and fingerprint fires once, but the same address held by
+    /// two different fingerprints yields two candidates (the final ranked
+    /// list still collapses them by address). Returns when the time budget
+    /// ends or the daemon closes the event channel.
+    ///
+    /// mdns-sd keeps one querier per service type per daemon, so the caller
+    /// must not run `browse`/`browse_with`/`watch` concurrently on the same
+    /// [`MdnsDiscovery`] instance; a later call replaces the earlier
+    /// listener.
+    pub fn browse_with(
+        &self,
+        duration: Duration,
+        mut on_event: impl FnMut(PeerCandidate),
+    ) -> Result<(), DiscoveryError> {
         let receiver = self
             .daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
         let deadline = std::time::Instant::now() + duration;
-        let mut out: Vec<PeerCandidate> = Vec::new();
+        let mut seen: HashSet<CandidateKey> = HashSet::new();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -207,22 +246,106 @@ impl MdnsDiscovery {
             let mdns_sd::ServiceEvent::ServiceResolved(info) = event else {
                 continue;
             };
-            let port = info.get_port();
-            let fingerprint = info.get_property_val_str("fp").and_then(decode_fingerprint);
-            for ip in info.get_addresses() {
-                let candidate = PeerCandidate {
-                    addr: SocketAddr::new(*ip, port),
-                    fingerprint,
-                    source: CandidateSource::Mdns,
-                };
-                if !out.iter().any(|c| c.addr == candidate.addr) {
-                    out.push(candidate);
+            for candidate in candidates_from_resolved(&info) {
+                if seen.insert(CandidateKey::of(&candidate)) {
+                    on_event(candidate);
                 }
             }
         }
         // Free the daemon-side channel for this search.
         let _ = self.daemon.stop_browse(SERVICE_TYPE);
-        Ok(out)
+        Ok(())
+    }
+
+    /// Continuous discovery for watch-style callers: browse in ~3s rounds
+    /// until `stop` is set, calling `on_event` for each candidate that is
+    /// new across the whole session (dedup by `(addr, fingerprint)`, same
+    /// semantics as [`MdnsDiscovery::browse_with`]).
+    ///
+    /// This is a synchronous API on purpose: mdns-sd runs its own daemon
+    /// thread and needs no async runtime, so the caller runs this loop on
+    /// one of its own threads (or inside `spawn_blocking`) and sets `stop`
+    /// from another. Stop latency is one browse round (~3s worst case): the
+    /// current round always finishes so the daemon-side channel is freed
+    /// cleanly. A daemon-side browse error aborts the watch and is returned.
+    ///
+    /// The same single-querier caveat as `browse_with` applies: do not run
+    /// concurrent discovery calls on the same instance.
+    pub fn watch(
+        &self,
+        stop: &AtomicBool,
+        mut on_event: impl FnMut(PeerCandidate) + Send,
+    ) -> Result<(), DiscoveryError> {
+        let mut seen: HashSet<CandidateKey> = HashSet::new();
+        // Relaxed is enough: a stale `stop` only costs one extra browse
+        // round, and no other memory is published through this flag.
+        while !stop.load(Ordering::Relaxed) {
+            self.browse_with(Duration::from_secs(3), |candidate| {
+                if seen.insert(CandidateKey::of(&candidate)) {
+                    on_event(candidate);
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Dedup identity of a candidate within browse/watch: same address AND same
+/// fingerprint means the same peer; a missing fingerprint is its own key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CandidateKey {
+    addr: SocketAddr,
+    fingerprint: Option<Fingerprint>,
+}
+
+impl CandidateKey {
+    fn of(candidate: &PeerCandidate) -> Self {
+        Self {
+            addr: candidate.addr,
+            fingerprint: candidate.fingerprint,
+        }
+    }
+}
+
+/// Map one resolved mDNS service instance to one candidate per address.
+/// TXT parsing is lenient on purpose (see `browse_with`): a bad `fp` or
+/// `name` degrades the candidate's metadata instead of dropping it.
+fn candidates_from_resolved(info: &mdns_sd::ServiceInfo) -> Vec<PeerCandidate> {
+    let port = info.get_port();
+    let fingerprint = info.get_property_val_str("fp").and_then(decode_fingerprint);
+    let device_name = info
+        .get_property_val_str("name")
+        .and_then(sanitize_device_name);
+    info.get_addresses()
+        .iter()
+        .map(|ip| PeerCandidate {
+            addr: SocketAddr::new(*ip, port),
+            fingerprint,
+            source: CandidateSource::Mdns,
+            device_name: device_name.clone(),
+        })
+        .collect()
+}
+
+/// Sanitize a peer-supplied device name for display: control characters
+/// become spaces (display-injection defense: control chars can reshape or
+/// forge terminal/UI output) and the result is truncated to at most 64
+/// bytes without splitting a UTF-8 character. A name that is empty or only
+/// whitespace after sanitizing yields `None`: there is nothing worth
+/// displaying, so the candidate reports no name rather than a blank one.
+fn sanitize_device_name(raw: &str) -> Option<String> {
+    const MAX_BYTES: usize = 64;
+    let mut out = String::with_capacity(raw.len().min(MAX_BYTES));
+    for ch in raw.chars() {
+        if out.len() + ch.len_utf8() > MAX_BYTES {
+            break;
+        }
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -365,6 +488,19 @@ mod tests {
             addr: text.parse().expect("test addr"),
             fingerprint,
             source,
+            device_name: None,
+        }
+    }
+
+    fn cand_named(
+        text: &str,
+        fingerprint: Option<Fingerprint>,
+        source: CandidateSource,
+        device_name: Option<&str>,
+    ) -> PeerCandidate {
+        PeerCandidate {
+            device_name: device_name.map(str::to_string),
+            ..cand(text, fingerprint, source)
         }
     }
 
@@ -567,6 +703,212 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_device_name_truncates_to_64_bytes_on_char_boundary() {
+        // Pure ASCII: 70 bytes -> exactly the first 64 bytes.
+        let ascii = sanitize_device_name(&"a".repeat(70)).expect("ascii name");
+        assert_eq!(ascii.len(), 64);
+        assert_eq!(ascii, "a".repeat(64));
+        // Exactly at the cap stays intact.
+        assert_eq!(
+            sanitize_device_name(&"b".repeat(64)).as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        // 3-byte chars: 22 of them are 66 bytes, so only 21 (63 bytes) fit
+        // and the 22nd is never split.
+        let cjk = sanitize_device_name(&"字".repeat(22)).expect("cjk name");
+        assert_eq!(cjk.len(), 63);
+        assert_eq!(cjk.chars().count(), 21);
+        assert_eq!(cjk, "字".repeat(21));
+        // A 4-byte char that would straddle the cap is dropped whole:
+        // 61 ASCII bytes + one emoji (4 bytes) = 65 > 64.
+        let mixed = sanitize_device_name(&format!("{}{}", "c".repeat(61), "😀")).expect("mixed");
+        assert_eq!(mixed, "c".repeat(61));
+        // Below the cap nothing changes.
+        assert_eq!(
+            sanitize_device_name("Alice's laptop").as_deref(),
+            Some("Alice's laptop")
+        );
+        // Empty input is not a name.
+        assert_eq!(sanitize_device_name(""), None);
+    }
+
+    #[test]
+    fn sanitize_device_name_replaces_control_characters_with_spaces() {
+        // BEL, DEL, ESC and NEL (U+0085, 2 UTF-8 bytes) are all control
+        // characters and all become one space each.
+        assert_eq!(
+            sanitize_device_name("A\u{7}B\u{7f}C\u{1b}D\u{85}E").as_deref(),
+            Some("A B C D E")
+        );
+        // NUL bytes cannot smuggle truncation or padding tricks in.
+        assert_eq!(
+            sanitize_device_name("\u{0}\u{0}tab").as_deref(),
+            Some("  tab")
+        );
+        // Newlines and tabs flatten to spaces too (single-line display).
+        assert_eq!(
+            sanitize_device_name("row1\nrow2\tend").as_deref(),
+            Some("row1 row2 end")
+        );
+        // A control char that lands on the 64th byte counts as one byte of
+        // the budget; anything past the cap is never emitted.
+        let dirty = format!("{}\u{1}{}", "d".repeat(63), "e".repeat(80));
+        let cleaned = sanitize_device_name(&dirty).expect("long dirty name");
+        assert_eq!(cleaned.len(), 64);
+        assert_eq!(cleaned, format!("{} ", "d".repeat(63)));
+        // Printable non-ASCII is preserved.
+        assert_eq!(
+            sanitize_device_name("手机-1234").as_deref(),
+            Some("手机-1234")
+        );
+    }
+
+    #[test]
+    fn resolved_candidates_carry_cleaned_name_and_fingerprint() {
+        let bytes = [9u8; 32];
+        let fingerprint = Fingerprint::from_bytes(bytes);
+        let properties = [
+            ("fp", fp_hex(&bytes)),
+            ("name", String::from("De\u{1}vice-ak\u{7f}")),
+        ];
+        let info = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            "inst9a7b",
+            "ak-inst9a7b.local.",
+            "127.0.0.1,::1",
+            7100,
+            &properties[..],
+        )
+        .expect("service info");
+        let candidates = candidates_from_resolved(&info);
+        // One candidate per resolved address, all sharing the TXT metadata.
+        assert_eq!(candidates.len(), 2);
+        for candidate in &candidates {
+            assert_eq!(candidate.source, CandidateSource::Mdns);
+            assert_eq!(candidate.fingerprint, Some(fingerprint));
+            assert_eq!(candidate.device_name.as_deref(), Some("De vice-ak "));
+            assert_eq!(candidate.addr.port(), 7100);
+        }
+        let addrs: Vec<String> = candidates.iter().map(|c| c.addr.to_string()).collect();
+        assert!(addrs.contains(&"127.0.0.1:7100".to_string()));
+        assert!(addrs.contains(&"[::1]:7100".to_string()));
+
+        // Missing or malformed metadata degrades to None, not an error.
+        let bare = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            "inst9a7b",
+            "ak-inst9a7b.local.",
+            "127.0.0.1",
+            7100,
+            &[
+                (String::from("fp"), String::from("not-hex")),
+                (String::from("other"), String::from("x")),
+            ][..],
+        )
+        .expect("bare service info");
+        let candidates = candidates_from_resolved(&bare);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].fingerprint, None);
+        assert_eq!(candidates[0].device_name, None);
+
+        // An all-blank name is dropped to None as well.
+        let blank = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            "inst9a7b",
+            "ak-inst9a7b.local.",
+            "127.0.0.1",
+            7100,
+            &[(String::from("name"), String::from("\u{1}\u{2}\u{3}"))][..],
+        )
+        .expect("blank-name service info");
+        let candidates = candidates_from_resolved(&blank);
+        assert_eq!(candidates[0].fingerprint, None);
+        assert_eq!(candidates[0].device_name, None);
+    }
+
+    #[test]
+    fn rank_is_invariant_to_device_name() {
+        let nets = [net4("192.168.1.0", 24)];
+        let plain = vec![
+            cand("8.8.8.8:9000", Some(fp(1)), CandidateSource::Mdns),
+            cand("192.168.1.55:9000", Some(fp(2)), CandidateSource::Mdns),
+            cand("[fe80::1]:9000", Some(fp(3)), CandidateSource::Mdns),
+        ];
+        let named: Vec<PeerCandidate> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut named = c.clone();
+                named.device_name = Some(format!("peer-{i}"));
+                named
+            })
+            .collect();
+        // Same ordering and payloads with or without names; names ride along.
+        let ranked_plain = rank(plain.clone(), &nets);
+        let ranked_named = rank(named, &nets);
+        assert_eq!(addr_strings(&ranked_plain), addr_strings(&ranked_named));
+        // The names ride along with their candidates through the reordering:
+        // input order was [peer-0 public, peer-1 lan, peer-2 link-local].
+        let ranked_names: Vec<_> = ranked_named
+            .iter()
+            .map(|c| c.device_name.as_deref())
+            .collect();
+        assert_eq!(
+            ranked_names,
+            vec![Some("peer-2"), Some("peer-1"), Some("peer-0")]
+        );
+
+        // Dedup by address keeps the higher-priority source's whole payload,
+        // including its device_name: a manual entry without a name displaces
+        // an mDNS candidate that had one.
+        let ranked = rank(
+            vec![
+                cand_named("1.2.3.4:5", Some(fp(1)), CandidateSource::Mdns, Some("Bob")),
+                cand("1.2.3.4:5", Some(fp(2)), CandidateSource::Manual),
+                cand_named(
+                    "5.6.7.8:5",
+                    Some(fp(3)),
+                    CandidateSource::Mdns,
+                    Some("Carol"),
+                ),
+                cand_named("5.6.7.8:5", Some(fp(4)), CandidateSource::Signaling, None),
+            ],
+            &[],
+        );
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].source, CandidateSource::Manual);
+        assert_eq!(ranked[0].device_name, None);
+        assert_eq!(ranked[1].source, CandidateSource::Signaling);
+        assert_eq!(ranked[1].device_name, None);
+        // Mdns keeps its name when it wins the slot.
+        let ranked = rank(
+            vec![
+                cand_named(
+                    "5.6.7.8:5",
+                    Some(fp(5)),
+                    CandidateSource::Mdns,
+                    Some("Dave"),
+                ),
+                cand_named(
+                    "5.6.7.8:5",
+                    Some(fp(6)),
+                    CandidateSource::Mdns,
+                    Some("Erin"),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].device_name.as_deref(), Some("Dave"));
+    }
+
+    #[test]
+    fn manual_and_default_candidates_have_no_device_name() {
+        let parsed = parse_manual_list("1.2.3.4:5").expect("manual entry");
+        assert_eq!(parsed[0].device_name, None);
+    }
+
     // Best-effort integration test: mDNS requires multicast, which may be
     // unavailable in this environment. Every degraded outcome prints the
     // reason via eprintln and counts as a skip, not a failure.
@@ -612,8 +954,94 @@ mod tests {
             Some(candidate) => {
                 assert_eq!(candidate.source, CandidateSource::Mdns);
                 assert_eq!(candidate.fingerprint, Some(fingerprint));
+                assert_eq!(candidate.device_name.as_deref(), Some("ak-test-device"));
                 assert_eq!(candidate.addr.port(), port);
             }
         }
+    }
+
+    // Best-effort, same skip rules as above: exercises the callback path of
+    // browse_with (browse delegates to it) and its (addr, fingerprint)
+    // dedup against a real multicast round trip.
+    #[test]
+    fn mdns_browse_with_dedup_best_effort() {
+        let fingerprint = fp(0xab);
+        let mut discovery = match MdnsDiscovery::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP: mDNS daemon unavailable in this environment: {e}");
+                return;
+            }
+        };
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|sock| sock.local_addr())
+            .map(|addr| addr.port())
+            .unwrap_or(45_679);
+        // Advertise a name that needs sanitizing: the TXT must carry the
+        // cleaned form and the callback must deliver it unchanged.
+        if let Err(e) = discovery.advertise(port, &fingerprint, "ak \u{7}dev") {
+            eprintln!("SKIP: mDNS advertise failed (multicast likely unavailable): {e}");
+            return;
+        }
+
+        let mut seen: Vec<PeerCandidate> = Vec::new();
+        let result =
+            discovery.browse_with(Duration::from_secs(3), |candidate| seen.push(candidate));
+        discovery.stop_advertise();
+        let found = match result {
+            Ok(()) => seen,
+            Err(e) => {
+                eprintln!("SKIP: mDNS browse_with failed: {e}");
+                return;
+            }
+        };
+
+        // Dedup contract: no (addr, fingerprint) pair may repeat.
+        let mut keys: HashSet<(SocketAddr, Option<Fingerprint>)> = HashSet::new();
+        for candidate in &found {
+            assert!(
+                keys.insert((candidate.addr, candidate.fingerprint)),
+                "duplicate candidate {:?}",
+                candidate.addr
+            );
+        }
+        match found.iter().find(|c| c.fingerprint == Some(fingerprint)) {
+            None => {
+                eprintln!(
+                    "SKIP: mDNS browse_with saw {} candidate(s) but none matched the local \
+                     fingerprint (multicast loopback likely unavailable)",
+                    found.len()
+                );
+            }
+            Some(candidate) => {
+                assert_eq!(candidate.device_name.as_deref(), Some("ak  dev"));
+            }
+        }
+    }
+
+    // watch() with a pre-set stop flag must return immediately and quietly;
+    // this pins the stop contract without depending on multicast timing.
+    // Daemon creation itself is still best-effort.
+    #[test]
+    fn watch_with_stop_pre_set_returns_immediately() {
+        let discovery = match MdnsDiscovery::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP: mDNS daemon unavailable in this environment: {e}");
+                return;
+            }
+        };
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        let mut events = 0usize;
+        discovery
+            .watch(&stop, |_candidate| events += 1)
+            .expect("watch with pre-set stop must not error");
+        assert_eq!(events, 0);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "watch returned only after {:?}, stop was pre-set",
+            start.elapsed()
+        );
     }
 }

@@ -1,8 +1,9 @@
 //! Task checkpoint persistence.
 //!
 //! v1 is a line-based file store with atomic writes (write temp, fsync,
-//! rename). The trait matches what a SQLite backend (BACKLOG P1-03) will
-//! implement later; the engine only sees [`CheckpointStore`].
+//! rename). An optional SQLite backend (BACKLOG P1-03, `sqlite` feature,
+//! [`sqlite::SqliteCheckpointStore`]) implements the same trait with the same
+//! semantics; the engine only sees [`CheckpointStore`].
 //!
 //! Rule from PROTOCOL: a completed marker is written strictly after final
 //! verification and save commit, never before.
@@ -82,6 +83,13 @@ pub trait CheckpointStore: Send + Sync {
     /// Remove after successful completion and commit; returns false if absent.
     fn remove(&self, job_id: &JobIdBytes) -> io::Result<bool>;
 }
+
+/// Optional SQLite backend (BACKLOG P1-03); semantics match the file backend.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteCheckpointStore;
 
 /// File-per-job store under a directory, files named `<job hex>.akjob`.
 pub struct FileCheckpointStore {
@@ -233,11 +241,14 @@ fn rename_replace(tmp: &Path, final_path: &Path) -> io::Result<()> {
     fs::rename(tmp, final_path)
 }
 
-fn invalid_data(message: impl Into<String>) -> io::Error {
+/// Invalid-data error shared by both backends (same kind the strict file
+/// parser produces).
+pub(crate) fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn valid_state(state: &str) -> bool {
+/// State charset rule `[A-Za-z0-9_-]+`, shared by both backends.
+pub(crate) fn valid_state(state: &str) -> bool {
     !state.is_empty()
         && state
             .chars()

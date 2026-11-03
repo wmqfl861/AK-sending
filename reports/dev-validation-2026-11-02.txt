@@ -328,3 +328,13 @@ $ cargo test -p ak-ffi → 6 passed（全部经 C ABI：版本/环回传输/坏 
 $ cargo test --workspace → 全绿（含 itests 全场景）
 # ak-ffi：9 个导出函数、错误码 0/1/2/-1..-5、19 种进度事件 JSON、unsafe 20 块全隔离于 shim（core forbid）、
 # spec JSON 未知字段忽略+控制字符拒绝；ADR-003 冻结契约与备选取舍；SECURITY 增 FFI 边界节。
+
+## 第十一轮（最终波）验证：Flutter 桌面端 UI（2026-11-03，2 并行代理互相接通＋集成者总验收）
+
+flutter_app：flutter analyze 零 issue；flutter test 46/46（UI 29 Fake 时间线驱动 + 服务 17 含真实 DLL 冒烟）；
+flutter build windows --release 成功 → ak_sending_app.exe (90,624B) + ak_ffi.dll (4,205,056B，SHA256 与 target/release 一致)
+packages/ak_ffi_dart：dart test 69/69（绑定 9 含真实环回 + 模型/状态 59 + smoke）
+打包：package_windows.ps1 -SkipFlutter:false → 17 文件 43,780,352B（CLI+DLL+GUI+data）→ zip 18,083,204B
+# 五页 GUI（主页身份卡/接收准入三选+any 警告弹层+监听横幅/发送多路径+开关/历史/关于），
+# 连通性失败文案对齐 UX 文档原文；TransferService 抽象（Fake 可测）+ FFI 实现三级 DLL 探测；
+# 已知限制：身份卡指纹/配对码空（ak-ffi 待 ak_identity_info 导出）、配对簿/前缀/历史列表待接（已列）

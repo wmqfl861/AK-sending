@@ -93,7 +93,7 @@
 
 - [x] ak_ffi_dart 纯 Dart 包（不经 Flutter 工具链即可开发验证——Dart SDK 随克隆就位）：FFI 绑定层（9 函数 dart:ffi、Dart 侧 spec 校验镜像 Rust、-3 自动扩容、Finalizer 防泄漏；真实 DLL 环回/取消/-3 语义 9 项测试）+ 模型层（19 事件类型化+Unknown 兜底、TransferReport、与 ak-cli 逐字对齐的 humanBytes/两行式指纹/进度条、准入策略解析——配对码匹配显式留给 Rust 不在 Dart 做哈希）+ 状态层（JobController 相位机/多连接聚合/文件表，FFI-free 59 项测试）。
 - [x] Windows 打包脚本 scripts/package_windows.ps1：exe+DLL+README+可选 Flutter 产物（探测式接入）+SHA256 MANIFEST+zip，两次自测幂等；仓库检查脚本同步排除 target/（dist 在场验证绿）。
-- [ ] Flutter 桌面端 UI（工具链首次构建进行中；widget 层+flutter build windows 验收待工具就绪）。
+- [x] Flutter 桌面端 UI（2026-11-03 终波，P1-04 的 Windows 桌面首端）：flutter test 46/46（Fake 时间线驱动的页面/组件测试 + 真实 DLL 服务冒烟）；`flutter build windows --release` 实际成功（exe+ak_ffi.dll 哈希一致）；五页 GUI（身份卡/接收/发送/历史/关于），连通性失败文案对齐 UX 文档；TransferService 抽象使 UI 全可测；打包脚本接入 → 完整产物 17 文件（CLI+DLL+GUI）zip 18MB。已知限制如实：身份卡指纹/配对码待 ak-ffi 导出身份 API、配对簿/前缀解析/历史列表本波未接（UI 文案已优雅降级）。
 
 ## P0
 

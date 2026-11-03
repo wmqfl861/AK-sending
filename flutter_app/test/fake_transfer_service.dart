@@ -43,6 +43,13 @@ class FakeTransferService implements TransferService {
   /// Directories captured by [setIdentityDir] calls.
   final List<String> identityDirRequests = [];
 
+  /// Value returned by [defaultReceiveOutDir]; '' (default) disables the
+  /// receive-page prefill so desktop-style tests are unaffected.
+  String defaultReceiveOutDirValue = '';
+
+  @override
+  Future<String> defaultReceiveOutDir() async => defaultReceiveOutDirValue;
+
   /// How many times pages called [refreshIdentity].
   int refreshIdentityCalls = 0;
 

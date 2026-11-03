@@ -233,9 +233,17 @@ abstract interface class TransferService {
   Future<DeviceInfo> refreshIdentity();
 
   /// Overrides the identity directory used by [refreshIdentity],
-  /// [listJobs] and job specs (`id_dir`; default
-  /// `%USERPROFILE%\.ak-sending`). An empty [dir] resets to the default.
+  /// [listJobs] and job specs (`id_dir`; desktop default
+  /// `%USERPROFILE%\.ak-sending`, Android default
+  /// `<app support>/.ak-sending`). An empty [dir] resets to the default.
   void setIdentityDir(String dir);
+
+  /// The platform default receive output directory, or `''` when the
+  /// platform has no better default than the user typing one (desktop).
+  /// Android implementations resolve the app-specific `Download` directory
+  /// (app-writable under scoped storage; the public Downloads directory is
+  /// not) — the receive page prefills its field from this. Never throws.
+  Future<String> defaultReceiveOutDir();
 
   /// Current coarse state for the status dot.
   TransferServiceStatus get status;

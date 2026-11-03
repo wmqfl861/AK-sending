@@ -32,6 +32,24 @@ class _ReceivePageState extends State<ReceivePage> {
   String? _formError;
 
   @override
+  void initState() {
+    super.initState();
+    _prefillOutDir();
+  }
+
+  /// Prefills the out-dir field with the platform default when the service
+  /// offers one (Android: the app-specific `Download` directory; desktop
+  /// services return '' and the user keeps typing the path). Never
+  /// overwrites a value typed before the async answer lands.
+  Future<void> _prefillOutDir() async {
+    final dir = await widget.service.defaultReceiveOutDir();
+    if (dir.isEmpty || _outDir.text.isNotEmpty || !mounted) {
+      return;
+    }
+    setState(() => _outDir.text = dir);
+  }
+
+  @override
   void dispose() {
     _session?.removeListener(_onSessionEvent);
     _outDir.dispose();

@@ -30,6 +30,32 @@ void main() {
     expect(find.byKey(_expectKey), findsNothing);
   });
 
+  testWidgets('out-dir field stays empty when the service has no platform '
+      'default (desktop typed-path UX)', (tester) async {
+    final fake = FakeTransferService(); // defaultReceiveOutDirValue: ''
+    await pumpPage(tester, ReceivePage(service: fake));
+    await tester.pump();
+
+    expect(
+      tester.widget<TextField>(find.byKey(_outDirKey)).controller?.text,
+      '',
+    );
+  });
+
+  testWidgets('out-dir field prefills from the platform default when the '
+      'service offers one (Android app-specific Download)', (tester) async {
+    final fake = FakeTransferService()
+      ..defaultReceiveOutDirValue =
+          '/storage/emulated/0/Android/data/dev.ak/files/Download';
+    await pumpPage(tester, ReceivePage(service: fake));
+    await tester.pump();
+
+    expect(
+      tester.widget<TextField>(find.byKey(_outDirKey)).controller?.text,
+      '/storage/emulated/0/Android/data/dev.ak/files/Download',
+    );
+  });
+
   testWidgets('pinned admission validates the expect text before starting',
       (tester) async {
     final fake = FakeTransferService();

@@ -3,6 +3,7 @@
 /// real-DLL loopback smoke that skips when ak_ffi.dll is absent.
 library;
 
+import 'dart:async' show Completer;
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -85,6 +86,149 @@ void main() {
         ),
         isNull,
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Android platform adaptation (dll_path tier-0 + service-layer dirs).
+  // -------------------------------------------------------------------------
+
+  group('Android 适配（dll_path tier-0 / 服务目录）', () {
+    test('android branch: bundled libak_ffi.so short-circuits every tier', () {
+      final resolution = resolveAkDllPath(
+        isAndroid: true,
+        // Even an explicit AK_FFI_DLL must not win — no env vars on Android.
+        environment: const {'AK_FFI_DLL': 'X:/custom/ak_ffi.dll'},
+        resolvedExecutable: '/fake/exe/app',
+        workingDirectory: '/fake/cwd',
+        exists: (path) => throw StateError('must not touch the filesystem'),
+      );
+      expect(resolution!.path, androidAkLibName);
+      expect(resolution.source, DllSource.bundled);
+      // Probe diagnostics on Android name only the bundled SONAME.
+      expect(akDllProbeCandidates(isAndroid: true), const [androidAkLibName]);
+    });
+
+    test('defaultAkDllFileName: android names the packaged cdylib', () {
+      expect(defaultAkDllFileName(isAndroid: true), androidAkLibName);
+    });
+
+    test('resolveDefaultReceiveOutDir: tier priority, guards, desktop empty',
+        () async {
+      // Desktop: no default — the receive page keeps its typed-path UX.
+      expect(
+        await FfiTransferService.resolveDefaultReceiveOutDir(isAndroid: false),
+        '',
+      );
+
+      // Tier 1 wins verbatim: path_provider's Android downloads directory IS
+      // the app-specific .../files/Download (no extra subdirectory).
+      expect(
+        await FfiTransferService.resolveDefaultReceiveOutDir(
+          isAndroid: true,
+          downloadsDirectory: () async =>
+              Directory('/storage/emulated/0/Android/data/dev.ak/files/Download'),
+        ),
+        '/storage/emulated/0/Android/data/dev.ak/files/Download',
+      );
+
+      // Tier 2: app-specific external root gains a Download/ subdirectory;
+      // a throwing downloads provider falls through instead of failing.
+      expect(
+        await FfiTransferService.resolveDefaultReceiveOutDir(
+          isAndroid: true,
+          downloadsDirectory: () async => throw StateError('no channel'),
+          externalStorageDirectory: () async =>
+              Directory('/storage/emulated/0/Android/data/dev.ak/files'),
+        ),
+        '/storage/emulated/0/Android/data/dev.ak/files/Download',
+      );
+
+      // Tier 3: internal app documents fallback.
+      expect(
+        await FfiTransferService.resolveDefaultReceiveOutDir(
+          isAndroid: true,
+          downloadsDirectory: () async => null,
+          externalStorageDirectory: () async => null,
+          applicationDocumentsDirectory: () async =>
+              Directory('/data/user/0/dev.ak/app_flutter'),
+        ),
+        '/data/user/0/dev.ak/app_flutter/Download',
+      );
+
+      // Last resort when every provider is absent: relative 'Download'.
+      expect(
+        await FfiTransferService.resolveDefaultReceiveOutDir(
+          isAndroid: true,
+          downloadsDirectory: () async => null,
+          externalStorageDirectory: () async => null,
+          applicationDocumentsDirectory: () async => null,
+        ),
+        'Download',
+      );
+    });
+
+    test('android identity dir: refreshIdentity/listJobs gate on the resolve '
+        'and re-anchor every facade call', () async {
+      final gate = Completer<String>();
+      final facade = FakeAkEngineFacade(jobsRows: [
+        <String, dynamic>{
+          'id': '0123456789abcdef',
+          'direction': 'receive',
+          'state': 'completed',
+          'files': 1,
+          'bytes': 10,
+          'updated_unix_ms': 1762000000000,
+        },
+      ]);
+      final service = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: facade,
+        pollInterval: const Duration(milliseconds: 1),
+        isAndroid: true,
+        androidIdentityDir: () => gate.future,
+      );
+      addTearDown(service.dispose);
+
+      final identity = service.refreshIdentity();
+      final jobs = service.listJobs();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(facade.idDirRequests, isEmpty, reason: '仍被 identityDirReady 门控');
+
+      gate.complete('/data/user/0/dev.ak/files/.ak-sending');
+      final info = await identity;
+      expect(info.fingerprintHex, 'ab' * 32);
+      expect(await jobs, hasLength(1));
+      // Every facade request used the resolved dir — never the provisional.
+      expect(
+        facade.idDirRequests.map((request) => request.$2).toSet(),
+        {'/data/user/0/dev.ak/files/.ak-sending'},
+      );
+      expect(service.identityDir, '/data/user/0/dev.ak/files/.ak-sending');
+    });
+
+    test('android identity dir: user override survives the late resolve; '
+        'empty reset lands on the resolved dir', () async {
+      final gate = Completer<String>();
+      final service = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: FakeAkEngineFacade(),
+        pollInterval: const Duration(milliseconds: 1),
+        isAndroid: true,
+        androidIdentityDir: () => gate.future,
+      );
+      addTearDown(service.dispose);
+
+      // Pin a directory before the async resolve lands.
+      service.setIdentityDir('/sdcard/custom-ids');
+      gate.complete('/data/user/0/dev.ak/files/.ak-sending');
+      await service.identityDirReady;
+      expect(service.identityDir, '/sdcard/custom-ids',
+          reason: '用户显式选择不可被平台解析覆盖');
+
+      // Empty reset returns to the resolved platform default.
+      service.setIdentityDir('  ');
+      expect(service.identityDir, '/data/user/0/dev.ak/files/.ak-sending');
     });
   });
 

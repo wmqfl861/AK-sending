@@ -1,6 +1,6 @@
-# ak_sending_app — AK-sending Flutter 桌面端（Windows）
+# ak_sending_app — AK-sending Flutter 端（Windows 桌面 + Android）
 
-AK-sending 的 Flutter 桌面应用壳：Material 3 + NavigationRail（主页 / 接收 /
+AK-sending 的 Flutter 应用壳：Material 3 + NavigationRail（主页 / 接收 /
 发送 / 历史 / 关于），传输能力经 FFI 调用仓库内 Rust 引擎（`ak-engine`），
 无中继、无云端暂存。
 
@@ -32,11 +32,12 @@ crates/ak-engine（内嵌 tokio 运行时，句柄式 C ABI，契约见 docs/adr
 | 文件 | 职责 |
 |---|---|
 | `lib/main.dart` | 入口：构造 `FfiTransferService` 交给 `ui/app.dart` 的壳 |
-| `lib/services/dll_path.dart` | DLL 三级探测（纯函数，可单测） |
+| `lib/services/dll_path.dart` | DLL 探测（Android tier-0 内置 so + 桌面三级；纯函数，可单测） |
 | `lib/services/transfer_service.dart` | 核心层抽象 + `DeviceInfo` 波次边界 + 异常 |
 | `lib/services/real_transfer_service.dart` | `EngineBackend` 注入缝、轮询泵、事件路由、单例 |
-| `lib/services/ffi_transfer_service.dart` | UI 契约实现（会话/准入/停止/历史） |
+| `lib/services/ffi_transfer_service.dart` | UI 契约实现（会话/准入/停止/历史 + 安卓目录适配） |
 | `windows/runner/CMakeLists.txt` | 构建时把 `ak_ffi.dll` 拷到 exe 旁（见下） |
+| `android/app/build.gradle.kts` | Android 平台：minSdk 24（NDK android24 对齐）、applicationId `dev.ak.ak_sending_app` |
 
 ## 构建（Windows）
 
@@ -68,6 +69,38 @@ flutter build windows --release
 
 三级全部未命中时构造不崩溃：状态点变"服务异常"，版本卡显示探测过的全部
 候选路径与修复提示；`startReceive`/`startSend` 抛 `StateError`。
+
+## 构建（Android，wave 13）
+
+前置：Android SDK/JDK（`JAVA_HOME` + `ANDROID_HOME`，集成者环境中
+`~/android-toolchain`）。`android/` 为 `flutter create --platforms=android
+--org dev.ak .` 生成的标准壳：minSdk 24（与 NDK clang 的 android24 目标三元
+组对齐）、`INTERNET` 权限（LAN 直传必需，release 只从 main manifest 获得）。
+
+```bash
+# 0. 引擎 so：交叉编译后放入 jniLibs（本波由集成者侧产出）
+#    android/app/src/main/jniLibs/<abi>/libak_ffi.so   （arm64-v8a / armeabi-v7a / x86_64）
+
+# 1. 构建（工作目录 flutter_app）
+flutter build apk --debug
+```
+
+### Android 平台差异（服务层吸收，UI 无感知）
+
+- **so 加载（tier 0）**：`libak_ffi.so` 随 apk 打包，`DynamicLibrary.open
+  ('libak_ffi.so')` 走 System.loadLibrary 语义（OS linker 在应用 native 库
+  目录解析）；`AK_FFI_DLL`/exe 同目录/CWD 探测全部跳过。
+- **身份目录**：无 `Platform.environment` 家目录概念，构造时经 path_provider
+  异步解析 `<应用支持目录>/.ak-sending`（`/data/user/0/dev.ak.ak_sending_app/
+  files/.ak-sending`）；`refreshIdentity`/`listJobs` 在首次引擎读取前等待解析
+  完成，用户 `setIdentityDir` 显式覆盖优先于解析结果。
+- **接收默认输出目录**：`getDownloadsDirectory`（Android 上是应用专属外部
+  `Android/data/<pkg>/files/Download`，path_provider ≥2.1 语义，非公共
+  Downloads）→ `getExternalStorageDirectory` + `Download/` → 应用文档目录 +
+  `Download/`；接收页异步预填，桌面仍手输路径。安卓 10+ 分区存储下公共
+  Downloads 不可任意写入——导出到公共位置（SAF/MediaStore）为后续波次。
+- **依赖**：`path_provider ^2.1.0`（ADR-002 受控新增，首个第三方运行时依赖：
+  安卓无可注入的家目录/存储根，只能经插件平台通道取得）。
 
 ### DLL 随构建分发（`windows/runner/CMakeLists.txt`）
 

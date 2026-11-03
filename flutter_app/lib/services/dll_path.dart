@@ -1,6 +1,14 @@
 /// Three-tier probe for the `ak_ffi` native library (see flutter_app/README.md
-/// "DLL 三级探测" for the operator-facing contract).
+/// "DLL 三级探测" for the operator-facing contract), plus an Android
+/// short-circuit (see [DllSource.bundled]).
 ///
+/// **Android（tier 0）**: the cdylib ships inside the apk as
+/// `jniLibs/<abi>/libak_ffi.so`; `DynamicLibrary.open('libak_ffi.so')` is
+/// resolved by the OS linker against the app's native library directory
+/// (System.loadLibrary semantics). No env/exe/CWD probing applies — not even
+/// `$AK_FFI_DLL`, which cannot be set on Android anyway.
+///
+/// **桌面（tiers 1–3）**:
 /// 1. **环境变量** `$AK_FFI_DLL` — explicit operator intent, returned verbatim
 ///    (existence is NOT checked; a typo surfaces as the OS loader's own error
 ///    naming that exact path).
@@ -20,8 +28,15 @@ library;
 
 import 'dart:io' show Directory, File, Platform;
 
+/// The SONAME the Android build packages into the apk (`jniLibs/<abi>/`).
+const String androidAkLibName = 'libak_ffi.so';
+
 /// Which tier produced the resolution.
 enum DllSource {
+  /// Android: the library is bundled inside the apk; the bare SONAME is
+  /// handed to `DynamicLibrary.open` (System.loadLibrary semantics).
+  bundled,
+
   /// `$AK_FFI_DLL` environment variable.
   environment,
 
@@ -45,7 +60,11 @@ final class DllResolution {
 }
 
 /// Native file name of the ak-ffi cdylib on the current OS.
-String defaultAkDllFileName() {
+///
+/// [isAndroid] is injectable for tests (defaults to `Platform.isAndroid`);
+/// Android names the packaged cdylib [androidAkLibName].
+String defaultAkDllFileName({bool? isAndroid}) {
+  if (isAndroid ?? Platform.isAndroid) return androidAkLibName;
   if (Platform.isWindows) return 'ak_ffi.dll';
   if (Platform.isMacOS) return 'libak_ffi.dylib';
   return 'libak_ffi.so';
@@ -53,6 +72,9 @@ String defaultAkDllFileName() {
 
 /// Resolves the ak-ffi native library, first tier wins.
 ///
+/// * [isAndroid] — defaults to `Platform.isAndroid`; when true the Android
+///   short-circuit returns the bundled [androidAkLibName] immediately
+///   (System.loadLibrary semantics) and no other tier runs;
 /// * [environment] — defaults to `Platform.environment`;
 /// * [resolvedExecutable] — defaults to `Platform.resolvedExecutable`
 ///   (tier 2 looks in its directory);
@@ -63,12 +85,18 @@ String defaultAkDllFileName() {
 /// Returns null when no tier resolves — callers should surface the tier list
 /// instead of silently continuing.
 DllResolution? resolveAkDllPath({
+  bool? isAndroid,
   Map<String, String>? environment,
   String? resolvedExecutable,
   String? workingDirectory,
   bool Function(String path)? exists,
   String? dllFileName,
 }) {
+  // Tier 0 (Android): bundled in the apk, bare SONAME for the OS linker.
+  if (isAndroid ?? Platform.isAndroid) {
+    return const DllResolution(path: androidAkLibName, source: DllSource.bundled);
+  }
+
   final env = environment ?? Platform.environment;
   final check = exists ?? (String path) => File(path).existsSync();
   final fileName = dllFileName ?? defaultAkDllFileName();
@@ -106,11 +134,17 @@ DllResolution? resolveAkDllPath({
 
 /// Every tier-2/3 candidate (for error/diagnostic messages). Tier 1 is
 /// excluded because it is only "a candidate" when the variable is set.
+/// On Android ([isAndroid], defaults to `Platform.isAndroid`) the single
+/// candidate is the bundled [androidAkLibName].
 List<String> akDllProbeCandidates({
+  bool? isAndroid,
   String? resolvedExecutable,
   String? workingDirectory,
   String? dllFileName,
 }) {
+  if (isAndroid ?? Platform.isAndroid) {
+    return const <String>[androidAkLibName];
+  }
   final fileName = dllFileName ?? defaultAkDllFileName();
   final exe = resolvedExecutable ?? Platform.resolvedExecutable;
   final cwd = workingDirectory ?? Directory.current.path;

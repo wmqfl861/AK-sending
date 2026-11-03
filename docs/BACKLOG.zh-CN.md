@@ -84,6 +84,13 @@
 - [x] 文档：SECURITY（并发隔离论证/双层注入防护/对抗加固/长名 part 回退，+7 条）、ARCHITECTURE（模块现状 5 行更新+接口 2 行，FileTransferEngine 过期行修正）。
 - [x] 第八轮后 workspace 417 项测试全绿、clippy 干净。
 
+第十轮（2026-11-03，2 个并行子代理；证据见 reports/dev-validation-2026-11-02.txt"第十轮并行开发验证"节）：
+
+- [x] ak-ffi C ABI 绑定层（ADR-003 契约先行）：9 个导出函数（句柄式/内嵌运行时/轮询进度 JSON/调用方缓冲区/spec JSON 未知字段忽略+控制字符拒绝）、错误码 0/1/2/-1..-5、catch_unwind 全入口；unsafe 20 块全部隔离于 shim 层逐块 SAFETY 注释（core 层 forbid(unsafe_code) 零 unsafe）；cdylib 产出 ak_ffi.dll 供前端动态加载。6 项测试全部经 C ABI 端到端：真实环回传输、20+ 坏 spec 反例、取消无假完成、双引擎无串扰、serve_concurrently 聚合。
+- [x] ADR-003（FFI 边界决策与备选取舍：bridge 代码生成/JSON-RPC 子进程/CLI 管道）；SECURITY 增 FFI 边界节（契约层防护与已知限制）。
+
+第十一轮进行中（2026-11-03，Dart 层与工具链并行）：flutter_app/packages/ak_ffi_dart 纯 Dart 包（FFI 绑定层+模型/状态层并行开发中，真实 DLL 环回为验证门槛）；Flutter SDK 已装（stable 浅克隆），工具链首次构建进行中；Windows 打包脚本并行开发中。完成后补记。
+
 ## P0
 
 - [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。

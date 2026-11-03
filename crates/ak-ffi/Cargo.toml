@@ -5,6 +5,9 @@ edition.workspace = true
 publish.workspace = true
 description = "C ABI over the transfer engine for future UI frontends (Flutter/native); unsafe confined to the audited shim"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ak-core = { workspace = true }
 ak-engine = { workspace = true }

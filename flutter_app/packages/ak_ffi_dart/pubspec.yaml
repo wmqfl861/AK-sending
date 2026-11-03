@@ -1,0 +1,11 @@
+name: ak_ffi_dart
+description: Pure-Dart bindings and state layer over the AK-sending ak-ffi C ABI (ADR-003); consumable by the future Flutter app via path dependency.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.0.0
+
+# No runtime dependencies: dart:ffi, dart:convert, dart:typed_data are core.
+dev_dependencies:
+  test: ^1.24.0

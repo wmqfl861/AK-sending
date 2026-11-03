@@ -13,3 +13,5 @@ __pycache__/
 *.pcapng
 .DS_Store
 Thumbs.db
+flutter_app/packages/ak_ffi_dart/.dart_tool/
+flutter_app/packages/ak_ffi_dart/.package_config.json

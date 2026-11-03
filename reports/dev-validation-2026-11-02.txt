@@ -322,3 +322,9 @@ $ bash scripts/smoke_loopback.sh --skip-probe → PASS（fmt 后复跑）
 # CI 工作流（双 OS 矩阵+手动深测 job，未推送未实跑如实标注）+ deny.toml；可重复双进程冒烟脚本
 # scripts/smoke_loopback.sh（完整含 probe 段 5 连跑全绿，固化 probe 启动顺序两个必要条件）；
 # reports/DEV_SUMMARY.zh-CN.md 执行摘要（九轮历程表+缺陷闭环实名）+ TEST_PLAN/ROADMAP 最终刷新。
+
+## 第十轮并行开发验证（2026-11-03，2 个并行子代理：ak-ffi 实现 + ADR-003）
+$ cargo test -p ak-ffi → 6 passed（全部经 C ABI：版本/环回传输/坏 spec 20+反例/取消无假完成/双引擎无串扰/并发接收聚合）
+$ cargo test --workspace → 全绿（含 itests 全场景）
+# ak-ffi：9 个导出函数、错误码 0/1/2/-1..-5、19 种进度事件 JSON、unsafe 20 块全隔离于 shim（core forbid）、
+# spec JSON 未知字段忽略+控制字符拒绝；ADR-003 冻结契约与备选取舍；SECURITY 增 FFI 边界节。

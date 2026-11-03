@@ -87,6 +87,7 @@ dependencies = [
  "ak-net",
  "ak-storage",
  "ak-store",
+ "ak-wire",
  "tempfile",
  "tokio",
 ]

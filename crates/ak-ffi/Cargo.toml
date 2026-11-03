@@ -12,6 +12,7 @@ ak-identity = { workspace = true }
 ak-net = { workspace = true }
 ak-storage = { workspace = true }
 ak-store = { workspace = true }
+ak-wire = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

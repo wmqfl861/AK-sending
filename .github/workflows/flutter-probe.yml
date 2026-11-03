@@ -1,0 +1,95 @@
+name: M0 Flutter risk harness (not device acceptance)
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: flutter-probe-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: windows-2022
+            platform: windows
+          - os: macos-26
+            platform: macos
+          - os: ubuntu-24.04
+            platform: android
+          - os: macos-26
+            platform: ios
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13.1'
+      - name: Pinned Rust and Flutter SDK
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          git clone --depth 1 --branch 3.47.0 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          test "$(git -C "$RUNNER_TEMP/flutter" rev-parse HEAD)" = '4cf24164269a5ebf0c16a028a00727d0e77bbb05'
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - name: Linux build prerequisites
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev
+      - name: Fixed Android tools and linker
+        if: matrix.platform == 'android'
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          mkdir -p validation/toolchain
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$SDKMANAGER" --list --channel=3 2>&1 | tee validation/toolchain/sdk-available.txt
+          "$SDKMANAGER" --channel=3 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;29.0.14206865' 2>&1 | tee validation/toolchain/android-install.txt
+          cat "$ANDROID_HOME/platforms/android-37.0/source.properties" | tee validation/toolchain/platform.txt
+          BIN="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-Clink-arg=-Wl,-z,max-page-size=16384' >> "$GITHUB_ENV"
+          rustup target add aarch64-linux-android --toolchain 1.97.1
+          java -version 2>&1 | tee validation/toolchain/java.txt
+      - name: Fixed Apple SDK
+        if: runner.os == 'macOS'
+        run: |
+          export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer
+          test -d "$DEVELOPER_DIR"
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '26.5'
+          mkdir -p validation/toolchain
+          xcodebuild -version | tee validation/toolchain/xcode.txt
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"
+          echo 'IPHONEOS_DEPLOYMENT_TARGET=15.0' >> "$GITHUB_ENV"
+          rustup target add aarch64-apple-ios --toolchain 1.97.1
+      - name: SDK and real release validation
+        run: |
+          flutter config --no-analytics
+          python scripts/run_flutter_validation.py --platform ${{ matrix.platform }} --output validation/flutter
+      - name: Exact committed source archive
+        if: always()
+        run: |
+          mkdir -p validation/flutter
+          git archive --format=zip --output=validation/flutter/source.zip HEAD
+      - name: Preserve results and generated products including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-${{ matrix.platform }}-${{ github.event.pull_request.head.sha }}
+          path: validation/
+          retention-days: 14

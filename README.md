@@ -22,15 +22,17 @@
 
 ## 当前实现状态
 
-**M0-02：最小认证直连适配器已开发、测试并审核；整个 M0 尚未完成。** [先行计划](docs/modules/M0-02_PLAN.zh-CN.md) · [审核记录](reports/M0-02_REVIEW.zh-CN.md) · [验证索引](reports/M0-02_VALIDATION.json)。
+**M0总状态为PARTIAL：M0-01至M0-04已完成各自范围的审核；M0-05工程子范围已审核并完成五端release构建，物理设备验收仍未完成。** [M0总表](reports/M0_STATUS.zh-CN.md) · [最新审核](reports/M0-05_REVIEW.zh-CN.md) · [验证索引](reports/M0-05_VALIDATION.json)。
 
-`ak-core` 仍无第三方运行时依赖，负责接收授权领域状态机；新增独立 `ak-transport`，以原生 UDP + quinn/rustls TLS 1.3 实现手工地址的双向认证连接、完整已配对证书固定、私有接收许可及有界固定探测。连接就绪不等于接收确认，旧会话/连接许可不能复用。取消未完成探测会关闭连接。
+`ak-core`无第三方运行时依赖；`ak-transport`提供原生UDP/quinn/rustls双向认证、完整配对证书固定、私有接收许可、68字节有界协议头与16KiB合成帧、TLS/task/sequence绑定及取消/正常收尾。文件数据中继仍被禁止。
 
-最终受测代码 `f0daac8aa464e645483920adc4f51188891a17bb`；Linux、Windows、macOS 每系统 81 项 Rust 用例、24 项 Python 测试及 fmt/clippy/依赖特性/源码无变更检查通过。Android arm64、iOS arm64 通过最小 library `cargo check`，不是完整 App 编译、安装或真机验收。具体 CI、失败修复及独立审查 SHA 见审核记录。
+独立的原生和Flutter实验壳已接通整数句柄FFI、低频状态、取消/释放与手机目录权限实验入口。最终受测且独立复审代码 `66555214e40e779013c07cb0bda3d6dcf6bd5332`：三桌面每系统108项生产Rust、6项native Rust通过；Linux/macOS 45项Python通过，Windows43项通过+2项Unix专用测试跳过；五个构建任务各7项Dart主机测试通过。三桌面运行真实Dart FFI，同机UDP/TLS成功。两Apple主机任务执行6项Swift真实文件回归。
 
-**尚不能传输用户文件。** 当前网络实测为同机 loopback 上的真实 UDP/TLS，不证明双机局域网或公网可达；未实现配对 UI/密钥持久化、文件协议/磁盘保存、持久化续传、NAT 穿透、自动选路、Flutter UI、手机权限与生命周期。无中继是实现约束，尚无跨网络抓包验收。性能与轻量预算尚未实测。
+Windows/Linux x64、macOS/Android/iOS arm64的Flutter release构建已通过；Android用测试密钥签名，iOS未签名。构建与链接不等于实机可用或商店发布。资源记录只有极小实验壳的产物字节，未证明完整产品性能预算。
 
-PR #3 叠加在 M0-01 PR #2 上，均未自动合并 main。M0-01 历史验收保留在 [原审核](reports/M0-01_REVIEW.zh-CN.md) 中，不将旧测试证据改写为新提交结果。
+**尚不能互传用户文件。** 当前实验固定loopback；独立两设备LAN实验驱动尚未接入。真实手机网络权限、目录持久授权/撤销、后台/锁屏/杀进程、两设备断外网Wi-Fi、最低系统与CPU/内存/启动预算未验收。没有生产文件引擎、可靠保存、持久续传、配对UI/密钥生命周期、NAT、自动LAN优先选路或完整产品GUI。
+
+最新工作分支 `dev/m0-05-flutter-risk-harness-20261102` / 草稿PR #6。所有PR仍未合并main，不部署、不采购、不强推。历史模块证据保留，不改写成当前提交的测试结果。
 
 ## 工程检查与模块流程
 

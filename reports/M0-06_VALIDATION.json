@@ -1,0 +1,87 @@
+{
+  "module": "M0-06",
+  "status": "REVIEWED_LAN_HARNESS_ONLY",
+  "plan_commit": "4bf8fa66b9863c5ca2baa498c8521c37fa84f42d",
+  "addendum_commit": "531a4e442a227618b1798e0aebeb3b800d27a01d",
+  "tested_and_reviewed_commit": "310079dbf9d07e9105bb419515ecc9b3f8debae6",
+  "tested_tree": "aaf4ccbd83e4f153ba2b459203c3eda527b49389",
+  "runs": {
+    "native": 41565411859,
+    "core": 41565411792,
+    "mobile_core": 41565411791,
+    "flutter_regression": 41565411783
+  },
+  "review": {
+    "actor": "chatgpt-codex-connector[bot]",
+    "actor_id": 199175422,
+    "receipt": 6593782051,
+    "summary": 6593753797,
+    "status": "completed_no_major_findings",
+    "formal_approved": false
+  },
+  "artifacts": [
+    {
+      "file": "m006-native-linux.zip",
+      "artifact_id": 13197829841,
+      "zip_sha256": "a3cafd722e4baf4ed833b8a2e9d9e7db0b2b2f700147d36e264983d73cc65b7a",
+      "results_sha256": "770ff3cf575a5c72a2376b7091c79c3a67199adc9c095ef9e6705bd140e7710b",
+      "commands": 11
+    },
+    {
+      "file": "m006-native-windows.zip",
+      "artifact_id": 13199630417,
+      "zip_sha256": "78297ac12c7b59384b57537a7d3c183f3051a8146c94714e2c4c7f260148e53a",
+      "results_sha256": "2c9791d80f1e4905047e5c31f59ab7df255de15c34b67afbf1326b9f244180ce",
+      "commands": 10
+    },
+    {
+      "file": "m006-native-macos.zip",
+      "artifact_id": 13198624907,
+      "zip_sha256": "78ec76d283818e0b556aa2349359688702a6be9b47ead78e81237faa26383a3d",
+      "results_sha256": "44d814aa9425c570d2c180d906a021e47bb8549d3ce8957862433b4847485c18",
+      "commands": 10
+    },
+    {
+      "file": "m006-native-android.zip",
+      "artifact_id": 13199210576,
+      "zip_sha256": "35c9a576cb6d60d8d0a5a4a137848f92c8ab960171dfdedc822763c12a715ded",
+      "results_sha256": "af53089c762c4f43b1418c8542e9a0af3679ddafa6c7120a6bc9f56eeba98beb",
+      "commands": 9
+    },
+    {
+      "file": "m006-native-ios.zip",
+      "artifact_id": 13198484908,
+      "zip_sha256": "5d55c5fc7707b5d6e7908753c2cbfb0f045924eb424555635291298be335fdd7",
+      "results_sha256": "60c0e04f3e7f72d920216f00f756fba7041c9c9cfd93858e199e6e93342f4dbc",
+      "commands": 8
+    }
+  ],
+  "local": {
+    "core_rust": 110,
+    "native_rust": 16,
+    "python": 49,
+    "namespace": "NOT_RUN_PERMISSION_DENIED"
+  },
+  "network_evidence": {
+    "three_desktop_independent_processes": "PASSED",
+    "linux_two_isolated_stacks_without_default_routes": "PASSED",
+    "cases": [
+      "explicit-pair-success",
+      "wrong-pin-rejected",
+      "cancel-listener"
+    ],
+    "physical_devices": false,
+    "wifi_tested": false
+  },
+  "artifact_retention_days": 14,
+  "not_proven": [
+    "whole M0 acceptance",
+    "physical devices",
+    "two-device Wi-Fi",
+    "mobile LAN UI at this commit",
+    "real permission/lifecycle/resource/minimum OS",
+    "user file I/O"
+  ],
+  "merged": false,
+  "deployed": false
+}

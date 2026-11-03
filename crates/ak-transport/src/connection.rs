@@ -79,6 +79,16 @@ impl DirectEndpoint {
         self.endpoint.local_addr().map_err(|_| Error::Closed)
     }
 
+    /// Close every connection on this endpoint and allow QUIC closing packets
+    /// to drain before the caller drops its runtime. Bounded, not a file ACK.
+    /// Consumes the endpoint; cancelling the wait cannot reopen its connections.
+    pub async fn shutdown(self) -> Result<()> {
+        self.endpoint.close(0_u32.into(), b"endpoint shutdown");
+        timeout(OPERATION_TIMEOUT, self.endpoint.wait_idle())
+            .await
+            .map_err(|_| Error::Timeout)
+    }
+
     pub async fn connect(&mut self, candidate: Candidate) -> Result<AuthenticatedDirectConnection> {
         let address = candidate.address()?;
         let connecting = self

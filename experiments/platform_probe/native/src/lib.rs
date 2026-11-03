@@ -1,8 +1,9 @@
-//! Synthetic loopback experiment. No pointers, user paths, credentials or target
-//! addresses cross this ABI. Load is inert; starting is an explicit caller action.
-//! One task per loaded library instance. This is not the product task manager.
+//! Isolated loopback and independent LAN experiments; no user file APIs.
+//! Load is inert. Each mode has one bounded task slot. LAN configuration is
+//! public scalar data only; private keys never cross the ABI. Not a product API.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod lan;
 mod probe;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};

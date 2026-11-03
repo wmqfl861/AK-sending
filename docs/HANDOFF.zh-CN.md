@@ -7,16 +7,18 @@
 服务器仅可用于设备发现、信令和 NAT 穿透协调，绝不承载文件数据或密文；ADR-001 不变。
 2026-11-02（第二阶段）：用户指示"继续本地开发，多模块多子代理并行，直到项目完成，不用推送"；本地分支推进，未推送、未部署、未强推、未加许可证。
 
-## 第二/三阶段完成内容（2026-11-02 至 2026-11-03，dev/local-parallel）
+## 第二至五阶段完成内容（2026-11-02 至 2026-11-03，dev/local-parallel）
 
 按 ADR-002（采纳评审 D1/D5/D6 路线）完成局域网 CLI 原型全栈：
 
-- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）。
+- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）→ `0140282`（第四、五轮：十并行代理＋接线）→ `9961506`（65,537 边界补记）。
 - 11 个 crate：ak-core（领域）、ak-identity、ak-wire、ak-storage、ak-net、ak-discovery、ak-store、ak-signal、ak-engine、ak-cli、ak-itests（跨 crate 场景测试）。
 - 数据面：QUIC（quinn 0.11）+ rustls/ring + 自签 Ed25519 证书双向钉扎；`DirectChannel` 无公开构造函数（类型约束）；无 relay/TURN 路径，Cargo.lock 依赖扫描锁定。
 - 引擎：完整端到端协议（见 ak-engine 文档），确定性任务 ID、窗口化确认、检查点续传、完成标记晚于校验+落盘；第三轮追加存储满预检（`check_headroom` 决策函数＋STORAGE_FULL 协议路径）与多根合并发送（`extra_roots`/`SourceSet`，`Report.roots`）。
 - 协调面：信令 TCP + STUN UDP 单进程（`ak-cli signal-server`），封闭消息集、限频、会话 TTL，无文件路由（测试锁定）；第三轮追加同出口提示（`PeerSignal::SameEgress`，两端 TCP 对端 IP 一致时各发一条，仅排序提示非信任判定）。
-- 验证证据：[开发验证记录](../reports/dev-validation-2026-11-02.txt)——第三轮后 workspace 308 项测试、clippy `-D warnings`、仓库检查、12 项 Python 测试、5 GiB 稀疏 release 环回（84.3s）、真实双进程 CLI 传输逐字节一致。
+- 验证证据：[开发验证记录](../reports/dev-validation-2026-11-02.txt)——第五轮后 workspace 364 项测试、clippy `-D warnings`、仓库检查、12 项 Python 测试、5 GiB 稀疏 release 环回（最新 111.49s）、真实双进程 CLI 传输逐字节一致、65,537 文件分页边界 release 实测完成（257 页清单）。
+
+第四/五轮新增（2026-11-03，提交 `0140282`，11 个并行子代理＋集成者）：ResumeRequest 多帧分页（单任务条目上限解除，100k 单元验证＋65,537 边界实测）；SQLite 检查点后端（可选特性 `sqlite`，默认依赖图零泄漏，事务原子性）；`DirectChannel::stats()` 连接统计（无中继运行时旁证）；T06 身份替换攻击面三场景、T08 端口变更重评估、T10 多流续传（ak-itests）；CLI 多路径发送＋指纹唯一前缀解析＋SameEgress 提示；发现模块设备名/browse_with/watch；DirectPolicy 策略闸门接入真实通道（`--no-internet`，零字节进入协议）；`ak-cli doctor` 环境自检；发送端 14 错误码友好映射；块尺寸扫描基准（64KiB 最差 -23%）；README/UX/OPERATIONS 现状化。
 
 第三轮新增（2026-11-03，提交 `5ac6f2a`，4 个并行子代理＋集成者）：
 

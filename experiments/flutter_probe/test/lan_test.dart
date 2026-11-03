@@ -262,7 +262,14 @@ void main() {
       await tester.tap(find.byKey(const Key('lan-prepare')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 200));
-      await tester.ensureVisible(find.byKey(const Key('lan-start')));
+      // The list lazily creates controls below the viewport. Scroll the outer
+      // list until the target exists; do not weaken the disabled-start assertion.
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('lan-start')),
+        300,
+        scrollable: find.byType(Scrollable).first,
+        maxScrolls: 20,
+      );
       final start = tester.widget<FilledButton>(
         find.byKey(const Key('lan-start')),
       );
@@ -270,6 +277,59 @@ void main() {
       expect(api.starts, 0);
       await tester.pumpWidget(const SizedBox());
       await tester.pump();
+    },
+  );
+  testWidgets(
+    'LAN screen starts only after importing and explicitly confirming',
+    (tester) async {
+      final api = FakeLan()..releaseCode = -2;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: LanPage(api: api, permission: () async => 'granted'),
+        ),
+      );
+      await tester.enterText(find.byKey(const Key('lan-ip')), '192.168.1.1');
+      await tester.tap(find.byKey(const Key('lan-prepare')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('lan-offer')),
+        300,
+        scrollable: find.byType(Scrollable).first,
+        maxScrolls: 20,
+      );
+      await tester.enterText(find.byKey(const Key('lan-offer')), offer);
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('lan-pair')),
+        200,
+        scrollable: find.byType(Scrollable).first,
+        maxScrolls: 20,
+      );
+      await tester.tap(find.byKey(const Key('lan-pair')));
+      await tester.pump();
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('lan-start')),
+        200,
+        scrollable: find.byType(Scrollable).first,
+        maxScrolls: 20,
+      );
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const Key('lan-start')))
+            .onPressed,
+        isNull,
+      );
+      expect(api.starts, 0);
+      await tester.ensureVisible(find.byKey(const Key('lan-confirm')));
+      await tester.tap(find.byKey(const Key('lan-confirm')));
+      await tester.pump();
+      await tester.ensureVisible(find.byKey(const Key('lan-start')));
+      await tester.tap(find.byKey(const Key('lan-start')));
+      await tester.pump();
+      expect(api.starts, 1);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+      expect(api.cancels, 1);
     },
   );
 }

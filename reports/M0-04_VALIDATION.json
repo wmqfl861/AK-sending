@@ -1,0 +1,101 @@
+{
+  "module": "M0-04",
+  "status": "REVIEWED_NATIVE_PROBE_ONLY",
+  "plan_commit": "926a413d3468b50308f7fca15f69d199134b7aac",
+  "tested_and_reviewed_commit": "171b3be9974f00139212360ebd8ec1acc9cde42e",
+  "native_run": 41455473740,
+  "production_core_run": 41455473751,
+  "mobile_library_run": 41455473689,
+  "artifacts": [
+    {
+      "platform": "linux",
+      "artifact_id": 13146816855,
+      "zip_sha256": "ff74ff235aff4ed7cd6638c81b4fa8b7f3ce3c439b0274faf7bd8712dcc7fdb5",
+      "results_sha256": "4f97ce79b61d709b2d559dc5d0c9c26bcb163ec6f09ddd9e72772e60156ae0bb",
+      "commands": 9,
+      "native_rust_tests": 6,
+      "native_artifact": {
+        "name": "libak_m0_probe.so",
+        "bytes": 3510128,
+        "sha256": "91e54be4bd5e82734e6755c24ee5ff41d76b67b4a927aeef3b05219341e518bc"
+      }
+    },
+    {
+      "platform": "windows",
+      "artifact_id": 13146519783,
+      "zip_sha256": "58cff7f22260295576c1d5daae13aa923b4a8db4a8f07df8b76aa74b800632d9",
+      "results_sha256": "873ef51325ad4e92bab7c59780ba41dabd938ed3da4d89d11dab73e92b9b4094",
+      "commands": 9,
+      "native_rust_tests": 6,
+      "native_artifact": {
+        "name": "ak_m0_probe.dll",
+        "bytes": 2299904,
+        "sha256": "c43f5027c13b716853ce34e4cc757ae7fd1981a1ffcdb961b66a4c7169db9393"
+      }
+    },
+    {
+      "platform": "macos",
+      "artifact_id": 13146273289,
+      "zip_sha256": "cf89b66f8829acb95e9f69ea2f032747bea64843a0049764f0580d9dcc0f845b",
+      "results_sha256": "48a50afdec0d6698f261862ca695b93057045a4df8e2c18b2cea1b330b6bdb9c",
+      "commands": 9,
+      "native_rust_tests": 6,
+      "native_artifact": {
+        "name": "libak_m0_probe.dylib",
+        "bytes": 3013872,
+        "sha256": "c87563b47c278b3e99533ec86dbdfb160061e8fc146014eb4936863c635e574c"
+      }
+    },
+    {
+      "platform": "android",
+      "artifact_id": 13145818941,
+      "zip_sha256": "f2a52392e2eb99dab77eedd6370aa254390e5e21b972a10883dcf6a7889aa784",
+      "results_sha256": "9d8eeb2d82b48c5d716578d23449229b3420c3bf3c6ceb59d99f1549b30a53d6",
+      "commands": 7,
+      "native_rust_tests": null,
+      "native_artifact": {
+        "name": "libak_m0_probe.so",
+        "bytes": 3542360,
+        "sha256": "f594ccad9764a8f349d00f54568e54cee9d91a604f63451fc60fe06ad81f3f0d"
+      }
+    },
+    {
+      "platform": "ios",
+      "artifact_id": 13145454755,
+      "zip_sha256": "503fdc330768889a9bf8e9a7fb0759e3ab7f69f8d75e04f7fd20e6a7179222d4",
+      "results_sha256": "3da474df8ac0f49a7ca572bf1eb608f97cee0b92d4f47a3c6231b2eea36d28ad",
+      "commands": 8,
+      "native_rust_tests": null,
+      "native_artifact": {
+        "name": "libak_m0_probe.a",
+        "bytes": 38690176,
+        "sha256": "b598e13530a4db9f4b4188a899cbd4c661368a29bb697c7a1b828ef232bba5a9"
+      }
+    }
+  ],
+  "review": {
+    "actor": "chatgpt-codex-connector[bot]",
+    "actor_id": 199175422,
+    "receipt": 6578890225,
+    "summary": 6578606119,
+    "status": "completed_no_major_findings",
+    "formal_approved": false
+  },
+  "retained_failure": {
+    "run": 41454690278,
+    "commit": "6ba736588a08705149cde56a2ab2fcf32f54b057",
+    "reason": "sdkmanager was not in PATH; explicit installed path fixes Android setup without weakening gates"
+  },
+  "verification": "All five archives downloaded. ZIP hashes, exact results commit, command exit codes, every logged command digest and native binary digest checked. Desktop native Rust test counts parsed as six each.",
+  "artifact_retention_days": 14,
+  "not_proven": [
+    "physical devices",
+    "two-device offline LAN",
+    "mobile permission semantics",
+    "App signing/install",
+    "App download/install size",
+    "device CPU/memory/cold-start"
+  ],
+  "merged": false,
+  "deployed": false
+}

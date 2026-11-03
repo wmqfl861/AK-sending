@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from prepare_flutter_probe import prepare, SYMBOLS
+from prepare_flutter_probe import prepare, FFI_SYMBOLS
 from run_validation import ROOT, all_passed, configure_console, file_sha256, git_value, run_one
 
 
@@ -43,7 +43,7 @@ def require_ffi_exports(log: Path, argv: list[str]) -> None:
         fields = line.split()
         if len(fields) == 3 and fields[1] == 'T':
             exports.add(fields[2])
-    if not all('_ak_m0_probe_' + symbol in exports for symbol in SYMBOLS):
+    if not all('_' + symbol in exports for symbol in FFI_SYMBOLS):
         raise ValueError('Required native symbols stripped')
 
 
@@ -122,6 +122,7 @@ def main() -> int:
         if not target:
             shared = release / {'linux':'libak_m0_probe.so', 'windows':'ak_m0_probe.dll', 'macos':'libak_m0_probe.dylib'}[platform]
             if not run('actual-dart-ffi', command('dart', 'run', 'tool/native_smoke.dart', str(shared)), project): return 1
+            if not run('actual-dart-lan-ffi', command('dart', 'run', 'tool/lan_smoke.dart', str(shared)), project): return 1
         build = command('flutter', 'build', 'apk' if platform == 'android' else platform,
                         '--release', '--no-pub')
         if platform == 'android': build += ['--target-platform=android-arm64']

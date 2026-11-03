@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import 'controller.dart';
 import 'native_api.dart';
+import 'lan_page.dart';
 
 const riskChannel = MethodChannel('ak.m0/risk');
 void main() => runApp(const MaterialApp(home: ProbePage()));
@@ -22,6 +23,8 @@ class _ProbePageState extends State<ProbePage> with WidgetsBindingObserver {
   ProbeController? controller;
   Timer? timer;
   bool operation = false;
+  bool lanRoute = false;
+  int operationEpoch = 0;
   bool foreground = true;
   String platformStatus = 'not-tested';
   @override
@@ -71,7 +74,9 @@ class _ProbePageState extends State<ProbePage> with WidgetsBindingObserver {
     setState(() {
       operation = true;
     });
+    final epoch = ++operationEpoch;
     final result = await (widget.permission?.call() ?? invoke('network'));
+    if (epoch != operationEpoch) return;
     if (!mounted) return;
     operation = false;
     platformStatus = result;
@@ -103,12 +108,17 @@ class _ProbePageState extends State<ProbePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     foreground = state == AppLifecycleState.resumed;
+    if (!foreground) {
+      ++operationEpoch;
+      operation = false;
+    }
     controller?.setForeground(foreground);
     watch();
   }
 
   @override
   void dispose() {
+    ++operationEpoch;
     WidgetsBinding.instance.removeObserver(this);
     timer?.cancel();
     final owned = controller;
@@ -126,7 +136,8 @@ class _ProbePageState extends State<ProbePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final idle = !operation && !(controller?.active ?? false) && foreground;
+    final idle =
+        !operation && !lanRoute && !(controller?.active ?? false) && foreground;
     return Scaffold(
       appBar: AppBar(title: const Text('AK · M0 风险实验')),
       body: ListView(
@@ -154,6 +165,24 @@ class _ProbePageState extends State<ProbePage> with WidgetsBindingObserver {
             child: const Text('取消并释放'),
           ),
           const Divider(height: 32),
+          OutlinedButton(
+            key: const Key('open-lan'),
+            onPressed: idle
+                ? () async {
+                    setState(() {
+                      lanRoute = true;
+                    });
+                    await Navigator.of(context).push<void>(
+                      MaterialPageRoute(builder: (_) => const LanPage()),
+                    );
+                    if (mounted)
+                      setState(() {
+                        lanRoute = false;
+                      });
+                  }
+                : null,
+            child: const Text('进入双设备局域网实验（非文件传输）'),
+          ),
           const Text('目录实验仅在明确操作后创建一个随机命名的 64 字节新文件，验证后删除；不会读取现有文件。请选择本机测试目录。'),
           OutlinedButton(
             onPressed: idle ? () => directory('choose') : null,

@@ -10,6 +10,8 @@ from run_validation import ROOT, file_sha256, git_value
 
 SOURCE = ROOT / 'experiments/flutter_probe'
 SYMBOLS = ['version', 'start', 'poll', 'cancel', 'release']
+LAN_SYMBOLS = ['version','prepare','poll','read','push','configure','start','cancel','release']
+FFI_SYMBOLS = ['ak_m0_probe_' + s for s in SYMBOLS] + ['ak_m0_lan_' + s for s in LAN_SYMBOLS]
 
 
 def replace_exact(path: Path, old: str, new: str, count: int = 1) -> None:
@@ -62,7 +64,7 @@ def prepare(project: Path, native: Path, platform: str) -> None:
     if platform in ['ios', 'macos']:
         config = project / ('ios/Flutter/Release.xcconfig' if platform == 'ios'
                             else 'macos/Runner/Configs/Release.xcconfig')
-        flags = ' '.join(f'-Wl,-u,_ak_m0_probe_{symbol}' for symbol in SYMBOLS)
+        flags = ' '.join(f'-Wl,-u,_{symbol}' for symbol in FFI_SYMBOLS)
         with config.open('a', encoding='utf-8') as stream:
             stream.write(f'\nOTHER_LDFLAGS = $(inherited) -force_load "{native.as_posix()}" '
                          f'-framework Security -framework SystemConfiguration -lresolv -liconv {flags} -Wl,-export_dynamic\n'
@@ -80,6 +82,8 @@ def prepare(project: Path, native: Path, platform: str) -> None:
             pbx = project / 'macos/Runner.xcodeproj/project.pbxproj'
             replace_exact(pbx, 'MACOSX_DEPLOYMENT_TARGET = 12.0;',
                           'MACOSX_DEPLOYMENT_TARGET = 13.0;', 3)
+            update_plist(project / 'macos/Runner/Info.plist', {
+                'NSLocalNetworkUsageDescription': '仅在用户核对身份并确认后执行双设备局域网合成数据实验。'})
             update_plist(project / 'macos/Runner/Release.entitlements', {
                 'com.apple.security.network.client': True,
                 'com.apple.security.network.server': True})

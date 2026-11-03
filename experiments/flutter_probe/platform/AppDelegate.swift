@@ -33,6 +33,7 @@ private final class DirectoryProbe: NSObject, UIDocumentPickerDelegate {
   func handle(_ method: String, result: @escaping FlutterResult) {
     guard !busy && pickerResult == nil else { result("busy"); return }
     switch method {
+    case "lanNetwork": result("system-mediated") // Actual LAN access triggers system policy, not a grant.
     case "network": result("loopback-only") // Does not claim local-network permission.
     case "forget": UserDefaults.standard.removeObject(forKey: key); result("forgotten")
     case "choose":

@@ -1,8 +1,8 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
 //! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `send`, `discover`,
-//! `jobs`, `signal-server`, `probe`, `bench`, `doctor`. The binary never
-//! talks to any file-carrying server; servers started here are
+//! `jobs`, `signal-server`, `probe`, `bench`, `doctor`, `completions`. The
+//! binary never talks to any file-carrying server; servers started here are
 //! coordination-only (ADR-001).
 //!
 //! Pairing model: the local peer book (`peers.book` in the id directory)
@@ -17,14 +17,14 @@ mod doctor;
 mod errors;
 
 use std::io::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use ak_core::handle::ConflictPolicy;
 use ak_core::policy::PathKind;
@@ -109,9 +109,17 @@ enum Command {
         /// Destination directory (must exist).
         #[arg(long, default_value = ".")]
         out: PathBuf,
-        /// UDP port to listen on (0 = auto).
-        #[arg(long, default_value_t = 7100)]
-        port: u16,
+        /// UDP port to listen on (0 = auto; default 7100).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Listen address override: a bare IP (`0.0.0.0` default, `::`,
+        /// `192.168.1.5` -- the port comes from --port) or a full
+        /// ip:port/[v6]:port (`[::]:7100` -- its port wins over --port, with
+        /// a notice). IPv6 listeners need the peer to reach this host over
+        /// IPv6 or an IPv4-mapped address; binding itself is left to the
+        /// engine (no relay fallback exists).
+        #[arg(long, value_parser = bind_arg_parser)]
+        bind: Option<BindArg>,
         /// Accept policy: omitted = only fingerprints in peers.book;
         /// 'any' = accept every peer (warning: unauthenticated);
         /// 64-hex fingerprint (or unique 8-63 character peers.book prefix)
@@ -207,10 +215,23 @@ enum Command {
     },
     /// Run the coordination server (signaling + STUN; no file routes).
     SignalServer {
-        #[arg(long, default_value_t = 7100)]
-        tcp_port: u16,
-        #[arg(long, default_value_t = 7101)]
-        stun_port: u16,
+        /// TCP signaling port (default 7100).
+        #[arg(long)]
+        tcp_port: Option<u16>,
+        /// STUN UDP port (default 7101).
+        #[arg(long)]
+        stun_port: Option<u16>,
+        /// Listen address override for the TCP signaling endpoint: a bare IP
+        /// (default 0.0.0.0; port comes from --tcp-port) or a full
+        /// ip:port/[v6]:port (`[::]:7100`; its port wins over --tcp-port,
+        /// with a notice). IPv6 listens need v6-reachable clients (or
+        /// v4-mapped on dual-stack hosts) for signaling to work.
+        #[arg(long, value_parser = bind_arg_parser)]
+        bind: Option<BindArg>,
+        /// Listen address override for the STUN UDP endpoint, same shapes as
+        /// --bind (default 0.0.0.0 + --stun-port).
+        #[arg(long, value_parser = bind_arg_parser)]
+        stun_bind: Option<BindArg>,
     },
     /// Public direct-connect probe: register, exchange candidates, punch, QUIC.
     Probe {
@@ -257,6 +278,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Generate a shell completion script (bash/zsh/fish/powershell) on
+    /// stdout; pipe it into your shell's completion directory, e.g.
+    /// `ak-cli completions bash > /etc/bash_completion.d/ak-cli`.
+    Completions {
+        /// Target shell.
+        shell: ShellKind,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,6 +326,13 @@ enum PairCommand {
 enum JobsCommand {
     /// List checkpointed jobs, most recently updated first.
     List,
+    /// Show one job's checkpoint in detail: direction, state, root, peer,
+    /// totals and every file's verified prefix (first 20 file rows, then a
+    /// count). Errors clearly when the job id is unknown.
+    Status {
+        /// Job id, 32 hex characters (copy from `ak-cli jobs list`).
+        job: String,
+    },
     /// Delete checkpoint record files (.akjob). Part files (.akpart) survive
     /// so interrupted transfers can still resume.
     Clean {
@@ -308,6 +343,129 @@ enum JobsCommand {
         #[arg(long, default_value_t = false)]
         completed: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// --bind value shapes (receive / signal-server listen overrides)
+// ---------------------------------------------------------------------------
+
+/// Parsed form of a `--bind` / `--stun-bind` value: either a bare IP whose
+/// port comes from the verb's port flag, or a full socket address carrying
+/// its own port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindArg {
+    /// Bare IPv4/IPv6 address (`0.0.0.0`, `::`, `192.168.1.5`).
+    Ip(IpAddr),
+    /// Full ip:port / `[v6]:port` (`0.0.0.0:7100`, `[::]:7101`).
+    Addr(SocketAddr),
+}
+
+impl BindArg {
+    /// Accept a full socket address first (`[::]:7100`, `1.2.3.4:5`), then a
+    /// bare IP (`::`, `0.0.0.0`); anything else is an explicit error naming
+    /// the expected shapes. Whitespace is trimmed like every other value.
+    fn parse(text: &str) -> Result<Self> {
+        let trimmed = text.trim();
+        if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+            return Ok(BindArg::Addr(addr));
+        }
+        if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            return Ok(BindArg::Ip(ip));
+        }
+        bail!(
+            "invalid bind address {trimmed:?}: expected a bare IP (`::`, `0.0.0.0`, \
+             `192.168.1.5`) or ip:port (`[::]:7100`, `0.0.0.0:7100`)"
+        )
+    }
+
+    /// The final listen address, combining a bare IP with `fallback_port`.
+    fn into_addr(self, fallback_port: u16) -> SocketAddr {
+        match self {
+            BindArg::Ip(ip) => SocketAddr::new(ip, fallback_port),
+            BindArg::Addr(addr) => addr,
+        }
+    }
+}
+
+/// clap value parser bridging [`BindArg::parse`] errors into help output.
+fn bind_arg_parser(text: &str) -> Result<BindArg, String> {
+    BindArg::parse(text).map_err(|err| err.to_string())
+}
+
+/// Combine a bind flag with the (optional, explicitly given) port flag and
+/// the verb's default port into the final listen address. When the bind
+/// value carries its own port AND a different explicit port flag was given,
+/// the bind port wins and a notice naming the ignored flag is returned;
+/// bare-IP binds combine with the port flag by design (no notice).
+fn resolve_listen_addr(
+    bind: Option<BindArg>,
+    bind_flag: &str,
+    port_flag: Option<u16>,
+    port_flag_name: &str,
+    default_port: u16,
+) -> (SocketAddr, Option<String>) {
+    match bind {
+        None => (
+            SocketAddr::from(([0, 0, 0, 0], port_flag.unwrap_or(default_port))),
+            None,
+        ),
+        Some(arg @ BindArg::Ip(_)) => (arg.into_addr(port_flag.unwrap_or(default_port)), None),
+        Some(BindArg::Addr(addr)) => {
+            let note = match port_flag {
+                Some(explicit) if explicit != addr.port() => Some(format!(
+                    "note: {bind_flag} includes its own port {}; ignoring \
+                     {port_flag_name} {explicit}",
+                    addr.port()
+                )),
+                _ => None,
+            };
+            (addr, note)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// completions (clap_complete; the four shells users asked for)
+// ---------------------------------------------------------------------------
+
+/// The shells `ak-cli completions` generates (clap_complete also speaks
+/// elvish, which nobody requested; keeping our own enum pins the CLI
+/// surface independently of the generator's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ShellKind {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+}
+
+impl ShellKind {
+    /// Map onto the generator's shell enum (same names, one type boundary).
+    fn generator_shell(self) -> clap_complete::aot::Shell {
+        match self {
+            ShellKind::Bash => clap_complete::aot::Shell::Bash,
+            ShellKind::Zsh => clap_complete::aot::Shell::Zsh,
+            ShellKind::Fish => clap_complete::aot::Shell::Fish,
+            ShellKind::Powershell => clap_complete::aot::Shell::PowerShell,
+        }
+    }
+}
+
+/// Render one shell's completion script into a string (shared by the
+/// command and the tests; generation writes nothing on its own).
+fn completions_script(shell: ShellKind) -> Result<String> {
+    let mut cmd = Cli::command();
+    let mut buf: Vec<u8> = Vec::new();
+    clap_complete::aot::generate(shell.generator_shell(), &mut cmd, "ak-cli", &mut buf);
+    String::from_utf8(buf).context("completion script must be UTF-8")
+}
+
+/// `completions <shell>`: print the script so shells can consume the pipe.
+fn completions_command(shell: ShellKind) -> Result<()> {
+    let script = completions_script(shell)?;
+    print!("{script}");
+    let _ = std::io::stdout().flush();
+    Ok(())
 }
 
 fn id_dir(cli: &Cli) -> PathBuf {
@@ -755,6 +913,15 @@ fn resolve_expect(text: Option<&str>, book_path: &Path) -> Result<ExpectPolicy> 
 // Job checkpoints (read-only view of the AKJOB1 files the engine writes)
 // ---------------------------------------------------------------------------
 
+/// One `file <index> <size> <verified prefix>` line of an AKJOB1 record
+/// (the on-disk twin of ak-store's FileCheckpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileProgress {
+    file_index: u32,
+    size: u64,
+    verified_prefix_chunks: u64,
+}
+
 /// The display-relevant slice of one `*.akjob` checkpoint record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JobEntry {
@@ -762,10 +929,13 @@ struct JobEntry {
     direction: &'static str,
     root: String,
     peer_short: Option<String>,
+    chunk_size: u32,
     total_files: u64,
     total_bytes: u64,
     state: String,
+    created_unix_ms: u64,
     updated_unix_ms: u64,
+    files: Vec<FileProgress>,
 }
 
 fn job_field<'a>(lines: &mut impl Iterator<Item = &'a str>, key: &str) -> Option<&'a str> {
@@ -797,28 +967,42 @@ fn parse_job_record(text: &str) -> Option<JobEntry> {
         Fingerprint::from_hex(peer)?;
         Some(peer[..8].to_owned())
     };
-    job_field(&mut lines, "chunk")?;
+    let chunk_size: u32 = job_field(&mut lines, "chunk")?.parse().ok()?;
     let total = job_field(&mut lines, "total")?;
     let mut total_parts = total.split(' ');
     let total_files: u64 = total_parts.next()?.parse().ok()?;
     let total_bytes: u64 = total_parts.next()?.parse().ok()?;
     let state = job_field(&mut lines, "state")?.to_owned();
-    job_field(&mut lines, "created")?;
+    let created_unix_ms: u64 = job_field(&mut lines, "created")?.parse().ok()?;
     let updated_unix_ms: u64 = job_field(&mut lines, "updated")?.parse().ok()?;
+    let mut files = Vec::new();
     for line in lines {
-        if !line.starts_with("file ") {
+        let rest = line.strip_prefix("file ")?;
+        let mut parts = rest.split(' ');
+        let file_index: u32 = parts.next()?.parse().ok()?;
+        let size: u64 = parts.next()?.parse().ok()?;
+        let verified_prefix_chunks: u64 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
             return None;
         }
+        files.push(FileProgress {
+            file_index,
+            size,
+            verified_prefix_chunks,
+        });
     }
     Some(JobEntry {
         job_hex,
         direction,
         root,
         peer_short,
+        chunk_size,
         total_files,
         total_bytes,
         state,
+        created_unix_ms,
         updated_unix_ms,
+        files,
     })
 }
 
@@ -1646,6 +1830,64 @@ fn pair_command(id: &Path, cmd: PairCommand) -> Result<()> {
     }
 }
 
+/// Per-file rows `jobs status` prints before folding the rest into a count.
+const JOB_STATUS_FILE_ROWS: usize = 20;
+
+/// Render the `jobs status <job-hex>` detail view for one checkpoint: the
+/// record fields plus every file's verified prefix (first
+/// [`JOB_STATUS_FILE_ROWS`] rows, then a count). Unknown or malformed job
+/// ids are explicit errors.
+fn jobs_status_text(dir: &Path, job_text: &str) -> Result<String> {
+    let wanted = job_text.trim().to_ascii_lowercase();
+    if !hex_to_bytes(&wanted).is_ok_and(|bytes| bytes.len() == 16) {
+        bail!("job id must be 32 hex characters, got {job_text:?}");
+    }
+    let Some((_, record)) = list_job_files(dir)
+        .into_iter()
+        .find(|(_, record)| record.job_hex == wanted)
+    else {
+        bail!(
+            "no checkpoint for job {wanted} in {} (see `ak-cli jobs list`)",
+            dir.display()
+        );
+    };
+    let mut out = format!("job {}\n", record.job_hex);
+    out.push_str(&format!("direction: {}\n", record.direction));
+    out.push_str(&format!("state:     {}\n", record.state));
+    out.push_str(&format!("root:      {}\n", record.root));
+    out.push_str(&format!(
+        "peer:      {}\n",
+        record.peer_short.as_deref().unwrap_or("-")
+    ));
+    out.push_str(&format!(
+        "totals:    {} files, {} bytes ({})\n",
+        record.total_files,
+        record.total_bytes,
+        human_bytes(record.total_bytes)
+    ));
+    out.push_str(&format!("chunk:     {} bytes\n", record.chunk_size));
+    out.push_str(&format!(
+        "created:   {}\nupdated:   {}\n",
+        format_utc_ms(record.created_unix_ms),
+        format_utc_ms(record.updated_unix_ms)
+    ));
+    out.push_str(&format!(
+        "files:     {} checkpointed file(s), verified prefix in chunks\n",
+        record.files.len()
+    ));
+    for file in record.files.iter().take(JOB_STATUS_FILE_ROWS) {
+        out.push_str(&format!(
+            "  file {}: {} bytes, {} verified chunk(s)\n",
+            file.file_index, file.size, file.verified_prefix_chunks
+        ));
+    }
+    let hidden = record.files.len().saturating_sub(JOB_STATUS_FILE_ROWS);
+    if hidden > 0 {
+        out.push_str(&format!("  ... and {hidden} more file(s) not shown\n"));
+    }
+    Ok(out)
+}
+
 fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
     let dir = checkpoint_dir(id);
     match cmd {
@@ -1674,6 +1916,10 @@ fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
             }
             Ok(())
         }
+        Some(JobsCommand::Status { job }) => {
+            print!("{}", jobs_status_text(&dir, &job)?);
+            Ok(())
+        }
         Some(JobsCommand::Clean { all, completed }) => {
             if all && completed {
                 bail!("choose one of --all or --completed, not both");
@@ -1698,11 +1944,16 @@ fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
     }
 }
 
+/// Default UDP port `receive` listens on when neither --bind nor --port
+/// names one.
+const DEFAULT_RECEIVE_PORT: u16 = 7100;
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_command(
     id: &Path,
     out: PathBuf,
-    port: u16,
+    port: Option<u16>,
+    bind: Option<BindArg>,
     expect: Option<String>,
     conflict: String,
     once: bool,
@@ -1710,6 +1961,17 @@ async fn receive_command(
     timeout: u64,
     jobs: Option<u64>,
 ) -> Result<()> {
+    let (listen, bind_note) =
+        resolve_listen_addr(bind, "--bind", port, "--port", DEFAULT_RECEIVE_PORT);
+    if let Some(note) = bind_note {
+        println!("{note}");
+    }
+    if listen.is_ipv6() {
+        println!(
+            "note: listening on IPv6 {listen}; peers must reach this host over IPv6 \
+             or an IPv4-mapped address (no relay fallback exists)"
+        );
+    }
     let (key, bundle) = load_identity(id)?;
     let fp = key.fingerprint();
     let policy = resolve_expect(expect.as_deref(), &peer_book_path(id))?;
@@ -1749,7 +2011,7 @@ async fn receive_command(
     // Concurrent mode: accept `jobs` senders on one endpoint at once.
     if let Some(expected) = jobs.map(|count| count as usize) {
         let mut spec = ReceiveSpec::new(out.clone(), bundle.clone());
-        spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
+        spec.bind = listen;
         spec.conflict = conflict;
         spec.checkpoint_dir = checkpoints.clone();
         spec.device_name = device_name.clone();
@@ -1787,7 +2049,7 @@ async fn receive_command(
     let mut rebind_retries = 0u32;
     loop {
         let mut spec = ReceiveSpec::new(out.clone(), bundle.clone());
-        spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
+        spec.bind = listen;
         spec.conflict = conflict;
         spec.checkpoint_dir = checkpoints.clone();
         spec.device_name = device_name.clone();
@@ -2043,6 +2305,7 @@ async fn main() -> Result<()> {
         Command::Receive {
             out,
             port,
+            bind,
             expect,
             conflict,
             once,
@@ -2050,7 +2313,19 @@ async fn main() -> Result<()> {
             timeout,
             jobs,
         } => {
-            receive_command(&id, out, port, expect, conflict, once, no_internet, timeout, jobs).await
+            receive_command(
+                &id,
+                out,
+                port,
+                bind,
+                expect,
+                conflict,
+                once,
+                no_internet,
+                timeout,
+                jobs,
+            )
+            .await
         }
         Command::Send {
             paths,
@@ -2085,10 +2360,31 @@ async fn main() -> Result<()> {
         Command::SignalServer {
             tcp_port,
             stun_port,
+            bind,
+            stun_bind,
         } => {
+            const DEFAULT_SIGNAL_TCP_PORT: u16 = 7100;
+            const DEFAULT_SIGNAL_STUN_PORT: u16 = 7101;
+            let (tcp_addr, tcp_note) = resolve_listen_addr(
+                bind,
+                "--bind",
+                tcp_port,
+                "--tcp-port",
+                DEFAULT_SIGNAL_TCP_PORT,
+            );
+            let (stun_addr, stun_note) = resolve_listen_addr(
+                stun_bind,
+                "--stun-bind",
+                stun_port,
+                "--stun-port",
+                DEFAULT_SIGNAL_STUN_PORT,
+            );
+            for note in [tcp_note, stun_note].into_iter().flatten() {
+                println!("{note}");
+            }
             let config = ak_signal::server::Config {
-                tcp: SocketAddr::from(([0, 0, 0, 0], tcp_port)),
-                stun_udp: SocketAddr::from(([0, 0, 0, 0], stun_port)),
+                tcp: tcp_addr,
+                stun_udp: stun_addr,
                 ..ak_signal::server::Config::default()
             };
             println!(
@@ -2118,6 +2414,7 @@ async fn main() -> Result<()> {
             once,
             json,
         } => bench_command(bytes, files, chunk_kb, multistream, once, json).await,
+        Command::Completions { shell } => completions_command(shell),
     }
 }
 
@@ -2368,11 +2665,17 @@ async fn probe_command(
     let socket = if dual_stack {
         match ak_net::holepunch::bind_dual_stack_udp(0) {
             Ok(std_socket) => {
-                probe_emit(json, "dual-stack probe socket (v4 peers via ::ffff mapping)");
+                probe_emit(
+                    json,
+                    "dual-stack probe socket (v4 peers via ::ffff mapping)",
+                );
                 tokio::net::UdpSocket::from_std(std_socket)?
             }
             Err(error) => {
-                probe_emit(json, &format!("dual-stack bind unavailable ({error}); falling back to v4"));
+                probe_emit(
+                    json,
+                    &format!("dual-stack bind unavailable ({error}); falling back to v4"),
+                );
                 tokio::net::UdpSocket::bind("0.0.0.0:0").await?
             }
         }
@@ -3233,6 +3536,99 @@ mod tests {
         assert_eq!((removed, kept), (0, 0));
     }
 
+    #[test]
+    fn jobs_status_renders_detail_from_real_store_fixture() {
+        let dir = TempDir::new("jobs-status");
+        let store = FileCheckpointStore::open(dir.path()).unwrap();
+        let mut record = stored_record(7, "transferring");
+        record.files = (0..25)
+            .map(|i| FileCheckpoint {
+                file_index: i,
+                size: 1000 + u64::from(i),
+                verified_prefix_chunks: u64::from(i),
+            })
+            .collect();
+        store.save(&record).unwrap();
+        // A second record proves status picks exactly the requested job and
+        // resolves uppercase hex input to the lowercase record id.
+        store.save(&stored_record(0xab, "completed")).unwrap();
+
+        let text = jobs_status_text(dir.path(), &"07".repeat(16)).unwrap();
+        assert!(text.contains(&format!("job {}", "07".repeat(16))), "{text}");
+        assert!(text.contains("direction: send"), "{text}");
+        assert!(text.contains("state:     transferring"), "{text}");
+        assert!(text.contains(r"root:      D:\send dir\photos"), "{text}");
+        assert!(text.contains("peer:      09090909"), "{text}");
+        assert!(
+            text.contains("totals:    3 files, 10000000 bytes (9.54 MiB)"),
+            "{text}"
+        );
+        assert!(text.contains("chunk:     262144 bytes"), "{text}");
+        assert!(
+            text.contains("created:") && text.contains("updated:"),
+            "{text}"
+        );
+        // First 20 per-file rows render; the remaining 5 fold into a count.
+        assert!(
+            text.contains("files:     25 checkpointed file(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  file 0: 1000 bytes, 0 verified chunk(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  file 19: 1019 bytes, 19 verified chunk(s)"),
+            "{text}"
+        );
+        assert!(!text.contains("file 20:"), "{text}");
+        assert!(text.contains("... and 5 more file(s) not shown"), "{text}");
+
+        let upper = jobs_status_text(dir.path(), &"AB".repeat(16)).unwrap();
+        assert!(upper.contains("state:     completed"), "{upper}");
+        assert!(
+            upper.contains(&format!("job {}", "ab".repeat(16))),
+            "{upper}"
+        );
+    }
+
+    #[test]
+    fn jobs_status_rejects_unknown_or_malformed_job_ids() {
+        let dir = TempDir::new("jobs-status-bad");
+        let store = FileCheckpointStore::open(dir.path()).unwrap();
+        store.save(&stored_record(7, "completed")).unwrap();
+
+        let unknown = jobs_status_text(dir.path(), &"09".repeat(16))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("no checkpoint"), "{unknown}");
+        assert!(unknown.contains(&"09".repeat(16)), "{unknown}");
+        assert!(unknown.contains("jobs list"), "{unknown}");
+        for bad in ["", "not-hex", "0707", &"0".repeat(33)] {
+            let err = jobs_status_text(dir.path(), bad).unwrap_err().to_string();
+            assert!(err.contains("32 hex"), "{err} for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn jobs_status_args_parse() {
+        let cli = cli_of(&["jobs", "status", &"07".repeat(16)]);
+        let Command::Jobs {
+            cmd: Some(JobsCommand::Status { job }),
+        } = cli.command
+        else {
+            panic!("expected jobs status");
+        };
+        assert_eq!(job, "07".repeat(16));
+        // The job id argument is required.
+        assert!(Cli::try_parse_from(["ak-cli", "jobs", "status"]).is_err());
+        // Plain `jobs` keeps listing.
+        assert!(matches!(
+            cli_of(&["jobs"]).command,
+            Command::Jobs { cmd: None }
+        ));
+    }
+
     // -- display helpers -----------------------------------------------------
 
     #[test]
@@ -3590,7 +3986,11 @@ mod tests {
         // Wire facts now come from ak-wire itself; pin the shipped values.
         assert_eq!(WIRE_VERSION, 1);
         assert_eq!(
-            (ak_wire::CAP_RESUME, ak_wire::CAP_PAUSE_RESUME, ak_wire::CAP_MULTISTREAM),
+            (
+                ak_wire::CAP_RESUME,
+                ak_wire::CAP_PAUSE_RESUME,
+                ak_wire::CAP_MULTISTREAM
+            ),
             (0x0001, 0x0002, 0x0004)
         );
         assert_eq!(WIRE_CAPS, 0x0007);
@@ -4024,5 +4424,236 @@ mod tests {
         let json = probe_json(&run);
         assert!(json.contains("timeout after 15s\\n(dial failed)"));
         assert!(json.contains("\"ok\": false"));
+    }
+
+    // -- --bind listen overrides ----------------------------------------------
+
+    #[test]
+    fn bind_arg_parses_bare_ips_and_full_addresses() {
+        let ip = |text: &str| BindArg::Ip(text.parse::<IpAddr>().unwrap());
+        let addr = |text: &str| BindArg::Addr(text.parse::<SocketAddr>().unwrap());
+        assert_eq!(BindArg::parse("0.0.0.0").unwrap(), ip("0.0.0.0"));
+        assert_eq!(BindArg::parse("::").unwrap(), ip("::"));
+        assert_eq!(BindArg::parse("192.168.1.5").unwrap(), ip("192.168.1.5"));
+        assert_eq!(BindArg::parse("fe80::1").unwrap(), ip("fe80::1"));
+        assert_eq!(
+            BindArg::parse("0.0.0.0:7100").unwrap(),
+            addr("0.0.0.0:7100")
+        );
+        assert_eq!(BindArg::parse("[::]:7100").unwrap(), addr("[::]:7100"));
+        assert_eq!(BindArg::parse("[::1]:9").unwrap(), addr("[::1]:9"));
+        // Whitespace is trimmed like every other value.
+        assert_eq!(BindArg::parse("  [::1]:9  ").unwrap(), addr("[::1]:9"));
+        for bad in [
+            "junk",
+            "",
+            "[::1",
+            ":7100",
+            "192.168.1.5:70000",
+            "host:7100",
+        ] {
+            let err = BindArg::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("invalid bind address"), "{err} for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_listen_addr_combines_and_notifies_on_port_conflicts() {
+        // No flags: wildcard v4 plus the verb default.
+        let (addr, note) = resolve_listen_addr(None, "--bind", None, "--port", 7100);
+        assert_eq!(addr, "0.0.0.0:7100".parse().unwrap());
+        assert_eq!(note, None);
+        // Port flag only.
+        let (addr, note) = resolve_listen_addr(None, "--bind", Some(7200), "--port", 7100);
+        assert_eq!(addr, "0.0.0.0:7200".parse().unwrap());
+        assert_eq!(note, None);
+        // Bare-IP bind combines with the port flag (or the default).
+        let (addr, note) = resolve_listen_addr(
+            Some(BindArg::parse("::").unwrap()),
+            "--bind",
+            None,
+            "--port",
+            7100,
+        );
+        assert_eq!(addr, "[::]:7100".parse().unwrap());
+        assert_eq!(note, None);
+        let (addr, note) = resolve_listen_addr(
+            Some(BindArg::parse("192.168.1.5").unwrap()),
+            "--bind",
+            Some(7001),
+            "--port",
+            7100,
+        );
+        assert_eq!(addr, "192.168.1.5:7001".parse().unwrap());
+        assert_eq!(note, None);
+        // Full-address bind: its own port wins over a DIFFERING explicit port
+        // flag, with a notice; an equal value or no flag stays silent.
+        let (addr, note) = resolve_listen_addr(
+            Some(BindArg::parse("[::]:7200").unwrap()),
+            "--bind",
+            Some(7300),
+            "--port",
+            7100,
+        );
+        assert_eq!(addr, "[::]:7200".parse().unwrap());
+        let note = note.unwrap_or_default();
+        assert!(note.contains("ignoring --port 7300"), "{note}");
+        let (addr, note) = resolve_listen_addr(
+            Some(BindArg::parse("[::]:7200").unwrap()),
+            "--bind",
+            Some(7200),
+            "--port",
+            7100,
+        );
+        assert_eq!(addr, "[::]:7200".parse().unwrap());
+        assert_eq!(note, None);
+        let (addr, note) = resolve_listen_addr(
+            Some(BindArg::parse("0.0.0.0:7000").unwrap()),
+            "--bind",
+            None,
+            "--port",
+            7100,
+        );
+        assert_eq!(addr, "0.0.0.0:7000".parse().unwrap());
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn receive_bind_flag_parses_all_address_shapes() {
+        // Defaults: port and bind both unset (resolved later in code).
+        let cli = cli_of(&["receive"]);
+        let Command::Receive { port, bind, .. } = cli.command else {
+            panic!("expected receive subcommand");
+        };
+        assert_eq!(port, None);
+        assert_eq!(bind, None);
+
+        // Bare v6 bind; --port keeps combining with it.
+        let cli = cli_of(&["receive", "--bind", "::"]);
+        let Command::Receive { port, bind, .. } = cli.command else {
+            panic!("expected receive subcommand");
+        };
+        assert_eq!(port, None);
+        assert_eq!(bind, Some(BindArg::Ip("::".parse().unwrap())));
+
+        // Full-address bind plus an explicit (ignored) port.
+        let cli = cli_of(&["receive", "--bind", "[::]:7200", "--port", "9"]);
+        let Command::Receive { port, bind, .. } = cli.command else {
+            panic!("expected receive subcommand");
+        };
+        assert_eq!(port, Some(9));
+        assert_eq!(bind, Some(BindArg::Addr("[::]:7200".parse().unwrap())));
+
+        for bad in [
+            vec!["receive", "--bind", "junk"],
+            vec!["receive", "--bind", "[::1"],
+            vec!["receive", "--bind", "host:7100"],
+        ] {
+            let mut argv = vec!["ak-cli"];
+            argv.extend_from_slice(&bad);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "unexpectedly accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signal_server_bind_flags_parse_and_default_ports_apply() {
+        let cli = cli_of(&["signal-server"]);
+        let Command::SignalServer {
+            tcp_port,
+            stun_port,
+            bind,
+            stun_bind,
+        } = cli.command
+        else {
+            panic!("expected signal-server subcommand");
+        };
+        assert_eq!((tcp_port, stun_port), (None, None));
+        assert!(bind.is_none() && stun_bind.is_none());
+        // No flags land on the documented default ports.
+        let (tcp_addr, note) = resolve_listen_addr(None, "--bind", None, "--tcp-port", 7100);
+        assert_eq!(tcp_addr, "0.0.0.0:7100".parse().unwrap());
+        assert_eq!(note, None);
+
+        let cli = cli_of(&[
+            "signal-server",
+            "--tcp-port",
+            "7200",
+            "--stun-port",
+            "7201",
+            "--bind",
+            "[::]:8000",
+            "--stun-bind",
+            "::",
+        ]);
+        let Command::SignalServer {
+            tcp_port,
+            stun_port,
+            bind,
+            stun_bind,
+        } = cli.command
+        else {
+            panic!("expected signal-server subcommand");
+        };
+        // --bind carries a port that beats the differing --tcp-port (noted).
+        let (tcp_addr, tcp_note) =
+            resolve_listen_addr(bind, "--bind", tcp_port, "--tcp-port", 7100);
+        assert_eq!(tcp_addr, "[::]:8000".parse().unwrap());
+        let note = tcp_note.as_deref().unwrap_or_default();
+        assert!(note.contains("ignoring --tcp-port 7200"), "{note}");
+        // Bare v6 --stun-bind combines with --stun-port silently.
+        let (stun_addr, stun_note) =
+            resolve_listen_addr(stun_bind, "--stun-bind", stun_port, "--stun-port", 7101);
+        assert_eq!(stun_addr, "[::]:7201".parse().unwrap());
+        assert_eq!(stun_note, None);
+    }
+
+    // -- completions -----------------------------------------------------------
+
+    #[test]
+    fn completions_args_parse_every_shell_and_reject_others() {
+        for (name, expected) in [
+            ("bash", ShellKind::Bash),
+            ("zsh", ShellKind::Zsh),
+            ("fish", ShellKind::Fish),
+            ("powershell", ShellKind::Powershell),
+        ] {
+            let cli = cli_of(&["completions", name]);
+            let Command::Completions { shell } = cli.command else {
+                panic!("expected completions subcommand");
+            };
+            assert_eq!(shell, expected);
+        }
+        assert!(Cli::try_parse_from(["ak-cli", "completions", "tcsh"]).is_err());
+        assert!(Cli::try_parse_from(["ak-cli", "completions"]).is_err());
+    }
+
+    #[test]
+    fn completions_generation_is_nonempty_and_names_the_binary() {
+        for shell in [
+            ShellKind::Bash,
+            ShellKind::Zsh,
+            ShellKind::Fish,
+            ShellKind::Powershell,
+        ] {
+            let script = completions_script(shell).unwrap();
+            assert!(!script.is_empty(), "{shell:?} script empty");
+            assert!(script.contains("ak-cli"), "{shell:?} missing binary name");
+        }
+        // One stable marker per shell so a mis-mapped shell cannot pass.
+        assert!(completions_script(ShellKind::Bash)
+            .unwrap()
+            .contains("complete -F _ak__cli"));
+        assert!(completions_script(ShellKind::Zsh)
+            .unwrap()
+            .starts_with("#compdef ak-cli"));
+        assert!(completions_script(ShellKind::Fish)
+            .unwrap()
+            .contains("complete -c ak-cli"));
+        assert!(completions_script(ShellKind::Powershell)
+            .unwrap()
+            .contains("Register-ArgumentCompleter -Native -CommandName 'ak-cli'"));
     }
 }

@@ -24,7 +24,7 @@
 
 ## 已实现的安全机制（截至 2026-11-03）
 
-以下机制已落在代码并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)，含第三轮验证节）：
+以下机制已落在代码并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)，含第三轮与第六/七轮验证节）：
 
 - Ed25519 设备密钥与指纹（`ak-identity`）：公钥即设备身份，指纹＝公钥 BLAKE3 摘要前 32 字节；配对码由指纹派生（`123-456` 形式）供人工核对；私钥种子 32 字节原子落盘，不进入任何协调面消息。
 - 自签证书钉扎（`ak-identity::tls`＋`ak-net`）：最小 DER 严格解析、仅从 SPKI 提取 Ed25519 公钥（其他字段无法遮蔽）、常量时间比较（自实现，无 `subtle` 依赖）、`verify_strict` 校验自签名；rustls 验证器无 webpki 根、无主机名校验，端点级默认客户端配置拒绝一切对端，仅 `connect(peer, pinned)` 可建立通道，握手后还会从已建立连接重导出指纹复核。
@@ -37,6 +37,10 @@
 - 禁依赖扫描（`scripts/check_repository.py`）：解析 Cargo.lock 禁止 relay/TURN/WebRTC/iroh 类 crate 进入依赖图，2026-11-02 扫描结果 clean。
 - 连接阶段地址族快速失败与空闲预算（`ak-engine`，2026-11-03）：`connect_bounded` 在发起 QUIC 前校验本地 socket 与对端地址族，v4 拨 v6（或反之）立即以 InvalidInput 失败，不再无限悬挂于 QUIC 重试（该缺陷由 IPv6 场景测试发现，回归测试 `connect_family_mismatch_fails_fast_instead_of_hanging` 钉死）；连接等待同时受空闲预算约束，不可达对端最终以错误/超时暴露。防挂起（资源耗尽向量）与防地址族错配。
 - 存储满预检（`ak-engine`，2026-11-03）：`check_headroom` 纯决策函数在接收端应答 ResumeRequest 前比较目的目录报告的剩余空间与任务总字节，不足即以 `EngineError::StorageFull`（携带真实余量/需求字节）中止并经协议 `ErrorCode::StorageFull` 告知对端；余量未知（Windows `available_bytes` 返回 None）放行，耗尽仍由真实写错误暴露——预检拒绝浪费，写错误兜底，不伪造成功。
+- 并发接收的失败隔离（`ak-engine`，2026-11-03）：`serve_concurrently` 一次 bind、每个被接受连接一个独立任务，逐任务运行与单任务接收完全一致的协议体（授权回调与策略闸门按连接执行）；检查点互不重叠——每任务独占自己的 `<job>.akjob` 文件（原子写），接收目录仅经只读 `LocalSaveTarget` 共享（`prepare_file` 无内部可变状态，不同条目映射不同 `.akpart` 文件）。任一任务失败只填充自己的结果槽位，不拖垮其他任务（真实双发送端冒烟 2/2 字节一致）；`ConflictPolicy::Fail` 下并发任务竞争同目标路径按文件粒度失败，与两次顺序接收语义一致；accept 握手在独立任务中驱动，不会被驱动循环的选择分支取消中途握手。同名 `.akpart` 的文件系统级竞态语义未消除，如实保留为已知限制（见“已知安全限制”节）。
+- 两层控制字符注入防护（`ak-signal::codec`＋`ak-wire`，2026-11-03）：第七轮发现并修复 Hello 设备名控制字符注入缺陷。协调面字符串字段（设备名/错误文本）与传输面显示字符串（相对路径/根名/错误消息）统一拒绝 C0 控制字符（U+0000..U+001F，含 NUL）、DEL（U+007F）与 C1 控制字符（U+0080..U+009F）：NUL 截断与终端转义序列无法借名字进入 UI 与日志；信令侧同一条规则分别落在解码路径与内存构造路径（`get_str`/`verify_hello` 共享 `is_control_free`），两条路径不会漂移；overlong UTF-8 编码先被 UTF-8 校验拒绝；`rejects_control_characters_in_display_strings` 等测试锁定。
+- 对抗性输入加固（`ak-signal`，2026-11-03）：三项实测存活并有测试锁定——500 帧原始 TCP 帧模糊（四种形态对抗帧混合、多次重连，模糊进行中合法客户端仍完成 Hello/Welcome 握手，模糊结束后服务器继续正常服务）；500 个畸形 UDP 数据报 STUN 洪泛（穿插的 50 个合法 Binding 请求全部获得事务匹配的正确响应，洪泛结束后仍存活）；限频/会话上限旁路（单条连接向 5 个不同目标连发 ConnectRequest，第 5 个命中每设备会话上限被拒且重复请求拒绝稳定，断开连接即释放配额）。
+- 长文件名 part 回退命名（`ak-storage`，2026-11-03）：极端名场景测试发现 249 字节文件名附加 `.akpart` 后缀超出 NTFS 255 字节组件上限的真实缺陷；修复为确定性回退——最终组件过长时改用同目录 `.akpart-<最终组件 BLAKE3 摘要前 16 字节 hex>` 短名，防止组件超限导致传输失败；回退名仅由最终名派生，断点续传仍能找到同一 part 文件；孤儿清理识别 `.akpart` 结尾与 `.akpart-` 开头两种 part 形态；边界测试翻转为完成路径。
 
 ## 已知安全限制（截至 2026-11-03）
 
@@ -47,10 +51,13 @@
 - part 文件 TOCTOU 残余窗口（`ak-storage`）：`.akpart` 路径的符号链接检查与随后的打开/改名不是单一原子操作，两者之间仍存在被竞争替换的理论窗口；逐级 `symlink_metadata` 复查覆盖已存在组件，但不承诺消除全部竞态。
 - 无证书有效期策略（`ak-identity::tls`）：自签证书约十年有效期，钉扎验证不检查有效期字段（过期或尚未生效不会导致失败）。
 - 协调面为明文 TCP＋签名认证、无 TLS（`ak-signal`）：Ed25519 Hello 签名证明设备密钥持有者并限重放（±10 秒），但不加密信令内容；候选地址、在线状态对链路观察者可见。
-- 引擎限制（`ak-engine` 文档）：接收端每次 `receive()` 仅接受一个任务（有意为之、已文档化；带内 Pause/Resume 与空闲超时已于第二轮实现，能力协商生效）。
+- 引擎限制（`ak-engine` 文档）：接收端每次 `receive()` 仅接受一个任务（有意为之、已文档化；带内 Pause/Resume 与空闲超时已于第二轮实现，能力协商生效）；并发接收 `serve_concurrently` 保持同一语义——每连接一个任务。
 - 私钥暂以用户目录下 32 字节种子文件保存（原子写入），尚未接入系统安全存储（Keychain/Keystore 等）。
 - 同出口提示存在误报场景（`ak-signal`，2026-11-03）：`PeerSignal::SameEgress` 仅比较两会话端在协调面的 TCP 对端 IP 是否一致——两端经同一反向代理统一来源 IP，或 CGNAT 后不同设备撞同一公网 IP 时会误报"同出口"。该提示只影响候选排序（LAN 优先），不作认证或信任判定；消费方不得将其当作"同一可信内网"的证据。
 - 多根同名仅精确匹配（`ak-engine`，2026-11-03）：多根合并发送的根名查重为精确字节比较（排序去重），大小写不敏感卷（Windows/macOS 默认）上 `Photos` 与 `photos` 不会被拒绝，两者可在接收端合并或触发冲突策略；发送端不保证根名的大小写语义唯一。
+- socket2 `only_v6` 在 Windows 的读取缺陷（`ak-net`，2026-11-03）：`IPV6_V6ONLY` 无可移植的查询方式——部分 Windows 版本 `getsockopt` 返回 1 字节 BOOLEAN，socket2 0.5 的 `only_v6` 读取结果不可靠。已规避：仅 `bind_dual_stack`（构造时显式清 V6ONLY）声称双栈身份，`bind_with_socket` 收养的 socket 一律报告非双栈，`connect` 的 v4→映射拨号改按 socket 地址族判定而非该标志。
+- 双栈映射流量的间歇 WSAENETUNREACH（`ak-net`，2026-11-03）：开发中观察到 Windows insider 版本对 `::ffff:` 映射发送间歇性返回 `WSAENETUNREACH` 且可持续数分钟，即使 socket 本为双栈；双栈端点仅扩大候选集，不替代探测/引擎层按地址族的可达性验证，`ak-net` 内双栈测试因此为尽力型（best-effort，环境相关现象不作断言门槛）。
+- `serve_concurrently` 无停止通道（`ak-engine`，2026-11-03）：完成条件即 `expected_jobs` 个连接全部接受并结束，没有中途停止参数；期待慢发送方的调用方应调高 `ReceiveSpec::idle_timeout`（约束每次 accept 等待），未填满的槽位以 `EngineError::IdleTimeout` 报告而非永久悬挂。
 
 ## 无中继发布门槛
 

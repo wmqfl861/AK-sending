@@ -16,6 +16,9 @@ ak-storage = { workspace = true }
 ak-wire = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+# ADR-002 controlled addition (clap family, generator only, no I/O side
+# effects): shell completion scripts for `ak-cli completions`.
+clap_complete = "4"
 env_logger = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }

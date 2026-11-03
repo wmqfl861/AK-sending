@@ -1,0 +1,32 @@
+name: Pinned Dart author kit (not acceptance)
+on:
+  push:
+    branches: [dev/m0-07-device-lan-harness-20261102]
+    paths: [.github/workflows/dart-author-kit.yml]
+permissions:
+  contents: read
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch exact public Flutter SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 3.47.0 https://github.com/flutter/flutter.git sdk
+          test "$(git -C sdk rev-parse HEAD)" = '4cf24164269a5ebf0c16a028a00727d0e77bbb05'
+          sdk/bin/flutter config --no-analytics
+          sdk/bin/flutter --version --machine > flutter-version.json
+          tar -C sdk/bin/cache -czf dart-author-kit.tar.gz dart-sdk
+          sha256sum dart-author-kit.tar.gz > dart-author-kit.sha256
+      - name: Preserve public author tools only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dart-author-kit-${{ github.sha }}
+          path: |
+            dart-author-kit.tar.gz
+            dart-author-kit.sha256
+            flutter-version.json
+          retention-days: 3
+          compression-level: 0

@@ -78,6 +78,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ak-ffi"
+version = "0.1.0"
+dependencies = [
+ "ak-core",
+ "ak-engine",
+ "ak-identity",
+ "ak-net",
+ "ak-storage",
+ "ak-store",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ak-identity"
 version = "0.1.0"
 dependencies = [

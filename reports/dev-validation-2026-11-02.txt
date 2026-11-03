@@ -218,3 +218,7 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 # 错误链保留）；块尺寸扫描基准（256MiB×8 轮：64KiB 最差 -23%，256KiB–1MiB 平台 ~99 MiB/s，4MiB+多流本轮 108）；
 # README/UX/OPERATIONS 现状化；CLI --no-internet 接线（send/receive），LAN-only 环回冒烟通过（LocalDirect 放行）。
 # 5 GiB release 回归 111.49s。
+
+### 补记：65,537 文件分页边界 release 实测（2026-11-03）
+T13-65537: transfer COMPLETES (ResumeRequest pagination verified): files=65537 bytes=65537
+pages=257 send=2339.9s recv=2340.0s wall=2410.1s（含与其他代理构建任务并行争用 CPU；结果：test ok）

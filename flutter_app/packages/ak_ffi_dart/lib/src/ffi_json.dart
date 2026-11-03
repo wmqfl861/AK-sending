@@ -203,7 +203,7 @@ String _encode(Object? json) {
   final text = jsonEncode(json);
   if (utf8.encode(text).length > _maxInputBytes) {
     throw AkSpecException(
-      'spec JSON exceeds the ${_maxInputBytes} byte input cap',
+      'spec JSON exceeds the $_maxInputBytes byte input cap',
     );
   }
   return text;

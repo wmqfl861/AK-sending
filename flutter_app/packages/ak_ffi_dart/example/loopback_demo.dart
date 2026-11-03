@@ -181,7 +181,9 @@ Future<bool> _run(AkEngineDart engine) async {
     for (final dir in tempDirs) {
       try {
         dir.deleteSync(recursive: true);
-      } on Exception {} // best-effort cleanup under the system temp root
+      } on Exception {
+        // best-effort cleanup under the system temp root
+      }
     }
   }
 }

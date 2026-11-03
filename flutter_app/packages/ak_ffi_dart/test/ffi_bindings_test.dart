@@ -255,7 +255,7 @@ test('job ids must be 16 bytes (argument checks)', () {
 // Dart-side spec pre-validation (friendly errors before the DLL).
 // ---------------------------------------------------------------------------
 
-AkSendSpec _send({
+AkSendSpec sendSpec({
   List<String>? roots,
   String peer = '127.0.0.1:7100',
   String fp = _fp1Hex,
@@ -275,49 +275,49 @@ AkSendSpec _send({
     );
 
 test('send spec: Dart-side mirror rejects every invalid branch', () {
-  _expectSpecError(() => _send(roots: const []).toJsonString(), 'source_roots');
+  _expectSpecError(() => sendSpec(roots: const []).toJsonString(), 'source_roots');
   _expectSpecError(
-      () => _send(roots: const ['']).toJsonString(), 'non-empty paths');
+      () => sendSpec(roots: const ['']).toJsonString(), 'non-empty paths');
   _expectSpecError(
-      () => _send(roots: const ['C:/ok', 'C:/bad\ttab']).toJsonString(),
+      () => sendSpec(roots: const ['C:/ok', 'C:/bad\ttab']).toJsonString(),
       'control');
   _expectSpecError(
-      () => _send(peer: 'localhost:7100').toJsonString(), 'ip:port');
-  _expectSpecError(() => _send(peer: '127.0.0.1').toJsonString(), 'ip:port');
+      () => sendSpec(peer: 'localhost:7100').toJsonString(), 'ip:port');
+  _expectSpecError(() => sendSpec(peer: '127.0.0.1').toJsonString(), 'ip:port');
   _expectSpecError(
-      () => _send(peer: '127.0.0.1:99999').toJsonString(), 'ip:port');
+      () => sendSpec(peer: '127.0.0.1:99999').toJsonString(), 'ip:port');
   _expectSpecError(
-      () => _send(peer: ' 127.0.0.1:7100').toJsonString(), 'ip:port');
-  _expectSpecError(() => _send(fp: 'ab' * 31).toJsonString(), '64 hex');
+      () => sendSpec(peer: ' 127.0.0.1:7100').toJsonString(), 'ip:port');
+  _expectSpecError(() => sendSpec(fp: 'ab' * 31).toJsonString(), '64 hex');
   _expectSpecError(
-      () => _send(fp: 'ab' * 32 + 'zz').toJsonString(), '64 hex');
+      () => sendSpec(fp: 'ab' * 32 + 'zz').toJsonString(), '64 hex');
   _expectSpecError(
-      () => _send(chunkKb: 0).toJsonString(), 'between 1 and 8192');
+      () => sendSpec(chunkKb: 0).toJsonString(), 'between 1 and 8192');
   _expectSpecError(
-      () => _send(chunkKb: 8193).toJsonString(), 'between 1 and 8192');
+      () => sendSpec(chunkKb: 8193).toJsonString(), 'between 1 and 8192');
   _expectSpecError(
-      () => _send(timeoutSecs: 0).toJsonString(), 'timeout_secs');
+      () => sendSpec(timeoutSecs: 0).toJsonString(), 'timeout_secs');
   _expectSpecError(
-      () => _send(timeoutSecs: 86401).toJsonString(), 'timeout_secs');
+      () => sendSpec(timeoutSecs: 86401).toJsonString(), 'timeout_secs');
   _expectSpecError(
-      () => _send(conflict: 'overwrite').toJsonString(), '"fail" or "rename"');
+      () => sendSpec(conflict: 'overwrite').toJsonString(), '"fail" or "rename"');
   _expectSpecError(
-      () => _send(deviceName: 'x' * 65).toJsonString(), '64 characters');
+      () => sendSpec(deviceName: 'x' * 65).toJsonString(), '64 characters');
   _expectSpecError(
-      () => _send(deviceName: 'two\nlines').toJsonString(), 'control');
+      () => sendSpec(deviceName: 'two\nlines').toJsonString(), 'control');
 
   // Valid minimal spec: exactly the required fields, compact output.
-  final json = _send().toJsonString();
+  final json = sendSpec().toJsonString();
   expect(jsonDecode(json), <String, dynamic>{
     'source_roots': const ['C:/pick/dir'],
     'peer': '127.0.0.1:7100',
     'fp_hex': _fp1Hex,
   });
   // Uppercase fingerprints pass (Rust parses case-insensitively).
-  expect(jsonDecode(_send(fp: _fp1Hex.toUpperCase()).toJsonString())['fp_hex'],
+  expect(jsonDecode(sendSpec(fp: _fp1Hex.toUpperCase()).toJsonString())['fp_hex'],
       _fp1Hex.toUpperCase());
   // Compact separators: no space after ':' or ','.
-  final spaced = _send(deviceName: 'with space', timeoutSecs: 5).toJsonString();
+  final spaced = sendSpec(deviceName: 'with space', timeoutSecs: 5).toJsonString();
   expect(spaced, isNot(contains('": ')));
   expect(spaced, isNot(contains(', "')));
 });

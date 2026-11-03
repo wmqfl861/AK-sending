@@ -1,0 +1,180 @@
+{
+  "module": "M0-07",
+  "engineering_status": "REVIEWED_DEVICE_LAN_HARNESS_ONLY",
+  "module_acceptance": "PARTIAL_PHYSICAL_DEVICE_GATES_NOT_RUN",
+  "plan_commit": "b533fe2969067a58cbed2511ec8aab0e0b8825b0",
+  "first_implementation": "8b464c9601eff3a67ca1a758bc7bfe4e68067075",
+  "tested_and_reviewed_commit": "253cc6c601253170e6847f59aef3c8bbd0c03d5f",
+  "tested_tree": "5133b67485df850a996e77cd40d877e76f27eef1",
+  "runs": {
+    "core": 41568269666,
+    "native": 41568269744,
+    "flutter": 41568269677,
+    "mobile_core": 41568269667
+  },
+  "per_desktop": {
+    "core_rust": 110,
+    "native_rust": 16,
+    "python_scheduled": 61,
+    "python_passed_linux_macos": 61,
+    "python_passed_windows": 58,
+    "python_skipped_windows": 3
+  },
+  "per_flutter_host_task": {
+    "dart_tests": 20,
+    "swift_regressions_on_apple_hosts": 6
+  },
+  "review": {
+    "actor": "chatgpt-codex-connector[bot]",
+    "actor_id": 199175422,
+    "receipt": 6594175099,
+    "summary": 6594045561,
+    "status": "completed_no_major_findings",
+    "formal_approved": false,
+    "specialist_security_audit": false
+  },
+  "retained_failure": {
+    "run": 41567457463,
+    "commit": "8b464c9601eff3a67ca1a758bc7bfe4e68067075",
+    "reason": "widget ensureVisible targeted a lazily unbuilt control",
+    "fix": "bounded outer-list scrolling, unchanged no-consent assertion, added complete confirmation path"
+  },
+  "artifact_verification": "All thirteen ZIPs downloaded. Exact commit, all recorded command status/exit codes, all log hashes and product/native hashes checked. Five source.zip archives normalize to 140 exact Git blobs under committed attributes.",
+  "artifacts": [
+    {
+      "file": "m007-final-core-macos.zip",
+      "artifact_id": 13200415602,
+      "zip_sha256": "d11dc73a9ab47679624247e848bf191acf90aabbf3782e63e806793eebcf7fdc",
+      "results_sha256": "71b02d1460360f5e640e67079f00006dec33d0e4934e2e2d8238f2f7184dadf1",
+      "commands": 9
+    },
+    {
+      "file": "m007-final-core-windows.zip",
+      "artifact_id": 13200009394,
+      "zip_sha256": "6cf1ebd4218575855cecd81ceb28e5128680143b0d89adfa422d4479ee88dc53",
+      "results_sha256": "4096e1d2ce003a6ba2679c5e8e7abd6e1ead81b13e82d5a0bef85953e2ee1cd6",
+      "commands": 9
+    },
+    {
+      "file": "m007-final-core-linux.zip",
+      "artifact_id": 13199184030,
+      "zip_sha256": "cfab41bd547762cfaa40e651bfe829aa7993e5b801f3f6adcb438a119b0fac3e",
+      "results_sha256": "6eefa368e4d4d63c9fd87d4d831b58ad8b2245c24994401048efa1dda9170d7d",
+      "commands": 9
+    },
+    {
+      "file": "m007-final-native-ios.zip",
+      "artifact_id": 13200165820,
+      "zip_sha256": "f8b0b7ab45bfb0abab4ca042df06771a0e2300299ca192c2caadbb724a07c464",
+      "results_sha256": "9071c77c85c465ed6f2d1c33935a9f858b370b4c5693849fe516cb6441a9eb46",
+      "commands": 8
+    },
+    {
+      "file": "m007-final-native-macos.zip",
+      "artifact_id": 13200019437,
+      "zip_sha256": "adf417bc65e51338659ba93e2e86764e1e8d7fd3e273d8500dee7030892a5f98",
+      "results_sha256": "5d508709b811d1163aad0b17d68ee027c827937ff61288f8380263fa1279aeed",
+      "commands": 10
+    },
+    {
+      "file": "m007-final-native-linux.zip",
+      "artifact_id": 13199964430,
+      "zip_sha256": "eed8d07f96007452e59dc64221dc6f3be409acae467ddff980e76b77dad52189",
+      "results_sha256": "66d3b852b29b949b222da06bda88e161aa39ad5215768d708b696a9b4479fcfc",
+      "commands": 11
+    },
+    {
+      "file": "m007-final-native-android.zip",
+      "artifact_id": 13199533712,
+      "zip_sha256": "0c0951d08448c19cda03bd1e06941e184a54325df8a705b9a3bdd4c37c4cfe0f",
+      "results_sha256": "7a8d96f7023e30fbe833c1d76916818446baf2e306ce0b2ab6b3a5e0ca37851a",
+      "commands": 9
+    },
+    {
+      "file": "m007-final-native-windows.zip",
+      "artifact_id": 13199224361,
+      "zip_sha256": "1bdc9566773f1919459c4ed22584b35d08aa979262f3839ae38b160e94051078",
+      "results_sha256": "ed225f79317097d44d448df24d2b7efeaafd8644b16e9989702a3630af4c739f",
+      "commands": 10
+    },
+    {
+      "file": "m007-final-flutter-windows.zip",
+      "artifact_id": 13200311330,
+      "zip_sha256": "3335a9ec7276f4ce57997f98627ffb8c233da0d8372fcbd0937f6dd034150407",
+      "results_sha256": "4ed78805a5dfcf15d0acd703c6fbb8367a0a839dfc34461934bc79bdfb8786dd",
+      "commands": 12
+    },
+    {
+      "file": "m007-final-flutter-ios.zip",
+      "artifact_id": 13199789284,
+      "zip_sha256": "0954a054a08f64afd40743f8095b8596bb7c122b32145ed7c24d8fa03493e211",
+      "results_sha256": "12d361037627ed0029ee47fe6c47020ac62a1ea90b5385a7eedb239a4128100e",
+      "commands": 14
+    },
+    {
+      "file": "m007-final-flutter-android.zip",
+      "artifact_id": 13199124381,
+      "zip_sha256": "912304e6778c2b8de392250979b2d5b06ecf218b083eacbe24673d5884f46c72",
+      "results_sha256": "042a1e0e0771d252e99e9d104a1efde006db726aba50ac2e9f6f0aed2e9f56cd",
+      "commands": 10
+    },
+    {
+      "file": "m007-final-flutter-macos.zip",
+      "artifact_id": 13200216652,
+      "zip_sha256": "b535bf4f727daabadfe0b3a84be6ece06f4616132347834e84c3379709bdec87",
+      "results_sha256": "2f3ff5b943e3af09c84bc8de91f061fdb024ca70e7d85a979f0d84da2306e6e5",
+      "commands": 16
+    },
+    {
+      "file": "m007-final-flutter-linux.zip",
+      "artifact_id": 13199704737,
+      "zip_sha256": "eb221cf5134fffcafc743785456b30489c9f47828bf73492d0972ef0d746c007",
+      "results_sha256": "5d6cf9dde4030cd0e6035f906efd357d3fcf3d328213b215822a08368f2b4921",
+      "commands": 12
+    }
+  ],
+  "products": [
+    {
+      "platform": "linux",
+      "name": "linux-release-unsigned-or-local.zip",
+      "bytes": 10723606,
+      "sha256": "962bf9a542f1bf8659672417500442482921f90b01d8e7485eb5ac7b9d1d9726"
+    },
+    {
+      "platform": "windows",
+      "name": "windows-release-unsigned-or-local.zip",
+      "bytes": 12480916,
+      "sha256": "898ac1d047d25ddd73966088577ae6d1d02881f0550131e6f7b8c9746c6ed4f5"
+    },
+    {
+      "platform": "macos",
+      "name": "macos-release-unsigned-or-local.zip",
+      "bytes": 10435331,
+      "sha256": "7ca7bc83235e28da8217b5f669317129fd3f78d8577c96b3e699afb9b1dc3157"
+    },
+    {
+      "platform": "android",
+      "name": "probe-debug-key-signed.apk",
+      "bytes": 20335269,
+      "sha256": "ec78d60659bb7a4c44fcc3545cbf03a01c880846966319120e9902328f3fc5b0"
+    },
+    {
+      "platform": "ios",
+      "name": "ios-release-unsigned-or-local.zip",
+      "bytes": 8816142,
+      "sha256": "fe2b959a73744ae8b097e3529c5bad523ae616e6cb65c8d973b751c080de6a45"
+    }
+  ],
+  "artifact_retention_days": 14,
+  "not_proven": [
+    "whole M0 acceptance",
+    "physical devices or Wi-Fi",
+    "mobile permissions/directories/lifecycle",
+    "minimum OS runtime",
+    "device resource budget",
+    "user file transfer"
+  ],
+  "physical_acceptance_issue": 9,
+  "merged": false,
+  "deployed": false
+}

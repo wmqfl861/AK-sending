@@ -22,17 +22,17 @@
 
 ## 当前实现状态
 
-**M0总状态为PARTIAL：M0-01至M0-04已完成各自范围的审核；M0-05工程子范围已审核并完成五端release构建，物理设备验收仍未完成。** [M0总表](reports/M0_STATUS.zh-CN.md) · [最新审核](reports/M0-05_REVIEW.zh-CN.md) · [验证索引](reports/M0-05_VALIDATION.json)。
+**M0工程已推进到M0-07：独立两端LAN原生探针、五端操作入口、设备证据工具均已实现并通过工程审核。完整M0验收仍为PARTIAL，剩余实机项目没有豁免。** [M0总表](reports/M0_STATUS.zh-CN.md) · [最新审核](reports/M0-07_REVIEW.zh-CN.md) · [验证索引](reports/M0-07_VALIDATION.json)。
 
-`ak-core`无第三方运行时依赖；`ak-transport`提供原生UDP/quinn/rustls双向认证、完整配对证书固定、私有接收许可、68字节有界协议头与16KiB合成帧、TLS/task/sequence绑定及取消/正常收尾。文件数据中继仍被禁止。
+`ak-core`仍无第三方运行时依赖；`ak-transport`提供原生UDP/quinn/rustls双向证书固定认证、私有接收许可、有界协议、TLS/task/sequence绑定与有界端点排空。独立LAN实验只传两块固定合成数据，不读取用户文件、不使用任何文件中继。
 
-独立的原生和Flutter实验壳已接通整数句柄FFI、低频状态、取消/释放与手机目录权限实验入口。最终受测且独立复审代码 `66555214e40e779013c07cb0bda3d6dcf6bd5332`：三桌面每系统108项生产Rust、6项native Rust通过；Linux/macOS 45项Python通过，Windows43项通过+2项Unix专用测试跳过；五个构建任务各7项Dart主机测试通过。三桌面运行真实Dart FFI，同机UDP/TLS成功。两Apple主机任务执行6项Swift真实文件回归。
+最终受测且独立复审代码 `253cc6c601253170e6847f59aef3c8bbd0c03d5f`：三桌面每系统110项核心Rust、16项native Rust通过；Linux/macOS61项Python通过，Windows58通过+3项Unix专用跳过；五个Flutter构建任务各20项Dart主机测试；两个Apple主机各6项Swift文件回归。
 
-Windows/Linux x64、macOS/Android/iOS arm64的Flutter release构建已通过；Android用测试密钥签名，iOS未签名。构建与链接不等于实机可用或商店发布。资源记录只有极小实验壳的产物字节，未证明完整产品性能预算。
+Windows/Linux x64、macOS/Android/iOS arm64 release构建通过；三桌面实际Dart FFI、两独立进程和Linux两个无默认路由网络栈正负例通过。新LAN页面支持手动地址、完整摘要核对、本机显式确认、权限回调失效和取消释放。构建不是五端实机运行，namespace不是Wi-Fi。
 
-**尚不能互传用户文件。** 当前实验固定loopback；独立两设备LAN实验驱动尚未接入。真实手机网络权限、目录持久授权/撤销、后台/锁屏/杀进程、两设备断外网Wi-Fi、最低系统与CPU/内存/启动预算未验收。没有生产文件引擎、可靠保存、持久续传、配对UI/密钥生命周期、NAT、自动LAN优先选路或完整产品GUI。
+**尚不能互传用户文件，完整M0也尚未验收。** 真实手机权限、目录持久授权/撤销、后台/锁屏/杀进程、断外网Wi-Fi、最低系统与资源预算仍NOT_RUN。[实机操作手册](experiments/flutter_probe/LAN_DEVICE_RUNBOOK.zh-CN.md) · [设备矩阵](experiments/flutter_probe/DEVICE_MATRIX.zh-CN.md)。用户文件引擎/可靠保存/续传属于M1，公网NAT与自动选路属于后续阶段。
 
-最新工作分支 `dev/m0-05-flutter-risk-harness-20261102` / 草稿PR #6。所有PR仍未合并main，不部署、不采购、不强推。历史模块证据保留，不改写成当前提交的测试结果。
+最新工作分支 `dev/m0-07-device-lan-harness-20261102` / 草稿PR #8；M0-06在草稿PR #7。实机缺口跟踪Issue #9。未合并main、不部署、不采购、不强推。Android用测试签名，iOS未签名；极小实验产物大小不代表完整产品性能预算。
 
 ## 工程检查与模块流程
 

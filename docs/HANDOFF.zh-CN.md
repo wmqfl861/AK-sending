@@ -1,31 +1,39 @@
-# 当前交接：M0-05工程子范围已审核，M0总验收PARTIAL
+# 当前交接：M0-06/07工程已审核，完整M0待实机验收
 
 ## 基线与分支
 
-仓库wmqfl861/AK-sending；当前工作分支 `dev/m0-05-flutter-risk-harness-20261102`，草稿PR #6。最终受测且独立复审实现 `66555214e40e779013c07cb0bda3d6dcf6bd5332`，树 `3bcdfa7574c5bf4a51c74c23e49d564314219319`。本交接所在提交只改报告/状态页/摘要；下次先读远端最新HEAD，不能把上述实现SHA当永久HEAD。
+仓库wmqfl861/AK-sending。当前工作分支 `dev/m0-07-device-lan-harness-20261102`，草稿PR #8；M0-06在草稿PR #7。最终受测且独立复审代码 `253cc6c601253170e6847f59aef3c8bbd0c03d5f`，树 `5133b67485df850a996e77cd40d877e76f27eef1`。本交接随后的提交只改文档、证据索引和MANIFEST，下次必须读取最新HEAD，不能把该实现SHA当永久HEAD。
 
-M0-05计划先行提交 `8edf293301b94684d95e81104e89a3c524ca0c43`。仍遵守 [AGENTS](../AGENTS.md)：先单独提交计划→开发→实际测试→审核→修复复测→交接。所有PR未合并main；没有部署、采购、生产签名或强推授权。
+先行计划：M0-06 `4bf8fa66b9863c5ca2baa498c8521c37fa84f42d`，端点排空补充 `531a4e442a227618b1798e0aebeb3b800d27a01d`；M0-07 `b533fe2969067a58cbed2511ec8aab0e0b8825b0`。保持 [AGENTS](../AGENTS.md) 的先计划→开发→测试→审核→修复复测→交接。未合并、部署、采购、强推或操作生产签名。
 
-## 本轮修改与真实验证
+## 本轮实际交付
 
-修复Apple日志头导致lipo架构误判，严格验证单一arm64和精确FFI导出；修正Android SDK包名为android-37.0但compile/target仍37；修复Apple产品归档中符号链接/文件模式保存；新增8项Python回归。未改变生产core/transport或添加中继。此前iOS部分写入清理与协调块取消的两项P2已修复并回归，本轮继承。
+M0-06：独立两端临时配对、9个有界标量LAN ABI、冻结对端/角色、一次性本机合成许可、真实UDP/TLS两固定帧、取消/过期/release；CLI及三桌面独立进程测试、Linux无默认路由隔离栈。生产新增消耗式有界shutdown排空，不更改TLS/授权/依赖。
 
-Flutter41553627431、core41553627658、native41553627512、mobile41553627432均成功。三桌面每系统108项生产Rust、6项native Rust；Linux/macOS45项Python，Windows43项+2项Unix专用跳过；每个Flutter构建任务7项Dart主机测试；三桌面真实Dart FFI；两个Apple任务各6项Swift文件回归。五端release产物均生成并校验。13份最终artifact已下载校验精确SHA、命令退出码及日志/产品摘要。
+M0-07：五端LAN页面与纯Dart控制器、严格公开offer、完整指纹核对/勾选/明确启动、异步权限代次和后台/销毁保护、原平台权限及用途声明；Apple新增导出保留校验。增加设备操作手册、未填模板和只验证一致性的证据检查器，不产生虚假真机记录。
 
-最终独立复审回执6592174236针对66555214e4，无重大问题；不是正式APPROVED或安全专项审计。旧失败41460994948保留，不以候选或旧SHA成功替代最终验收。具体记录见 [审核](../reports/M0-05_REVIEW.zh-CN.md)、[证据](../reports/M0-05_VALIDATION.json)。M0-04两份历史报告原样继承到此分支，保留自己的受测SHA。
+首轮Flutter41567457463的组件测试错误已修复：有界滚动定位懒构建按钮，并新增完整确认流程，保留未确认不得start断言；不是跳过失败。最终独立回执6594175099明确审查253cc6c601、未发现重大问题。M0-06回执6593782051针对310079dbf9；不是正式APPROVED或专项安全审计。
 
-续接容器仅实际运行45项Python/静态检查和下载的最终Linux native库3次同机TLS及取消释放；本轮未本地编译Rust或执行Flutter。完整构建/测试来自真实GitHub CI。没有把测试计数、跳过用例或主机测试写成手机真机通过。
+## 最终测试与核验
 
-## 尚未完成与下一入口
+core41568269666、native41568269744、Flutter41568269677、mobile41568269667均成功。三桌面每系统110核心Rust、16native Rust；Linux/macOS61 Python，Windows58通过+3项Unix专用跳过；五个Flutter主机任务各20 Dart；两个Apple主机各6 Swift真实文件回归。三桌面实际Dart FFI新旧入口通过，LAN网络通过独立进程/隔离栈，不冒称手机UI网络实测。
 
-总状态见 [M0总表](../reports/M0_STATUS.zh-CN.md)。M0-05工程子范围reviewed，但计划A4的物理设备验收未运行，模块总状态PARTIAL。独立两设备LAN实验驱动**也尚未实现**；当前UI按钮只能运行同机loopback，所以不是“只剩让用户运行现有程序”。
+13份最终artifact均下载，核对ZIP、精确commit、所有命令退出码和原始日志/产品摘要；五份source.zip各140个正规化Git blob匹配受测树。详细索引见[M0-07_VALIDATION](../reports/M0-07_VALIDATION.json)，[审核](../reports/M0-07_REVIEW.zh-CN.md)。本地Rust/Dart工具经只读公开工具包核验后使用；本地执行Rust/native/Python及纯Dart检查，完整Flutter来自CI。本地netns权限不足，隔离栈成功来自CI，不绕过限制。
 
-下一模块建议M0-06：先单独提交跨设备LAN探针计划，明确可信配对、两端独立地址/端口、合成内容、本机确认、取消和仅短状态码诊断；然后开发与两进程自动测试，再用真实两设备断外网Wi-Fi验收。不得自动打开不受限网络端口、绕过系统权限或恢复relay。
+M0-06历史两份报告从PR #7文档提交733513116e3cd15146c9b81d8ede542bf371af1b原样继承，保留其受测SHA，不把历史结果改写为新结果。当前新增功能的正负例和复审绑定本轮最终SHA。
 
-Android/iOS实际安装、LAN权限允许/拒绝/撤销、持久目录/文件提供者、后台/锁屏/杀进程、最低平台、资源预算均缺真机证据。设备矩阵保持NOT_RUN/BLOCKED。用户文件流式I/O、BLAKE3、可靠保存和续传归M1；NAT/公网功能归M2，不能在没计划时塞入一个大提交。
+## 下一节点与明确边界
+
+**LAN独立驱动和五端操作入口已经实现，不需要再重复开发这两个旧缺口。完整M0仍PARTIAL，阻断在实际设备退出验收。** 跟踪[Issue #9](https://github.com/wmqfl861/AK-sending/issues/9)，按[设备操作手册](../experiments/flutter_probe/LAN_DEVICE_RUNBOOK.zh-CN.md)和[设备矩阵](../experiments/flutter_probe/DEVICE_MATRIX.zh-CN.md)取得真实手机/无线网络/权限/目录/进程/最低系统与资源证据。
+
+Android为测试签名APK，iOS为未签名App ZIP，后者需本地可信Xcode签名安装且记录实际安装产物。当前没有接入可操作物理Android/iOS，不得用构建、namespace、组件fake或人工填表代替实测。证据检查器退出0只是单记录完整性，不是M0通过。
+
+实验仅私网IPv4、临时证书、固定合成内容；不是生产密钥管理、文件引擎或可靠保存。手机切后台/系统弹窗会取消，恢复不自动重启，配对数据交换需可信带外方式并保持实验页面；这不是最终配对UX。平台系统调用可能不立即响应取消，保持busy而非无限叠任务。
+
+M1文件I/O/校验/续传、M2公网NAT仍需另行先行计划；不能提前实现它们来掩盖M0未验收。新发现实机问题先写小模块修复计划。历史失败和未测项不删。
 
 ## 产物与回退
 
-固定SDK生成工程、所有覆盖源码与真实锁文件已提交；生成的完整平台工程及产品在CI artifact，来源摘要可核验。Android产物是测试密钥签名APK，iOS为未签名App ZIP，不代表可直接安装或正式发布。构建产物字节不是商店下载大小、安装大小或手机内存。
+五端极小实验产物约Windows11.90、Linux10.23、macOS9.95、Android19.39、iOS8.41 MiB（分别ZIP或APK），不是完整产品预算结论。CI artifact保留14天，文本日志另保全；过期不保证远端ZIP可取。
 
-artifact保留14天，文本日志已另行保全；过期后不能承诺远端仍能下载。回退限于M0-05实验壳/生成器/专项workflow，不动ADR-001、原始字节/纯直连/轻量约束。保持单写入者，遇到远端新提交先核对，不覆盖他人修改。
+回退按模块移除实验页面/绑定/工具，保留认证/授权/无中继约束；不改main。保持单写入者，远端发生新提交先核对。无会话结束后自动继续的承诺。

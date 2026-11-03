@@ -89,7 +89,11 @@
 - [x] ak-ffi C ABI 绑定层（ADR-003 契约先行）：9 个导出函数（句柄式/内嵌运行时/轮询进度 JSON/调用方缓冲区/spec JSON 未知字段忽略+控制字符拒绝）、错误码 0/1/2/-1..-5、catch_unwind 全入口；unsafe 20 块全部隔离于 shim 层逐块 SAFETY 注释（core 层 forbid(unsafe_code) 零 unsafe）；cdylib 产出 ak_ffi.dll 供前端动态加载。6 项测试全部经 C ABI 端到端：真实环回传输、20+ 坏 spec 反例、取消无假完成、双引擎无串扰、serve_concurrently 聚合。
 - [x] ADR-003（FFI 边界决策与备选取舍：bridge 代码生成/JSON-RPC 子进程/CLI 管道）；SECURITY 增 FFI 边界节（契约层防护与已知限制）。
 
-第十一轮进行中（2026-11-03，Dart 层与工具链并行）：flutter_app/packages/ak_ffi_dart 纯 Dart 包（FFI 绑定层+模型/状态层并行开发中，真实 DLL 环回为验证门槛）；Flutter SDK 已装（stable 浅克隆），工具链首次构建进行中；Windows 打包脚本并行开发中。完成后补记。
+第十一轮（2026-11-03，Dart 层与工具链并行；证据：flutter_app/packages/ak_ffi_dart 全包 dart test 69/69、dart analyze 零告警）：
+
+- [x] ak_ffi_dart 纯 Dart 包（不经 Flutter 工具链即可开发验证——Dart SDK 随克隆就位）：FFI 绑定层（9 函数 dart:ffi、Dart 侧 spec 校验镜像 Rust、-3 自动扩容、Finalizer 防泄漏；真实 DLL 环回/取消/-3 语义 9 项测试）+ 模型层（19 事件类型化+Unknown 兜底、TransferReport、与 ak-cli 逐字对齐的 humanBytes/两行式指纹/进度条、准入策略解析——配对码匹配显式留给 Rust 不在 Dart 做哈希）+ 状态层（JobController 相位机/多连接聚合/文件表，FFI-free 59 项测试）。
+- [x] Windows 打包脚本 scripts/package_windows.ps1：exe+DLL+README+可选 Flutter 产物（探测式接入）+SHA256 MANIFEST+zip，两次自测幂等；仓库检查脚本同步排除 target/（dist 在场验证绿）。
+- [ ] Flutter 桌面端 UI（工具链首次构建进行中；widget 层+flutter build windows 验收待工具就绪）。
 
 ## P0
 

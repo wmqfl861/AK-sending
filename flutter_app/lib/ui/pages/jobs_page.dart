@@ -1,4 +1,5 @@
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show humanBytes;
+import 'package:ak_ffi_dart/ak_ffi_dart.dart'
+    show fingerprintShortId, humanBytes, isFingerprintHex;
 import 'package:flutter/material.dart';
 
 import '../service/transfer_service.dart';
@@ -57,6 +58,7 @@ class _JobsPageState extends State<JobsPage> {
               child: Text('历史任务', style: theme.textTheme.headlineSmall),
             ),
             IconButton(
+              key: const ValueKey('jobs_refresh'),
               tooltip: '刷新',
               onPressed: _load,
               icon: const Icon(Icons.refresh),
@@ -78,6 +80,7 @@ class _JobsPageState extends State<JobsPage> {
           )
         else if (jobs == null)
           const Padding(
+            key: ValueKey('jobs_loading'),
             padding: EdgeInsets.all(32),
             child: Center(child: CircularProgressIndicator()),
           )
@@ -147,6 +150,12 @@ class _JobTile extends StatelessWidget {
               '${formatTime(job.startedAt)} · '
               '${job.files} 个文件 · ${humanBytes(job.bytes)}',
             ),
+            if (_peerLine(job).isNotEmpty)
+              Text(
+                _peerLine(job),
+                key: const ValueKey('job_peer_line'),
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
             if (job.summary.isNotEmpty) Text(job.summary),
             if (job.error != null)
               Text(
@@ -159,5 +168,23 @@ class _JobTile extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// `对端 <短式指纹> · <root>` from the record's peer/root fields
+  /// (engine jobsList rows); empty when the record carries neither.
+  static String _peerLine(JobRecord job) {
+    final peer = job.peer;
+    final root = job.root;
+    final buffer = StringBuffer();
+    if (peer != null && peer.isNotEmpty) {
+      buffer.write('对端 ');
+      buffer.write(
+          isFingerprintHex(peer) ? fingerprintShortId(peer) : peer);
+    }
+    if (root != null && root.isNotEmpty) {
+      if (buffer.isNotEmpty) buffer.write(' · ');
+      buffer.write(root);
+    }
+    return buffer.toString();
   }
 }

@@ -1,8 +1,10 @@
 //! End-to-end tests for the ak-ffi C ABI. Every test drives the library
 //! ONLY through the exported `ak_*` functions (never `core` directly):
 //! real loopback QUIC transfers crossing the C boundary, spec-JSON
-//! validation, cancellation, buffer-capacity handling, and two engines
-//! running concurrently. Fixture preparation (writing source files,
+//! validation, cancellation, buffer-capacity handling, two engines
+//! running concurrently, identity inspection (`ak_identity_info`),
+//! persisted-job listing (`ak_jobs_list`), and receive admission by peer
+//! book (`expect: "book"`). Fixture preparation (writing source files,
 //! pre-creating a receiver device key so its fingerprint is known) uses
 //! plain `std`/`ak-identity` — the transfers themselves never bypass the
 //! ABI.
@@ -19,10 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ak_ffi::{
-    ak_engine_free, ak_engine_last_error, ak_engine_new, ak_job_cancel, ak_job_result,
-    ak_poll_progress, ak_receive_start, ak_send_start, ak_version, AkEngine, AK_DONE,
-    AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK,
-    AK_PENDING,
+    ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,
+    ak_job_result, ak_jobs_list, ak_poll_progress, ak_receive_start, ak_send_start, ak_version,
+    AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT,
+    AK_FAILED, AK_OK, AK_PENDING,
 };
 
 // ---------------------------------------------------------------------------
@@ -258,6 +260,20 @@ fn run_loopback(
     assert_ne!(send_job, [0u8; 16], "job ids must never be all-zero");
     assert_ne!(send_job, recv_job, "each job gets its own id");
 
+    pump_jobs(engine, &recv_job, &send_job, probe_small_buffers)
+}
+
+/// Pump both started jobs to their terminal states through the ABI and
+/// verify the buffer-retry path mid-run when asked. Panics when either
+/// side fails; shared by `run_loopback` and the custom-spec tests.
+fn pump_jobs(
+    engine: *mut AkEngine,
+    recv_job: &[u8; 16],
+    send_job: &[u8; 16],
+    probe_small_buffers: bool,
+) -> LoopbackOutcome {
+    let recv_job = *recv_job;
+    let send_job = *send_job;
     let mut lines: Vec<String> = Vec::new();
     let mut send_json = String::new();
     let mut recv_json = String::new();
@@ -1097,6 +1113,604 @@ fn concurrent_receive_aggregates_two_senders() {
         || send_jobs
             .iter()
             .any(|(job, _)| line_job(line) == hex16(job))));
+
+    ak_engine_free(engine);
+}
+
+// ---------------------------------------------------------------------------
+// ak_identity_info / ak_jobs_list / receive expect "book".
+// ---------------------------------------------------------------------------
+
+/// Drive `ak_identity_info` through the C ABI with a large buffer.
+fn call_identity_info(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
+    let mut buf = [0 as c_char; 4096];
+    let code = ak_identity_info(
+        engine,
+        CString::new(id_dir).unwrap().as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    (code, cbuf_to_string(&buf))
+}
+
+/// Drive `ak_jobs_list` through the C ABI with a large buffer.
+fn call_jobs_list(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
+    let mut buf = [0 as c_char; 8192];
+    let code = ak_jobs_list(
+        engine,
+        CString::new(id_dir).unwrap().as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    (code, cbuf_to_string(&buf))
+}
+
+/// The single element of a one-element JSON array (fails loudly otherwise).
+/// Elements are objects, so their own `,` separators are fine — only the
+/// `},{` boundary between two elements rules out "exactly one".
+fn single_element(body: &str) -> String {
+    assert!(
+        body.starts_with('[') && body.ends_with(']'),
+        "expected a JSON array: {body}"
+    );
+    let inner = &body[1..body.len() - 1];
+    assert!(
+        !inner.is_empty() && !inner.contains("},{"),
+        "expected exactly one element: {body}"
+    );
+    inner.to_string()
+}
+
+#[test]
+fn identity_info_creates_once_and_matches_independent_key_load() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    // The id_dir does not exist yet; the call must create it.
+    let base = tempfile::tempdir().unwrap();
+    let id_dir = base.path().join("fresh-id");
+    assert!(!id_dir.exists());
+
+    let (code, body) = call_identity_info(engine, &id_dir.to_string_lossy());
+    assert_eq!(code, AK_DONE, "identity_info: {}", last_error_text(engine));
+    let device_id = field_str(&body, "device_id");
+    let fingerprint = field_str(&body, "fingerprint");
+    let pairing = field_str(&body, "pairing_code");
+    // Exact key set, order, and shapes.
+    assert_eq!(
+        body,
+        format!(
+            "{{\"device_id\":\"{device_id}\",\"fingerprint\":\"{fingerprint}\",\
+             \"pairing_code\":\"{pairing}\",\"peers\":0,\"created\":true}}"
+        )
+    );
+    assert_eq!(device_id.len(), 64);
+    assert!(device_id.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(pairing.len(), 7);
+    assert_eq!(pairing.as_bytes()[3], b'-');
+    assert!(pairing
+        .bytes()
+        .enumerate()
+        .all(|(i, b)| { b.is_ascii_digit() || (i == 3 && b == b'-') }));
+    assert_eq!(field_u64(&body, "peers"), 0);
+
+    assert!(id_dir.is_dir(), "id_dir was created");
+    assert_eq!(
+        fs::metadata(id_dir.join("device.key")).unwrap().len(),
+        32,
+        "32-byte seed file"
+    );
+
+    // Second call: the key exists, created flips to false, identity stable.
+    let (code, again) = call_identity_info(engine, &id_dir.to_string_lossy());
+    assert_eq!(code, AK_DONE);
+    assert_eq!(
+        again,
+        body.replace("\"created\":true", "\"created\":false"),
+        "only the created flag changes"
+    );
+
+    // The reported identity matches an independent load of the same file
+    // (fixture-side ak-identity use, like make_receiver_identity).
+    let (key, created) =
+        ak_identity::DeviceKeyPair::load_or_create(&id_dir.join("device.key")).unwrap();
+    assert!(!created);
+    assert_eq!(key.fingerprint().to_hex(), fingerprint);
+    let public_hex: String = key
+        .public_key()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(public_hex, device_id);
+    assert_eq!(ak_identity::pairing_code(&key.fingerprint()), pairing);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn identity_info_counts_peers_and_flags_corrupt_book() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+
+    // No peers.book yet: zero peers, no note.
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 0);
+    assert_eq!(last_error_text(engine), "", "no note for a missing book");
+
+    // Two paired peers are counted.
+    let mut book = ak_identity::PeerBook::default();
+    for name in ["laptop", "phone"] {
+        book.upsert(ak_identity::PeerRecord {
+            fingerprint: ak_identity::DeviceKeyPair::generate().fingerprint(),
+            name: name.to_owned(),
+            paired_unix_ms: 1,
+        });
+    }
+    book.save(&id_dir.path().join("peers.book")).unwrap();
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 2);
+
+    // A corrupt book still succeeds but reports 0 with a last_error note.
+    fs::write(id_dir.path().join("peers.book"), b"NOTPEERS\n").unwrap();
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE, "corrupt book does not fail the call");
+    assert_eq!(field_u64(&body, "peers"), 0);
+    let note = last_error_text(engine);
+    assert!(
+        note.contains("peers.book") && note.contains('0'),
+        "note names the book and the zero: {note}"
+    );
+
+    // Removing the book restores the clean zero (and clears the note).
+    fs::remove_file(id_dir.path().join("peers.book")).unwrap();
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 0);
+    assert_eq!(last_error_text(engine), "");
+
+    // Argument errors: null id_dir / empty id_dir / null buffer / tiny cap.
+    let c_path = CString::new(path_text.clone()).unwrap();
+    assert_eq!(
+        ak_identity_info(engine, std::ptr::null(), [0 as c_char; 64].as_mut_ptr(), 64),
+        AK_ERR_NULL
+    );
+    let empty = CString::new("").unwrap();
+    let mut buf = [0 as c_char; 64];
+    assert_eq!(
+        ak_identity_info(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        AK_ERR_INVALID
+    );
+    assert!(last_error_text(engine).contains("id_dir"));
+    assert_eq!(
+        ak_identity_info(engine, c_path.as_ptr(), std::ptr::null_mut(), 64),
+        AK_ERR_NULL
+    );
+    let mut tiny = [0 as c_char; 2];
+    assert_eq!(
+        ak_identity_info(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        AK_ERR_BUFFER
+    );
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("buffer too small") && message.contains("need"),
+        "capacity hint: {message}"
+    );
+
+    // An id_dir that can never be created (regular file in the way).
+    let as_file = tempfile::tempdir().unwrap();
+    let file_path = as_file.path().join("i-am-a-file");
+    fs::write(&file_path, b"x").unwrap();
+    let (code, body) = call_identity_info(engine, &file_path.to_string_lossy());
+    assert_eq!(code, AK_ERR_INVALID, "bad id_dir is -2");
+    assert_eq!(body, "", "nothing written on failure");
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn jobs_list_missing_directory_is_an_empty_array() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+
+    let (code, body) = call_jobs_list(engine, &path_text);
+    assert_eq!(code, AK_DONE, "jobs_list: {}", last_error_text(engine));
+    assert_eq!(body, "[]");
+    assert!(
+        !id_dir.path().join("checkpoints").exists(),
+        "a read must not create the directory"
+    );
+
+    // `[]` still honors the buffer contract: cap 2 cannot hold "[]" + NUL.
+    let c_path = CString::new(path_text.clone()).unwrap();
+    let mut tiny = [0 as c_char; 2];
+    assert_eq!(
+        ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        AK_ERR_BUFFER
+    );
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("buffer too small") && message.contains("need"),
+        "capacity hint: {message}"
+    );
+    let (code, body) = call_jobs_list(engine, &path_text);
+    assert_eq!((code, body.as_str()), (AK_DONE, "[]"), "lossless retry");
+
+    // Argument errors.
+    assert_eq!(
+        ak_jobs_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8),
+        AK_ERR_NULL
+    );
+    let empty = CString::new("").unwrap();
+    let mut buf = [0 as c_char; 8];
+    assert_eq!(
+        ak_jobs_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        AK_ERR_INVALID
+    );
+    assert!(last_error_text(engine).contains("id_dir"));
+    assert_eq!(
+        ak_jobs_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8),
+        AK_ERR_NULL
+    );
+
+    // An id_dir that is a regular file has no checkpoints directory: [].
+    let as_file = tempfile::tempdir().unwrap();
+    let file_path = as_file.path().join("not-a-dir");
+    fs::write(&file_path, b"x").unwrap();
+    let (code, body) = call_jobs_list(engine, &file_path.to_string_lossy());
+    assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn jobs_list_after_loopback_lists_completed_records() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    let recv_id = tempfile::tempdir().unwrap();
+    let recv_fp = make_receiver_identity(recv_id.path());
+    let send_id = tempfile::tempdir().unwrap();
+    // make_receiver_identity is direction-agnostic: any pre-created identity.
+    let send_fp = make_receiver_identity(send_id.path());
+
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("ffi-source");
+    let (total_bytes, total_entries) = make_source_tree(&src);
+    let dst = tempfile::tempdir().unwrap();
+
+    // Both sides carry an id_dir, so both persist under <id_dir>/checkpoints.
+    let extra = format!(",\"id_dir\":{}", path_jstr(send_id.path()));
+    let outcome = run_loopback(
+        engine,
+        &src,
+        dst.path(),
+        recv_id.path(),
+        &recv_fp,
+        false,
+        &extra,
+    );
+    let wire_job = field_str(&outcome.send_json, "wire_job");
+
+    // Receiver side: one completed receive record naming the sender.
+    let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
+    assert_eq!(code, AK_DONE, "{}", last_error_text(engine));
+    let recv_record = single_element(&body);
+    assert_eq!(field_str(&recv_record, "id"), wire_job);
+    assert_eq!(field_str(&recv_record, "direction"), "receive");
+    assert_eq!(field_str(&recv_record, "state"), "completed");
+    assert_eq!(field_str(&recv_record, "peer"), send_fp);
+    assert_eq!(field_u64(&recv_record, "files"), total_entries);
+    assert_eq!(field_u64(&recv_record, "bytes"), total_bytes);
+    assert!(field_u64(&recv_record, "updated_unix_ms") > 0);
+    assert!(
+        body.contains(&jstr(&dst.path().to_string_lossy())),
+        "root is the out_dir: {body}"
+    );
+
+    // Sender side: one completed send record pinned to the receiver.
+    let (code, body) = call_jobs_list(engine, &send_id.path().to_string_lossy());
+    assert_eq!(code, AK_DONE);
+    let send_record = single_element(&body);
+    assert_eq!(field_str(&send_record, "id"), wire_job);
+    assert_eq!(field_str(&send_record, "direction"), "send");
+    assert_eq!(field_str(&send_record, "state"), "completed");
+    assert_eq!(field_str(&send_record, "peer"), recv_fp);
+    assert!(
+        body.contains(&jstr(&src.to_string_lossy())),
+        "root is the source: {body}"
+    );
+
+    // Buffer contract on a populated list: a small cap refuses the whole
+    // array; the retry returns the identical bytes.
+    let c_path = CString::new(send_id.path().to_string_lossy().into_owned()).unwrap();
+    let mut tiny = [0 as c_char; 8];
+    assert_eq!(
+        ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        AK_ERR_BUFFER
+    );
+    let (code, retry) = call_jobs_list(engine, &send_id.path().to_string_lossy());
+    assert_eq!(code, AK_DONE);
+    assert_eq!(retry, body, "retry is lossless");
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn receive_expect_book_accepts_paired_sender() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    let recv_id = tempfile::tempdir().unwrap();
+    let recv_fp = make_receiver_identity(recv_id.path());
+    let send_id = tempfile::tempdir().unwrap();
+    let send_key = ak_identity::DeviceKeyPair::generate();
+    send_key.save(&send_id.path().join("device.key")).unwrap();
+    let send_fp = send_key.fingerprint();
+
+    // Pre-pair: the receiver's book holds the sender's fingerprint.
+    let mut book = ak_identity::PeerBook::default();
+    book.upsert(ak_identity::PeerRecord {
+        fingerprint: send_fp,
+        name: "ffi-sender".to_owned(),
+        paired_unix_ms: 42,
+    });
+    book.save(&recv_id.path().join("peers.book")).unwrap();
+
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("book-src");
+    let mut pattern = Pattern(0xB00C_0000_0000_0001);
+    write_file(&src.join("payload.bin"), &pattern.bytes(200 * 1024));
+    let dst = tempfile::tempdir().unwrap();
+
+    let port = free_udp_port();
+    let recv_spec = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"book\",\"id_dir\":{},\
+         \"device_name\":\"book-recv\",\"timeout_secs\":30}}",
+        path_jstr(dst.path()),
+        path_jstr(recv_id.path())
+    );
+    let mut recv_job = [0u8; 16];
+    assert_eq!(
+        ak_receive_start(
+            engine,
+            CString::new(recv_spec).unwrap().as_ptr(),
+            recv_job.as_mut_ptr()
+        ),
+        AK_OK,
+        "{}",
+        last_error_text(engine)
+    );
+    let send_spec = format!(
+        "{{\"source_roots\":[{}],\"peer\":\"127.0.0.1:{port}\",\"fp_hex\":\"{recv_fp}\",\
+         \"chunk_kb\":64,\"id_dir\":{},\"timeout_secs\":30}}",
+        path_jstr(&src),
+        path_jstr(send_id.path())
+    );
+    let mut send_job = [0u8; 16];
+    assert_eq!(
+        ak_send_start(
+            engine,
+            CString::new(send_spec).unwrap().as_ptr(),
+            send_job.as_mut_ptr()
+        ),
+        AK_OK,
+        "{}",
+        last_error_text(engine)
+    );
+
+    let outcome = pump_jobs(engine, &recv_job, &send_job, false);
+    assert_eq!(field_str(&outcome.send_json, "peer"), recv_fp);
+    assert_eq!(
+        field_str(&outcome.recv_json, "peer"),
+        send_fp.to_hex(),
+        "the book-admitted sender is reported as the peer"
+    );
+    assert_trees_identical(&src, dst.path());
+
+    // The admitted transfer left a completed record under the receiver's
+    // checkpoints, naming the paired sender.
+    let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
+    assert_eq!(code, AK_DONE);
+    let record = single_element(&body);
+    assert_eq!(field_str(&record, "direction"), "receive");
+    assert_eq!(field_str(&record, "state"), "completed");
+    assert_eq!(field_str(&record, "peer"), send_fp.to_hex());
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn receive_expect_book_rejects_bad_books_at_start() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_field = path_jstr(out_dir.path());
+    let mut job = [0u8; 16];
+
+    // Missing book (id_dir holds only device.key): "pair first".
+    let missing = tempfile::tempdir().unwrap();
+    make_receiver_identity(missing.path());
+    let spec = format!(
+        "{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"book\",\"id_dir\":{}}}",
+        path_jstr(missing.path())
+    );
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_ERR_INVALID);
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("no paired peers") && message.contains("pair first"),
+        "pair-first hint: {message}"
+    );
+    assert_eq!(job, [0u8; 16], "no job id is written on failure");
+
+    // Empty book (header only) is the same refusal.
+    let empty = tempfile::tempdir().unwrap();
+    make_receiver_identity(empty.path());
+    fs::write(empty.path().join("peers.book"), b"AKPEERS1\n").unwrap();
+    let spec = format!(
+        "{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"book\",\"id_dir\":{}}}",
+        path_jstr(empty.path())
+    );
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_ERR_INVALID);
+    assert!(last_error_text(engine).contains("no paired peers"));
+
+    // Corrupt book: a load failure, still -2.
+    let corrupt = tempfile::tempdir().unwrap();
+    make_receiver_identity(corrupt.path());
+    fs::write(
+        corrupt.path().join("peers.book"),
+        b"AKPEERS1\nzz\tname\t1\n",
+    )
+    .unwrap();
+    let spec = format!(
+        "{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"book\",\"id_dir\":{}}}",
+        path_jstr(corrupt.path())
+    );
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_ERR_INVALID);
+    assert!(
+        last_error_text(engine).contains("peer book"),
+        "corrupt book error: {}",
+        last_error_text(engine)
+    );
+
+    // expect "book" without an id_dir cannot resolve a book at all.
+    let spec = format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"book\"}}");
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_ERR_INVALID);
+    assert!(last_error_text(engine).contains("id_dir"));
+
+    // A bad id_dir (regular file in the way) also refuses with -2.
+    let as_file = tempfile::tempdir().unwrap();
+    let file_path = as_file.path().join("not-a-dir");
+    fs::write(&file_path, b"x").unwrap();
+    let spec = format!(
+        "{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"book\",\"id_dir\":{}}}",
+        path_jstr(&file_path)
+    );
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_ERR_INVALID);
+
+    // The other policies are unaffected: "any" still starts (then cancels).
+    let any_id = tempfile::tempdir().unwrap();
+    make_receiver_identity(any_id.path());
+    let spec = format!(
+        "{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"any\",\"id_dir\":{}}}",
+        path_jstr(any_id.path())
+    );
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_OK);
+    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn receive_expect_book_rejects_unpaired_sender() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    let recv_id = tempfile::tempdir().unwrap();
+    let recv_fp = make_receiver_identity(recv_id.path());
+    // The book holds some OTHER device, never the sender below.
+    let mut book = ak_identity::PeerBook::default();
+    book.upsert(ak_identity::PeerRecord {
+        fingerprint: ak_identity::DeviceKeyPair::generate().fingerprint(),
+        name: "someone else".to_owned(),
+        paired_unix_ms: 1,
+    });
+    book.save(&recv_id.path().join("peers.book")).unwrap();
+
+    let base = tempfile::tempdir().unwrap();
+    let src = base.path().join("unpaired");
+    write_file(&src.join("secret.bin"), b"must not land");
+    let dst = tempfile::tempdir().unwrap();
+
+    let port = free_udp_port();
+    let recv_spec = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"book\",\"id_dir\":{},\
+         \"timeout_secs\":30}}",
+        path_jstr(dst.path()),
+        path_jstr(recv_id.path())
+    );
+    let mut recv_job = [0u8; 16];
+    assert_eq!(
+        ak_receive_start(
+            engine,
+            CString::new(recv_spec).unwrap().as_ptr(),
+            recv_job.as_mut_ptr()
+        ),
+        AK_OK,
+        "{}",
+        last_error_text(engine)
+    );
+    // No id_dir on the sender: its identity is ephemeral and unpaired.
+    let send_spec = format!(
+        "{{\"source_roots\":[{}],\"peer\":\"127.0.0.1:{port}\",\"fp_hex\":\"{recv_fp}\",\
+         \"timeout_secs\":30}}",
+        path_jstr(&src)
+    );
+    let mut send_job = [0u8; 16];
+    assert_eq!(
+        ak_send_start(
+            engine,
+            CString::new(send_spec).unwrap().as_ptr(),
+            send_job.as_mut_ptr()
+        ),
+        AK_OK,
+        "{}",
+        last_error_text(engine)
+    );
+
+    // Both sides fail: the receiver refuses the unauthorized peer and the
+    // sender sees the connection torn down before any stream opens.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut send_json, mut recv_json) = (String::new(), String::new());
+    while Instant::now() < deadline {
+        loop {
+            let (code, _) = poll_big(engine);
+            if code != AK_EVENT {
+                assert_eq!(code, AK_PENDING, "{}", last_error_text(engine));
+                break;
+            }
+        }
+        if send_json.is_empty() {
+            let (code, json) = result_big(engine, &send_job);
+            if code != AK_PENDING {
+                send_json = json;
+            }
+        }
+        if recv_json.is_empty() {
+            let (code, json) = result_big(engine, &recv_job);
+            if code != AK_PENDING {
+                recv_json = json;
+            }
+        }
+        if !send_json.is_empty() && !recv_json.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!send_json.is_empty(), "sender reached a terminal state");
+    assert!(!recv_json.is_empty(), "receiver reached a terminal state");
+    assert!(
+        send_json.contains("\"error\""),
+        "sender failed: {send_json}"
+    );
+    assert!(
+        recv_json.contains("rejected by the authorize callback"),
+        "receiver names the refusal: {recv_json}"
+    );
+    assert!(
+        !dst.path().join("unpaired").exists(),
+        "nothing from an unpaired sender lands"
+    );
+    // The refused connection produced no checkpoint record at all.
+    let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
+    assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
 
     ak_engine_free(engine);
 }

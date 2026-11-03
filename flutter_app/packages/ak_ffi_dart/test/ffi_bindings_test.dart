@@ -2,7 +2,10 @@
 /// (workspace `target/release`), mirroring the Rust-side `crates/ak-ffi/
 /// tests/ffi.rs` claims: exact version string, Dart-side spec pre-validation,
 /// Rust-side `-2` revalidation, a real loopback QUIC transfer through the
-/// boundary, mid-transfer cancellation, and the `-3` buffer retry semantics.
+/// boundary, mid-transfer cancellation, the `-3` buffer retry semantics,
+/// identity summaries (`ak_identity_info`), persisted job records
+/// (`ak_jobs_list`), and `expect:"book"` admission from a pre-written
+/// `peers.book`.
 ///
 /// Receiver identities: the seeds below are the RFC 8032 Ed25519
 /// test-vector seeds; the fingerprints are the first 32 bytes of
@@ -174,6 +177,38 @@ int _awaitListening(AkEngineDart engine, Uint8List recvJob,
     }
     sleep(const Duration(milliseconds: 5));
   }
+}
+
+/// Pump the progress queue and poll [jobs] until every one finished ok;
+/// returns each report JSON keyed by job hex. A failed job fails the test.
+Map<String, Map<String, dynamic>> _pumpUntilDone(
+    AkEngineDart engine, List<Uint8List> jobs,
+    [Duration budget = const Duration(seconds: 90)]) {
+  final reports = <String, Map<String, dynamic>>{};
+  final open = <String, Uint8List>{for (final job in jobs) _jobHex(job): job};
+  final deadline = DateTime.now().add(budget);
+  while (open.isNotEmpty) {
+    engine.pollProgress(); // keep the queue drained
+    open.removeWhere((hex, job) {
+      final result = engine.jobResult(job);
+      if (result.isDone) {
+        reports[hex] = result.map!;
+        return true;
+      }
+      if (result.isFailed) {
+        fail('job $hex failed through the ABI: ${result.map}');
+      }
+      return false;
+    });
+    if (open.isEmpty) {
+      break;
+    }
+    if (DateTime.now().isAfter(deadline)) {
+      fail('jobs did not finish within ${budget.inSeconds} s: $open');
+    }
+    sleep(const Duration(milliseconds: 2));
+  }
+  return reports;
 }
 
 // ---------------------------------------------------------------------------
@@ -786,5 +821,399 @@ test('pollProgress: -3 keeps the event queued, retry is lossless',
   } finally {
     engine.dispose();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Identity info (ak_identity_info) + persisted jobs list (ak_jobs_list).
+// ---------------------------------------------------------------------------
+
+test('identityInfo: creates once, is stable, flags bad id_dir and books',
+    () {
+  final engine = AkEngineDart();
+  try {
+    final base = _newTempDir('idinfo');
+    final fresh = Directory('${base.path}/fresh-id'); // does NOT exist yet
+    expect(fresh.existsSync(), isFalse);
+
+    // First call: the directory and device.key are created.
+    final first = engine.identityInfo(fresh.path);
+    expect(first.created, isTrue, reason: 'device.key created by the call');
+    expect(File('${fresh.path}/device.key').existsSync(), isTrue);
+    expect(RegExp(r'^[0-9a-f]{64}$').hasMatch(first.fingerprint), isTrue,
+        reason: 'fingerprint is 64 lowercase hex: ${first.fingerprint}');
+    expect(RegExp(r'^[0-9a-f]{64}$').hasMatch(first.deviceId), isTrue,
+        reason: 'device_id is the 64-hex public key');
+    expect(RegExp(r'^\d{3}-\d{3}$').hasMatch(first.pairingCode), isTrue,
+        reason: 'pairing code is ddd-ddd: ${first.pairingCode}');
+    expect(first.peers, 0, reason: 'no peers.book yet');
+
+    // Second call: same identity, created is now false (exactly once).
+    final second = engine.identityInfo(fresh.path);
+    expect(second.created, isFalse);
+    expect(second.fingerprint, first.fingerprint);
+    expect(second.deviceId, first.deviceId);
+    expect(second.pairingCode, first.pairingCode);
+    expect(second.peers, 0);
+
+    // A corrupt peers.book still succeeds with peers 0, leaving a note in
+    // the last-error buffer (read right after the call).
+    File('${fresh.path}/peers.book')
+        .writeAsStringSync('AKPEERS1\nzz\tbad\t1\n');
+    final corrupt = engine.identityInfo(fresh.path);
+    expect(corrupt.peers, 0);
+    expect(corrupt.created, isFalse);
+    expect(engine.lastError(), contains('peers.book'),
+        reason: 'corrupt-book note surfaces through lastError');
+
+    // Empty id_dir: -2 with the engine's message.
+    try {
+      engine.identityInfo('');
+      fail('expected an AkFfiException');
+    } on AkFfiException catch (e) {
+      expect(e.code, AkStatus.errInvalid, reason: e.message);
+      expect(e.message, contains('id_dir'));
+    }
+
+    // Tiny buffer at the raw layer: -3 names the needed size, the friendly
+    // call retries internally and is unaffected.
+    final idPtr = toNativeUtf8(fresh.path);
+    final tiny = processAllocator.allocate<Uint8>(4);
+    try {
+      expect(
+          engine.bindings.identityInfo(engine.nativeHandle, idPtr, tiny, 4),
+          AkStatus.errBuffer);
+      expect(engine.lastError(), contains('buffer too small'));
+      expect(engine.lastError(), contains('need'));
+    } finally {
+      processAllocator.free(tiny);
+      processAllocator.free(idPtr);
+    }
+    expect(engine.identityInfo(fresh.path).fingerprint, first.fingerprint,
+        reason: 'lossless retry after the -3 probe');
+  } finally {
+    engine.dispose();
+  }
+});
+
+test('identityInfo fingerprints are the wire identity (pinned loopback)',
+    timeout: const Timeout(Duration(seconds: 240)), () {
+  final engine = AkEngineDart();
+  try {
+    final base = _newTempDir('pin');
+    final src = Directory('${base.path}/pin-source')
+      ..createSync(recursive: true);
+    final payload = _Pattern(0x1212000000000004).bytes(120 * 1024);
+    File('${src.path}/payload.bin').writeAsBytesSync(payload);
+
+    // Both identities are created (and summarized) BEFORE any transfer.
+    final recvId = Directory('${base.path}/recv-id');
+    final sendId = Directory('${base.path}/send-id');
+    final recvInfo = engine.identityInfo(recvId.path);
+    final sendInfo = engine.identityInfo(sendId.path);
+    expect(recvInfo.created, isTrue);
+    expect(sendInfo.created, isTrue);
+
+    final dst = _newTempDir('pin-dst');
+    // Each side pins the fingerprint identityInfo reported for the other:
+    // if either summary were wrong, admission or TLS would refuse.
+    final recvJob = engine.receiveStart(AkReceiveSpec(
+      outDir: dst.path,
+      port: 0,
+      expect: sendInfo.fingerprint,
+      idDir: recvId.path,
+      timeoutSecs: 30,
+    ));
+    final events = <Map<String, dynamic>>[];
+    final port = _awaitListening(engine, recvJob, events);
+    final sendJob = engine.sendStart(AkSendSpec(
+      sourceRoots: [src.path],
+      peer: '127.0.0.1:$port',
+      fpHex: recvInfo.fingerprint,
+      idDir: sendId.path,
+      timeoutSecs: 30,
+    ));
+
+    final reports = _pumpUntilDone(engine, [sendJob, recvJob]);
+    final sendJson = reports[_jobHex(sendJob)]!;
+    final recvJson = reports[_jobHex(recvJob)]!;
+    expect(sendJson['peer'], recvInfo.fingerprint,
+        reason: 'sender authenticated the receiver at the reported fp');
+    expect(recvJson['peer'], sendInfo.fingerprint,
+        reason: 'receiver admitted the sender pinned at the reported fp');
+    expect(sendJson['files'], 1);
+    expect(sendJson['bytes'], payload.length);
+    _assertTreesIdentical(src, dst);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test('jobsList: fresh, key-only, and missing directories are []', () {
+  final engine = AkEngineDart();
+  try {
+    final base = _newTempDir('jl0');
+    expect(engine.jobsList(base.path), isEmpty,
+        reason: 'existing dir without checkpoints/');
+    expect(engine.jobsList('${base.path}/never-created'), isEmpty,
+        reason: 'a missing id_dir is also the empty list');
+
+    final withKey = Directory('${base.path}/has-key');
+    engine.identityInfo(withKey.path); // creates the dir + device.key only
+    expect(engine.jobsList(withKey.path), isEmpty,
+        reason: 'an identity without transfers lists nothing');
+
+    // Empty id_dir: -2 with the engine's message.
+    try {
+      engine.jobsList('');
+      fail('expected an AkFfiException');
+    } on AkFfiException catch (e) {
+      expect(e.code, AkStatus.errInvalid, reason: e.message);
+      expect(e.message, contains('id_dir'));
+    }
+
+    // Raw layer: a null buffer is -1.
+    final idPtr = toNativeUtf8(base.path);
+    try {
+      expect(
+          engine.bindings.jobsList(engine.nativeHandle, idPtr, nullptr, 64),
+          AkStatus.errNull);
+    } finally {
+      processAllocator.free(idPtr);
+    }
+  } finally {
+    engine.dispose();
+  }
+});
+
+test('jobsList: id_dir loopback persists one completed record per side',
+    timeout: const Timeout(Duration(seconds: 240)), () {
+  final engine = AkEngineDart();
+  try {
+    final base = _newTempDir('jl');
+    final src = Directory('${base.path}/jl-source')
+      ..createSync(recursive: true);
+    final pattern = _Pattern(0x1213000000000005);
+    File('${src.path}/one.bin').writeAsBytesSync(pattern.bytes(50 * 1024));
+    Directory('${src.path}/sub').createSync(recursive: true);
+    File('${src.path}/sub/two.bin')
+        .writeAsBytesSync(pattern.bytes(3 * 1024 + 9));
+    const totalBytes = 50 * 1024 + 3 * 1024 + 9;
+    const totalEntries = 3; // two files + the directory "sub"
+
+    final recvId = Directory('${base.path}/recv-id');
+    final sendId = Directory('${base.path}/send-id');
+    final recvInfo = engine.identityInfo(recvId.path);
+    final sendInfo = engine.identityInfo(sendId.path);
+    expect(engine.jobsList(recvId.path), isEmpty,
+        reason: 'nothing persisted before the transfer');
+
+    final dst = _newTempDir('jl-dst');
+    final recvJob = engine.receiveStart(AkReceiveSpec(
+      outDir: dst.path,
+      port: 0,
+      expect: 'any',
+      idDir: recvId.path,
+      timeoutSecs: 30,
+    ));
+    final events = <Map<String, dynamic>>[];
+    final port = _awaitListening(engine, recvJob, events);
+    final sendJob = engine.sendStart(AkSendSpec(
+      sourceRoots: [src.path],
+      peer: '127.0.0.1:$port',
+      fpHex: recvInfo.fingerprint,
+      idDir: sendId.path,
+      timeoutSecs: 30,
+    ));
+
+    final reports = _pumpUntilDone(engine, [sendJob, recvJob]);
+    final wireJob = reports[_jobHex(sendJob)]!['wire_job'] as String;
+    expect(reports[_jobHex(recvJob)]!['wire_job'], wireJob);
+
+    // Receiver side: one completed receive record naming the sender.
+    final recvRecords = engine.jobsList(recvId.path);
+    expect(recvRecords, hasLength(1));
+    final recvRecord = recvRecords.single;
+    expect(RegExp(r'^[0-9a-f]{32}$').hasMatch(recvRecord.id), isTrue,
+        reason: 'id is the 32-hex wire job id: ${recvRecord.id}');
+    expect(recvRecord.id, wireJob);
+    expect(recvRecord.direction, 'receive');
+    expect(recvRecord.state, 'completed');
+    expect(recvRecord.files, totalEntries);
+    expect(recvRecord.bytes, totalBytes);
+    expect(recvRecord.updatedUnixMs, greaterThan(0));
+    expect(recvRecord.peer, sendInfo.fingerprint);
+    expect(recvRecord.root, dst.path, reason: 'receive root is the out_dir');
+
+    // Sender side: one completed send record pinned to the receiver.
+    final sendRecords = engine.jobsList(sendId.path);
+    expect(sendRecords, hasLength(1));
+    final sendRecord = sendRecords.single;
+    expect(sendRecord.id, wireJob);
+    expect(sendRecord.direction, 'send');
+    expect(sendRecord.state, 'completed');
+    expect(sendRecord.files, totalEntries);
+    expect(sendRecord.bytes, totalBytes);
+    expect(sendRecord.peer, recvInfo.fingerprint);
+    expect(sendRecord.root, src.path, reason: 'send root is the source');
+
+    // Whole-array -3 at the raw layer: nothing consumed; the friendly
+    // retry returns the identical record (also proving == on the type).
+    final idPtr = toNativeUtf8(sendId.path);
+    final tiny = processAllocator.allocate<Uint8>(8);
+    try {
+      expect(engine.bindings.jobsList(engine.nativeHandle, idPtr, tiny, 8),
+          AkStatus.errBuffer);
+      expect(engine.lastError(), contains('buffer too small'));
+    } finally {
+      processAllocator.free(tiny);
+      processAllocator.free(idPtr);
+    }
+    expect(engine.jobsList(sendId.path), [sendRecord],
+        reason: 'lossless retry after the -3 probe');
+  } finally {
+    engine.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// expect:"book" admission (peer book under id_dir).
+// ---------------------------------------------------------------------------
+
+test('expect book admits a paired sender end to end',
+    timeout: const Timeout(Duration(seconds: 240)), () {
+  final engine = AkEngineDart();
+  try {
+    final base = _newTempDir('book');
+    final src = Directory('${base.path}/book-src')
+      ..createSync(recursive: true);
+    final payload = _Pattern(0xB00C000000000006).bytes(200 * 1024);
+    File('${src.path}/payload.bin').writeAsBytesSync(payload);
+
+    // Receiver identity from the RFC 8032 seed 1 fixture (fp known); the
+    // book pre-pairs the sender (seed 2 => _fp2Hex).
+    final recvId = _newTempDir('book-recv');
+    File('${recvId.path}/device.key').writeAsBytesSync(_seedBytes(_seed1Hex));
+    File('${recvId.path}/peers.book')
+        .writeAsStringSync('AKPEERS1\n$_fp2Hex\tdart-book\t1700000000000\n');
+    final sendId = _newTempDir('book-send');
+    File('${sendId.path}/device.key').writeAsBytesSync(_seedBytes(_seed2Hex));
+    final dst = _newTempDir('book-dst');
+
+    // identityInfo sees the paired peer; the seeded key was not created.
+    final info = engine.identityInfo(recvId.path);
+    expect(info.peers, 1, reason: 'one peers.book entry');
+    expect(info.created, isFalse, reason: 'device.key pre-existed');
+
+    final recvJob = engine.receiveStart(AkReceiveSpec(
+      outDir: dst.path,
+      port: 0,
+      expect: 'book',
+      idDir: recvId.path,
+      deviceName: 'book-recv',
+      timeoutSecs: 30,
+    ));
+    final events = <Map<String, dynamic>>[];
+    final port = _awaitListening(engine, recvJob, events);
+    final sendJob = engine.sendStart(AkSendSpec(
+      sourceRoots: [src.path],
+      peer: '127.0.0.1:$port',
+      fpHex: _fp1Hex,
+      idDir: sendId.path,
+      deviceName: 'book-send',
+      timeoutSecs: 30,
+    ));
+
+    final reports = _pumpUntilDone(engine, [sendJob, recvJob]);
+    expect(reports[_jobHex(recvJob)]!['peer'], _fp2Hex,
+        reason: 'the book-admitted sender is reported as the peer');
+    expect(reports[_jobHex(sendJob)]!['peer'], _fp1Hex);
+    _assertTreesIdentical(src, dst);
+
+    // The admitted transfer persisted a completed record naming the sender.
+    final records = engine.jobsList(recvId.path);
+    expect(records, hasLength(1));
+    expect(records.single.direction, 'receive');
+    expect(records.single.state, 'completed');
+    expect(records.single.peer, _fp2Hex);
+    expect(records.single.files, 1);
+    expect(records.single.bytes, payload.length);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test('expect book refuses empty, missing, and corrupt books at start', () {
+  final engine = AkEngineDart();
+  try {
+    final outDir = _newTempDir('bookref-out');
+
+    void expectRefusal(void Function() start, List<String> needles) {
+      try {
+        start();
+        fail('expected an AkFfiException');
+      } on AkFfiException catch (e) {
+        expect(e.code, AkStatus.errInvalid, reason: e.message);
+        for (final needle in needles) {
+          expect(e.message, contains(needle),
+              reason: 'message was: ${e.message}');
+        }
+      }
+    }
+
+    AkReceiveSpec bookSpec(String idDir) => AkReceiveSpec(
+          outDir: outDir.path,
+          port: 0,
+          expect: 'book',
+          idDir: idDir.isEmpty ? null : idDir,
+        );
+
+    // Missing book (id_dir holds only device.key): "pair first".
+    final missing = _newTempDir('bookref-missing');
+    File('${missing.path}/device.key')
+        .writeAsBytesSync(_seedBytes(_seed1Hex));
+    expectRefusal(() => engine.receiveStart(bookSpec(missing.path)),
+        ['no paired peers', 'pair first']);
+
+    // Header-only (empty) book: the same refusal.
+    final empty = _newTempDir('bookref-empty');
+    File('${empty.path}/device.key').writeAsBytesSync(_seedBytes(_seed1Hex));
+    File('${empty.path}/peers.book').writeAsStringSync('AKPEERS1\n');
+    expectRefusal(() => engine.receiveStart(bookSpec(empty.path)),
+        ['no paired peers', 'pair first']);
+
+    // Corrupt book: a load failure naming the peer book.
+    final corrupt = _newTempDir('bookref-corrupt');
+    File('${corrupt.path}/device.key')
+        .writeAsBytesSync(_seedBytes(_seed1Hex));
+    File('${corrupt.path}/peers.book')
+        .writeAsStringSync('AKPEERS1\nzz\tname\t1\n');
+    expectRefusal(() => engine.receiveStart(bookSpec(corrupt.path)),
+        ['peer book']);
+
+    // "book" without an id_dir cannot resolve a book at all.
+    expectRefusal(() => engine.receiveStart(bookSpec('')), ['id_dir']);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test('expect spec: "book" is a valid value, near-misses are not', () {
+  AkReceiveSpec recv(String? expect) => AkReceiveSpec(
+        outDir: 'C:/inbox',
+        port: 0,
+        expect: expect,
+        timeoutSecs: 5,
+      );
+
+  // "book" round-trips verbatim in every case shape the engine parses.
+  expect(jsonDecode(recv('book').toJsonString())['expect'], 'book');
+  expect(jsonDecode(recv('BOOK').toJsonString())['expect'], 'BOOK');
+  expect(jsonDecode(recv(' Book ').toJsonString())['expect'], ' Book ');
+
+  // Near-misses stay rejected, with the updated message naming "book".
+  _expectSpecError(() => recv('books').toJsonString(), '"book"');
+  _expectSpecError(() => recv('bookk').toJsonString(), '"book"');
+  _expectSpecError(() => recv('nope').toJsonString(), '"book"');
+  _expectSpecError(() => recv('12345').toJsonString(), '6-digit');
 });
 }

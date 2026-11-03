@@ -174,12 +174,13 @@ void _checkRange(String field, int value, int min, int max) {
   }
 }
 
-/// Mirror of `Expect::parse`: `any` (case-insensitive), a 64-hex
+/// Mirror of `Expect::parse`: `any` or `book` (case-insensitive), a 64-hex
 /// fingerprint, or a 6-digit pairing code (digits plus `-`/space separators).
 void _checkExpect(String expect) {
   _checkString('expect', expect);
   final trimmed = expect.trim();
-  if (trimmed.toLowerCase() == 'any') {
+  final lowered = trimmed.toLowerCase();
+  if (lowered == 'any' || lowered == 'book') {
     return;
   }
   if (_hex64.hasMatch(trimmed)) {
@@ -193,7 +194,7 @@ void _checkExpect(String expect) {
     return;
   }
   throw AkSpecException(
-    'field "expect" must be "any", a 64-hex fingerprint, or a 6-digit '
+    'field "expect" must be "any", "book", a 64-hex fingerprint, or a 6-digit '
     'pairing code',
   );
 }
@@ -342,7 +343,15 @@ class AkReceiveSpec {
   /// progress event (only meaningful with the default `onceJobs == 1`).
   final int? port;
 
-  /// Optional `"any"` (default), a 64-hex fingerprint, or a 6-digit code.
+  /// Optional admission policy: `"any"` (default), `"book"`, a 64-hex
+  /// fingerprint, or a 6-digit pairing code.
+  ///
+  /// `"book"` admits ONLY fingerprints listed in `<id_dir>/peers.book`
+  /// (the book is re-read on every connection, so pairing edits apply
+  /// without restarting a concurrent receive) and requires a non-empty
+  /// [idDir]; the engine validates both at start — a missing, empty, or
+  /// corrupt book makes `receiveStart` fail with an `AkFfiException`
+  /// ("pair first") before any listener binds.
   final String? expect;
 
   /// Optional `"fail"` (default) or `"rename"`.

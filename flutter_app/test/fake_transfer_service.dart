@@ -1,4 +1,7 @@
+import 'dart:async' show Completer;
+
 import 'package:ak_ffi_dart/ak_ffi_dart.dart';
+import 'package:ak_sending_app/services/ak_engine_facade.dart';
 import 'package:ak_sending_app/ui/service/transfer_service.dart';
 
 /// Deterministic in-memory [TransferService] for widget tests: pages get
@@ -10,19 +13,38 @@ class FakeTransferService implements TransferService {
     DeviceInfo? deviceInfo,
     this.versionText = 'ak-ffi 1 (wire v1, caps 0x0007)',
     List<JobRecord>? jobs,
+    this.jobsGate,
+    this.refreshIdentityResult,
   })  : deviceInfoValue = deviceInfo ??
             DeviceInfo(
               deviceName: 'DESKTOP-AK1',
               fingerprintHex: 'ab' * 32,
               pairingCode: '123-456',
+              peersCount: 0,
             ),
         _jobs = List.of(jobs ?? const <JobRecord>[]);
 
-  /// Identity returned by [deviceInfo].
-  final DeviceInfo deviceInfoValue;
+  /// Identity returned by [deviceInfo]; mutated by [refreshIdentity] when
+  /// [refreshIdentityResult] is set (the three identity forms of the
+  /// wave-12 wiring: normal / created / degraded).
+  DeviceInfo deviceInfoValue;
 
   /// String returned by [version].
   final String versionText;
+
+  /// When non-null, [listJobs] awaits this completer before answering —
+  /// drives the JobsPage loading state.
+  final Completer<List<JobRecord>>? jobsGate;
+
+  /// Identity handed back by the NEXT [refreshIdentity] (and cached into
+  /// [deviceInfoValue]); null keeps the constructor identity.
+  DeviceInfo? refreshIdentityResult;
+
+  /// Directories captured by [setIdentityDir] calls.
+  final List<String> identityDirRequests = [];
+
+  /// How many times pages called [refreshIdentity].
+  int refreshIdentityCalls = 0;
 
   final List<JobRecord> _jobs;
   final List<void Function()> _statusListeners = [];
@@ -53,6 +75,24 @@ class FakeTransferService implements TransferService {
   DeviceInfo deviceInfo() => deviceInfoValue;
 
   @override
+  Future<DeviceInfo> refreshIdentity() async {
+    refreshIdentityCalls += 1;
+    final result = refreshIdentityResult;
+    if (result != null) {
+      deviceInfoValue = result;
+      for (final listener in List.of(_statusListeners)) {
+        listener();
+      }
+    }
+    return deviceInfoValue;
+  }
+
+  @override
+  void setIdentityDir(String dir) {
+    identityDirRequests.add(dir);
+  }
+
+  @override
   TransferServiceStatus get status => _status;
 
   @override
@@ -76,6 +116,7 @@ class FakeTransferService implements TransferService {
 
   @override
   JobController startReceive(ReceiveOptions options) {
+    startReceiveCalls += 1; // counts attempts, including rejected ones
     if (receiveStartError != null) {
       throw receiveStartError!;
     }
@@ -83,7 +124,6 @@ class FakeTransferService implements TransferService {
       throw StateError('already listening');
     }
     lastReceiveOptions = options;
-    startReceiveCalls += 1;
     _activeReceive = JobController();
     _setStatus(TransferServiceStatus.listening);
     return _activeReceive!;
@@ -106,7 +146,13 @@ class FakeTransferService implements TransferService {
   }
 
   @override
-  Future<List<JobRecord>> listJobs() async => List.of(_jobs);
+  Future<List<JobRecord>> listJobs() async {
+    final gate = jobsGate;
+    if (gate != null && !gate.isCompleted) {
+      await gate.future;
+    }
+    return List.of(_jobs);
+  }
 
   /// Adds a record to the history fixture.
   void addJob(JobRecord record) => _jobs.insert(0, record);
@@ -147,3 +193,62 @@ class FakeTransferService implements TransferService {
 /// A fixed 64-hex peer fingerprint used across tests.
 const String kPeerFingerprint =
     '6c31041268f471609c79f5f2dbcc38e4a4ab2f4d416109a4e09fcf50fd0f0062';
+
+/// In-memory [AkEngineFacade] double driving the three identityInfo forms
+/// of the wave-12 wiring (normal / created / missing-DLL degrade via
+/// [identityThrows]) and the jobsList forms (empty / rows).
+///
+/// Shape mirrors the frozen engine contract: identityInfo keys
+/// device_id/fingerprint/pairing_code/peers/created; jobsList row keys
+/// id/direction/state/files/bytes/updated_unix_ms/peer/root.
+class FakeAkEngineFacade implements AkEngineFacade {
+  FakeAkEngineFacade({
+    Map<String, dynamic>? identityInfo,
+    this.identityThrows = false,
+    List<Map<String, dynamic>>? jobsRows,
+    this.jobsThrows = false,
+  })  : identityInfoValue = identityInfo ??
+            <String, dynamic>{
+              'device_id': 'abababab',
+              'fingerprint': 'ab' * 32,
+              'pairing_code': '123456',
+              'peers': 0,
+              'created': false,
+            },
+        _jobsRows = List.of(jobsRows ?? const <Map<String, dynamic>>[]);
+
+  /// Answer of [identityInfo].
+  final Map<String, dynamic> identityInfoValue;
+
+  /// When true, [identityInfo] throws like a missing DLL / absent export.
+  final bool identityThrows;
+
+  final List<Map<String, dynamic>> _jobsRows;
+
+  /// When true, [jobsList] throws like a missing DLL / absent export.
+  final bool jobsThrows;
+
+  /// idDir arguments captured per call site.
+  final List<(String site, String idDir)> idDirRequests = [];
+
+  @override
+  Map<String, dynamic> identityInfo(String idDir) {
+    idDirRequests.add(('identityInfo', idDir));
+    if (identityThrows) {
+      throw StateError('未找到 ak_ffi 动态库（fake: DLL missing）');
+    }
+    return identityInfoValue;
+  }
+
+  @override
+  List<Map<String, dynamic>> jobsList(String idDir) {
+    idDirRequests.add(('jobsList', idDir));
+    if (jobsThrows) {
+      throw StateError('未找到 ak_ffi 动态库（fake: DLL missing）');
+    }
+    return List.of(_jobsRows);
+  }
+
+  /// Appends one jobs row (test fixture helper).
+  void addJobRow(Map<String, dynamic> row) => _jobsRows.insert(0, row);
+}

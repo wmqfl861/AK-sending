@@ -36,7 +36,8 @@ use ak_engine::{
     SendSpec,
 };
 use ak_identity::tls::{make_self_signed, TlsBundle};
-use ak_identity::{verify_pairing_code, DeviceKeyPair, Fingerprint};
+use ak_identity::{pairing_code, verify_pairing_code, DeviceKeyPair, Fingerprint, PeerBook};
+use ak_store::{CheckpointStore, Direction, FileCheckpointStore};
 
 // ---------------------------------------------------------------------------
 // Status codes shared with the shim (documented in the crate header).
@@ -153,6 +154,111 @@ pub fn version_string() -> String {
         "ak-ffi {FFI_API_VERSION} (wire v{}, caps 0x{caps:04x})",
         ak_wire::VERSION
     )
+}
+
+// ---------------------------------------------------------------------------
+// Identity + checkpoint inspection (safe layer behind `ak_identity_info`
+// and `ak_jobs_list`; neither needs the engine — both read the ak-cli
+// on-disk conventions under `id_dir`).
+// ---------------------------------------------------------------------------
+
+/// Render the identity summary JSON for `id_dir` (schema in the crate
+/// header): creates the directory and `device.key` when missing, counts
+/// `peers.book` entries, and derives the pairing code.
+///
+/// A missing `peers.book` is simply zero peers; a CORRUPT one also reports
+/// zero but leaves a note in the thread-local last-error buffer while the
+/// call itself still succeeds (the identity half of the answer is sound).
+pub fn identity_info_json(id_dir: &str) -> Result<String, FfiError> {
+    if id_dir.is_empty() {
+        return Err(FfiError::invalid("id_dir must be a non-empty path"));
+    }
+    let dir = PathBuf::from(id_dir);
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        FfiError::invalid(format!("cannot create id_dir {}: {error}", dir.display()))
+    })?;
+    let key_path = dir.join("device.key");
+    let (key, created) = DeviceKeyPair::load_or_create(&key_path).map_err(|error| {
+        FfiError::invalid(format!(
+            "cannot load device key at {}: {error}",
+            key_path.display()
+        ))
+    })?;
+    let fingerprint = key.fingerprint();
+    let book_path = dir.join("peers.book");
+    let peers = match PeerBook::load(&book_path) {
+        Ok(book) => book.iter().count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            set_last_error(format!(
+                "note: peers.book at {} is unreadable; reporting peers as 0: {error}",
+                book_path.display()
+            ));
+            0
+        }
+    };
+    Ok(format!(
+        "{{\"device_id\":\"{}\",\"fingerprint\":\"{}\",\"pairing_code\":\"{}\",\
+         \"peers\":{peers},\"created\":{}}}",
+        hex_encode(&key.public_key()),
+        fingerprint.to_hex(),
+        pairing_code(&fingerprint),
+        created
+    ))
+}
+
+/// Render the jobs list JSON for `id_dir` (schema in the crate header): one
+/// array element per parsable `<id_dir>/checkpoints/*.akjob` record, sorted
+/// by job id (the store's order). A missing checkpoint directory is an
+/// empty array; the whole array is rendered before any buffer write so an
+/// `AK_ERR_BUFFER` retry is simply a fresh, lossless call.
+pub fn jobs_list_json(id_dir: &str) -> Result<String, FfiError> {
+    if id_dir.is_empty() {
+        return Err(FfiError::invalid("id_dir must be a non-empty path"));
+    }
+    let dir = PathBuf::from(id_dir).join("checkpoints");
+    if !dir.exists() {
+        return Ok("[]".to_string());
+    }
+    let store = FileCheckpointStore::open(&dir).map_err(|error| {
+        FfiError::invalid(format!(
+            "cannot open checkpoint directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let records = store.list().map_err(|error| {
+        FfiError::invalid(format!(
+            "cannot list checkpoint directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let mut out = String::from("[");
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let direction = match record.direction {
+            Direction::Send => "send",
+            Direction::Receive => "receive",
+        };
+        let peer = match &record.peer_fingerprint {
+            Some(fingerprint) => fingerprint.to_hex(),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{{\"id\":\"{}\",\"direction\":\"{direction}\",\"state\":{},\
+             \"files\":{},\"bytes\":{},\"updated_unix_ms\":{},\"peer\":{},\"root\":{}}}",
+            hex_encode(&record.job_id),
+            json::quoted(&record.state),
+            record.total_files,
+            record.total_bytes,
+            record.updated_unix_ms,
+            json::quoted(&peer),
+            json::quoted(&record.root.to_string_lossy()),
+        ));
+    }
+    out.push(']');
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -634,8 +740,11 @@ impl AkEngine {
         }
     }
 
-    /// Per-job checkpoint directory (isolated by FFI job id, so concurrent
-    /// jobs never share `<job>.akjob` files).
+    /// Ephemeral fallback checkpoint directory for jobs started WITHOUT an
+    /// `id_dir`: isolated by FFI job id so concurrent jobs never share
+    /// `<job>.akjob` files, and nothing persists for `ak_jobs_list`. Jobs
+    /// WITH an `id_dir` use the CLI-visible `<id_dir>/checkpoints` instead
+    /// (see [`stable_checkpoint_dir`]).
     fn checkpoint_dir(&self, job: &[u8; 16]) -> PathBuf {
         std::env::temp_dir()
             .join("ak-ffi-checkpoints")
@@ -1092,8 +1201,12 @@ fn multi_error_json(
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {
+    hex_encode(bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(32);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0xF) as usize] as char);
@@ -1193,12 +1306,19 @@ fn resolve_identity(id_dir: Option<&str>) -> Result<(DeviceKeyPair, TlsBundle), 
     Ok((key, bundle))
 }
 
-/// Receiver admission policy from `expect`: `any`, a 64-hex fingerprint,
-/// or a 6-digit pairing code (with or without the `123-456` dash).
+/// The engine-facing consent callback (`ReceiveSpec.authorize`).
+type Authorize = Box<dyn Fn(&Fingerprint) -> bool + Send + Sync>;
+
+/// Receiver admission policy from `expect`: `any`, `book` (the peer book
+/// under `id_dir`), a 64-hex fingerprint, or a 6-digit pairing code (with
+/// or without the `123-456` dash).
 enum Expect {
     Any,
     Pinned(Fingerprint),
     Code(String),
+    /// Admit only fingerprints listed in `<id_dir>/peers.book`; resolved
+    /// against the spec's `id_dir` in [`Expect::authorize`].
+    Book,
 }
 
 impl Expect {
@@ -1206,6 +1326,9 @@ impl Expect {
         let trimmed = text.trim();
         if trimmed.eq_ignore_ascii_case("any") {
             return Ok(Expect::Any);
+        }
+        if trimmed.eq_ignore_ascii_case("book") {
+            return Ok(Expect::Book);
         }
         if let Some(pinned) = Fingerprint::from_hex(trimmed) {
             return Ok(Expect::Pinned(pinned));
@@ -1218,17 +1341,70 @@ impl Expect {
             return Ok(Expect::Code(trimmed.to_string()));
         }
         Err(FfiError::invalid(
-            "field \"expect\" must be \"any\", a 64-hex fingerprint, or a 6-digit pairing code",
+            "field \"expect\" must be \"any\", \"book\", a 64-hex fingerprint, or a 6-digit \
+             pairing code",
         ))
     }
 
-    fn authorize(self) -> Box<dyn Fn(&Fingerprint) -> bool + Send + Sync> {
+    /// Build the `ReceiveSpec.authorize` callback. `Book` needs the spec's
+    /// `id_dir` and is validated eagerly (missing/empty/corrupt book is an
+    /// `AK_ERR_INVALID` at start time, mirroring the CLI's "pair first").
+    fn authorize(self, id_dir: Option<&str>) -> Result<Authorize, FfiError> {
         match self {
-            Expect::Any => Box::new(|_| true),
-            Expect::Pinned(pinned) => Box::new(move |peer| *peer == pinned),
-            Expect::Code(code) => Box::new(move |peer| verify_pairing_code(peer, &code)),
+            Expect::Any => Ok(Box::new(|_| true)),
+            Expect::Pinned(pinned) => Ok(Box::new(move |peer| *peer == pinned)),
+            Expect::Code(code) => Ok(Box::new(move |peer| verify_pairing_code(peer, &code))),
+            Expect::Book => book_authorizer(id_dir),
         }
     }
+}
+
+/// The `expect: "book"` admission callback plus its start-time validation.
+///
+/// Mirrors the CLI exactly: the book must load AND hold at least one peer
+/// before the job starts (otherwise the caller must pair first or authorize
+/// explicitly), and the callback re-reads the file on every connection so
+/// pairing edits take effect without restarting the receive.
+fn book_authorizer(id_dir: Option<&str>) -> Result<Authorize, FfiError> {
+    let dir = id_dir.filter(|dir| !dir.is_empty()).ok_or_else(|| {
+        FfiError::invalid(
+            "expect \"book\" requires a non-empty \"id_dir\" (the peer book lives at \
+             <id_dir>/peers.book)",
+        )
+    })?;
+    let path = PathBuf::from(dir).join("peers.book");
+    match PeerBook::load(&path) {
+        // A missing file is the empty book: same "pair first" refusal.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(empty_book_error(&path)),
+        Err(error) => Err(FfiError::invalid(format!(
+            "cannot load peer book {}: {error}",
+            path.display()
+        ))),
+        Ok(book) if book.iter().next().is_none() => Err(empty_book_error(&path)),
+        Ok(_) => Ok(Box::new(move |peer| {
+            PeerBook::load(&path)
+                .map(|book| book.get(peer).is_some())
+                .unwrap_or(false)
+        })),
+    }
+}
+
+fn empty_book_error(path: &Path) -> FfiError {
+    FfiError::invalid(format!(
+        "no paired peers in {}: pair first (add the sender's fingerprint to the book, \
+         or print this device's pairing code via ak_identity_info), or authorize this \
+         receive explicitly with \"expect\": \"any\" or a 64-hex fingerprint",
+        path.display()
+    ))
+}
+
+/// Checkpoint directory for jobs started with an `id_dir`: the ak-cli
+/// convention `<id_dir>/checkpoints`, so `ak_jobs_list` (and the CLI) see
+/// the records. `None` when no usable `id_dir` was given; the caller then
+/// falls back to the ephemeral per-job temp directory.
+fn stable_checkpoint_dir(id_dir: Option<&str>) -> Option<PathBuf> {
+    let dir = id_dir.filter(|dir| !dir.is_empty())?;
+    Some(PathBuf::from(dir).join("checkpoints"))
 }
 
 /// Build a [`SendSpec`] from the parsed JSON object. Schema (all strings
@@ -1249,7 +1425,9 @@ impl Expect {
 /// }
 /// ```
 ///
-/// Unknown fields are ignored.
+/// Unknown fields are ignored. With an `id_dir` the job's checkpoints are
+/// persisted under `<id_dir>/checkpoints` (visible to `ak_jobs_list`);
+/// without one they go to an ephemeral per-job temp directory.
 fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec, FfiError> {
     let roots = match args.get("source_roots") {
         None | Some(json::Json::Null) => {
@@ -1303,7 +1481,8 @@ fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec,
     } else {
         SocketAddr::from(([0u8; 4], 0))
     };
-    spec.checkpoint_dir = checkpoint_dir.to_path_buf();
+    spec.checkpoint_dir =
+        stable_checkpoint_dir(id_dir.as_deref()).unwrap_or_else(|| checkpoint_dir.to_path_buf());
     if let Some(kb) = chunk_kb {
         spec.chunk_size =
             NonZeroU32::new((kb * 1024) as u32).ok_or_else(|| FfiError::invalid("bad chunk_kb"))?;
@@ -1335,7 +1514,7 @@ fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec,
 /// {
 ///   "out_dir": "C:/inbox",              // required, created when missing
 ///   "port": 7100,                       // optional, default 7100
-///   "expect": "any",                    // "any" | 64-hex | 6-digit code
+///   "expect": "any",                    // "any" | "book" | 64-hex | code
 ///   "conflict": "fail",                 // "fail" | "rename"
 ///   "timeout_secs": 30,                 // optional idle budget
 ///   "id_dir": "C:/ak/identity",         // optional stable identity
@@ -1345,8 +1524,15 @@ fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec,
 /// }
 /// ```
 ///
+/// `expect: "book"` admits only fingerprints in `<id_dir>/peers.book` and
+/// requires that book to exist, parse, and hold at least one peer at start
+/// time (CLI semantics: pair first or authorize explicitly).
+///
 /// `once_jobs > 1` selects `serve_concurrently` and requires an explicit
 /// non-zero port (that engine path does not report its bound address).
+/// With an `id_dir` the job's checkpoints are persisted under
+/// `<id_dir>/checkpoints` (visible to `ak_jobs_list`); without one they go
+/// to an ephemeral per-job temp directory.
 fn build_receive_spec(
     args: &json::Json,
     checkpoint_dir: &Path,
@@ -1391,8 +1577,9 @@ fn build_receive_spec(
 
     let mut spec = ReceiveSpec::new(PathBuf::from(&out_dir), bundle);
     spec.bind = SocketAddr::from(([0u8; 4], port as u16));
-    spec.authorize = expect.authorize();
-    spec.checkpoint_dir = checkpoint_dir.to_path_buf();
+    spec.authorize = expect.authorize(id_dir.as_deref())?;
+    spec.checkpoint_dir =
+        stable_checkpoint_dir(id_dir.as_deref()).unwrap_or_else(|| checkpoint_dir.to_path_buf());
     if let Some(secs) = field_u64(args, "timeout_secs")? {
         spec.idle_timeout = parse_timeout(secs)?;
     }

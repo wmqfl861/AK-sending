@@ -30,7 +30,7 @@
 //! | code | meaning |
 //! |------|---------|
 //! | `0`  | ok (`ak_poll_progress`: no event pending; `ak_job_result`: still running) |
-//! | `1`  | `ak_poll_progress`: one event written / `ak_job_result`: finished ok |
+//! | `1`  | `ak_poll_progress`: one event written / `ak_job_result`: finished ok / `ak_identity_info` + `ak_jobs_list`: JSON written |
 //! | `2`  | `ak_job_result`: finished with an error (error JSON written) |
 //! | `-1` | `AK_ERR_NULL`: a required pointer argument was null |
 //! | `-2` | `AK_ERR_INVALID`: malformed JSON, wrong field type, failed validation |
@@ -57,13 +57,18 @@
 //! }
 //! ```
 //!
+//! With an `id_dir` the job persists its checkpoint record under
+//! `<id_dir>/checkpoints` (the ak-cli convention, visible to
+//! `ak_jobs_list`); without one the record goes to an ephemeral per-job
+//! temp directory and nothing persists.
+//!
 //! Receive (`ak_receive_start`), unknown fields ignored:
 //!
 //! ```json
 //! {
 //!   "out_dir": "C:/inbox",     // required, created when missing
 //!   "port": 7100,              // optional, default 7100
-//!   "expect": "any",           // optional: "any" | 64-hex | 6-digit code
+//!   "expect": "any",           // optional: "any" | "book" | 64-hex | 6-digit code
 //!   "conflict": "fail",        // optional: "fail" | "rename"
 //!   "timeout_secs": 30,        // optional idle budget
 //!   "id_dir": "C:/ak/id",      // optional stable identity
@@ -72,6 +77,15 @@
 //!   "no_internet": false       // optional policy gate
 //! }
 //! ```
+//!
+//! `expect` admission policies: `"any"` accepts everyone (dangerous);
+//! a 64-hex fingerprint pins one peer; a 6-digit pairing code (with or
+//! without the dash) accepts only the device whose code matches; `"book"`
+//! accepts only fingerprints listed in `<id_dir>/peers.book` — the book is
+//! validated at start (missing, empty, or corrupt → `AK_ERR_INVALID`
+//! telling the caller to pair first, exactly like the CLI) and re-read on
+//! every connection, so pairing edits apply without restarting a
+//! concurrent receive. `"book"` requires a non-empty `id_dir`.
 //!
 //! Parser policy (hand-written, no serde): unknown fields are ignored for
 //! forward compatibility; wrong types are errors; string values never
@@ -121,6 +135,37 @@
 //! Failure (status `2`): `{"job":"...","error":"message"}` (plus
 //! `"jobs"/"ok"/"failed"/"errors"` for a concurrent receive).
 //!
+//! # identity info JSON (`ak_identity_info`)
+//!
+//! Written on status `1`; the directory and `device.key` are created when
+//! missing (`created:true`, exactly once):
+//!
+//! ```json
+//! {"device_id":"<public key, 64 hex>","fingerprint":"<64 hex>",
+//!  "pairing_code":"123-456","peers":2,"created":false}
+//! ```
+//!
+//! `peers` counts `<id_dir>/peers.book` entries. A missing book is zero; a
+//! CORRUPT book also reports zero while the call still succeeds — the
+//! last-error buffer then carries a note, so read it right after the call.
+//!
+//! # jobs list JSON (`ak_jobs_list`)
+//!
+//! Written on status `1`: one array element per parsable checkpoint record
+//! under `<id_dir>/checkpoints` (sorted by job id). A missing directory is
+//! `[]`. The whole array is rendered before any write, so `AK_ERR_BUFFER`
+//! is cleanly retryable with a larger cap:
+//!
+//! ```json
+//! [{"id":"<32-hex wire job id>","direction":"send"|"receive",
+//!   "state":"completed","files":3,"bytes":123456,
+//!   "updated_unix_ms":1730000000000,"peer":"<64 hex or empty>","root":"C:/in"}]
+//! ```
+//!
+//! `id` is the wire job id (the `wire_job` field of result JSONs); `peer`
+//! is empty when a record has no peer; `root` is the source root (send) or
+//! destination (receive).
+//!
 //! NOT yet wired to any frontend: verified by Rust-side tests that drive
 //! the C ABI end-to-end (real loopback transfers through the boundary).
 
@@ -132,6 +177,6 @@ pub use crate::core::{
     AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
 };
 pub use crate::shim::{
-    ak_engine_free, ak_engine_last_error, ak_engine_new, ak_job_cancel, ak_job_result,
-    ak_poll_progress, ak_receive_start, ak_send_start, ak_version,
+    ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,
+    ak_job_result, ak_jobs_list, ak_poll_progress, ak_receive_start, ak_send_start, ak_version,
 };

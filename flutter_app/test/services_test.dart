@@ -14,7 +14,15 @@ import 'package:ak_sending_app/services/dll_path.dart';
 import 'package:ak_sending_app/services/ffi_transfer_service.dart';
 import 'package:ak_sending_app/services/real_transfer_service.dart';
 import 'package:ak_sending_app/ui/service/transfer_service.dart'
-    show AdmissionMode, ReceiveOptions, SendOptions, TransferServiceStatus;
+    show
+        AdmissionMode,
+        JobDirection,
+        JobRecordState,
+        ReceiveOptions,
+        SendOptions,
+        TransferServiceStatus;
+
+import 'fake_transfer_service.dart' show FakeAkEngineFacade;
 
 final String _fpHex64 = 'a' * 64;
 
@@ -218,12 +226,15 @@ void main() {
 
   group('FfiTransferService (UI contract adapter)', () {
     late _FakeBackend backend;
+    late FakeAkEngineFacade facade;
     late FfiTransferService service;
 
     setUp(() {
       backend = _FakeBackend();
+      facade = FakeAkEngineFacade();
       service = FfiTransferService(
         backend: backend,
+        engineFacade: facade,
         pollInterval: const Duration(milliseconds: 1),
         resultPollInterval: const Duration(milliseconds: 2),
       );
@@ -236,25 +247,217 @@ void main() {
           admission: AdmissionMode.any,
         );
 
-    test('identity placeholders, version passthrough, empty history', () {
+    test('identity: cached deviceInfo degrades until refreshed; empty '
+        'history passthrough', () async {
       expect(service.version(), contains('fake'));
       final info = service.deviceInfo();
       expect(info.deviceName, isNotEmpty); // real hostname
-      expect(info.fingerprintHex, isEmpty); // wave 11: no ak-ffi export
+      expect(info.fingerprintHex, isEmpty); // pre-refresh snapshot
       expect(info.pairingCode, isEmpty);
+      expect(info.peersCount, 0);
       expect(service.status, TransferServiceStatus.idle);
       expect(service.listJobs(), completion(isEmpty));
     });
 
-    test('book admission is refused with pairing guidance (empty book)', () {
+    test('identityInfo (normal form) fills fingerprint/code/peersCount', () async {
+      final normal = FakeAkEngineFacade(identityInfo: {
+        'device_id': '6c310412',
+        'fingerprint': '6C' * 32, // engine may send uppercase
+        'pairing_code': '123456',
+        'peers': 3,
+        'created': false,
+      });
+      final wired = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: normal,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(wired.dispose);
+
+      final info = await wired.refreshIdentity();
+      expect(info.fingerprintHex, '6c' * 32); // lowercased
+      expect(info.pairingCode, '123456');
+      expect(info.peersCount, 3);
+      expect(info.identityCreated, isFalse);
+      expect(wired.deviceInfo(), same(info)); // cached
+      expect(
+        normal.idDirRequests.single,
+        ('identityInfo', wired.identityDir),
+      );
+      expect(wired.identityDir, FfiTransferService.defaultIdentityDir());
+    });
+
+    test('identityInfo (created form) reports the first-run hint', () async {
+      final created = FakeAkEngineFacade(identityInfo: {
+        'device_id': 'abababab',
+        'fingerprint': 'ab' * 32,
+        'pairing_code': '654321',
+        'peers': 0,
+        'created': true,
+      });
+      final wired = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: created,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(wired.dispose);
+
+      final info = await wired.refreshIdentity();
+      expect(info.identityCreated, isTrue);
+      expect(info.peersCount, 0);
+    });
+
+    test('identityInfo (DLL missing) degrades instead of throwing', () async {
+      final broken = FakeAkEngineFacade(identityThrows: true);
+      final wired = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: broken,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(wired.dispose);
+
+      final info = await wired.refreshIdentity();
+      expect(info.deviceName, isNotEmpty); // hostname fallback
+      expect(info.fingerprintHex, isEmpty);
+      expect(info.pairingCode, isEmpty);
+      expect(info.peersCount, 0);
+      expect(info.identityCreated, isFalse);
+      expect(wired.deviceInfo(), same(info));
+    });
+
+    test('setIdentityDir drives subsequent facade calls and job specs',
+        () async {
+      service.setIdentityDir('D:/ids/ak');
+      await service.refreshIdentity();
+      expect(service.identityDir, 'D:/ids/ak');
+      expect(
+        facade.idDirRequests.last,
+        ('identityInfo', 'D:/ids/ak'),
+      );
+
+      service.startSend(SendOptions(
+        sourceRoots: const ['C:/pick/dir'],
+        peer: '127.0.0.1:7100',
+        fingerprint: _fpHex64,
+      ));
+      expect(backend.sendSpecs.single.idDir, 'D:/ids/ak');
+
+      // Empty resets to the platform default.
+      service.setIdentityDir('  ');
+      expect(service.identityDir, FfiTransferService.defaultIdentityDir());
+    });
+
+    test('book admission forwards expect:"book" to the engine (id_dir '
+        'wired), no local refusal', () {
+      final controller = service.startReceive(const ReceiveOptions(
+        outDir: 'C:/inbox',
+        admission: AdmissionMode.book,
+      ));
+      expect(controller, isNotNull);
+      expect(service.isListening, isTrue);
+      expect(backend.receiveSpecs.single.expect, 'book');
+      expect(backend.receiveSpecs.single.idDir, service.identityDir);
+    });
+
+    test('empty-book engine error propagates to the caller (page copy)',
+        () async {
+      backend.receiveStartError =
+          StateError('配对簿为空（peers.book 无条目）：请先完成一次配对');
       expect(
         () => service.startReceive(const ReceiveOptions(
           outDir: 'C:/inbox',
           admission: AdmissionMode.book,
         )),
-        throwsStateError,
+        throwsA(isA<StateError>()
+            .having((e) => e.message, 'message', contains('配对簿为空'))),
       );
       expect(service.isListening, isFalse);
+      backend.receiveStartError = null;
+    });
+
+    test('jobsList rows map to JobRecord, newest first', () async {
+      final rowsFacade = FakeAkEngineFacade(jobsRows: [
+        <String, dynamic>{
+          'id': '0123456789abcdef0123456789abcdef',
+          'direction': 'receive',
+          'state': 'failed_storage_full', // engine's failed* family
+          'files': 0,
+          'bytes': 0,
+          'updated_unix_ms': 1762000000000,
+          'peer': _fpHex64,
+          'root': r'C:\inbox',
+        },
+        <String, dynamic>{
+          'id': 'fedcba9876543210',
+          'direction': 'send',
+          'state': 'completed',
+          'files': 12,
+          'bytes': 3 * 1024 * 1024 * 1024,
+          'updated_unix_ms': 1762100000000,
+          'peer': '', // engine sends "" when a record has no peer
+          'root': r'D:\photos',
+        },
+        <String, dynamic>{
+          'id': 'aabbccdd',
+          'direction': 'receive',
+          'state': 'transferring',
+          'files': 1,
+          'bytes': 512,
+          'updated_unix_ms': 1761900000000,
+          'peer': '',
+          'root': r'C:\inbox',
+        },
+      ]);
+      final wired = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: rowsFacade,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(wired.dispose);
+
+      final jobs = await wired.listJobs();
+      expect(jobs, hasLength(3));
+      // Newest (larger updated_unix_ms) first.
+      expect(jobs.first.id, 'fedcba98'); // shortened display id
+      expect(jobs.first.direction, JobDirection.send);
+      expect(jobs.first.state, JobRecordState.done); // completed → done
+      expect(jobs.first.files, 12);
+      expect(jobs.first.bytes, 3 * 1024 * 1024 * 1024);
+      expect(jobs.first.startedAt,
+          DateTime.fromMillisecondsSinceEpoch(1762100000000));
+      expect(jobs.first.peer, isNull); // "" normalized to null
+      expect(jobs.first.root, r'D:\photos');
+      expect(jobs[1].id, '01234567');
+      expect(jobs[1].direction, JobDirection.receive);
+      expect(jobs[1].state, JobRecordState.failed); // failed* → failed
+      expect(jobs[1].peer, _fpHex64);
+      expect(jobs[1].root, r'C:\inbox');
+      expect(jobs.last.state, JobRecordState.running); // in-flight record
+      expect(
+        rowsFacade.idDirRequests.single,
+        ('jobsList', wired.identityDir),
+      );
+    });
+
+    test('jobsList empty and error forms degrade to an empty history',
+        () async {
+      final empty = FakeAkEngineFacade();
+      final emptyService = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: empty,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(emptyService.dispose);
+      expect(await emptyService.listJobs(), isEmpty);
+
+      final broken = FakeAkEngineFacade(jobsThrows: true);
+      final brokenService = FfiTransferService(
+        backend: _FakeBackend(),
+        engineFacade: broken,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(brokenService.dispose);
+      expect(await brokenService.listJobs(), isEmpty);
     });
 
     test('any admission: listening status, event folding, terminal result',
@@ -326,7 +529,8 @@ void main() {
       expect(service.status, TransferServiceStatus.idle);
     });
 
-    test('engine-open failure degrades to status=error, not a crash', () {
+    test('engine-open failure degrades to status=error, not a crash',
+        () async {
       final failing = FfiTransferService(
         backend: _FakeBackend(versionThrows: true),
         pollInterval: const Duration(milliseconds: 1),
@@ -335,6 +539,10 @@ void main() {
       expect(failing.status, TransferServiceStatus.error);
       expect(failing.version(), contains('不可用'));
       expect(() => failing.startReceive(anyReceive()), throwsStateError);
+      // Identity and history also degrade honestly without the engine.
+      final degraded = await failing.refreshIdentity();
+      expect(degraded.fingerprintHex, isEmpty);
+      expect(await failing.listJobs(), isEmpty);
     });
   });
 
@@ -399,10 +607,16 @@ class _FakeBackend implements EngineBackend {
   final List<Map<String, Object?>> lines = [];
   final List<Uint8List> sendStarted = [];
   final List<Uint8List> receiveStarted = [];
+  final List<AkReceiveSpec> receiveSpecs = [];
+  final List<AkSendSpec> sendSpecs = [];
   final List<Uint8List> cancelled = [];
   final Map<String, AkJobResult> results = {};
   bool disposed = false;
   bool polledAtLeastOnce = false;
+
+  /// When set, [receiveStart] throws it (engine-side rejection, e.g. an
+  /// empty pairing book surfaced through ak_engine_last_error).
+  Object? receiveStartError;
 
   int _cursor = 0;
   int _seq = 0;
@@ -433,13 +647,19 @@ class _FakeBackend implements EngineBackend {
   Uint8List sendStart(AkSendSpec spec) {
     final id = _newId();
     sendStarted.add(id);
+    sendSpecs.add(spec);
     return id;
   }
 
   @override
   Uint8List receiveStart(AkReceiveSpec spec) {
+    final error = receiveStartError;
+    if (error != null) {
+      throw error;
+    }
     final id = _newId();
     receiveStarted.add(id);
+    receiveSpecs.add(spec);
     return id;
   }
 

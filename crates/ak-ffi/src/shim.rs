@@ -403,6 +403,97 @@ pub extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
     }
 }
 
+/// Write the identity summary JSON for `id_dir` (UTF-8 + NUL) into `buf`.
+///
+/// Creates `id_dir` and its `device.key` when missing (`"created":true`),
+/// counts `peers.book` entries, and derives the pairing code; the schema is
+/// in the crate header. `engine` is reserved (like
+/// [`ak_engine_last_error`]) and never dereferenced; it may be null — the
+/// answer comes from disk, not from any engine state.
+///
+/// Returns `AK_DONE` (1) when the JSON was written, `AK_ERR_NULL` for null
+/// pointer arguments, `AK_ERR_INVALID` for an empty/unusable `id_dir`, or
+/// `AK_ERR_BUFFER` when `cap` is too small (retry with a larger buffer; the
+/// last-error message names the needed size). Note: a corrupt `peers.book`
+/// still succeeds with `"peers":0` and leaves a note in the last-error
+/// buffer — read it right after the call.
+#[no_mangle]
+pub extern "C" fn ak_identity_info(
+    engine: *const AkEngine,
+    id_dir: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let _ = engine;
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
+    // to this call, matching the caller's buffer lifetime.
+    let id_dir = match unsafe { read_cstr(id_dir) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| core::identity_info_json(id_dir)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: write_cstr checks null/bounds itself and writes only
+            // within the caller-provided capacity.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the identity info JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Write the persisted-jobs JSON array for `id_dir` (UTF-8 + NUL) into
+/// `buf`: one element per parsable record under `<id_dir>/checkpoints` (the
+/// ak-cli convention; jobs started with an `id_dir` persist there). A
+/// missing checkpoint directory yields `[]`. The schema is in the crate
+/// header.
+///
+/// `engine` is reserved and never dereferenced; it may be null.
+///
+/// Returns `AK_DONE` (1) when the array was written, `AK_ERR_NULL` for null
+/// pointer arguments, `AK_ERR_INVALID` for an empty/unusable `id_dir`, or
+/// `AK_ERR_BUFFER` when the whole array does not fit — nothing is consumed;
+/// re-issue the call with a larger `cap` (the last-error message names the
+/// needed size).
+#[no_mangle]
+pub extern "C" fn ak_jobs_list(
+    engine: *const AkEngine,
+    id_dir: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let _ = engine;
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
+    // to this call, matching the caller's buffer lifetime.
+    let id_dir = match unsafe { read_cstr(id_dir) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| core::jobs_list_json(id_dir)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: write_cstr checks null/bounds itself and writes only
+            // within the caller-provided capacity.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the jobs list JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
 /// Write the library version string (UTF-8 + NUL) into `buf`, e.g.
 /// `ak-ffi 1 (wire v1, caps 0x0007)`. Returns the written byte length
 /// (excluding the NUL), `AK_ERR_NULL`, or `AK_ERR_BUFFER`.

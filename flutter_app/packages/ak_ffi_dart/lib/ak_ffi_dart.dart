@@ -12,6 +12,7 @@ library;
 export 'src/bindings.dart';
 export 'src/engine.dart';
 export 'src/ffi_json.dart';
+export 'src/identity.dart';
 export 'src/model/progress_events.dart';
 export 'src/model/report.dart';
 export 'src/model/display.dart';

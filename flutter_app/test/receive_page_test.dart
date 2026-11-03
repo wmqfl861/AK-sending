@@ -185,4 +185,33 @@ void main() {
     expect(fake.isListening, isFalse);
     expect(find.byKey(const ValueKey('receive_listen_addr')), findsNothing);
   });
+
+  testWidgets('book admission passes the book form through and surfaces the '
+      'engine empty-book error copy', (tester) async {
+    final fake = FakeTransferService();
+    await pumpPage(tester, ReceivePage(service: fake));
+    await _fillBasics(tester);
+
+    // Default book tile selected: start forwards admission=book with no
+    // pinned expect text (the engine sees expect:"book").
+    await tester.tap(find.text('开始监听'));
+    await tester.pump();
+    expect(fake.startReceiveCalls, 1);
+    expect(fake.lastReceiveOptions?.admission, AdmissionMode.book);
+    expect(fake.lastReceiveOptions?.expectText, isNull);
+    expect(find.byKey(const ValueKey('receive_task_card')), findsOneWidget);
+
+    // Stop, then make the "engine" reject like an empty pairing book would
+    // (ak_engine_last_error text): the page surfaces the message verbatim.
+    await tester.tap(find.text('停止'));
+    await tester.pumpAndSettle();
+    fake.receiveStartError =
+        StateError('配对簿为空（peers.book 无条目）：请先完成一次配对');
+    await tester.tap(find.text('开始监听'));
+    await tester.pump();
+
+    expect(fake.startReceiveCalls, 2);
+    expect(find.textContaining('启动失败'), findsOneWidget);
+    expect(find.textContaining('配对簿为空'), findsOneWidget);
+  });
 }

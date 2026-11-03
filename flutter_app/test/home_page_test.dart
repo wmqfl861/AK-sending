@@ -1,5 +1,6 @@
 import 'package:ak_sending_app/ui/pages/home_page.dart';
 import 'package:ak_sending_app/ui/service/transfer_service.dart';
+import 'package:flutter/material.dart' show ValueKey;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -69,5 +70,60 @@ void main() {
     await tester.tap(find.text('接收文件'));
     await tester.tap(find.text('发送文件'));
     expect(visited, [1, 2]);
+  });
+
+  testWidgets('startup refreshIdentity renders the real identity data '
+      '(peersCount row)', (tester) async {
+    final fake = FakeTransferService(
+      refreshIdentityResult: DeviceInfo(
+        deviceName: 'DESKTOP-AK1',
+        fingerprintHex: '6c' * 32,
+        pairingCode: '123456',
+        peersCount: 3,
+      ),
+    );
+    await pumpPage(tester, HomePage(service: fake));
+    await tester.pump();
+
+    expect(fake.refreshIdentityCalls, 1);
+    expect(find.textContaining('已配对设备：3'), findsOneWidget);
+    // The refreshed fingerprint/code replaced the constructor snapshot.
+    expect(find.text('指纹 6c6c6c6c'), findsOneWidget);
+    expect(find.text('123-456'), findsOneWidget);
+  });
+
+  testWidgets('shows the first-run hint when the engine created the '
+      'identity', (tester) async {
+    final fake = FakeTransferService(
+      refreshIdentityResult: DeviceInfo(
+        deviceName: 'DESKTOP-AK1',
+        fingerprintHex: 'ab' * 32,
+        pairingCode: '123-456',
+        identityCreated: true,
+      ),
+    );
+    await pumpPage(tester, HomePage(service: fake));
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('home_identity_created')), findsOneWidget);
+    expect(find.textContaining('首次已创建身份'), findsOneWidget);
+  });
+
+  testWidgets('degrades gracefully when the engine cannot read identity',
+      (tester) async {
+    final fake = FakeTransferService(
+      refreshIdentityResult: const DeviceInfo(
+        deviceName: 'DESKTOP-AK1',
+        fingerprintHex: '',
+        pairingCode: '',
+      ),
+    );
+    await pumpPage(tester, HomePage(service: fake));
+    await tester.pump();
+
+    expect(find.text('指纹无效'), findsOneWidget);
+    expect(find.textContaining('已配对设备：0'), findsOneWidget);
+    // Empty pairing code renders as the honest empty snapshot, no crash.
+    expect(find.byKey(const ValueKey('home_pairing_code')), findsOneWidget);
   });
 }

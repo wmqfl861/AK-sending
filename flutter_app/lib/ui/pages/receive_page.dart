@@ -243,8 +243,8 @@ class _ReceivePageState extends State<ReceivePage> {
                       setState(() => _admission = AdmissionMode.book),
                   title: '配对簿（默认）',
                   subtitle:
-                      '只接受本机配对簿（peers.book）内的指纹；簿为空时会拒绝启动并提示配对步骤。'
-                      '配对簿外的连接会被拒绝并继续等待。',
+                      '只接受本机配对簿（peers.book）内的指纹；簿为空时引擎会拒绝启动，'
+                      '错误原因会显示在下方。配对簿外的连接会被拒绝并继续等待。',
                 ),
                 _AdmissionTile(
                   key: const ValueKey('receive_admission_pinned'),

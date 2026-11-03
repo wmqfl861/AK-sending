@@ -46,11 +46,19 @@ enum JobRecordState { running, done, failed }
 
 /// This device's identity, as surfaced on the HomePage identity card and
 /// the ReceivePage listening banner.
+///
+/// Wave-12 wiring: a real implementation fills this from
+/// `engine.identityInfo(idDir)` (`device_id`/`fingerprint`/`pairing_code`/
+/// `peers`/`created` keys); see [TransferService.refreshIdentity]. A missing
+/// engine degrades to the hostname-only shape (empty fingerprint/pairing
+/// code, [peersCount] 0).
 class DeviceInfo {
   const DeviceInfo({
     required this.deviceName,
     required this.fingerprintHex,
     required this.pairingCode,
+    this.peersCount = 0,
+    this.identityCreated = false,
   });
 
   /// Human-readable device name sent to peers (`device_name`).
@@ -61,6 +69,13 @@ class DeviceInfo {
 
   /// This device's pairing code in canonical `123-456` form.
   final String pairingCode;
+
+  /// Entries in the pairing book (`peers` of `identityInfo`).
+  final int peersCount;
+
+  /// True when `identityInfo` reported `created` — the engine just minted
+  /// the `<idDir>/device.key` identity on this call (first run).
+  final bool identityCreated;
 }
 
 /// Which peers a receive listener admits — the CLI's three admission
@@ -144,8 +159,9 @@ class SendOptions {
   final int timeoutSecs;
 }
 
-/// One record of the job history (jobs checkpoint store read by the
-/// service; see JobsPage).
+/// One record of the job history — the jobs checkpoint store read back via
+/// `engine.jobsList(idDir)` (rows: `id`/`direction`/`state`/`files`/`bytes`/
+/// `updated_unix_ms`/`peer`/`root`); see JobsPage.
 class JobRecord {
   const JobRecord({
     required this.id,
@@ -156,6 +172,8 @@ class JobRecord {
     this.bytes = 0,
     this.summary = '',
     this.error,
+    this.peer,
+    this.root,
   });
 
   /// Short display id (fingerprint prefix / short job id).
@@ -164,7 +182,8 @@ class JobRecord {
   /// Send or receive.
   final JobDirection direction;
 
-  /// When the job started.
+  /// When the job was last updated (the engine reports `updated_unix_ms`,
+  /// not a start timestamp — this is that wall clock, newest first).
   final DateTime startedAt;
 
   /// Running / done / failed.
@@ -181,6 +200,12 @@ class JobRecord {
 
   /// Failure message of a failed record.
   final String? error;
+
+  /// Peer fingerprint of the record (64 hex) when the engine reported one.
+  final String? peer;
+
+  /// Destination/source root of the record when the engine reported one.
+  final String? root;
 }
 
 /// The abstract transfer service consumed by every page.
@@ -193,8 +218,24 @@ abstract interface class TransferService {
   /// Engine/library version string, e.g. `ak-ffi 1 (wire v1, caps 0x0007)`.
   String version();
 
-  /// This device's identity (name, fingerprint, pairing code).
+  /// This device's identity (name, fingerprint, pairing code, pairing-book
+  /// size). Synchronous: implementations return the cached snapshot filled
+  /// by [refreshIdentity] (or an honest degraded placeholder before the
+  /// first refresh / when the engine is unavailable).
   DeviceInfo deviceInfo();
+
+  /// Re-reads the identity from the engine's identity store under the
+  /// configured identity directory (see [setIdentityDir]), caches it for
+  /// [deviceInfo] and notifies status listeners.
+  ///
+  /// Never throws for an unavailable engine: the call degrades to the
+  /// hostname-only identity so the pages stay usable.
+  Future<DeviceInfo> refreshIdentity();
+
+  /// Overrides the identity directory used by [refreshIdentity],
+  /// [listJobs] and job specs (`id_dir`; default
+  /// `%USERPROFILE%\.ak-sending`). An empty [dir] resets to the default.
+  void setIdentityDir(String dir);
 
   /// Current coarse state for the status dot.
   TransferServiceStatus get status;
@@ -219,7 +260,11 @@ abstract interface class TransferService {
   /// Starts a one-shot send and returns its folding [JobController].
   JobController startSend(SendOptions options);
 
-  /// Job history records, newest first.
+  /// Job history records, newest first — a REAL read of the jobs checkpoint
+  /// store (`engine.jobsList(idDir)`) in the wired implementation; rows are
+  /// mapped to [JobRecord] (update time, direction/state/files/bytes, peer
+  /// and root). Implementations without the store return an empty list
+  /// rather than throwing (missing engine degrades gracefully).
   Future<List<JobRecord>> listJobs();
 
   /// Releases engine resources. Idempotent.

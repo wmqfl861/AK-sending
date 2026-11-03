@@ -1,4 +1,4 @@
-/// Raw dart:ffi bindings for the nine exported `ak_*` functions of the
+/// Raw dart:ffi bindings for the eleven exported `ak_*` functions of the
 /// ak-ffi C ABI (see `crates/ak-ffi/src/shim.rs` for the frozen signatures
 /// and docs/adr/003 for the boundary decisions).
 ///
@@ -98,7 +98,7 @@ final class _ProcessAllocator implements Allocator {
 }
 
 // ---------------------------------------------------------------------------
-// Native signatures of the nine exports (shim.rs, verbatim).
+// Native signatures of the eleven exports (shim.rs, verbatim).
 // ---------------------------------------------------------------------------
 
 typedef _EngineNewC = Pointer<AkEngine> Function();
@@ -138,7 +138,17 @@ typedef _JobCancelDart = int Function(Pointer<AkEngine>, Pointer<Uint8>);
 typedef _VersionC = Int32 Function(Pointer<Uint8>, IntPtr);
 typedef _VersionDart = int Function(Pointer<Uint8>, int);
 
-/// Lookup of the nine `ak_*` exports from one `DynamicLibrary`.
+typedef _IdentityInfoC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
+typedef _IdentityInfoDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
+
+typedef _JobsListC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
+typedef _JobsListDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
+
+/// Lookup of the eleven `ak_*` exports from one `DynamicLibrary`.
 class AkFfiBindings {
   /// Opens the DLL at [dllPath] (or [library] directly when injecting a
   /// preopened `DynamicLibrary`, e.g. from tests or another embedding).
@@ -173,6 +183,11 @@ class AkFfiBindings {
         'ak_job_cancel');
     version = this.library
         .lookupFunction<_VersionC, _VersionDart>('ak_version');
+    identityInfo =
+        this.library.lookupFunction<_IdentityInfoC, _IdentityInfoDart>(
+            'ak_identity_info');
+    jobsList = this.library
+        .lookupFunction<_JobsListC, _JobsListDart>('ak_jobs_list');
   }
 
   /// The loaded library; kept alive so the resolved symbols stay valid.
@@ -221,6 +236,22 @@ class AkFfiBindings {
   /// `ak_version(buf, cap)`: written byte length (excluding NUL), or
   /// -1/-3.
   late final int Function(Pointer<Uint8> buf, int cap) version;
+
+  /// `ak_identity_info(engine, id_dir, buf, cap)`: 1 with the identity
+  /// summary JSON written, -2 for an empty/unusable `id_dir`, -3 too small
+  /// (retry losslessly; the needed size is in the last-error message), -1
+  /// null pointer arguments. `engine` is reserved and never dereferenced —
+  /// the answer comes from disk, not engine state (see [engineLastError]
+  /// for the same reserved-handle pattern).
+  late final int Function(Pointer<AkEngine> engine, Pointer<Uint8> idDir,
+      Pointer<Uint8> buf, int cap) identityInfo;
+
+  /// `ak_jobs_list(engine, id_dir, buf, cap)`: 1 with the persisted-jobs
+  /// JSON array written (`[]` for a missing checkpoint directory), same
+  /// error contract as [identityInfo]. `engine` is reserved and never
+  /// dereferenced.
+  late final int Function(Pointer<AkEngine> engine, Pointer<Uint8> idDir,
+      Pointer<Uint8> buf, int cap) jobsList;
 
   /// Where the DLL is loaded from when neither [AkFfiBindings.library] nor
   /// an explicit path is given: `$AK_FFI_DLL` wins, else a path relative to

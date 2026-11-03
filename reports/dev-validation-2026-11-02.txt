@@ -338,3 +338,11 @@ packages/ak_ffi_dart：dart test 69/69（绑定 9 含真实环回 + 模型/状�
 # 五页 GUI（主页身份卡/接收准入三选+any 警告弹层+监听横幅/发送多路径+开关/历史/关于），
 # 连通性失败文案对齐 UX 文档原文；TransferService 抽象（Fake 可测）+ FFI 实现三级 DLL 探测；
 # 已知限制：身份卡指纹/配对码空（ak-ffi 待 ak_identity_info 导出）、配对簿/前缀/历史列表待接（已列）
+
+## 第十二轮验证：身份导出/簿准入/历史接线（2026-11-03，3 代理接力＋集成者切换）
+
+Rust: cargo test --workspace 430/0（ak-ffi 13 含 book 准入 e2e/未配对拒绝/identity 首建/真实环回后 jobs_list）
+Dart: dart test 76/76（identityInfo/jobsList/expect:book 真实 DLL 7 项新增：簿准入接受+空/坏簿拒绝+指纹互 pin 环回即证）
+Flutter: analyze 零 issue；flutter test 59/59（身份卡真数据/created 提示/历史加载刷新/book 透传与空簿文案）；
+flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
+# 集成：AkEngineDartFacade 两处切换为真实 engine.identityInfo/jobsList 调用（UI 代理预留的一行切换点）

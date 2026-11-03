@@ -53,6 +53,10 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     widget.service.addStatusListener(_onStatus);
+    // Real identity read at startup (engine.identityInfo through the
+    // service); the card first renders the cached/degraded snapshot and
+    // re-renders once this lands.
+    _refreshIdentity();
   }
 
   @override
@@ -62,6 +66,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onStatus() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _refreshIdentity() async {
+    await widget.service.refreshIdentity();
     if (mounted) setState(() {});
   }
 
@@ -139,6 +148,25 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const Divider(height: 32),
+                if (info.identityCreated)
+                  Padding(
+                    key: const ValueKey('home_identity_created'),
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Row(
+                      children: [
+                        Icon(Icons.auto_awesome,
+                            size: 18, color: scheme.primary),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '首次已创建身份：本机已生成新的设备身份并写入身份目录。',
+                            style: theme.textTheme.bodySmall
+                                ?.copyWith(color: scheme.primary),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 Text('本机指纹', style: theme.textTheme.labelLarge),
                 FingerprintChip(fingerprintHex: info.fingerprintHex),
                 const SizedBox(height: 16),
@@ -149,6 +177,7 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     SelectableText(
                       pairingCode,
+                      key: const ValueKey('home_pairing_code'),
                       style: theme.textTheme.displaySmall
                           ?.copyWith(fontWeight: FontWeight.w700),
                     ),
@@ -157,6 +186,19 @@ class _HomePageState extends State<HomePage> {
                       icon: const Icon(Icons.copy),
                       tooltip: '复制配对码',
                       onPressed: () => _copyPairingCode(pairingCode),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Icon(Icons.how_to_reg,
+                        size: 16, color: scheme.outline),
+                    const SizedBox(width: 6),
+                    Text(
+                      '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
+                      key: const ValueKey('home_peers_count'),
+                      style: theme.textTheme.bodySmall,
                     ),
                   ],
                 ),

@@ -1,8 +1,8 @@
 /// `AkEngineDart`: the friendly face over [AkFfiBindings] — engine
 /// lifecycle with a finalizer backstop, typed start/poll/result/cancel
-/// calls, automatic `-3` buffer growth with lossless retry, and negative
-/// status codes turned into [AkFfiException]s carrying the last-error
-/// message.
+/// calls, id_dir inspection ([IdentityInfo]/[JobRecordJson]), automatic
+/// `-3` buffer growth with lossless retry, and negative status codes turned
+/// into [AkFfiException]s carrying the last-error message.
 ///
 /// Concurrency contract (inherited from the shim): calls on ONE engine
 /// handle must be serialized by the caller — keep a single engine per
@@ -16,7 +16,9 @@ import 'dart:ffi';
 import 'dart:typed_data' show Uint8List;
 
 import 'bindings.dart';
-import 'ffi_json.dart' show AkReceiveSpec, AkSendSpec, fromNativeUtf8, toNativeUtf8;
+import 'ffi_json.dart'
+    show AkReceiveSpec, AkSendSpec, decodeFfiJson, fromNativeUtf8, toNativeUtf8;
+import 'identity.dart';
 
 /// Byte length of every FFI job id.
 const int akJobIdLength = 16;
@@ -143,6 +145,89 @@ class AkEngineDart {
   String lastError() {
     _ensureLive();
     return _readLastError(bindings, _handle);
+  }
+
+  // -------------------------------------------------------------------------
+  // Identity + persisted jobs (id_dir inspection; no engine state needed).
+  // -------------------------------------------------------------------------
+
+  /// The identity summary of [idDir] via `ak_identity_info`: creates the
+  /// directory and its `device.key` when missing ([IdentityInfo.created] is
+  /// then true, exactly once per directory) and reports the fingerprint,
+  /// pairing code, and `peers.book` entry count.
+  ///
+  /// The answer comes from disk, so it is valid before any transfer. A
+  /// corrupt `peers.book` still succeeds with `peers: 0` and leaves a note
+  /// in [lastError] — read it right after this call. Throws
+  /// [AkFfiException] (with the last-error message) for an empty or
+  /// unusable [idDir]; a `-3` grows the buffer and retries losslessly.
+  IdentityInfo identityInfo(String idDir) {
+    final json = _inspectIdDir(idDir, bindings.identityInfo,
+        'ak_identity_info', _maxIdentityJsonBytes);
+    return IdentityInfo.fromJson(decodeFfiJson(json));
+  }
+
+  /// The persisted job records of [idDir] via `ak_jobs_list`: one
+  /// [JobRecordJson] per parsable record under `<idDir>/checkpoints`, sorted
+  /// by job id (jobs started WITHOUT an `id_dir` never persist, so a fresh
+  /// directory lists `[]`).
+  ///
+  /// A missing checkpoint directory is the empty list. Throws
+  /// [AkFfiException] (with the last-error message) for an empty or unusable
+  /// [idDir]; the whole array is rendered before any write, so a `-3` retry
+  /// with a larger buffer is lossless (and automatic here).
+  List<JobRecordJson> jobsList(String idDir) {
+    final json = _inspectIdDir(
+        idDir, bindings.jobsList, 'ak_jobs_list', _maxJobsListBytes);
+    final array = jsonDecode(json) as List<dynamic>;
+    return [
+      for (final element in array)
+        JobRecordJson.fromJson(element as Map<String, dynamic>),
+    ];
+  }
+
+  /// Starting buffer for identity summaries (~130 bytes of JSON).
+  static const int _maxIdentityJsonBytes = 256;
+
+  /// Starting buffer for job lists (grows by doubling; hundreds of records
+  /// still fit in a few doublings).
+  static const int _maxJobsListBytes = 1024;
+
+  /// Shared id_dir-inspection call: native [idDir] in, JSON payload out,
+  /// with the standard `-3` grow-retry and last-error-carrying
+  /// [AkFfiException]s for the other negative codes.
+  String _inspectIdDir(
+    String idDir,
+    int Function(Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int)
+        invoke,
+    String symbol,
+    int initialCapacity,
+  ) {
+    _ensureLive();
+    final idPointer = toNativeUtf8(idDir);
+    try {
+      var capacity = initialCapacity;
+      while (capacity <= _maxBufferBytes) {
+        final buf = processAllocator.allocate<Uint8>(capacity);
+        try {
+          final code = invoke(_handle, idPointer, buf, capacity);
+          if (code == AkStatus.done) {
+            return fromNativeUtf8(buf);
+          }
+          if (code == AkStatus.errBuffer) {
+            capacity *= 2; // nothing was consumed; retry losslessly
+            continue;
+          }
+          throw _exceptionFor(code, symbol);
+        } finally {
+          processAllocator.free(buf);
+        }
+      }
+      throw StateError(
+          '$symbol kept requesting more than $_maxBufferBytes bytes');
+    } finally {
+      processAllocator.free(idPointer);
+    }
   }
 
   // -------------------------------------------------------------------------

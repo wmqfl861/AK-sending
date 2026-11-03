@@ -19,16 +19,20 @@
 /// delivers the terminal `ak_job_result` body via `setResultJson` — the
 /// poll → JobController pattern of packages/ak_ffi_dart's loopback demo.
 ///
-/// Wave-11 boundaries (documented in flutter_app/README.md):
-/// * `deviceInfo()` — ak-ffi exports no identity introspection yet
-///   (`ak_identity_info` is the proposed follow-up API), so fingerprint and
-///   pairing code are empty placeholders; the pages degrade gracefully
-///   ("指纹无效" chip, empty code). deviceName uses the real hostname.
-/// * `AdmissionMode.book` — the pairing book (peers.book) is not wired into
-///   the app service this wave, so book == empty book: `startReceive`
-///   refuses with pairing guidance, exactly what the Receive page copy
-///   promises ("簿为空时会拒绝启动并提示配对步骤").
-/// * `listJobs()` — always empty until the jobs checkpoint store lands.
+/// Wave-12 wiring (this file):
+/// * `deviceInfo()`/`refreshIdentity()` — real identity via
+///   [AkEngineFacade.identityInfo] (`engine.identityInfo(idDir)`, frozen
+///   contract); the cached [DeviceInfo] carries fingerprint, pairing code,
+///   pairing-book size and the first-run "created" flag. A missing DLL or a
+///   not-yet-exported engine API degrades to the hostname-only identity.
+/// * `AdmissionMode.book` — the pairing book is wired engine-side:
+///   `startReceive` sends `expect:"book"` straight to the engine (spec
+///   `id_dir` points at the same identity store), and an empty book is
+///   rejected by the engine with its `last_error` text passed through to
+///   the page copy.
+/// * `listJobs()` — a real read of the jobs checkpoint store through
+///   [AkEngineFacade.jobsList] (`engine.jobsList(idDir)`), mapped to
+///   [JobRecord] rows, newest first.
 library;
 
 import 'dart:async' show StreamSubscription, Timer;
@@ -49,11 +53,13 @@ import '../ui/service/transfer_service.dart'
         DeviceInfo,
         JobDirection,
         JobRecord,
+        JobRecordState,
         ReceiveOptions,
         SendOptions,
         TransferService,
         TransferServiceStatus;
 
+import 'ak_engine_facade.dart';
 import 'real_transfer_service.dart';
 
 /// One live job: its core job id, folding controller and terminal state.
@@ -72,9 +78,11 @@ final class _Session {
 final class FfiTransferService implements TransferService {
   FfiTransferService({
     EngineBackend? backend,
+    AkEngineFacade? engineFacade,
     Duration pollInterval = const Duration(milliseconds: 50),
     this.resultPollInterval = const Duration(milliseconds: 200),
-  }) {
+  })  : _facade = engineFacade ?? AkEngineDartFacade(),
+        _identityDir = defaultIdentityDir() {
     RealTransferService? core;
     try {
       core = backend == null
@@ -93,12 +101,34 @@ final class FfiTransferService implements TransferService {
     _status = _deriveStatus(); // e.g. error right away on an open failure
   }
 
+  /// Default identity directory: `%USERPROFILE%\.ak-sending` (PathProvider
+  /// is unavailable for this desktop shell — plain `Platform.environment`).
+  /// [environment] is injectable for tests.
+  static String defaultIdentityDir({Map<String, String>? environment}) {
+    final env = environment ?? Platform.environment;
+    final home = env['USERPROFILE'] ?? env['HOME'] ?? '';
+    if (home.isEmpty) {
+      return '.ak-sending';
+    }
+    final separator = Platform.isWindows ? r'\' : '/';
+    return '$home$separator.ak-sending';
+  }
+
   /// How often unfinished sessions are asked for their terminal result.
   final Duration resultPollInterval;
 
   RealTransferService? _core;
   late final String _versionText;
   Object? _loadError;
+
+  /// Engine identity/jobs-store seam (frozen wave-12 contract).
+  final AkEngineFacade _facade;
+
+  /// Identity directory used by the facade and every job spec (`id_dir`).
+  String _identityDir;
+
+  /// Cached identity; null until the first [deviceInfo]/[refreshIdentity].
+  DeviceInfo? _identity;
 
   StreamSubscription<ProgressEvent>? _eventsSubscription;
   late final Timer _resultPoller;
@@ -124,17 +154,63 @@ final class FfiTransferService implements TransferService {
   String version() => _versionText;
 
   @override
-  DeviceInfo deviceInfo() {
-    // Wave 11: no ak-ffi identity export (proposed: ak_identity_info).
-    // Empty fingerprint/pairing code render as honest placeholders; the
-    // hostname is real and is what peers see via `device_name`.
-    final host = Platform.localHostname;
-    return DeviceInfo(
-      deviceName: host.length > 64 ? host.substring(0, 64) : host,
-      fingerprintHex: '',
-      pairingCode: '',
-    );
+  DeviceInfo deviceInfo() => _identity ??= _degradedIdentity();
+
+  @override
+  Future<DeviceInfo> refreshIdentity() async {
+    DeviceInfo next;
+    if (_disposed || _loadError != null) {
+      // No engine to ask: degrade to the honest hostname-only card.
+      next = _degradedIdentity();
+    } else {
+      try {
+        final info = _facade.identityInfo(_identityDir);
+        final fingerprint = _stringOf(info, 'fingerprint');
+        next = DeviceInfo(
+          deviceName: _hostDisplayName(),
+          fingerprintHex: fingerprint.toLowerCase(),
+          pairingCode: _stringOf(info, 'pairing_code'),
+          peersCount: _intOf(info, 'peers'),
+          identityCreated: info['created'] == true,
+        );
+      } on Object {
+        // Missing DLL, engine error, or the identityInfo export not landed
+        // yet (AkEngineDartFacade's wave-12 TODO): degrade, never throw.
+        next = _degradedIdentity();
+      }
+    }
+    _identity = next;
+    _notifyListeners(); // identity card/banner re-render
+    return next;
   }
+
+  @override
+  void setIdentityDir(String dir) {
+    final trimmed = dir.trim();
+    _identityDir = trimmed.isEmpty ? defaultIdentityDir() : trimmed;
+  }
+
+  /// The identity directory every facade call and job spec (`id_dir`) uses.
+  String get identityDir => _identityDir;
+
+  /// Degraded identity: real hostname (what peers see via `device_name`),
+  /// empty fingerprint/pairing code rendered as honest placeholders.
+  DeviceInfo _degradedIdentity() => DeviceInfo(
+        deviceName: _hostDisplayName(),
+        fingerprintHex: '',
+        pairingCode: '',
+      );
+
+  static String _hostDisplayName() {
+    final host = Platform.localHostname;
+    return host.length > 64 ? host.substring(0, 64) : host;
+  }
+
+  static String _stringOf(Map<String, dynamic> map, String key) =>
+      map[key] is String ? map[key] as String : '';
+
+  static int _intOf(Map<String, dynamic> map, String key) =>
+      map[key] is int ? map[key] as int : 0;
 
   @override
   TransferServiceStatus get status => _status;
@@ -168,12 +244,11 @@ final class FfiTransferService implements TransferService {
     String? expect;
     switch (options.admission) {
       case AdmissionMode.book:
-        // peers.book is not wired into the app service this wave, so the
-        // book is empty by definition — refuse like ak-cli would.
-        throw StateError(
-          '配对簿为空（本波未接入 peers.book）：请改用"指定指纹或配对码"，'
-          '或确认警告后使用"接受每一个对端"。',
-        );
+        // Pairing-book admission goes straight to the engine
+        // (expect:"book", frozen wave-12 contract; the model layer accepts
+        // any string). An empty book is rejected engine-side and the
+        // engine's last_error text propagates up to the page copy.
+        expect = 'book';
       case AdmissionMode.any:
         expect = 'any';
       case AdmissionMode.pinned:
@@ -190,6 +265,7 @@ final class FfiTransferService implements TransferService {
       expect: expect,
       conflict: options.conflict,
       timeoutSecs: options.timeoutSecs,
+      idDir: _identityDir,
       deviceName: deviceName.isEmpty ? null : deviceName,
     ));
     final session = _Session(
@@ -245,6 +321,7 @@ final class FfiTransferService implements TransferService {
       noInternet: options.noInternet,
       conflict: options.conflict,
       timeoutSecs: options.timeoutSecs,
+      idDir: _identityDir,
       deviceName: deviceInfo().deviceName,
     ));
     final session = _Session(
@@ -266,9 +343,68 @@ final class FfiTransferService implements TransferService {
 
   @override
   Future<List<JobRecord>> listJobs() async {
-    // Wave 11: empty by contract — the jobs checkpoint store (docs/BACKLOG
-    // P1-03) is not wired; see core.TransferService.listJobs.
-    return const <JobRecord>[];
+    // Real read of the jobs checkpoint store through the facade (frozen
+    // wave-12 contract). Until the engine export lands — or when the DLL
+    // is missing — the facade throws and we degrade to an honest empty
+    // list rather than surfacing an error on the history page.
+    if (_disposed || _loadError != null) {
+      return const <JobRecord>[];
+    }
+    final List<Map<String, dynamic>> rows;
+    try {
+      rows = _facade.jobsList(_identityDir);
+    } on Object {
+      return const <JobRecord>[];
+    }
+    final records = <JobRecord>[];
+    for (final row in rows) {
+      final record = _jobRecordOf(row);
+      if (record != null) {
+        records.add(record);
+      }
+    }
+    records.sort((a, b) => b.startedAt.compareTo(a.startedAt));
+    return records;
+  }
+
+  /// Maps one `engine.jobsList` row (`id`/`direction`/`state`/`files`/
+  /// `bytes`/`updated_unix_ms`/`peer`/`root`) to a [JobRecord]; null for a
+  /// row without a usable id (skipped defensively).
+  ///
+  /// The engine persists checkpoint states as snake_case strings
+  /// (`connecting`/`transferring`/`completed`/`failed`/`failed_storage_full`
+  /// /...); terminal mapping: `completed` → done, `failed*`/`cancelled` →
+  /// failed, everything else → running. `peer` arrives as `""` when a
+  /// record has none — normalized to null.
+  static JobRecord? _jobRecordOf(Map<String, dynamic> row) {
+    final idRaw = row['id'];
+    if (idRaw is! String || idRaw.isEmpty) {
+      return null;
+    }
+    final updated = row['updated_unix_ms'];
+    final direction =
+        row['direction'] == 'send' ? JobDirection.send : JobDirection.receive;
+    final stateText = row['state'] is String ? row['state'] as String : '';
+    final state = switch (stateText) {
+      'completed' || 'done' => JobRecordState.done,
+      _ when stateText.startsWith('failed') || stateText == 'cancelled' =>
+        JobRecordState.failed,
+      _ => JobRecordState.running,
+    };
+    final peerRaw = row['peer'];
+    final rootRaw = row['root'];
+    return JobRecord(
+      id: idRaw.length > 8 ? idRaw.substring(0, 8) : idRaw,
+      direction: direction,
+      startedAt: DateTime.fromMillisecondsSinceEpoch(
+          updated is int && updated >= 0 ? updated : 0),
+      state: state,
+      files: row['files'] is int ? row['files'] as int : 0,
+      bytes: row['bytes'] is int ? row['bytes'] as int : 0,
+      peer: peerRaw is String && peerRaw.isNotEmpty ? peerRaw : null,
+      root: rootRaw is String && rootRaw.isNotEmpty ? rootRaw : null,
+      error: row['error'] is String ? row['error'] as String? : null,
+    );
   }
 
   @override
@@ -280,6 +416,10 @@ final class FfiTransferService implements TransferService {
     _resultPoller.cancel();
     _eventsSubscription?.cancel();
     _core?.dispose();
+    final facade = _facade;
+    if (facade is AkEngineDartFacade) {
+      facade.dispose();
+    }
     _receive = null;
     _sends.clear();
     _status = TransferServiceStatus.idle;
@@ -387,6 +527,12 @@ final class FfiTransferService implements TransferService {
       return;
     }
     _status = status;
+    _notifyListeners();
+  }
+
+  /// Fires every status listener — status changes AND identity refreshes
+  /// (pages listen to re-render the identity card / listening banner).
+  void _notifyListeners() {
     for (final listener in List<void Function()>.of(_statusListeners)) {
       listener();
     }

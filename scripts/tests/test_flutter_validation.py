@@ -9,7 +9,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_flutter_validation import command_payload, require_arm64, require_ffi_exports, package_zip
-from prepare_flutter_probe import SYMBOLS
+from prepare_flutter_probe import FFI_SYMBOLS
 from run_validation import run_one, ROOT
 
 
@@ -43,9 +43,9 @@ class FlutterEvidenceChecks(unittest.TestCase):
     def test_exact_defined_function_exports_not_strings_in_command_or_suffixes(self):
         with tempfile.TemporaryDirectory() as directory:
             log=Path(directory)/'symbols'
-            argv=['nm','-gU',' '.join('_ak_m0_probe_'+s for s in SYMBOLS)]
+            argv=['nm','-gU',' '.join('_'+s for s in FFI_SYMBOLS)]
             header='command='+json.dumps(argv)+'\n'
-            body=''.join('00001234 T _ak_m0_probe_'+s+'\n' for s in SYMBOLS)
+            body=''.join('00001234 T _'+s+'\n' for s in FFI_SYMBOLS)
             log.write_text(header+body)
             require_ffi_exports(log, argv)
             for bad in ['',body.replace(' T ',' U '),body.replace('_start','_start_fake'),body.replace('00001234 T _ak_m0_probe_start\n','')]:

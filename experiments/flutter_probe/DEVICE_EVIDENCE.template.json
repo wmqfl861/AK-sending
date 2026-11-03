@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "commit": null,
+  "build": "release",
+  "device": {
+    "kind": "physical",
+    "platform": null,
+    "model": null,
+    "os_build": null,
+    "coverage": null
+  },
+  "artifact": {
+    "path": null,
+    "sha256": null
+  },
+  "cases": {
+    "background-lock-kill": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "directory-create-verify-clean": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "directory-restart-revoke": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "idle-resource-budget": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "install-cold-start": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "lan-permission-allow-deny-revoke": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "provider-offline-timeout-cleanup": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "two-device-wifi-without-internet": {
+      "status": "NOT_RUN",
+      "observed_at": null,
+      "evidence": {
+        "path": null,
+        "sha256": null
+      }
+    }
+  },
+  "metrics": {
+    "memory_metric": null,
+    "idle_memory_bytes": null,
+    "idle_cpu_percent": null,
+    "idle_sample_seconds": null,
+    "cold_start_ms": [],
+    "installed_bytes": null
+  }
+}

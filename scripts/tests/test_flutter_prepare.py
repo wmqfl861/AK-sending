@@ -39,7 +39,12 @@ class FlutterPreparation(unittest.TestCase):
             pbx.write_text('MACOSX_DEPLOYMENT_TARGET = 12.0;\n'*3)
             entitlement = project/'macos/Runner/Release.entitlements'
             entitlement.write_bytes(plistlib.dumps({'com.apple.security.app-sandbox': True}))
+            info = project/'macos/Runner/Info.plist'
+            info.write_bytes(plistlib.dumps({'original': True}))
             prepare(project, native, 'macos')
+            self.assertIn('NSLocalNetworkUsageDescription', plistlib.loads(info.read_bytes()))
+            for symbol in ['version','prepare','poll','read','push','configure','start','cancel','release']:
+                self.assertIn('-Wl,-u,_ak_m0_lan_'+symbol, config.read_text())
             self.assertIn('ARCHS = arm64\nEXCLUDED_ARCHS = x86_64\n', config.read_text())
             self.assertEqual(pbx.read_text().count('MACOSX_DEPLOYMENT_TARGET = 13.0;'), 3)
             self.assertTrue(plistlib.loads(entitlement.read_bytes())['com.apple.security.app-sandbox'])

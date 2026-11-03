@@ -128,7 +128,7 @@ class MainActivity : FlutterActivity() {
             if (picker != null || permission != null || DiskProbe.busy.get()) {
                 result.success("busy")
             } else when (call.method) {
-                "network" -> {
+                "network", "lanNetwork" -> {
                     if (Build.VERSION.SDK_INT < 37) result.success("not-required")
                     else if (checkSelfPermission(localNetwork) == PackageManager.PERMISSION_GRANTED)
                         result.success("granted")

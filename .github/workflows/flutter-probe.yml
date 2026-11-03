@@ -56,7 +56,8 @@ jobs:
           mkdir -p validation/toolchain
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           "$SDKMANAGER" --list --channel=3 2>&1 | tee validation/toolchain/sdk-available.txt
-          "$SDKMANAGER" --channel=3 'platforms;android-37' 'build-tools;36.0.0' 'ndk;29.0.14206865' 2>&1 | tee validation/toolchain/android-install.txt
+          "$SDKMANAGER" --channel=3 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;29.0.14206865' 2>&1 | tee validation/toolchain/android-install.txt
+          cat "$ANDROID_HOME/platforms/android-37.0/source.properties" | tee validation/toolchain/platform.txt
           BIN="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> "$GITHUB_ENV"

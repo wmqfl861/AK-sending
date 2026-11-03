@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -20,10 +21,47 @@ def command(name: str, *args: str) -> list[str]:
     return [executable, *args]
 
 
+def command_payload(log: Path, expected_argv: list[str]) -> str:
+    """Remove only run_one's verified metadata line, preserving actual tool output."""
+    header, separator, payload = log.read_text(encoding='utf-8').partition('\n')
+    if not separator or not header.startswith('command='):
+        raise ValueError('Missing command evidence header')
+    if json.loads(header[len('command='):]) != expected_argv:
+        raise ValueError('Command evidence does not match requested tool')
+    return payload
+
+
+def require_arm64(log: Path, argv: list[str]) -> None:
+    # Exact single architecture, never a substring in a command/path or universal ABI.
+    if command_payload(log, argv).strip() != 'arm64':
+        raise ValueError('Declared arm64 ABI mismatch')
+
+
+def require_ffi_exports(log: Path, argv: list[str]) -> None:
+    exports = set()
+    for line in command_payload(log, argv).splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[1] == 'T':
+            exports.add(fields[2])
+    if not all('_ak_m0_probe_' + symbol in exports for symbol in SYMBOLS):
+        raise ValueError('Required native symbols stripped')
+
+
 def package_zip(source: Path, output: Path) -> None:
+    """Preserve bundle modes and internal symlinks, never follow links outside it."""
+    root = source.resolve()
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(source.rglob('*')):
-            if path.is_file(): archive.write(path, path.relative_to(source.parent))
+            relative = path.relative_to(source.parent).as_posix()
+            if path.is_symlink():
+                if not path.resolve().is_relative_to(root):
+                    raise ValueError('Bundle symlink escapes product root')
+                info = zipfile.ZipInfo(relative)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(info, os.readlink(path).encode('utf-8'))
+            elif path.is_file() or path.is_dir():
+                archive.write(path, relative)
 
 
 def main() -> int:
@@ -104,13 +142,12 @@ def main() -> int:
             if not product.is_dir(): raise ValueError('Release product missing')
             if platform in ['ios', 'macos']:
                 binary = product / ('Runner' if platform == 'ios' else 'Contents/MacOS/ak_m0_probe')
-                if not run('native-architecture', ['lipo', '-archs', str(binary)]): return 1
-                architecture = (output / 'native-architecture.log').read_text(encoding='utf-8').strip()
-                if architecture != 'arm64': raise ValueError('Declared arm64 ABI mismatch')
-                if not run('native-symbols', ['nm', '-gU', str(binary)]): return 1
-                symbols = (output / 'native-symbols.log').read_text(encoding='utf-8')
-                if not all('_ak_m0_probe_' + symbol in symbols for symbol in SYMBOLS):
-                    raise ValueError('Required native symbols stripped')
+                architecture_argv = ['lipo', '-archs', str(binary)]
+                if not run('native-architecture', architecture_argv): return 1
+                require_arm64(output / 'native-architecture.log', architecture_argv)
+                symbols_argv = ['nm', '-gU', str(binary)]
+                if not run('native-symbols', symbols_argv): return 1
+                require_ffi_exports(output / 'native-symbols.log', symbols_argv)
             else:
                 embedded = product / ('lib/libak_m0_probe.so' if platform == 'linux' else 'ak_m0_probe.dll')
                 if file_sha256(embedded) != file_sha256(native): raise ValueError('Bundled native library mismatch')

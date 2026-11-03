@@ -19,6 +19,8 @@ use ak_identity::Fingerprint;
 /// mDNS service type advertised by AK-sending endpoints.
 pub const SERVICE_TYPE: &str = "_ak-sending._udp.local.";
 
+/// Where a candidate address came from (also the dedup priority: Manual >
+/// Signaling > Mdns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateSource {
     Manual,
@@ -26,6 +28,8 @@ pub enum CandidateSource {
     Signaling,
 }
 
+/// One discovered peer address: a hint only, never authorization — every
+/// candidate still goes through the authenticated direct channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCandidate {
     pub addr: SocketAddr,
@@ -42,6 +46,8 @@ pub struct PeerCandidate {
     pub device_name: Option<String>,
 }
 
+/// Discovery failure: a bad manual-entry list, an mDNS daemon problem, or
+/// an io error.
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
     #[error("invalid address list: {0}")]
@@ -135,6 +141,7 @@ pub struct MdnsDiscovery {
 }
 
 impl MdnsDiscovery {
+    /// Start the mDNS daemon (browse-capable even before [`Self::advertise`]).
     pub fn new() -> Result<Self, DiscoveryError> {
         let daemon =
             mdns_sd::ServiceDaemon::new().map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
@@ -183,6 +190,8 @@ impl MdnsDiscovery {
         Ok(())
     }
 
+    /// Unregister the announcement, sending a graceful goodbye (best
+    /// effort; an error leaves the record to expire via TTL).
     pub fn stop_advertise(&mut self) {
         if let Some(info) = self.announced.take() {
             // Graceful goodbye so peers drop us promptly. Best effort: an
@@ -355,6 +364,9 @@ pub mod ak_net_shim {
     pub use ak_core::policy::PathKind;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// One local network (address + prefix length), same shape as
+    /// ak-net's `classify::Net`; LAN tiering in [`crate::rank`] matches
+    /// against these.
     pub struct Net {
         pub addr: std::net::IpAddr,
         pub prefix_len: u8,

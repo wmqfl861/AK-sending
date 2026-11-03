@@ -3,6 +3,9 @@
 //! Codes are stable on the wire; display names match the protocol list.
 use std::fmt;
 
+/// Protocol error codes (stable on the wire, 1..=14); see
+/// docs/PROTOCOL.zh-CN.md. Unknown codes decode as `None` via
+/// [`ErrorCode::from_code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ErrorCode {
@@ -23,10 +26,12 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// The stable wire code of this variant (1..=14).
     pub fn code(self) -> u16 {
         self as u16
     }
 
+    /// Variant for a wire code; `None` outside the closed 1..=14 set.
     pub fn from_code(code: u16) -> Option<Self> {
         use ErrorCode::*;
         Some(match code {

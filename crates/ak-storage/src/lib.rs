@@ -21,6 +21,8 @@ use ak_core::error::ErrorCode;
 use ak_core::handle::{default_chunk_size, ConflictPolicy, FileSink, SaveTarget, SourceHandle};
 use ak_core::manifest::{validate_rel_path, FileEntry, Manifest, DIGEST_ALG_BLAKE3, DIGEST_LEN};
 
+/// Why opening a source root or save target failed: missing path, wrong
+/// type, symlink anywhere on the root path, escape attempt, or io error.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     #[error("path not found: {0}")]
@@ -180,6 +182,7 @@ impl LocalSource {
         }
     }
 
+    /// The canonicalized source root path being scanned.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -582,10 +585,7 @@ fn with_part_suffix(path: &Path) -> PathBuf {
         PathBuf::from(os)
     } else {
         let digest = blake3::hash(name_bytes);
-        let short = format!(
-            ".akpart-{}",
-            hex_prefix(digest.as_bytes(), 16)
-        );
+        let short = format!(".akpart-{}", hex_prefix(digest.as_bytes(), 16));
         path.with_file_name(short)
     }
 }
@@ -828,8 +828,7 @@ pub fn conflict_free_name(existing: &Path) -> PathBuf {
 fn has_part_suffix(path: &Path) -> bool {
     path.file_name().is_some_and(|n| {
         let bytes = n.as_encoded_bytes();
-        bytes.ends_with(PART_SUFFIX.as_bytes())
-            || bytes.starts_with(b".akpart-")
+        bytes.ends_with(PART_SUFFIX.as_bytes()) || bytes.starts_with(b".akpart-")
     })
 }
 

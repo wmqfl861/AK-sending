@@ -219,6 +219,9 @@ pub mod classify {
     }
 }
 
+/// Failure of [`DirectEndpoint::connect`] / [`DirectEndpoint::accept`]:
+/// transport, peer-identity, authorization, or (via
+/// [`DirectEndpoint::accept_within`]) deadline.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     #[error("io error: {0}")]
@@ -233,6 +236,8 @@ pub enum ConnectError {
     Timeout(Duration),
 }
 
+/// Failure while using an established stream: connection loss, wire decode
+/// rejection, or io error.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
     #[error("connection lost: {0}")]
@@ -374,6 +379,8 @@ impl DirectEndpoint {
         })
     }
 
+    /// The bound socket address (on a dual-stack endpoint this is
+    /// `[::]:port`; see [`Self::local_addr_display`] for dialable forms).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.endpoint.local_addr()
     }
@@ -409,6 +416,8 @@ impl DirectEndpoint {
         &self.nets
     }
 
+    /// Classify a peer address against the interfaces seen at bind time
+    /// (loopback/same-subnet => Local, else Internet; never Relay).
     pub fn classify_peer(&self, peer: IpAddr) -> PathKind {
         classify::classify(peer, &self.nets)
     }
@@ -490,8 +499,8 @@ impl DirectEndpoint {
     }
 
     /// [`Self::accept`] bounded by an overall deadline: returns
-    /// [`ConnectError::Timeout(timeout)`] when no authorized peer arrives in
-    /// time. Probe or engine code that coordinates a hole-punch window can
+    /// [`ConnectError::Timeout`] with the elapsed budget when no authorized
+    /// peer arrives in time. Probe or engine code that coordinates a hole-punch window can
     /// use this instead of hand-rolling a timeout around `accept`.
     pub async fn accept_within(
         &self,
@@ -616,14 +625,17 @@ pub struct DirectChannel {
 }
 
 impl DirectChannel {
+    /// The verified peer identity this channel was pinned to.
     pub fn peer_fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
     }
 
+    /// Path classification of the connected peer (policy-gate input).
     pub fn path(&self) -> PathKind {
         self.path
     }
 
+    /// Open a new bidirectional stream (client side of a protocol exchange).
     pub async fn open_bi(&self) -> Result<DirectStream, StreamError> {
         let (send, recv) = self
             .conn
@@ -633,6 +645,7 @@ impl DirectChannel {
         Ok(DirectStream { send, recv })
     }
 
+    /// Accept a bidirectional stream the peer opened (server side).
     pub async fn accept_bi(&self) -> Result<DirectStream, StreamError> {
         let (send, recv) = self
             .conn
@@ -695,12 +708,15 @@ impl DirectStream {
         )
     }
 
+    /// Encode and send one wire frame.
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), StreamError> {
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
         self.send_bytes(&bytes).await
     }
 
+    /// Read and decode one wire frame under `limits` (exactly one frame;
+    /// a declared payload beyond the budget is rejected before allocating).
     pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
         let mut header = [0u8; ak_wire::HEADER_LEN];
         self.recv_exact(&mut header).await?;
@@ -743,6 +759,7 @@ pub struct DirectSendStream {
 }
 
 impl DirectSendStream {
+    /// Encode and send one wire frame on the send half.
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), StreamError> {
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
@@ -752,6 +769,7 @@ impl DirectSendStream {
             .map_err(|e| StreamError::Connection(e.to_string()))
     }
 
+    /// Send raw bytes on the send half.
     pub async fn send_bytes(&mut self, data: &[u8]) -> Result<(), StreamError> {
         self.send
             .write_all(data)
@@ -759,6 +777,7 @@ impl DirectSendStream {
             .map_err(|e| StreamError::Connection(e.to_string()))
     }
 
+    /// Half-close the send half (finish sending, peer sees EOF).
     pub fn finish(&mut self) -> Result<(), StreamError> {
         self.send
             .finish()
@@ -772,6 +791,7 @@ pub struct DirectRecvStream {
 }
 
 impl DirectRecvStream {
+    /// Read and decode one wire frame under `limits` on the receive half.
     pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
         let mut header = [0u8; ak_wire::HEADER_LEN];
         self.recv_exact(&mut header).await?;
@@ -782,6 +802,7 @@ impl DirectRecvStream {
         Ok(Frame::decode(&frame_bytes, limits)?)
     }
 
+    /// Read exactly `buf.len()` bytes on the receive half.
     pub async fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), StreamError> {
         self.recv
             .read_exact(buf)
@@ -847,7 +868,7 @@ pub mod holepunch {
 
     /// Bind a raw dual-stack UDP socket (`[::]:port`, V6ONLY cleared) for
     /// probing flows that later hand the same socket to QUIC via
-    /// [`DirectEndpoint::bind_with_socket`]. Returns `Unsupported` when the
+    /// [`crate::DirectEndpoint::bind_with_socket`]. Returns `Unsupported` when the
     /// host cannot clear V6ONLY or lacks IPv6; callers fall back to a plain
     /// `UdpSocket::bind("0.0.0.0:port")`. Blocking mode: callers `set_nonblocking`
     /// or convert per their runtime (tokio's `from_std` does it).

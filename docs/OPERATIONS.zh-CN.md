@@ -42,3 +42,29 @@
 
 - 服务器实现不可见文件名、清单与字节（消息集封闭即保证），日志只记录会话与设备级事件（例如"session 共享出口，提示 LAN 优先"一类的 info 行，含会话短 id）。
 - 文件清单、路径与内容摘要不进入信令消息，也不进入服务端任何存储；传输量、文件规模等用户数据不写入控制面日志或计费接口（与上文指标约束一致）。
+
+## 持续集成
+
+`.github/workflows/ci.yml` 已入库备用；仓库尚未推送，该工作流从未在 GitHub Actions 上实际运行过（配置与本地门槛一致，命令均为本地已验证的形态）。推送后行为：
+
+- 触发：push 与 PR 到 `main`、`dev/**` 分支；另支持 workflow_dispatch 手动整跑。
+- `checks` job（ubuntu-latest，Python 3.12）：运行 `scripts/check_repository.py`（结构、Cargo.lock 禁依赖扫描、文档链接检查）与 `python -m unittest discover -s scripts/tests`（校验器自身的 12 个单元测试）。
+- `rust` job（矩阵：ubuntu-latest + windows-latest；stable 工具链含 clippy/rustfmt；Swatinem/rust-cache 缓存 cargo）：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`cargo test -p ak-store --features sqlite`（bundled C SQLite，验证 MSVC/GCC 双平台可编译）、`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`。
+- `release-deep-tests` job（仅 workflow_dispatch 手动触发，不进常规 push/PR 路径）：release-only `#[ignore]` 清单——ak-engine 5 GiB 稀疏文件传输、ak-itests 20,000/65,537 文件多文件传输与 512 MiB 吞吐、256 MiB 分块扫描基准。耗时分钟级（常规测试套件为秒级），故单独手动触发。
+
+`deny.toml` 是与 Python 扫描互补的 cargo-deny 配置：[bans] 按精确名拒绝 iroh/iroh-net/iroh-relay/turn/rusturn/turn-rs/webrtc/str0m/libdatachannel/coturn（multiple-versions 仅警告），[licenses] 限定常见宽松许可证名单（MIT/Apache-2.0/BSD/ISC/Unicode/Zlib/BSL-1.0/CC0），[advisories] 拉取 RustSec 漏洞库、漏洞默认拒绝而 unmaintained/yanked 仅警告。本地开发机未安装 cargo-deny，该文件未在本地执行过；需要时在 CI 增加可选 job（如 EmbarkStudios/cargo-deny-action@v2），或开发者执行 `cargo install cargo-deny --locked` 后运行 `cargo deny check`。
+
+本地等效命令（与 [CONTRIBUTING.md](../CONTRIBUTING.md) 的门槛一致，细节以该文件为准）：
+
+```sh
+python scripts/check_repository.py
+python -m unittest discover -s scripts/tests
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p ak-store --features sqlite
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+# 手动深测（分钟级，默认 #[ignore]）：
+cargo test --release -p ak-engine -- --ignored --nocapture
+cargo test --release -p ak-itests -- --ignored --nocapture
+```

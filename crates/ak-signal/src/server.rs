@@ -25,9 +25,13 @@ use crate::util;
 
 /// Server error codes carried in ServerError frames.
 pub const ERR_UNKNOWN_DEVICE: u16 = 1;
+/// ConnectRequest named a device with no live registration.
 pub const ERR_SESSION_LIMIT: u16 = 2;
+/// Per-connection token bucket exhausted.
 pub const ERR_RATE_LIMITED: u16 = 3;
+/// Message invalid in the current connection state.
 pub const ERR_BAD_REQUEST: u16 = 4;
+/// Signal/Cancel named an unknown or expired session.
 pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 
 /// Server limits; every field is a coordination-plane resource cap.

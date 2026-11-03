@@ -216,6 +216,8 @@ pub struct ResumeEntry {
     pub verified_prefix_chunks: u64,
 }
 
+/// The closed file-protocol message set (one frame payload each; the
+/// type-value mapping is frozen — see the crate docs table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     Hello {
@@ -289,12 +291,16 @@ impl Message {
     }
 }
 
+/// One versioned wire frame: header plus one [`Message`] payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub version: u8,
     pub message: Message,
 }
 
+/// Why a frame was rejected: every decode validates version, type, length,
+/// offsets, and resource budgets before allocating, and refuses unknown
+/// values.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("frame shorter than the {HEADER_LEN}-byte header")]
@@ -733,10 +739,14 @@ fn limited_string(cursor: &mut Cursor, limit: u16) -> Result<String, DecodeError
     }
     let bytes = cursor.take(len)?;
     match std::str::from_utf8(bytes) {
-        Ok(s) if !s.chars().any(|c| {
-            // Unicode Cc: C0 (U+0000..=001F), DEL (U+007F), C1 (U+0080..=009F).
-            matches!(c as u32, 0..=0x1F | 0x7F..=0x9F)
-        }) => Ok(s.to_owned()),
+        Ok(s)
+            if !s.chars().any(|c| {
+                // Unicode Cc: C0 (U+0000..=001F), DEL (U+007F), C1 (U+0080..=009F).
+                matches!(c as u32, 0..=0x1F | 0x7F..=0x9F)
+            }) =>
+        {
+            Ok(s.to_owned())
+        }
         _ => Err(DecodeError::BadString { limit }),
     }
 }
@@ -1649,7 +1659,13 @@ mod tests {
 
     #[test]
     fn rejects_control_characters_in_display_strings() {
-        for bad in ["a\u{0}b", "esc\u{1b}[31m", "del\u{7f}", "c1\u{85}x", "nl\na"] {
+        for bad in [
+            "a\u{0}b",
+            "esc\u{1b}[31m",
+            "del\u{7f}",
+            "c1\u{85}x",
+            "nl\na",
+        ] {
             let buf = encoded(&Message::Hello {
                 proto_version: 1,
                 device_name: bad.to_string(),
@@ -1673,7 +1689,10 @@ mod tests {
         });
         assert!(matches!(
             Frame::decode(&ok, &Limits::default()),
-            Ok(Frame { message: Message::Hello { .. }, .. })
+            Ok(Frame {
+                message: Message::Hello { .. },
+                ..
+            })
         ));
     }
 

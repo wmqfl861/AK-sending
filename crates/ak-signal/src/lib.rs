@@ -9,9 +9,13 @@
 //! by tests.
 #![forbid(unsafe_code)]
 
+/// Hello-authenticated signaling client over one TCP connection.
 pub mod client;
+/// Signaling wire codec: fixed message set, every field bounded.
 pub mod codec;
+/// Signaling server (TCP signaling + UDP STUN responder).
 pub mod server;
+/// Minimal STUN binding (RFC 5389 subset).
 pub mod stun;
 
 mod util;

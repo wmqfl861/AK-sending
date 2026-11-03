@@ -19,15 +19,24 @@ use ak_identity::{DeviceKeyPair, Fingerprint};
 
 use crate::util::{put_u16, put_u32, put_u64};
 
+/// Signaling protocol version (frame header byte 0).
 pub const VERSION: u8 = 1;
+/// Frame header size: version(1) + type(1) + payload_len(2).
 pub const HEADER_LEN: usize = 4;
+/// Hard cap for one signaling frame, header included.
 pub const MAX_FRAME_BYTES: usize = 4096;
+/// Most candidates one Register/Signal::Candidates message may carry.
 pub const MAX_CANDIDATES: usize = 16;
+/// Byte cap for a device-name string field.
 pub const MAX_NAME_BYTES: usize = 64;
+/// Byte cap for an error-message string field.
 pub const MAX_ERROR_BYTES: usize = 128;
+/// Hello timestamps older than this are rejected (replay window).
 pub const HELLO_MAX_AGE_MS: u64 = 10_000;
 
+/// Device identity on the coordination plane: the Ed25519 public key bytes.
 pub type DeviceId = [u8; 32];
+/// Server-assigned session identifier.
 pub type SessionId = [u8; 16];
 
 // Wire type values. The set is closed: decode rejects everything outside
@@ -65,6 +74,8 @@ pub enum PeerSignal {
     SameEgress,
 }
 
+/// The closed client<->server message set (one frame payload each; the
+/// type byte mapping is locked by tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtrlMessage {
     /// First message on a connection; signature covers version|device_id|name|timestamp.
@@ -105,12 +116,15 @@ pub enum CtrlMessage {
     },
 }
 
+/// One versioned signaling frame: `[version][type][payload_len BE][payload]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtrlFrame {
     pub version: u8,
     pub message: CtrlMessage,
 }
 
+/// Why a signaling frame was rejected; every decode path validates version,
+/// type, lengths, budgets, and string hygiene before accepting a frame.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("frame shorter than the 4-byte header")]
@@ -155,6 +169,8 @@ impl CtrlFrame {
         out[start + 3] = len_be[1];
     }
 
+    /// Strict decode of exactly one frame (leftover input is an error;
+    /// see [`DecodeError::Trailing`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() < HEADER_LEN {
             return Err(DecodeError::TruncatedHeader);

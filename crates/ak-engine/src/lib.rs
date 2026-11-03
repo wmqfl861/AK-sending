@@ -166,6 +166,8 @@ pub struct SendSpec {
 }
 
 impl SendSpec {
+    /// Defaults for every field: default chunk size, `Fail` conflict
+    /// policy, auto bind, temp checkpoint dir, window 8, single-stream.
     pub fn new(
         source_root: PathBuf,
         peer: SocketAddr,
@@ -220,6 +222,9 @@ pub struct ReceiveSpec {
 }
 
 impl ReceiveSpec {
+    /// Defaults for every field: bind 0.0.0.0:7100, default chunk size,
+    /// `Fail` conflict policy, authorize-everyone callback, temp
+    /// checkpoint dir.
     pub fn new(out_dir: PathBuf, identity: TlsBundle) -> Self {
         Self {
             out_dir,
@@ -272,7 +277,7 @@ pub enum Progress {
         chunk_index: u64,
     },
     /// Cumulative verified bytes of one file, piggybacked on the checkpoint
-    /// cadence (every [`CHECKPOINT_EVERY_ACKS`] acknowledged chunks).
+    /// cadence (every `CHECKPOINT_EVERY_ACKS` acknowledged chunks).
     BytesAcked {
         file_index: u32,
         cumulative_bytes: u64,
@@ -312,6 +317,9 @@ pub struct Report {
     pub roots: Vec<String>,
 }
 
+/// Transfer failure taxonomy: connect/stream errors, peer refusals and
+/// errors, timeouts, checkpoint/io problems, verification failure, and the
+/// policy-gate refusal ([`EngineError::RouteForbidden`]).
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("connect failed: {0}")]
@@ -348,7 +356,7 @@ pub enum EngineError {
     /// The connected route's path kind is not allowed by the configured
     /// [`DirectPolicy`] (internet refused by policy, or a Relay/Unknown
     /// path that must never carry file data — see [`authorize_path`]).
-    /// The channel is closed with [`POLICY_GATE_CLOSE_CODE`] before any
+    /// The channel is closed with `POLICY_GATE_CLOSE_CODE` before any
     /// protocol byte moves.
     #[error("route refused by policy: {0:?}")]
     RouteForbidden(PathKind),
@@ -1968,7 +1976,7 @@ impl AcceptStop {
 /// their order; events from different tasks interleave arbitrarily. The
 /// callback itself runs on this driver task and must be cheap.
 ///
-/// Concurrency safety (see also the module docs and [`receive_job`]): the
+/// Concurrency safety (see also the module docs and `receive_job`): the
 /// receive directory is shared only as `&LocalSaveTarget`
 /// (`prepare_file*` has no interior mutable state; different entries map
 /// to different `.akpart` files), and every task opens its own checkpoint

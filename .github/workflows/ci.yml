@@ -1,0 +1,93 @@
+# AK-sending continuous integration.
+#
+# Status: the repository has NOT been pushed to GitHub yet, so this workflow
+# has never actually executed on Actions runners; it is committed ahead of
+# time so it takes effect on the first push. The commands mirror the local
+# gate documented in CONTRIBUTING.md and docs/OPERATIONS.zh-CN.md.
+#
+# ADR-001 / ADR-002 (D6): the dependency ban (no relay/TURN/WebRTC/iroh in
+# the dependency graph) is enforced by scripts/check_repository.py scanning
+# Cargo.lock in the `checks` job; deny.toml provides the complementary
+# cargo-deny view (licenses, advisories, duplicate versions) for optional
+# use -- see the header of deny.toml.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "dev/**"]
+  pull_request:
+    branches: [main, "dev/**"]
+  # Enables the manual-only `release-deep-tests` job below.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # L0 repository gate: structure, Cargo.lock banned-dependency scan,
+  # markdown link check, plus the unit tests of the validator itself.
+  checks:
+    name: Repository checks (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Repository structure, Cargo.lock bans, doc links
+        run: python scripts/check_repository.py
+      - name: Validator unit tests
+        run: python -m unittest discover -s scripts/tests -v
+
+  # Rust gate on both first-class platforms (Windows MSVC matters: the
+  # optional ak-store `sqlite` backend bundles C SQLite).
+  rust:
+    name: Rust stable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (workspace)
+        run: cargo test --workspace
+      - name: Tests (ak-store sqlite backend, bundled C SQLite)
+        run: cargo test -p ak-store --features sqlite
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+  # Manual deep test: the release-only #[ignore] suite. Wall time is on the
+  # order of minutes (the unit suite is seconds): ak-engine 5 GiB sparse
+  # transfer, ak-itests 20,000/65,537-file many-files runs, 512 MiB x2
+  # throughput bench and 256 MiB x8 chunk-size sweep. Too slow for the
+  # ordinary push/PR path, so it only runs via workflow_dispatch
+  # (Actions tab -> Run workflow).
+  release-deep-tests:
+    name: Release deep tests (ignored suite, minutes-scale)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ak-engine ignored tests (5 GiB sparse transfer)
+        run: cargo test --release -p ak-engine -- --ignored --nocapture
+      - name: ak-itests ignored tests (20k files + benches)
+        run: cargo test --release -p ak-itests -- --ignored --nocapture

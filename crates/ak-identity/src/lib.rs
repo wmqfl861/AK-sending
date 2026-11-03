@@ -13,8 +13,11 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 
+/// Byte length of an Ed25519 public key (the device identity itself).
 pub const PUBLIC_KEY_LEN: usize = 32;
+/// Byte length of an Ed25519 signature.
 pub const SIGNATURE_LEN: usize = 64;
+/// Byte length of a [`Fingerprint`] (BLAKE3 of the public key).
 pub const FINGERPRINT_LEN: usize = 32;
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
@@ -44,6 +47,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 impl Fingerprint {
+    /// Derive the fingerprint of a public key (first 32 bytes of its BLAKE3
+    /// digest).
     pub fn from_public_key(public: &[u8; PUBLIC_KEY_LEN]) -> Self {
         let digest = blake3::hash(public);
         let mut bytes = [0u8; FINGERPRINT_LEN];
@@ -51,10 +56,12 @@ impl Fingerprint {
         Fingerprint(bytes)
     }
 
+    /// Wrap 32 raw fingerprint bytes (no re-hashing).
     pub fn from_bytes(bytes: [u8; FINGERPRINT_LEN]) -> Self {
         Fingerprint(bytes)
     }
 
+    /// Raw fingerprint bytes.
     pub fn as_bytes(&self) -> &[u8; FINGERPRINT_LEN] {
         &self.0
     }
@@ -130,6 +137,7 @@ pub struct DeviceKeyPair {
 }
 
 impl DeviceKeyPair {
+    /// Generate a fresh key pair from the OS RNG.
     pub fn generate() -> Self {
         Self {
             signing: SigningKey::generate(&mut OsRng),
@@ -176,14 +184,17 @@ impl DeviceKeyPair {
         atomic_write(path, &self.signing.to_bytes())
     }
 
+    /// The public key (the device identity) as raw bytes.
     pub fn public_key(&self) -> [u8; PUBLIC_KEY_LEN] {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// Fingerprint of this device's public key.
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::from_public_key(&self.public_key())
     }
 
+    /// Sign `message` with the device key (Ed25519).
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
         self.signing.sign(message).to_bytes()
     }
@@ -336,6 +347,9 @@ impl PeerBook {
         Ok(book)
     }
 
+    /// Persist the book atomically in the tab-separated `peers.book` format
+    /// (header line, then one `fingerprint\tname\tpaired_unix_ms` line per
+    /// peer, in insertion order).
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut out = String::with_capacity(PEERBOOK_MAGIC.len() + 1 + self.peers.len() * 80);
         out.push_str(PEERBOOK_MAGIC);
@@ -351,6 +365,8 @@ impl PeerBook {
         atomic_write(path, out.as_bytes())
     }
 
+    /// Insert a peer, or replace the existing entry with the same
+    /// fingerprint (rename/re-pair keeps its position).
     pub fn upsert(&mut self, record: PeerRecord) {
         match self
             .peers
@@ -362,18 +378,21 @@ impl PeerBook {
         }
     }
 
+    /// Look up one peer by fingerprint.
     pub fn get(&self, fingerprint: &Fingerprint) -> Option<&PeerRecord> {
         self.peers
             .iter()
             .find(|peer| &peer.fingerprint == fingerprint)
     }
 
+    /// Remove one peer; returns whether an entry was actually removed.
     pub fn remove(&mut self, fingerprint: &Fingerprint) -> bool {
         let len = self.peers.len();
         self.peers.retain(|peer| &peer.fingerprint != fingerprint);
         self.peers.len() != len
     }
 
+    /// Iterate peers in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = &PeerRecord> + '_ {
         self.peers.iter()
     }
@@ -477,6 +496,8 @@ pub mod tls {
         }
     }
 
+    /// Why a peer certificate failed verification (parse, self-signature,
+    /// or pin mismatch).
     #[derive(Debug, thiserror::Error)]
     pub enum CertError {
         #[error("malformed certificate")]

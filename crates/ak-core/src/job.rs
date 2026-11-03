@@ -1,6 +1,8 @@
 //! Receiver-side task lifecycle model only: no disk persistence or scheduler.
 use std::fmt;
 
+/// Receiver-side task states; terminal states never restart (see
+/// [`State::advance`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Pending,
@@ -16,6 +18,8 @@ pub enum State {
     Failed,
 }
 
+/// Lifecycle events fed to [`State::advance`]; `Cancel` and `Fail` are
+/// accepted from any non-terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Begin,
@@ -33,6 +37,8 @@ pub enum Event {
     Fail,
 }
 
+/// A state/event pair the lifecycle model rejects; carries the rejected
+/// [`State`] and [`Event`] for reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidTransition {
     pub state: State,
@@ -51,6 +57,9 @@ impl fmt::Display for InvalidTransition {
 impl std::error::Error for InvalidTransition {}
 
 impl State {
+    /// Apply one lifecycle event, returning the next state or
+    /// [`InvalidTransition`] (terminal states accept nothing, and
+    /// verification always precedes saving).
     pub fn advance(self, event: Event) -> Result<Self, InvalidTransition> {
         let invalid = InvalidTransition { state: self, event };
         if matches!(self, Self::Completed | Self::Cancelled | Self::Failed) {

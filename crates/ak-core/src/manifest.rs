@@ -14,6 +14,8 @@ pub const DIGEST_LEN: usize = 32;
 /// Upper bound for a validated relative path in bytes (UTF-8).
 pub const MAX_REL_PATH_BYTES: usize = 1024;
 
+/// A relative path rejected by [`validate_rel_path`] (carry-all marker; the
+/// rules are listed there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidRelPath;
 
@@ -64,6 +66,8 @@ pub fn validate_rel_path(path: &str) -> Result<&str, InvalidRelPath> {
     Ok(path)
 }
 
+/// One manifest entry: a file with its digests, or an empty directory
+/// marker (directories carry no size or digests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// Validated `/`-separated relative path (also the disk layout).
@@ -123,10 +127,12 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Sum of every file entry's size (directories contribute zero).
     pub fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.size).sum()
     }
 
+    /// Number of entries, files and directories alike.
     pub fn file_count(&self) -> u64 {
         self.entries.len() as u64
     }

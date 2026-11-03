@@ -13,11 +13,17 @@ use tokio::net::UdpSocket;
 
 use crate::util::{put_u16, put_u32, unique_array};
 
+/// RFC 5389 magic cookie fixed in every header.
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
+/// STUN header size: type(2) + length(2) + cookie(4) + transaction id(12).
 pub const HEADER_LEN: usize = 20;
+/// Message type of a binding request.
 pub const BINDING_REQUEST: u16 = 0x0001;
+/// Message type of a binding response.
 pub const BINDING_RESPONSE: u16 = 0x0101;
+/// Attribute type carrying the XOR-encoded mapped address.
 pub const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// Attribute type of the plain (non-XOR) mapped-address form.
 pub const MAPPED_ADDRESS: u16 = 0x0001;
 
 const FAMILY_IPV4: u8 = 0x01;
@@ -25,6 +31,8 @@ const FAMILY_IPV6: u8 = 0x02;
 /// RFC 5389: port is xored with the top 16 bits of the magic cookie.
 const PORT_XOR_MASK: u16 = (MAGIC_COOKIE >> 16) as u16;
 
+/// Why a STUN exchange failed: malformed or mismatched packet, missing
+/// mapped address, io error, or no response in the budget.
 #[derive(Debug, thiserror::Error)]
 pub enum StunError {
     #[error("packet too short for a STUN header")]

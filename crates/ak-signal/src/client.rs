@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, Mutex};
 use crate::codec::{self, CtrlFrame, CtrlMessage, DeviceId, PeerSignal, SessionId};
 use crate::util;
 
+/// Signaling client failure: io, protocol surprise, server refusal,
+/// closed connection, or codec rejection.
 #[derive(Debug, thiserror::Error)]
 pub enum SignalError {
     #[error("io error: {0}")]
@@ -80,6 +82,7 @@ impl SignalClient {
         }
     }
 
+    /// This client's device id (the key's public bytes from the Hello).
     pub fn device_id(&self) -> DeviceId {
         self.device_id
     }

@@ -2,6 +2,8 @@
 use std::num::NonZeroU32;
 use std::ops::Range;
 
+/// Fixed-size chunking of a byte length: pure arithmetic over
+/// `total_bytes` and a nonzero `chunk_bytes`, no allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPlan {
     total_bytes: u64,
@@ -17,10 +19,13 @@ impl ChunkPlan {
         }
     }
 
+    /// Total byte length the plan covers.
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
+    /// Number of chunks that cover `total_bytes` (ceiling division;
+    /// zero for an empty input).
     pub fn chunk_count(&self) -> u64 {
         let size = u64::from(self.chunk_bytes.get());
         self.total_bytes / size + u64::from(!self.total_bytes.is_multiple_of(size))

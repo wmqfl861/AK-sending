@@ -83,7 +83,7 @@ fn version_line_static() -> &'static str {
 )]
 struct Cli {
     /// Identity directory holding device.key, peers.book, checkpoints
-    /// (default: <home>/.ak-sending).
+    /// (default: `<home>/.ak-sending`).
     #[arg(long, global = true)]
     id_dir: Option<PathBuf>,
 
@@ -114,8 +114,8 @@ enum Command {
         port: Option<u16>,
         /// Listen address override: a bare IP (`0.0.0.0` default, `::`,
         /// `192.168.1.5` -- the port comes from --port) or a full
-        /// ip:port/[v6]:port (`[::]:7100` -- its port wins over --port, with
-        /// a notice). IPv6 listeners need the peer to reach this host over
+        /// `ip:port`/`[v6]:port` (`[::]:7100` -- its port wins over --port,
+        /// with a notice). IPv6 listeners need the peer to reach this host over
         /// IPv6 or an IPv4-mapped address; binding itself is left to the
         /// engine (no relay fallback exists).
         #[arg(long, value_parser = bind_arg_parser)]
@@ -192,7 +192,7 @@ enum Command {
         json: bool,
     },
     /// Show or clean transfer job checkpoints (resumable state records in
-    /// <id-dir>/checkpoints). Part files (.akpart) are never touched.
+    /// `<id-dir>/checkpoints`). Part files (.akpart) are never touched.
     Jobs {
         #[command(subcommand)]
         cmd: Option<JobsCommand>,
@@ -223,7 +223,7 @@ enum Command {
         stun_port: Option<u16>,
         /// Listen address override for the TCP signaling endpoint: a bare IP
         /// (default 0.0.0.0; port comes from --tcp-port) or a full
-        /// ip:port/[v6]:port (`[::]:7100`; its port wins over --tcp-port,
+        /// `ip:port`/`[v6]:port` (`[::]:7100`; its port wins over --tcp-port,
         /// with a notice). IPv6 listens need v6-reachable clients (or
         /// v4-mapped on dual-stack hosts) for signaling to work.
         #[arg(long, value_parser = bind_arg_parser)]

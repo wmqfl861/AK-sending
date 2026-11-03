@@ -21,6 +21,7 @@ pub struct Observation {
     pub cellular: bool,
 }
 
+/// Why [`DirectPolicy::choose`] could not select a route yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
     LocalProbePending,
@@ -28,6 +29,7 @@ pub enum WaitReason {
     DirectUnavailable,
 }
 
+/// Outcome of route selection: pick one observation or keep waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// The index is only meaningful for the unchanged input observations.
@@ -56,6 +58,9 @@ impl Default for DirectPolicy {
 }
 
 impl DirectPolicy {
+    /// Fail-closed route selection: pick the first permitted observation,
+    /// preferring [`PathKind::LocalDirect`], else report why not (never a
+    /// relay — there is no such setting on purpose).
     pub fn choose(
         &self,
         expected_peer: [u8; 32],

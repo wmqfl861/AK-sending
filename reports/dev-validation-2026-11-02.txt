@@ -307,3 +307,18 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 # 语义两态断言）；信令建立会话→关停证明死亡→直传照常（协调面仅建立期存在）。
 # CLI：completions 四 shell、jobs status 详情、receive/signal-server --bind/--stun-bind（v6 实测 [::1] 监听）。
 # 文档：SECURITY/ARCHITECTURE 六七波对齐（含 FileTransferEngine 过期行修正、.akpart 哈希表述精确化）。
+
+## 第九轮并行开发验证（2026-11-03，5 个并行子代理＋集成者收尾）
+
+$ cargo fmt --all -- --check  → CLEAN（含消除 5 处既有漂移）
+$ cargo test --workspace → 417 passed / 0 failed / 5 ignored
+$ cargo test -p ak-store --features sqlite → 26 passed
+$ cargo clippy --workspace --all-targets -- -D warnings → 干净
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps → 零警告（默认与全特性均过）
+$ python scripts/check_repository.py → passed；unittest → 12 OK
+$ bash scripts/smoke_loopback.sh --skip-probe → PASS（fmt 后复跑）
+
+# 成果：README/HANDOFF/CONTRIBUTING 收尾（13 行全命令清单）；rustdoc 12 警告清零+103 公共项补文档；
+# CI 工作流（双 OS 矩阵+手动深测 job，未推送未实跑如实标注）+ deny.toml；可重复双进程冒烟脚本
+# scripts/smoke_loopback.sh（完整含 probe 段 5 连跑全绿，固化 probe 启动顺序两个必要条件）；
+# reports/DEV_SUMMARY.zh-CN.md 执行摘要（九轮历程表+缺陷闭环实名）+ TEST_PLAN/ROADMAP 最终刷新。

@@ -1,11 +1,22 @@
 //! Task checkpoint persistence.
 //!
 //! v1 is a line-based file store with atomic writes (write temp, fsync,
-//! rename). An optional SQLite backend (BACKLOG P1-03, `sqlite` feature,
-//! [`sqlite::SqliteCheckpointStore`]) implements the same trait with the same
-//! semantics; the engine only sees [`CheckpointStore`]. With the `sqlite`
-//! feature, [`migrate_file_to_sqlite`] moves existing file-backend records
-//! into a SQLite database in one pass.
+//! rename). The engine only sees [`CheckpointStore`].
+#![cfg_attr(feature = "sqlite", doc = "")]
+#![cfg_attr(
+    feature = "sqlite",
+    doc = "An optional SQLite backend (BACKLOG P1-03, `sqlite` feature,"
+)]
+#![cfg_attr(
+    feature = "sqlite",
+    doc = "[`sqlite::SqliteCheckpointStore`]) implements the same trait with the same"
+)]
+#![cfg_attr(feature = "sqlite", doc = "semantics;")]
+#![cfg_attr(
+    feature = "sqlite",
+    doc = "[`migrate_file_to_sqlite`] moves existing file-backend records"
+)]
+#![cfg_attr(feature = "sqlite", doc = "into a SQLite database in one pass.")]
 //!
 //! Rule from PROTOCOL: a completed marker is written strictly after final
 //! verification and save commit, never before.
@@ -38,8 +49,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ak_identity::Fingerprint;
 
+/// Transfer job identifier: 16 bytes (truncated BLAKE3 of the job inputs).
 pub type JobIdBytes = [u8; 16];
 
+/// Transfer direction a checkpoint records (`send` / `receive` on disk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Send,
@@ -54,6 +67,8 @@ pub struct FileCheckpoint {
     pub verified_prefix_chunks: u64,
 }
 
+/// One resumable task's persisted state: identity, totals, current state
+/// string, and per-file verified prefixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRecord {
     pub job_id: JobIdBytes,
@@ -77,6 +92,8 @@ impl TaskRecord {
     }
 }
 
+/// Backend-neutral checkpoint persistence (file or SQLite); see the module
+/// docs for the shared semantics.
 pub trait CheckpointStore: Send + Sync {
     /// Persist atomically; readers never observe a torn record.
     fn save(&self, record: &TaskRecord) -> io::Result<()>;
@@ -158,6 +175,8 @@ const JOB_HEX_LEN: usize = 16 * 2;
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl FileCheckpointStore {
+    /// Open (creating if needed) the checkpoint directory and return the
+    /// store.
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         Ok(Self {
@@ -173,7 +192,7 @@ impl FileCheckpointStore {
 
 impl CheckpointStore for FileCheckpointStore {
     /// Persist atomically: write a temp file in the same directory, fsync it,
-    /// then rename over the final name (see [`rename_replace`] for the
+    /// then rename over the final name (see `rename_replace` below for the
     /// Windows overwrite handling).
     ///
     /// PROTOCOL ordering note: this crate only provides the atomic write

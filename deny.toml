@@ -1,0 +1,59 @@
+# cargo-deny configuration for AK-sending.
+#
+# Status: the local development machine does NOT have cargo-deny installed,
+# so this file has never been executed locally (configuration only, staged
+# for later use). Ways to run it:
+#   * CI: add an optional job/step using EmbarkStudios/cargo-deny-action@v2
+#     (not part of the default gate in .github/workflows/ci.yml);
+#   * developers: `cargo install cargo-deny --locked`, then `cargo deny check`.
+#
+# Relationship to scripts/check_repository.py: the Python script scans
+# Cargo.lock for banned relay/TURN/WebRTC/iroh crates (ADR-001 / ADR-002 D6)
+# and runs in the default gate; this file complements it via cargo-deny with
+# exact-name crate bans plus duplicate-version, license and RustSec advisory
+# checks the Python scan does not cover.
+
+[bans]
+# ADR-001: direct-only transport. Any relay/TURN/WebRTC-style crate is
+# rejected outright; duplicated dependency versions only warn so routine
+# upstream churn does not block development.
+multiple-versions = "warn"
+deny = [
+    { name = "iroh" },
+    { name = "iroh-net" },
+    { name = "iroh-relay" },
+    { name = "turn" },
+    { name = "rusturn" },
+    { name = "turn-rs" },
+    { name = "webrtc" },
+    { name = "str0m" },
+    { name = "libdatachannel" },
+    { name = "coturn" },
+]
+
+[licenses]
+# Common permissive set (SPDX identifiers). The controlled workspace
+# dependency list from ADR-002 is expected to stay within it; "BSD" is
+# spelled out as BSD-2-Clause/BSD-3-Clause, "CC0" as CC0-1.0, and
+# Unicode-DFS-2016 covers older unicode-ident releases that predate the
+# Unicode-3.0 SPDX id.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+]
+
+[advisories]
+# cargo-deny fetches the RustSec advisory database (default URL:
+# https://github.com/rustsec/advisory-db) on each run. Vulnerable crates are
+# denied by default; unmaintained and yanked crates only warn so a transitive
+# notice does not block the build.
+unmaintained = "warn"
+yanked = "warn"

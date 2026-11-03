@@ -564,11 +564,40 @@ fn ensure_real_dirs(root: &Path, parts: &[&OsStr]) -> io::Result<()> {
 }
 
 /// Append [`PART_SUFFIX`] to a full path (simple OsString append, keeps any
-/// multi-dot extensions intact).
+/// multi-dot extensions intact). When the final component is so long that the
+/// suffixed name would exceed common filesystem component limits (255 chars),
+/// fall back to a short deterministic sibling instead: `.akpart-<blake3 of the
+/// final component, first 16 hex>`. The fallback is derived from the final
+/// name only, so resume finds the same part file again (scenario test found
+/// the 249-byte-name boundary on NTFS).
 fn with_part_suffix(path: &Path) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(PART_SUFFIX);
-    PathBuf::from(os)
+    const COMPONENT_LIMIT: usize = 255;
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let name_bytes = name.as_encoded_bytes();
+    if name_bytes.len() + PART_SUFFIX.len() <= COMPONENT_LIMIT {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(PART_SUFFIX);
+        PathBuf::from(os)
+    } else {
+        let digest = blake3::hash(name_bytes);
+        let short = format!(
+            ".akpart-{}",
+            hex_prefix(digest.as_bytes(), 16)
+        );
+        path.with_file_name(short)
+    }
+}
+
+/// Lowercase hex of the first `n` bytes (no external hex dependency).
+fn hex_prefix(bytes: &[u8], n: usize) -> String {
+    let mut out = String::with_capacity(n * 2);
+    for byte in bytes.iter().take(n) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Re-verify an existing `.akpart` file chunk by chunk against the manifest,
@@ -794,10 +823,14 @@ pub fn conflict_free_name(existing: &Path) -> PathBuf {
 // Orphan part cleanup
 // ---------------------------------------------------------------------------
 
-/// True when the path's file name ends with [`PART_SUFFIX`].
+/// True when the path's file name is a part file: the regular
+/// `<name>.akpart` form or the long-name fallback `.akpart-<hex>`.
 fn has_part_suffix(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.as_encoded_bytes().ends_with(PART_SUFFIX.as_bytes()))
+    path.file_name().is_some_and(|n| {
+        let bytes = n.as_encoded_bytes();
+        bytes.ends_with(PART_SUFFIX.as_bytes())
+            || bytes.starts_with(b".akpart-")
+    })
 }
 
 /// Delete stale `*.akpart` temp files anywhere under `root`: a part whose last

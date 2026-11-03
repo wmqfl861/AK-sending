@@ -791,6 +791,7 @@ mod tests {
     use super::*;
     use crate::client::test_support as client_support;
     use crate::client::SignalClient;
+    use ed25519_dalek::Signer as _;
     use tokio::io::AsyncReadExt;
 
     async fn next_msg(client: &SignalClient) -> CtrlMessage {
@@ -1310,5 +1311,342 @@ mod tests {
         assert_empty(&mut rx_replacement);
         assert_empty(&mut rx_target); // retired connection gets nothing
         assert_empty(&mut rx_requester);
+    }
+
+    // ---- adversarial input hardening (round 7) ----
+
+    /// Small deterministic LCG (Numerical Recipes constants): the fuzz
+    /// corpora below must be reproducible run to run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+
+        /// Append `len` pseudo-random bytes to `out`.
+        fn fill(&mut self, out: &mut Vec<u8>, len: usize) {
+            while out.len() < len {
+                let chunk = self.next_u64().to_le_bytes();
+                let take = (len - out.len()).min(8);
+                out.extend_from_slice(&chunk[..take]);
+            }
+        }
+    }
+
+    /// One adversarial frame, mixing four shapes: pure garbage of random
+    /// length 0..=8192; a plausible header (valid version, in-range type)
+    /// wrapped around garbage payload bytes of matching or random length; a
+    /// declared payload length above the hard cap; and a half frame whose
+    /// header claims more body bytes than are ever sent.
+    fn fuzz_frame(rng: &mut Lcg) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let shape = rng.below(4);
+        if shape == 0 {
+            let len = rng.below(8193) as usize;
+            rng.fill(&mut buf, len);
+        } else if shape == 1 {
+            buf.push(codec::VERSION);
+            buf.push(1 + rng.below(8) as u8);
+            let declared = rng.below(4093) as usize; // at or under the cap
+            buf.extend_from_slice(&(declared as u16).to_be_bytes());
+            let body = if rng.below(2) == 0 {
+                declared
+            } else {
+                rng.below(8193) as usize
+            };
+            rng.fill(&mut buf, body);
+        } else if shape == 2 {
+            buf.push(codec::VERSION);
+            buf.push(1 + rng.below(8) as u8);
+            let declared = 4093 + rng.below(61_443) as u16; // over the cap
+            buf.extend_from_slice(&declared.to_be_bytes());
+            let len = rng.below(65) as usize;
+            rng.fill(&mut buf, len);
+        } else {
+            buf.push(codec::VERSION);
+            buf.push(1 + rng.below(8) as u8);
+            let declared = 1 + rng.below(4092) as usize;
+            buf.extend_from_slice(&(declared as u16).to_be_bytes());
+            rng.fill(&mut buf, declared / 2); // half frame, then reconnect
+        }
+        buf
+    }
+
+    /// Direct fuzzing of the live server: >=500 adversarial frames over raw
+    /// TCP connections with repeated reconnects (including half-frame
+    /// drops). The assertions are: the server never panics (this test
+    /// completing is the proof); every illegal frame ends as a connection
+    /// close or silent discard, never a hang; and legal clients can still
+    /// complete the full Hello/Welcome handshake during and after the fuzz.
+    #[tokio::test]
+    async fn server_survives_raw_tcp_frame_fuzzing() {
+        let server = test_support::start(Limits::default()).await;
+        let mut rng = Lcg(0x243F_6A88_85A3_08D3);
+        let mut sent = 0usize;
+        let mut connections = 0usize;
+        let mut probes = 0usize;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while sent < 500 {
+                let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+                connections += 1;
+                let frames_this_conn = 1 + rng.below(4) as usize;
+                for _ in 0..frames_this_conn {
+                    let frame = fuzz_frame(&mut rng);
+                    // The server may already have closed this connection
+                    // after an earlier illegal frame; a failed write counts
+                    // as the "connection closed" outcome and moves on.
+                    if stream.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                    sent += 1;
+                }
+                // Half-close our side, then observe the outcome: close
+                // (EOF or reset) or silence (bytes silently discarded).
+                let _ = stream.shutdown().await;
+                let mut tail = [0u8; 128];
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break; // quiet connection: garbage was discarded
+                    }
+                    match tokio::time::timeout(remaining, stream.read(&mut tail)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => continue, // queued error frame; drain to EOF
+                    }
+                }
+                drop(stream);
+                // Mid-fuzz liveness probe: a legal client must still get a
+                // full Hello/Welcome while the fuzzing is ongoing.
+                if connections.is_multiple_of(40) {
+                    let seed = 10 + (connections as u8 / 40);
+                    let probe = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client_support::connect(server.tcp, &client_support::key(seed), "probe"),
+                    )
+                    .await
+                    .expect("server stopped serving legal clients mid-fuzz");
+                    drop(probe);
+                    probes += 1;
+                }
+            }
+        })
+        .await
+        .expect("fuzz loop stalled: server wedged on adversarial input");
+        assert!(sent >= 500, "fuzz must deliver at least 500 frames");
+        assert!(connections > 20, "fuzz must exercise repeated reconnects");
+        assert!(probes >= 3, "mid-fuzz liveness probes must have run");
+
+        // The service was not wrecked: a fresh legal pair completes the
+        // full Hello/Welcome handshake and opens a session afterwards.
+        let key_a = client_support::key(1);
+        let key_b = client_support::key(2);
+        let a = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_support::connect(server.tcp, &key_a, "alpha"),
+        )
+        .await
+        .expect("post-fuzz Hello/Welcome timed out");
+        let b = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_support::connect(server.tcp, &key_b, "beta"),
+        )
+        .await
+        .expect("post-fuzz Hello/Welcome timed out");
+        a.connect_peer(client_support::device(&key_b))
+            .await
+            .unwrap();
+        let CtrlMessage::SessionOpened { session, peer } = next_msg(&a).await else {
+            panic!("expected SessionOpened after fuzzing");
+        };
+        assert_eq!(peer, client_support::device(&key_b));
+        match next_msg(&b).await {
+            CtrlMessage::SessionOpened {
+                session: theirs, ..
+            } => assert_eq!(theirs, session),
+            other => panic!("expected SessionOpened for b, got {other:?}"),
+        }
+        server.stop().await.unwrap();
+    }
+
+    /// A correctly signed Hello whose device name carries control
+    /// characters (NUL, terminal escapes) is refused at the codec layer, so
+    /// the server drops the connection instead of ever storing or echoing
+    /// the name (display-injection hardening; see codec tests).
+    #[tokio::test]
+    async fn hello_with_control_characters_in_name_is_disconnected() {
+        let server = test_support::start(Limits::default()).await;
+        let key = client_support::key(11);
+        let device_id = client_support::device(&key);
+        let name = "bad\u{0}\u{1b}[2J".to_string();
+        let timestamp = util::now_unix_ms();
+        let signature = key
+            .sign(&codec::hello_signing_bytes(1, &device_id, &name, timestamp))
+            .to_bytes();
+        // Encoding a dirty name still works (encode is infallible); the
+        // server-side decode is what must reject it.
+        let mut bytes = Vec::new();
+        CtrlFrame {
+            version: codec::VERSION,
+            message: CtrlMessage::Hello {
+                version: 1,
+                device_id,
+                name,
+                timestamp_unix_ms: timestamp,
+                signature,
+            },
+        }
+        .encode(&mut bytes);
+        let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte).await {
+            Ok(0) => {}
+            Ok(_) | Err(_) => panic!("expected the server to close the connection"),
+        }
+        server.stop().await.unwrap();
+    }
+
+    /// Rate-limit bypass attempt: hammering ConnectRequest from one
+    /// connection toward five distinct targets must hit SESSION_LIMIT on
+    /// the fifth (per-device session cap) instead of growing server state,
+    /// the refusal must be stable on repeat, and dropping the connection
+    /// must release the quota (the same device reconnects and opens
+    /// sessions again).
+    #[tokio::test]
+    async fn one_connection_cannot_bypass_session_limit() {
+        let server = test_support::start(Limits::default()).await; // 4 sessions per device
+        let key_a = client_support::key(1);
+        let a = client_support::connect(server.tcp, &key_a, "a").await;
+        let mut targets = Vec::new();
+        for seed in 2u8..=6 {
+            let target = client_support::connect(server.tcp, &client_support::key(seed), "t").await;
+            targets.push(target);
+        }
+        let device_of = |seed: u8| client_support::device(&client_support::key(seed));
+
+        // Four distinct targets, all opened over this single connection.
+        for (i, seed) in (2u8..=5).enumerate() {
+            a.connect_peer(device_of(seed)).await.unwrap();
+            let CtrlMessage::SessionOpened { session, peer } = next_msg(&a).await else {
+                panic!("expected SessionOpened toward target {seed}");
+            };
+            assert_eq!(peer, device_of(seed));
+            expect_same_egress(&a, session).await;
+            let CtrlMessage::SessionOpened {
+                session: theirs,
+                peer,
+            } = next_msg(&targets[i]).await
+            else {
+                panic!("expected target {seed} to see the session");
+            };
+            assert_eq!(peer, client_support::device(&key_a));
+            assert_eq!(theirs, session);
+            expect_same_egress(&targets[i], theirs).await;
+        }
+
+        // Fifth distinct target from the same connection: refused, and the
+        // refusal is stable on repeat rather than silently leaking growth.
+        a.connect_peer(device_of(6)).await.unwrap();
+        match next_server_error(&a).await {
+            CtrlMessage::ServerError { code, .. } => assert_eq!(code, ERR_SESSION_LIMIT),
+            other => panic!("expected SESSION_LIMIT, got {other:?}"),
+        }
+        a.connect_peer(device_of(6)).await.unwrap();
+        match next_server_error(&a).await {
+            CtrlMessage::ServerError { code, .. } => assert_eq!(code, ERR_SESSION_LIMIT),
+            other => panic!("expected SESSION_LIMIT again, got {other:?}"),
+        }
+
+        // Dropping the connection releases the quota: the peer observes
+        // the Cancel (cleanup ran; see also
+        // client_disconnect_cancels_peer_sessions), and the same device
+        // reconnecting can open a session again.
+        drop(a);
+        match next_msg(&targets[0]).await {
+            CtrlMessage::Cancel { .. } => {}
+            other => panic!("expected Cancel after disconnect, got {other:?}"),
+        }
+        let a2 = client_support::connect(server.tcp, &key_a, "a").await;
+        a2.connect_peer(device_of(2)).await.unwrap();
+        let CtrlMessage::SessionOpened { session, peer } = next_msg(&a2).await else {
+            panic!("expected SessionOpened after quota release");
+        };
+        assert_eq!(peer, device_of(2));
+        expect_same_egress(&a2, session).await;
+        server.stop().await.unwrap();
+    }
+
+    /// 500 random 0..64-byte UDP datagrams with valid Binding requests
+    /// interspersed: the STUN responder must never panic and every valid
+    /// request must still get a correct, transaction-matching response
+    /// amid the garbage — including one final request after the flood.
+    #[tokio::test]
+    async fn stun_responder_survives_malformed_datagram_flood() {
+        let server = test_support::start(Limits::default()).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = socket.local_addr().unwrap();
+        let mut rng = Lcg(0x4528_21E6_38D0_1377);
+        let mut buf = [0u8; 128];
+        let mut answered = 0usize;
+        for round in 0..500usize {
+            if round.is_multiple_of(10) {
+                let txid = [(round / 10 + 1) as u8; 12];
+                socket
+                    .send_to(&stun::binding_request(txid), server.stun)
+                    .await
+                    .unwrap();
+                let mapped = loop {
+                    match tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+                        .await
+                    {
+                        Err(_) => panic!("no STUN response in round {round}"),
+                        Ok(Err(e)) => panic!("recv failed in round {round}: {e}"),
+                        Ok(Ok((len, from))) => {
+                            assert_eq!(from, server.stun, "unexpected datagram source");
+                            if let Ok(mapped) = stun::parse_binding_response(&buf[..len], txid) {
+                                break mapped;
+                            }
+                            // Stray reply to an earlier request: keep waiting.
+                        }
+                    }
+                };
+                assert_eq!(mapped, expected);
+                answered += 1;
+            } else {
+                let mut junk = Vec::new();
+                let len = rng.below(65) as usize;
+                rng.fill(&mut junk, len);
+                socket.send_to(&junk, server.stun).await.unwrap();
+            }
+        }
+        assert_eq!(answered, 50);
+        // The responder is still alive after the whole flood.
+        socket
+            .send_to(&stun::binding_request([0xAA; 12]), server.stun)
+            .await
+            .unwrap();
+        let mapped = loop {
+            match tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
+                Err(_) => panic!("no final STUN response after flood"),
+                Ok(Err(e)) => panic!("final recv failed: {e}"),
+                Ok(Ok((len, _))) => {
+                    if let Ok(mapped) = stun::parse_binding_response(&buf[..len], [0xAA; 12]) {
+                        break mapped;
+                    }
+                }
+            }
+        };
+        assert_eq!(mapped, expected);
+        server.stop().await.unwrap();
     }
 }

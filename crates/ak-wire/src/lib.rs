@@ -40,6 +40,9 @@
 //!
 //! Every decode validates type, version, length, offsets and resource budgets
 //! against [`Limits`] before allocating memory, and refuses unknown values.
+//! For diagnostics, [`type_name`] maps each `type` value in the table above
+//! to its variant name (`6` → `"Chunk"`; `None` outside the closed set), and
+//! [`Message::kind`] reports a message's own type value.
 //!
 //! Message set mirrors docs/PROTOCOL.zh-CN.md. There is deliberately no
 //! generic payload or blob message (ADR-001 D6 type lock): the set is closed
@@ -277,6 +280,15 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// Wire type value of this message — the `[type u16 BE]` header field a
+    /// frame carrying it encodes. Every variant maps to exactly one `TYPE_*`
+    /// constant; see [`type_name`] for the human-readable view.
+    pub fn kind(&self) -> u16 {
+        type_of(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub version: u8,
@@ -427,6 +439,29 @@ fn type_of(message: &Message) -> u16 {
         Message::FinalAck { .. } => TYPE_FINAL_ACK,
         Message::Error { .. } => TYPE_ERROR,
     }
+}
+
+/// Human-readable name of a message type value for diagnostics (logs,
+/// metrics, error context): `type_name(TYPE_CHUNK)` is `Some("Chunk")`.
+/// Values outside the frozen message set return `None` — the same values
+/// decode rejects with [`DecodeError::UnknownType`], so a `None` here is
+/// itself a diagnostic signal.
+pub fn type_name(r#type: u16) -> Option<&'static str> {
+    Some(match r#type {
+        TYPE_HELLO => "Hello",
+        TYPE_OFFER => "Offer",
+        TYPE_ACCEPT => "Accept",
+        TYPE_REJECT => "Reject",
+        TYPE_MANIFEST_PAGE => "ManifestPage",
+        TYPE_CHUNK => "Chunk",
+        TYPE_CHUNK_ACK => "ChunkAck",
+        TYPE_RESUME_REQUEST => "ResumeRequest",
+        TYPE_CONTROL => "Control",
+        TYPE_FINALIZE => "Finalize",
+        TYPE_FINAL_ACK => "FinalAck",
+        TYPE_ERROR => "Error",
+        _ => return None,
+    })
 }
 
 /// Exact payload upper bound for one message type under `limits`, or `None`
@@ -687,7 +722,10 @@ impl<'a> Cursor<'a> {
 }
 
 /// `[len u16][bytes]`: length checked against `limit`, then presence, then
-/// UTF-8 — all before the `String` is allocated.
+/// UTF-8 — all before the `String` is allocated. Control characters (Cc,
+/// including NUL/DEL and C1) are rejected: every string field here flows into
+/// peer-facing UI/logs, and accepting them would be a display-injection
+/// vector (same rule as ak-signal's coordination strings).
 fn limited_string(cursor: &mut Cursor, limit: u16) -> Result<String, DecodeError> {
     let len = cursor.u16()? as usize;
     if len > usize::from(limit) {
@@ -695,8 +733,11 @@ fn limited_string(cursor: &mut Cursor, limit: u16) -> Result<String, DecodeError
     }
     let bytes = cursor.take(len)?;
     match std::str::from_utf8(bytes) {
-        Ok(s) => Ok(s.to_owned()),
-        Err(_) => Err(DecodeError::BadString { limit }),
+        Ok(s) if !s.chars().any(|c| {
+            // Unicode Cc: C0 (U+0000..=001F), DEL (U+007F), C1 (U+0080..=009F).
+            matches!(c as u32, 0..=0x1F | 0x7F..=0x9F)
+        }) => Ok(s.to_owned()),
+        _ => Err(DecodeError::BadString { limit }),
     }
 }
 
@@ -1196,6 +1237,133 @@ mod tests {
     }
 
     #[test]
+    fn type_names_cover_exactly_the_closed_set() {
+        let expected: [(u16, &str); 12] = [
+            (TYPE_HELLO, "Hello"),
+            (TYPE_OFFER, "Offer"),
+            (TYPE_ACCEPT, "Accept"),
+            (TYPE_REJECT, "Reject"),
+            (TYPE_MANIFEST_PAGE, "ManifestPage"),
+            (TYPE_CHUNK, "Chunk"),
+            (TYPE_CHUNK_ACK, "ChunkAck"),
+            (TYPE_RESUME_REQUEST, "ResumeRequest"),
+            (TYPE_CONTROL, "Control"),
+            (TYPE_FINALIZE, "Finalize"),
+            (TYPE_FINAL_ACK, "FinalAck"),
+            (TYPE_ERROR, "Error"),
+        ];
+        assert_eq!(expected.len(), TYPE_VALUES.len());
+        for (value, name) in expected {
+            assert_eq!(type_name(value), Some(name));
+        }
+        // Everything outside the frozen set is unnamed, symmetric with
+        // DecodeError::UnknownType rejecting the same values.
+        for unknown in [0u16, 13, 999, u16::MAX] {
+            assert_eq!(type_name(unknown), None, "type {unknown} must be unnamed");
+        }
+    }
+
+    #[test]
+    fn kind_matches_the_constant_and_header_of_every_variant() {
+        let samples: Vec<(u16, Message)> = vec![
+            (
+                TYPE_HELLO,
+                Message::Hello {
+                    proto_version: 1,
+                    device_name: "device".to_owned(),
+                    public_key: digest(1),
+                    capabilities: CAP_RESUME,
+                },
+            ),
+            (
+                TYPE_OFFER,
+                Message::Offer {
+                    job_id: [1; 16],
+                    root_name: "root".to_owned(),
+                    file_count: 1,
+                    total_bytes: 2,
+                    chunk_size: 3,
+                },
+            ),
+            (TYPE_ACCEPT, Message::Accept { job_id: [1; 16] }),
+            (
+                TYPE_REJECT,
+                Message::Reject {
+                    job_id: [1; 16],
+                    reason: ErrorCode::AuthFailed,
+                },
+            ),
+            (
+                TYPE_MANIFEST_PAGE,
+                Message::ManifestPage {
+                    job_id: [1; 16],
+                    page_index: 0,
+                    last_page: true,
+                    entries: vec![file_entry("a/b.txt", 1, 2)],
+                },
+            ),
+            (
+                TYPE_CHUNK,
+                Message::Chunk {
+                    job_id: [1; 16],
+                    file_index: 3,
+                    chunk_index: 4,
+                    data: vec![1, 2, 3],
+                },
+            ),
+            (
+                TYPE_CHUNK_ACK,
+                Message::ChunkAck {
+                    job_id: [1; 16],
+                    file_index: 3,
+                    chunk_index: 4,
+                },
+            ),
+            (
+                TYPE_RESUME_REQUEST,
+                Message::ResumeRequest {
+                    job_id: [1; 16],
+                    files: vec![ResumeEntry {
+                        file_index: 0,
+                        verified_prefix_chunks: 1,
+                    }],
+                    more: false,
+                },
+            ),
+            (
+                TYPE_CONTROL,
+                Message::Control {
+                    job_id: [1; 16],
+                    control: Control::Cancel,
+                },
+            ),
+            (TYPE_FINALIZE, Message::Finalize { job_id: [1; 16] }),
+            (
+                TYPE_FINAL_ACK,
+                Message::FinalAck {
+                    job_id: [1; 16],
+                    verified: true,
+                },
+            ),
+            (
+                TYPE_ERROR,
+                Message::Error {
+                    code: ErrorCode::StorageFull,
+                    message: "no space".to_owned(),
+                },
+            ),
+        ];
+        assert_eq!(samples.len(), TYPE_VALUES.len());
+        for (expected, message) in samples {
+            assert_eq!(message.kind(), expected);
+            assert_eq!(type_name(message.kind()), type_name(expected));
+            // The encoded frame header carries the same type value.
+            let buf = encoded(&message);
+            assert_eq!(message.kind(), u16::from_be_bytes([buf[1], buf[2]]));
+        }
+    }
+
+    #[test]
     fn capability_bits_are_disjoint() {
         assert_eq!(CAP_RESUME, 0x0001);
         assert_eq!(CAP_PAUSE_RESUME, 0x0002);
@@ -1480,6 +1648,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_control_characters_in_display_strings() {
+        for bad in ["a\u{0}b", "esc\u{1b}[31m", "del\u{7f}", "c1\u{85}x", "nl\na"] {
+            let buf = encoded(&Message::Hello {
+                proto_version: 1,
+                device_name: bad.to_string(),
+                public_key: [0; 32],
+                capabilities: 0,
+            });
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &Limits::default()),
+                    Err(DecodeError::BadString { .. })
+                ),
+                "device name {bad:?} accepted"
+            );
+        }
+        // Legitimate names (CJK, emoji, spaces) still round-trip.
+        let ok = encoded(&Message::Hello {
+            proto_version: 1,
+            device_name: "设备 hello 😀".into(),
+            public_key: [0; 32],
+            capabilities: 0,
+        });
+        assert!(matches!(
+            Frame::decode(&ok, &Limits::default()),
+            Ok(Frame { message: Message::Hello { .. }, .. })
+        ));
+    }
+
+    #[test]
     fn rejects_bad_relative_paths() {
         for bad in [
             "../up",
@@ -1500,7 +1698,10 @@ mod tests {
             assert!(
                 matches!(
                     Frame::decode(&buf, &Limits::default()),
-                    Err(DecodeError::BadPath(_))
+                    // Control characters are already refused by the string
+                    // layer before path validation sees them; both variants
+                    // are rejections.
+                    Err(DecodeError::BadPath(_)) | Err(DecodeError::BadString { .. })
                 ),
                 "path {bad:?} accepted"
             );

@@ -3,7 +3,9 @@
 //! v1 is a line-based file store with atomic writes (write temp, fsync,
 //! rename). An optional SQLite backend (BACKLOG P1-03, `sqlite` feature,
 //! [`sqlite::SqliteCheckpointStore`]) implements the same trait with the same
-//! semantics; the engine only sees [`CheckpointStore`].
+//! semantics; the engine only sees [`CheckpointStore`]. With the `sqlite`
+//! feature, [`migrate_file_to_sqlite`] moves existing file-backend records
+//! into a SQLite database in one pass.
 //!
 //! Rule from PROTOCOL: a completed marker is written strictly after final
 //! verification and save commit, never before.
@@ -91,6 +93,58 @@ pub mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteCheckpointStore;
 
+/// Counters from a [`migrate_file_to_sqlite`] run: `migrated` records were
+/// saved into the destination, `skipped` `.akjob` files could not be read,
+/// parsed, or stored. Files without the `.akjob` extension (temp files,
+/// unrelated data) are ignored entirely and counted in neither.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateSummary {
+    pub migrated: u64,
+    pub skipped: u64,
+}
+
+/// One-shot migration from the file backend to the SQLite backend (BACKLOG
+/// P1-03): every parsable `<hex>.akjob` record under `src_dir` is saved into
+/// a [`SqliteCheckpointStore`] at `dst_db`, which is created if absent.
+///
+/// Saving is an upsert: a job already present in the destination is replaced
+/// by the source record. A `.akjob` file that fails anywhere — unreadable,
+/// corrupt, its job id not matching the file name, or rejected by the SQLite
+/// backend's stricter rules (u64 counters beyond `i64::MAX`, duplicate file
+/// indexes; see the [`sqlite`] module docs) — is skipped, counted in
+/// [`MigrateSummary::skipped`], and never aborts the run. Only
+/// environment-level failures (source directory unreadable, destination
+/// unopenable) return `Err`; per-record problems always land in the summary.
+#[cfg(feature = "sqlite")]
+pub fn migrate_file_to_sqlite(src_dir: &Path, dst_db: &Path) -> io::Result<MigrateSummary> {
+    let destination = SqliteCheckpointStore::open(dst_db)?;
+    let mut summary = MigrateSummary {
+        migrated: 0,
+        skipped: 0,
+    };
+    for entry in fs::read_dir(src_dir)? {
+        let Ok(entry) = entry else {
+            summary.skipped += 1;
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(EXTENSION) {
+            continue;
+        }
+        let Some(record) = load_checkpoint_file(&path) else {
+            summary.skipped += 1;
+            continue;
+        };
+        if destination.save(&record).is_ok() {
+            summary.migrated += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+    Ok(summary)
+}
+
 /// File-per-job store under a directory, files named `<job hex>.akjob`.
 pub struct FileCheckpointStore {
     dir: PathBuf,
@@ -174,23 +228,9 @@ impl CheckpointStore for FileCheckpointStore {
             if path.extension().and_then(|e| e.to_str()) != Some(EXTENSION) {
                 continue;
             }
-            // Skip files whose name is not `<job hex>.akjob` to begin with.
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some(name_job) = hex_decode_fixed::<16>(stem) else {
-                continue;
-            };
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(record) = decode_record(&text) else {
-                continue;
-            };
-            if record.job_id != name_job {
-                continue;
+            if let Some(record) = load_checkpoint_file(&path) {
+                records.push(record);
             }
-            records.push(record);
         }
         records.sort_by_key(|record| record.job_id);
         Ok(records)
@@ -480,6 +520,20 @@ fn decode_record(text: &str) -> io::Result<TaskRecord> {
         updated_unix_ms,
         files,
     })
+}
+
+/// Read and strictly parse one `<32-hex>.akjob` file. `None` covers every
+/// reason a checkpoint file is skipped: stem not 32 hex chars, unreadable,
+/// corrupt record, or the record's job id not matching its file name.
+///
+/// Single source of the skip rules for both [`FileCheckpointStore::list`]
+/// and [`migrate_file_to_sqlite`].
+fn load_checkpoint_file(path: &Path) -> Option<TaskRecord> {
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    let name_job = hex_decode_fixed::<16>(stem)?;
+    let text = fs::read_to_string(path).ok()?;
+    let record = decode_record(&text).ok()?;
+    (record.job_id == name_job).then_some(record)
 }
 
 /// Lowercase hex codec, kept local so this crate never depends on the

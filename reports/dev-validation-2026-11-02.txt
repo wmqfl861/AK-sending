@@ -222,3 +222,49 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 ### 补记：65,537 文件分页边界 release 实测（2026-11-03）
 T13-65537: transfer COMPLETES (ResumeRequest pagination verified): files=65537 bytes=65537
 pages=257 send=2339.9s recv=2340.0s wall=2410.1s（含与其他代理构建任务并行争用 CPU；结果：test ok）
+
+## 第六/七轮并行开发验证（2026-11-03，3+3 个并行子代理＋集成者）
+
+$ cargo test --workspace
+     11 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      2 test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+      1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.34s
+      1 test result: ok. 2 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 46.78s
+      1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+      1 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+      1 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+      1 test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+      1 test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+      1 test result: ok. 35 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.95s
+      1 test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+      1 test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+      1 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+      1 test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+      1 test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+$ cargo test -p ak-store --features sqlite
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.41s
+
+# 第六轮：serve_concurrently 并发接收（2 发送端字节一致、失败任务不拖垮他者）；空闲机基准刷新
+#   （20k 文件 263.7s，较旧值快 20%；512MiB 单流 93.9 / 多流 97.9 MiB/s）；双栈端点（bind_dual_stack、
+#   v4-mapped classify 展开、local_addr_display；本机实测可用，含 socket2 only_v6 坑规避）；
+#   t11 极端名测试发现 249 字节文件名 × .akpart 后缀超 NTFS 255 真实缺陷。
+# 第七轮：probe --json（双进程实测）、pair export/import（私钥哨兵验证不泄漏）、--version 协议信息；
+#   wire 帧类型诊断名 + store file→sqlite 迁移（3 好 1 坏→3/1）；信令对抗加固（500 帧 TCP 模糊、STUN 洪泛、
+#   限频旁路全存活；发现并修复 Hello 设备名控制字符注入缺陷——ak-wire 显示字符串同规则修复）。
+# 集成者：CLI --jobs N 并发接收（真实双发送端字节一致 2/2）、probe --dual-stack、wire 依赖去镜像、
+#   ak-storage 长文件名 part 回退命名（.akpart-<hash16>，249 字节边界测试翻转为完成路径）、
+#   holepunch::bind_dual_stack_udp 辅助。六/七轮后 workspace 404 项测试（＋sqlite 特性 26）全绿。

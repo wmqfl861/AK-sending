@@ -8,6 +8,9 @@
 //! Pairing model: the local peer book (`peers.book` in the id directory)
 //! holds fingerprint/name pairs. `receive` defaults to accepting only paired
 //! fingerprints; a successful `send` records the receiver trust-on-first-use.
+//! `pair export` / `pair import` move that PUBLIC pairing data between
+//! machines as an AKPAIR1 text block; device.key (the private seed) is never
+//! part of any export.
 #![forbid(unsafe_code)]
 
 mod doctor;
@@ -24,14 +27,57 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use ak_core::handle::ConflictPolicy;
+use ak_core::policy::PathKind;
 use ak_engine::{EngineError, Progress, ReceiveSpec, Report, SendSpec};
 use ak_identity::tls::TlsBundle;
 use ak_identity::{DeviceKeyPair, Fingerprint, PeerBook, PeerRecord};
+
+// ---------------------------------------------------------------------------
+// --version payload (two-machine version alignment)
+// ---------------------------------------------------------------------------
+
+/// Wire protocol facts come straight from ak-wire now (single source of
+/// truth; the version test pins the shipped values).
+const WIRE_VERSION: u8 = ak_wire::VERSION;
+/// Every capability this build speaks (the engine advertises exactly these).
+const WIRE_CAPS: u16 = ak_wire::CAP_RESUME | ak_wire::CAP_PAUSE_RESUME | ak_wire::CAP_MULTISTREAM;
+
+/// Compile profile of this binary (cargo's default profiles only).
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+/// `--version` payload (clap prepends the program name itself): workspace
+/// version, wire protocol version with capability bits, and the compile
+/// profile -- enough for two machines to confirm they run compatible builds
+/// before debugging a transfer.
+fn version_line() -> String {
+    format!(
+        "{} (wire v{}, caps 0x{WIRE_CAPS:04x} \
+         [resume|pause-resume|multistream], {} build)",
+        env!("CARGO_PKG_VERSION"),
+        WIRE_VERSION,
+        build_profile()
+    )
+}
+
+/// The same line as a `&'static str` for clap's `long_version`, which only
+/// accepts 'static strings. Built once per process; the single small
+/// allocation is intentionally leaked.
+fn version_line_static() -> &'static str {
+    static LINE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| Box::leak(version_line().into_boxed_str()))
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "ak-cli",
     version,
+    long_version = version_line_static(),
     about = "AK-sending direct-only prototype",
     after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> [more paths...] --to <ip:7100> --fp <fingerprint>\n\nFingerprints accept the full 64 hex characters or a unique 8-63 character\nprefix of a peer already in peers.book. Multiple send paths travel in one\njob; each keeps its own top-level name on the receiver (paths with the same\nname must be sent in separate runs).\nAll transfers are direct device-to-device; no server ever carries file data."
 )]
@@ -87,6 +133,10 @@ enum Command {
         /// iteration.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
+        /// Accept N transfers CONCURRENTLY from different senders (one-shot
+        /// concurrent mode; overrides the sequential loop).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(2..))]
+        jobs: Option<u64>,
     },
     /// Send files and/or directories to a peer. The first path is the
     /// primary root; further paths join the same job, each keeping its own
@@ -172,6 +222,14 @@ enum Command {
         /// Skip the STUN mapping query.
         #[arg(long, default_value_t = false)]
         no_stun: bool,
+        /// Probe over a dual-stack IPv6 socket (v4 peers via ::ffff mapping);
+        /// falls back to the plain v4 socket when the host cannot.
+        #[arg(long, default_value_t = false)]
+        dual_stack: bool,
+        /// Emit the whole run as one JSON object on stdout (progress logs go
+        /// to stderr) for scripted probing; exit-code semantics are unchanged.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// In-process loopback benchmark: generate files, then push them through
     /// the real engine over 127.0.0.1 QUIC (evidence generator; no server
@@ -222,6 +280,18 @@ enum PairCommand {
     /// Print this device's fingerprint and pairing code so the peer side can
     /// pair with this device.
     Code,
+    /// Print an AKPAIR1 text block with this device's PUBLIC pairing data
+    /// (device id, fingerprint, pairing code, every peers.book entry) for
+    /// `pair import` on another machine. device.key / private key material
+    /// is NEVER included.
+    Export,
+    /// Merge an AKPAIR1 block (from `pair export` on the peer device) into
+    /// this device's peers.book: peers upsert by fingerprint keeping the
+    /// newer paired time; malformed lines are counted, never fatal.
+    Import {
+        /// The AKPAIR1 text block, e.g. `"$(cat akpair.txt)"`.
+        text: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -401,6 +471,208 @@ fn record_peer_after_send(id: &Path, fingerprint: &Fingerprint) -> Result<bool> 
             .with_context(|| format!("cannot save {}", path.display()))?;
     }
     Ok(added)
+}
+
+// ---------------------------------------------------------------------------
+// pair export / import (AKPAIR1 public-only pairing block)
+// ---------------------------------------------------------------------------
+
+/// First line of every exported pairing block (format version tag).
+const PAIR_EXPORT_MAGIC: &str = "AKPAIR1";
+
+/// The PUBLIC content of one AKPAIR1 block: who exported it (informational
+/// on import; never merged into anything) plus the peer entries to merge.
+/// SECURITY RED LINE (AGENTS.md): this format carries only public values --
+/// device id, fingerprint, pairing code, peer book entries. The device.key
+/// file (the 32-byte private seed) must never appear in it; tests assert a
+/// sentinel seed's hex is absent from every export.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedPairBlock {
+    /// Exporting device's public key, 64 hex characters.
+    device: Option<String>,
+    /// Exporting device's fingerprint, 64 hex characters.
+    fingerprint: Option<String>,
+    /// Exporting device's pairing code, "ddd-ddd".
+    code: Option<String>,
+    /// Valid peer lines, already deduped in-block (newer paired time wins).
+    peers: Vec<PeerRecord>,
+}
+
+/// `pair export`: render this device's public pairing data as an AKPAIR1
+/// block. Everything in the output is already shown by `pair code` and
+/// `pair list`; no private material is read besides loading the key pair
+/// whose public half becomes the `device` line.
+fn pair_export_text(id: &Path) -> Result<String> {
+    let (key, _) = load_identity(id)?;
+    let fingerprint = key.fingerprint();
+    let book = load_peer_book(&peer_book_path(id))?;
+    let mut out = String::from(PAIR_EXPORT_MAGIC);
+    out.push('\n');
+    out.push_str(&format!("device {}\n", hex_of(&key.public_key())));
+    out.push_str(&format!("fingerprint {}\n", fingerprint.to_hex()));
+    out.push_str(&format!(
+        "code {}\n",
+        ak_identity::pairing_code(&fingerprint)
+    ));
+    for peer in book.iter() {
+        out.push_str(&format!(
+            "peer {} {} {}\n",
+            peer.fingerprint.to_hex(),
+            peer.paired_unix_ms,
+            export_name(&peer.name)
+        ));
+    }
+    Ok(out)
+}
+
+/// Tab/newline bytes would break the one-line-per-record format, so they
+/// become spaces exactly like ak-identity does when saving peers.book.
+fn export_name(name: &str) -> String {
+    name.chars()
+        .map(|c| matches!(c, '\t' | '\n' | '\r').then_some(' ').unwrap_or(c))
+        .collect()
+}
+
+/// Upsert `record` by fingerprint keeping the NEWER paired time; an exact
+/// tie keeps the existing entry, so importing a block twice never rewrites
+/// the book. The whole winning record (name included) replaces the loser.
+fn upsert_newer(book: &mut PeerBook, record: PeerRecord) {
+    match book.get(&record.fingerprint) {
+        Some(existing) if existing.paired_unix_ms >= record.paired_unix_ms => {}
+        _ => book.upsert(record),
+    }
+}
+
+/// Parse one `peer <fingerprint> <paired_unix_ms> [name...]` line. The name
+/// is everything after the single space following the timestamp (it may be
+/// empty or contain spaces); names carrying tab/newline bytes can never have
+/// come from our exporter and are rejected.
+fn parse_peer_line(rest: &str) -> Option<PeerRecord> {
+    let mut parts = rest.splitn(3, ' ');
+    let fingerprint = Fingerprint::from_hex(parts.next()?)?;
+    let paired_unix_ms: u64 = parts.next()?.parse().ok()?;
+    let name = parts.next().unwrap_or("");
+    if name.contains('\t') || name.contains('\n') || name.contains('\r') {
+        return None;
+    }
+    Some(PeerRecord {
+        fingerprint,
+        name: name.to_owned(),
+        paired_unix_ms,
+    })
+}
+
+/// Pairing codes are always "ddd-ddd"; anything else cannot be a code line.
+fn pairing_code_shape_ok(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 7
+        && bytes[..3].iter().all(|b| b.is_ascii_digit())
+        && bytes[3] == b'-'
+        && bytes[4..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Parse an AKPAIR1 block. The first line must be the magic (anything else
+/// is a fatal error: the block is not ours to interpret); every later line
+/// is validated individually, with malformed lines counted (never fatal) so
+/// a partially corrupted block still merges its intact records.
+fn parse_pair_block(text: &str) -> Result<(ParsedPairBlock, usize)> {
+    let mut lines = text.lines();
+    match lines.next().map(|line| line.trim_end_matches('\r')) {
+        Some(PAIR_EXPORT_MAGIC) => {}
+        Some(other) => bail!(
+            "not an AKPAIR1 pairing block (first line is {other:?}); generate it with \
+             `ak-cli pair export` on the source device"
+        ),
+        None => bail!("empty input: expected an AKPAIR1 pairing block"),
+    }
+
+    let mut block = ParsedPairBlock::default();
+    let mut staged = PeerBook::default();
+    let mut bad = 0usize;
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue; // tolerate blank lines and trailing newline noise
+        }
+        if let Some(rest) = line.strip_prefix("device ") {
+            let value = rest.trim();
+            if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                block.device = Some(value.to_ascii_lowercase());
+            } else {
+                bad += 1;
+            }
+        } else if let Some(rest) = line.strip_prefix("fingerprint ") {
+            match Fingerprint::from_hex(rest.trim()) {
+                Some(_) => block.fingerprint = Some(rest.trim().to_ascii_lowercase()),
+                None => bad += 1,
+            }
+        } else if let Some(rest) = line.strip_prefix("code ") {
+            let value = rest.trim();
+            if pairing_code_shape_ok(value) {
+                block.code = Some(value.to_owned());
+            } else {
+                bad += 1;
+            }
+        } else if let Some(rest) = line.strip_prefix("peer ") {
+            match parse_peer_line(rest) {
+                Some(record) => upsert_newer(&mut staged, record),
+                None => bad += 1,
+            }
+        } else {
+            bad += 1;
+        }
+    }
+    block.peers = staged.iter().cloned().collect();
+    Ok((block, bad))
+}
+
+/// What one `pair import` changed, for both the user report and the tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PairImportOutcome {
+    /// Distinct valid peer records the block carried (after in-block dedup).
+    peers: usize,
+    added: usize,
+    updated: usize,
+    unchanged: usize,
+    /// Malformed non-header lines skipped.
+    bad: usize,
+    /// Short id (first 8 hex) of the exporting device, when the block says.
+    source_short: Option<String>,
+}
+
+/// `pair import`: validate the block, merge its peers into peers.book by
+/// fingerprint keeping the newer paired time, and report what happened. The
+/// book is rewritten only when something actually changed.
+fn pair_import_text(id: &Path, text: &str) -> Result<PairImportOutcome> {
+    let (block, bad) = parse_pair_block(text)?;
+    let path = peer_book_path(id);
+    let mut book = load_peer_book(&path)?;
+    let mut outcome = PairImportOutcome {
+        bad,
+        source_short: block.device.as_ref().map(|hex| hex[..8].to_owned()),
+        ..PairImportOutcome::default()
+    };
+    for record in block.peers {
+        outcome.peers += 1;
+        match book.get(&record.fingerprint) {
+            None => {
+                book.upsert(record);
+                outcome.added += 1;
+            }
+            Some(existing) if existing.paired_unix_ms >= record.paired_unix_ms => {
+                outcome.unchanged += 1;
+            }
+            Some(_) => {
+                book.upsert(record);
+                outcome.updated += 1;
+            }
+        }
+    }
+    if outcome.added + outcome.updated > 0 {
+        book.save(&path)
+            .with_context(|| format!("cannot save {}", path.display()))?;
+    }
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1164,22 @@ fn progress_printer(direction: &'static str) -> Arc<dyn Fn(Progress) + Send + Sy
     })
 }
 
+/// Progress adapter for concurrent receive: job-prefixed whole-line events
+/// only (per-job single-line refresh would garble when jobs interleave, so
+/// byte-level ticks are skipped in this mode).
+fn progress_printer_multi() -> Arc<dyn Fn(u64, Progress) + Send + Sync> {
+    Arc::new(move |job: u64, progress: Progress| {
+        if std::env::var_os("AK_QUIET").is_some() {
+            return;
+        }
+        if matches!(progress, Progress::BytesAcked { .. }) {
+            return;
+        }
+        let direction = format!("recv#{job}");
+        print_progress(&direction, &progress);
+    })
+}
+
 fn short_of(peer: &Option<String>) -> String {
     peer.as_deref()
         .map(|hex| hex.chars().take(8).collect::<String>())
@@ -1324,6 +1612,37 @@ fn pair_command(id: &Path, cmd: PairCommand) -> Result<()> {
             print_identity(&key);
             Ok(())
         }
+        PairCommand::Export => {
+            // stdout carries ONLY the block so `ak-cli pair export > file`
+            // round-trips through `pair import "$(cat file)"` untouched.
+            let text = pair_export_text(id)?;
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            Ok(())
+        }
+        PairCommand::Import { text } => {
+            let outcome = pair_import_text(id, &text)?;
+            let source = outcome
+                .source_short
+                .clone()
+                .unwrap_or_else(|| "(unknown device)".to_owned());
+            println!(
+                "imported {} peer(s) from device {source} into {}: {} added, {} updated, \
+                 {} unchanged",
+                outcome.peers,
+                peer_book_path(id).display(),
+                outcome.added,
+                outcome.updated,
+                outcome.unchanged
+            );
+            if outcome.bad > 0 {
+                println!(
+                    "skipped {} malformed line(s); every valid line was still merged",
+                    outcome.bad
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1389,6 +1708,7 @@ async fn receive_command(
     once: bool,
     no_internet: bool,
     timeout: u64,
+    jobs: Option<u64>,
 ) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
     let fp = key.fingerprint();
@@ -1426,6 +1746,40 @@ async fn receive_command(
     );
 
     let mut first = true;
+    // Concurrent mode: accept `jobs` senders on one endpoint at once.
+    if let Some(expected) = jobs.map(|count| count as usize) {
+        let mut spec = ReceiveSpec::new(out.clone(), bundle.clone());
+        spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
+        spec.conflict = conflict;
+        spec.checkpoint_dir = checkpoints.clone();
+        spec.device_name = device_name.clone();
+        spec.idle_timeout = idle;
+        spec.policy.allow_internet = !no_internet;
+        spec.authorize = policy.authorize();
+        println!(
+            "receiving {expected} concurrent transfer(s) into {}",
+            out.display()
+        );
+        println!("fingerprint (full): {}", fp.to_hex());
+        let printer = progress_printer_multi();
+        let results = ak_engine::serve_concurrently(spec, expected, &*printer).await;
+        let mut completed = 0usize;
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(report) => {
+                    completed += 1;
+                    println!("job #{index}:");
+                    report_summary(&report);
+                }
+                Err(error) => println!("job #{index}: failed: {error}"),
+            }
+        }
+        if completed == expected {
+            println!("concurrent receive finished: {completed}/{expected} completed");
+            return Ok(());
+        }
+        bail!("concurrent receive finished: {completed}/{expected} completed");
+    }
     // The previous iteration's QUIC endpoint releases its UDP socket
     // asynchronously after drop, so an immediate rebind can hit AddrInUse.
     // Retry briefly instead of failing the whole loop.
@@ -1694,8 +2048,9 @@ async fn main() -> Result<()> {
             once,
             no_internet,
             timeout,
+            jobs,
         } => {
-            receive_command(&id, out, port, expect, conflict, once, no_internet, timeout).await
+            receive_command(&id, out, port, expect, conflict, once, no_internet, timeout, jobs).await
         }
         Command::Send {
             paths,
@@ -1707,8 +2062,18 @@ async fn main() -> Result<()> {
             no_internet,
             timeout,
         } => {
-            send_command(&id, paths, to, fp, port, conflict, multistream, no_internet, timeout)
-                .await
+            send_command(
+                &id,
+                paths,
+                to,
+                fp,
+                port,
+                conflict,
+                multistream,
+                no_internet,
+                timeout,
+            )
+            .await
         }
         Command::Discover { seconds, json } => discover_command(&id, seconds, json).await,
         Command::Jobs { cmd } => jobs_command(&id, cmd),
@@ -1742,7 +2107,9 @@ async fn main() -> Result<()> {
             server,
             peer,
             no_stun,
-        } => probe_command(&id, server, peer, no_stun).await,
+            dual_stack,
+            json,
+        } => probe_command(&id, server, peer, no_stun, dual_stack, json).await,
         Command::Bench {
             bytes,
             files,
@@ -1764,7 +2131,224 @@ pub(crate) fn whoami() -> String {
         .unwrap_or_else(|_| "ak-device".into())
 }
 
-async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: bool) -> Result<()> {
+// ---------------------------------------------------------------------------
+// probe: structured run record shared by text output and --json
+// ---------------------------------------------------------------------------
+
+/// STUN mapping query outcome for one probe run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeStun {
+    /// --no-stun was given.
+    Skipped,
+    /// Mapping learned (address included).
+    Ok(SocketAddr),
+    /// Server answered with an error (message included).
+    Failed(String),
+    /// No answer within the budget.
+    TimedOut,
+}
+
+/// One hole-punch round, mirroring ak_net::holepunch's PunchReport.
+#[derive(Debug, Clone, Default)]
+struct ProbePunch {
+    packets_sent: u64,
+    packets_received: u64,
+    reachable: Vec<SocketAddr>,
+    peer_observed_from: Option<SocketAddr>,
+}
+
+/// QUIC verification round after a successful punch.
+#[derive(Debug, Clone, Default)]
+struct ProbeHandshake {
+    attempted: bool,
+    ok: bool,
+    path: Option<&'static str>,
+    peer_fingerprint: Option<String>,
+    error: Option<String>,
+}
+
+/// Everything one probe run learned, collected in BOTH output modes so
+/// `--json` can emit one stable object at the end. Field names are a
+/// script-facing contract: extend, never rename.
+#[derive(Debug, Clone)]
+struct ProbeRun {
+    server: String,
+    peer: String,
+    device_id: String,
+    fingerprint: String,
+    stun: ProbeStun,
+    registered_candidates: usize,
+    candidates: Vec<String>,
+    session_open: bool,
+    session_peer: Option<String>,
+    peer_candidates: Vec<String>,
+    same_egress: bool,
+    punch: Option<ProbePunch>,
+    role: Option<&'static str>,
+    handshake: ProbeHandshake,
+    conclusion: &'static str,
+}
+
+impl Default for ProbeRun {
+    fn default() -> Self {
+        ProbeRun {
+            server: String::new(),
+            peer: String::new(),
+            device_id: String::new(),
+            fingerprint: String::new(),
+            stun: ProbeStun::Skipped,
+            registered_candidates: 0,
+            candidates: Vec::new(),
+            session_open: false,
+            session_peer: None,
+            peer_candidates: Vec::new(),
+            same_egress: false,
+            punch: None,
+            role: None,
+            handshake: ProbeHandshake::default(),
+            conclusion: "no-peer-candidates",
+        }
+    }
+}
+
+/// Stable JSON name for the engine's path classification.
+fn path_kind_name(path: PathKind) -> &'static str {
+    match path {
+        PathKind::LocalDirect => "local-direct",
+        PathKind::InternetDirect => "internet-direct",
+        // A relay path can never occur (direct-only); reported for completeness.
+        PathKind::Relay => "relay",
+        PathKind::Unknown => "unknown",
+    }
+}
+
+/// JSON string-array of already-stringified values ([] when empty).
+fn json_string_array(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".to_owned();
+    }
+    let inner: Vec<String> = items
+        .iter()
+        .map(|item| format!("\"{}\"", json_escape(item)))
+        .collect();
+    format!("[{}]", inner.join(", "))
+}
+
+fn json_opt_string(value: &Option<String>) -> String {
+    match value {
+        Some(text) => format!("\"{}\"", json_escape(text)),
+        None => "null".to_owned(),
+    }
+}
+
+/// One probe run as a single JSON object (the only stdout content in --json
+/// mode). Shape mirrors ProbeRun; see that struct for the field contract.
+fn probe_json(run: &ProbeRun) -> String {
+    let stun = match &run.stun {
+        ProbeStun::Skipped => {
+            "{\"status\": \"skipped\", \"mapped\": null, \"error\": null}".to_owned()
+        }
+        ProbeStun::Ok(addr) => {
+            format!("{{\"status\": \"ok\", \"mapped\": \"{addr}\", \"error\": null}}")
+        }
+        ProbeStun::TimedOut => {
+            "{\"status\": \"timeout\", \"mapped\": null, \"error\": null}".to_owned()
+        }
+        ProbeStun::Failed(message) => format!(
+            "{{\"status\": \"failed\", \"mapped\": null, \"error\": \"{}\"}}",
+            json_escape(message)
+        ),
+    };
+    let punch = match &run.punch {
+        None => "null".to_owned(),
+        Some(round) => {
+            let reachable: Vec<String> = round
+                .reachable
+                .iter()
+                .map(|addr| format!("\"{addr}\""))
+                .collect();
+            let observed = match round.peer_observed_from {
+                Some(addr) => format!("\"{addr}\""),
+                None => "null".to_owned(),
+            };
+            format!(
+                "{{\"packets_sent\": {}, \"packets_received\": {}, \"reachable\": [{}], \
+                 \"peer_observed_from\": {}}}",
+                round.packets_sent,
+                round.packets_received,
+                reachable.join(", "),
+                observed
+            )
+        }
+    };
+    let role = match run.role {
+        Some(role) => format!("\"{role}\""),
+        None => "null".to_owned(),
+    };
+    let path = match run.handshake.path {
+        Some(path) => format!("\"{path}\""),
+        None => "null".to_owned(),
+    };
+    format!(
+        "{{\n\
+           \"server\": \"{}\",\n\
+           \"peer\": \"{}\",\n\
+           \"device_id\": \"{}\",\n\
+           \"fingerprint\": \"{}\",\n\
+           \"stun\": {},\n\
+           \"registered_candidates\": {},\n\
+           \"candidates\": {},\n\
+           \"session_open\": {},\n\
+           \"session_peer\": {},\n\
+           \"peer_candidates\": {},\n\
+           \"same_egress\": {},\n\
+           \"punch\": {},\n\
+           \"role\": {},\n\
+           \"handshake\": {{\"attempted\": {}, \"ok\": {}, \"path\": {}, \
+           \"peer_fingerprint\": {}, \"error\": {}}},\n\
+           \"conclusion\": \"{}\"\n\
+         }}",
+        json_escape(&run.server),
+        json_escape(&run.peer),
+        json_escape(&run.device_id),
+        json_escape(&run.fingerprint),
+        stun,
+        run.registered_candidates,
+        json_string_array(&run.candidates),
+        run.session_open,
+        json_opt_string(&run.session_peer),
+        json_string_array(&run.peer_candidates),
+        run.same_egress,
+        punch,
+        role,
+        run.handshake.attempted,
+        run.handshake.ok,
+        path,
+        json_opt_string(&run.handshake.peer_fingerprint),
+        json_opt_string(&run.handshake.error),
+        run.conclusion
+    )
+}
+
+/// Probe progress goes to stdout in text mode and to stderr in --json mode,
+/// so JSON stdout carries exactly one object.
+fn probe_emit(json: bool, line: &str) {
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_command(
+    id: &Path,
+    server: SocketAddr,
+    peer: String,
+    no_stun: bool,
+    dual_stack: bool,
+    json: bool,
+) -> Result<()> {
     let (key, bundle) = load_identity(id)?;
     let peer_id_hex = peer.trim().to_ascii_lowercase();
     let target: [u8; 32] = {
@@ -1776,14 +2360,27 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
         id.copy_from_slice(&bytes);
         id
     };
-    println!("device id: {}", hex_of(&key.public_key()));
-    println!("{}", fingerprint_lines("fingerprint", &key.fingerprint()));
+    probe_emit(json, &format!("device id: {}", hex_of(&key.public_key())));
+    probe_emit(json, &fingerprint_lines("fingerprint", &key.fingerprint()));
 
     // 1. Bind the transfer UDP socket first: every mapped/public candidate
     //    must belong to the socket we would actually transfer on.
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = if dual_stack {
+        match ak_net::holepunch::bind_dual_stack_udp(0) {
+            Ok(std_socket) => {
+                probe_emit(json, "dual-stack probe socket (v4 peers via ::ffff mapping)");
+                tokio::net::UdpSocket::from_std(std_socket)?
+            }
+            Err(error) => {
+                probe_emit(json, &format!("dual-stack bind unavailable ({error}); falling back to v4"));
+                tokio::net::UdpSocket::bind("0.0.0.0:0").await?
+            }
+        }
+    } else {
+        tokio::net::UdpSocket::bind("0.0.0.0:0").await?
+    };
     let local = socket.local_addr()?;
-    println!("transfer socket: {local}");
+    probe_emit(json, &format!("transfer socket: {local}"));
 
     // 2. Local candidates: real interface addresses plus loopback (never the
     //    unspecified 0.0.0.0 bind address, which is not dialable), then the
@@ -1793,6 +2390,7 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
         .map(|net| SocketAddr::new(net.addr, local.port()))
         .collect();
     candidates.push(SocketAddr::from(([127, 0, 0, 1], local.port())));
+    let mut stun_state = ProbeStun::Skipped;
     if !no_stun {
         let stun_addr = SocketAddr::new(server.ip(), server.port() + 1);
         match tokio::time::timeout(
@@ -1802,11 +2400,18 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
         .await
         {
             Ok(Ok(mapped)) => {
-                println!("STUN mapped address: {mapped}");
+                stun_state = ProbeStun::Ok(mapped);
+                probe_emit(json, &format!("STUN mapped address: {mapped}"));
                 candidates.push(mapped);
             }
-            Ok(Err(error)) => println!("STUN query failed: {error}"),
-            Err(_) => println!("STUN query timed out"),
+            Ok(Err(error)) => {
+                stun_state = ProbeStun::Failed(error.to_string());
+                probe_emit(json, &format!("STUN query failed: {error}"));
+            }
+            Err(_) => {
+                stun_state = ProbeStun::TimedOut;
+                probe_emit(json, "STUN query timed out");
+            }
         }
     }
 
@@ -1817,19 +2422,24 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
     candidates.sort();
     candidates.dedup();
     client.register(&candidates).await?;
-    println!("registered {} candidates", candidates.len());
+    let registered = candidates.len();
+    probe_emit(json, &format!("registered {registered} candidates"));
     client.connect_peer(target).await?;
 
     // 4. Exchange signals until we see the peer's candidates, then punch.
     let mut peer_candidates: Vec<SocketAddr> = Vec::new();
     let mut reachable: Option<SocketAddr> = None;
+    let mut session_peer_hex: Option<String> = None;
     let mut same_egress = OnceNotice::new();
+    let mut same_egress_seen = false;
+    let mut punch_data: Option<ProbePunch> = None;
     let deadline = Instant::now() + Duration::from_secs(20);
     'signal: while Instant::now() < deadline {
         let message = tokio::time::timeout(Duration::from_secs(5), client.next()).await??;
         match message {
             ak_signal::codec::CtrlMessage::SessionOpened { session, peer } => {
-                println!("session open with peer {}", hex_of(&peer));
+                session_peer_hex = Some(hex_of(&peer));
+                probe_emit(json, &format!("session open with peer {}", hex_of(&peer)));
                 client
                     .send_signal(
                         session,
@@ -1840,7 +2450,7 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
             ak_signal::codec::CtrlMessage::Signal { signal, .. } => match signal {
                 ak_signal::codec::PeerSignal::Candidates(list) => {
                     peer_candidates = list;
-                    println!("peer candidates: {peer_candidates:?}");
+                    probe_emit(json, &format!("peer candidates: {peer_candidates:?}"));
                     let report = ak_net::holepunch::probe(
                         &socket,
                         &peer_candidates,
@@ -1848,13 +2458,22 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
                         Duration::from_secs(5),
                     )
                     .await?;
-                    println!(
-                        "punch: sent {} recv {} reachable {:?} from {:?}",
-                        report.packets_sent,
-                        report.packets_received,
-                        report.reachable,
-                        report.peer_observed_from
+                    probe_emit(
+                        json,
+                        &format!(
+                            "punch: sent {} recv {} reachable {:?} from {:?}",
+                            report.packets_sent,
+                            report.packets_received,
+                            report.reachable,
+                            report.peer_observed_from
+                        ),
                     );
+                    punch_data = Some(ProbePunch {
+                        packets_sent: report.packets_sent,
+                        packets_received: report.packets_received,
+                        reachable: report.reachable.clone(),
+                        peer_observed_from: report.peer_observed_from,
+                    });
                     if let Some(first) = report.reachable.first() {
                         reachable = Some(*first);
                         break 'signal;
@@ -1862,15 +2481,18 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
                 }
                 ak_signal::codec::PeerSignal::SameEgress => {
                     // The server may repeat the hint; announce it once.
+                    same_egress_seen = true;
                     if let Some(text) = same_egress.take() {
-                        println!("{text}");
+                        probe_emit(json, text);
                     }
                 }
-                other => println!("signal: {other:?}"),
+                other => probe_emit(json, &format!("signal: {other:?}")),
             },
-            other => println!("server: {other:?}"),
+            other => probe_emit(json, &format!("server: {other:?}")),
         }
     }
+    let mut role: Option<&'static str> = None;
+    let mut handshake_data = ProbeHandshake::default();
     if let Some(target_addr) = reachable {
         // 5. Real verification: QUIC handshake with pinned identity on the
         // SAME socket that punched (keeps NAT pinholes valid). Role is
@@ -1880,11 +2502,14 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
         let pinned = Fingerprint::from_public_key(&target);
         let std_socket = socket.into_std()?;
         let endpoint = ak_net::DirectEndpoint::bind_with_socket(std_socket, &bundle).await?;
+        handshake_data.attempted = true;
         let handshake = if our_key < target {
-            println!("role: client, dialing {target_addr}");
+            role = Some("client");
+            probe_emit(json, &format!("role: client, dialing {target_addr}"));
             endpoint.connect(target_addr, &pinned).await
         } else {
-            println!("role: server, waiting on the punched path");
+            role = Some("server");
+            probe_emit(json, "role: server, waiting on the punched path");
             let authorize = move |fp: &Fingerprint| fp == &pinned;
             match tokio::time::timeout(Duration::from_secs(15), endpoint.accept(&authorize)).await {
                 Ok(result) => result,
@@ -1893,23 +2518,74 @@ async fn probe_command(id: &Path, server: SocketAddr, peer: String, no_stun: boo
         };
         match handshake {
             Ok(channel) => {
-                println!(
-                    "QUIC handshake OK path={:?} peer={}",
-                    channel.path(),
-                    channel.peer_fingerprint().to_hex()
+                handshake_data.ok = true;
+                handshake_data.path = Some(path_kind_name(channel.path()));
+                handshake_data.peer_fingerprint = Some(channel.peer_fingerprint().to_hex());
+                probe_emit(
+                    json,
+                    &format!(
+                        "QUIC handshake OK path={:?} peer={}",
+                        channel.path(),
+                        channel.peer_fingerprint().to_hex()
+                    ),
                 );
             }
-            Err(error) => println!("QUIC handshake failed after punch: {error}"),
+            Err(error) => {
+                handshake_data.error = Some(error.to_string());
+                probe_emit(json, &format!("QUIC handshake failed after punch: {error}"));
+            }
         }
     } else if peer_candidates.is_empty() {
-        println!(
-            "no peer candidates received; peer may be offline or behind an unreachable network"
+        probe_emit(
+            json,
+            "no peer candidates received; peer may be offline or behind an unreachable network",
         );
     } else {
-        println!("no candidate answered probes; this network pair may not support direct connections (no relay fallback exists)");
+        probe_emit(
+            json,
+            "no candidate answered probes; this network pair may not support direct \
+             connections (no relay fallback exists)",
+        );
     }
     let _ = client.close().await;
-    println!("probe finished (direct-only: no relay fallback exists)");
+    let conclusion = if reachable.is_some() {
+        if handshake_data.ok {
+            "connected"
+        } else {
+            "handshake-failed"
+        }
+    } else if peer_candidates.is_empty() {
+        "no-peer-candidates"
+    } else {
+        "no-reachable-candidate"
+    };
+    let run = ProbeRun {
+        server: server.to_string(),
+        peer: peer_id_hex,
+        device_id: hex_of(&key.public_key()),
+        fingerprint: key.fingerprint().to_hex(),
+        stun: stun_state,
+        registered_candidates: registered,
+        candidates: candidates.iter().map(|addr| addr.to_string()).collect(),
+        session_open: session_peer_hex.is_some(),
+        session_peer: session_peer_hex,
+        peer_candidates: peer_candidates
+            .iter()
+            .map(|addr| addr.to_string())
+            .collect(),
+        same_egress: same_egress_seen,
+        punch: punch_data,
+        role,
+        handshake: handshake_data,
+        conclusion,
+    };
+    probe_emit(
+        json,
+        "probe finished (direct-only: no relay fallback exists)",
+    );
+    if json {
+        println!("{}", probe_json(&run));
+    }
     Ok(())
 }
 
@@ -2905,5 +3581,448 @@ mod tests {
         assert_eq!(clipped.chars().count(), 79);
         // Tiny widths degrade to a plain truncation, never wider than width.
         assert_eq!(clip_line("abc", 2), "ab");
+    }
+
+    // -- --version --------------------------------------------------------------
+
+    #[test]
+    fn version_line_carries_wire_facts_and_profile() {
+        // Wire facts now come from ak-wire itself; pin the shipped values.
+        assert_eq!(WIRE_VERSION, 1);
+        assert_eq!(
+            (ak_wire::CAP_RESUME, ak_wire::CAP_PAUSE_RESUME, ak_wire::CAP_MULTISTREAM),
+            (0x0001, 0x0002, 0x0004)
+        );
+        assert_eq!(WIRE_CAPS, 0x0007);
+
+        let line = version_line();
+        assert!(line.starts_with(&format!("{} (", env!("CARGO_PKG_VERSION"))));
+        assert!(line.contains("wire v1"));
+        assert!(line.contains("caps 0x0007"));
+        assert!(line.contains("[resume|pause-resume|multistream]"));
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        assert!(line.ends_with(&format!("{profile} build)")));
+    }
+
+    #[test]
+    fn long_version_flag_renders_the_enhanced_line() {
+        use clap::CommandFactory;
+        // `--version` must print exactly "ak-cli " + the payload, so two
+        // machines can paste outputs and diff them.
+        let rendered = Cli::command().render_long_version();
+        assert_eq!(rendered.trim(), format!("ak-cli {}", version_line()));
+        // The plain `-V` short form keeps the bare workspace version.
+        let short = Cli::command().render_version();
+        assert_eq!(
+            short.trim(),
+            format!("ak-cli {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    // -- pair export / import ------------------------------------------------------
+
+    #[test]
+    fn pair_subcommands_parse_export_and_import() {
+        let cli = cli_of(&["pair", "export"]);
+        assert!(matches!(
+            cli.command,
+            Command::Pair {
+                cmd: PairCommand::Export
+            }
+        ));
+
+        let cli = cli_of(&["pair", "import", "AKPAIR1\ndevice 00\n"]);
+        let Command::Pair {
+            cmd: PairCommand::Import { text },
+        } = cli.command
+        else {
+            panic!("expected import subcommand");
+        };
+        assert!(text.starts_with("AKPAIR1"));
+
+        // import needs its block argument.
+        assert!(Cli::try_parse_from(["ak-cli", "pair", "import"]).is_err());
+    }
+
+    #[test]
+    fn pair_export_shape_is_public_only() {
+        let dir = TempDir::new("pair-export");
+        // Sentinel key with a fixed seed: the test can then prove the private
+        // half never leaks into the export (AGENTS.md key red line).
+        let seed: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
+        std::fs::write(dir.path().join("device.key"), seed).unwrap();
+        let (key, _) = DeviceKeyPair::load_or_create(&dir.path().join("device.key")).unwrap();
+        let fp = key.fingerprint();
+        let peer = random_fp();
+        pair_add(dir.path(), &peer.to_hex(), Some("laptop")).unwrap();
+        let paired_ms = PeerBook::load(&peer_book_path(dir.path()))
+            .unwrap()
+            .get(&peer)
+            .unwrap()
+            .paired_unix_ms;
+
+        let text = pair_export_text(dir.path()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "AKPAIR1",
+                &format!("device {}", hex_of(&key.public_key())),
+                &format!("fingerprint {}", fp.to_hex()),
+                &format!("code {}", ak_identity::pairing_code(&fp)),
+                &format!("peer {} {paired_ms} laptop", peer.to_hex()),
+            ]
+        );
+        assert!(text.ends_with('\n'));
+
+        // Private key red line: the seed (device.key content) must not appear
+        // in any hex form, lower or upper case.
+        let seed_hex = hex_of(&seed);
+        assert!(!text.contains(&seed_hex), "export leaked the seed hex");
+        assert!(
+            !text.contains(&seed_hex.to_uppercase()),
+            "export leaked seed hex (upper)"
+        );
+        // The device line is the PUBLIC key, not the seed.
+        assert!(text.contains(&hex_of(&key.public_key())));
+    }
+
+    #[test]
+    fn pair_export_import_round_trip_restores_the_book() {
+        let dir = TempDir::new("pair-export-roundtrip");
+        let (key, _) = DeviceKeyPair::load_or_create(&dir.path().join("device.key")).unwrap();
+        let _ = key;
+        let a = random_fp();
+        let b = random_fp();
+        let c = random_fp();
+        pair_add(dir.path(), &a.to_hex(), Some("alice laptop")).unwrap();
+        pair_add(dir.path(), &b.to_hex(), Some("设备 名字 空格")).unwrap();
+        pair_add(dir.path(), &c.to_hex(), None).unwrap();
+        let before = PeerBook::load(&peer_book_path(dir.path())).unwrap();
+
+        let text = pair_export_text(dir.path()).unwrap();
+        // Wipe the book completely, then rebuild it from the export alone.
+        std::fs::remove_file(peer_book_path(dir.path())).unwrap();
+        let outcome = pair_import_text(dir.path(), &text).unwrap();
+        assert_eq!(
+            (
+                outcome.peers,
+                outcome.added,
+                outcome.updated,
+                outcome.unchanged,
+                outcome.bad
+            ),
+            (3, 3, 0, 0, 0)
+        );
+
+        let after = PeerBook::load(&peer_book_path(dir.path())).unwrap();
+        let mut before_list: Vec<PeerRecord> = before.iter().cloned().collect();
+        let mut after_list: Vec<PeerRecord> = after.iter().cloned().collect();
+        before_list.sort_by_key(|record| record.fingerprint.to_hex());
+        after_list.sort_by_key(|record| record.fingerprint.to_hex());
+        assert_eq!(after_list, before_list);
+
+        // Re-importing the same block changes nothing (idempotent).
+        let again = pair_import_text(dir.path(), &text).unwrap();
+        assert_eq!(
+            (
+                again.peers,
+                again.added,
+                again.updated,
+                again.unchanged,
+                again.bad
+            ),
+            (3, 0, 0, 3, 0)
+        );
+    }
+
+    #[test]
+    fn pair_import_merges_by_fingerprint_keeping_newer_paired_time() {
+        let dir = TempDir::new("pair-merge");
+        let x = random_fp();
+        let y = random_fp();
+        let z = random_fp();
+        let mut book = PeerBook::default();
+        book.upsert(PeerRecord {
+            fingerprint: x,
+            name: "local-name".to_owned(),
+            paired_unix_ms: 100,
+        });
+        book.upsert(PeerRecord {
+            fingerprint: z,
+            name: "kept".to_owned(),
+            paired_unix_ms: 300,
+        });
+        book.save(&peer_book_path(dir.path())).unwrap();
+
+        let block = format!(
+            "AKPAIR1\ndevice {}\nfingerprint {}\ncode 123-456\n\
+             peer {} 200 remote-name\npeer {} 150 stale-dup\n\
+             peer {} 50 fresh peer name\npeer {} 100 older\n",
+            "11".repeat(32),
+            "22".repeat(32),
+            x.to_hex(),
+            x.to_hex(),
+            y.to_hex(),
+            z.to_hex()
+        );
+        let outcome = pair_import_text(dir.path(), &block).unwrap();
+        // x: in-block newer (200) beats the stale duplicate, then updates the
+        // local entry (100); y: new; z: import older (100 < 300), unchanged.
+        assert_eq!(
+            (
+                outcome.peers,
+                outcome.added,
+                outcome.updated,
+                outcome.unchanged,
+                outcome.bad
+            ),
+            (3, 1, 1, 1, 0)
+        );
+        assert_eq!(outcome.source_short.as_deref(), Some("11111111"));
+
+        let merged = PeerBook::load(&peer_book_path(dir.path())).unwrap();
+        assert_eq!(
+            merged.get(&x).map(|r| (r.name.as_str(), r.paired_unix_ms)),
+            Some(("remote-name", 200))
+        );
+        assert_eq!(
+            merged.get(&y).map(|r| (r.name.as_str(), r.paired_unix_ms)),
+            Some(("fresh peer name", 50))
+        );
+        assert_eq!(
+            merged.get(&z).map(|r| (r.name.as_str(), r.paired_unix_ms)),
+            Some(("kept", 300))
+        );
+    }
+
+    #[test]
+    fn pair_import_counts_bad_lines_and_enforces_the_header() {
+        let dir = TempDir::new("pair-import-bad");
+        let good = random_fp();
+        let block = format!(
+            "AKPAIR1\r\npeer {} 12 ok\r\ngarbage line\r\npeer nothex 12 x\r\n\
+             peer {} abc ts-not-a-number\r\ndevice nothex\r\nfingerprint short\r\n\
+             code 12-34\r\npeer {}\r\npeer {} 12 tab\tname\r\n",
+            good.to_hex(),
+            good.to_hex(),
+            good.to_hex(),
+            good.to_hex()
+        );
+        let outcome = pair_import_text(dir.path(), &block).unwrap();
+        // One valid peer line survives; the other eight are counted bad.
+        assert_eq!(
+            (
+                outcome.peers,
+                outcome.added,
+                outcome.updated,
+                outcome.unchanged,
+                outcome.bad
+            ),
+            (1, 1, 0, 0, 8)
+        );
+        let book = PeerBook::load(&peer_book_path(dir.path())).unwrap();
+        assert_eq!(
+            book.get(&good).map(|r| (r.name.as_str(), r.paired_unix_ms)),
+            Some(("ok", 12))
+        );
+
+        // A wrong or missing header is fatal: nothing merges at all.
+        for bad in [
+            "",
+            "AKPEERS1\npeer 00 1 x\n",
+            &format!("peer {} 1 x\n", good.to_hex()),
+        ] {
+            assert!(
+                pair_import_text(dir.path(), bad).is_err(),
+                "unexpectedly accepted block {bad:?}"
+            );
+        }
+        // A header-only block is a valid no-op.
+        let empty = pair_import_text(dir.path(), "AKPAIR1\n").unwrap();
+        assert_eq!(
+            (
+                empty.peers,
+                empty.added,
+                empty.updated,
+                empty.unchanged,
+                empty.bad
+            ),
+            (0, 0, 0, 0, 0)
+        );
+    }
+
+    // -- probe --json -----------------------------------------------------------
+
+    #[test]
+    fn probe_args_parse_json_flag() {
+        let peer = "a".repeat(64);
+        let cli = cli_of(&[
+            "probe",
+            "--server",
+            "127.0.0.1:7100",
+            "--peer",
+            &peer,
+            "--json",
+            "--no-stun",
+        ]);
+        let Command::Probe {
+            server,
+            peer,
+            no_stun,
+            dual_stack: _,
+            json,
+        } = cli.command
+        else {
+            panic!("expected probe subcommand");
+        };
+        assert_eq!(server, "127.0.0.1:7100".parse::<SocketAddr>().unwrap());
+        assert_eq!(peer, "a".repeat(64));
+        assert!(no_stun && json);
+
+        // Default output stays textual.
+        let cli = cli_of(&["probe", "--server", "127.0.0.1:7100", "--peer", &peer]);
+        let Command::Probe { json, .. } = cli.command else {
+            panic!("expected probe subcommand");
+        };
+        assert!(!json);
+    }
+
+    #[test]
+    fn probe_json_renders_full_run_shape() {
+        let peer_hex = "aa".repeat(32);
+        let run = ProbeRun {
+            server: "203.0.113.9:7100".to_owned(),
+            peer: peer_hex.clone(),
+            device_id: "bb".repeat(32),
+            fingerprint: "cc".repeat(32),
+            stun: ProbeStun::Ok("203.0.113.9:52000".parse().unwrap()),
+            registered_candidates: 3,
+            candidates: vec![
+                "192.168.1.5:52000".to_owned(),
+                "127.0.0.1:52000".to_owned(),
+                "203.0.113.9:52000".to_owned(),
+            ],
+            session_open: true,
+            session_peer: Some(peer_hex.clone()),
+            peer_candidates: vec!["192.168.1.7:7100".to_owned()],
+            same_egress: true,
+            punch: Some(ProbePunch {
+                packets_sent: 4,
+                packets_received: 2,
+                reachable: vec!["192.168.1.7:7100".parse().unwrap()],
+                peer_observed_from: Some("192.168.1.7:7100".parse().unwrap()),
+            }),
+            role: Some("client"),
+            handshake: ProbeHandshake {
+                attempted: true,
+                ok: true,
+                path: Some("local-direct"),
+                peer_fingerprint: Some(peer_hex),
+                error: None,
+            },
+            conclusion: "connected",
+        };
+        let json = probe_json(&run);
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        // Every field name is a stable script-facing contract.
+        for key in [
+            "server",
+            "peer",
+            "device_id",
+            "fingerprint",
+            "stun",
+            "registered_candidates",
+            "candidates",
+            "session_open",
+            "session_peer",
+            "peer_candidates",
+            "same_egress",
+            "punch",
+            "role",
+            "handshake",
+            "conclusion",
+        ] {
+            assert!(json.contains(&format!("\"{key}\":")), "missing key {key}");
+        }
+        assert!(json.contains("\"status\": \"ok\""));
+        assert!(json.contains("\"mapped\": \"203.0.113.9:52000\""));
+        assert!(json.contains("\"registered_candidates\": 3"));
+        assert!(json.contains(
+            "\"candidates\": [\"192.168.1.5:52000\", \"127.0.0.1:52000\", \"203.0.113.9:52000\"]"
+        ));
+        assert!(json.contains("\"session_open\": true"));
+        assert!(json.contains(&format!("\"session_peer\": \"{}\"", "aa".repeat(32))));
+        assert!(json.contains("\"same_egress\": true"));
+        assert!(json.contains("\"packets_sent\": 4"));
+        assert!(json.contains("\"packets_received\": 2"));
+        assert!(json.contains("\"reachable\": [\"192.168.1.7:7100\"]"));
+        assert!(json.contains("\"peer_observed_from\": \"192.168.1.7:7100\""));
+        assert!(json.contains("\"role\": \"client\""));
+        assert!(json.contains("\"attempted\": true"));
+        assert!(json.contains("\"ok\": true"));
+        assert!(json.contains("\"path\": \"local-direct\""));
+        assert!(json.contains(&format!("\"peer_fingerprint\": \"{}\"", "aa".repeat(32))));
+        assert!(json.contains("\"conclusion\": \"connected\""));
+        // Exactly one top-level object: 16 lines with nothing after it.
+        assert_eq!(json.matches('\n').count(), 15 + 1);
+    }
+
+    #[test]
+    fn probe_json_renders_minimal_run_with_nulls() {
+        let json = probe_json(&ProbeRun::default());
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(
+            json.contains("\"stun\": {\"status\": \"skipped\", \"mapped\": null, \"error\": null}")
+        );
+        assert!(json.contains("\"registered_candidates\": 0"));
+        assert!(json.contains("\"candidates\": []"));
+        assert!(json.contains("\"session_open\": false"));
+        assert!(json.contains("\"session_peer\": null"));
+        assert!(json.contains("\"peer_candidates\": []"));
+        assert!(json.contains("\"same_egress\": false"));
+        assert!(json.contains("\"punch\": null"));
+        assert!(json.contains("\"role\": null"));
+        assert!(json.contains(
+            "\"handshake\": {\"attempted\": false, \"ok\": false, \"path\": null, \
+             \"peer_fingerprint\": null, \"error\": null}"
+        ));
+        assert!(json.contains("\"conclusion\": \"no-peer-candidates\""));
+    }
+
+    #[test]
+    fn probe_json_covers_remaining_stun_states_and_escapes_errors() {
+        let run = ProbeRun {
+            stun: ProbeStun::TimedOut,
+            ..ProbeRun::default()
+        };
+        assert!(probe_json(&run).contains("\"status\": \"timeout\""));
+
+        let run = ProbeRun {
+            stun: ProbeStun::Failed("bind \"refused\"".to_owned()),
+            ..ProbeRun::default()
+        };
+        let json = probe_json(&run);
+        assert!(json.contains("\"status\": \"failed\""));
+        assert!(json.contains("bind \\\"refused\\\""));
+
+        // Handshake error strings ride through the same escaper.
+        let run = ProbeRun {
+            handshake: ProbeHandshake {
+                attempted: true,
+                ok: false,
+                path: None,
+                peer_fingerprint: None,
+                error: Some("timeout after 15s\n(dial failed)".to_owned()),
+            },
+            ..ProbeRun::default()
+        };
+        let json = probe_json(&run);
+        assert!(json.contains("timeout after 15s\\n(dial failed)"));
+        assert!(json.contains("\"ok\": false"));
     }
 }

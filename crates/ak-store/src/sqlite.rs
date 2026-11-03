@@ -398,7 +398,7 @@ fn decode_job(
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::hex_encode;
+    use crate::{hex_encode, migrate_file_to_sqlite, FileCheckpointStore, MigrateSummary};
 
     fn db_under(dir: &Path) -> PathBuf {
         dir.join("jobs.db")
@@ -718,5 +718,108 @@ mod tests {
             ),
             1
         );
+    }
+
+    // ------------------------------------------------------------------
+    // File -> SQLite migration.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn migrate_moves_good_records_and_skips_corrupt_files() {
+        let src = tempfile::tempdir().expect("src dir");
+        let dst_root = tempfile::tempdir().expect("dst dir");
+        let db = dst_root.path().join("migrated.db");
+
+        let file_store = FileCheckpointStore::open(src.path()).expect("open file store");
+        let mut no_files = sample(job(3), Direction::Receive, None);
+        no_files.files.clear();
+        let records = vec![
+            sample(job(1), Direction::Send, Some(fp(9))),
+            sample(job(2), Direction::Send, None),
+            no_files,
+        ];
+        for record in &records {
+            file_store.save(record).expect("save record");
+        }
+        // One corrupt checkpoint plus one non-checkpoint file: only the
+        // former counts as skipped, the latter is ignored entirely.
+        fs::write(
+            src.path().join(format!("{}.akjob", hex_encode(&job(200)))),
+            b"AKJOB1\ngarbage",
+        )
+        .expect("write corrupt");
+        fs::write(src.path().join("notes.txt"), b"not a checkpoint").expect("write noise");
+
+        let summary = migrate_file_to_sqlite(src.path(), &db).expect("migrate");
+        assert_eq!(
+            summary,
+            MigrateSummary {
+                migrated: 3,
+                skipped: 1
+            }
+        );
+
+        let sqlite_store = SqliteCheckpointStore::open(&db).expect("open sqlite");
+        for record in &records {
+            assert_eq!(
+                sqlite_store.load(&record.job_id).expect("load"),
+                Some(record.clone())
+            );
+        }
+        assert_eq!(sqlite_store.load(&job(200)).expect("load"), None);
+    }
+
+    #[test]
+    fn migrate_empty_dir_produces_empty_database() {
+        let src = tempfile::tempdir().expect("src dir");
+        let dst_root = tempfile::tempdir().expect("dst dir");
+        let db = dst_root.path().join("empty.db");
+        let summary = migrate_file_to_sqlite(src.path(), &db).expect("migrate");
+        assert_eq!(
+            summary,
+            MigrateSummary {
+                migrated: 0,
+                skipped: 0
+            }
+        );
+        let s = SqliteCheckpointStore::open(&db).expect("open sqlite");
+        assert!(s.list().expect("list").is_empty());
+    }
+
+    #[test]
+    fn migrate_upserts_over_existing_destination_job() {
+        let src = tempfile::tempdir().expect("src dir");
+        let dst_root = tempfile::tempdir().expect("dst dir");
+        let db = dst_root.path().join("upsert.db");
+
+        // The destination already holds a record for job(5) with three file
+        // rows; the source carries a newer record with none.
+        let destination = SqliteCheckpointStore::open(&db).expect("open dst");
+        let mut stale = sample(job(5), Direction::Send, Some(fp(1)));
+        stale.state = "stale_state".to_string();
+        destination.save(&stale).expect("seed destination");
+
+        let file_store = FileCheckpointStore::open(src.path()).expect("open file store");
+        let mut fresh = sample(job(5), Direction::Receive, None);
+        fresh.files.clear();
+        file_store.save(&fresh).expect("save source");
+
+        let summary = migrate_file_to_sqlite(src.path(), &db).expect("migrate");
+        assert_eq!(
+            summary,
+            MigrateSummary {
+                migrated: 1,
+                skipped: 0
+            }
+        );
+
+        // The destination now shows exactly the source record; no stale
+        // child rows survive the replace.
+        assert_eq!(
+            destination.load(&job(5)).expect("load"),
+            Some(fresh.clone())
+        );
+        assert_eq!(destination.list().expect("list"), vec![fresh]);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM job_files"), 0);
     }
 }

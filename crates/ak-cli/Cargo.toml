@@ -13,6 +13,7 @@ ak-identity = { workspace = true }
 ak-net = { workspace = true }
 ak-signal = { workspace = true }
 ak-storage = { workspace = true }
+ak-wire = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }

@@ -51,8 +51,22 @@
 //!   root's name; the receiver side is unchanged (the tree simply grows a
 //!   top-level directory per root).
 //!
+//! Concurrent receive (round 6, no wire-format change):
+//! [`serve_concurrently`] binds once and serves several senders — one
+//! independent task per accepted connection, each running the exact
+//! single-job body of [`receive_with_addr`] (authorize callback and policy
+//! gate execute per connection). Checkpoints never overlap: every task
+//! owns its own `<job>.akjob` file (one per job id, atomic writes). The
+//! receive directory is shared read-only through `LocalSaveTarget`, whose
+//! `prepare_file` keeps no interior mutable state, so the conflict policy
+//! acts at file granularity — two concurrent jobs racing for the same
+//! target path resolve it per file (under `ConflictPolicy::Fail` one of
+//! them fails; `Rename` sidesteps). Per-task progress order is preserved;
+//! events from different tasks interleave arbitrarily.
+//!
 //! Known v1 limitations still true (deliberate, documented): receiver accepts
-//! one job per `receive()` call.
+//! one job per `receive()` call — and one job per connection under
+//! [`serve_concurrently`] (one connection = one job).
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -1530,14 +1544,69 @@ pub async fn receive_with_addr(
     addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> Result<Report, EngineError> {
     let started = Instant::now();
-    let limits = engine_limits();
     let target = LocalSaveTarget::open(&spec.out_dir)?;
-    let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
 
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
     let local = endpoint.local_addr()?;
     let _ = addr_tx.send(local);
     let channel = endpoint.accept(&spec.authorize).await?;
+    // One connection through the shared single-job protocol body — the very
+    // same body [`serve_concurrently`] runs per connection.
+    receive_job(channel, &target, &JobSpec::of(&spec), started, progress).await
+}
+
+/// The per-connection subset of [`ReceiveSpec`] the single-job protocol body
+/// ([`receive_job`]) needs. [`ReceiveSpec`] is not `Clone` (its `authorize`
+/// callback belongs to the accept side only), so the concurrent receiver
+/// clones this small value into every spawned task instead.
+#[derive(Debug, Clone)]
+struct JobSpec {
+    out_dir: PathBuf,
+    identity: TlsBundle,
+    device_name: String,
+    conflict: ConflictPolicy,
+    checkpoint_dir: PathBuf,
+    idle_timeout: Duration,
+    policy: DirectPolicy,
+}
+
+impl JobSpec {
+    fn of(spec: &ReceiveSpec) -> Self {
+        Self {
+            out_dir: spec.out_dir.clone(),
+            identity: spec.identity.clone(),
+            device_name: spec.device_name.clone(),
+            conflict: spec.conflict,
+            checkpoint_dir: spec.checkpoint_dir.clone(),
+            idle_timeout: spec.idle_timeout,
+            policy: spec.policy,
+        }
+    }
+}
+
+/// One accepted connection driven through the full receive protocol:
+/// policy gate, Hello/Offer/Accept, manifest pages, resume answer, chunk
+/// phase (single-stream or multistream), verify, commit, FinalAck. Both
+/// [`receive_with_addr`] and [`serve_concurrently`] run this verbatim, so
+/// the concurrent path is the single-job path — no protocol divergence.
+///
+/// Concurrency isolation when several of these run at once (see module
+/// docs): the checkpoint store is opened per call, and distinct job ids
+/// mean distinct `<job>.akjob` files written atomically by exactly one
+/// task; `target` is shared immutably (`LocalSaveTarget` holds only a
+/// canonicalized root path — no interior mutable state), and different
+/// manifest entries map to different `.akpart` files, so a same-path race
+/// between two jobs is resolved by the per-file conflict policy.
+async fn receive_job(
+    channel: DirectChannel,
+    target: &LocalSaveTarget,
+    spec: &JobSpec,
+    started: Instant,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let limits = engine_limits();
+    let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
+
     // Policy gate (protocol step 0): a refused path closes the connection
     // before any stream is accepted or frame moves.
     gate_channel(&spec.policy, &channel)?;
@@ -1847,6 +1916,226 @@ pub async fn receive_with_addr(
             Err(error)
         }
     }
+}
+
+/// Terminal state of the accept loop before every expected connection
+/// arrived. Produces one error per unfilled result slot: `io::Error` and
+/// [`ak_net::ConnectError`] are not `Clone`, so [`AcceptStop::Failed`]
+/// hands the original error to the first unfilled slot and descriptive io
+/// errors to the rest.
+enum AcceptStop {
+    /// No authorized peer within the idle budget — the expected way a
+    /// concurrent receive ends early (a sender that never came).
+    TimedOut(Duration),
+    /// The listener itself failed mid-loop.
+    Failed(Option<ak_net::ConnectError>),
+}
+
+impl AcceptStop {
+    fn error(&mut self) -> EngineError {
+        match self {
+            AcceptStop::TimedOut(idle) => EngineError::IdleTimeout(*idle),
+            AcceptStop::Failed(first) => {
+                first.take().map(EngineError::Connect).unwrap_or_else(|| {
+                    EngineError::Io(std::io::Error::other(
+                        "listener failed before every expected connection arrived",
+                    ))
+                })
+            }
+        }
+    }
+}
+
+/// Serve several senders concurrently on one bound endpoint: one
+/// independent task per accepted connection, each running the exact
+/// single-job receive protocol of [`receive_with_addr`] (the authorize
+/// callback and the policy gate execute per connection).
+///
+/// Completion condition: `expected_jobs` connections accepted and every
+/// task finished. There is deliberately no stop parameter — callers that
+/// expect slow senders should raise [`ReceiveSpec::idle_timeout`], which
+/// bounds each accept wait (an unfilled slot reports
+/// [`EngineError::IdleTimeout`] instead of hanging forever).
+///
+/// Ordering: result slot `i` — and the first `progress` argument `i` — is
+/// the `i`-th accepted connection, 0-based. The returned Vec always holds
+/// exactly `expected_jobs` entries (`expected_jobs = 0` yields an empty
+/// Vec): a task that fails carries its [`EngineError`] in its own slot
+/// without affecting the others, and if the listener stops before every
+/// expected connection arrived, the unfilled slots carry that accept
+/// failure. A pre-listen failure (opening the destination or binding)
+/// yields a one-element Vec with that error. Per-task progress events keep
+/// their order; events from different tasks interleave arbitrarily. The
+/// callback itself runs on this driver task and must be cheap.
+///
+/// Concurrency safety (see also the module docs and [`receive_job`]): the
+/// receive directory is shared only as `&LocalSaveTarget`
+/// (`prepare_file*` has no interior mutable state; different entries map
+/// to different `.akpart` files), and every task opens its own checkpoint
+/// store with its own `<job>.akjob` file (atomic writes) — so under
+/// `ConflictPolicy::Fail` two jobs racing for the same target path fail
+/// per file, exactly as two sequential receives would.
+pub async fn serve_concurrently(
+    spec: ReceiveSpec,
+    expected_jobs: usize,
+    progress: &(dyn Fn(u64, Progress) + Send + Sync),
+) -> Vec<Result<Report, EngineError>> {
+    let target = match LocalSaveTarget::open(&spec.out_dir) {
+        Ok(target) => Arc::new(target),
+        Err(error) => return vec![Err(error.into())],
+    };
+    let endpoint = match DirectEndpoint::bind(spec.bind, &spec.identity).await {
+        Ok(endpoint) => endpoint,
+        Err(error) => return vec![Err(error.into())],
+    };
+    let job_spec = JobSpec::of(&spec);
+    let idle = spec.idle_timeout;
+    // `Box<dyn Fn + Send + Sync>` is 'static: the authorize callback moves
+    // into the accept task and still runs once per connection.
+    let authorize = spec.authorize;
+
+    // The accept loop runs in its own task because `DirectEndpoint::accept`
+    // drives a QUIC handshake to completion, which is not cancel-safe:
+    // polling it inside the driver's select! below would drop a
+    // mid-handshake connection every time a progress event arrived first.
+    // Here its future is never cancelled.
+    let (channel_tx, mut channel_rx) =
+        tokio::sync::mpsc::channel::<Result<DirectChannel, ak_net::ConnectError>>(1);
+    let expected = expected_jobs;
+    tokio::spawn(async move {
+        let mut accepted = 0usize;
+        while accepted < expected {
+            match endpoint.accept_within(&authorize, idle).await {
+                Ok(channel) => {
+                    accepted += 1;
+                    if channel_tx.send(Ok(channel)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = channel_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+        // Dropping the endpoint closes the listener for NEW connections
+        // only; already-accepted channels keep working (the transport keeps
+        // its driver alive while connections exist).
+    });
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Progress)>();
+    let mut results: Vec<Option<Result<Report, EngineError>>> =
+        (0..expected_jobs).map(|_| None).collect();
+    let mut set: tokio::task::JoinSet<(u64, Result<Report, EngineError>)> =
+        tokio::task::JoinSet::new();
+    let mut accepted = 0usize;
+    let mut accept_stop: Option<AcceptStop> = None;
+    let mut lost_task: Option<EngineError> = None;
+
+    // Phase 1: fill every slot with an accepted connection (or a terminal
+    // accept failure) while forwarding progress and recording finishes.
+    while accepted < expected_jobs && accept_stop.is_none() {
+        tokio::select! {
+            channel = channel_rx.recv() => {
+                match channel {
+                    Some(Ok(channel)) => {
+                        let job = job_spec.clone();
+                        let events = events_tx.clone();
+                        let shared = Arc::clone(&target);
+                        let index = accepted as u64;
+                        accepted += 1;
+                        set.spawn(async move {
+                            // Unbounded on purpose: the sync progress
+                            // callback must never block or drop a transfer
+                            // event; the driver loop below drains eagerly.
+                            let forward = move |event: Progress| {
+                                let _ = events.send((index, event));
+                            };
+                            (index, receive_job(channel, &shared, &job, Instant::now(), &forward).await)
+                        });
+                    }
+                    Some(Err(ak_net::ConnectError::Timeout(idle))) => {
+                        accept_stop = Some(AcceptStop::TimedOut(idle));
+                    }
+                    Some(Err(error)) => {
+                        accept_stop = Some(AcceptStop::Failed(Some(error)));
+                    }
+                    None => {
+                        // The accept task ended without delivering a
+                        // terminal error; nothing more can ever arrive.
+                        accept_stop = Some(AcceptStop::Failed(None));
+                    }
+                }
+            }
+            event = events_rx.recv() => {
+                if let Some((index, event)) = event {
+                    progress(index, event);
+                }
+            }
+            joined = set.join_next(), if !set.is_empty() => {
+                match joined {
+                    Some(Ok((index, outcome))) => results[index as usize] = Some(outcome),
+                    Some(Err(join)) => {
+                        lost_task = Some(EngineError::Io(std::io::Error::other(format!(
+                            "receive task failed: {join}"
+                        ))));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    // Phase 2: every slot is filled; drain the still-running tasks. The
+    // driver keeps its own events_tx alive so events_rx.recv() below can
+    // never observe a closed channel (and busy-loop on it).
+    while !set.is_empty() {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((index, outcome))) => results[index as usize] = Some(outcome),
+                    Some(Err(join)) => {
+                        lost_task = Some(EngineError::Io(std::io::Error::other(format!(
+                            "receive task failed: {join}"
+                        ))));
+                    }
+                    None => break,
+                }
+            }
+            event = events_rx.recv() => {
+                if let Some((index, event)) = event {
+                    progress(index, event);
+                }
+            }
+        }
+    }
+    // All tasks joined, so every sender clone is dropped; release ours and
+    // flush whatever was still buffered when the last join completed.
+    drop(events_tx);
+    while let Ok((index, event)) = events_rx.try_recv() {
+        progress(index, event);
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| match slot {
+            Some(outcome) => outcome,
+            // Slots the listener never filled before stopping.
+            None if index >= accepted => Err(accept_stop
+                .as_mut()
+                .map(|stop| stop.error())
+                .unwrap_or_else(|| {
+                    EngineError::Io(std::io::Error::other(
+                        "listener stopped before this connection arrived",
+                    ))
+                })),
+            // A spawned task that never delivered an outcome (join failure).
+            None => Err(lost_task.take().unwrap_or_else(|| {
+                EngineError::Io(std::io::Error::other("receive task produced no outcome"))
+            })),
+        })
+        .collect()
 }
 
 /// How to hold the connection open until the sender observed the FinalAck.
@@ -2914,6 +3203,241 @@ mod tests {
             .collect();
         assert_eq!(rels, vec!["photos/a.txt", "nothing"]);
         assert!(set.manifest.entries[1].is_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Concurrent receive (serve_concurrently)
+    // ------------------------------------------------------------------
+
+    /// serve_concurrently keeps its signature minimal (no addr_tx), so
+    /// tests probe a free UDP port exactly the way the receiver will bind
+    /// one; same-process UDP rebinding is immediate on every platform we
+    /// run the suite on.
+    fn free_udp_port() -> u16 {
+        let socket = std::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        socket.local_addr().unwrap().port()
+    }
+
+    fn concurrent_receive_spec(dst: &Path, checkpoint: &Path) -> (ReceiveSpec, Fingerprint) {
+        let receiver_key = DeviceKeyPair::generate();
+        let mut recv = ReceiveSpec::new(
+            dst.to_path_buf(),
+            ak_identity::tls::make_self_signed(&receiver_key),
+        );
+        recv.bind = SocketAddr::from(([127, 0, 0, 1], free_udp_port()));
+        recv.checkpoint_dir = checkpoint.to_path_buf();
+        (recv, receiver_key.fingerprint())
+    }
+
+    fn concurrent_send_spec(
+        src: PathBuf,
+        peer: SocketAddr,
+        pinned: Fingerprint,
+        chunk_kb: u32,
+        checkpoint: &Path,
+    ) -> SendSpec {
+        let mut spec = SendSpec::new(
+            src,
+            peer,
+            pinned,
+            ak_identity::tls::make_self_signed(&DeviceKeyPair::generate()),
+        );
+        spec.chunk_size = NonZeroU32::new(chunk_kb * 1024).unwrap();
+        spec.checkpoint_dir = checkpoint.to_path_buf();
+        spec
+    }
+
+    /// Two independent senders (own keys and certificates, own source
+    /// trees, one pinned receiver) land concurrently in one
+    /// serve_concurrently(2) receiver: both jobs complete, bytes are
+    /// identical on both sides, and every progress event carries its task
+    /// ordinal (0/1, accept order) with each ordinal observing its own
+    /// Connected..Done sequence.
+    #[tokio::test]
+    async fn two_senders_concurrently_complete_into_one_receiver() {
+        let src_a = tempfile::tempdir().unwrap();
+        let src_b = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload_a: Vec<u8> = (0..30_000u32).map(|i| i as u8).collect();
+        let payload_b: Vec<u8> = (0..24_000u32).map(|i| (i % 251) as u8).collect();
+        write(&src_a.path().join("alpha/a.bin"), &payload_a);
+        write(&src_b.path().join("beta/b.bin"), &payload_b);
+        fs::create_dir_all(src_b.path().join("beta/empty")).unwrap();
+
+        let checkpoint = std::env::temp_dir().join(format!("ak-tests-{}", std::process::id()));
+        let (recv, receiver_fp) = concurrent_receive_spec(dst.path(), &checkpoint);
+        let spec_a = concurrent_send_spec(
+            src_a.path().to_path_buf(),
+            recv.bind,
+            receiver_fp,
+            1,
+            &checkpoint,
+        );
+        let spec_b = concurrent_send_spec(
+            src_b.path().to_path_buf(),
+            recv.bind,
+            receiver_fp,
+            4,
+            &checkpoint,
+        );
+
+        let seen: Arc<std::sync::Mutex<Vec<(u64, Progress)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let progress = move |index: u64, event: Progress| log.lock().unwrap().push((index, event));
+        let receiver = tokio::spawn(async move { serve_concurrently(recv, 2, &progress).await });
+        // Let the listener bind before the senders dial (the port was
+        // probed, not reported).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let sender_a = tokio::spawn(async move { send(spec_a, &noop).await });
+        let sender_b = tokio::spawn(async move { send(spec_b, &noop).await });
+        let report_a = sender_a.await.unwrap().expect("sender A completes");
+        let report_b = sender_b.await.unwrap().expect("sender B completes");
+        let outcomes = receiver.await.unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        let mut reports = Vec::with_capacity(2);
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            reports.push(outcome.unwrap_or_else(|error| panic!("job {index} failed: {error:?}")));
+        }
+        // Slots are in accept order, which is racy; compare as a set.
+        let mut by_bytes: Vec<(u64, u64)> = reports.iter().map(|r| (r.bytes, r.files)).collect();
+        by_bytes.sort_unstable();
+        let mut expected = vec![(24_000, 3), (30_000, 2)];
+        expected.sort_unstable();
+        assert_eq!(by_bytes, expected, "reports: {reports:?}");
+        assert_eq!(report_a.bytes, 30_000);
+        assert_eq!(report_b.bytes, 24_000);
+
+        assert_eq!(fs::read(dst.path().join("alpha/a.bin")).unwrap(), payload_a);
+        assert_eq!(fs::read(dst.path().join("beta/b.bin")).unwrap(), payload_b);
+        assert!(dst.path().join("beta/empty").is_dir());
+        let (files, bytes) = count_entries(dst.path());
+        assert_eq!((files, bytes), (2, 30_000 + 24_000));
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(index, _)| *index < 2),
+            "task ordinals out of range: {seen:?}"
+        );
+        for index in 0..2u64 {
+            assert!(
+                seen.iter()
+                    .any(|(i, e)| *i == index && matches!(e, Progress::Connected { .. })),
+                "no Connected event for task {index}: {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .any(|(i, e)| *i == index && matches!(e, Progress::Done)),
+                "no Done event for task {index}: {seen:?}"
+            );
+        }
+    }
+
+    /// One sender aborted mid-transfer must not sink the other job: the
+    /// Vec holds exactly one Ok (the healthy job, bytes intact) and one Err
+    /// (the aborted one), and the aborted job's part file survives with its
+    /// verified prefix for resume.
+    #[tokio::test]
+    async fn one_failing_sender_does_not_sink_the_other_job() {
+        let src_a = tempfile::tempdir().unwrap();
+        let src_b = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload_a: Vec<u8> = (0..20_000u32).map(|i| (i % 249) as u8).collect();
+        let payload_b: Vec<u8> = (0..16_384u32).map(|i| (i % 253) as u8).collect();
+        write(&src_a.path().join("solid/a.bin"), &payload_a);
+        write(&src_b.path().join("doomed/b.bin"), &payload_b);
+
+        let checkpoint = std::env::temp_dir().join(format!("ak-tests-{}", std::process::id()));
+        let (recv, receiver_fp) = concurrent_receive_spec(dst.path(), &checkpoint);
+        let spec_a = concurrent_send_spec(
+            src_a.path().to_path_buf(),
+            recv.bind,
+            receiver_fp,
+            4,
+            &checkpoint,
+        );
+        let mut spec_b = concurrent_send_spec(
+            src_b.path().to_path_buf(),
+            recv.bind,
+            receiver_fp,
+            1,
+            &checkpoint,
+        );
+        // Park after every chunk: the abort below then lands deterministically
+        // mid-transfer.
+        spec_b.in_flight_window = 1;
+
+        let receiver = tokio::spawn(async move { serve_concurrently(recv, 2, &|_, _| {}).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let sender_a = tokio::spawn(async move { send(spec_a, &noop).await });
+        let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(0u64);
+        let sender_b = {
+            let progress = std::sync::Arc::new(move |event: Progress| {
+                if let Progress::ChunkSent { .. } = event {
+                    sent_tx.send_modify(|count| *count += 1);
+                }
+            });
+            tokio::spawn(async move { send(spec_b, &*progress).await })
+        };
+        while *sent_rx.borrow() < 2 {
+            sent_rx.changed().await.unwrap();
+        }
+        sender_b.abort();
+
+        let report_a = sender_a.await.unwrap().expect("healthy sender completes");
+        let outcomes = receiver.await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        let oks: Vec<&Report> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        let errs: Vec<&EngineError> = outcomes.iter().filter_map(|o| o.as_ref().err()).collect();
+        assert_eq!(oks.len(), 1, "outcomes: {outcomes:?}");
+        assert_eq!(errs.len(), 1, "outcomes: {outcomes:?}");
+        assert_eq!(oks[0].bytes, report_a.bytes);
+
+        assert_eq!(fs::read(dst.path().join("solid/a.bin")).unwrap(), payload_a);
+        // The aborted job leaves its verified part file for resume, and no
+        // committed final file.
+        assert!(
+            dst.path()
+                .join(format!("doomed/b.bin{}", ak_storage::PART_SUFFIX))
+                .exists(),
+            "part file must survive the aborted sender"
+        );
+        assert!(!dst.path().join("doomed/b.bin").exists());
+    }
+
+    /// The no-hang contract: a slot whose sender never arrives fails with
+    /// IdleTimeout once the (per-accept) idle budget expires, instead of
+    /// blocking forever.
+    #[tokio::test]
+    async fn serve_concurrently_times_out_unfilled_slots_instead_of_hanging() {
+        let dst = tempfile::tempdir().unwrap();
+        let checkpoint = std::env::temp_dir().join(format!("ak-tests-{}", std::process::id()));
+        let (mut recv, _) = concurrent_receive_spec(dst.path(), &checkpoint);
+        recv.idle_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let outcomes = serve_concurrently(recv, 1, &|_index: u64, _event: Progress| {}).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], Err(EngineError::IdleTimeout(_))),
+            "got: {outcomes:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not hang, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_concurrently_zero_expected_jobs_returns_empty() {
+        let dst = tempfile::tempdir().unwrap();
+        let checkpoint = std::env::temp_dir().join(format!("ak-tests-{}", std::process::id()));
+        let (recv, _) = concurrent_receive_spec(dst.path(), &checkpoint);
+        let outcomes = serve_concurrently(recv, 0, &|_index: u64, _event: Progress| {}).await;
+        assert!(outcomes.is_empty());
     }
 
     /// T12 analog: >4 GiB via a sparse file. Release-only (debug hashing is

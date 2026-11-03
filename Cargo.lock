@@ -35,6 +35,7 @@ dependencies = [
  "ak-signal",
  "ak-storage",
  "ak-store",
+ "ak-wire",
  "anyhow",
  "clap",
  "env_logger",

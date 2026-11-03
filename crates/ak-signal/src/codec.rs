@@ -3,6 +3,14 @@
 //! Frame layout: `[version u8][type u8][payload_len u16 BE][payload]`.
 //! Hard cap 4096 bytes per frame. Candidates are `SocketAddr`s only; the
 //! payload types have no byte-blob field by construction.
+//!
+//! String fields (device names, error text) are additionally
+//! control-character-free: valid UTF-8, length-capped, and rejecting
+//! C0 controls (U+0000..U+001F, including NUL), DEL (U+007F), and C1
+//! controls (U+0080..U+009F) so a name or message cannot carry terminal
+//! escape sequences or NUL tricks into UIs and logs (display-injection
+//! hardening; overlong UTF-8 encodings are already refused by UTF-8
+//! validation).
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -119,6 +127,8 @@ pub enum DecodeError {
     TooManyCandidates { count: usize, limit: usize },
     #[error("string field exceeds {limit} bytes")]
     StringTooLong { limit: usize },
+    #[error("string field contains control characters (C0/C1/DEL)")]
+    ControlChars,
     #[error("field out of range: {0}")]
     Malformed(&'static str),
     #[error("leftover {0} trailing bytes")]
@@ -321,13 +331,29 @@ impl<'a> Cur<'a> {
     }
 }
 
+/// Decode a length-prefixed string field. Beyond the byte cap and UTF-8
+/// validity (which already refuses overlong encodings and surrogates),
+/// control characters (Cc: C0, DEL, C1) are rejected so names and error
+/// text cannot smuggle NUL or terminal escape sequences into UIs/logs.
 fn get_str(cur: &mut Cur<'_>, limit: usize) -> Result<String, DecodeError> {
     let len = cur.u16()? as usize;
     if len > limit {
         return Err(DecodeError::StringTooLong { limit });
     }
     let bytes = cur.take(len)?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::Malformed("invalid utf-8"))
+    let s =
+        String::from_utf8(bytes.to_vec()).map_err(|_| DecodeError::Malformed("invalid utf-8"))?;
+    if !is_control_free(&s) {
+        return Err(DecodeError::ControlChars);
+    }
+    Ok(s)
+}
+
+/// True when the string carries no C0/C1/DEL control characters. Shared by
+/// decode ([`get_str`]) and in-memory validation ([`verify_hello`]) so the
+/// rule cannot drift between the wire path and the constructor path.
+fn is_control_free(s: &str) -> bool {
+    !s.chars().any(char::is_control)
 }
 
 fn get_addr(cur: &mut Cur<'_>) -> Result<SocketAddr, DecodeError> {
@@ -482,6 +508,11 @@ pub fn verify_hello(message: &CtrlMessage, now_unix_ms: u64) -> Result<Fingerpri
         return Err(DecodeError::StringTooLong {
             limit: MAX_NAME_BYTES,
         });
+    }
+    // Same rule as decode: a signed Hello whose name smuggles C0/C1/DEL
+    // controls (NUL, terminal escapes) is refused, not sanitized.
+    if !is_control_free(name) {
+        return Err(DecodeError::ControlChars);
     }
     let signed = hello_signing_bytes(*version, device_id, name, *timestamp_unix_ms);
     if !ed25519_verify(device_id, &signed, signature) {
@@ -1023,6 +1054,82 @@ mod tests {
         assert!(matches!(
             verify_hello(&message, 42),
             Err(DecodeError::StringTooLong { .. })
+        ));
+    }
+
+    // ---- string-field injection hardening (C0/C1/DEL, NUL, overlong UTF-8) ----
+
+    #[test]
+    fn err_name_with_control_characters() {
+        // NUL, ESC (terminal escape lead-in), C0 edge, DEL, C1 edge, C1 middle.
+        for name in [
+            "a\u{0}b",
+            "\u{1b}[2J wiped",
+            "\u{1f}",
+            "x\u{7f}y",
+            "\u{9f}",
+            "line\u{85}break",
+        ] {
+            let mut bytes = Vec::new();
+            frame(hello_message(name)).encode(&mut bytes);
+            assert!(
+                matches!(CtrlFrame::decode(&bytes), Err(DecodeError::ControlChars)),
+                "name {name:?} must be rejected as control-character injection"
+            );
+        }
+    }
+
+    #[test]
+    fn err_error_string_with_control_characters() {
+        // The client surfaces ServerError text in UIs; same rule on decode.
+        let mut bytes = Vec::new();
+        frame(CtrlMessage::ServerError {
+            code: 1,
+            message: "err\u{0}or\u{1b}".to_string(),
+        })
+        .encode(&mut bytes);
+        assert!(matches!(
+            CtrlFrame::decode(&bytes),
+            Err(DecodeError::ControlChars)
+        ));
+    }
+
+    #[test]
+    fn err_name_with_overlong_or_invalid_utf8() {
+        // 0xC0 0x80 is an overlong encoding of NUL: UTF-8 validation must
+        // refuse it before any control-character check could see a char.
+        let mut payload = vec![0, 1, 0, 2, 0xC0, 0x80];
+        payload.extend_from_slice(&[0u8; 8 + 64]);
+        assert!(matches!(
+            CtrlFrame::decode(&wrap(1, &payload)),
+            Err(DecodeError::Malformed(_))
+        ));
+        // 0xF8.. would be a 5-byte sequence: never valid UTF-8.
+        let mut payload = vec![0, 1, 0, 2, 0xF8, 0x80];
+        payload.extend_from_slice(&[0u8; 8 + 64]);
+        assert!(matches!(
+            CtrlFrame::decode(&wrap(1, &payload)),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn legit_unicode_names_still_roundtrip() {
+        // The control rule must not catch ordinary international names.
+        roundtrip(hello_message("手机-📱"));
+        roundtrip(hello_message("Ünïcødé — déjà vu"));
+        roundtrip(hello_message("tab-free 'quoted' \"name\""));
+    }
+
+    #[test]
+    fn verify_hello_rejects_control_character_name() {
+        // Even a correctly signed in-memory Hello cannot smuggle controls:
+        // the rule is mirrored in verify_hello, not just in decode.
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let message = signed_hello_from(&key, 1, "signed\u{0}name", 42);
+        assert!(matches!(
+            verify_hello(&message, 42),
+            Err(DecodeError::ControlChars)
         ));
     }
 

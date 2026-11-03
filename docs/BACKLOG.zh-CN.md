@@ -65,6 +65,18 @@
 - [x] 文档现状化：README 快速上手全旗标核对、UX"CLI 已实现交互"现状节（配对三形态/接收循环/进度渲染，与原文分歧以现状注记对冲）、OPERATIONS 协调服务器运维节（限额默认、无文件路由三层验证、SameEgress 误报场景、日志边界）。
 - [x] 第五轮后 workspace 364 项测试通过、clippy 全绿、5 GiB release 回归 111.49s。
 
+第六/七轮（2026-11-03，3+3 个并行子代理＋集成者；证据见 reports/dev-validation-2026-11-02.txt"第六/七轮并行开发验证"节）：
+
+- [x] 并发接收：`ak_engine::serve_concurrently`（一次 bind、每连接独立任务/检查点、失败任务不拖垮他者、accept 非取消安全处理）；CLI `receive --jobs N`；真实双发送端冒烟 2/2 字节一致。
+- [x] 双栈端点（评审 4.1 IPv6 优先深化）：`bind_dual_stack`（V6ONLY=0）、v4-mapped classify 展开、`local_addr_display` 候选 API、`holepunch::bind_dual_stack_udp`、CLI `probe --dual-stack`；本机实测可用（含 socket2 `only_v6` Windows 坑与间歇 WSAENETUNREACH 如实记录）。
+- [x] 基准刷新（空闲机）：20k 文件 263.7s（较旧值快 20%）；512MiB 单流 93.9 / 多流 97.9 MiB/s（1.04x）；块尺寸扫描见第五轮。
+- [x] 长文件名 part 缺陷修复（场景测试发现→集成者修复）：249 字节文件名 × `.akpart` 后缀超 NTFS 255 上限 → `.akpart-<hash16>` 短名回退（确定性、续传兼容）；边界测试翻转为完成路径；孤儿清理识别两种 part 形态。
+- [x] T11 极端名边界：248 字节满长名/CJK/emoji/单字符/近 260 与 `\?\` 超长路径往返一致；尾随点/空格 18 形态校验层拒绝。
+- [x] probe --json（15 字段稳定形状，双进程实测）；pair export/import（AKPAIR1 文本块，私钥哨兵验证不泄漏，坏行容错合并）；--version 携带 wire v1/caps/profile。
+- [x] wire 帧类型诊断名 + ak-wire 直接依赖去镜像；检查点 file→sqlite 迁移工具（3 好 1 坏→3/1 语义）。
+- [x] 信令对抗加固：500 帧 TCP 模糊、STUN 畸形包洪泛、限频旁路全部存活；发现并修复 Hello 设备名控制字符注入（codec 层拒绝 C0/DEL/C1），ak-wire 显示字符串同规则修复（测试锁定）。
+- [x] 六/七轮后 workspace 404 项测试（＋sqlite 特性 26）全绿、clippy 干净。
+
 ## P0
 
 - [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。

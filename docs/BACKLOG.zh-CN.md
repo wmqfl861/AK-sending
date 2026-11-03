@@ -77,6 +77,13 @@
 - [x] 信令对抗加固：500 帧 TCP 模糊、STUN 畸形包洪泛、限频旁路全部存活；发现并修复 Hello 设备名控制字符注入（codec 层拒绝 C0/DEL/C1），ak-wire 显示字符串同规则修复（测试锁定）。
 - [x] 六/七轮后 workspace 404 项测试（＋sqlite 特性 26）全绿、clippy 干净。
 
+第八轮（2026-11-03，3 个并行子代理＋集成者；证据见 reports/dev-validation-2026-11-02.txt"第八轮并行开发验证"节）：
+
+- [x] 产品全流程 e2e（ak-itests e2e_product_flow.rs 四幕）：配对簿准入+未配对第三方零字节拒绝；16MiB/256 块中断→part 存活→同 job_id 续传→检查点 state==completed 且全量已验证前缀；serve_concurrently(2) 多根+单根并发（Report.roots 单/多根两种落盘语义如实断言）；信令会话建立→服务器死亡证明→直传照常。首个业务里程碑的单机可执行子集闭环。
+- [x] CLI：completions（bash/zsh/fish/powershell）、jobs status <id>（每文件 verified 前缀视图）、receive --bind 与 signal-server --bind/--stun-bind（IPv6 监听实测 [::1]）。
+- [x] 文档：SECURITY（并发隔离论证/双层注入防护/对抗加固/长名 part 回退，+7 条）、ARCHITECTURE（模块现状 5 行更新+接口 2 行，FileTransferEngine 过期行修正）。
+- [x] 第八轮后 workspace 417 项测试全绿、clippy 干净。
+
 ## P0
 
 - [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。

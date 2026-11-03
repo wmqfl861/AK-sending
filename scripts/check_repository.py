@@ -127,7 +127,12 @@ def check(root: Path) -> dict:
     if violations:
         errors.append(f"banned crates in Cargo.lock (relay/TURN/WebRTC): {violations}")
     checked_links = 0
-    markdowns = sorted(root.rglob("*.md"))
+    # Skip build outputs: target/ holds cargo artifacts and dist copies of
+    # README whose relative links legitimately dangle there.
+    markdowns = sorted(
+        path for path in root.rglob("*.md")
+        if "target" not in path.relative_to(root).parts
+    )
     for path in markdowns:
         text = path.read_text(encoding="utf-8")
         for link in re.findall(r"\[[^\]]*\]\(([^\s)]+)\)", text):

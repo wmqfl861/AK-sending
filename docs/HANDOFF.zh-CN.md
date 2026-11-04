@@ -11,7 +11,7 @@
 
 按 ADR-002（采纳评审 D1/D5/D6 路线）完成局域网 CLI 原型全栈与桌面/安卓前端：
 
-- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）→ `0140282`（第四、五轮：十并行代理＋接线）→ `9961506`（65,537 边界补记）→ `ab33a46`（第六、七轮：六并行代理＋集成者修复）→ `d1fa222`（六/七轮 BACKLOG 记录）→ `3b39c03`（第八轮：产品流程 e2e/CLI 打磨/文档对齐）→ `cbdb2a4`（第八轮 BACKLOG 记录）→ `64c7278`（第九轮：文档收尾/CI 配置/冒烟脚本）→ `40d7d63`（第十轮：ak-ffi C ABI＋ADR-003）→ `7dffa51`（第十一轮：Flutter Windows 桌面端）→ `bc7fa01`（第十二轮：身份导出/簿准入/历史接线）→ `834f42a`（第十三轮：安卓平台移植）→ `6ea65f0`/`1e6a8ab`（第十三轮证据记录＋重启恢复手册；后者随附 ak-ffi peer 三导出与 smoke_android_host.sh）→ `b4fb427`（跨设备里程碑证据记录）→ `f82ff77`（第十四/十五轮集成：配对 UI 真调用、daemon、随机性质套件、安卓存储通道）。
+- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）→ `0140282`（第四、五轮：十并行代理＋接线）→ `9961506`（65,537 边界补记）→ `ab33a46`（第六、七轮：六并行代理＋集成者修复）→ `d1fa222`（六/七轮 BACKLOG 记录）→ `3b39c03`（第八轮：产品流程 e2e/CLI 打磨/文档对齐）→ `cbdb2a4`（第八轮 BACKLOG 记录）→ `64c7278`（第九轮：文档收尾/CI 配置/冒烟脚本）→ `40d7d63`（第十轮：ak-ffi C ABI＋ADR-003）→ `7dffa51`（第十一轮：Flutter Windows 桌面端）→ `bc7fa01`（第十二轮：身份导出/簿准入/历史接线）→ `834f42a`（第十三轮：安卓平台移植）→ `6ea65f0`/`1e6a8ab`（第十三轮证据记录＋重启恢复手册；后者随附 ak-ffi peer 三导出与 smoke_android_host.sh）→ `b4fb427`（跨设备里程碑证据记录）→ `f82ff77`（第十四/十五轮集成：配对 UI 真调用、daemon、随机性质套件、安卓存储通道）→ `a07d8c1`/`7a5f50e`（Codex 邀请码配对开发计划两批）→ `1e8b276`（第十八/十九波：配对契约冻结与基础实现）→ `18f2aae`（第二十波：TLS 注册服务/客户端分派/runtime/准入与 staging）→ `bfc74d7`（第二十一波：配对编排 e2e/引擎拆分/CLI invite）。
 - 11 个 crate：ak-core（领域）、ak-identity、ak-wire、ak-storage、ak-net、ak-discovery、ak-store、ak-signal、ak-engine、ak-cli、ak-itests（跨 crate 场景测试）。
 - 数据面：QUIC（quinn 0.11）+ rustls/ring + 自签 Ed25519 证书双向钉扎；`DirectChannel` 无公开构造函数（类型约束）；无 relay/TURN 路径，Cargo.lock 依赖扫描锁定。
 - 引擎：完整端到端协议（见 ak-engine 文档），确定性任务 ID、窗口化确认、检查点续传、完成标记晚于校验+落盘；第三轮追加存储满预检（`check_headroom` 决策函数＋STORAGE_FULL 协议路径）与多根合并发送（`extra_roots`/`SourceSet`，`Report.roots`）。
@@ -38,6 +38,14 @@
 第十四轮新增（2026-11-04，配对链路波；ak-ffi 侧随 `1e6a8ab`，其余随 `f82ff77`）：ak-ffi 配对簿三导出 `ak_peer_list`/`ak_peer_add`/`ak_peer_remove`（缺簿 `[]`、坏簿 `-1`、upsert 保 CLI TOFU 配对时间、坏指纹/控制字符名 `-2`、remove 未知 `-4`；C ABI 测试 23/23）；ak_ffi_dart peers 绑定（PeerEntry 模型＋`-3` 无损重试，dart test 85/85 含 CLI 写簿往返）；Flutter 配对页（簿列表/指纹短式展开/添加表单完整 64 hex 校验/删除二次确认/坏簿内联错误行，flutter test 84/84）；集成者将 `AkEngineDartFacade` peer 三方法由桩切为真实调用，切换点测试升级为真实 facade→C ABI→DLL 往返。逐项证据见 [BACKLOG](BACKLOG.zh-CN.md) 第十四轮节。
 
 第十五轮新增（2026-11-04，提交 `f82ff77`）：`ak-cli daemon` 常驻接收（与 `receive` 共享准入配置、mDNS 广播、失败任务不终止进程；`--json-lines` NDJSON 五型事件流，stdout 逐行可解析；ak-cli 83/83，真实双任务冒烟）；确定性随机性质套件（无依赖 LCG 种子可复现；25 种子随机树传输＋10 种子随机中断续传不变量，release 94.8s 零缺陷；快速回归种子 1/2/3 入默认 `cargo test`）；安卓存储通道（Kotlin MethodChannel `dev.ak/storage`：目录信息/SAF 目录选择/SAF 写闭环探针/持久授权列举，APK 179MB 重建；模拟器端选择器走查待 GUI 路线恢复）。逐项证据见 [BACKLOG](BACKLOG.zh-CN.md) 第十五轮节。AGENTS.md 同日由所有者增补并行开发六规则（见 AGENTS.md，此处不重复）。
+
+## 第十八至二十一波：邀请码配对功能（2026-11-04）
+
+前置：Codex（gpt-6-astra/max）只读产出两批开发计划（`docs/plans/pairing-code-plan-draft.md`＋`pairing-code-plan-part2.md`，提交 `a07d8c1`/`7a5f50e`）；第十八波按 AGENTS.md 并行开发规则先冻结 ADR-004＋`docs/contracts/` 五份契约（合计六份冻结文档，157 项与计划逐字核对）。决策见 [ADR-004](adr/004-invite-pairing.zh-CN.md)，逐项证据见 [BACKLOG](BACKLOG.zh-CN.md)"邀请码配对功能"节与 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 尾部三节。
+
+- 提交链（3 个功能提交）：`1e8b276`（第十八/十九波，5 并行代理——v2 codec 47 测试；identity 邀请码/transcript/簿事务 73/73；journal/队列持久化 38＋sqlite 54；新 crate ak-session 调度器 51 测试；workspace 667/0，基线 507）→ `18f2aae`（第二十波，4 并行代理——server_v2 TLS 注册服务 63 项新测试（`server-persistence` 特性下 227 全绿）；client_v2 分派 25＋9；runtime 28（ak-session 累计 79）；wire 准入＋staging 22；workspace 773/0）→ `bfc74d7`（第二十一波，2 并行代理＋集成者——配对编排 13 项真 TLS＋SQLite e2e；引擎拆分 `send_on_channel`/`receive_on_channel`（新 8 项、既有 49+1 零回归）；CLI `invite create/redeem/list/revoke`＋`registry-server`＋daemon 邀请码旗标 12 项；workspace 851/0）。三波收官 clippy `-D warnings` 干净、repo check passed。
+- 代码落点：新 crate `ak-session`（`scheduler`/`runtime`/`pairing` 三模块，CLI 与 FFI 共用）；`ak-signal` 增 `protocol_v2`/`server_v2`/`client_v2`（服务器持久库在 `server-persistence` 特性后，默认关闭）；`ak-identity` 增 `InviteCode`（AKI1/Crockford/160 bit）＋`pairing_txn`（typed transcript 五查）＋`peer_store`（事务式落簿）；`ak-store` 增 `PairingJournal`＋`TaskQueueStore`（AKREC2 域分离、AKREC1 兼容）；`ak-wire` 增 `CAP_SCHEDULER`（0x0008）准入三消息（类型 13–15）；`ak-engine` 拆 on-channel 入口（准入上下文受控构造）；`ak-cli` 增 invite 族、`registry-server`（默认端口 7200）、`daemon --invite-code/--pairing/--same-code/--cross-code`。
+- 如实边界：13 项配对 e2e 为进程内真 TLS（rustls）＋真 SQLite 形态（全流程互录 journal/owner 离线补推/中断恢复/防中间人/同码多兑换/幂等/双 runtime listener 均实测），无跨机器注册服务部署、无真机双端配对验证；B8 FFI（`ak_pairing_*`/`ak_sched_*` 18 个新导出，契约 `docs/contracts/ffi-v2.md` 已冻结）与 Dart/Flutter 邀请码入口在十八至二十一波提交（至 `bfc74d7`）内未实现，按计划属后续波；`ak-signal` 内 `client_v2` 与 `server_v2` 三处握手常量分歧（ALPN/pin/exporter label）未统一，第二十一波 `RegistryClient` 按服务端公共面构建绕过；ghost 反枚举为内存态、owner 握手窗口崩溃不可恢复（见 [SECURITY](SECURITY.zh-CN.md) 邀请码节已知限制）。
 
 ## 实现与验证边界（如实）
 
@@ -68,9 +76,10 @@ README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 ## 下一工程节点
 
 1. **首要剩余项＝两台真实物理机器（同网段）双端实测**：跨设备首证的模拟器形态已完成（Android 模拟器→Windows 宿主 CLI 路线，经 `10.0.2.2`，逐字节一致，2026-11-04 里程碑），模拟器路线已通；下一步在物理双机上跑 `ak-cli receive`/`send`（CLI 先行，随后 Flutter GUI 双端），验证真实网卡/防火墙行为；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。多流并行在环回仅约 1.04–1.06x（第六轮空闲机刷新：单流 93.9 vs 多流 97.9 MiB/s），是否默认启用待物理双机网卡数据再定。
-2. GUI 模拟器验证恢复（受阻记录）：GUI APK 装机成功但模拟器 System UI 不稳（三轮 ANR；应用进程存活＋topResumed 确认），GUI 截图/走查未成——根因排查方向为模拟器 WHPX/镜像稳定性，非应用崩溃；恢复后补 GUI 路线跨设备走查与安卓 SAF 选择器走查。CLI 旁路（模拟器内 ak-cli 实跑＋宿主 receiver）已提供跨设备证据，不阻塞节点 1。
-3. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
-4. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
-5. Flutter UI 双端化（Windows 桌面端已含配对页；Android GUI 走查待节点 2）与移动端后台/存储适配（mDNS、SAF 实机走查、MediaStore）。
-经第十五轮后复核：模拟器跨设备路线已通（CLI），本地可执行范围内的跨设备证据已取得；物理双机与真实网络（L3/L4）仍需外部资源。
+2. **邀请码配对功能接线与场景波（第十八至二十一波后）**：B8 FFI（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 邀请码/队列 UI 入口，契约 `docs/contracts/ffi-v2.md` 已冻结）；B9 `ak-itests` 场景波（同码多设备、多码四模式、持久恢复、无中继、安全负例）；`ak-signal` 内 `client_v2`/`server_v2` 三处握手常量（ALPN/pin/exporter label）统一后撤掉 `RegistryClient` 旁路；`registry-server` 跨机器部署与真机双端配对验证（当前 e2e 为进程内真 TLS＋SQLite 形态）。
+3. GUI 模拟器验证恢复（受阻记录）：GUI APK 装机成功但模拟器 System UI 不稳（三轮 ANR；应用进程存活＋topResumed 确认），GUI 截图/走查未成——根因排查方向为模拟器 WHPX/镜像稳定性，非应用崩溃；恢复后补 GUI 路线跨设备走查与安卓 SAF 选择器走查。CLI 旁路（模拟器内 ak-cli 实跑＋宿主 receiver）已提供跨设备证据，不阻塞节点 1。
+4. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
+5. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
+6. Flutter UI 双端化（Windows 桌面端已含配对页；Android GUI 走查待节点 3）与移动端后台/存储适配（mDNS、SAF 实机走查、MediaStore）。
+经第二十一波后复核：模拟器跨设备路线已通（CLI），本地可执行范围内的跨设备证据已取得；邀请码配对全栈（契约→协议→服务端→编排→CLI）已闭环，workspace 851/0；物理双机、真实网络（L3/L4）与配对功能 FFI/UI 接线仍为剩余项。
 后续开发先读取本文件、AGENTS、ROADMAP 和现有源码；保留已有历史，禁止强推。

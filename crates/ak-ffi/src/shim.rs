@@ -48,6 +48,7 @@ use crate::core::{
     self, guarded, AkEngine, FfiError, JobState, AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID,
     AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
 };
+use crate::pairing as v2;
 
 /// Byte length of every job id crossing the boundary.
 const JOB_ID_LEN: usize = 16;
@@ -833,6 +834,582 @@ pub extern "C" fn ak_version(buf: *mut c_char, cap: usize) -> i32 {
             fail_buffer(need, capacity, "the version string")
         }
         Err(WriteError::NullBuffer) => {
+            core::set_last_error("buf argument is null");
+            AK_ERR_NULL
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B8 (wave 22): pairing orchestration + scheduler (ffi-v2.md).
+//
+// Conventions shared by everything below (documented per function in the
+// crate header):
+//
+// * 16-byte ids (`runtime_id`, `op_id`, `task_id`) are opaque copies —
+//   never interpreted, never retained beyond the call;
+// * pointer and string validation happens BEFORE any side effect: a call
+//   that fails on its arguments never spawns an op, registers a runtime,
+//   or submits a task (ffi-v2 §2);
+// * `AK_ERR_BUFFER` (`-3`) never consumes: op results are re-readable,
+//   popped events are pushed back;
+// * `-4` names an unknown runtime/op/task id.
+// ---------------------------------------------------------------------------
+
+/// Resolve the engine handle or fail with `-1` (shared B8 prologue).
+fn engine_or_fail<'a>(engine: *const AkEngine) -> Option<&'a AkEngine> {
+    // SAFETY: the raw handle comes from ak_engine_new; the caller keeps it
+    // alive, un-freed and un-concurrent for the duration of this call, so
+    // the shared borrow cannot dangle or alias a mutation. The unbounded
+    // lifetime is the same one `engine.as_ref()` infers at every inline
+    // call site; the C contract (single serialized caller per handle)
+    // justifies it there and here.
+    unsafe { engine.as_ref() }
+}
+
+/// Start one pairing runtime: connect the pinned control client, open the
+/// journal + trust book under the spec's `id_dir`, and (by default) run
+/// the resident owner loop. Returns `AK_OK` with the fresh 16-byte
+/// `runtime_id` written; the connect itself completes in the background —
+/// poll `ak_pairing_poll_event` for `runtime_ready`/`runtime_failed`.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `spec_json` must be non-null, NUL-terminated,
+/// valid UTF-8, readable up to its NUL for the duration of the call;
+/// `runtime_id_out` must be non-null and writable for 16 bytes (checked
+/// BEFORE the spec is parsed or anything is registered). The engine handle
+/// contract is that of [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_start(
+    engine: *mut AkEngine,
+    spec_json: *const c_char,
+    runtime_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // Output pointer first: a failed start must never leave side effects
+    // behind (F6 discipline).
+    if runtime_id_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "runtime_id_out argument is null".to_string(),
+        });
+    }
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is
+    // confined to this call.
+    let spec = match unsafe { read_cstr(spec_json) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::pairing_start(engine, spec)) {
+        Ok(runtime_id) => match unsafe { write_job(runtime_id_out, &runtime_id) } {
+            // SAFETY: write_job verifies non-null and writes exactly the 16
+            // documented bytes within the caller's buffer.
+            Ok(()) => AK_OK,
+            Err(error) => fail(error),
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// The safe-layer entry every op start delegates to.
+type OpLauncher = fn(&AkEngine, &[u8; 16], &str) -> Result<[u8; 16], FfiError>;
+
+/// Shared shape of the four op starts: validate every pointer argument
+/// before parsing, then mint the op id.
+fn op_start(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    spec_json: *const c_char,
+    op_id_out: *mut u8,
+    launch: OpLauncher,
+) -> i32 {
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    if op_id_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "op_id_out argument is null".to_string(),
+        });
+    }
+    // SAFETY: read_job verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_job(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: read_cstr verifies non-null and UTF-8.
+    let spec = match unsafe { read_cstr(spec_json) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| launch(engine, &runtime_id, spec)) {
+        Ok(op_id) => match unsafe { write_job(op_id_out, &op_id) } {
+            // SAFETY: write_job verifies non-null and writes exactly 16
+            // bytes within the caller's buffer.
+            Ok(()) => AK_OK,
+            Err(error) => fail(error),
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Generate + register one invite code (async op; result carries the
+/// plaintext code exactly once per op). Spec: see the crate header.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id` must be non-null and readable
+/// for 16 bytes; `spec_json` non-null, NUL-terminated, valid UTF-8;
+/// `op_id_out` non-null and writable for 16 bytes (all checked before any
+/// side effect). Engine handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_create_start(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    spec_json: *const c_char,
+    op_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    op_start(
+        engine,
+        runtime_id,
+        spec_json,
+        op_id_out,
+        v2::pairing_create_start,
+    )
+}
+
+/// Redeem an invite code and drive the transcript to the applied trust
+/// book entry (async op). Spec: see the crate header.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): as [`ak_pairing_create_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_redeem_start(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    spec_json: *const c_char,
+    op_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    op_start(
+        engine,
+        runtime_id,
+        spec_json,
+        op_id_out,
+        v2::pairing_redeem_start,
+    )
+}
+
+/// Page through this runtime's invites (async op). Query schema: see the
+/// crate header.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): as [`ak_pairing_create_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_list_start(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    query_json: *const c_char,
+    op_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    op_start(
+        engine,
+        runtime_id,
+        query_json,
+        op_id_out,
+        v2::pairing_list_start,
+    )
+}
+
+/// Revoke one of this runtime's invite codes (async op). Spec: see the
+/// crate header.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): as [`ak_pairing_create_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_revoke_start(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    spec_json: *const c_char,
+    op_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    op_start(
+        engine,
+        runtime_id,
+        spec_json,
+        op_id_out,
+        v2::pairing_revoke_start,
+    )
+}
+
+/// Read one op's outcome: `AK_DONE` (1) with the result JSON in `buf`,
+/// `AK_PENDING` (0) while running, `AK_FAILED` (2) with the error JSON in
+/// `buf`, `AK_ERR_BUFFER` when `cap` is too small (the stored result is
+/// NOT consumed — retry losslessly with a larger `cap`; a create op never
+/// regenerates its code), `AK_ERR_NOT_FOUND` for an unknown runtime or op.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id`/`op_id` non-null and readable
+/// for 16 bytes; when non-null, `buf` writable for `cap` bytes, not
+/// modified concurrently; `cap` must not overstate the real allocation.
+#[no_mangle]
+pub extern "C" fn ak_pairing_op_result(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    op_id: *const u8,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_job verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_job(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: same contract as runtime_id.
+    let op_id = match unsafe { read_job(op_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::pairing_op_result(engine, &runtime_id, &op_id)) {
+        Ok(v2::OpResult::Running) => AK_PENDING,
+        Ok(v2::OpResult::Finished { ok, json }) => {
+            // SAFETY: write_cstr checks null/bounds itself and writes only
+            // within the caller-provided capacity; a TooSmall result leaves
+            // the stored JSON unconsumed.
+            match unsafe { write_cstr(buf, cap, &json) } {
+                Ok(_) if ok => AK_DONE,
+                Ok(_) => AK_FAILED,
+                Err(WriteError::TooSmall { need, capacity }) => {
+                    fail_buffer(need, capacity, "the op result JSON")
+                }
+                Err(WriteError::NullBuffer) => {
+                    core::set_last_error("buf argument is null");
+                    AK_ERR_NULL
+                }
+            }
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Pop the oldest pairing event of one runtime as one JSON line:
+/// `AK_EVENT` (1) when written, `AK_PENDING` (0) when none is queued,
+/// `AK_ERR_BUFFER` when `cap` is too small (the event is pushed back —
+/// nothing is lost), `AK_ERR_NOT_FOUND` for an unknown runtime.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id` non-null and readable for 16
+/// bytes; when non-null, `buf` writable for `cap` bytes, not modified
+/// concurrently; `cap` must not overstate the real allocation.
+#[no_mangle]
+pub extern "C" fn ak_pairing_poll_event(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_job verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_job(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    let line = match guarded(|| v2::pairing_poll_event(engine, &runtime_id)) {
+        Ok(Some(line)) => line,
+        Ok(None) => return AK_PENDING,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: write_cstr checks null/bounds itself and writes only within
+    // the caller-provided capacity.
+    match unsafe { write_cstr(buf, cap, &line) } {
+        Ok(_) => AK_EVENT,
+        Err(WriteError::TooSmall { need, capacity }) => {
+            if let Err(error) = v2::pairing_push_event_front(engine, &runtime_id, line) {
+                return fail(error);
+            }
+            fail_buffer(need, capacity, "a pairing event")
+        }
+        Err(WriteError::NullBuffer) => {
+            if let Err(error) = v2::pairing_push_event_front(engine, &runtime_id, line) {
+                return fail(error);
+            }
+            core::set_last_error("buf argument is null");
+            AK_ERR_NULL
+        }
+    }
+}
+
+/// Cancel one op: `AK_OK`, or `AK_ERR_NOT_FOUND` for an unknown runtime or
+/// op. A finished op is left untouched.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id`/`op_id` non-null and readable
+/// for 16 bytes. Engine handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_pairing_cancel_op(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    op_id: *const u8,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_job verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_job(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: same contract as runtime_id.
+    let op_id = match unsafe { read_job(op_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::pairing_cancel_op(engine, &runtime_id, &op_id)) {
+        Ok(()) => AK_OK,
+        Err(error) => fail(error),
+    }
+}
+
+/// Start the scheduler runtime bound to one pairing runtime (the most
+/// recent one when the spec omits `runtime_id`): `AK_OK`, `-2` for a bad
+/// spec or a not-yet-connected runtime, `-4` when no pairing runtime
+/// exists. One scheduler per engine.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `spec_json` non-null, NUL-terminated, valid
+/// UTF-8, readable up to its NUL for the duration of the call. Engine
+/// handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_sched_start(engine: *mut AkEngine, spec_json: *const c_char) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_cstr verifies non-null and UTF-8.
+    let spec = match unsafe { read_cstr(spec_json) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::sched_start(engine, spec)) {
+        Ok(()) => AK_OK,
+        Err(error) => fail(error),
+    }
+}
+
+/// Submit one transfer task through the scheduler: resolve the pairing
+/// relation from the local journal (code group + verified peer key), then
+/// enqueue a REAL `ak-engine` send. Returns `AK_OK` with the fresh 16-byte
+/// `task_id` written. Spec: see the crate header.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `spec_json` non-null, NUL-terminated, valid
+/// UTF-8; `task_id_out` non-null and writable for 16 bytes (checked before
+/// anything is submitted). Engine handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_sched_enqueue(
+    engine: *mut AkEngine,
+    spec_json: *const c_char,
+    task_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    if task_id_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "task_id_out argument is null".to_string(),
+        });
+    }
+    // SAFETY: read_cstr verifies non-null and UTF-8.
+    let spec = match unsafe { read_cstr(spec_json) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::sched_enqueue(engine, spec)) {
+        Ok(task_id) => match unsafe { write_job(task_id_out, &task_id) } {
+            // SAFETY: write_job verifies non-null and writes exactly 16
+            // bytes within the caller's buffer.
+            Ok(()) => AK_OK,
+            Err(error) => fail(error),
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Switch the scheduling policy at runtime: `AK_OK`, `-2` for a bad
+/// policy, `-4` when no scheduler runtime exists.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `policy_json` non-null, NUL-terminated, valid
+/// UTF-8. Engine handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_sched_set_policy(engine: *mut AkEngine, policy_json: *const c_char) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_cstr verifies non-null and UTF-8.
+    let policy = match unsafe { read_cstr(policy_json) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::sched_set_policy(engine, policy)) {
+        Ok(()) => AK_OK,
+        Err(error) => fail(error),
+    }
+}
+
+/// Cancel one task (queued removal, or a running cancellation that
+/// finalizes when the executor reports back): `AK_OK`, `-4` for an unknown
+/// or already-terminal task / missing scheduler runtime.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `task_id` non-null and readable for 16 bytes.
+/// Engine handle as [`ak_send_start`].
+#[no_mangle]
+pub extern "C" fn ak_sched_cancel(engine: *mut AkEngine, task_id: *const u8) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_job verifies non-null and copies exactly 16 bytes.
+    let task_id = match unsafe { read_job(task_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| v2::sched_cancel(engine, &task_id)) {
+        Ok(()) => AK_OK,
+        Err(error) => fail(error),
+    }
+}
+
+/// Write the scheduler snapshot JSON (UTF-8 + NUL) into `buf`:
+/// `AK_DONE` (1), `AK_ERR_BUFFER` when it does not fit (nothing is
+/// consumed — retry with a larger `cap`), `AK_ERR_NOT_FOUND` when no
+/// scheduler runtime exists.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `buf` writable for `cap`
+/// bytes, not modified concurrently; `cap` must not overstate the real
+/// allocation.
+#[no_mangle]
+pub extern "C" fn ak_sched_snapshot(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    match guarded(|| v2::sched_snapshot(engine)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: write_cstr checks null/bounds itself and writes only
+            // within the caller-provided capacity.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the scheduler snapshot JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Pop the oldest scheduler event as one JSON line (transfer-plane events;
+/// kept separate from pairing events per ffi-v2 §5): `AK_EVENT` (1),
+/// `AK_PENDING` (0), `AK_ERR_BUFFER` (the event is pushed back), or
+/// `AK_ERR_NOT_FOUND` when no scheduler runtime exists.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `buf` writable for `cap`
+/// bytes, not modified concurrently; `cap` must not overstate the real
+/// allocation.
+#[no_mangle]
+pub extern "C" fn ak_sched_poll_event(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    let line = match guarded(|| v2::sched_poll_event(engine)) {
+        Ok(Some(line)) => line,
+        Ok(None) => return AK_PENDING,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: write_cstr checks null/bounds itself and writes only within
+    // the caller-provided capacity.
+    match unsafe { write_cstr(buf, cap, &line) } {
+        Ok(_) => AK_EVENT,
+        Err(WriteError::TooSmall { need, capacity }) => {
+            if let Err(error) = v2::sched_push_event_front(engine, line) {
+                return fail(error);
+            }
+            fail_buffer(need, capacity, "a scheduler event")
+        }
+        Err(WriteError::NullBuffer) => {
+            if let Err(error) = v2::sched_push_event_front(engine, line) {
+                return fail(error);
+            }
             core::set_last_error("buf argument is null");
             AK_ERR_NULL
         }

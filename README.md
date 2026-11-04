@@ -20,6 +20,7 @@
 - 2026-11-03（第五轮，同分支）：DirectPolicy 策略闸门接入真实通道（`--no-internet`，非本地路径零字节进入协议）、`ak-cli doctor` 环境自检、发送端 14 错误码友好映射、块尺寸扫描基准（64KiB 最差 -23%）。第五轮后 workspace 364 项测试通过。
 - 2026-11-03（第六至八轮，同分支）：并发接收（`serve_concurrently` + `receive --jobs N`）、IPv6 双栈端点与 `probe --dual-stack`、长文件名 part 短名回退（NTFS 255 上限真实缺陷修复）、`probe --json` 与 `pair export`/`import`（AKPAIR1，无私钥）、信令对抗加固（TCP 模糊/STUN 洪泛/限频旁路全存活，Hello 设备名控制字符注入修复）、产品全流程 e2e 四幕（配对准入/中断续传/并发接收/信令关停后直传照常）、CLI `completions`/`jobs status`/`--bind`/`--stun-bind`。第八轮后 workspace 417 项测试通过（＋sqlite 特性 26）、clippy 全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第六/七、八轮节。
 - 2026-11-04（第十三轮，安卓移植波，同分支；承接第十至十二轮 ak-ffi/Dart 绑定/Flutter Windows 桌面端）：双 ABI 交叉编译脚本（llvm-nm 符号验证）＋flutter_app 安卓平台（INTERNET 权限/minSdk 24/tier-0 so 加载/身份目录异步/Download 输出链），flutter test 66/66；APK 构建成功（161MB debug、双 ABI so 在包内，装机待验）；Windows GUI 首启截图核验通过；AVD 装机与跨设备传输进行中（系统镜像重装中）。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第十三轮节。
+- 2026-11-04（第十八至二十一波，同分支，邀请码配对）：ADR-004＋五份契约冻结（157 项与 Codex 计划逐字核对）→控制协议 v2（TLS 1.3、30 消息、独立端口 7200 不降级明文）→权威注册服务（rustls＋SQLite，ghost-pending 反枚举）→共享调度层 `ak-session`（两维并发/常驻 runtime/配对编排）→wire 任务准入＋staging→引擎 on-channel 拆分→CLI `invite`/`registry-server`；13 项真 TLS＋SQLite 配对 e2e，workspace 851 项测试通过；FFI/Dart 侧接线属后续波。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 邀请码配对节与 [ADR-004](docs/adr/004-invite-pairing.zh-CN.md)。
 - 仍未完成（如实标注）：跨机器/跨网段真实传输、NAT 穿透实测、抓包级无中继证明（L3）、Flutter 五端 UI（Windows 桌面与安卓壳已就位，macOS/Linux/iOS 未开始）、移动原生适配（mDNS/SAF/后台）、真机验收。当前全部验证为本机环回（L2 形态）。
 - 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
@@ -74,6 +75,11 @@ cargo run -p ak-cli -- send PATH [PATH...] --to IP:7100 --fp <完整指纹|唯�
 cargo run -p ak-cli -- jobs [list] | jobs status <id> | jobs clean --all|--completed  # 检查点记录查看/清理（.akpart 分片永不删除，保持可续传）
 cargo run -p ak-cli -- discover [--seconds N] [--json]  # mDNS 发现（带配对状态与设备名）
 cargo run -p ak-cli -- signal-server [--tcp-port 7100] [--stun-port 7101] [--bind IP|IP:PORT] [--stun-bind IP|IP:PORT]  # 协调服务器（信令+STUN，无文件路由）
+cargo run -p ak-cli -- registry-server [--port 7200] [--bind IP|IP:PORT] [--db-path PATH]  # v2 权威邀请码注册服务（TLS 1.3＋SQLite；启动打印 registry id 供对端 --registry-fp 钉扎；无文件路由）
+cargo run -p ak-cli -- invite create [--ttl-secs 600 | --long-lived] --server IP:7200 --registry-fp <64hex>  # 生成并登记配对邀请码（输出 AKI1-...；bearer 凭证，像密码一样保管；--server/--registry-fp 首次成对提供后持久化到 registry.pin）
+cargo run -p ak-cli -- invite list | invite revoke <code-id-32hex>  # 列出/撤销本机邀请码（list 只显示状态/到期/掩码，不输出明文码）
+cargo run -p ak-cli -- invite redeem AKI1-... --out DIR [--once] [--conflict error|rename]  # 兑换邀请码：与 owner 完成配对证明并落簿，随后按簿准入接收
+cargo run -p ak-cli -- daemon --pairing [--invite-code AKI1-...] [--same-code serial|parallel] [--cross-code serial|parallel] --server IP:7200 --registry-fp <64hex>  # 常驻 daemon：owner 侧自动应答兑换＋两维并发策略（码本身即授权，owner 需在线）
 cargo run -p ak-cli -- probe --server IP:7100 --peer <对端指纹64hex> [--no-stun] [--dual-stack] [--json]  # 公网直连探测（STUN 隐含使用 server 端口+1；--json 输出机器可读结果）
 cargo run -p ak-cli -- bench [--bytes N] [--files N] [--chunk-kb N] [--multistream] [--once] [--json]  # 进程内环回吞吐基准（默认单流 vs 多流各一轮并对比）
 cargo run -p ak-cli -- doctor [--stun IP:PORT] [--mdns-seconds N] [--json]  # 环境自检（身份/网络/UDP 绑定/mDNS/可选 STUN/磁盘余量）

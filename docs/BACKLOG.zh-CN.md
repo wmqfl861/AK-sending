@@ -127,6 +127,27 @@
 - [x] 确定性随机性质套件（crates/ak-itests/tests/property_random.rs＋prop_common.rs）：一切随机出自无依赖 LCG（Knuth 常数），种子完全决定树形/字节/旋钮，断言失败消息带 seed＋生成器摘要、同种子重跑可复现。两套 release 深测（`#[ignore]`，本轮执行 94.8s 零缺陷）：25 种子随机树传输不变量（0-40 文件、单文件 0-512KiB、深 0-6、CJK/内部空格/多点/点前缀/单字符混合名、随机空目录链、chunk_kb∈{16,64,256}、multistream 随机——双端 Report 计数对账、job_id 双端一致、全新目的地 resumed=0、ChunkReceived 恰每 chunk 一次、逐字节一致、无 .akpart 残留）＋10 种子随机中断续传不变量（中断点由第二种子流抽取；leg-1 发送端必须失败关闭、中断仅数据面——0 最终文件/≥1 part 存活/恰一条检查点、同身份重传 resumed≥1 且 job_id 与中断前一致、逐字节一致）。快速回归（种子 1/2/3 缩小版）入默认 `cargo test`。已知限制模块文档声明（全空树/多根不在矩阵、中断为进程内 abort 形态非真实断网注入、"最后一刻完成"竞态以 leg-1 失败关闭断言兜底）。
 - [x] 安卓存储通道（flutter_app/android/app/src/main/kotlin/dev/ak/ak_sending_app/MainActivity.kt，MethodChannel `dev.ak/storage`）：`getStorageInfo`（应用专属 Download 目录＋卷剩余字节＋SAF 持久授权态）、`pickFolder`（ACTION_OPEN_DOCUMENT_TREE；FlutterActivity 非 ComponentActivity，自建 ActivityResultRegistry 经 v2 embedding 路由，无弃用 onActivityResult）、`safWriteTest`（DocumentsContract createDocument→写 1 字节→读回校验→delete，SAF 写路径最小闭环探针）、`listSafPersisted`（uri/read/write/tree/persistedTimeMs）；选择器进行中重复触发与坏 URI 反例处理；APK 重建（apk-debug.apk 179,026,123B，2026-11-04 10:15，debug 形态）。Kotlin 文件头如实声明：本轮保证编译通过与通道闭环设计，模拟器/真机 SAF 选择器走查与 Flutter 侧接线为其后续（Android TV 无选择器返回 null、SAF 授权可被系统收回等限制同处声明）。
 
+## 邀请码配对功能（第十八至二十一波，2026-11-04）
+
+前置：Codex（gpt-6-astra/max）只读产出两批开发计划（`docs/plans/pairing-code-plan-draft.md`＋`pairing-code-plan-part2.md`，提交 `a07d8c1`/`7a5f50e`）。按 AGENTS.md 并行开发规则第 3 条（公共 API 契约先行冻结再并行），第十八波先把全部跨模块接口冻结为 ADR-004＋`docs/contracts/` 契约，第十九至二十一波按冻结契约多代理并行实现。决策与备选取舍见 [ADR-004](adr/004-invite-pairing.zh-CN.md)；证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"第十八/十九波""第二十波""第二十一波"三节；提交链：`1e8b276`（第十八/十九波，5 并行代理）→ `18f2aae`（第二十波，4 并行代理）→ `bfc74d7`（第二十一波，2 并行代理＋集成者修复）。
+
+- [x] A0 契约冻结（第十八波）：ADR-004 与 `docs/contracts/` 五份契约（protocol-v2/pairing-flow/scheduler/ffi-v2/storage-schema，合计六份冻结文档）共 157 项与 Codex 计划逐字核对通过；修改任一契约需集成者核准并同步 ADR-004。
+- [x] A1 控制协议 v2 codec（第十九波，`crates/ak-signal/src/protocol_v2/`）：30 个 `CtrlMessage` 变体、逐类型 payload 预算锁定、方向表穷举、封闭 tag 集、尾随字节/超长/截断拒绝——47 项测试与契约零出入。
+- [x] A4 邀请码与信任簿事务（第十九波，`crates/ak-identity`）：`InviteCode`（`OsRng` 20 字节 160 bit 熵、Crockford Base32、`AKI1-` 展示格式、lookup/auth 域分离派生、Debug 脱敏）、typed transcript 五查（换钥/换码/过期/nonce 重放/MAC 恒定时间）、`PeerBookStore` 事务式落簿与防重放——新增 34 项测试，crate 73/73。
+- [x] A5＋B1 本地持久化（第十九波，`crates/ak-store`）：`PairingJournal` 四态单调（pending→committed→applied＋Ready 边界）、`TaskQueueStore` AKREC2 恢复映射（`transfer_id` 域分离、AKREC1 兼容）、三类崩溃模拟（每个落盘边界崩溃恢复/坏记录失败关闭/不污染文件检查点）——默认特性 38 项＋sqlite 特性 54 项。
+- [x] B0 共享调度层（第十九波，新 crate `ak-session::scheduler`）：same_code×cross_code 四模式矩阵、同组 FIFO＋组间轮转公平、parallel→serial draining、permit 准入、队列满前不扫描——51 项测试。
+- [x] 第十八/十九波收官：`cargo test --workspace` 667/0（基线 507 → +160）；clippy `-D warnings` 干净；sqlite 特性 54/54；repo check passed。
+- [x] A2 TLS 注册服务（第二十波，`crates/ak-signal/src/server_v2/`）：rustls＋tokio-rustls TLS 1.3（TLS exporter 按契约原样实现）、SQLite 三表（`invite_codes` 等与 storage-schema 契约逐字）、claim `BEGIN IMMEDIATE` 线性化、ghost-pending 统一 `PAIR_UNAVAILABLE`（无存在性预言机）、claim→redeem→Ready 全时序、限速双桶、重启恢复（码＋挂起事务＋状态查询重发）——63 项新测试（`server-persistence` 特性下 ak-signal 227 全绿）。
+- [x] A3 v2 客户端分派（第二十波，`crates/ak-signal/src/client_v2/`）：TLS 钉扎、单 reader 有界分派（修复 v1 无界 inbox 形态）、`request_id` 幂等重试、重连 epoch 重置、被替换通知——25 项集成＋9 项单元。
+- [x] B6 常驻 runtime（第二十波，`crates/ak-session/src/runtime/`）：SessionHandle 七 API（start/enqueue/set_policy/cancel/retry/snapshot/shutdown）、PairingTransport/TransferExecutor 双 trait 注入、四模式以任务活动时间区间证明、退避 park＋手动 retry、Shutdown Drain/Cancel/超时——28 项新测试（ak-session 累计 79）。
+- [x] B2 wire 任务准入＋B4 staging（第二十波）：`ak-wire` 准入三消息（TaskOpen/TaskAdmission/TaskAdmissionAck，`CAP_SCHEDULER` 0x0008，封闭 reason）＋`ak-storage` staging 命名空间（同目标并发按内容裁决、旧 `.akpart` 迁移兼容、取消隔离）——新增 22 项测试（波末 crate 合计 wire 59/storage 48）。
+- [x] 第二十波收官：`cargo test --workspace` 773/0（667 → +106）；sqlite 54；ak-signal＋持久化特性 227；clippy 干净；repo passed。
+- [x] A6 配对编排 e2e（第二十一波，`crates/ak-session/src/pairing/`）：`PairingOrchestrator` create（CODE_CONFLICT 重试）/redeem/recover/revoke 全时序＋`RealTransport`；13 项真 TLS＋SQLite e2e（全流程互录 journal/owner 离线补推/中断恢复/防中间人（错 auth_key 不落簿）/同码多兑换/同 `request_id` 幂等/双 runtime listener 收真事件）；发现并报告 A2/A3 三处常量分歧（ALPN/pin/exporter label），`RegistryClient` 按服务端公共面构建绕过。
+- [x] B5 引擎拆分（第二十一波，`crates/ak-engine`）：`send_on_channel`/`receive_on_channel`（准入三步握手＋staging），既有 49+1 零回归，新 8 项测试。
+- [x] B7 CLI（第二十一波，`crates/ak-cli`）：`invite create/redeem/list/revoke`＋`registry-server`（TLS＋SQLite，默认端口 7200）＋`daemon --invite-code/--same-code/--cross-code`——12 项新测试。
+- [x] 第二十一波集成收口：ak-net type_budget/header_payload_check 测试适配新 wire 类型 13–15；invite.rs clippy 三处修复。收官：`cargo test --workspace` 851/0（773 → +78）；clippy 干净；repo check passed。
+- [ ] B8 FFI 接线（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 入口）：契约已冻结于 `docs/contracts/ffi-v2.md`；截至 `bfc74d7` 未实现，按计划属第二十一至二十二波。
+
 ## P0
 
 - [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。

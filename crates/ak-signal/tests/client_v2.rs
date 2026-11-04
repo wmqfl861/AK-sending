@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ak_identity::{DeviceKeyPair, Fingerprint};
+use ak_identity::DeviceKeyPair;
 use ak_signal::client_v2::{
     hello_v2_signing_bytes, Backoff, ClientV2, ClientV2Config, ClientV2Error, ConnState,
     ERR_DEVICE_REPLACED, HELLO_EXPORTER_LABEL,
@@ -35,7 +35,7 @@ use ak_signal::client_v2::{
 use ak_signal::protocol_v2::{
     AbortReason, CtrlFrame, CtrlMessage, DeviceId, Digest32, ErrorScope, InviteState,
     InviteSummary, Nonce32, PairProof, PairingId, PairingState, PeerSignal, RedeemRequest,
-    RequestId, Role, SessionId, StateFilter, Transcript256, CURSOR_START,
+    RegistryId, RequestId, Role, SessionId, StateFilter, Transcript256, CURSOR_START,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -57,7 +57,7 @@ fn pid(seed: u8) -> PairingId {
     [seed; 16]
 }
 
-fn server_tls_config(key: &DeviceKeyPair) -> (rustls::ServerConfig, Fingerprint) {
+fn server_tls_config(key: &DeviceKeyPair) -> (rustls::ServerConfig, RegistryId) {
     let bundle = ak_identity::tls::make_self_signed(key);
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -75,7 +75,9 @@ fn server_tls_config(key: &DeviceKeyPair) -> (rustls::ServerConfig, Fingerprint)
     )
     .unwrap();
     config.alpn_protocols = vec![ak_signal::client_v2::CTRL_ALPN.to_vec()];
-    (config, bundle.fingerprint)
+    // server_v2 pin semantics: the served certificate's raw public key IS
+    // the registry id the client pins and the AuthChallenge names.
+    (config, key.public_key())
 }
 
 // ---- fake registry --------------------------------------------------------
@@ -96,7 +98,9 @@ struct ConnHandle {
 /// [`FakeRegistry::send`] / [`FakeRegistry::kill`].
 struct FakeRegistry {
     addr: SocketAddr,
-    fp: Fingerprint,
+    /// Registry id this fake is pinned by: the raw public key of the
+    /// generated key pair (server_v2 semantics).
+    registry_id: RegistryId,
     conns: Arc<StdMutex<HashMap<u64, ConnHandle>>>,
     hellos: Arc<StdMutex<HashMap<u64, HelloRecord>>>,
     received: tokio::sync::mpsc::Receiver<(u64, CtrlMessage)>,
@@ -106,7 +110,7 @@ struct FakeRegistry {
 impl FakeRegistry {
     async fn start() -> FakeRegistry {
         let registry_key = DeviceKeyPair::generate();
-        let (config, fp) = server_tls_config(&registry_key);
+        let (config, registry_id) = server_tls_config(&registry_key);
         let acceptor = TlsAcceptor::from(Arc::new(config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -142,9 +146,17 @@ impl FakeRegistry {
                             kill: Arc::clone(&kill),
                         },
                     );
-                    if opening_exchange(tls, conn, &hellos, &fp, &tx_received, out_rx, &kill)
-                        .await
-                        .is_err()
+                    if opening_exchange(
+                        tls,
+                        conn,
+                        &hellos,
+                        &registry_id,
+                        &tx_received,
+                        out_rx,
+                        &kill,
+                    )
+                    .await
+                    .is_err()
                     {
                         conns.lock().unwrap().remove(&conn);
                     }
@@ -156,7 +168,7 @@ impl FakeRegistry {
 
         FakeRegistry {
             addr,
-            fp,
+            registry_id,
             conns,
             hellos,
             received: rx_received,
@@ -259,7 +271,7 @@ async fn opening_exchange(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     conn: u64,
     hellos: &Arc<StdMutex<HashMap<u64, HelloRecord>>>,
-    fp: &Fingerprint,
+    registry_id: &RegistryId,
     tx_received: &tokio::sync::mpsc::Sender<(u64, CtrlMessage)>,
     out_rx: tokio::sync::mpsc::UnboundedReceiver<CtrlMessage>,
     kill: &Arc<tokio::sync::Notify>,
@@ -268,7 +280,7 @@ async fn opening_exchange(
     write_frame(
         &mut tls,
         CtrlMessage::AuthChallenge {
-            registry_id: *fp.as_bytes(),
+            registry_id: *registry_id,
             nonce,
             expires_ms: now_ms() + 10_000,
         },
@@ -291,7 +303,7 @@ async fn opening_exchange(
                 .export_keying_material(&mut exporter, HELLO_EXPORTER_LABEL, None)
                 .unwrap();
             let signing = hello_v2_signing_bytes(
-                fp.as_bytes(),
+                registry_id,
                 &exporter,
                 version,
                 &device_id,
@@ -399,12 +411,12 @@ fn spawn_conn_io(
 }
 
 /// A listener with valid TLS that sends one (attacker-controlled)
-/// AuthChallenge and then stays silent. Returns the address and the
-/// certificate fingerprint (so tests can pin the cert correctly while
+/// AuthChallenge and then stays silent. Returns the address and the served
+/// certificate's raw public key (so tests can pin the cert correctly while
 /// breaking the protocol layer above it).
 struct BadChallenge {
     addr: SocketAddr,
-    cert_fp: Fingerprint,
+    cert_key: RegistryId,
 }
 
 impl BadChallenge {
@@ -412,8 +424,8 @@ impl BadChallenge {
     /// matches and only the expiry is wrong).
     async fn start(registry_id: Option<[u8; 32]>, expires_ms: u64) -> BadChallenge {
         let key = DeviceKeyPair::generate();
-        let (config, cert_fp) = server_tls_config(&key);
-        let registry_id = registry_id.unwrap_or(*cert_fp.as_bytes());
+        let (config, cert_key) = server_tls_config(&key);
+        let registry_id = registry_id.unwrap_or(cert_key);
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -433,13 +445,13 @@ impl BadChallenge {
                 }
             }
         });
-        BadChallenge { addr, cert_fp }
+        BadChallenge { addr, cert_key }
     }
 
     /// TLS completes, but no frame ever arrives.
     async fn start_silent() -> BadChallenge {
         let key = DeviceKeyPair::generate();
-        let (config, cert_fp) = server_tls_config(&key);
+        let (config, cert_key) = server_tls_config(&key);
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -450,7 +462,7 @@ impl BadChallenge {
                 }
             }
         });
-        BadChallenge { addr, cert_fp }
+        BadChallenge { addr, cert_key }
     }
 }
 
@@ -469,7 +481,7 @@ fn fast_config(response_timeout: Duration, retries: u32) -> ClientV2Config {
 async fn connect(fake: &FakeRegistry, key: &DeviceKeyPair) -> ClientV2 {
     ClientV2::connect_with_config(
         fake.addr,
-        fake.fp,
+        fake.registry_id,
         key,
         "test-device",
         ClientV2Config {
@@ -531,7 +543,7 @@ async fn connect_rejects_authchallenge_naming_another_registry() {
     let key = DeviceKeyPair::generate();
     let result = ClientV2::connect_with_config(
         bad.addr,
-        bad.cert_fp,
+        bad.cert_key,
         &key,
         "x",
         fast_config(Duration::from_secs(3), 0),
@@ -546,7 +558,7 @@ async fn connect_rejects_expired_challenge() {
     let key = DeviceKeyPair::generate();
     let result = ClientV2::connect_with_config(
         bad.addr,
-        bad.cert_fp,
+        bad.cert_key,
         &key,
         "x",
         fast_config(Duration::from_secs(3), 0),
@@ -562,11 +574,11 @@ async fn connect_rejects_expired_challenge() {
 async fn connect_with_wrong_tls_pin_fails_closed() {
     let fake = FakeRegistry::start().await;
     let other = DeviceKeyPair::generate();
-    let (_config, other_fp) = server_tls_config(&other);
+    let (_config, other_key) = server_tls_config(&other);
     let key = DeviceKeyPair::generate();
     let result = ClientV2::connect_with_config(
         fake.addr,
-        other_fp, // pin ≠ served certificate
+        other_key, // pin ≠ served certificate
         &key,
         "x",
         fast_config(Duration::from_secs(3), 0),
@@ -584,7 +596,7 @@ async fn connect_times_out_when_challenge_never_arrives() {
     let key = DeviceKeyPair::generate();
     let result = ClientV2::connect_with_config(
         silent.addr,
-        silent.cert_fp,
+        silent.cert_key,
         &key,
         "x",
         ClientV2Config {
@@ -690,7 +702,7 @@ async fn response_timeout_is_reported_with_attempt_count() {
     let key = DeviceKeyPair::generate();
     let client = ClientV2::connect_with_config(
         fake.addr,
-        fake.fp,
+        fake.registry_id,
         &key,
         "slow",
         fast_config(Duration::from_millis(250), 0),
@@ -714,7 +726,7 @@ async fn timeout_retry_reuses_the_same_request_id() {
     let key = DeviceKeyPair::generate();
     let client = ClientV2::connect_with_config(
         fake.addr,
-        fake.fp,
+        fake.registry_id,
         &key,
         "retry",
         fast_config(Duration::from_millis(250), 1),

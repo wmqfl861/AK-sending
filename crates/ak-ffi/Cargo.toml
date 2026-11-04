@@ -13,10 +13,24 @@ ak-core = { workspace = true }
 ak-engine = { workspace = true }
 ak-identity = { workspace = true }
 ak-net = { workspace = true }
+# B8 (wave 22): frozen v2 protocol vocabulary (invite states, cursor
+# constants) used by the pairing result JSON; no server-side surface (the
+# server-persistence feature stays dev-only below).
+ak-signal = { workspace = true }
 ak-storage = { workspace = true }
 ak-store = { workspace = true }
 ak-wire = { workspace = true }
+# B8 (wave 22): the pairing runtime behind ak_pairing_*/ak_sched_* — the
+# PairingOrchestrator, RegistryClient and SessionRuntime of the frozen
+# pairing/scheduler contracts. Declared locally (path, not in the shared
+# workspace table) to avoid cross-agent edits of the root Cargo.toml, the
+# same pattern ak-signal used for tokio-rustls.
+ak-session = { path = "../ak-session" }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# The e2e pairing tests boot the real v2 registry (engine + SQLite store),
+# which lives behind ak-signal's `server-persistence` feature. Dev-only:
+# the ak-ffi library itself never links a server-side SQLite.
+ak-signal = { workspace = true, features = ["server-persistence"] }
 tempfile = "3"

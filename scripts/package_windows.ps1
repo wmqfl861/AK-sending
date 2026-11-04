@@ -41,8 +41,14 @@
 #
 # Output:
 #   ak-cli.exe, ak_ffi.dll, README.md (+ LICENSE only if the repo ever gains one),
-#   flutter\ (optional), android\ (optional, -IncludeAndroid), MANIFEST.txt (SHA256 +
-#   size per file), plus a .zip next to OutDir.
+#   ak_sending_registry.db (empty SQLite template; a zero-length file is a valid
+#   empty SQLite database, the v2 registry server creates its schema on first
+#   open), ak_sending_registry.db.README.txt (what the template is / how to
+#   back it up), start-registry-server.bat (launcher for `ak-cli
+#   registry-server` against the packaged template; extra args pass through),
+#   flutter\ (optional), android\ (optional, -IncludeAndroid), MANIFEST.txt
+#   (SHA256 + size per file - the registry files above are counted in it),
+#   plus a .zip next to OutDir.
 
 param(
     [string]$OutDir,
@@ -158,6 +164,70 @@ try {
     else {
         Write-Host '==> no license file (owner decision pending)'
     }
+
+    # --- 3b. registry-server starter kit (wave 21, B7) ---
+    # ak_sending_registry.db: an intentionally EMPTY SQLite template. SQLite
+    # treats a zero-length file as a valid empty database (file-format docs:
+    # an empty file is an empty DB), and `ak-cli registry-server` runs
+    # CREATE TABLE IF NOT EXISTS + PRAGMA user_version when it opens the
+    # store (crates/ak-signal/src/server_v2/store.rs), so the template needs
+    # no schema baked in and cannot drift from the server's DDL.
+    $registryDb = Join-Path $OutDirFull 'ak_sending_registry.db'
+    [System.IO.File]::WriteAllBytes($registryDb, (New-Object byte[] 0))
+
+    $registryReadmeLines = @(
+        'ak_sending_registry.db - v2 pairing registry SQLite template',
+        '=================================================================',
+        '',
+        'This file is an intentionally EMPTY SQLite database (a zero-length file',
+        'is a valid empty SQLite database; the server creates its schema on',
+        'first open, so the template carries no schema and cannot drift from',
+        'the server DDL).',
+        '',
+        'Purpose: persistent store of the authoritative v2 pairing registry',
+        '(invite codes, pairing transactions, pairing relations, request',
+        'journal - see docs/contracts/storage-schema.md in the repository).',
+        '',
+        'Usage:',
+        '  start-registry-server.bat            (default port 7200, TLS-only)',
+        '  start-registry-server.bat --port N --bind 127.0.0.1',
+        'The launcher runs: ak-cli.exe registry-server --id-dir registry-id',
+        '                    --db-path ak_sending_registry.db',
+        'On first start the server creates the tables (CREATE TABLE IF NOT',
+        'EXISTS, PRAGMA user_version), writes its long-term identity key to',
+        'registry-id\registry.key and prints the registry id that devices pin',
+        '(--registry-fp). ak-cli.exe must sit next to this file.',
+        '',
+        'Operations:',
+        '  - back up: stop the server, copy ak_sending_registry.db.',
+        '  - the database holds invite-code hashes and pairing state - treat it',
+        '    as server-private data; do not publish or reuse it across servers.',
+        '  - deleting the file resets the registry to empty (all invites and',
+        '    pairing relations are lost).')
+    [System.IO.File]::WriteAllText((Join-Path $OutDirFull 'ak_sending_registry.db.README.txt'),
+        (($registryReadmeLines -join "`r`n") + "`r`n"))
+
+    # start-registry-server.bat: plain cmd launcher, ASCII-only, CRLF lines.
+    # Extra arguments (%*) pass through to `ak-cli registry-server`
+    # (--port / --bind), so operators can override the listen address
+    # without editing the script.
+    $batLines = @(
+        '@echo off',
+        'rem AK-sending v2 pairing registry server launcher.',
+        'rem Runs ak-cli.exe registry-server against ak_sending_registry.db;',
+        'rem schema and registry key are created on first start.',
+        'rem Extra args pass through, e.g.: start-registry-server.bat --port 7200',
+        'setlocal',
+        'set "HERE=%~dp0"',
+        'if not exist "%HERE%ak-cli.exe" (',
+        '  echo error: ak-cli.exe not found next to this script - unzip the full package',
+        '  exit /b 1',
+        ')',
+        '"%HERE%ak-cli.exe" registry-server --id-dir "%HERE%registry-id" --db-path "%HERE%ak_sending_registry.db" %*',
+        'endlocal')
+    [System.IO.File]::WriteAllText((Join-Path $OutDirFull 'start-registry-server.bat'),
+        (($batLines -join "`r`n") + "`r`n"))
+    Write-Host '==> included: ak_sending_registry.db (empty SQLite template) + README + start-registry-server.bat'
 
     # --- 4. optional Flutter app ---
     if ($SkipFlutter) {
@@ -293,6 +363,7 @@ try {
     $manifest.Add("version : $Version")
     $manifest.Add("profile : $Profile")
     $manifest.Add('android : ' + $(if ($androidIncluded -gt 0) { "included ($androidIncluded file(s) under android\)" } else { 'not included' }))
+    $manifest.Add('registry: ak_sending_registry.db (empty SQLite template) + ak_sending_registry.db.README.txt + start-registry-server.bat')
     $manifest.Add("created : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') local time; local packaging only, not uploaded")
     $manifest.Add('format  : SHA256  bytes  relative-path (SHA256 via PowerShell Get-FileHash)')
     $manifest.Add('')

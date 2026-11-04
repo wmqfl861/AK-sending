@@ -70,6 +70,12 @@ jobs:
         run: cargo test --locked --workspace
       - name: Tests (ak-store sqlite backend, bundled C SQLite)
         run: cargo test --locked -p ak-store --features sqlite
+      # Wave 21: the v2 registry server's SQLite persistence lives behind
+      # the opt-in ak-signal `server-persistence` feature (ak-session boots
+      # the real engine+store in its e2e dev tests through the same
+      # feature). Server-side only - not in any default feature set.
+      - name: Tests (ak-signal server-persistence, v2 registry store)
+        run: cargo test --locked -p ak-signal --features server-persistence
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -107,6 +113,17 @@ jobs:
   # cargo check does not link; ak-store stays on its default file backend
   # (no C SQLite), so only rust-std + the platform C toolchain for
   # ring/blake3 build scripts are required.
+  #
+  # ak-session (wave 21) is part of the package list below on every triple.
+  # Its ANDROID targets (x86_64-linux-android / aarch64-linux-android) are
+  # NOT checked here: Actions runners have no NDK. They are verified on the
+  # local Windows+NDK host instead, via scripts/check_targets.sh (matrix
+  # includes both android triples when an NDK is found) and
+  # scripts/build_android_ffi.sh (full cross BUILD of -p ak-ffi -p
+  # ak-session for both ABIs plus the frozen-ABI symbol check). ak-session
+  # itself is pure Rust on default features (tokio/blake3/thiserror/log +
+  # workspace crates; the rusqlite `server-persistence` backend is
+  # dev/test-only and never linked), so no android-specific code exists.
   portability:
     name: Portability check (${{ matrix.target }})
     strategy:
@@ -131,5 +148,5 @@ jobs:
       - name: cargo check core matrix packages
         run: >-
           cargo check --locked -p ak-core -p ak-wire -p ak-identity -p ak-storage
-          -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-cli
-          -p ak-ffi --target ${{ matrix.target }}
+          -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-session
+          -p ak-cli -p ak-ffi --target ${{ matrix.target }}

@@ -54,7 +54,7 @@ pub enum ClientV2Error {
     BadName { max: usize },
     #[error("TLS or TCP handshake failed within {0:?}")]
     HandshakeTimeout(Duration),
-    #[error("AuthChallenge names a different registry than the pinned fingerprint")]
+    #[error("AuthChallenge names a different registry than the pinned key")]
     RegistryMismatch,
     #[error("AuthChallenge already expired at {expires_ms} ms")]
     ChallengeExpired { expires_ms: u64 },

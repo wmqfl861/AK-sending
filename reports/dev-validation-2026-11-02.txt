@@ -502,3 +502,18 @@ $ cargo test --workspace → 773/0（基线 667 → +106）；sqlite 54；signal
 # B7 CLI：invite create/redeem/list/revoke + registry-server + daemon --invite-code/--same-code/--cross-code
 # 集成者：ak-net type_budget/header_payload_check 测试适配新 wire 类型 13-15；invite.rs clippy 三处修复
 $ cargo test --workspace → 851/0（基线 773 → +78）；clippy 干净；repo passed
+
+## 第二十二次：FFI 导出+常量统一+Dart/Flutter+集成测试+文档+构建矩阵（2026-11-04，6 并行代理）
+# 常量统一：client_v2 tls.rs 三处对齐 server_v2（ALPN ak-signal/2、exporter label、pin=原始 32B 公钥）
+# B8 FFI：14 导出（ak_pairing_* 8 + ak_sched_* 6），真 TLS+SQLite 回环 16 测试（含 redeem 全流程落簿、
+#   sched 四模式真传输、create 幂等、-3 无损重读）——ak-ffi 45/45
+# Dart 绑定：pairing_ffi/sched_ffi/model 六文件（Crockford 校验/事件映射/op 轮询/-3 扩容），22 测试
+# Flutter：第七页邀请码（生成/兑换/撤销/事件流/双调度开关/持久化），16 widget + 8 服务测试
+# 集成测试：14 项跨产品链（CLI 多进程全链/调度器四模式真码区间/安全负例含限速精确计数+反枚举不可区分）
+# 文档：七文件全档（BACKLOG 16 条目/SECURITY 11 条/PROTOCOL v2 节/ARCHITECTURE ak-session 行/TEST_PLAN 映射）
+# 构建矩阵：符号门严格化（5 符号）、registry 三件套入包、CI server-persistence 步骤、交叉编译含 ak-session
+# CLI 修复：invite redeem/daemon 打印 owner 指纹（原误打本机 redeemer）+ 缺换行
+# 集成者：app.dart 第七页接线（invite_nav key + IndexedStack + import）
+
+$ cargo test --workspace → 881/0（基线 851 → +30）；signal+persistence 227；dart 107/107；flutter 108/108；
+$ clippy 干净；repo passed；flutter analyze 零 issue

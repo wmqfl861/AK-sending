@@ -68,7 +68,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use ak_identity::{DeviceKeyPair, Fingerprint};
+use ak_identity::DeviceKeyPair;
 use dispatch::{DispatchKey, DispatchRegistry, RouteOutcome};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -77,7 +77,8 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use crate::protocol_v2::CtrlMessage;
 use crate::protocol_v2::{
     AbortReason, CodeId, ConnectionId, DeviceId, Digest32, ErrorScope, InviteSummary, PairProof,
-    PairingId, PeerSignal, RequestId, SessionId, Signature64, StateFilter, Transcript256,
+    PairingId, PeerSignal, RegistryId, RequestId, SessionId, Signature64, StateFilter,
+    Transcript256,
 };
 
 /// Connection state reported through [`ClientV2::state_watcher`].
@@ -156,7 +157,9 @@ pub struct OpenedSession {
 /// Shared state behind the cheap-to-clone [`ClientV2`] handle.
 pub(crate) struct Inner {
     pub(crate) server: SocketAddr,
-    pub(crate) registry_fp: Fingerprint,
+    /// Pinned registry id: the registry key's raw 32-byte public half
+    /// (server_v2 semantics — the served certificate key **is** this id).
+    pub(crate) registry_id: RegistryId,
     pub(crate) key: DeviceKeyPair,
     pub(crate) name: String,
     pub(crate) config: ClientV2Config,
@@ -180,7 +183,7 @@ pub(crate) struct Inner {
 impl Inner {
     fn new(
         server: SocketAddr,
-        registry_fp: Fingerprint,
+        registry_id: RegistryId,
         key: DeviceKeyPair,
         name: String,
         config: ClientV2Config,
@@ -190,7 +193,7 @@ impl Inner {
         let (state_tx, _) = watch::channel(ConnState::Connecting);
         Ok(Arc::new(Inner {
             server,
-            registry_fp,
+            registry_id,
             key,
             name,
             config,
@@ -346,26 +349,27 @@ pub struct ClientV2 {
 }
 
 impl ClientV2 {
-    /// Connect with the default configuration: pinned TLS, AuthChallenge /
-    /// signed Hello / Welcome, then a live single-reader dispatcher.
+    /// Connect with the default configuration: pinned TLS (raw registry
+    /// public-key pin, `server_v2` semantics), AuthChallenge / signed Hello /
+    /// Welcome, then a live single-reader dispatcher.
     pub async fn connect(
         server: SocketAddr,
-        registry_fp: Fingerprint,
+        registry_id: RegistryId,
         key: &DeviceKeyPair,
         name: &str,
     ) -> Result<Self, ClientV2Error> {
-        Self::connect_with_config(server, registry_fp, key, name, ClientV2Config::default()).await
+        Self::connect_with_config(server, registry_id, key, name, ClientV2Config::default()).await
     }
 
     /// [`ClientV2::connect`] with explicit tunables.
     pub async fn connect_with_config(
         server: SocketAddr,
-        registry_fp: Fingerprint,
+        registry_id: RegistryId,
         key: &DeviceKeyPair,
         name: &str,
         config: ClientV2Config,
     ) -> Result<Self, ClientV2Error> {
-        let inner = Inner::new(server, registry_fp, key.clone(), name.to_string(), config)?;
+        let inner = Inner::new(server, registry_id, key.clone(), name.to_string(), config)?;
         conn::open_connection(&inner).await?;
         Ok(ClientV2 { inner })
     }

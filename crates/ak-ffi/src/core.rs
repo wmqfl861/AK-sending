@@ -907,6 +907,9 @@ pub struct AkEngine {
     /// by different engines from looking alike. Uniqueness within one
     /// engine comes from the counter alone.
     tag: u64,
+    /// B8 (wave 22) pairing/scheduler runtimes behind the `ak_pairing_*` /
+    /// `ak_sched_*` exports (see [`crate::pairing`]).
+    pub(crate) v2: Mutex<crate::pairing::V2State>,
 }
 
 impl AkEngine {
@@ -929,6 +932,7 @@ impl AkEngine {
             events: Arc::new(Mutex::new(VecDeque::new())),
             counter: AtomicU64::new(0),
             tag,
+            v2: Mutex::new(crate::pairing::V2State::default()),
         })
     }
 
@@ -942,6 +946,17 @@ impl AkEngine {
                 return id;
             }
         }
+    }
+
+    /// The embedded runtime (B8 pairing/scheduler tasks spawn here).
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Runtime {
+        &self.runtime
+    }
+
+    /// The engine-wide progress queue (`ak_poll_progress`); the B8
+    /// scheduler executor forwards per-task transfer progress into it.
+    pub(crate) fn events_queue(&self) -> Arc<Mutex<VecDeque<String>>> {
+        Arc::clone(&self.events)
     }
 
     /// Ephemeral fallback checkpoint directory for jobs started WITHOUT an
@@ -1313,6 +1328,17 @@ impl Drop for AkEngine {
                 }
             }
         }
+        // B8 runtimes: abort op tasks and the owner loop, close the
+        // control clients, and stop the scheduler actor (bounded; the
+        // runtime is still alive here — fields drop after this body).
+        if let Ok(v2) = self.v2.lock() {
+            for rt in v2.runtimes.values() {
+                rt.teardown(&self.runtime);
+            }
+            if let Some(sched) = &v2.sched {
+                sched.teardown(&self.runtime);
+            }
+        }
     }
 }
 
@@ -1327,7 +1353,7 @@ fn finish(outcome: &Mutex<Outcome>, value: Outcome) {
 
 /// Serialize one progress event as a compact JSON line, dropping it only if
 /// the queue is at capacity (see `MAX_QUEUED_EVENTS`).
-fn push_event(
+pub(crate) fn push_event(
     queue: &Arc<Mutex<VecDeque<String>>>,
     job: &str,
     conn: Option<u64>,
@@ -1357,7 +1383,7 @@ fn push_event(
     }
 }
 
-fn push_capped(queue: &mut VecDeque<String>, line: String) {
+pub(crate) fn push_capped(queue: &mut VecDeque<String>, line: String) {
     if queue.len() < MAX_QUEUED_EVENTS {
         queue.push_back(line);
     }
@@ -1538,7 +1564,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex_encode(bytes)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

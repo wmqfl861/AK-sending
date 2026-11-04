@@ -71,6 +71,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         JobController,
         JobPhase,
         ProgressEvent,
+        SchedulerPolicy,
         isFingerprintHex;
 
 import '../ui/service/transfer_service.dart'
@@ -87,6 +88,8 @@ import '../ui/service/transfer_service.dart'
         TransferServiceStatus;
 
 import 'ak_engine_facade.dart';
+import 'invite_service.dart'
+    show FfiInviteService, InviteService, PairingStartConfig;
 import 'real_transfer_service.dart';
 
 /// One live job: its core job id, folding controller and terminal state.
@@ -277,6 +280,57 @@ final class FfiTransferService implements TransferService {
 
   TransferServiceStatus _status = TransferServiceStatus.idle;
   bool _disposed = false;
+
+  // -------------------------------------------------------------------------
+  // Invite pairing + scheduler policy (wave-22).
+  // -------------------------------------------------------------------------
+
+  /// Lazily-constructed invite service over the facade's borrowed engine.
+  /// Null while the engine is unusable (missing DLL / open failure) — the
+  /// honest "unsupported" signal of the UI contract.
+  FfiInviteService? _inviteService;
+
+  /// Optional pairing-start overrides injected by `main.dart` wiring
+  /// (daemon `--signal-*` equivalents); see [PairingStartConfig].
+  PairingStartConfig? inviteStartConfig;
+
+  @override
+  InviteService? get inviteService {
+    if (_disposed || _loadError != null) {
+      return null;
+    }
+    final existing = _inviteService;
+    if (existing != null) {
+      return existing;
+    }
+    final facade = _facade;
+    if (facade is! AkEngineDartFacade) {
+      // Non-engine facades (tests) never get the pairing runtime.
+      return null;
+    }
+    final created = FfiInviteService.fromFacade(
+      facade: facade,
+      identityDirProvider: () => _identityDir,
+      startConfig: inviteStartConfig,
+    );
+    return _inviteService = created;
+  }
+
+  @override
+  Future<SchedulerPolicy> setSchedulerPolicy(SchedulerPolicy policy) async {
+    if (_isAndroidPlatform) {
+      await identityDirReady;
+    }
+    if (_disposed) {
+      throw StateError('FfiTransferService 已释放。');
+    }
+    final invite = inviteService;
+    if (invite is FfiInviteService) {
+      return invite.applySchedulerPolicy(policy);
+    }
+    throw StateError('调度策略需要配对运行时（ak_pairing_*/ak_sched_* 不可用），'
+        '无法在本波应用策略。');
+  }
 
   // -------------------------------------------------------------------------
   // Identity / version / status.
@@ -703,6 +757,8 @@ final class FfiTransferService implements TransferService {
     _disposed = true;
     _resultPoller.cancel();
     _eventsSubscription?.cancel();
+    _inviteService?.dispose();
+    _inviteService = null;
     _core?.dispose();
     final facade = _facade;
     if (facade is AkEngineDartFacade) {

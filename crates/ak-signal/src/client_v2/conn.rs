@@ -79,7 +79,7 @@ async fn read_server_message<S: AsyncRead + Unpin>(
 /// Open one pinned-TLS control connection and drive the frozen opening
 /// exchange (`pairing-flow.md` §3, §6):
 ///
-/// 1. TCP + TLS 1.3 with the registry fingerprint pin,
+/// 1. TCP + TLS 1.3 with the registry key pin (raw public key),
 /// 2. server sends `AuthChallenge` — its `registry_id` must equal the pin
 ///    and the challenge must not already be expired,
 /// 3. client answers `Hello` signed over
@@ -97,7 +97,7 @@ pub(crate) async fn open_connection(inner: &Arc<Inner>) -> Result<(), ClientV2Er
         .map_err(ClientV2Error::Io)?;
     tcp.set_nodelay(true).map_err(ClientV2Error::Io)?;
 
-    let config = Arc::new(tls::client_config(&inner.registry_fp).map_err(ClientV2Error::Io)?);
+    let config = Arc::new(tls::client_config(&inner.registry_id).map_err(ClientV2Error::Io)?);
     let connector = TlsConnector::from(config);
     let mut stream: TlsStream<TcpStream> = tokio::time::timeout(
         connect_timeout,
@@ -128,7 +128,7 @@ pub(crate) async fn open_connection(inner: &Arc<Inner>) -> Result<(), ClientV2Er
         }
         other => return Err(ClientV2Error::Unexpected(other)),
     };
-    if challenge.registry_id != *inner.registry_fp.as_bytes() {
+    if challenge.registry_id != inner.registry_id {
         return Err(ClientV2Error::RegistryMismatch);
     }
     if challenge.expires_ms <= crate::util::now_unix_ms() {

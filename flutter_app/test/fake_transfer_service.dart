@@ -2,6 +2,7 @@ import 'dart:async' show Completer;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart';
 import 'package:ak_sending_app/services/ak_engine_facade.dart';
+import 'package:ak_sending_app/services/invite_service.dart' show InviteService;
 import 'package:ak_sending_app/ui/service/transfer_service.dart';
 
 /// Deterministic in-memory [TransferService] for widget tests: pages get
@@ -283,6 +284,35 @@ class FakeTransferService implements TransferService {
     for (final listener in List.of(_statusListeners)) {
       listener();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Wave-22: invite pairing seam + scheduler policy.
+  // -------------------------------------------------------------------------
+
+  /// The invite service surfaced through the seam; null by default (the
+  /// "unsupported runtime" form the invite page must render honestly).
+  @override
+  InviteService? inviteService;
+
+  /// Policies captured by [setSchedulerPolicy], in call order.
+  final List<SchedulerPolicy> policyRequests = [];
+
+  /// When non-null, [setSchedulerPolicy] throws it (engine/runtime
+  /// unavailable forms).
+  Object? setSchedulerPolicyError;
+
+  /// When non-null, overrides the echo returned by [setSchedulerPolicy]
+  /// (the effective-policy intersection form).
+  SchedulerPolicy? setSchedulerPolicyEffective;
+
+  @override
+  Future<SchedulerPolicy> setSchedulerPolicy(SchedulerPolicy policy) async {
+    if (setSchedulerPolicyError != null) {
+      throw setSchedulerPolicyError!;
+    }
+    policyRequests.add(policy);
+    return setSchedulerPolicyEffective ?? policy;
   }
 }
 

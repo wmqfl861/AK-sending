@@ -216,10 +216,171 @@
 //! last-error message names the needed size); a null `buf` is `-1`, also
 //! checked before any write to disk.
 //!
+//! # B8 (wave 22): pairing orchestration + scheduler (`ak_pairing_*` / `ak_sched_*`)
+//!
+//! Contract: `docs/contracts/ffi-v2.md` (C ABI, status codes, `-3`/`-4`
+//! semantics, idempotency). One `AkEngine` hosts any number of pairing
+//! runtimes (`ak_pairing_start`, keyed by 16-byte `runtime_id`) and at
+//! most one scheduler runtime (`ak_sched_start`) that shares the most
+//! recent pairing runtime's control client. Every operation is
+//! asynchronous: the `*_start` calls only *accept* work (no network wait
+//! in a synchronous FFI call) and results arrive by polling.
+//!
+//! Event/result JSON field names below are the B8 schema fill-in ffi-v2
+//! §5 reserves for this implementation ("事件字段在 B8 与 Dart 绑定实现时必须
+//! 先回本契约补档") — the contract document still needs the integrator's
+//! sign-off before it can be edited (its freeze note requires that), so
+//! this header is the normative rendering of this build.
+//!
+//! `ak_pairing_start` spec (unknown fields ignored):
+//!
+//! ```json
+//! {
+//!   "spec_version": 1,
+//!   "registry": "127.0.0.1:7101",        // required ip:port of the v2 registry
+//!   "registry_id": "<64 hex>",           // required: pinned raw registry public key
+//!   "id_dir": "C:/ak/id",                // required: device.key / peers.book / pairing/
+//!   "device_name": "phone",              // optional, <= 64 chars
+//!   "owner_loop": true,                  // optional (default): answer redeems of my codes
+//!   "redeem_window_ms": 90000            // optional, 1000..=119000
+//! }
+//! ```
+//!
+//! Returns `AK_OK` + `runtime_id` immediately; the TLS connect completes
+//! in the background and surfaces as a `runtime_ready` (or
+//! `runtime_failed`) pairing event.
+//!
+//! Op specs (all parsed and validated BEFORE an op id exists — a `-2`
+//! never spawns anything; `request_id` everywhere is the optional 32-hex
+//! idempotency key of ffi-v2 §4):
+//!
+//! ```json
+//! // ak_pairing_create_start
+//! {"spec_version":1,"request_id":"<32hex>","ttl_secs":0}
+//! // ak_pairing_redeem_start
+//! {"spec_version":1,"request_id":"<32hex>","invite_code":"AKI1-XXXX-..."}
+//! // ak_pairing_list_start
+//! {"spec_version":1,"cursor":"<32hex>","limit":32,"state_filter":"active"}
+//! // ak_pairing_revoke_start
+//! {"spec_version":1,"request_id":"<32hex>","code_id":"<32hex>"}
+//! ```
+//!
+//! `ak_pairing_op_result` (`1` done JSON / `0` running / `2` failed JSON /
+//! `-3` buffer — the stored result is NOT consumed, so a create retry
+//! re-reads the SAME code, never generates a second one / `-4` unknown
+//! runtime or op):
+//!
+//! ```json
+//! {"op":"create","code":"AKI1-...","hint":"AKI1-****-...","code_id":"<32hex>","expires_ms":0,"revision":1}
+//! {"op":"redeem","pairing_id":"<32hex>","code_id":"<32hex>","peer":"<64hex>","peer_device":"<64hex>","book":"C:/ak/id/peers.book"}
+//! {"op":"list","next_cursor":"<32hex>","entries":[{"code_id":"<32hex>","state":"active","created_ms":1,"expires_ms":0,"revision":1}]}
+//! {"op":"revoke","code_id":"<32hex>","revision":2,"revoked_ms":1730000000000}
+//! // failures: {"op":"<name>","error":"message"}
+//! ```
+//!
+//! A redeem op drives the full transcript (challenge → proofs → commit →
+//! `peers.book` apply → `PairReady`); on success the peer is durably in
+//! the trust book — the file is readable directly or via `ak_peer_list`.
+//!
+//! `ak_pairing_poll_event` (`1` event / `0` none / `-3` buffer — the event
+//! is pushed back, nothing is lost / `-4` unknown runtime). Pairing-plane
+//! events (schema B8):
+//!
+//! ```json
+//! {"event":"runtime_ready","runtime":"<32hex>"}
+//! {"event":"runtime_failed","runtime":"<32hex>","error":"message"}
+//! {"event":"op_done","op_id":"<32hex>","op":"create"}
+//! {"event":"op_failed","op_id":"<32hex>","op":"redeem"}
+//! ```
+//!
+//! `ak_pairing_cancel_op` aborts a running op (its result becomes
+//! `{"op":"...","error":"cancelled by caller"}`); a finished op is
+//! untouched; unknown ids are `-4`.
+//!
+//! `ak_sched_start` spec (binds to the most recent pairing runtime unless
+//! `runtime_id` names one; the runtime must be connected — poll
+//! `runtime_ready` first; one scheduler per engine):
+//!
+//! ```json
+//! {
+//!   "spec_version": 1,
+//!   "runtime_id": "<32hex>",             // optional
+//!   "same_code": "serial",               // optional: serial|parallel (default serial)
+//!   "cross_code": "parallel",            // optional: serial|parallel (default parallel)
+//!   "max_active_tasks_per_code": 4,      // optional, contract ranges
+//!   "max_active_code_groups": 4,         // optional
+//!   "max_queued_tasks": 256              // optional
+//! }
+//! ```
+//!
+//! `ak_sched_enqueue` spec — the pairing relation (code group + verified
+//! peer key) resolves from the local pairing journal; the caller cannot
+//! override either (ffi-v2 §4). The data endpoint of the paired peer is
+//! the caller's to reach in this revision:
+//!
+//! ```json
+//! {
+//!   "spec_version": 1,
+//!   "request_id": "<32hex>",
+//!   "pairing_id": "<32hex>",             // required: applied pairing in this runtime's journal
+//!   "source_roots": ["C:/send/file.bin"],
+//!   "peer": "127.0.0.1:7100",            // required: the paired peer's data endpoint
+//!   "conflict": "fail",                  // optional: "fail" | "rename"
+//!   "multistream": false,                // optional
+//!   "no_internet": false,                // optional policy gate
+//!   "timeout_secs": 30                   // optional idle budget
+//! }
+//! ```
+//!
+//! Admitted tasks run REAL `ak-engine` transfers (per-task progress also
+//! flows into `ak_poll_progress` with the task id as the `job` field);
+//! the wire-level `TaskOpen`/`TaskAdmission` handshake of the on-channel
+//! executor is the documented next step (see `src/pairing.rs`).
+//!
+//! `ak_sched_snapshot` (`1` JSON / `-3` buffer / `-4` no scheduler):
+//!
+//! ```json
+//! {"policy":{"same_code":"serial","cross_code":"parallel","max_active_tasks_per_code":4,
+//!   "max_active_code_groups":4,"max_queued_tasks":256},
+//!  "policy_revision":1,"draining":false,"active_tasks":2,"queued_tasks":1,
+//!  "shutting_down":false,"listener":{"enabled":false,"running":false,
+//!   "inbound_submitted":0,"inbound_rejected_queue_full":0},
+//!  "tasks":[{"id":"<32hex>","state":"Transferring","group":"<32hex code>",
+//!   "registry":"<64hex>","direction":"send","label":"file.bin","attempts":1,
+//!   "last_error":null,"cancel_requested":false,"parked":null}]}
+//! ```
+//!
+//! `ak_sched_poll_event` (`1` / `0` / `-3` push-back / `-4`) — transfer-
+//! plane events, polled separately from pairing events (ffi-v2 §5):
+//!
+//! ```json
+//! {"event":"task_queued","task":"<32hex>","group":"<32hex>"}
+//! {"event":"task_admitted","task":"<32hex>","group":"<32hex>"}
+//! {"event":"task_started","task":"<32hex>"}
+//! {"event":"task_finished","task":"<32hex>","group":"<32hex>","outcome":"completed"}
+//! {"event":"task_cancelled","task":"<32hex>","group":"<32hex>","was_running":false}
+//! {"event":"policy_changed","revision":2,"draining":false}
+//! {"event":"draining","active_tasks":3}
+//! {"event":"backoff_scheduled","task":"<32hex>","attempt":1,"until_ms":1050}
+//! {"event":"retrying","task":"<32hex>","attempt":2}
+//! {"event":"task_parked","task":"<32hex>","reason":"retry_exhausted"}
+//! {"event":"transport_disconnected"}
+//! {"event":"transport_reconnected","replayed":0}
+//! {"event":"redeem_offered","code_id":"<32hex>","pairing_id":"<32hex>","peer":"<64hex>"}
+//! {"event":"pair_aborted","pairing_id":"<32hex>"}
+//! {"event":"shutdown_started","mode":"cancel"}
+//! {"event":"shutdown_complete","completed":1,"cancelled":0,"timed_out":false}
+//! ```
+//!
+//! `ak_sched_set_policy` takes the same policy fields as
+//! `ak_sched_start` (`AK_OK` / `-2` / `-4`). `ak_sched_cancel` takes the
+//! 16-byte task id (`AK_OK`; `-4` unknown or already-terminal task).
+//!
 //! NOT yet wired to any frontend: verified by Rust-side tests that drive
 //! the C ABI end-to-end (real loopback transfers through the boundary).
 
 mod core;
+mod pairing;
 mod shim;
 
 pub use crate::core::{
@@ -228,6 +389,9 @@ pub use crate::core::{
 };
 pub use crate::shim::{
     ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,
-    ak_job_result, ak_jobs_list, ak_peer_add, ak_peer_list, ak_peer_remove, ak_poll_progress,
-    ak_receive_start, ak_send_start, ak_version,
+    ak_job_result, ak_jobs_list, ak_pairing_cancel_op, ak_pairing_create_start,
+    ak_pairing_list_start, ak_pairing_op_result, ak_pairing_poll_event, ak_pairing_redeem_start,
+    ak_pairing_revoke_start, ak_pairing_start, ak_peer_add, ak_peer_list, ak_peer_remove,
+    ak_poll_progress, ak_receive_start, ak_sched_cancel, ak_sched_enqueue, ak_sched_poll_event,
+    ak_sched_set_policy, ak_sched_snapshot, ak_sched_start, ak_send_start, ak_version,
 };

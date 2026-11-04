@@ -173,6 +173,17 @@ final class AkEngineDartFacade implements AkEngineFacade {
     _engine = AkEngineDart(dllPath: resolution.path);
     return _engine!;
   }
+
+  /// The live engine handle for wave-22 borrowers: the pairing/scheduler
+  /// bindings need the engine's native pointer AND its loaded
+  /// `DynamicLibrary` to look up the `ak_pairing_*`/`ak_sched_*` exports
+  /// (ffi-v2.md §2 — the facade borrows the handle and never
+  /// double-disposes; the borrowers must NOT call `engine.dispose`).
+  ///
+  /// Throws like the facade's other calls when the DLL is missing; a
+  /// missing wave-22 export then surfaces from the binding lookup as the
+  /// explicit "old DLL unsupported" error.
+  AkEngineDart borrowEngine() => _engineOrThrow();
 }
 
 /// Minimal stand-in for AkEngineBackend's DllNotFoundException (which lives

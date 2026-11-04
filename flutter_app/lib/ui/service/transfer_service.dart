@@ -21,7 +21,10 @@
 /// real service; the member signatures here are final for this wave.
 library;
 
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show JobController;
+import 'package:ak_ffi_dart/ak_ffi_dart.dart'
+    show JobController, SchedulerPolicy;
+
+import '../../services/invite_service.dart' show InviteService;
 
 /// Coarse service state rendered as the HomePage status dot.
 enum TransferServiceStatus {
@@ -330,6 +333,36 @@ abstract interface class TransferService {
   /// Implementations refresh the cached identity afterwards like
   /// [addPeer].
   Future<bool> removePeer(String fpHex);
+
+  // -------------------------------------------------------------------------
+  // Invite pairing + scheduler policy (wave-22).
+  // -------------------------------------------------------------------------
+
+  /// The invite-code pairing service (create / redeem / list / revoke,
+  /// live pairing events, persisted scheduler-mode preference) consumed by
+  /// the invite page.
+  ///
+  /// Null when the runtime does not offer invite pairing — an engine
+  /// without the wave-22 `ak_pairing_*`/`ak_sched_*` exports (old DLL) or
+  /// an unusable engine: ffi-v2.md §2 forbids silently continuing with
+  /// key fields dropped by an old runtime, so pages render the honest
+  /// unsupported card instead of a broken form. Implementations that
+  /// construct the service lazily may return a non-null service whose
+  /// individual calls still throw the explicit unsupported error; `null`
+  /// remains the "definitely unavailable" signal.
+  InviteService? get inviteService;
+
+  /// Applies the two-dimensional scheduler concurrency policy
+  /// (`same_code_mode` × `cross_code_mode` plus the resource caps, see
+  /// docs/contracts/scheduler.md §2/§3) to the SHARED runtime and returns
+  /// the EFFECTIVE policy — both ends intersect, so the answer may be
+  /// stricter than the request (serial wins over parallel).
+  ///
+  /// Throws [StateError] when no scheduler runtime is available this wave
+  /// (the scheduler shares the pairing runtime started by
+  /// [inviteService]); implementations wired to a standalone runtime
+  /// apply directly.
+  Future<SchedulerPolicy> setSchedulerPolicy(SchedulerPolicy policy);
 
   /// Releases engine resources. Idempotent.
   void dispose();

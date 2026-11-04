@@ -1,11 +1,16 @@
 //! TLS and Hello-v2 signing material for the v2 control-plane client.
 //!
 //! Discipline mirrors `ak-net::tls` (ADR-001/ADR-002): self-signed Ed25519
-//! certificate verified by fingerprint pin, no webpki roots, no hostname
-//! check, no fallback verifier, TLS 1.3 only, ring provider. On top of the
-//! transport pin the client cross-checks that the `AuthChallenge.registry_id`
-//! equals the pinned registry fingerprint, so both the TLS identity and the
+//! certificate verified by key pin, no webpki roots, no hostname check, no
+//! fallback verifier, TLS 1.3 only, ring provider. On top of the transport
+//! pin the client cross-checks that the `AuthChallenge.registry_id` equals
+//! the pinned registry public key, so both the TLS identity and the
 //! protocol-level registry binding must agree.
+//!
+//! Wave-22 constant alignment (A2/A3 reconciliation, server_v2 is
+//! authoritative): the ALPN, exporter label and pin semantics match
+//! `ak_signal::server_v2::{tls, hello2}` exactly, so `ClientV2::connect`
+//! interoperates with `serve_v2` byte for byte.
 //!
 //! Hello-v2 signature domain (frozen by `docs/contracts/pairing-flow.md` §3):
 //!
@@ -18,7 +23,6 @@
 use std::io;
 use std::sync::Arc;
 
-use ak_identity::Fingerprint;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -28,12 +32,14 @@ use super::error::ClientV2Error;
 use crate::protocol_v2::{DeviceId, Nonce32, RegistryId};
 
 /// ALPN protocol identifier for the v2 control plane. The server must offer
-/// exactly this value; alignment constant for A2 (wave 21).
-pub const CTRL_ALPN: &[u8] = b"ak-ctrl/2";
+/// exactly this value; aligned with `server_v2::tls::ALPN_V2` (wave 22,
+/// server is authoritative).
+pub const CTRL_ALPN: &[u8] = b"ak-signal/2";
 
-/// TLS exporter label bound into the Hello-v2 signature. Alignment constant
-/// for A2 (wave 21): both sides must derive the exporter with this label.
-pub const HELLO_EXPORTER_LABEL: &[u8] = b"AK-CTRL-V2-HELLO";
+/// TLS exporter label bound into the Hello-v2 signature. Aligned with
+/// `server_v2::hello2::EXPORTER_LABEL` (wave 22, server is authoritative):
+/// both sides must derive the exporter with this label.
+pub const HELLO_EXPORTER_LABEL: &[u8] = b"AK control hello exporter";
 
 /// Exported keying material length folded into the Hello signature.
 pub const HELLO_EXPORTER_LEN: usize = 32;
@@ -50,13 +56,13 @@ fn cert_reject(reason: &str) -> rustls::Error {
 }
 
 /// Client-side verifier: the server (registry) certificate must be a valid
-/// self-signed Ed25519 certificate whose key fingerprint equals the pinned
-/// registry fingerprint. Identical rules to `ak-net`'s
-/// `PinnedServerCertVerifier` — coordination and data planes pin the same
-/// way; there is no accept-unknown-pin path and no downgrade to plaintext.
+/// self-signed Ed25519 certificate whose raw 32-byte public key equals the
+/// pinned [`RegistryId`] byte for byte — `server_v2::tls` semantics (the
+/// certificate key **is** the registry id). There is no
+/// accept-unknown-pin path and no downgrade to plaintext.
 #[derive(Debug)]
 struct PinnedRegistryVerifier {
-    pinned: Fingerprint,
+    pinned: RegistryId,
     schemes: WebPkiSupportedAlgorithms,
 }
 
@@ -77,10 +83,9 @@ impl ServerCertVerifier for PinnedRegistryVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         let public_key = ak_identity::tls::self_signed_public_key(end_entity.as_ref())
             .map_err(|why| cert_reject(&why.to_string()))?;
-        let fingerprint = Fingerprint::from_public_key(&public_key);
-        if fingerprint != self.pinned {
+        if public_key != self.pinned {
             return Err(cert_reject(
-                "fingerprint does not match the pinned registry",
+                "certificate key does not match the pinned registry id",
             ));
         }
         Ok(ServerCertVerified::assertion())
@@ -109,13 +114,15 @@ impl ServerCertVerifier for PinnedRegistryVerifier {
     }
 }
 
-/// Build the pinned rustls client config for one registry fingerprint.
+/// Build the pinned rustls client config for one registry id (the registry
+/// key's raw 32-byte public half).
 ///
 /// TLS 1.3 only, ring provider, ALPN [`CTRL_ALPN`], custom verifier that
-/// accepts exactly the pinned self-signed Ed25519 certificate. The client
-/// presents no certificate: device authentication is the signed Hello
-/// (challenge-bound), not TLS client auth.
-pub fn client_config(pinned: &Fingerprint) -> io::Result<rustls::ClientConfig> {
+/// accepts exactly the pinned self-signed Ed25519 certificate (its
+/// SubjectPublicKeyInfo **is** the [`RegistryId`] — `server_v2::tls`
+/// semantics). The client presents no certificate: device authentication is
+/// the signed Hello (challenge-bound), not TLS client auth.
+pub fn client_config(pinned: &RegistryId) -> io::Result<rustls::ClientConfig> {
     let verifier = PinnedRegistryVerifier {
         pinned: *pinned,
         schemes: provider().signature_verification_algorithms,
@@ -184,7 +191,7 @@ pub fn hello_version() -> u16 {
 }
 
 /// The TLS server name for a pinned connection: the socket's IP literal —
-/// identity comes from the fingerprint pin, never from DNS names.
+/// identity comes from the key pin, never from DNS names.
 pub fn server_name(ip: std::net::IpAddr) -> ServerName<'static> {
     ServerName::IpAddress(ip.into())
 }

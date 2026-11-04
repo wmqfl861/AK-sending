@@ -12,6 +12,7 @@ flowchart LR
 ```
 
 图中虚线仅为控制流，粗线唯一文件流。不存在服务器文件通道。
+控制面有两个并存平面（2026-11-04 第十八至二十一波）：v1 明文信令（TCP＋STUN，端口 7100/7101）承载既有候选交换；控制协议 v2（TLS 1.3，默认端口 7200）承载邀请码配对——权威注册库只见 lookup 摘要与固定形状的配对事务消息，`transcript_digest` 是配对握手记录摘要而非文件摘要，文件正文/路径/清单/进度仍一律不进控制面（ADR-001 不变量不变）。
 
 ```mermaid
 flowchart TD
@@ -33,10 +34,11 @@ flowchart TD
 |---|---|---|---|
 | DeviceIdentity | 本机密钥、安全配对、对端指纹 | 私钥不出设备；不信任服务器替换公钥 | 已实现＋测试（`ak-identity`：Ed25519 密钥、BLAKE3 指纹、配对码、PeerBook、自签证书与钉扎验证；私钥暂为用户目录种子文件，未接系统安全存储） |
 | DiscoveryService | 本地服务广播、已知地址候选 | 发现不等于授权；不广播用户文件资料 | 已实现＋测试（`ak-discovery`：手工地址、mDNS、信令候选与本地优先排序；mDNS 为尽力而为） |
-| SignalingService | 有界结构化连接消息 | 无文件正文/清单/哈希/通用 blob | 已实现＋测试（`ak-signal`：TCP 信令服务器/客户端＋内置 STUN；封闭消息集与限频、对抗加固（TCP 帧模糊/STUN 洪泛/限频旁路实测存活）与控制字符注入防护（codec 拒绝 C0/DEL/C1）由测试锁定） |
+| SignalingService | 有界结构化连接消息 | 无文件正文/清单/哈希/通用 blob | 已实现＋测试（`ak-signal`：TCP 信令服务器/客户端＋内置 STUN；封闭消息集与限频、对抗加固（TCP 帧模糊/STUN 洪泛/限频旁路实测存活）与控制字符注入防护（codec 拒绝 C0/DEL/C1）由测试锁定。**控制协议 v2（2026-11-04 第十八至二十一波）**：TLS 1.3＋SQLite 权威邀请码注册库（`server_v2`，独立端口默认 7200，`server-persistence` 特性）＋`client_v2` 分派＋`protocol_v2` codec——TLS-only 不降级，与 v1 明文并存；消息面见 [contracts/protocol-v2.md](contracts/protocol-v2.md)） |
 | NatTraversalService | 映射发现、候选检查、打洞协调 | 不使用 TURN/relay | 部分（`ak-signal::stun` STUN 映射查询与 `ak-net` 同 socket UDP 打洞已实现并在环回＋本机网卡验证；双栈端点 `bind_dual_stack`、v4-mapped `classify` 展开、`holepunch::bind_dual_stack_udp` 打洞 socket 本机实测可用——含 socket2 `only_v6` Windows 缺陷规避与间歇 `WSAENETUNREACH` 如实记录；真实 NAT/跨网未测，端口映射未启用） |
 | DirectConnectionManager | 已验证实际连接→直连句柄 | 未知路径/代理/relay/身份不符关闭 | 已实现＋测试（`ak-net`：DirectEndpoint/DirectChannel、指纹钉扎、路径分类启发式；并发接收 `ak-engine::serve_concurrently`——一次 bind、每连接独立任务/检查点，失败任务不拖垮他者；QUIC active migration 禁用为第十七波 F5 修复项、落地中——落地前存活连接路径变化不重触发准入，见"服务故障"节 INV-004 现状） |
-| FileTransferEngine | 直连句柄、SourceHandle、SaveTarget | 没有服务器上传客户端；有界缓冲 | 已实现＋测试（`ak-engine`：环回集成测试＋5 GiB 稀疏文件 release 测试；带内 Pause/Resume 与空闲超时已于第二轮实现（能力协商），多根/存储满预检/策略闸门第三至五轮补齐；单次 receive 一个任务、并发接收见 `serve_concurrently`） |
+| FileTransferEngine | 直连句柄、SourceHandle、SaveTarget | 没有服务器上传客户端；有界缓冲 | 已实现＋测试（`ak-engine`：环回集成测试＋5 GiB 稀疏文件 release 测试；带内 Pause/Resume 与空闲超时已于第二轮实现（能力协商），多根/存储满预检/策略闸门第三至五轮补齐；单次 receive 一个任务、并发接收见 `serve_concurrently`；第二十一波拆出 `send_on_channel`/`receive_on_channel` 供共享调度层按准入上下文调用（准入三步握手＋staging），既有入口继续走同一文件协议内核） |
+| SessionScheduler | 两维并发策略、常驻监听、配对编排 | 邀请码生命周期不进文件协议引擎；策略由共享层统一 | 已实现＋测试（`ak-session`，2026-11-04 第十八至二十一波新增 crate：`scheduler` 两维并发（same_code×cross_code 四模式、FIFO＋组间公平、draining、permit 准入）、`runtime` 单身份常驻运行时（SessionHandle 七 API、退避重试、Shutdown Drain/Cancel）、`pairing` 邀请码配对编排（PairingOrchestrator create/redeem/recover/revoke，13 项真 TLS e2e）；CLI 与 FFI 共用，契约见 [contracts/scheduler.md](contracts/scheduler.md)；FFI 侧接线属后续波） |
 | FileStorageEngine | 本地授权读写、验证、提交 | 目录越界防护和权限失效处理 | 已实现＋测试（`ak-storage`：扫描、路径越界与符号链接防护、`.akpart` 原子提交、断点续传；长文件名 part 回退命名 `.akpart-<hash16>`——249 字节边界实测缺陷修复，续传兼容，孤儿清理识别两种 part 形态） |
 | TaskStore | SQLite 任务和检查点 | 完成标记必须晚于最终校验/保存 | 已实现＋测试（`ak-store`：file 与 sqlite 双后端——行式文件检查点＋`SqliteCheckpointStore`（可选特性 `sqlite`，rusqlite bundled，默认依赖图零泄漏；事务原子性、双连接 WAL 并发、与文件后端语义等价）；`migrate_file_to_sqlite` 迁移工具：好记录迁移、损坏文件跳过计数） |
 | PlatformLifecycle | 原生后台/通知/权限 | 不假设 UI 生命周期即传输生命周期 | 未开始（无平台适配层） |

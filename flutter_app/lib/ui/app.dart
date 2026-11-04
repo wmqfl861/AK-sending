@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'pages/about_page.dart';
 import 'pages/home_page.dart';
+import 'pages/invite_page.dart';
 import 'pages/jobs_page.dart';
 import 'pages/pairing_page.dart';
 import 'pages/receive_page.dart';
@@ -89,6 +90,11 @@ class _AppShellState extends State<AppShell> {
                     label: Text('配对'),
                   ),
                   NavigationRailDestination(
+                    icon: Icon(Icons.vpn_key_outlined),
+                    selectedIcon: Icon(Icons.vpn_key),
+                    label: Text('邀请码', key: ValueKey('invite_nav')),
+                  ),
+                  NavigationRailDestination(
                     icon: Icon(Icons.info_outline),
                     selectedIcon: Icon(Icons.info),
                     label: Text('关于'),
@@ -108,6 +114,7 @@ class _AppShellState extends State<AppShell> {
                     SendPage(service: service),
                     JobsPage(service: service),
                     PairingPage(service: service),
+                    InvitePage(transfer: service),
                     AboutPage(service: service),
                   ],
                 ),

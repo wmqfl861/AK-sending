@@ -301,7 +301,10 @@ async fn start_policy_runtime(
     let mut config = config;
     config.listener_enabled = false;
     let handle = SessionRuntime::start(config).context("cannot start the scheduler runtime")?;
-    let switch = handle.set_policy(policy).await.context("set_policy failed")?;
+    let switch = handle
+        .set_policy(policy)
+        .await
+        .context("set_policy failed")?;
     Ok(switch)
 }
 
@@ -363,7 +366,11 @@ pub(crate) async fn daemon_core(
             if json_lines {
                 eprintln!("paired with redeemer {}", peer.to_hex());
             } else {
-                println!("pairing: paired with redeemer {} ({})", peer.short_id(), peer.to_hex());
+                println!(
+                    "pairing: paired with redeemer {} ({})",
+                    peer.short_id(),
+                    peer.to_hex()
+                );
             }
         });
         tokio::spawn(crate::invite::owner_pairing_loop(
@@ -381,7 +388,7 @@ pub(crate) async fn daemon_core(
     if let Some(code) = &opts.invite_code {
         let settings = crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?;
         let verified = crate::invite::redeem_and_pair(id, code, &settings).await?;
-        let peer = verified.redeemer_fingerprint();
+        let peer = verified.owner_fingerprint(); // the code owner is the peer
         out.note("paired with the code owner:");
         out.note(&crate::fingerprint_lines("owner", &peer));
     }
@@ -675,29 +682,19 @@ mod tests {
         assert!(opts.pairing);
         assert_eq!(opts.same_code.as_deref(), Some("parallel"));
         assert_eq!(opts.cross_code.as_deref(), Some("serial"));
-        assert_eq!(
-            opts.server,
-            Some("127.0.0.1:7200".parse().unwrap())
-        );
+        assert_eq!(opts.server, Some("127.0.0.1:7200".parse().unwrap()));
         assert_eq!(opts.registry_fp.as_deref(), Some(&"ab".repeat(32)[..]));
     }
 
     #[test]
     fn daemon_rejects_bad_policy_words_and_half_registry_flags() {
         // Bad concurrency words are refused at parse time.
-        assert!(crate::Cli::try_parse_from([
-            "ak-cli", "daemon", "--same-code", "fast"
-        ])
-        .is_err());
-        assert!(crate::Cli::try_parse_from([
-            "ak-cli", "daemon", "--cross-code", "lazy"
-        ])
-        .is_err());
+        assert!(crate::Cli::try_parse_from(["ak-cli", "daemon", "--same-code", "fast"]).is_err());
+        assert!(crate::Cli::try_parse_from(["ak-cli", "daemon", "--cross-code", "lazy"]).is_err());
         // Registry flags must come as a pair.
-        assert!(crate::Cli::try_parse_from([
-            "ak-cli", "daemon", "--server", "127.0.0.1:7200"
-        ])
-        .is_err());
+        assert!(
+            crate::Cli::try_parse_from(["ak-cli", "daemon", "--server", "127.0.0.1:7200"]).is_err()
+        );
         assert!(crate::Cli::try_parse_from([
             "ak-cli",
             "daemon",
@@ -1024,7 +1021,14 @@ mod tests {
         let (registry_stop, registry_stop_rx) = tokio::sync::watch::channel(false);
         let server_key = registry_key.clone();
         tokio::spawn(async move {
-            let _ = serve_v2(listener, &server_key, store, Limits::default(), registry_stop_rx).await;
+            let _ = serve_v2(
+                listener,
+                &server_key,
+                store,
+                Limits::default(),
+                registry_stop_rx,
+            )
+            .await;
         });
         let settings = crate::invite::RegistrySettings {
             server: registry_addr,
@@ -1032,12 +1036,16 @@ mod tests {
         };
 
         // 2. `invite create` on the owner side.
-        let first = crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
-            .await
-            .expect("invite create");
+        let first =
+            crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
+                .await
+                .expect("invite create");
         assert!(first.display.starts_with("AKI1-"), "{}", first.display);
         assert_eq!(
-            crate::invite::InviteStore::open(&dir_a).load().unwrap().len(),
+            crate::invite::InviteStore::open(&dir_a)
+                .load()
+                .unwrap()
+                .len(),
             1,
             "the bearer secret persists for the owner loop"
         );
@@ -1072,20 +1080,34 @@ mod tests {
         assert_eq!(verified.owner_fingerprint(), fp_a);
         let book_a = std::fs::read_to_string(crate::peer_book_path(&dir_a)).unwrap();
         let book_b = std::fs::read_to_string(crate::peer_book_path(&dir_b)).unwrap();
-        assert!(book_a.contains(&fp_b.to_hex()), "owner book records redeemer: {book_a}");
-        assert!(book_b.contains(&fp_a.to_hex()), "redeemer book records owner: {book_b}");
-        assert_eq!(*paired.lock().unwrap(), vec![fp_b], "owner observed the pairing");
+        assert!(
+            book_a.contains(&fp_b.to_hex()),
+            "owner book records redeemer: {book_a}"
+        );
+        assert!(
+            book_b.contains(&fp_a.to_hex()),
+            "redeemer book records owner: {book_b}"
+        );
+        assert_eq!(
+            *paired.lock().unwrap(),
+            vec![fp_b],
+            "owner observed the pairing"
+        );
 
         // 5. `daemon --invite-code` on a SECOND code of the same owner:
         // redeem at startup, then resident receive.
-        let second = crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
-            .await
-            .expect("second invite");
+        let second =
+            crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
+                .await
+                .expect("second invite");
         let out_b = tmp.path().join("out-b");
         std::fs::create_dir_all(&out_b).unwrap();
         let daemon_port = pick_free_port().unwrap();
-        let registry_fp_hex: String =
-            registry_key.public_key().iter().map(|b| format!("{b:02x}")).collect();
+        let registry_fp_hex: String = registry_key
+            .public_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let daemon_opts = DaemonOptions {
             out: out_b.clone(),
             port: daemon_port,
@@ -1103,9 +1125,10 @@ mod tests {
         };
         let (daemon_stop, daemon_stop_rx) = tokio::sync::watch::channel(false);
         let daemon_dir = dir_b.clone();
-        let daemon = tokio::spawn(async move {
-            daemon_core(&daemon_dir, daemon_opts, daemon_stop_rx).await
-        });
+        let daemon =
+            tokio::spawn(
+                async move { daemon_core(&daemon_dir, daemon_opts, daemon_stop_rx).await },
+            );
 
         // 6. Wait for the second pairing (owner side observes it), then
         // send one real file into the daemon's listener.

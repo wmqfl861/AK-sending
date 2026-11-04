@@ -16,7 +16,11 @@
 #   4. for every target runs, exactly once:
 #        cargo check -p ak-core -p ak-wire -p ak-identity -p ak-storage \
 #                    -p ak-store -p ak-engine -p ak-signal -p ak-net \
-#                    -p ak-cli -p ak-ffi --target <t>
+#                    -p ak-session -p ak-cli -p ak-ffi --target <t>
+#      (default features everywhere: the ak-signal `server-persistence`
+#      opt-in rusqlite backend is deliberately NOT enabled here - it is
+#      server-side and dev/test-only per crates/ak-signal/Cargo.toml and
+#      crates/ak-session/Cargo.toml, and the summary table notes this)
 #   5. classifies each non-passing target:
 #        FAIL       - rustc reported compile errors (error[E...] or errors
 #                     pointing at crates/ak-* sources): a REAL portability
@@ -32,7 +36,7 @@
 #
 # Caveat documented in docs/TECH_SELECTION.zh-CN.md: `cargo check` still RUNS
 # dependency build scripts, so ring/blake3 C compilation happens even though
-# nothing is linked. On hosts without the target C toolchain the full 10-crate
+# nothing is linked. On hosts without the target C toolchain the full 11-crate
 # check therefore stops in ring/blake3 while our crates stay unproven there;
 # the {ak-core, ak-wire} subset plus zero `error[E...]` lines in the log is
 # the local evidence used to classify those targets as environment-blocked.
@@ -49,9 +53,10 @@
 
 set -euo pipefail
 
-# The 10-crate matrix defined by the portability task (ak-discovery and
+# The 11-crate matrix defined by the portability task (ak-discovery and
 # ak-itests intentionally excluded; the host CI `rust` job covers them).
-PACKAGES="-p ak-core -p ak-wire -p ak-identity -p ak-storage -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-cli -p ak-ffi"
+# ak-session (wave 21) joined the matrix: default dependencies only.
+PACKAGES="-p ak-core -p ak-wire -p ak-identity -p ak-storage -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-session -p ak-cli -p ak-ffi"
 # Pure-Rust subset: no dependency with a C build script reaches these two,
 # so they check on any triple that has rust-std installed.
 PURE_PACKAGES="-p ak-core -p ak-wire"
@@ -206,6 +211,13 @@ blocked=$(tail -n +2 <<<"$RESULTS" | awk -F'|' '$2 == "BLOCKED"{n++} END {print 
 skipped=$(tail -n +2 <<<"$RESULTS" | awk -F'|' '$2 == "SKIPPED"{n++} END {print n+0}')
 echo "-----------------------------------------------------------------"
 echo "PASS=$passes BLOCKED=$blocked SKIPPED=$skipped FAIL=$fails"
+echo "feature status: ak-signal 'server-persistence' (opt-in rusqlite backend)"
+echo "  NOT part of this matrix - server-side/dev-only per"
+echo "  crates/ak-signal/Cargo.toml [features] and crates/ak-session"
+echo "  [dev-dependencies]; every target above was checked with default"
+echo "  features (ak-store file backend, no server SQLite). CI covers the"
+echo "  feature on the host via: cargo test --locked -p ak-signal \\"
+echo "  --features server-persistence (.github/workflows/ci.yml rust job)."
 echo "logs: $LOGDIR/check-<triple>.log (full cargo output per target)"
 echo "==================================================================="
 [ "$fails" -eq 0 ] || exit 1

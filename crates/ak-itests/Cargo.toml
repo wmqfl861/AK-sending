@@ -19,3 +19,12 @@ ak-wire = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# Invite-pairing itests (wave 21/22): the shared pairing orchestration
+# layer (PairingOrchestrator + RegistryClient) driven cross-boundary from
+# real CLI processes and the scheduler runtime.
+ak-session = { path = "../ak-session" }
+# The real v2 registry server (engine + authoritative SQLite store) for
+# the invite-pairing itests; dev-only here (same discipline as
+# ak-session's own dev-dependencies: the library never links the
+# server-side SQLite).
+ak-signal = { workspace = true, features = ["server-persistence"] }

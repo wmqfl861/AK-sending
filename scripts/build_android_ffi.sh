@@ -9,12 +9,22 @@
 #      (pure environment-variable scheme: the NDK <ver> directory name cannot
 #      be written statically into .cargo/config.toml, and env vars leave the
 #      repo's cargo config untouched);
-#   3. cargo build -p ak-ffi --release for x86_64-linux-android (emulator)
-#      and aarch64-linux-android (arm64 devices);
+#   3. cargo build -p ak-ffi -p ak-session --release for
+#      x86_64-linux-android (emulator) and aarch64-linux-android (arm64
+#      devices). ak-session (wave 21) is the shared session layer B8's
+#      pairing/scheduler FFI surface binds; its default dependency set
+#      (ak-core, ak-identity, ak-signal default features, ak-store file
+#      backend, blake3, log, thiserror, tokio) is fully cross-compilable
+#      with the NDK clang exported below - the `server-persistence`
+#      rusqlite backend is dev/test-only and never linked by a plain
+#      `cargo build -p ak-session`;
 #   4. copies both libak_ffi.so into
 #      flutter_app/android/app/src/main/jniLibs/{x86_64,arm64-v8a}/;
 #   5. verifies with the NDK's llvm-nm that each .so exports the frozen ABI
-#      symbols ak_engine_new / ak_identity_info / ak_jobs_list;
+#      symbols ak_engine_new / ak_identity_info / ak_jobs_list plus the
+#      v2 contract spot-check entries ak_pairing_start / ak_sched_listen_start
+#      (docs/contracts/ffi-v2.md §1; strict: any missing symbol FAILS the
+#      run and all missing ones are listed);
 #   6. prints size + SHA-256 of every artifact.
 #
 # Usage:
@@ -157,8 +167,8 @@ for target in x86_64-linux-android aarch64-linux-android; do
 done
 
 cd "$ROOT"
-echo "==> cargo build -p ak-ffi --release (x86_64-linux-android + aarch64-linux-android)"
-cargo build -p ak-ffi --release \
+echo "==> cargo build -p ak-ffi -p ak-session --release (x86_64-linux-android + aarch64-linux-android)"
+cargo build -p ak-ffi -p ak-session --release \
   --target x86_64-linux-android --target aarch64-linux-android
 
 # ---------------------------------------------------------------------------
@@ -181,16 +191,24 @@ LLVM_NM="$NDK_BIN/llvm-nm.exe"
 [ "$HOST_TAG" = "linux-x86_64" ] && LLVM_NM="$NDK_BIN/llvm-nm"
 [ -f "$LLVM_NM" ] || die "llvm-nm not found in NDK: $LLVM_NM"
 
-REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list"
+# Frozen ABI v1 (ak_engine_new / ak_identity_info / ak_jobs_list) plus the
+# v2 contract spot check: ak_pairing_start and ak_sched_listen_start
+# (docs/contracts/ffi-v2.md §1 — the sched entry point is listen_start;
+# the contract defines no bare ak_sched_start). STRICT: every missing
+# symbol is listed per .so and the run FAILs (no WARNING fallback).
+REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list ak_pairing_start ak_sched_listen_start"
 verify_symbols() { # $1 = .so path, $2 = label
-  local missing=0
+  local missing=""
   for sym in $REQUIRED_SYMBOLS; do
     if ! "$LLVM_NM" -D --defined-only "$1" | awk '{print $NF}' | grep -qx "$sym"; then
-      echo "ERROR: symbol $sym missing from $2 ($1)" >&2
-      missing=1
+      missing="$missing $sym"
     fi
   done
-  [ "$missing" -eq 0 ] || exit 1
+  if [ -n "$missing" ]; then
+    echo "ERROR: $2 ($1) is missing required ABI symbol(s):$missing" >&2
+    echo "       (frozen ABI: ak_engine_new/ak_identity_info/ak_jobs_list; v2 contract: ak_pairing_start/ak_sched_listen_start)" >&2
+    exit 1
+  fi
 }
 verify_symbols "$JNILIBS/x86_64/libak_ffi.so"   "x86_64"
 verify_symbols "$JNILIBS/arm64-v8a/libak_ffi.so" "arm64-v8a"

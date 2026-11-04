@@ -24,9 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use ak_identity::invite::InviteCode;
-use ak_identity::pairing_txn::{
-    random_nonce32, PairTranscript, PairingRecord, VerifyExpectations,
-};
+use ak_identity::pairing_txn::{random_nonce32, PairTranscript, PairingRecord, VerifyExpectations};
 use ak_identity::peer_store::PeerBookStore;
 use ak_identity::{DeviceKeyPair, Fingerprint, PeerRecord};
 use ak_session::pairing::{CreatedInvite, PairingOrchestrator, RegistryClient};
@@ -70,7 +68,10 @@ impl RegistrySettings {
                     .with_context(|| format!("bad registry address in pin file: {addr}"))?;
                 let registry_id = hex_to_32(hex)
                     .with_context(|| format!("bad registry id in pin file: {hex:?}"))?;
-                Ok(RegistrySettings { server, registry_id })
+                Ok(RegistrySettings {
+                    server,
+                    registry_id,
+                })
             }
             _ => bail!("malformed registry pin file (expected AKREG1 <addr> <64hex>)"),
         }
@@ -80,7 +81,10 @@ impl RegistrySettings {
         format!(
             "AKREG1 {} {}\n",
             self.server,
-            self.registry_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            self.registry_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         )
     }
 }
@@ -163,14 +167,9 @@ pub(crate) async fn connect_registry(
     settings: &RegistrySettings,
     key: &DeviceKeyPair,
 ) -> Result<RegistryClient> {
-    let client = RegistryClient::connect(
-        settings.server,
-        settings.registry_id,
-        key,
-        &whoami(),
-    )
-    .await
-    .context("cannot connect to the pairing registry")?;
+    let client = RegistryClient::connect(settings.server, settings.registry_id, key, &whoami())
+        .await
+        .context("cannot connect to the pairing registry")?;
     Ok(client)
 }
 
@@ -208,7 +207,13 @@ impl StoredInvite {
     /// Parse one `AKINV1 …` line.
     pub(crate) fn parse(line: &str) -> Result<Self> {
         let mut parts = line.trim().splitn(5, ' ');
-        match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+        match (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
             (Some("AKINV1"), Some(id), Some(expires), Some(revision), Some(display)) => {
                 Ok(StoredInvite {
                     code_id: hex_to_16(id).context("bad code id in invite store")?,
@@ -251,7 +256,8 @@ impl InviteStore {
                 continue;
             }
             out.push(
-                StoredInvite::parse(line).with_context(|| format!("invite store line {}", index + 1))?,
+                StoredInvite::parse(line)
+                    .with_context(|| format!("invite store line {}", index + 1))?,
             );
         }
         Ok(out)
@@ -285,7 +291,10 @@ impl InviteStore {
     }
 
     pub(crate) fn find(&self, code_id: &[u8; 16]) -> Result<Option<StoredInvite>> {
-        Ok(self.load()?.into_iter().find(|held| &held.code_id == code_id))
+        Ok(self
+            .load()?
+            .into_iter()
+            .find(|held| &held.code_id == code_id))
     }
 }
 
@@ -376,9 +385,11 @@ pub(crate) async fn invite_list_rows(
             .await
             .context("invite list failed")?;
         for entry in entries {
-            let hint = store.find(&entry.code_id).ok().flatten().and_then(|held| {
-                held.code().ok().map(|code| code.code_hint())
-            });
+            let hint = store
+                .find(&entry.code_id)
+                .ok()
+                .flatten()
+                .and_then(|held| held.code().ok().map(|code| code.code_hint()));
             rows.push(InviteRow {
                 code_id: entry.code_id,
                 state: entry.state,
@@ -594,9 +605,7 @@ pub(crate) async fn answer_offer_as_owner(
             transcript,
             commit_revision,
             ..
-        } if transcript == verified.record().transcript.to_bytes() => {
-            Some(commit_revision)
-        }
+        } if transcript == verified.record().transcript.to_bytes() => Some(commit_revision),
         _ => None,
     })
     .await
@@ -737,9 +746,7 @@ pub(crate) async fn owner_pairing_loop(
                         Ok(peer) => on_paired(peer),
                         Err(err) => {
                             log::warn!("owner pairing flow failed: {err}");
-                            let _ = client
-                                .pair_abort(pairing_id, AbortReason::Protocol)
-                                .await;
+                            let _ = client.pair_abort(pairing_id, AbortReason::Protocol).await;
                         }
                     }
                 });
@@ -810,8 +817,8 @@ mod tests {
         assert!(resolve_registry(&dir, Some(server), None).is_err());
         assert!(resolve_registry(&dir, None, Some("00".repeat(32))).is_err());
         // Both flags persist and later resolve without flags.
-        let settings = resolve_registry(&dir, Some(server), Some("ab".repeat(32)))
-            .expect("flags resolve");
+        let settings =
+            resolve_registry(&dir, Some(server), Some("ab".repeat(32))).expect("flags resolve");
         assert_eq!(settings.server, server);
         assert_eq!(settings.registry_id, hex_to_32(&"ab".repeat(32)).unwrap());
         let again = resolve_registry(&dir, None, None).expect("pin reused");
@@ -844,15 +851,20 @@ mod tests {
         assert_eq!(store.find(&[1u8; 16]).unwrap().unwrap().revision, 4);
         // The stored line parses back into the same typed code.
         assert_eq!(
-            store.find(&[1u8; 16]).unwrap().unwrap().code().unwrap().secret(),
+            store
+                .find(&[1u8; 16])
+                .unwrap()
+                .unwrap()
+                .code()
+                .unwrap()
+                .secret(),
             code.secret()
         );
         assert!(store.remove(&[1u8; 16]).unwrap());
         assert!(!store.remove(&[1u8; 16]).unwrap());
         assert!(store.load().unwrap().is_empty());
         // Corrupt line fails closed.
-        atomic_replace(&dir.join(INVITE_STORE_FILE), b"AKINV1 zz 0 0 AKI1-X\n")
-            .unwrap();
+        atomic_replace(&dir.join(INVITE_STORE_FILE), b"AKINV1 zz 0 0 AKI1-X\n").unwrap();
         assert!(store.load().is_err());
     }
 

@@ -2569,8 +2569,7 @@ async fn invite_command(id: &Path, cmd: InviteCommand) -> Result<()> {
             }
             println!("code-id (32hex)  state    revision  expires              hint");
             for row in rows {
-                let id_hex: String =
-                    row.code_id.iter().map(|b| format!("{b:02x}")).collect();
+                let id_hex: String = row.code_id.iter().map(|b| format!("{b:02x}")).collect();
                 println!(
                     "{id_hex}  {:<7}  {:<8}   {:<20}  {}",
                     format!("{:?}", row.state).to_lowercase(),
@@ -2606,9 +2605,9 @@ async fn invite_command(id: &Path, cmd: InviteCommand) -> Result<()> {
         } => {
             let settings = invite::resolve_registry(id, server, registry_fp)?;
             let verified = invite::redeem_and_pair(id, &code, &settings).await?;
-            let peer = verified.redeemer_fingerprint(); // we are the redeemer
+            let peer = verified.owner_fingerprint(); // the code owner is the peer
             println!("paired with the code owner:");
-            print!("{}", fingerprint_lines("owner", &peer));
+            println!("{}", fingerprint_lines("owner", &peer));
             println!(
                 "waiting for transfers into {} (Ctrl-C stops; --once handles one job)",
                 out.display()
@@ -2647,9 +2646,13 @@ async fn receive_one_after_pairing(
     let spec = config.iteration_spec();
     let printer = progress_printer("recv");
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-    let receiver = tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
+    let receiver =
+        tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
     let addr = addr_rx.await.context("receiver failed to bind")?;
-    println!("receiving one transfer into {} (listening on {addr})", out.display());
+    println!(
+        "receiving one transfer into {} (listening on {addr})",
+        out.display()
+    );
     println!("fingerprint (full): {}", config.fingerprint.to_hex());
     let report = receiver.await.context("receiver task failed")??;
     report_summary(&report);
@@ -2687,7 +2690,9 @@ async fn receive_loop_after_pairing(
         let printer = progress_printer("recv");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let receiver =
-            tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
+            tokio::spawn(
+                async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
+            );
         let _ = addr_rx.await;
         match receiver.await.context("receiver task failed")? {
             Ok(report) => {
@@ -2726,10 +2731,8 @@ fn registry_server_config(
     bind: Option<BindArg>,
     db_path: Option<PathBuf>,
 ) -> (ak_signal::server_v2::Config, Option<String>) {
-    const DEFAULT_REGISTRY_PORT: u16 =
-        ak_signal::server_v2::config::DEFAULT_V2_PORT;
-    let (listen, note) =
-        resolve_listen_addr(bind, "--bind", port, "--port", DEFAULT_REGISTRY_PORT);
+    const DEFAULT_REGISTRY_PORT: u16 = ak_signal::server_v2::config::DEFAULT_V2_PORT;
+    let (listen, note) = resolve_listen_addr(bind, "--bind", port, "--port", DEFAULT_REGISTRY_PORT);
     let config = ak_signal::server_v2::Config {
         listen,
         db_path: db_path.unwrap_or_else(|| registry_db_path(id)),
@@ -5251,14 +5254,10 @@ mod tests {
             "--long-lived"
         ])
         .is_err());
-        assert!(Cli::try_parse_from([
-            "ak-cli",
-            "invite",
-            "create",
-            "--server",
-            "127.0.0.1:7200"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["ak-cli", "invite", "create", "--server", "127.0.0.1:7200"])
+                .is_err()
+        );
         assert!(Cli::try_parse_from([
             "ak-cli",
             "invite",
@@ -5378,7 +5377,10 @@ mod tests {
         );
         assert_eq!(
             config.listen,
-            SocketAddr::from(([127, 0, 0, 1], ak_signal::server_v2::config::DEFAULT_V2_PORT))
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                ak_signal::server_v2::config::DEFAULT_V2_PORT
+            ))
         );
         let (config, note) = registry_server_config(
             &id,

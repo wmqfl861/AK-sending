@@ -60,6 +60,30 @@
 - `serve_concurrently` 无停止通道（`ak-engine`，2026-11-03）：完成条件即 `expected_jobs` 个连接全部接受并结束，没有中途停止参数；期待慢发送方的调用方应调高 `ReceiveSpec::idle_timeout`（约束每次 accept 等待），未填满的槽位以 `EngineError::IdleTimeout` 报告而非永久悬挂。
 - 存活连接迁移与路径重授权（`ak-engine`/`ak-net`，2026-11-04，INV-004）：准入与策略闸门只在连接建立时执行一次，不随存活连接的路径变化重评；重连场景（断线→新连接）已重新走钉扎＋闸门并由 `t08_reconnect_recheck` 锁定，但该测试明确不覆盖 connection migration。第十七波 F5 正在禁用 QUIC active migration（修复进行中，落地前按未禁用对待，落地证据由集成者补）；禁用后存活连接不再静默迁移对端地址，而连接迁移后的重授权机制（迁移重协商准入/路径）为后续项。
 
+## 邀请码配对安全机制（2026-11-04，第十八至二十一波）
+
+决策与契约见 [ADR-004](adr/004-invite-pairing.zh-CN.md) 与 `docs/contracts/`（pairing-flow/protocol-v2/storage-schema）；以下机制均已落地并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"第十八/十九波"至"第二十一波"节）。
+
+### 码格式与生成
+
+- 160 bit 熵：客户端以操作系统 CSPRNG（Rust `OsRng`）生成 20 字节随机，Crockford Base32 编码为 `AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` 展示格式（`AKI1` 为格式版本前缀，不计入熵）；不使用 `ak-signal::util::unique_bytes`（时钟与计数器派生工具，非密码学随机源）。解析规范化仅接受 ASCII 小写折叠与规定位置的连字符（或无分组），拒绝 Unicode 同形字符、控制字符、任意空白、错误长度与未定义符号。邀请码是 bearer credential：码泄露后持有者即具配对能力，不承诺区分"原本想邀请的人"与"窃取了码的人"。
+- 域分离双派生：`lookup_digest` 与 `auth_key` 以不同 BLAKE3 derive-key 标签（"AK invite lookup v1"/"AK invite authentication v1"）从同一 20 字节秘密派生。服务端只接收 `lookup_digest`（仅能用于受限查找，不能当配对凭证）；`auth_key` 只留在两个端点，用于配对 transcript 的 MAC。
+- 服务端不存明文：权威库 `invite_codes` 表只有 `lookup_digest`，没有也不得增加明文码、`auth_key` 或 MAC 材料；`InviteCode` 的 `Debug` 手写为掩码提示，`invite list` 不输出明文码；日志/诊断不记录邀请码、lookup 或 MAC。
+- 幂等与唯一性：claim 线性化点是唯一索引保护下的 INSERT 事务提交（SQLite `BEGIN IMMEDIATE`），同码并发 claim 最多一个成功、其余 `CODE_CONFLICT`；同 owner 同 `request_id` 同请求内容返回原结果、不同内容拒绝 `REQUEST_CONFLICT`（有界幂等记录，库表唯一约束承载）；网络超时先以原 `request_id` 重试，不直接生成新码。随机性防猜测，唯一性由权威事务保证。
+
+### 反枚举与防暴力
+
+- ghost-pending 反枚举：兑换不存在/错误/过期/撤销的码，服务端先返回与真码相同字段形状的 `InviteRedeemPending` 并在内存登记 ghost，到期限统一返回 `PAIR_UNAVAILABLE`——兑换方在等待期与失败期均无法区分"码不存在"与"码存在但不可用"（无存在性预言机）；配额拒绝在 lookup 查询前执行；owner 查询自己的列表可见真实状态。
+- 防暴力限速（双桶）：redeem 10 次/分钟/连接＋60 次/分钟全局滑动窗口；叠加 owner 维度预算（每 owner 32 个 active 码、6 次 claim/小时、32 个并发 pending 兑换）与全局 pending 4096 上限；既有帧限频（32 帧/秒、突发 64）保留。设备密钥可批量生成，设备级限速不单独承担防暴力，必须叠加全局与 owner 预算。
+- 防中间人（换钥/换码/nonce 检测）：256 字节 `PairTranscript` 绑定双方设备公钥、`code_id`/`lookup_digest`/`code_revision`、双 nonce 与期限；owner/redeemer 各自构造 `MAC(auth_key, 角色域 || transcript)`＋Ed25519 签名（覆盖 `角色域 || transcript || mac`），MAC 验证恒定时间。被入侵的协调服务替换任一侧公钥→签名验证失败（换钥检测）；交换、替换或重放其他码的 transcript/证明→MAC 验证失败（换码检测，`auth_key` 仅由码秘密派生）；nonce 重放与过期证明为独立错误变体拒绝；对已有信任，服务端返回新公钥不能静默替换本地簿记录。仅有 TLS 不足以防被入侵协调服务替换首次配对公钥，故 TLS 之上叠加该双端证明。
+- TLS-only 不降级：控制协议 v2 仅经 TLS 1.3（ALPN `ak-signal/2`）使用；服务端证书公钥即 `RegistryId`，客户端显式 pin（`--registry-fp`，持久化于身份目录 `registry.pin`），不自动接受未知 pin、不降级现有明文 TCP（v1 明文信令保留独立端口，两者无共享 socket、无降级路径）；Hello v2 签名绑定 `"AKHELLO2" || registry_id || TLS exporter || Hello 规范字段（不含 signature）`；`AuthChallenge` 只在当前 TLS 连接上使用一次、最长有效 10 秒。
+
+### 已知限制（第十八至二十一波如实声明）
+
+- ghost 兑换记录仅存内存（`server_v2`）：服务端重启后 ghost 丢失，不存在码与存在码的失败时序在重启窗口可能重新可区分；真实挂起事务本身持久化并支持重启恢复，但 ghost 形态的时序均匀性不跨重启承诺（不声称完全消除所有时序侧信道）。
+- owner 握手窗口崩溃不可恢复：owner 必须在线自动应答兑换；在事务到达 Prepared/Commit 之前 owner 进程崩溃或离线，该次事务按期限失败（redeemer 统一看到 `PAIR_UNAVAILABLE`），恢复路径只续接服务端已 Prepared/Commit/Ready 的事务，半途握手的 owner 侧不能续接，需重新发起兑换。
+- 波二十并行产物 `ak-signal::client_v2` 与 `server_v2` 在三处握手常量（ALPN/pin 语义/exporter label）上分歧，从未互跑；第二十一波 `ak-session::pairing::RegistryClient` 按服务端公共面构建绕过（差异记录于其模块文档），`ak-signal` 内两侧常量统一为后续项。
+
 ## FFI 边界（2026-11-03 契约冻结；实现已落地经 C ABI 测试；2026-11-04 第十七波修复带来契约增补、落地中）
 
 `crates/ak-ffi` 以句柄式 C ABI 向 UI 暴露引擎（决策与备选方案见 [ADR-003](adr/003-ffi-boundary.zh-CN.md)）。本节登记边界防护；实现已于第十至十二轮落地并由 C ABI 端到端测试锁定（版本/环回传输/坏 spec 反例/取消/双引擎/并发接收，见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 相应节）。第十七波修复代理带来契约增补（receive spec `expect` 必填、摘要算法未知显式拒绝、任务/检查点身份分离、冲突原子 no-replace、禁用 QUIC active migration、spec 边界校验收窄——逐项状态见 ADR-003"修复波落地中的契约增补"节，均标注修复波落地中），落地前实际语义以 `crates/ak-ffi` 当前实现为准。

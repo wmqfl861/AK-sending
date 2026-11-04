@@ -378,3 +378,12 @@ flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
 # 跨平台矩阵：android 双 ABI 十 crate 全集 check 通过；纯 Rust 子集（ak-core/wire）五 triple 全过；
 #   linux-gnu/apple 全集受阻=宿主无交叉 C 工具链（ring/blake3 cc-rs），零 E-error 属环境非代码；
 #   scripts/check_targets.sh + CI portability job（未实跑如实标注）+ TECH_SELECTION 矩阵节。
+
+## 第十六轮收官：桌面真实应用级 E2E（2026-11-04）
+# flutter test integration_test -d windows（真实窗口进程）连续全绿：主页身份卡（配对码/指纹/计数）→
+#   接收页 any 准入确认弹窗 → 监听横幅地址/指纹 → 进程内第二引擎发送 → 落盘逐字节一致 →
+#   历史页 completed 记录 → 配对页手动添加 → 主页计数 0→1（peers.book 落盘断言）。
+# 附带修复（集成者复核通过）：refreshIdentity 微任务跳变避开 build 相 setState 崩溃（仅 debug 可见）；
+#   defaultIdentityDir 增 AK_ID_DIR 测试注入（tier-0）。诚实发现：引擎接收侧无自动 TOFU，
+#   配对页'自动记入'文案为前瞻——测试按手动路径断言，文案修正列入待办。
+# 收官回归：Rust 450/0 + clippy 干净；Dart 85/85 + analyze 干净；Flutter 84/84 + analyze 干净；repo check + 12 Python OK。

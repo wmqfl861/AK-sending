@@ -346,3 +346,12 @@ Dart: dart test 76/76（identityInfo/jobsList/expect:book 真实 DLL 7 项新增
 Flutter: analyze 零 issue；flutter test 59/59（身份卡真数据/created 提示/历史加载刷新/book 透传与空簿文案）；
 flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
 # 集成：AkEngineDartFacade 两处切换为真实 engine.identityInfo/jobsList 调用（UI 代理预留的一行切换点）
+
+## 第十三轮进行中证据（2026-11-04）
+# Windows GUI 首次真实启动取证：target/windows_gui_first_launch.png（293KB 全屏截图），
+#   经视觉模型核验：五页导航（主页/接收/发送/历史/关于）、身份卡完整渲染——
+#   设备名 HK575168、指纹 b6998f27、配对码 146-778 大号展示、'首次已创建身份'提示、
+#   状态点'就绪'、已配对设备 0 台、接收/发送快速入口；无白屏/崩溃/错版。
+#   （注意：主题为浅色而非深色——视觉核验发现与任务描述不符处，界面本身正常。）
+# Android：apk-debug.apk 161MB 构建成功，libak_ffi.so 双 ABI 在包内（x86_64 4.3MB + arm64 3.7MB）；
+#   系统镜像首次下载 zip 损坏已定位（unknown archive @33%），带校验重试循环重装中。

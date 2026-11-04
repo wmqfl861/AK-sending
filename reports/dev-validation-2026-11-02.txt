@@ -470,3 +470,5 @@ t09 冲突测试重写为'相同内容幂等（无(2)副本）+真实内容差�
 $ cargo test --workspace → 507 passed / 0 failed（基线 450 → +57）
 $ cargo clippy --workspace --all-targets -- -D warnings → 干净
 $ dart test → 85/85；$ flutter test → 84/84；repo check → passed
+
+5 GiB release 回归（十七波修复后）: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 236.73s

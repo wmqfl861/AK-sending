@@ -1,7 +1,7 @@
 # AK-sending 完整项目审核报告（Codex / gpt-6-astra / reasoning=max，2026-11-04）
 
-> 只读审核；静态代码结论，未运行构建/测试。审核范围：全部 12 个 Rust crate + 依赖链 + 文档证据链。
-> 本文件为审核原文归档；修复立项见同日提交与后续验证记录。
+> 只读审核；静态代码结论，未运行构建/测试。范围：12 个 Rust crate + 依赖链 + 文档证据链。
+> 审核原文归档；修复立项见同日后续提交。
 
 本轮只读审阅了 `ak-engine`、`ak-wire`，并沿调用链核对 `ak-storage`、`ak-store`、`ak-core` 与相关 `ak-itests`。没有修改文件，没有运行构建、测试或动态攻击；以下均为静态代码结论。
 
@@ -72,16 +72,3 @@
 | `t08_reconnect_recheck` | 旧端口有界失败、新端口不同、job id 不变、恢复块数≥1、指纹相同、最终目录逐字节一致 | 真实 QUIC 环回重连测试；未验证 live migration，文件头已如实声明 |
 
 所有上述“测试质量”结论来自阅读断言，**本轮未重跑这些测试**。
-
----
-
-确认存在取消未收敛的问题，建议定为 **P2**，准确范围是取消状态提前发布、监听与部分多流子任务暂时存活；不能说取消后会无限传输或由后台任务完成最终提交。
-
-- `crates/ak-ffi/src/core.rs:1123` 调用 `entry.handle.abort()`，随后 `:1128`–`:1138` 立即发布 `cancelled by caller`，没有等待任务真正退出。Tokio abort 是安排取消，不是同步等待清理完成。
-- `crates/ak-net/src/lib.rs:621` 的 `DirectChannel` 没有 `Drop` 实现，只有显式 `close()`（`:659`）。我读取了 `Cargo.lock` 锁定的 **quinn 0.11.12** 本机依赖源；其 `connection.rs:292`–`:295` 明确规定，必须所有 Connection 和各类 stream 引用都被释放才自动关闭连接；`RecvStream` 和 `SendStream` 都持有 `ConnectionRef`。因此丢掉外层 `DirectChannel` 无法立即关闭仍由子任务持有的连接。
-- `serve_concurrently` 在 `crates/ak-engine/src/lib.rs:2013` 丢弃接受任务的 JoinHandle。取消外层任务后，接受任务仍拥有 endpoint，并继续当前 `accept_within`；直到有连接到达或超时，向已关闭的 `channel_tx` 发送才退出。默认剩余时间最多约 30 秒，因此取消后立即用同端口重新开始接收可能遇到地址占用。这里的超时由 `ak-net/src/lib.rs:510` 明确约束，不是永久残留监听。
-- 多流文件任务由 `ak-engine/src/lib.rs:2465` 独立 spawn，拥有 `DirectStream` 与 `LocalFileSink`。父任务退出后，它可以继续当前一轮接收、`:2491` 写块及 `:2494` ACK，随后在 `:2507`–`:2515` 向已经关闭的事件通道发送时发现失败并结束。**父 `receive_job` 已被实际销毁之后，每个这种子任务最多继续当前一轮块处理；不能声称它会无限写入。** `job_cancel()` 返回到父任务实际退出之间还有调度延迟，因此 API 返回时也没有立即静止保证。
-- 多流控制读取任务 `:2298` 同样分离，会持续到下一个控制消息或 idle 超时。
-- 最终 `sink.finish()`、`completed` 保存、FinalAck 位于父 `receive_job` 的 `:1838`–`:1862`，这些分离的文件子任务没有最终提交调用。因此没有证据支持“被取消后分离任务仍能独立完成全部提交”。正在执行的同步文件操作也不能被 Tokio abort 立即打断，应将这个一般性的取消时序边界与分离子任务问题区分开。
-
-建议让监听、控制流和数据流子任务属于同一个受管理的取消域，保存 JoinHandle/使用 JoinSet，取消时显式关闭连接、停止接受并等待子任务退出，最后才发布稳定的 `cancelled` 结果。适合的验证是“取消返回并报告终态后端口能立即复用，且 `.akpart` 大小不再变化”；本次没有新增实验或修改文件。

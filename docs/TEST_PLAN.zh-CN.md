@@ -23,11 +23,13 @@
 
 100 GB/十万文件是测试样本，不是产品上限；手机按实际容量安排大文件样本。
 
-## 自动化覆盖映射（截至 2026-11-03，环回 L2 形态）
+## 自动化覆盖映射（截至 2026-11-04，环回 L2 形态）
 
-本节如实记录截至 2026-11-03（含第八轮并行开发补充）各 T 编号落入自动化测试的位置，执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 与 [开发总结](../reports/DEV_SUMMARY.zh-CN.md)。2026-11-03 复测：`cargo test --workspace` 417 项通过、0 失败、5 项 ignored；`cargo test -p ak-store --features sqlite` 26 项通过；clippy `--workspace --all-targets -- -D warnings` 与 sqlite 特性双配置零警告。所有自动化测试均为进程内环回形态：单机、QUIC over UDP 环回/本机网卡、真实文件系统。上表中的通过标准凡未列入下表"已自动化"的部分仍是计划。跨 crate 场景测试统一位于 `crates/ak-itests`（每个测试文件对应若干 T 编号，现含 T02/T03/T04/T05/T06/T07/T08/T09/T10/T11/T13 的环回形态、两个信息性吞吐/块尺寸基准与产品全流程 e2e 四幕），下表按 crate 内单测/集成测现状标注。
+本节如实记录截至 2026-11-04（含第八轮并行开发补充与第十三轮安卓平台波）各 T 编号落入自动化测试的位置，执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 与 [开发总结](../reports/DEV_SUMMARY.zh-CN.md)。2026-11-03 复测：`cargo test --workspace` 417 项通过、0 失败、5 项 ignored；`cargo test -p ak-store --features sqlite` 26 项通过；clippy `--workspace --all-targets -- -D warnings` 与 sqlite 特性双配置零警告。第十二轮后 workspace 复测 430 项通过（见验证记录"第十二轮验证"节）。所有自动化测试均为进程内环回形态：单机、QUIC over UDP 环回/本机网卡、真实文件系统。上表中的通过标准凡未列入下表"已自动化"的部分仍是计划。跨 crate 场景测试统一位于 `crates/ak-itests`（每个测试文件对应若干 T 编号，现含 T02/T03/T04/T05/T06/T07/T08/T09/T10/T11/T13 的环回形态、两个信息性吞吐/块尺寸基准与产品全流程 e2e 四幕），下表按 crate 内单测/集成测现状标注。
 
 workspace 默认排除的 5 项 `#[ignore]` release 深测（均已于 release 形态执行通过，见验证记录）：`ak-engine five_gib_sparse_file_transfers_with_u64_offsets`（5 GiB 稀疏，首跑 73.68s，回归 95.96s/84.3s/111.49s）；`ak-itests bench_throughput`（512 MiB×2）；`ak-itests bench_chunk_sweep`（256 MiB×8）；`ak-itests t13_many_files` 的 20,000 文件规模变体（328s，空闲机刷新 263.7s）与 65,537 文件边界变体（257 页清单，完成）。
+
+第十三轮（2026-11-04，安卓移植波）：`flutter test` 66/66 覆盖安卓平台适配（服务/页面层——tier-0 so 加载决策、身份目录异步门控、Download 输出链与接收页预填；L1 形态，不涉真实跨设备传输）；`apk-debug.apk` 161MB 构建成功、双 ABI `libak_ffi.so` 在包内属构建事实，不构成任何 T 编号通过；T16 安卓端装机与互通验证待模拟器系统镜像重装完成后执行（见下表 T16 行）。
 
 | 编号 | 自动化状态 | 测试位置 | 层级 |
 |---|---|---|---|
@@ -46,9 +48,9 @@ workspace 默认排除的 5 项 `#[ignore]` release 深测（均已于 release �
 | T13 | 部分 | `ak-core` `manifest_pages_are_bounded_and_ordered`、`empty_manifest_has_one_empty_page`、`directory_entries_carry_no_digests_and_do_not_count_bytes`；`ak-wire` `manifest_page_round_trip_*` 系列、`rejects_entry_count_over_limit`。环回缩样见 `crates/ak-itests/tests/t13_many_files.rs`：2,000 文件、4,097 条目边界（第二轮缺陷回归）与 20,000 文件 release（328s，第六轮空闲机刷新 263.7s）；ResumeRequest 多帧分页（第四轮）后 100,000 条目分片单元验证（2 片 65,535＋34,465 全量按序到达）、65,537 文件 release 边界实测完成（257 页清单）。十万文件规模与端到端取消未自动化（带内 Pause/Resume 已于第二轮实现；通过标准中的界面取消依赖未开始的 UI 层） | L1＋L2（环回） |
 | T14 | 部分 | 通用字节保真：`ak-engine` `loopback_directory_transfer_is_byte_identical`、`ak-storage` `write_all_chunks_then_finish_commits_identical_file`。相册原件/HEVC/HDR/Live Photo 及跨系统元数据保留未测（无平台适配层） | L2（环回，仅通用字节） |
 | T15 | 未覆盖 | 无平台生命周期代码 | — |
-| T16 | 未覆盖 | 仅 Windows 本机环回（`ak-cli` 命令行原型）；五端矩阵未开始 | — |
+| T16 | 未覆盖 | 仅 Windows 本机环回（`ak-cli` 命令行原型＋Flutter Windows GUI 单机验证）。第十三轮起安卓端已能构建（`flutter build apk` 成功、双 ABI so 在包内），装机与互通验证待模拟器就绪——构建就绪不等于互通通过，20 个有向组合仍无一执行 | — |
 
-明确声明：截至 2026-11-03，**没有任何 L3/L4 验证被执行**——无真机、无跨网段/真实 NAT、无服务器端抓包；dev-validation 中的双进程 probe 与 T03/T07 场景测试同为单机环回＋本机网卡形态；环回吞吐基准（单流 97.9 / 多流 103.3 MiB/s）是引擎自身效率对照，不代表真实网卡吞吐。"部分"表示场景仅局部或间接自动化，不等于场景通过。
+明确声明：截至 2026-11-04，**没有任何 L3/L4 验证被执行**——无真机、无跨网段/真实 NAT、无服务器端抓包、无跨设备（含模拟器↔主机）互通组合；dev-validation 中的双进程 probe 与 T03/T07 场景测试同为单机环回＋本机网卡形态；环回吞吐基准（单流 97.9 / 多流 103.3 MiB/s）是引擎自身效率对照，不代表真实网卡吞吐。"部分"表示场景仅局部或间接自动化，不等于场景通过。
 
 ## 证明服务器不传文件
 

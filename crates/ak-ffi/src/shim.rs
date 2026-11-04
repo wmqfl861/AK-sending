@@ -494,6 +494,181 @@ pub extern "C" fn ak_jobs_list(
     }
 }
 
+/// Write the paired-peers JSON array for `id_dir` (UTF-8 + NUL) into `buf`:
+/// one element per `<id_dir>/peers.book` entry, sorted by fingerprint (the
+/// schema is in the crate header). A missing book is `[]`; a corrupt book
+/// is `AK_ERR_INVALID` with a "cannot load peer book" message. Reads never
+/// create anything on disk.
+///
+/// `engine` is reserved and never dereferenced; it may be null.
+///
+/// Returns `AK_DONE` (1) when the array was written, `AK_ERR_NULL` for null
+/// pointer arguments, `AK_ERR_INVALID` for an empty/unusable `id_dir` or a
+/// corrupt book, or `AK_ERR_BUFFER` when the whole array does not fit —
+/// nothing is consumed; re-issue the call with a larger `cap` (the
+/// last-error message names the needed size).
+#[no_mangle]
+pub extern "C" fn ak_peer_list(
+    engine: *mut AkEngine,
+    id_dir: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let _ = engine;
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
+    // to this call, matching the caller's buffer lifetime.
+    let id_dir = match unsafe { read_cstr(id_dir) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| core::peer_list_json(id_dir)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: write_cstr checks null/bounds itself and writes only
+            // within the caller-provided capacity.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the peer list JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Pair (or rename) one peer in `<id_dir>/peers.book` and write the new
+/// peer count JSON `{"peers":N}` (UTF-8 + NUL) into `buf`.
+///
+/// `fingerprint_hex` must be exactly 64 hex characters. `name` is the one
+/// OPTIONAL string argument of this ABI: null or empty means "no name
+/// given" (the CLI's `pair add <fingerprint>`); a new peer is then stored
+/// as "(unnamed)", and an already-paired fingerprint keeps its record
+/// untouched — with a name it is renamed while keeping its original
+/// `paired_unix_ms` (CLI TOFU semantics, so `AK_ERR_BUFFER` retries are
+/// idempotent). Names with control characters are refused. The book is
+/// saved atomically.
+///
+/// `engine` is reserved and never dereferenced; it may be null.
+///
+/// Returns `AK_DONE` (1) with the count JSON, `AK_ERR_NULL` for null
+/// pointer arguments (`buf` included — checked before anything is
+/// persisted), `AK_ERR_INVALID` for a bad fingerprint/name, an empty
+/// `id_dir`, or a corrupt book, `AK_ERR_BUFFER` when the count JSON does
+/// not fit (checked BEFORE the save: nothing was persisted; retry with a
+/// larger `cap`), or `AK_ERR_INTERNAL` when the save fails.
+#[no_mangle]
+pub extern "C" fn ak_peer_add(
+    engine: *mut AkEngine,
+    id_dir: *const c_char,
+    fingerprint_hex: *const c_char,
+    name: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let _ = engine;
+    if buf.is_null() {
+        core::set_last_error("buf argument is null");
+        return AK_ERR_NULL;
+    }
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
+    // to this call, matching the caller's buffer lifetime.
+    let id_dir = match unsafe { read_cstr(id_dir) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: same non-null + UTF-8 contract as id_dir.
+    let fingerprint_hex = match unsafe { read_cstr(fingerprint_hex) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    // `name` is optional (see the doc comment): null means "no name", it is
+    // not an error. SAFETY: the null case is filtered above; read_cstr then
+    // verifies UTF-8 for the non-null case, borrow confined to this call.
+    let name = if name.is_null() {
+        None
+    } else {
+        match unsafe { read_cstr(name) } {
+            Ok(text) => Some(text),
+            Err(error) => return fail(error),
+        }
+    };
+    match guarded(move || core::peer_add(id_dir, fingerprint_hex, name, cap)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: core pre-flighted `cap` against this exact JSON, so
+            // the write fits by construction; write_cstr still re-checks.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the peer count JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
+/// Remove one paired fingerprint from `<id_dir>/peers.book` and write the
+/// remaining peer count JSON `{"peers":N}` (UTF-8 + NUL) into `buf`. The
+/// book is saved atomically.
+///
+/// `engine` is reserved and never dereferenced; it may be null.
+///
+/// Returns `AK_DONE` (1) with the count JSON, `AK_ERR_NOT_FOUND` when the
+/// fingerprint is not in the book (a missing book has no peers, so it is
+/// the same `-4`; the last-error buffer carries the hint), `AK_ERR_NULL`
+/// for null pointer arguments (`buf` checked before anything is
+/// persisted), `AK_ERR_INVALID` for a bad fingerprint (64 hex required,
+/// like add), an empty `id_dir`, or a corrupt book, `AK_ERR_BUFFER` when
+/// the count JSON does not fit (BEFORE the save: nothing was removed;
+/// retry with a larger `cap`), or `AK_ERR_INTERNAL` when the save fails.
+#[no_mangle]
+pub extern "C" fn ak_peer_remove(
+    engine: *mut AkEngine,
+    id_dir: *const c_char,
+    fingerprint_hex: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    core::clear_last_error();
+    let _ = engine;
+    if buf.is_null() {
+        core::set_last_error("buf argument is null");
+        return AK_ERR_NULL;
+    }
+    // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
+    // to this call, matching the caller's buffer lifetime.
+    let id_dir = match unsafe { read_cstr(id_dir) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    // SAFETY: same non-null + UTF-8 contract as id_dir.
+    let fingerprint_hex = match unsafe { read_cstr(fingerprint_hex) } {
+        Ok(text) => text,
+        Err(error) => return fail(error),
+    };
+    match guarded(move || core::peer_remove(id_dir, fingerprint_hex, cap)) {
+        Ok(json) => match unsafe { write_cstr(buf, cap, &json) } {
+            // SAFETY: core pre-flighted `cap` against this exact JSON, so
+            // the write fits by construction; write_cstr still re-checks.
+            Ok(_) => AK_DONE,
+            Err(WriteError::TooSmall { need, capacity }) => {
+                fail_buffer(need, capacity, "the peer count JSON")
+            }
+            Err(WriteError::NullBuffer) => {
+                core::set_last_error("buf argument is null");
+                AK_ERR_NULL
+            }
+        },
+        Err(error) => fail(error),
+    }
+}
+
 /// Write the library version string (UTF-8 + NUL) into `buf`, e.g.
 /// `ak-ffi 1 (wire v1, caps 0x0007)`. Returns the written byte length
 /// (excluding the NUL), `AK_ERR_NULL`, or `AK_ERR_BUFFER`.

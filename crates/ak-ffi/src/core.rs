@@ -36,7 +36,9 @@ use ak_engine::{
     SendSpec,
 };
 use ak_identity::tls::{make_self_signed, TlsBundle};
-use ak_identity::{pairing_code, verify_pairing_code, DeviceKeyPair, Fingerprint, PeerBook};
+use ak_identity::{
+    pairing_code, verify_pairing_code, DeviceKeyPair, Fingerprint, PeerBook, PeerRecord,
+};
 use ak_store::{CheckpointStore, Direction, FileCheckpointStore};
 
 // ---------------------------------------------------------------------------
@@ -259,6 +261,176 @@ pub fn jobs_list_json(id_dir: &str) -> Result<String, FfiError> {
     }
     out.push(']');
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Peer book management (safe layer behind `ak_peer_list`, `ak_peer_add`,
+// and `ak_peer_remove`; the same `<id_dir>/peers.book` the CLI's `pair`
+// subcommands and the `expect: "book"` admission policy read and write).
+// ---------------------------------------------------------------------------
+
+/// Stored name for a peer paired without one (the CLI renders empty names
+/// this way in `pair list`; the FFI bakes it in at write time).
+const UNNAMED_PEER: &str = "(unnamed)";
+
+/// Current wall clock in Unix milliseconds (mirrors the CLI helper).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The count JSON the writers return: `{"peers":N}` with the book size
+/// after the operation.
+fn peers_count_json(peers: usize) -> String {
+    format!("{{\"peers\":{peers}}}")
+}
+
+/// The retryable buffer error for the writers. Raised BEFORE anything is
+/// persisted, so `AK_ERR_BUFFER` leaves the book untouched; the message
+/// mirrors the shim's capacity-hint wording.
+fn buffer_too_small(need: usize, capacity: usize, what: &str) -> FfiError {
+    FfiError {
+        code: AK_ERR_BUFFER,
+        message: format!(
+            "buffer too small for {what}: need {need} bytes including the NUL terminator \
+             (capacity {capacity}); retry with a larger buffer"
+        ),
+    }
+}
+
+/// Load `<id_dir>/peers.book` with the CLI convention: a missing file is a
+/// fresh empty book, a corrupt file is a load error ("cannot load peer
+/// book"), an empty `id_dir` is invalid.
+fn load_peer_book(id_dir: &str) -> Result<(PathBuf, PeerBook), FfiError> {
+    if id_dir.is_empty() {
+        return Err(FfiError::invalid("id_dir must be a non-empty path"));
+    }
+    let path = PathBuf::from(id_dir).join("peers.book");
+    match PeerBook::load(&path) {
+        Ok(book) => Ok((path, book)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((path, PeerBook::default()))
+        }
+        Err(error) => Err(FfiError::invalid(format!(
+            "cannot load peer book {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Render the paired-peers JSON for `id_dir` (schema in the crate header):
+/// one element per book entry, sorted by fingerprint, names reported as
+/// stored. A missing book is `[]`; a corrupt one is a load error. The whole
+/// array is rendered before any buffer write, so an `AK_ERR_BUFFER` retry
+/// is simply a fresh, lossless call.
+pub fn peer_list_json(id_dir: &str) -> Result<String, FfiError> {
+    let (_path, book) = load_peer_book(id_dir)?;
+    let mut records: Vec<&PeerRecord> = book.iter().collect();
+    records.sort_by_key(|record| *record.fingerprint.as_bytes());
+    let mut out = String::from("[");
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"fingerprint\":\"{}\",\"name\":{},\"paired_unix_ms\":{}}}",
+            record.fingerprint.to_hex(),
+            json::quoted(&record.name),
+            record.paired_unix_ms
+        ));
+    }
+    out.push(']');
+    Ok(out)
+}
+
+/// Pair (or rename) one peer in `<id_dir>/peers.book` and return the new
+/// peer count JSON. Semantics mirror the CLI's TOFU `pair add`:
+///
+/// - an existing fingerprint keeps its original `paired_unix_ms`: a given
+///   name renames the entry, no name (null or empty) leaves the record
+///   untouched — so re-running an add is always idempotent;
+/// - a NEW peer without a name is stored as "(unnamed)";
+/// - names must not contain control characters (rejected, never
+///   sanitized) and are capped like every ABI string.
+///
+/// `cap` is the caller's buffer capacity: the count JSON is pre-flighted
+/// against it BEFORE the save, so `AK_ERR_BUFFER` persists nothing and the
+/// retry is a fresh call. A save failure is `AK_ERR_INTERNAL`.
+pub fn peer_add(
+    id_dir: &str,
+    fingerprint_hex: &str,
+    name: Option<&str>,
+    cap: usize,
+) -> Result<String, FfiError> {
+    let fingerprint = Fingerprint::from_hex(fingerprint_hex)
+        .ok_or_else(|| FfiError::invalid("fingerprint_hex must be 64 hex characters"))?;
+    let name = name.filter(|text| !text.is_empty());
+    if let Some(text) = name {
+        if text.bytes().any(|byte| byte < 0x20) {
+            return Err(FfiError::invalid(
+                "name must not contain control characters",
+            ));
+        }
+        if text.len() > json::MAX_STRING_BYTES {
+            return Err(FfiError::invalid(format!(
+                "name must be at most {} bytes",
+                json::MAX_STRING_BYTES
+            )));
+        }
+    }
+    let (path, mut book) = load_peer_book(id_dir)?;
+    match (book.get(&fingerprint), name) {
+        (Some(existing), Some(name)) => {
+            let paired_unix_ms = existing.paired_unix_ms;
+            book.upsert(PeerRecord {
+                fingerprint,
+                name: name.to_owned(),
+                paired_unix_ms,
+            });
+        }
+        (Some(_), None) => {}
+        (None, name) => book.upsert(PeerRecord {
+            fingerprint,
+            name: name.unwrap_or(UNNAMED_PEER).to_owned(),
+            paired_unix_ms: now_unix_ms(),
+        }),
+    }
+    let json = peers_count_json(book.iter().count());
+    if json.len() + 1 > cap {
+        return Err(buffer_too_small(json.len() + 1, cap, "the peer count JSON"));
+    }
+    book.save(&path).map_err(|error| {
+        FfiError::internal(format!("cannot save peer book {}: {error}", path.display()))
+    })?;
+    Ok(json)
+}
+
+/// Remove one paired fingerprint from `<id_dir>/peers.book` and return the
+/// remaining peer count JSON. A fingerprint not in the book (including a
+/// missing book) is `AK_ERR_NOT_FOUND`; a corrupt book is a load error.
+/// Like [`peer_add`], the count JSON is pre-flighted against `cap` before
+/// anything is persisted, so `AK_ERR_BUFFER` removes nothing.
+pub fn peer_remove(id_dir: &str, fingerprint_hex: &str, cap: usize) -> Result<String, FfiError> {
+    let fingerprint = Fingerprint::from_hex(fingerprint_hex)
+        .ok_or_else(|| FfiError::invalid("fingerprint_hex must be 64 hex characters"))?;
+    let (path, mut book) = load_peer_book(id_dir)?;
+    if !book.remove(&fingerprint) {
+        return Err(FfiError::not_found(format!(
+            "fingerprint {} is not in the peer book {}; nothing removed (see ak_peer_list)",
+            fingerprint.short_id(),
+            path.display()
+        )));
+    }
+    let json = peers_count_json(book.iter().count());
+    if json.len() + 1 > cap {
+        return Err(buffer_too_small(json.len() + 1, cap, "the peer count JSON"));
+    }
+    book.save(&path).map_err(|error| {
+        FfiError::internal(format!("cannot save peer book {}: {error}", path.display()))
+    })?;
+    Ok(json)
 }
 
 // ---------------------------------------------------------------------------

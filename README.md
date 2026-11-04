@@ -19,7 +19,8 @@
 - 2026-11-03（第四轮，同分支）：ResumeRequest 多帧分页解除单任务条目上限（65,537 文件 release 实测）、SQLite 检查点可选后端（特性 sqlite，默认依赖图零泄漏）、连接统计 API（tx/rx 字节/帧数/丢包，无中继运行时旁证）、T06 身份替换与 T08 端口变更重钉扎续传场景自动化。第四轮后 workspace 338 项测试通过（含 sqlite 特性 +23）、clippy 双配置全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第四轮节。
 - 2026-11-03（第五轮，同分支）：DirectPolicy 策略闸门接入真实通道（`--no-internet`，非本地路径零字节进入协议）、`ak-cli doctor` 环境自检、发送端 14 错误码友好映射、块尺寸扫描基准（64KiB 最差 -23%）。第五轮后 workspace 364 项测试通过。
 - 2026-11-03（第六至八轮，同分支）：并发接收（`serve_concurrently` + `receive --jobs N`）、IPv6 双栈端点与 `probe --dual-stack`、长文件名 part 短名回退（NTFS 255 上限真实缺陷修复）、`probe --json` 与 `pair export`/`import`（AKPAIR1，无私钥）、信令对抗加固（TCP 模糊/STUN 洪泛/限频旁路全存活，Hello 设备名控制字符注入修复）、产品全流程 e2e 四幕（配对准入/中断续传/并发接收/信令关停后直传照常）、CLI `completions`/`jobs status`/`--bind`/`--stun-bind`。第八轮后 workspace 417 项测试通过（＋sqlite 特性 26）、clippy 全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第六/七、八轮节。
-- 仍未完成（如实标注）：跨机器/跨网段真实传输、NAT 穿透实测、抓包级无中继证明（L3）、Flutter 五端 UI、移动原生适配、真机验收。当前全部验证为本机环回（L2 形态）。
+- 2026-11-04（第十三轮，安卓移植波，同分支；承接第十至十二轮 ak-ffi/Dart 绑定/Flutter Windows 桌面端）：双 ABI 交叉编译脚本（llvm-nm 符号验证）＋flutter_app 安卓平台（INTERNET 权限/minSdk 24/tier-0 so 加载/身份目录异步/Download 输出链），flutter test 66/66；APK 构建成功（161MB debug、双 ABI so 在包内，装机待验）；Windows GUI 首启截图核验通过；AVD 装机与跨设备传输进行中（系统镜像重装中）。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第十三轮节。
+- 仍未完成（如实标注）：跨机器/跨网段真实传输、NAT 穿透实测、抓包级无中继证明（L3）、Flutter 五端 UI（Windows 桌面与安卓壳已就位，macOS/Linux/iOS 未开始）、移动原生适配（mDNS/SAF/后台）、真机验收。当前全部验证为本机环回（L2 形态）。
 - 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
 ## 产品原则
@@ -77,6 +78,13 @@ cargo run -p ak-cli -- probe --server IP:7100 --peer <对端指纹64hex> [--no-s
 cargo run -p ak-cli -- bench [--bytes N] [--files N] [--chunk-kb N] [--multistream] [--once] [--json]  # 进程内环回吞吐基准（默认单流 vs 多流各一轮并对比）
 cargo run -p ak-cli -- doctor [--stun IP:PORT] [--mdns-seconds N] [--json]  # 环境自检（身份/网络/UDP 绑定/mDNS/可选 STUN/磁盘余量）
 cargo run -p ak-cli -- completions bash|zsh|fish|powershell  # 生成 shell 补全脚本（stdout，自行管道到补全目录）
+```
+
+安卓端（先产引擎 so 再打包 APK；前置、目录布局与故障排查见 [Android 交叉编译指南](docs/ANDROID_BUILD.zh-CN.md)）：
+
+```sh
+bash scripts/build_android_ffi.sh   # 交叉编译 x86_64+arm64 双 ABI libak_ffi.so 放入 jniLibs（含 llvm-nm 符号验证）
+cd flutter_app && flutter build apk --debug
 ```
 
 首次初始化空仓库可使用 [发布说明](docs/PUBLISHING.zh-CN.md) 及 `scripts/publish.ps1`；脚本不包含凭据、不强推，也不处理已有提交的仓库。

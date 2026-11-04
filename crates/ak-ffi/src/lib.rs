@@ -30,12 +30,12 @@
 //! | code | meaning |
 //! |------|---------|
 //! | `0`  | ok (`ak_poll_progress`: no event pending; `ak_job_result`: still running) |
-//! | `1`  | `ak_poll_progress`: one event written / `ak_job_result`: finished ok / `ak_identity_info` + `ak_jobs_list`: JSON written |
+//! | `1`  | `ak_poll_progress`: one event written / `ak_job_result`: finished ok / `ak_identity_info`, `ak_jobs_list`, `ak_peer_list`, `ak_peer_add`, `ak_peer_remove`: JSON written |
 //! | `2`  | `ak_job_result`: finished with an error (error JSON written) |
 //! | `-1` | `AK_ERR_NULL`: a required pointer argument was null |
 //! | `-2` | `AK_ERR_INVALID`: malformed JSON, wrong field type, failed validation |
 //! | `-3` | `AK_ERR_BUFFER`: caller buffer too small — nothing was consumed, retry with a larger cap (the last-error message names the needed size) |
-//! | `-4` | `AK_ERR_NOT_FOUND`: unknown job id |
+//! | `-4` | `AK_ERR_NOT_FOUND`: unknown job id / paired fingerprint |
 //! | `-5` | `AK_ERR_INTERNAL`: lock poisoning, runtime failure, panic |
 //!
 //! # spec JSON schemas
@@ -166,6 +166,51 @@
 //! is empty when a record has no peer; `root` is the source root (send) or
 //! destination (receive).
 //!
+//! # peer book management JSON (`ak_peer_list` / `ak_peer_add` / `ak_peer_remove`)
+//!
+//! The paired-peer book at `<id_dir>/peers.book` — the same file the CLI's
+//! `pair` subcommands and the `expect: "book"` admission policy use — is
+//! managed through three calls. `engine` is reserved on all three (like
+//! `ak_identity_info`); they answer from disk, never from engine state.
+//!
+//! `ak_peer_list(e, id_dir, buf, cap)` writes on status `1`: one element
+//! per paired peer, sorted by fingerprint. A missing book is `[]`; a
+//! corrupt book is `AK_ERR_INVALID` with a "cannot load peer book"
+//! message; reads never create anything on disk. Names are reported as
+//! stored (a peer the CLI paired without a name has `""`; this API's own
+//! add stores "(unnamed)", see below):
+//!
+//! ```json
+//! [{"fingerprint":"<64 hex>","name":"laptop","paired_unix_ms":1730000000000}]
+//! ```
+//!
+//! `ak_peer_add(e, id_dir, fingerprint_hex, name, buf, cap)` pairs one
+//! peer (or renames it) and writes `{"peers":N}` with the new peer count
+//! on status `1`. Semantics aligned with the CLI's TOFU `pair add`:
+//!
+//! - `fingerprint_hex` must be exactly 64 hex characters (else `-2`);
+//! - `name` is the ABI's one OPTIONAL string argument: null or empty means
+//!   "no name given". A NEW peer is then stored as "(unnamed)". Re-adding
+//!   an existing fingerprint with a name renames it but KEEPS the original
+//!   `paired_unix_ms`; re-adding without a name leaves the record
+//!   untouched. The call is therefore idempotent;
+//! - names must not contain control characters and are capped at 4096
+//!   bytes (the ABI-wide string cap), else `-2` (rejected, never
+//!   sanitized);
+//! - the book is saved atomically (temp file + rename); a save failure is
+//!   `-5`.
+//!
+//! `ak_peer_remove(e, id_dir, fingerprint_hex, buf, cap)` deletes one
+//! paired peer and writes `{"peers":N}`. A fingerprint not in the book
+//! (a missing book has no peers, so it is the same case) is
+//! `AK_ERR_NOT_FOUND` (`-4`) with a hint in the last-error buffer; a bad
+//! fingerprint is `-2` like on add; the save rules match add.
+//!
+//! On both writers an `AK_ERR_BUFFER` (`-3`) is raised BEFORE anything is
+//! persisted — nothing was consumed, retry with a larger cap (the
+//! last-error message names the needed size); a null `buf` is `-1`, also
+//! checked before any write to disk.
+//!
 //! NOT yet wired to any frontend: verified by Rust-side tests that drive
 //! the C ABI end-to-end (real loopback transfers through the boundary).
 
@@ -178,5 +223,6 @@ pub use crate::core::{
 };
 pub use crate::shim::{
     ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,
-    ak_job_result, ak_jobs_list, ak_poll_progress, ak_receive_start, ak_send_start, ak_version,
+    ak_job_result, ak_jobs_list, ak_peer_add, ak_peer_list, ak_peer_remove, ak_poll_progress,
+    ak_receive_start, ak_send_start, ak_version,
 };

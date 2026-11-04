@@ -99,6 +99,17 @@
 - [x] ak_ffi_dart 接 identityInfo/jobsList/book（真实 DLL 76/76：簿准入 e2e 接受配对端、空簿 "pair first"、指纹互 pin 环回即证一致性）。
 - [x] Flutter 接线：身份卡真数据（created 提示/已配对设备数）、book 准入直达引擎（错误透传）、历史页真实列表（peer 短式+root）；Facade 切换真实调用；flutter test 59/59 + build windows 成功 + 打包含 UI。剩余如实：发送侧前缀→簿补全仍本地拒绝（后绪项）。
 
+第十三轮（2026-11-04，安卓移植波，提交 `834f42a`＋`6ea65f0` 证据记录；证据见 reports/dev-validation-2026-11-02.txt"第十三轮进行中证据"节与 docs/ANDROID_BUILD.zh-CN.md）：
+
+- [x] 双 ABI 交叉编译脚本＋符号验证（安卓构建侧前置）：`scripts/build_android_ffi.sh` 纯环境变量 linker 方案（不新增 `.cargo/config.toml`），一次构建 x86_64-linux-android＋aarch64-linux-android（NDK 28.2，Windows 主机），产物复制进 jniLibs 并以 NDK `llvm-nm -D --defined-only` 抽查冻结符号（ak_engine_new/ak_identity_info/ak_jobs_list）、target 与 jniLibs 两处 SHA-256 一致。产物哈希：x86_64 5,664,296 字节 `6d92792e546fb6f085723d42883e5ea599ee1c0fde8d3e5c4003d54cc392e7a2`；arm64-v8a 5,557,928 字节 `c7f1eaa04bbeb9b55e288af0b502e26d78bf8e6a91914c0dd29168c5026a58cb`。符号验证属静态产物检查，不等价真机运行验证（ANDROID_BUILD 文档标记约定）。
+- [x] flutter_app 安卓平台（P1-04 安卓首端；P0-06 代码侧）：INTERNET 权限（LAN 直传必需，release 只从 main manifest 获得）、minSdk 24（与 NDK clang 的 android24 目标三元组对齐）、tier-0 `libak_ffi.so` 加载（System.loadLibrary 语义，桌面三级 DLL 探测全部跳过）、path_provider 身份目录异步解析（`<应用支持目录>/.ak-sending`，首次引擎读取前等待解析完成）、应用专属 Download 输出链（getDownloadsDirectory → getExternalStorageDirectory+`Download/` → 文档目录+`Download/`；公共 Downloads 导出留待 SAF/MediaStore 后续波次）；flutter test 66/66、analyze 零告警。
+- [x] APK 构建成功且双 ABI so 在包内：apk-debug.apk 161MB（debug 形态，未做 size/strip 优化），libak_ffi.so 双 ABI 随包（包内 x86_64 4.3MB＋arm64 3.7MB）；装机尚未执行。
+- [x] Windows GUI 首启截图核验（第十一/十二轮 GUI 的真启动补证）：target/windows_gui_first_launch.png 经视觉模型核验，五页导航与身份卡完整渲染（配对码 146-778 大号展示、指纹 b6998f27），无白屏/崩溃/错版；主题实测浅色、与任务描述不符处如实记录。
+- [ ] 进行中：AVD/模拟器装机与跨设备传输——系统镜像重装中（首次下载 zip 损坏已定位：unknown archive @33%，改带校验重试循环重装）。
+- [ ] 模拟器 UI 驱动验证（截图/操作走查）。
+- [ ] 跨设备实测：模拟器↔主机（10.0.2.2）起步，真双机仍其后。
+- [ ] 安卓 mDNS 发现、SAF/MediaStore 公共目录导出、后台/生命周期适配（P0-06 剩余部分）。
+
 ## P0
 
 - [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。

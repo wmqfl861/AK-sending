@@ -31,12 +31,26 @@
 
 第八轮新增（2026-11-03，提交 `3b39c03`，3 个并行子代理＋集成者）：产品全流程 e2e 四幕（ak-itests `e2e_product_flow.rs`——配对簿准入＋未配对第三方零字节落盘前拒绝；16MiB/256 块中断→part 存活→同 job_id 续传→检查点 completed 且全量已验证前缀；`serve_concurrently(2)` 多根+单根并发；信令会话建立→服务器死亡证明→直传照常）；CLI 打磨（`completions` bash/zsh/fish/powershell、`jobs status <id>` 每文件 verified 前缀视图、`receive --bind` 与 `signal-server --bind`/`--stun-bind`，IPv6 监听实测 `[::1]`）；文档对齐（SECURITY 并发隔离论证/双层注入防护/对抗加固/长名 part 回退，ARCHITECTURE 模块现状与 FileTransferEngine 过期行修正）。第八轮后 workspace 417 项测试全绿、clippy 干净。
 
+第十三轮新增（2026-11-04，安卓移植波，提交 `834f42a`＋`6ea65f0` 证据记录；第十至十二轮——ak-ffi C ABI/ak_ffi_dart/Flutter 桌面端接线——逐项见 [BACKLOG](BACKLOG.zh-CN.md)，此处不重复）：`scripts/build_android_ffi.sh` 双 ABI 交叉编译（纯环境变量 linker、NDK 28.2、`llvm-nm` 冻结符号验证、jniLibs 与 target 哈希一致，流程与故障排查见 [ANDROID_BUILD](ANDROID_BUILD.zh-CN.md)）；flutter_app 安卓平台（INTERNET 权限、minSdk 24、tier-0 so 加载、path_provider 身份目录异步解析、应用专属 Download 输出链），flutter test 66/66；apk-debug.apk 161MB 构建成功、双 ABI so 在包内（装机尚未执行）；Windows GUI 首启截图核验通过（配对码/指纹渲染正常，证据见验证记录"第十三轮进行中证据"节）。进行中：AVD 系统镜像重装（首次下载 zip 损坏已定位，unknown archive @33%）→ 模拟器装机与跨设备传输。环境事实：Android SDK/NDK/JDK 布局于 `~/android-toolchain`（`sdk/ndk/` 下 27.2 与 28.2 双版本，脚本自动取最高），Flutter SDK 于 `~/flutter-sdk`（使用前 `export PATH="$USERPROFILE/flutter-sdk/bin:$PATH"`）；模拟器操作经 android-emulator 插件的 23 个工具以 JSON-RPC 直驱 MCP 服务器（约定辅助脚本 `/tmp/mcp_call.py` 发起调用）。
+
 ## 实现与验证边界（如实）
 
 - 已验证范围＝本机环回（L2 形态）：QUIC 握手、传输、续传、大文件、CLI 双进程。跨机器、跨网段、公网 NAT 穿透、抓包（L3/L4）未执行。
 - 打洞：holepunch 探测与 probe 命令已实现并有本地 UDP 互探测试；真实 NAT 环境成功率未测（P0-05）。
-- 移动端/Flutter、真机验收、性能调优（多流并发、千兆跑满）未开始。
+- 移动端/Flutter 现状（第十三轮后如实）：Flutter Windows 桌面端与安卓平台壳已就位（单机/构建级验证）；安卓装机运行、真机验收、移动原生能力（mDNS/SAF/后台生命周期）、性能调优（多流并发、千兆跑满）未开始。
 - 已知限制见各 crate 文档与 SECURITY：接收端 available_bytes 为真实实现（fs2）、mtime 尽力回写（filetime）、IPv6 前缀按 /64 简化、probe nonce 非密码学随机（身份由 QUIC 握手承担）、SameEgress 存在反代/CGNAT 误报场景（仅排序提示）。
+
+## 重启恢复手册（2026-11-04，WHPX 启用后首次重启）
+
+重启原因：Android 模拟器 x86_64 需硬件加速；本机 Hypervisor 在位，已 `Enable-WindowsOptionalFeature HypervisorPlatform`（State=Enabled, RestartNeeded=True）。重启后按序执行：
+
+1. `cd <仓库根>`；`git status` 确认树状态（若有十四波代理半成品文件：ak-ffi peer 导出 / scripts/smoke_android_host.sh，先跑各自验证门槛收尾再提交）。
+2. 验证 WHPX 生效：`emulator -accel-check`（~/android-toolchain/sdk/emulator/）应报 WHPX 可用。
+3. 启模拟器：`emulator.exe -avd ak_test -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim`（后台）→ `adb wait-for-device && adb shell getprop sys.boot_completed` 轮询到 1。
+4. 装 APK：`~/android-toolchain/sdk/platform-tools/adb.exe install -r flutter_app/build/app/outputs/flutter-apk/app-debug.apk`。
+5. 启动 app：`adb shell am start -n dev.ak.ak_sending_app/.MainActivity`；截图 `adb exec-out screencap -p > target/android_first_launch.png`（或经插件工具 /tmp/mcp_call.py——脚本重启后需重建，内容见 docs/HANDOFF 本节末注）。
+6. 跨设备实测：`bash scripts/smoke_android_host.sh`（主机接收端自动化；安卓端 UI 驱动用插件 android_ui_* 工具或 adb input）。
+7. 环境路径备忘：SDK=~/android-toolchain/sdk（NDK 27.2/28.2、platform-tools、emulator、AVD ak_test）；JDK=~/android-toolchain/jdk；Flutter=~/flutter-sdk；cargo=$USERPROFILE/.cargo/bin；插件工具驱动脚本（JSON-RPC over stdio，初始化→notifications/initialized→tools/call）曾存 /tmp/mcp_call.py，重启即失——按 HANDOFF 第十三轮段描述重建或直接用 adb/emulator 命令行。
 
 ## 历史记录（第一阶段，main 分支）
 
@@ -47,9 +61,9 @@ README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 
 ## 下一工程节点
 
-1. 两台真实机器（同网段）跑 `ak-cli receive`/`send`，验证非环回路径与防火墙行为；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。多流并行在环回仅约 1.04–1.06x（第六轮空闲机刷新：单流 93.9 vs 多流 97.9 MiB/s），是否默认启用待双机网卡数据再定。
+1. 跨设备首证＝模拟器↔主机（第十三轮口径更新）：AVD 就绪后在模拟器内以宿主回环别名 `10.0.2.2` 跑 `receive`/`send`，验证非环回路径与防火墙行为（安卓端 APK 已能构建、装机待验）；两台真实机器（同网段）的真双机实测仍在其后；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。多流并行在环回仅约 1.04–1.06x（第六轮空闲机刷新：单流 93.9 vs 多流 97.9 MiB/s），是否默认启用待双机网卡数据再定。
 2. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
 3. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
 4. Flutter UI（Windows → Android 优先）与移动端后台/存储适配。
-经第八轮后复核，上述节点仍然成立且顺序不变；本地可执行范围已尽，余项均需外部资源（第二台机器/真实网络/Flutter SDK/移动工具链）。
+经第十三轮后复核，上述节点顺序不变，唯节点 1 的跨设备首证改为模拟器↔主机起步；Flutter SDK 与 Android 移动工具链已就位（`~/flutter-sdk`、`~/android-toolchain`），本地可执行范围延伸到模拟器装机与 UI 驱动，真双机与真实网络（L3/L4）仍需外部资源。
 后续开发先读取本文件、AGENTS、ROADMAP 和现有源码；保留已有历史，禁止强推。

@@ -3,11 +3,12 @@
 //! real loopback QUIC transfers crossing the C boundary, spec-JSON
 //! validation, cancellation, buffer-capacity handling, two engines
 //! running concurrently, identity inspection (`ak_identity_info`),
-//! persisted-job listing (`ak_jobs_list`), and receive admission by peer
-//! book (`expect: "book"`). Fixture preparation (writing source files,
-//! pre-creating a receiver device key so its fingerprint is known) uses
-//! plain `std`/`ak-identity` — the transfers themselves never bypass the
-//! ABI.
+//! persisted-job listing (`ak_jobs_list`), paired-peer book management
+//! (`ak_peer_list`/`ak_peer_add`/`ak_peer_remove`), and receive admission
+//! by peer book (`expect: "book"`). Fixture preparation (writing source
+//! files, pre-creating a receiver device key so its fingerprint is known)
+//! uses plain `std`/`ak-identity` — the transfers themselves never bypass
+//! the ABI.
 //!
 //! L2 shape: real engine + real QUIC on 127.0.0.1 (same claim level as
 //! the ak-itests loopback scenarios), not a cross-machine claim.
@@ -22,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use ak_ffi::{
     ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,
-    ak_job_result, ak_jobs_list, ak_poll_progress, ak_receive_start, ak_send_start, ak_version,
-    AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT,
-    AK_FAILED, AK_OK, AK_PENDING,
+    ak_job_result, ak_jobs_list, ak_peer_add, ak_peer_list, ak_peer_remove, ak_poll_progress,
+    ak_receive_start, ak_send_start, ak_version, AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INTERNAL,
+    AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
 };
 
 // ---------------------------------------------------------------------------
@@ -1711,6 +1712,698 @@ fn receive_expect_book_rejects_unpaired_sender() {
     // The refused connection produced no checkpoint record at all.
     let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
     assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
+
+    ak_engine_free(engine);
+}
+
+// ---------------------------------------------------------------------------
+// ak_peer_list / ak_peer_add / ak_peer_remove (paired-peer book management).
+// ---------------------------------------------------------------------------
+
+/// Drive `ak_peer_list` through the C ABI with a large buffer.
+fn call_peer_list(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
+    let mut buf = [0 as c_char; 8192];
+    let code = ak_peer_list(
+        engine,
+        CString::new(id_dir).unwrap().as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    (code, cbuf_to_string(&buf))
+}
+
+/// Drive `ak_peer_add` through the C ABI; `name: None` passes a null
+/// pointer (the documented "no name given" form).
+fn call_peer_add(
+    engine: *mut AkEngine,
+    id_dir: &str,
+    fingerprint_hex: &str,
+    name: Option<&str>,
+) -> (i32, String) {
+    let c_dir = CString::new(id_dir).unwrap();
+    let c_fp = CString::new(fingerprint_hex).unwrap();
+    let c_name = name.map(|text| CString::new(text).unwrap());
+    let mut buf = [0 as c_char; 128];
+    let code = ak_peer_add(
+        engine,
+        c_dir.as_ptr(),
+        c_fp.as_ptr(),
+        c_name
+            .as_ref()
+            .map_or(std::ptr::null(), |text| text.as_ptr()),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    (code, cbuf_to_string(&buf))
+}
+
+/// Drive `ak_peer_remove` through the C ABI.
+fn call_peer_remove(engine: *mut AkEngine, id_dir: &str, fingerprint_hex: &str) -> (i32, String) {
+    let c_dir = CString::new(id_dir).unwrap();
+    let c_fp = CString::new(fingerprint_hex).unwrap();
+    let mut buf = [0 as c_char; 128];
+    let code = ak_peer_remove(
+        engine,
+        c_dir.as_ptr(),
+        c_fp.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    (code, cbuf_to_string(&buf))
+}
+
+/// Deterministic valid 64-hex fingerprint: one byte value repeated 32 times.
+fn fp_hex(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+/// Parse an `ak_identity::Fingerprint` from 64 hex chars (fixture side).
+fn fp_from_hex(hex: &str) -> ak_identity::Fingerprint {
+    ak_identity::Fingerprint::from_hex(hex).expect("test fingerprints are valid")
+}
+
+/// Split a flat (object-element) JSON array body into its element strings.
+/// Only safe for tests whose names contain no `},{` sequence.
+fn array_elements(body: &str) -> Vec<String> {
+    assert!(
+        body.starts_with('[') && body.ends_with(']'),
+        "array: {body}"
+    );
+    body[1..body.len() - 1]
+        .split("},{")
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn peer_list_missing_and_empty_book_is_empty_array() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    // A completely absent id_dir: [] and the directory is NOT created.
+    let base = tempfile::tempdir().unwrap();
+    let id_dir = base.path().join("fresh-id");
+    assert!(!id_dir.exists());
+    let path_text = id_dir.to_string_lossy().into_owned();
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE, "peer_list: {}", last_error_text(engine));
+    assert_eq!(body, "[]");
+    assert!(!id_dir.exists(), "a read must not create the directory");
+
+    // A header-only book (a `pair remove` that emptied the CLI's file) too.
+    fs::create_dir_all(&id_dir).unwrap();
+    fs::write(id_dir.join("peers.book"), b"AKPEERS1\n").unwrap();
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
+
+    // `[]` still honors the buffer contract: cap 2 cannot hold "[]" + NUL.
+    let c_path = CString::new(path_text.clone()).unwrap();
+    let mut tiny = [0 as c_char; 2];
+    assert_eq!(
+        ak_peer_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        AK_ERR_BUFFER
+    );
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("buffer too small") && message.contains("need"),
+        "capacity hint: {message}"
+    );
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!((code, body.as_str()), (AK_DONE, "[]"), "lossless retry");
+
+    // Argument errors: null id_dir / null buf / empty id_dir.
+    assert_eq!(
+        ak_peer_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8),
+        AK_ERR_NULL
+    );
+    assert_eq!(
+        ak_peer_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8),
+        AK_ERR_NULL
+    );
+    let empty = CString::new("").unwrap();
+    let mut buf = [0 as c_char; 8];
+    assert_eq!(
+        ak_peer_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        AK_ERR_INVALID
+    );
+    assert!(last_error_text(engine).contains("id_dir"));
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_list_parses_cli_written_book_sorted() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+
+    // A book byte-for-byte in the CLI's `pair add` format: AKPEERS1 header,
+    // one `fingerprint\tname\tpaired_unix_ms` line per peer, in insertion
+    // (NOT fingerprint) order; names may be empty or unicode.
+    let (a, b, c) = (fp_hex(0x10), fp_hex(0x42), fp_hex(0xfe));
+    let text = format!("AKPEERS1\n{c}\t手机 二号\t42\n{a}\tlaptop pro\t1700000000000\n{b}\t\t7\n");
+    fs::write(id_dir.path().join("peers.book"), text).unwrap();
+
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE, "{}", last_error_text(engine));
+    // Sorted by fingerprint; exact element shape; names verbatim (a peer
+    // the CLI paired without a name keeps its empty stored name).
+    assert_eq!(
+        body,
+        format!(
+            "[{{\"fingerprint\":\"{a}\",\"name\":\"laptop pro\",\
+             \"paired_unix_ms\":1700000000000}},\
+             {{\"fingerprint\":\"{b}\",\"name\":\"\",\"paired_unix_ms\":7}},\
+             {{\"fingerprint\":\"{c}\",\"name\":\"手机 二号\",\"paired_unix_ms\":42}}]"
+        )
+    );
+
+    // A book written through ak-identity's own save (what the CLI binary
+    // actually calls) parses identically.
+    let mut book = ak_identity::PeerBook::default();
+    book.upsert(ak_identity::PeerRecord {
+        fingerprint: fp_from_hex(&a),
+        name: "saved-via-ak-identity".to_owned(),
+        paired_unix_ms: 5,
+    });
+    book.save(&id_dir.path().join("peers.book")).unwrap();
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(
+        body,
+        format!(
+            "[{{\"fingerprint\":\"{a}\",\"name\":\"saved-via-ak-identity\",\
+             \"paired_unix_ms\":5}}]"
+        )
+    );
+
+    // A stored name with JSON metacharacters is escaped, never injected.
+    fs::write(
+        id_dir.path().join("peers.book"),
+        format!("AKPEERS1\n{b}\tquote\" back\\slash\t9\n"),
+    )
+    .unwrap();
+    let (code, body) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(
+        body,
+        format!(
+            "[{{\"fingerprint\":\"{b}\",\"name\":\"quote\\\" back\\\\slash\",\
+             \"paired_unix_ms\":9}}]"
+        )
+    );
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_list_corrupt_book_is_invalid() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let fp = fp_hex(0x01);
+
+    let cases: Vec<(&str, String)> = vec![
+        ("wrong header", "NOTPEERS\n".to_owned()),
+        ("bad fingerprint line", "AKPEERS1\nzz\tname\t1\n".to_owned()),
+        ("bad timestamp", format!("AKPEERS1\n{fp}\tname\tnope\n")),
+        ("missing fields", format!("AKPEERS1\n{fp}\tname\n")),
+    ];
+    let mut last_content = String::new();
+    for (label, content) in cases {
+        fs::write(id_dir.path().join("peers.book"), &content).unwrap();
+        last_content = content;
+        let (code, body) = call_peer_list(engine, &path_text);
+        assert_eq!(code, AK_ERR_INVALID, "case {label}");
+        assert_eq!(body, "", "nothing written on failure");
+        let message = last_error_text(engine);
+        assert!(
+            message.contains("cannot load peer book"),
+            "case {label}: {message}"
+        );
+    }
+
+    // The writers refuse the same corrupt book instead of clobbering it.
+    let (code, body) = call_peer_add(engine, &path_text, &fp, Some("x"));
+    assert_eq!((code, body.as_str()), (AK_ERR_INVALID, ""));
+    assert!(last_error_text(engine).contains("cannot load peer book"));
+    let (code, body) = call_peer_remove(engine, &path_text, &fp);
+    assert_eq!((code, body.as_str()), (AK_ERR_INVALID, ""));
+    assert!(last_error_text(engine).contains("cannot load peer book"));
+    assert_eq!(
+        fs::read_to_string(id_dir.path().join("peers.book")).unwrap(),
+        last_content,
+        "the corrupt book is left untouched"
+    );
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_add_pairs_new_peers_with_name_or_unnamed_default() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let (a, b, c) = (fp_hex(0xaa), fp_hex(0xbb), fp_hex(0xcc));
+
+    // Named first peer: {"peers":1}, persisted in the CLI's AKPEERS1 format.
+    let (code, body) = call_peer_add(engine, &path_text, &a, Some("laptop"));
+    assert_eq!(code, AK_DONE, "add: {}", last_error_text(engine));
+    assert_eq!(body, "{\"peers\":1}");
+    let saved = fs::read_to_string(id_dir.path().join("peers.book")).unwrap();
+    assert!(saved.starts_with("AKPEERS1\n"), "CLI header: {saved:?}");
+    assert_eq!(saved.lines().count(), 2, "header + one entry");
+    // Round-trips through ak-identity (i.e. the CLI reads what the FFI wrote).
+    let book = ak_identity::PeerBook::load(&id_dir.path().join("peers.book")).unwrap();
+    let record = book.get(&fp_from_hex(&a)).unwrap();
+    assert_eq!(record.name, "laptop");
+    assert!(record.paired_unix_ms > 0, "pairing time stamped");
+
+    // Second peer with a null name and third with an empty string: both
+    // mean "no name given" and store "(unnamed)".
+    let (code, body) = call_peer_add(engine, &path_text, &b, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
+    let (code, body) = call_peer_add(engine, &path_text, &c, Some(""));
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":3}"));
+
+    // The list reflects all three, sorted, with the documented default.
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    let elements = array_elements(&list);
+    assert_eq!(elements.len(), 3);
+    assert!(elements[0].contains(&format!("\"fingerprint\":\"{a}\"")));
+    assert!(elements[0].contains("\"name\":\"laptop\""));
+    assert!(elements[1].contains(&format!("\"fingerprint\":\"{b}\"")));
+    assert!(elements[1].contains("\"name\":\"(unnamed)\""));
+    assert!(elements[2].contains(&format!("\"fingerprint\":\"{c}\"")));
+    assert!(elements[2].contains("\"name\":\"(unnamed)\""));
+    for element in &elements {
+        assert!(field_u64(element, "paired_unix_ms") > 0);
+    }
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_add_upsert_keeps_original_pairing_time_like_cli() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let fp = fp_hex(0x33);
+
+    // Seed the book the way the CLI paired this peer long ago: a fixed
+    // ancient timestamp that must survive every FFI re-add below.
+    fs::write(
+        id_dir.path().join("peers.book"),
+        format!("AKPEERS1\n{fp}\told name\t1000\n"),
+    )
+    .unwrap();
+
+    // Re-add with a new name: renamed, pairing time preserved, count stays.
+    let (code, body) = call_peer_add(engine, &path_text, &fp, Some("renamed"));
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    let element = single_element(&list);
+    assert_eq!(field_str(&element, "name"), "renamed");
+    assert_eq!(
+        field_u64(&element, "paired_unix_ms"),
+        1000,
+        "CLI TOFU: the original pairing time is kept on rename"
+    );
+
+    // Re-add with an empty name: the record is left untouched.
+    let (code, body) = call_peer_add(engine, &path_text, &fp, Some(""));
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+    let (_, list) = call_peer_list(engine, &path_text);
+    let element = single_element(&list);
+    assert_eq!(
+        field_str(&element, "name"),
+        "renamed",
+        "a no-name re-add never renames"
+    );
+    assert_eq!(field_u64(&element, "paired_unix_ms"), 1000);
+
+    // Same for a null name.
+    let (code, body) = call_peer_add(engine, &path_text, &fp, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+
+    // The on-disk book still matches what ak-identity (the CLI) expects.
+    let book = ak_identity::PeerBook::load(&id_dir.path().join("peers.book")).unwrap();
+    let record = book.get(&fp_from_hex(&fp)).unwrap();
+    assert_eq!(
+        (record.name.as_str(), record.paired_unix_ms),
+        ("renamed", 1000)
+    );
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_add_rejects_bad_fingerprints_and_control_names() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let good = fp_hex(0x77);
+
+    // Bad fingerprints: wrong length, non-hex, empty.
+    let bad_fps = [
+        "".to_owned(),
+        "ab".to_owned(),
+        good[..63].to_owned(),
+        format!("{good}0"),
+        good.replace('7', "g"),
+    ];
+    for bad in &bad_fps {
+        let (code, body) = call_peer_add(engine, &path_text, bad, Some("x"));
+        assert_eq!(code, AK_ERR_INVALID, "fingerprint {bad:?}");
+        assert_eq!(body, "");
+        assert!(last_error_text(engine).contains("64 hex"));
+    }
+    assert!(
+        !id_dir.path().join("peers.book").exists(),
+        "nothing persisted on a rejected add"
+    );
+
+    // Control characters in names are refused outright (raw bytes under
+    // 0x20 — the ABI never sanitizes silently).
+    for bad_name in ["two\nlines", "tab\there", "carriage\rreturn", "\u{1}beep"] {
+        let (code, body) = call_peer_add(engine, &path_text, &good, Some(bad_name));
+        assert_eq!(
+            (code, body.as_str()),
+            (AK_ERR_INVALID, ""),
+            "name {bad_name:?}"
+        );
+        assert!(last_error_text(engine).contains("control"));
+    }
+    assert!(!id_dir.path().join("peers.book").exists());
+
+    // Oversized name (beyond the ABI-wide 4096-byte string cap).
+    let huge = "x".repeat(4097);
+    let (code, _) = call_peer_add(engine, &path_text, &good, Some(&huge));
+    assert_eq!(code, AK_ERR_INVALID);
+
+    // Null arguments: id_dir and fingerprint are required; `name` is the
+    // documented optional one. A null buf is refused BEFORE anything is
+    // persisted.
+    let c_dir = CString::new(path_text.clone()).unwrap();
+    let c_good = CString::new(good.clone()).unwrap();
+    assert_eq!(
+        ak_peer_add(
+            engine,
+            c_dir.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_NULL
+    );
+    assert_eq!(
+        ak_peer_add(
+            engine,
+            std::ptr::null(),
+            c_good.as_ptr(),
+            std::ptr::null(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_NULL
+    );
+    assert_eq!(
+        ak_peer_add(
+            engine,
+            c_dir.as_ptr(),
+            c_good.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            64
+        ),
+        AK_ERR_NULL
+    );
+    assert!(
+        !id_dir.path().join("peers.book").exists(),
+        "a null buf persists nothing"
+    );
+
+    // Empty id_dir.
+    let empty = CString::new("").unwrap();
+    assert_eq!(
+        ak_peer_add(
+            engine,
+            empty.as_ptr(),
+            c_good.as_ptr(),
+            std::ptr::null(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_INVALID
+    );
+    assert!(last_error_text(engine).contains("id_dir"));
+
+    // After all that, one valid add still works.
+    let (code, body) = call_peer_add(engine, &path_text, &good, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_remove_deletes_existing_and_reports_missing() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let (a, b) = (fp_hex(0x51), fp_hex(0x52));
+
+    let (code, _) = call_peer_add(engine, &path_text, &a, Some("one"));
+    assert_eq!(code, AK_DONE);
+    let (code, _) = call_peer_add(engine, &path_text, &b, Some("two"));
+    assert_eq!(code, AK_DONE);
+
+    // Remove an existing peer: count JSON, atomic rewrite, CLI-readable.
+    let (code, body) = call_peer_remove(engine, &path_text, &a);
+    assert_eq!(code, AK_DONE, "remove: {}", last_error_text(engine));
+    assert_eq!(body, "{\"peers\":1}");
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    let element = single_element(&list);
+    assert_eq!(field_str(&element, "fingerprint"), b);
+    let book = ak_identity::PeerBook::load(&id_dir.path().join("peers.book")).unwrap();
+    assert!(book.get(&fp_from_hex(&a)).is_none());
+    assert_eq!(book.iter().count(), 1);
+
+    // Removing it again: NOT_FOUND with a hint in the last-error buffer.
+    let (code, body) = call_peer_remove(engine, &path_text, &a);
+    assert_eq!(code, AK_ERR_NOT_FOUND);
+    assert_eq!(body, "");
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("not in") && message.contains("nothing removed"),
+        "hint: {message}"
+    );
+
+    // A book that never existed has no peers either: same NOT_FOUND, and
+    // still nothing is created on disk.
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_text = fresh.path().to_string_lossy().into_owned();
+    let (code, _) = call_peer_remove(engine, &fresh_text, &b);
+    assert_eq!(code, AK_ERR_NOT_FOUND);
+    assert!(!fresh.path().join("peers.book").exists());
+
+    // Bad fingerprint / null arguments / empty id_dir.
+    let (code, _) = call_peer_remove(engine, &path_text, "nope");
+    assert_eq!(code, AK_ERR_INVALID);
+    assert!(last_error_text(engine).contains("64 hex"));
+    let c_dir = CString::new(path_text.clone()).unwrap();
+    let c_b = CString::new(b.clone()).unwrap();
+    assert_eq!(
+        ak_peer_remove(
+            engine,
+            std::ptr::null(),
+            c_b.as_ptr(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_NULL
+    );
+    assert_eq!(
+        ak_peer_remove(
+            engine,
+            c_dir.as_ptr(),
+            std::ptr::null(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_NULL
+    );
+    assert_eq!(
+        ak_peer_remove(
+            engine,
+            c_dir.as_ptr(),
+            c_b.as_ptr(),
+            std::ptr::null_mut(),
+            16
+        ),
+        AK_ERR_NULL
+    );
+    let empty = CString::new("").unwrap();
+    assert_eq!(
+        ak_peer_remove(
+            engine,
+            empty.as_ptr(),
+            c_b.as_ptr(),
+            [0 as c_char; 16].as_mut_ptr(),
+            16
+        ),
+        AK_ERR_INVALID
+    );
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_add_and_remove_feed_identity_info_peer_count() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let base = tempfile::tempdir().unwrap();
+    let id_dir = base.path().join("id");
+    let path_text = id_dir.to_string_lossy().into_owned();
+    let (a, b) = (fp_hex(0x64), fp_hex(0x65));
+
+    // A brand-new id_dir: identity_info creates it and reports zero peers.
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 0);
+
+    let (code, body) = call_peer_add(engine, &path_text, &a, Some("laptop"));
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+    let (code, body) = call_peer_add(engine, &path_text, &b, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
+
+    // identity_info counts the FFI-added peers (same peers.book).
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 2);
+
+    let (code, body) = call_peer_remove(engine, &path_text, &b);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+    let (code, body) = call_identity_info(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(field_u64(&body, "peers"), 1);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_writers_pre_flight_the_buffer_before_persisting() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let (a, b) = (fp_hex(0x90), fp_hex(0x91));
+    let c_dir = CString::new(path_text.clone()).unwrap();
+    let c_b = CString::new(b.clone()).unwrap();
+    // {"peers":N} for N in 0..=9 is 11 bytes; 12 with the NUL terminator.
+    let mut tiny = [0 as c_char; 11];
+
+    let (code, _) = call_peer_add(engine, &path_text, &a, Some("seed"));
+    assert_eq!(code, AK_DONE);
+
+    // ADD with a too-small cap: refused BEFORE the save, so the book is
+    // untouched and the retry is a plain fresh call.
+    let code = ak_peer_add(
+        engine,
+        c_dir.as_ptr(),
+        c_b.as_ptr(),
+        std::ptr::null(),
+        tiny.as_mut_ptr(),
+        tiny.len(),
+    );
+    assert_eq!(code, AK_ERR_BUFFER);
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("buffer too small") && message.contains("need"),
+        "capacity hint: {message}"
+    );
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    let element = single_element(&list);
+    assert_eq!(
+        field_str(&element, "fingerprint"),
+        a,
+        "the refused add paired nothing"
+    );
+
+    // The retry with a large buffer succeeds; re-running the add is
+    // idempotent anyway.
+    let (code, body) = call_peer_add(engine, &path_text, &b, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
+
+    // REMOVE with a too-small cap: nothing removed, retry then works.
+    let code = ak_peer_remove(
+        engine,
+        c_dir.as_ptr(),
+        c_b.as_ptr(),
+        tiny.as_mut_ptr(),
+        tiny.len(),
+    );
+    assert_eq!(code, AK_ERR_BUFFER);
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert!(
+        list.contains(&b),
+        "the peer survived the refused remove: {list}"
+    );
+    let (code, body) = call_peer_remove(engine, &path_text, &b);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn peer_writer_save_failure_is_internal_and_leaves_book_intact() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    let (a, b) = (fp_hex(0xa0), fp_hex(0xa1));
+
+    let (code, _) = call_peer_add(engine, &path_text, &a, Some("first"));
+    assert_eq!(code, AK_DONE);
+
+    // Block the atomic-write temp slot with a directory: every save now
+    // fails (opening a directory for write is an error on every platform),
+    // which must surface as AK_ERR_INTERNAL naming the book.
+    fs::create_dir_all(id_dir.path().join("peers.book.tmp")).unwrap();
+    let (code, body) = call_peer_add(engine, &path_text, &b, Some("second"));
+    assert_eq!(code, AK_ERR_INTERNAL);
+    assert_eq!(body, "");
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("cannot save peer book"),
+        "save failure names the book: {message}"
+    );
+
+    // Remove shares the save path.
+    let (code, body) = call_peer_remove(engine, &path_text, &a);
+    assert_eq!((code, body.as_str()), (AK_ERR_INTERNAL, ""));
+
+    // The book on disk is untouched: still exactly the first peer.
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    let element = single_element(&list);
+    assert_eq!(field_str(&element, "fingerprint"), a);
+
+    // Removing the blocker restores writability.
+    fs::remove_dir_all(id_dir.path().join("peers.book.tmp")).unwrap();
+    let (code, body) = call_peer_add(engine, &path_text, &b, None);
+    assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
 
     ak_engine_free(engine);
 }

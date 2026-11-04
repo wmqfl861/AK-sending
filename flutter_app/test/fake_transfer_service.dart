@@ -15,14 +15,17 @@ class FakeTransferService implements TransferService {
     List<JobRecord>? jobs,
     this.jobsGate,
     this.refreshIdentityResult,
+    List<PeerEntryUi>? peers,
+    this.listPeersError,
   })  : deviceInfoValue = deviceInfo ??
             DeviceInfo(
               deviceName: 'DESKTOP-AK1',
               fingerprintHex: 'ab' * 32,
               pairingCode: '123-456',
-              peersCount: 0,
+              peersCount: peers?.length ?? 0,
             ),
-        _jobs = List.of(jobs ?? const <JobRecord>[]);
+        _jobs = List.of(jobs ?? const <JobRecord>[]),
+        _peers = List.of(peers ?? const <PeerEntryUi>[]);
 
   /// Identity returned by [deviceInfo]; mutated by [refreshIdentity] when
   /// [refreshIdentityResult] is set (the three identity forms of the
@@ -55,6 +58,92 @@ class FakeTransferService implements TransferService {
 
   final List<JobRecord> _jobs;
   final List<void Function()> _statusListeners = [];
+
+  // -------------------------------------------------------------------------
+  // Pairing book (wave-14) — an in-memory peers.book double.
+  // -------------------------------------------------------------------------
+
+  final List<PeerEntryUi> _peers;
+
+  /// When non-null, [listPeers] throws it (the corrupt-book / engine
+  /// error forms the pairing page must render inline).
+  Object? listPeersError;
+
+  /// Timestamp stored as pairedAt by [addPeer] (fixed for determinism).
+  DateTime peerAddClock = DateTime.fromMillisecondsSinceEpoch(1730000000000);
+
+  int listPeersCalls = 0;
+  int addPeerCalls = 0;
+  int removePeerCalls = 0;
+
+  /// Arguments captured by the latest [addPeer] call.
+  String? lastAddPeerFingerprint;
+  String? lastAddPeerName;
+
+  /// Argument captured by the latest [removePeer] call.
+  String? lastRemovePeerFingerprint;
+
+  /// Live pairing-book fixture; mutations are visible to the next
+  /// [listPeers] (sorted copy) like the engine's disk read.
+  List<PeerEntryUi> get peers => _peers;
+
+  @override
+  Future<List<PeerEntryUi>> listPeers() async {
+    listPeersCalls += 1;
+    final error = listPeersError;
+    if (error != null) {
+      throw error;
+    }
+    final copy = List.of(_peers)
+      ..sort((a, b) => a.fingerprint.compareTo(b.fingerprint));
+    return copy;
+  }
+
+  @override
+  Future<int> addPeer(String fpHex, String name) async {
+    addPeerCalls += 1;
+    lastAddPeerFingerprint = fpHex;
+    lastAddPeerName = name;
+    final fingerprint = fpHex.trim().toLowerCase();
+    if (!isFingerprintHex(fingerprint)) {
+      // Mirrors the real adapter's local validation (64 hex only).
+      throw const FormatException('指纹须为 64 位十六进制字符。');
+    }
+    final trimmed = name.trim();
+    final index =
+        _peers.indexWhere((peer) => peer.fingerprint == fingerprint);
+    if (index >= 0) {
+      if (trimmed.isNotEmpty) {
+        // Rename keeps the original pairing time (engine semantics).
+        _peers[index] = PeerEntryUi(
+          fingerprint: fingerprint,
+          name: trimmed,
+          pairedAt: _peers[index].pairedAt,
+        );
+      } // re-add without a name: record untouched (idempotent)
+    } else {
+      _peers.add(PeerEntryUi(
+        fingerprint: fingerprint,
+        name: trimmed.isEmpty ? '(unnamed)' : trimmed,
+        pairedAt: peerAddClock,
+      ));
+    }
+    return _peers.length;
+  }
+
+  @override
+  Future<bool> removePeer(String fpHex) async {
+    removePeerCalls += 1;
+    lastRemovePeerFingerprint = fpHex;
+    final fingerprint = fpHex.trim().toLowerCase();
+    final index =
+        _peers.indexWhere((peer) => peer.fingerprint == fingerprint);
+    if (index < 0) {
+      return false; // engine -4 not-found form mapped by the contract
+    }
+    _peers.removeAt(index);
+    return true;
+  }
 
   /// Options captured by the latest [startReceive] call.
   ReceiveOptions? lastReceiveOptions;
@@ -203,26 +292,32 @@ const String kPeerFingerprint =
 
 /// In-memory [AkEngineFacade] double driving the three identityInfo forms
 /// of the wave-12 wiring (normal / created / missing-DLL degrade via
-/// [identityThrows]) and the jobsList forms (empty / rows).
+/// [identityThrows]) and the jobsList forms (empty / rows), plus the
+/// wave-14 pairing-book forms (rows / corrupt-book error via
+/// [peerListError], add/rename/remove idempotence).
 ///
 /// Shape mirrors the frozen engine contract: identityInfo keys
 /// device_id/fingerprint/pairing_code/peers/created; jobsList row keys
-/// id/direction/state/files/bytes/updated_unix_ms/peer/root.
+/// id/direction/state/files/bytes/updated_unix_ms/peer/root; peerList row
+/// keys fingerprint/name/paired_unix_ms.
 class FakeAkEngineFacade implements AkEngineFacade {
   FakeAkEngineFacade({
     Map<String, dynamic>? identityInfo,
     this.identityThrows = false,
     List<Map<String, dynamic>>? jobsRows,
     this.jobsThrows = false,
+    List<Map<String, dynamic>>? peerRows,
+    this.peerListError,
   })  : identityInfoValue = identityInfo ??
             <String, dynamic>{
               'device_id': 'abababab',
               'fingerprint': 'ab' * 32,
               'pairing_code': '123456',
-              'peers': 0,
+              'peers': peerRows?.length ?? 0,
               'created': false,
             },
-        _jobsRows = List.of(jobsRows ?? const <Map<String, dynamic>>[]);
+        _jobsRows = List.of(jobsRows ?? const <Map<String, dynamic>>[]),
+        _peerRows = List.of(peerRows ?? const <Map<String, dynamic>>[]);
 
   /// Answer of [identityInfo].
   final Map<String, dynamic> identityInfoValue;
@@ -234,6 +329,12 @@ class FakeAkEngineFacade implements AkEngineFacade {
 
   /// When true, [jobsList] throws like a missing DLL / absent export.
   final bool jobsThrows;
+
+  final List<Map<String, dynamic>> _peerRows;
+
+  /// When non-null, [peerList] throws it (the corrupt peers.book form:
+  /// the engine's AK_ERR_INVALID "cannot load peer book").
+  final Object? peerListError;
 
   /// idDir arguments captured per call site.
   final List<(String site, String idDir)> idDirRequests = [];
@@ -254,6 +355,64 @@ class FakeAkEngineFacade implements AkEngineFacade {
       throw StateError('未找到 ak_ffi 动态库（fake: DLL missing）');
     }
     return List.of(_jobsRows);
+  }
+
+  @override
+  List<Map<String, dynamic>> peerList(String idDir) {
+    idDirRequests.add(('peerList', idDir));
+    final error = peerListError;
+    if (error != null) {
+      throw error;
+    }
+    final copy = List.of(_peerRows)
+      ..sort((a, b) => (a['fingerprint'] as String)
+          .toLowerCase()
+          .compareTo((b['fingerprint'] as String).toLowerCase()));
+    return copy;
+  }
+
+  @override
+  int peerAdd(String idDir, String fpHex, {String? name}) {
+    idDirRequests.add(('peerAdd', idDir));
+    final fingerprint = fpHex.trim().toLowerCase();
+    if (!isFingerprintHex(fingerprint)) {
+      throw const FormatException('指纹须为 64 位十六进制字符。');
+    }
+    final trimmed = name?.trim() ?? '';
+    final index = _peerRows.indexWhere(
+        (row) => (row['fingerprint'] as String).toLowerCase() == fingerprint);
+    if (index >= 0) {
+      if (trimmed.isNotEmpty) {
+        _peerRows[index] = <String, dynamic>{
+          ..._peerRows[index],
+          'name': trimmed, // rename keeps paired_unix_ms (engine rule)
+        };
+      } // re-add without a name: untouched (idempotent)
+    } else {
+      _peerRows.add(<String, dynamic>{
+        'fingerprint': fingerprint,
+        'name': trimmed.isEmpty ? '(unnamed)' : trimmed,
+        'paired_unix_ms': 1730000000000,
+      });
+    }
+    return _peerRows.length;
+  }
+
+  @override
+  int peerRemove(String idDir, String fpHex) {
+    idDirRequests.add(('peerRemove', idDir));
+    final fingerprint = fpHex.trim().toLowerCase();
+    if (!isFingerprintHex(fingerprint)) {
+      throw const FormatException('指纹须为 64 位十六进制字符。');
+    }
+    final index = _peerRows.indexWhere(
+        (row) => (row['fingerprint'] as String).toLowerCase() == fingerprint);
+    if (index < 0) {
+      throw const AkFfiException(
+          AkStatus.errNotFound, 'fingerprint not in peer book');
+    }
+    _peerRows.removeAt(index);
+    return _peerRows.length;
   }
 
   /// Appends one jobs row (test fixture helper).

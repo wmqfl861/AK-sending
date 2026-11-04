@@ -159,6 +159,30 @@ class SendOptions {
   final int timeoutSecs;
 }
 
+/// One paired peer of the pairing book (`<idDir>/peers.book`), as listed
+/// by [TransferService.listPeers] — the wave-14 pairing-management page.
+///
+/// Mirrors one `engine.peerList(idDir)` row (`fingerprint`/`name`/
+/// `paired_unix_ms`, frozen wave-14 contract).
+class PeerEntryUi {
+  const PeerEntryUi({
+    required this.fingerprint,
+    required this.name,
+    required this.pairedAt,
+  });
+
+  /// The peer's fingerprint, 64 lowercase hex characters.
+  final String fingerprint;
+
+  /// Stored display name. The engine pairs nameless peers as
+  /// `"(unnamed)"` (the CLI TOFU `pair add` convention); pages render a
+  /// local fallback for the empty string regardless.
+  final String name;
+
+  /// When the peer was first paired (wall clock, `paired_unix_ms`).
+  final DateTime pairedAt;
+}
+
 /// One record of the job history — the jobs checkpoint store read back via
 /// `engine.jobsList(idDir)` (rows: `id`/`direction`/`state`/`files`/`bytes`/
 /// `updated_unix_ms`/`peer`/`root`); see JobsPage.
@@ -274,6 +298,38 @@ abstract interface class TransferService {
   /// and root). Implementations without the store return an empty list
   /// rather than throwing (missing engine degrades gracefully).
   Future<List<JobRecord>> listJobs();
+
+  // -------------------------------------------------------------------------
+  // Pairing book (wave-14).
+  // -------------------------------------------------------------------------
+
+  /// Lists the paired peers of the pairing book (`<idDir>/peers.book`,
+  /// `engine.peerList(idDir)`, frozen wave-14 contract): one [PeerEntryUi]
+  /// per row (`fingerprint`/`name`/`paired_unix_ms`), sorted by
+  /// fingerprint. A missing book is the empty list.
+  ///
+  /// Unlike [listJobs] this does NOT swallow errors: a corrupt book
+  /// (the engine's "cannot load peer book" form) or an unavailable engine
+  /// propagates, so the pairing page can show the honest reason inline.
+  Future<List<PeerEntryUi>> listPeers();
+
+  /// Pairs one peer (or renames it) via `engine.peerAdd(idDir, fpHex,
+  /// {name})` and returns the new peer count. [fpHex] must be exactly 64
+  /// hex characters — an 8–63 prefix is NOT resolved here and throws
+  /// [FormatException], as does any other malformed input. A blank [name]
+  /// means "no name given": the engine stores `"(unnamed)"` for a new
+  /// peer and re-adding an existing one without a name leaves the record
+  /// untouched (idempotent). Implementations refresh the cached identity
+  /// afterwards so the HomePage pairing-book count follows the book.
+  Future<int> addPeer(String fpHex, String name);
+
+  /// Removes one paired peer via `engine.peerRemove(idDir, fpHex)` and
+  /// returns true on success. Returns false when the fingerprint is not
+  /// in the book (the engine's `-4` not-found form mapped here); other
+  /// failures (corrupt book, bad fingerprint, engine errors) throw.
+  /// Implementations refresh the cached identity afterwards like
+  /// [addPeer].
+  Future<bool> removePeer(String fpHex);
 
   /// Releases engine resources. Idempotent.
   void dispose();

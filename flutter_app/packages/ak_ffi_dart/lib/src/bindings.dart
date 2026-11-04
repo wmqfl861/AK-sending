@@ -1,4 +1,4 @@
-/// Raw dart:ffi bindings for the eleven exported `ak_*` functions of the
+/// Raw dart:ffi bindings for the fourteen exported `ak_*` functions of the
 /// ak-ffi C ABI (see `crates/ak-ffi/src/shim.rs` for the frozen signatures
 /// and docs/adr/003 for the boundary decisions).
 ///
@@ -98,7 +98,7 @@ final class _ProcessAllocator implements Allocator {
 }
 
 // ---------------------------------------------------------------------------
-// Native signatures of the eleven exports (shim.rs, verbatim).
+// Native signatures of the fourteen exports (shim.rs, verbatim).
 // ---------------------------------------------------------------------------
 
 typedef _EngineNewC = Pointer<AkEngine> Function();
@@ -148,7 +148,22 @@ typedef _JobsListC = Int32 Function(
 typedef _JobsListDart = int Function(
     Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
 
-/// Lookup of the eleven `ak_*` exports from one `DynamicLibrary`.
+typedef _PeerListC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
+typedef _PeerListDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
+
+typedef _PeerAddC = Int32 Function(Pointer<AkEngine>, Pointer<Uint8>,
+    Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
+typedef _PeerAddDart = int Function(Pointer<AkEngine>, Pointer<Uint8>,
+    Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, int);
+
+typedef _PeerRemoveC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
+typedef _PeerRemoveDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, Pointer<Uint8>, int);
+
+/// Lookup of the fourteen `ak_*` exports from one `DynamicLibrary`.
 class AkFfiBindings {
   /// Opens the DLL at [dllPath] (or [library] directly when injecting a
   /// preopened `DynamicLibrary`, e.g. from tests or another embedding).
@@ -188,6 +203,12 @@ class AkFfiBindings {
             'ak_identity_info');
     jobsList = this.library
         .lookupFunction<_JobsListC, _JobsListDart>('ak_jobs_list');
+    peerList = this.library
+        .lookupFunction<_PeerListC, _PeerListDart>('ak_peer_list');
+    peerAdd = this.library
+        .lookupFunction<_PeerAddC, _PeerAddDart>('ak_peer_add');
+    peerRemove = this.library
+        .lookupFunction<_PeerRemoveC, _PeerRemoveDart>('ak_peer_remove');
   }
 
   /// The loaded library; kept alive so the resolved symbols stay valid.
@@ -252,6 +273,41 @@ class AkFfiBindings {
   /// dereferenced.
   late final int Function(Pointer<AkEngine> engine, Pointer<Uint8> idDir,
       Pointer<Uint8> buf, int cap) jobsList;
+
+  /// `ak_peer_list(engine, id_dir, buf, cap)`: 1 with the paired-peers JSON
+  /// array written (`[]` for a missing book; a corrupt book is -2 with a
+  /// "cannot load peer book" message), same error contract as
+  /// [identityInfo]. Reads never create anything on disk. `engine` is
+  /// reserved and never dereferenced.
+  late final int Function(Pointer<AkEngine> engine, Pointer<Uint8> idDir,
+      Pointer<Uint8> buf, int cap) peerList;
+
+  /// `ak_peer_add(engine, id_dir, fingerprint_hex, name, buf, cap)`: 1 with
+  /// `{"peers":N}` (the new count) written. CLI TOFU semantics:
+  /// `fingerprint_hex` must be 64 hex chars (else -2); `name` is the ABI's
+  /// one OPTIONAL string argument — a null pointer means "no name given"
+  /// (a new peer is then stored as "(unnamed)", an existing one is left
+  /// untouched); a given name renames while keeping the original pairing
+  /// time. Names with control characters or over 4096 bytes are -2; a -3 is
+  /// raised before anything is persisted. `engine` is reserved.
+  late final int Function(
+      Pointer<AkEngine> engine,
+      Pointer<Uint8> idDir,
+      Pointer<Uint8> fingerprintHex,
+      Pointer<Uint8> name,
+      Pointer<Uint8> buf,
+      int cap) peerAdd;
+
+  /// `ak_peer_remove(engine, id_dir, fingerprint_hex, buf, cap)`: 1 with
+  /// `{"peers":N}` (the remaining count) written. A fingerprint not in the
+  /// book (a missing book has no peers) is -4; a bad fingerprint is -2 like
+  /// on add; the save/buffer rules match [peerAdd]. `engine` is reserved.
+  late final int Function(
+      Pointer<AkEngine> engine,
+      Pointer<Uint8> idDir,
+      Pointer<Uint8> fingerprintHex,
+      Pointer<Uint8> buf,
+      int cap) peerRemove;
 
   /// Where the DLL is loaded from when neither [AkFfiBindings.library] nor
   /// an explicit path is given: `$AK_FFI_DLL` wins, else a path relative to

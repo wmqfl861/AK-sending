@@ -1,7 +1,8 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
-//! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `send`, `discover`,
-//! `jobs`, `signal-server`, `probe`, `bench`, `doctor`, `completions`. The
+//! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `daemon`, `send`,
+//! `discover`, `jobs`, `signal-server`, `probe`, `bench`, `doctor`,
+//! `completions`. The
 //! binary never talks to any file-carrying server; servers started here are
 //! coordination-only (ADR-001).
 //!
@@ -13,6 +14,7 @@
 //! part of any export.
 #![forbid(unsafe_code)]
 
+mod daemon;
 mod doctor;
 mod errors;
 
@@ -145,6 +147,41 @@ enum Command {
         /// concurrent mode; overrides the sequential loop).
         #[arg(long, value_parser = clap::value_parser!(u64).range(2..))]
         jobs: Option<u64>,
+    },
+    /// Resident receive mode: advertise this device over mDNS (same TXT as
+    /// `discover` shows) and keep accepting job after job until Ctrl-C.
+    /// Unlike `receive`, a failed or timed-out job does not end the daemon:
+    /// the failure is reported and the loop keeps listening. `--json-lines`
+    /// turns stdout into an NDJSON event stream (listening/job_started/
+    /// job_done/error/stopped) for GUI and script consumers.
+    Daemon {
+        /// Destination directory (must exist).
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+        /// UDP port to listen on; 0 = auto-assign (the default, because the
+        /// concrete port is published via mDNS and the listening event).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Accept policy, same shapes as `receive --expect`: omitted =
+        /// fingerprints in peers.book only; 'any'; a 64-hex fingerprint (or
+        /// unique 8-63 character book prefix); a 6-digit pairing code.
+        #[arg(long)]
+        expect: Option<String>,
+        /// Overwrite policy: error (default) or rename.
+        #[arg(long, default_value = "error")]
+        conflict: String,
+        /// Idle timeout in seconds: frame-gap budget per job (not total run
+        /// time; waiting between senders is unbounded like `receive`).
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+        /// Device name published in the mDNS TXT and shown to senders
+        /// (default: the local user name, as `receive` reports).
+        #[arg(long)]
+        name: Option<String>,
+        /// Emit NDJSON events on stdout instead of human text; progress
+        /// rendering is suppressed and informational notes move to stderr.
+        #[arg(long, default_value_t = false)]
+        json_lines: bool,
     },
     /// Send files and/or directories to a peer. The first path is the
     /// primary root; further paths join the same job, each keeping its own
@@ -552,7 +589,7 @@ pub(crate) fn peer_book_path(id: &Path) -> PathBuf {
     id.join("peers.book")
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1117,7 +1154,7 @@ fn format_utc_ms(unix_ms: u64) -> String {
 }
 
 /// Two-line fingerprint display used everywhere: short 8 first, full second.
-fn fingerprint_lines(label: &str, fingerprint: &Fingerprint) -> String {
+pub(crate) fn fingerprint_lines(label: &str, fingerprint: &Fingerprint) -> String {
     format!(
         "{label}: {}\n{label} (full): {}",
         fingerprint.short_id(),
@@ -1297,20 +1334,20 @@ fn clip_line(text: &str, width: usize) -> String {
 /// println per event (the engine emits BytesAcked every 16 acks, which used
 /// to flood the terminal). Whole-line events (Done, file-level, ...) first
 /// erase an open progress line so log lines stay readable.
-struct ProgressLine {
+pub(crate) struct ProgressLine {
     direction: &'static str,
     open: std::sync::atomic::AtomicBool,
 }
 
 impl ProgressLine {
-    fn new(direction: &'static str) -> Self {
+    pub(crate) fn new(direction: &'static str) -> Self {
         ProgressLine {
             direction,
             open: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn show(&self, progress: &Progress) {
+    pub(crate) fn show(&self, progress: &Progress) {
         if let Progress::BytesAcked {
             file_index,
             cumulative_bytes,
@@ -1380,7 +1417,7 @@ fn roots_line(report: &Report) -> Option<String> {
     }
 }
 
-fn report_summary(report: &Report) {
+pub(crate) fn report_summary(report: &Report) {
     println!(
         "job {} complete: {} entries, {}, resumed {} chunks, peer {}",
         report
@@ -1948,6 +1985,109 @@ fn jobs_command(id: &Path, cmd: Option<JobsCommand>) -> Result<()> {
 /// names one.
 const DEFAULT_RECEIVE_PORT: u16 = 7100;
 
+/// Firewall notice printed by every listener verb (`receive`, `daemon`).
+pub(crate) const FIREWALL_NOTE: &str = "note: Windows may prompt to allow ak-cli through the \
+                                       firewall on first listen; granting it only opens this \
+                                       direct transfer port";
+
+/// Fully-resolved receive-loop parameters shared by `receive` and `daemon`:
+/// one identity, one accept policy, one destination. Every loop iteration
+/// builds a fresh [`ReceiveSpec`] from this config, so identity/admission
+/// wiring can never drift between the two verbs.
+pub(crate) struct ReceiveLoopConfig {
+    pub(crate) out: PathBuf,
+    pub(crate) listen: SocketAddr,
+    pub(crate) bundle: TlsBundle,
+    pub(crate) fingerprint: Fingerprint,
+    pub(crate) conflict: ConflictPolicy,
+    pub(crate) checkpoints: PathBuf,
+    pub(crate) device_name: String,
+    pub(crate) idle: Duration,
+    pub(crate) allow_internet: bool,
+    pub(crate) policy: ExpectPolicy,
+}
+
+impl ReceiveLoopConfig {
+    /// Resolve everything both receive loops share: device identity, accept
+    /// policy, conflict policy, checkpoint directory and idle budget. The
+    /// only per-verb inputs are the destination, listen address, device
+    /// name and the LAN-only flag.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve(
+        id: &Path,
+        out: PathBuf,
+        listen: SocketAddr,
+        expect: Option<&str>,
+        conflict_text: &str,
+        no_internet: bool,
+        timeout_secs: u64,
+        device_name: String,
+    ) -> Result<Self> {
+        let (key, bundle) = load_identity(id)?;
+        let policy = resolve_expect(expect, &peer_book_path(id))?;
+        Ok(Self {
+            out,
+            listen,
+            bundle,
+            fingerprint: key.fingerprint(),
+            conflict: conflict_policy(conflict_text)?,
+            checkpoints: checkpoint_dir(id),
+            device_name,
+            idle: idle_timeout_from_secs(timeout_secs),
+            allow_internet: !no_internet,
+            policy,
+        })
+    }
+
+    /// One loop iteration's engine spec. `authorize` is re-created per call
+    /// so the peers.book policy re-reads the book on every connection
+    /// (`pair add` takes effect without restarting the loop).
+    pub(crate) fn iteration_spec(&self) -> ReceiveSpec {
+        let mut spec = ReceiveSpec::new(self.out.clone(), self.bundle.clone());
+        spec.bind = self.listen;
+        spec.conflict = self.conflict;
+        spec.checkpoint_dir = self.checkpoints.clone();
+        spec.device_name = self.device_name.clone();
+        spec.idle_timeout = self.idle;
+        spec.policy.allow_internet = self.allow_internet;
+        spec.authorize = self.policy.authorize();
+        spec
+    }
+}
+
+/// The accept-policy startup notice lines, shared by `receive` and
+/// `daemon` so both verbs describe the same admission semantics.
+pub(crate) fn expect_policy_lines(policy: &ExpectPolicy) -> Vec<String> {
+    match policy {
+        ExpectPolicy::Any => vec![
+            "warning: --expect any accepts EVERY peer; anyone who can reach \
+             this port may send files"
+                .to_owned(),
+        ],
+        ExpectPolicy::Pinned(pinned) => vec![format!(
+            "accept policy: only peer {} (its pairing code must be {})",
+            pinned.short_id(),
+            ak_identity::pairing_code(pinned)
+        )],
+        ExpectPolicy::PairingCode(code) => {
+            vec![format!(
+                "accept policy: only the peer presenting pairing code {code}"
+            )]
+        }
+        ExpectPolicy::Book(path) => match PeerBook::load(path) {
+            Ok(book) => vec![format!(
+                "accept policy: paired peers only ({} in {})",
+                book.iter().count(),
+                path.display()
+            )],
+            Err(_) => vec![format!(
+                "accept policy: paired peers only ({})",
+                path.display()
+            )],
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_command(
     id: &Path,
@@ -1972,52 +2112,26 @@ async fn receive_command(
              or an IPv4-mapped address (no relay fallback exists)"
         );
     }
-    let (key, bundle) = load_identity(id)?;
-    let fp = key.fingerprint();
-    let policy = resolve_expect(expect.as_deref(), &peer_book_path(id))?;
-    let conflict = conflict_policy(&conflict)?;
-    let checkpoints = checkpoint_dir(id);
-    let device_name = whoami();
-    let idle = idle_timeout_from_secs(timeout);
-
-    match &policy {
-        ExpectPolicy::Any => println!(
-            "warning: --expect any accepts EVERY peer; anyone who can reach \
-             this port may send files"
-        ),
-        ExpectPolicy::Pinned(pinned) => println!(
-            "accept policy: only peer {} (its pairing code must be {})",
-            pinned.short_id(),
-            ak_identity::pairing_code(pinned)
-        ),
-        ExpectPolicy::PairingCode(code) => {
-            println!("accept policy: only the peer presenting pairing code {code}")
-        }
-        ExpectPolicy::Book(path) => match PeerBook::load(path) {
-            Ok(book) => println!(
-                "accept policy: paired peers only ({} in {})",
-                book.iter().count(),
-                path.display()
-            ),
-            Err(_) => println!("accept policy: paired peers only ({})", path.display()),
-        },
+    let config = ReceiveLoopConfig::resolve(
+        id,
+        out.clone(),
+        listen,
+        expect.as_deref(),
+        &conflict,
+        no_internet,
+        timeout,
+        whoami(),
+    )?;
+    let fp = config.fingerprint;
+    for line in expect_policy_lines(&config.policy) {
+        println!("{line}");
     }
-    println!(
-        "note: Windows may prompt to allow ak-cli through the firewall on \
-         first listen; granting it only opens this direct transfer port"
-    );
+    println!("{FIREWALL_NOTE}");
 
     let mut first = true;
     // Concurrent mode: accept `jobs` senders on one endpoint at once.
     if let Some(expected) = jobs.map(|count| count as usize) {
-        let mut spec = ReceiveSpec::new(out.clone(), bundle.clone());
-        spec.bind = listen;
-        spec.conflict = conflict;
-        spec.checkpoint_dir = checkpoints.clone();
-        spec.device_name = device_name.clone();
-        spec.idle_timeout = idle;
-        spec.policy.allow_internet = !no_internet;
-        spec.authorize = policy.authorize();
+        let spec = config.iteration_spec();
         println!(
             "receiving {expected} concurrent transfer(s) into {}",
             out.display()
@@ -2048,14 +2162,7 @@ async fn receive_command(
     const MAX_REBIND_RETRIES: u32 = 50;
     let mut rebind_retries = 0u32;
     loop {
-        let mut spec = ReceiveSpec::new(out.clone(), bundle.clone());
-        spec.bind = listen;
-        spec.conflict = conflict;
-        spec.checkpoint_dir = checkpoints.clone();
-        spec.device_name = device_name.clone();
-        spec.idle_timeout = idle;
-        spec.policy.allow_internet = !no_internet;
-        spec.authorize = policy.authorize();
+        let spec = config.iteration_spec();
         let printer = progress_printer("recv");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let receiver =
@@ -2324,6 +2431,29 @@ async fn main() -> Result<()> {
                 no_internet,
                 timeout,
                 jobs,
+            )
+            .await
+        }
+        Command::Daemon {
+            out,
+            port,
+            expect,
+            conflict,
+            timeout,
+            name,
+            json_lines,
+        } => {
+            daemon::daemon_command(
+                &id,
+                daemon::DaemonOptions {
+                    out,
+                    port,
+                    expect,
+                    conflict,
+                    timeout,
+                    name,
+                    json_lines,
+                },
             )
             .await
         }

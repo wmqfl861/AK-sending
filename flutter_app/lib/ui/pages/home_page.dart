@@ -41,7 +41,8 @@ class HomePage extends StatefulWidget {
 
   final TransferService service;
 
-  /// Jump to a shell tab index (0..4); wired by the NavigationRail shell.
+  /// Jump to a shell tab index (0..5; 4 = the Pairing tab); wired by the
+  /// NavigationRail shell.
   final void Function(int index)? onGoTab;
 
   @override
@@ -190,17 +191,30 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Icon(Icons.how_to_reg,
-                        size: 16, color: scheme.outline),
-                    const SizedBox(width: 6),
-                    Text(
-                      '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
-                      key: const ValueKey('home_peers_count'),
-                      style: theme.textTheme.bodySmall,
+                // Wave-14 linkage: tapping the pairing-book row jumps to
+                // the Pairing tab (index 4) where the book is managed.
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => widget.onGoTab?.call(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.how_to_reg,
+                            size: 16, color: scheme.outline),
+                        const SizedBox(width: 6),
+                        Text(
+                          '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
+                          key: const ValueKey('home_peers_count'),
+                          style: theme.textTheme.bodySmall,
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(Icons.chevron_right,
+                            size: 16, color: scheme.outline),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
                 const SizedBox(height: 8),
                 Text(

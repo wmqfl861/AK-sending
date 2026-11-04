@@ -63,4 +63,25 @@ void main() {
     await tester.pump();
     expect(find.byKey(const ValueKey('receive_task_card')), findsOneWidget);
   });
+
+  testWidgets('the pairing tab (wave-14 sixth tab) renders the pairing '
+      'management page; the home peers row jumps to it', (tester) async {
+    final fake = FakeTransferService();
+    await tester.binding.setSurfaceSize(const Size(1280, 1800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(AkSendingApp(service: fake));
+
+    // Direct rail navigation.
+    await tester.tap(railLabel('配对'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('pairing_add_button')), findsOneWidget);
+    expect(find.text('还没有配对设备'), findsOneWidget);
+
+    // Home linkage: the identity card's pairing-book row jumps here too.
+    await tester.tap(railLabel('主页'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.textContaining('已配对设备'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('pairing_add_button')), findsOneWidget);
+  });
 }

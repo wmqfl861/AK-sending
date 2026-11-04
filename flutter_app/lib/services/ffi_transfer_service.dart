@@ -33,6 +33,14 @@
 /// * `listJobs()` — a real read of the jobs checkpoint store through
 ///   [AkEngineFacade.jobsList] (`engine.jobsList(idDir)`), mapped to
 ///   [JobRecord] rows, newest first.
+/// * Wave-14 wiring (pairing book): `listPeers()`/`addPeer()`/
+///   `removePeer()` go through [AkEngineFacade.peerList]/[peerAdd]/
+///   [peerRemove] (`engine.peer*`, frozen contract). Unlike the history
+///   read these PROPAGATE errors — a corrupt peers.book must surface as
+///   an inline reason on the pairing page, not as an empty list. The
+///   facade's real adapter throws [UnsupportedError] at its
+///   `TODO(wave14-dart)` call sites until the bindings land; every peer
+///   write refreshes the cached identity so the HomePage count follows.
 ///
 /// Android adaptation (wave 13): there is no `Platform.environment` home on
 /// Android, so the default identity directory resolves asynchronously from
@@ -56,8 +64,10 @@ import 'package:path_provider/path_provider.dart'
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show
+        AkFfiException,
         AkReceiveSpec,
         AkSendSpec,
+        AkStatus,
         JobController,
         JobPhase,
         ProgressEvent,
@@ -70,6 +80,7 @@ import '../ui/service/transfer_service.dart'
         JobDirection,
         JobRecord,
         JobRecordState,
+        PeerEntryUi,
         ReceiveOptions,
         SendOptions,
         TransferService,
@@ -569,6 +580,102 @@ final class FfiTransferService implements TransferService {
       root: rootRaw is String && rootRaw.isNotEmpty ? rootRaw : null,
       error: row['error'] is String ? row['error'] as String? : null,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Pairing book (wave-14).
+  // -------------------------------------------------------------------------
+
+  /// Real read of the pairing book through the facade (`engine.peerList`,
+  /// frozen wave-14 contract). Unlike [listJobs] errors PROPAGATE: a
+  /// corrupt book or an unusable engine surfaces on the pairing page as
+  /// an inline reason instead of a silently empty list — the page cannot
+  /// tell "empty" from "unreadable" otherwise.
+  @override
+  Future<List<PeerEntryUi>> listPeers() async {
+    if (_isAndroidPlatform) {
+      await identityDirReady; // read the book under the real dir
+    }
+    _requireEngine(); // honest StateError when unusable
+    final rows = _facade.peerList(_identityDir);
+    final peers = <PeerEntryUi>[];
+    for (final row in rows) {
+      final entry = _peerEntryOf(row);
+      if (entry != null) {
+        peers.add(entry);
+      }
+    }
+    peers.sort((a, b) => a.fingerprint.compareTo(b.fingerprint));
+    return peers;
+  }
+
+  /// Maps one `engine.peerList` row (`fingerprint`/`name`/
+  /// `paired_unix_ms`) to a [PeerEntryUi]; null for a row without a
+  /// usable fingerprint (skipped defensively, like `_jobRecordOf`).
+  static PeerEntryUi? _peerEntryOf(Map<String, dynamic> row) {
+    final fingerprintRaw = row['fingerprint'];
+    if (fingerprintRaw is! String || fingerprintRaw.isEmpty) {
+      return null;
+    }
+    final nameRaw = row['name'];
+    final paired = row['paired_unix_ms'];
+    return PeerEntryUi(
+      fingerprint: fingerprintRaw.toLowerCase(),
+      name: nameRaw is String ? nameRaw : '',
+      pairedAt: DateTime.fromMillisecondsSinceEpoch(
+          paired is int && paired >= 0 ? paired : 0),
+    );
+  }
+
+  /// Adds (or renames) one paired peer through the facade. Validation is
+  /// mirrored locally (64 hex, no prefix resolution) so a malformed input
+  /// fails before any disk write; a blank name is passed as null — the
+  /// engine stores "(unnamed)" for new peers. The cached identity is
+  /// refreshed afterwards so the HomePage pairing-book count follows.
+  @override
+  Future<int> addPeer(String fpHex, String name) async {
+    if (_isAndroidPlatform) {
+      await identityDirReady;
+    }
+    _requireEngine();
+    final fingerprint = fpHex.trim().toLowerCase();
+    if (!isFingerprintHex(fingerprint)) {
+      throw const FormatException('指纹须为 64 位十六进制字符（前缀不能用于添加，请粘贴完整指纹）。');
+    }
+    final trimmedName = name.trim();
+    final count = _facade.peerAdd(
+      _identityDir,
+      fingerprint,
+      name: trimmedName.isEmpty ? null : trimmedName,
+    );
+    await _refreshIdentityUngated(); // HomePage peersCount follows the book
+    return count;
+  }
+
+  /// Removes one paired peer through the facade. The engine's `-4`
+  /// not-found form (the fingerprint is not in the book) maps to `false`;
+  /// every other failure propagates. Refreshes the cached identity like
+  /// [addPeer].
+  @override
+  Future<bool> removePeer(String fpHex) async {
+    if (_isAndroidPlatform) {
+      await identityDirReady;
+    }
+    _requireEngine();
+    final fingerprint = fpHex.trim().toLowerCase();
+    if (!isFingerprintHex(fingerprint)) {
+      throw const FormatException('指纹须为 64 位十六进制字符。');
+    }
+    try {
+      _facade.peerRemove(_identityDir, fingerprint);
+    } on AkFfiException catch (error) {
+      if (error.code == AkStatus.errNotFound) {
+        return false; // not in the book — the page shows the honest case
+      }
+      rethrow;
+    }
+    await _refreshIdentityUngated();
+    return true;
   }
 
   @override

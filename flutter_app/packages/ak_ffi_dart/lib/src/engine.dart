@@ -1,8 +1,9 @@
 /// `AkEngineDart`: the friendly face over [AkFfiBindings] — engine
 /// lifecycle with a finalizer backstop, typed start/poll/result/cancel
-/// calls, id_dir inspection ([IdentityInfo]/[JobRecordJson]), automatic
-/// `-3` buffer growth with lossless retry, and negative status codes turned
-/// into [AkFfiException]s carrying the last-error message.
+/// calls, id_dir inspection ([IdentityInfo]/[JobRecordJson]), peer-book
+/// management ([PeerEntry]), automatic `-3` buffer growth with lossless
+/// retry, and negative status codes turned into [AkFfiException]s carrying
+/// the last-error message.
 ///
 /// Concurrency contract (inherited from the shim): calls on ONE engine
 /// handle must be serialized by the caller — keep a single engine per
@@ -19,6 +20,7 @@ import 'bindings.dart';
 import 'ffi_json.dart'
     show AkReceiveSpec, AkSendSpec, decodeFfiJson, fromNativeUtf8, toNativeUtf8;
 import 'identity.dart';
+import 'peers.dart';
 
 /// Byte length of every FFI job id.
 const int akJobIdLength = 16;
@@ -193,6 +195,96 @@ class AkEngineDart {
   /// still fit in a few doublings).
   static const int _maxJobsListBytes = 1024;
 
+  // -------------------------------------------------------------------------
+  // Peer book management (`<id_dir>/peers.book`; no engine state needed).
+  // -------------------------------------------------------------------------
+
+  /// The paired-peer book of [idDir] via `ak_peer_list`: one [PeerEntry]
+  /// per `<idDir>/peers.book` entry, sorted by fingerprint. The book is the
+  /// same file the CLI's `pair` subcommands and the `expect: "book"`
+  /// admission policy use; reads never create anything on disk, so a fresh
+  /// or never-existing directory lists the empty list.
+  ///
+  /// A CORRUPT book throws [AkFfiException] (code -2, "cannot load peer
+  /// book"); an empty or unusable [idDir] is -2 like on [identityInfo]. The
+  /// whole array is rendered before any write, so a `-3` retry with a
+  /// larger buffer is lossless (and automatic here).
+  List<PeerEntry> peerList(String idDir) {
+    final json = _inspectIdDir(
+        idDir, bindings.peerList, 'ak_peer_list', _maxPeersJsonBytes);
+    final array = jsonDecode(json) as List<dynamic>;
+    return [
+      for (final element in array)
+        PeerEntry.fromJson(element as Map<String, dynamic>),
+    ];
+  }
+
+  /// Pairs (or renames) one peer in `<idDir>/peers.book` via `ak_peer_add`
+  /// and returns the NEW peer count.
+  ///
+  /// CLI TOFU semantics: [fingerprintHex] must be exactly 64 hex characters
+  /// (else [AkFfiException] code -2). A NEW peer paired with an empty
+  /// [name] is stored as "(unnamed)"; re-adding an EXISTING fingerprint
+  /// with a name renames it while keeping the original
+  /// [PeerEntry.pairedUnixMs], and re-adding without a name leaves the
+  /// record untouched — the call is idempotent, so retrying after an
+  /// exception is always safe. Names must not contain control characters
+  /// and are capped at 4096 bytes (else -2, rejected rather than
+  /// sanitized). A `-3` is raised before anything is persisted (the retry
+  /// here is automatic); a failed save surfaces as -5.
+  int peerAdd(String idDir, String fingerprintHex, {String name = ''}) {
+    _ensureLive();
+    final idPointer = toNativeUtf8(idDir);
+    final fpPointer = toNativeUtf8(fingerprintHex);
+    Pointer<Uint8>? namePointer;
+    try {
+      // `name` is the ABI's one OPTIONAL string argument: a null pointer
+      // means "no name given" (an empty string is equivalent), so the
+      // empty Dart default maps to null.
+      if (name.isNotEmpty) {
+        namePointer = toNativeUtf8(name);
+      }
+      final json = _jsonCall(
+          'ak_peer_add',
+          _maxPeersJsonBytes,
+          (buf, cap) => bindings.peerAdd(_handle, idPointer, fpPointer,
+              namePointer ?? nullptr, buf, cap));
+      return decodeFfiJson(json)['peers'] as int;
+    } finally {
+      if (namePointer != null) {
+        processAllocator.free(namePointer);
+      }
+      processAllocator.free(fpPointer);
+      processAllocator.free(idPointer);
+    }
+  }
+
+  /// Removes one paired peer from `<idDir>/peers.book` via
+  /// `ak_peer_remove` and returns the REMAINING peer count.
+  ///
+  /// A fingerprint not in the book (a missing book has no peers, so it is
+  /// the same case) throws [AkFfiException] code -4 carrying the engine's
+  /// hint; a bad [fingerprintHex] is -2 like on [peerAdd]; a corrupt book
+  /// is -2 ("cannot load peer book"). A `-3` precedes any persistence, so
+  /// the automatic retry removes exactly once.
+  int peerRemove(String idDir, String fingerprintHex) {
+    _ensureLive();
+    final idPointer = toNativeUtf8(idDir);
+    final fpPointer = toNativeUtf8(fingerprintHex);
+    try {
+      final json = _jsonCall('ak_peer_remove', _maxPeersJsonBytes,
+          (buf, cap) => bindings.peerRemove(_handle, idPointer, fpPointer, buf, cap));
+      return decodeFfiJson(json)['peers'] as int;
+    } finally {
+      processAllocator.free(fpPointer);
+      processAllocator.free(idPointer);
+    }
+  }
+
+  /// Starting buffer for peer-book payloads (the count JSON is tiny; lists
+  /// grow by doubling).
+  static const int _maxPeersJsonBytes = 256;
+
   /// Shared id_dir-inspection call: native [idDir] in, JSON payload out,
   /// with the standard `-3` grow-retry and last-error-carrying
   /// [AkFfiException]s for the other negative codes.
@@ -206,28 +298,40 @@ class AkEngineDart {
     _ensureLive();
     final idPointer = toNativeUtf8(idDir);
     try {
-      var capacity = initialCapacity;
-      while (capacity <= _maxBufferBytes) {
-        final buf = processAllocator.allocate<Uint8>(capacity);
-        try {
-          final code = invoke(_handle, idPointer, buf, capacity);
-          if (code == AkStatus.done) {
-            return fromNativeUtf8(buf);
-          }
-          if (code == AkStatus.errBuffer) {
-            capacity *= 2; // nothing was consumed; retry losslessly
-            continue;
-          }
-          throw _exceptionFor(code, symbol);
-        } finally {
-          processAllocator.free(buf);
-        }
-      }
-      throw StateError(
-          '$symbol kept requesting more than $_maxBufferBytes bytes');
+      return _jsonCall(symbol, initialCapacity,
+          (buf, cap) => invoke(_handle, idPointer, buf, cap));
     } finally {
       processAllocator.free(idPointer);
     }
+  }
+
+  /// Shared grow-retry loop for the JSON-out calls: status `1` decodes the
+  /// payload, `-3` doubles the capacity and retries (nothing was consumed),
+  /// other negatives throw an [AkFfiException] carrying the last error.
+  String _jsonCall(
+    String symbol,
+    int initialCapacity,
+    int Function(Pointer<Uint8> buf, int cap) invoke,
+  ) {
+    var capacity = initialCapacity;
+    while (capacity <= _maxBufferBytes) {
+      final buf = processAllocator.allocate<Uint8>(capacity);
+      try {
+        final code = invoke(buf, capacity);
+        if (code == AkStatus.done) {
+          return fromNativeUtf8(buf);
+        }
+        if (code == AkStatus.errBuffer) {
+          capacity *= 2; // nothing was consumed; retry losslessly
+          continue;
+        }
+        throw _exceptionFor(code, symbol);
+      } finally {
+        processAllocator.free(buf);
+      }
+    }
+    throw StateError(
+        '$symbol kept requesting more than $_maxBufferBytes bytes');
   }
 
   // -------------------------------------------------------------------------

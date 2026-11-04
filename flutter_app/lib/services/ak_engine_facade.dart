@@ -12,11 +12,25 @@
 ///             updated_unix_ms / peer / root
 /// ```
 ///
-/// The real adapter below is written against that contract; until
-/// `AkEngineDart` grows the two methods it throws [UnsupportedError] at the
-/// exact call sites marked `TODO(wave12-dart)` — integration is a one-line
-/// switch per method. Tests inject their own fake of this interface and
-/// never touch the real one.
+/// Frozen wave-14 contract (pairing book, also landing with the bindings
+/// agent in parallel):
+///
+/// ```text
+/// engine.peerList(String idDir) → List<PeerEntry{fingerprint, name,
+///   pairedUnixMs}>        // sorted by fingerprint; missing book = []
+/// engine.peerAdd(String idDir, String fpHex, {String? name}) → int
+///   // new peer count; fpHex must be 64 hex (engine -2 otherwise);
+///   // null/empty name stores "(unnamed)" for NEW peers; idempotent
+/// engine.peerRemove(String idDir, String fpHex) → int
+///   // new peer count; a fingerprint not in the book raises the engine's
+///   // -4 AK_ERR_NOT_FOUND (surfacing as AkFfiException here)
+/// ```
+///
+/// The real adapter below is written against those contracts; until
+/// `AkEngineDart` grows a method it throws [UnsupportedError] at the
+/// exact call sites marked `TODO(wave12-dart)` / `TODO(wave14-dart)` —
+/// integration is a one-line switch per method. Tests inject their own
+/// fake of this interface and never touch the real one.
 library;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart' show AkEngineDart;
@@ -36,6 +50,26 @@ abstract interface class AkEngineFacade {
   /// `id`/`direction`/`state`/`files`/`bytes`/`updated_unix_ms`/`peer`/
   /// `root` per row.
   List<Map<String, dynamic>> jobsList(String idDir);
+
+  /// Lists the pairing book (`<idDir>/peers.book`) rows: one map per
+  /// paired peer with keys `fingerprint` (64 hex)/`name`/
+  /// `paired_unix_ms`, sorted by fingerprint. A missing book is the
+  /// empty list; a CORRUPT book throws (the engine's "cannot load peer
+  /// book" error) so callers can surface the reason inline.
+  List<Map<String, dynamic>> peerList(String idDir);
+
+  /// Pairs one peer (or renames an existing one; idempotent) and returns
+  /// the NEW peer count. [fpHex] must be exactly 64 hex characters — the
+  /// engine rejects anything else with `-2`. A null/empty [name] stores
+  /// `"(unnamed)"` for a NEW peer; re-adding an existing fingerprint
+  /// with a name renames it but keeps the original `paired_unix_ms`.
+  int peerAdd(String idDir, String fpHex, {String? name});
+
+  /// Removes one paired peer and returns the NEW peer count. A
+  /// fingerprint not in the book (a missing book has no peers, so it is
+  /// the same case) throws the engine's `-4` not-found error; a bad
+  /// fingerprint throws like on [peerAdd].
+  int peerRemove(String idDir, String fpHex);
 }
 
 /// Real [AkEngineFacade] over one lazily-opened [AkEngineDart].
@@ -85,6 +119,30 @@ final class AkEngineDartFacade implements AkEngineFacade {
           },
         )
         .toList();
+  }
+
+  @override
+  List<Map<String, dynamic>> peerList(String idDir) {
+    return _engineOrThrow()
+        .peerList(idDir)
+        .map(
+          (peer) => <String, dynamic>{
+            'fingerprint': peer.fingerprint,
+            'name': peer.name,
+            'paired_unix_ms': peer.pairedUnixMs,
+          },
+        )
+        .toList();
+  }
+
+  @override
+  int peerAdd(String idDir, String fpHex, {String? name}) {
+    return _engineOrThrow().peerAdd(idDir, fpHex, name: name ?? '');
+  }
+
+  @override
+  int peerRemove(String idDir, String fpHex) {
+    return _engineOrThrow().peerRemove(idDir, fpHex);
   }
 
   /// Releases the engine when this facade opened its own. Idempotent.

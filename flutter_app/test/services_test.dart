@@ -11,6 +11,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show AkJobResult, AkReceiveSpec, AkSendSpec, JobPhase, Listening, ProgressEvent;
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:ak_sending_app/services/ak_engine_facade.dart';
 import 'package:ak_sending_app/services/dll_path.dart';
 import 'package:ak_sending_app/services/ffi_transfer_service.dart';
 import 'package:ak_sending_app/services/real_transfer_service.dart';
@@ -23,7 +24,7 @@ import 'package:ak_sending_app/ui/service/transfer_service.dart'
         SendOptions,
         TransferServiceStatus;
 
-import 'fake_transfer_service.dart' show FakeAkEngineFacade;
+import 'fake_transfer_service.dart' show FakeAkEngineFacade, kPeerFingerprint;
 
 final String _fpHex64 = 'a' * 64;
 
@@ -687,6 +688,151 @@ void main() {
       final degraded = await failing.refreshIdentity();
       expect(degraded.fingerprintHex, isEmpty);
       expect(await failing.listJobs(), isEmpty);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // FfiTransferService pairing book (wave-14, fake engine facade).
+  // -------------------------------------------------------------------------
+
+  group('FfiTransferService pairing book (wave-14)', () {
+    FfiTransferService wired(
+      FakeAkEngineFacade facade, {
+      _FakeBackend? backend,
+    }) {
+      final service = FfiTransferService(
+        backend: backend ?? _FakeBackend(),
+        engineFacade: facade,
+        pollInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(service.dispose);
+      return service;
+    }
+
+    test('peerList rows map to UI entries sorted by fingerprint, through '
+        'the configured id_dir', () async {
+      final facade = FakeAkEngineFacade(peerRows: [
+        <String, dynamic>{
+          'fingerprint': 'CD' * 32, // engine may send uppercase
+          'name': 'laptop',
+          'paired_unix_ms': 1730000000000,
+        },
+        <String, dynamic>{
+          'fingerprint': kPeerFingerprint,
+          'name': '(unnamed)',
+          'paired_unix_ms': 0,
+        },
+      ]);
+      final service = wired(facade);
+      service.setIdentityDir('D:/ids/ak');
+
+      final peers = await service.listPeers();
+      expect(peers, hasLength(2));
+      // Sorted by fingerprint: 6c31... before cdcd....
+      expect(peers.first.fingerprint, kPeerFingerprint);
+      expect(peers.first.name, '(unnamed)');
+      expect(peers.first.pairedAt,
+          DateTime.fromMillisecondsSinceEpoch(0));
+      expect(peers.last.fingerprint, 'cd' * 32); // lowercased
+      expect(peers.last.name, 'laptop');
+      expect(facade.idDirRequests.single, ('peerList', 'D:/ids/ak'));
+    });
+
+    test('listPeers propagates a corrupt book and an unusable engine '
+        'instead of degrading to an empty list', () async {
+      final corrupt = FakeAkEngineFacade(
+        peerListError: StateError('cannot load peer book: peers.book 损坏'),
+      );
+      await expectLater(wired(corrupt).listPeers(), throwsStateError);
+
+      // Engine open failure: the honest 传输引擎不可用 StateError.
+      final failing =
+          wired(FakeAkEngineFacade(), backend: _FakeBackend(versionThrows: true));
+      await expectLater(failing.listPeers(), throwsStateError);
+    });
+
+    test('addPeer normalizes input, writes through the facade and refreshes '
+        'the identity (home-card linkage)', () async {
+      final facade = FakeAkEngineFacade();
+      final service = wired(facade);
+      await service.refreshIdentity();
+      facade.idDirRequests.clear();
+
+      final count = await service.addPeer('6C' * 32, '  笔记本  ');
+      expect(count, 1);
+      expect(
+        facade.idDirRequests.where((r) => r.$1 == 'peerAdd').single,
+        ('peerAdd', service.identityDir),
+      );
+      // The identity re-read after the write keeps 已配对设备 in sync.
+      expect(facade.idDirRequests.last.$1, 'identityInfo');
+      final peers = await service.listPeers();
+      expect(peers.single.fingerprint, '6c' * 32); // lowercased
+      expect(peers.single.name, '笔记本'); // trimmed
+    });
+
+    test('addPeer with a blank name pairs as (unnamed); malformed input '
+        'never reaches the facade', () async {
+      final facade = FakeAkEngineFacade();
+      final service = wired(facade);
+
+      expect(await service.addPeer(kPeerFingerprint, '   '), 1);
+      expect((await service.listPeers()).single.name, '(unnamed)');
+
+      // 8-hex prefix, non-hex junk and a 63-hex run are all local rejects.
+      for (final bad in ['6c310412', 'zz' * 32, 'a' * 63]) {
+        await expectLater(service.addPeer(bad, 'x'), throwsFormatException);
+      }
+      expect(
+        facade.idDirRequests.where((r) => r.$1 == 'peerAdd'),
+        hasLength(1),
+        reason: '只有合法的那一次写入到达引擎',
+      );
+    });
+
+    test('removePeer maps the engine -4 not-found to false; success '
+        'refreshes the identity', () async {
+      final facade = FakeAkEngineFacade(peerRows: [
+        <String, dynamic>{
+          'fingerprint': kPeerFingerprint,
+          'name': 'laptop',
+          'paired_unix_ms': 1730000000000,
+        },
+      ]);
+      final service = wired(facade);
+      await service.refreshIdentity();
+      facade.idDirRequests.clear();
+
+      expect(await service.removePeer(kPeerFingerprint), isTrue);
+      expect(
+        facade.idDirRequests.where((r) => r.$1 == 'peerRemove').single,
+        ('peerRemove', service.identityDir),
+      );
+      expect(facade.idDirRequests.last.$1, 'identityInfo');
+      // The peer is gone: the engine's -4 form becomes a plain false.
+      expect(await service.removePeer(kPeerFingerprint), isFalse);
+      expect(() => service.removePeer('abcd1234'), throwsFormatException);
+      expect(await service.listPeers(), isEmpty);
+    });
+
+    test('the real AkEngineDartFacade peer seam drives the real DLL '
+        '(wave-14 integration switched on)',
+        () {
+      final facade = AkEngineDartFacade();
+      addTearDown(facade.dispose);
+      // The DLL probe finds <repo>/target/release/ak_ffi.dll from the test
+      // CWD, so this exercises the full seam: facade -> AkEngineDart -> C ABI.
+      final idDir = Directory.systemTemp.createTempSync('ak-facade-peers-');
+      addTearDown(() => idDir.deleteSync(recursive: true));
+      expect(facade.peerList(idDir.path), isEmpty);
+      final fp = 'ab' * 32;
+      expect(facade.peerAdd(idDir.path, fp, name: 'host-a'), 1);
+      final peers = facade.peerList(idDir.path);
+      expect(peers, hasLength(1));
+      expect(peers.first['fingerprint'], fp);
+      expect(peers.first['name'], 'host-a');
+      expect(facade.peerRemove(idDir.path, fp), 0);
+      expect(facade.peerList(idDir.path), isEmpty);
     });
   });
 

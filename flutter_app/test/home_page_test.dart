@@ -72,6 +72,19 @@ void main() {
     expect(visited, [1, 2]);
   });
 
+  testWidgets('pairing-book row (wave-14 linkage) jumps to the pairing tab',
+      (tester) async {
+    final visited = <int>[];
+    final fake = FakeTransferService();
+    await pumpPage(
+      tester,
+      HomePage(service: fake, onGoTab: visited.add),
+    );
+
+    await tester.tap(find.textContaining('已配对设备'));
+    expect(visited, [4], reason: '配对是 NavigationRail 的第 5 个标签（索引 4）');
+  });
+
   testWidgets('startup refreshIdentity renders the real identity data '
       '(peersCount row)', (tester) async {
     final fake = FakeTransferService(

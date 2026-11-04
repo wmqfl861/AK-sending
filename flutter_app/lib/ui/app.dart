@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'pages/about_page.dart';
 import 'pages/home_page.dart';
 import 'pages/jobs_page.dart';
+import 'pages/pairing_page.dart';
 import 'pages/receive_page.dart';
 import 'pages/send_page.dart';
 import 'service/transfer_service.dart';
@@ -30,9 +31,9 @@ class AkSendingApp extends StatelessWidget {
   }
 }
 
-/// NavigationRail shell: Home / Receive / Send / Jobs / About. Pages stay
-/// alive in an IndexedStack so form state (e.g. the remembered output
-/// directory) survives tab switches.
+/// NavigationRail shell: Home / Receive / Send / Jobs / Pairing / About.
+/// Pages stay alive in an IndexedStack so form state (e.g. the remembered
+/// output directory) survives tab switches.
 class AppShell extends StatefulWidget {
   const AppShell({super.key, required this.service});
 
@@ -83,6 +84,11 @@ class _AppShellState extends State<AppShell> {
                     label: Text('历史'),
                   ),
                   NavigationRailDestination(
+                    icon: Icon(Icons.how_to_reg_outlined),
+                    selectedIcon: Icon(Icons.how_to_reg),
+                    label: Text('配对'),
+                  ),
+                  NavigationRailDestination(
                     icon: Icon(Icons.info_outline),
                     selectedIcon: Icon(Icons.info),
                     label: Text('关于'),
@@ -101,6 +107,7 @@ class _AppShellState extends State<AppShell> {
                     ReceivePage(service: service),
                     SendPage(service: service),
                     JobsPage(service: service),
+                    PairingPage(service: service),
                     AboutPage(service: service),
                   ],
                 ),

@@ -938,6 +938,446 @@ fn cancel_mid_transfer_fails_without_fake_completion() {
     ak_engine_free(engine);
 }
 
+// ---------------------------------------------------------------------------
+// Wave-17 fixes: null job_out before side effects, required `expect`,
+// cancel convergence (port rebind + quiet), DEL/C1 control characters.
+// ---------------------------------------------------------------------------
+
+/// Poll until the queue is empty, collecting every line; asserts PENDING.
+fn drain_events(engine: *mut AkEngine, lines: &mut Vec<String>) {
+    loop {
+        let (code, line) = poll_big(engine);
+        if code != AK_EVENT {
+            assert_eq!(code, AK_PENDING, "drain: {}", last_error_text(engine));
+            break;
+        }
+        lines.push(line);
+    }
+}
+
+/// Poll until `job` emits `event` (other lines collected and returned);
+/// panics with the collected lines when `timeout` elapses first.
+fn wait_for_event(
+    engine: *mut AkEngine,
+    job: &[u8; 16],
+    event: &str,
+    timeout: Duration,
+) -> Vec<String> {
+    let job_hex = hex16(job);
+    let mut others = Vec::new();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let (code, line) = poll_big(engine);
+        if code == AK_EVENT {
+            assert!(!line.contains('\n'), "single-line events: {line}");
+            if line_job(&line) == job_hex && event_name(&line) == event {
+                return others;
+            }
+            others.push(line);
+        } else {
+            assert_eq!(code, AK_PENDING, "poll: {}", last_error_text(engine));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("no {event} event for job {job_hex} within {timeout:?}; saw {others:?}");
+}
+
+#[test]
+fn null_job_out_is_refused_before_any_task_starts() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+
+    // A fully VALID send spec; the only defect is the null output pointer.
+    let src = tempfile::tempdir().unwrap();
+    write_file(&src.path().join("f.bin"), b"payload");
+    let fp = "ab".repeat(32);
+    let dead_port = free_udp_port();
+    let send_spec = format!(
+        "{{\"source_roots\":[{}],\"peer\":\"127.0.0.1:{dead_port}\",\
+         \"fp_hex\":\"{fp}\",\"timeout_secs\":30}}",
+        path_jstr(src.path())
+    );
+    assert_eq!(
+        ak_send_start(
+            engine,
+            CString::new(send_spec).unwrap().as_ptr(),
+            std::ptr::null_mut()
+        ),
+        AK_ERR_NULL
+    );
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("job_out"),
+        "last_error names job_out: {message}"
+    );
+
+    // A fully VALID receive spec with a concrete port; same defect.
+    let id_dir = tempfile::tempdir().unwrap();
+    make_receiver_identity(id_dir.path());
+    let dst = tempfile::tempdir().unwrap();
+    let port = free_udp_port();
+    let recv_spec = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"any\",\"id_dir\":{},\
+         \"timeout_secs\":30}}",
+        path_jstr(dst.path()),
+        path_jstr(id_dir.path())
+    );
+    assert_eq!(
+        ak_receive_start(
+            engine,
+            CString::new(recv_spec.clone()).unwrap().as_ptr(),
+            std::ptr::null_mut()
+        ),
+        AK_ERR_NULL
+    );
+    assert!(last_error_text(engine).contains("job_out"));
+
+    // No task may have been produced: over a window long enough for a real
+    // receive to emit `listening` (bind is immediate) and a real send to
+    // emit `connecting`, the queue stays empty.
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        let (code, line) = poll_big(engine);
+        assert_eq!(code, AK_PENDING, "no event may exist, got: {line}");
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    // Contrast: the same spec with a real job_out DOES start and emit,
+    // proving the quiet window above was the absence of tasks, not a dead
+    // engine (the job table and queue still work).
+    let mut recv_job = [0u8; 16];
+    assert_eq!(
+        ak_receive_start(
+            engine,
+            CString::new(recv_spec).unwrap().as_ptr(),
+            recv_job.as_mut_ptr()
+        ),
+        AK_OK,
+        "{}",
+        last_error_text(engine)
+    );
+    wait_for_event(engine, &recv_job, "listening", Duration::from_secs(20));
+    assert_eq!(ak_job_cancel(engine, recv_job.as_ptr()), AK_OK);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn receive_spec_without_expect_is_rejected() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let dst = tempfile::tempdir().unwrap();
+    let out_field = path_jstr(dst.path());
+    let id_dir = tempfile::tempdir().unwrap();
+    let id_field = path_jstr(id_dir.path());
+    let mut job = [0u8; 16];
+
+    // Missing or null expect: -2 with the exact required-field hint.
+    for spec in [
+        format!("{{\"out_dir\":{out_field},\"port\":0}}"),
+        format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":null}}"),
+    ] {
+        assert_eq!(
+            try_receive(engine, &spec, &mut job),
+            AK_ERR_INVALID,
+            "spec {spec}"
+        );
+        let message = last_error_text(engine);
+        assert!(
+            message.contains("expect required")
+                && message.contains("any")
+                && message.contains("book")
+                && message.contains("pairing code"),
+            "required-expect hint: {message}"
+        );
+        assert_eq!(job, [0u8; 16], "no job id on refusal");
+        assert!(
+            !dst.path().join("checkpoints").exists(),
+            "refusal starts nothing on disk"
+        );
+    }
+
+    // A present-but-empty expect is a VALUE error (the parse hint), still -2.
+    assert_eq!(
+        try_receive(
+            engine,
+            &format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"\"}}"),
+            &mut job
+        ),
+        AK_ERR_INVALID
+    );
+    assert!(last_error_text(engine).contains("expect"));
+
+    // A wrong TYPE is a type error, not the required hint.
+    assert_eq!(
+        try_receive(
+            engine,
+            &format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":7}}"),
+            &mut job
+        ),
+        AK_ERR_INVALID
+    );
+
+    // "any" must be EXPLICIT: with it the same spec starts (then cancels).
+    let spec =
+        format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"any\",\"id_dir\":{id_field}}}");
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_OK);
+    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_FAILED);
+    assert!(json.contains("cancelled by caller"), "{json}");
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn cancelled_single_receive_port_rebinds_immediately() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    make_receiver_identity(id_dir.path());
+    let dst = tempfile::tempdir().unwrap();
+    let port = free_udp_port();
+    let recv_spec = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"any\",\"id_dir\":{},\
+         \"timeout_secs\":30}}",
+        path_jstr(dst.path()),
+        path_jstr(id_dir.path())
+    );
+
+    let mut job = [0u8; 16];
+    assert_eq!(try_receive(engine, &recv_spec, &mut job), AK_OK);
+    wait_for_event(engine, &job, "listening", Duration::from_secs(20));
+    let job_hex = hex16(&job);
+
+    // Cancel through the ABI; the result flips to the cancelled failure.
+    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_FAILED, "cancelled job reports failure");
+    assert!(
+        json.contains("cancelled by caller"),
+        "failure body names the cancellation: {json}"
+    );
+
+    // Convergence: once cancel returned, the job never emits again. Drain
+    // the pre-cancel backlog, then the queue must stay empty — and no
+    // fake-completion `done` may ever have been queued.
+    let mut lines = Vec::new();
+    drain_events(engine, &mut lines);
+    thread::sleep(Duration::from_millis(300));
+    let (code, line) = poll_big(engine);
+    assert_eq!(code, AK_PENDING, "quiet after cancel: {line}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| line_job(l) == job_hex && l.contains("\"event\":\"done\"")),
+        "no done for a cancelled job: {lines:?}"
+    );
+
+    // THE point of the convergence fix: the same port rebinds IMMEDIATELY
+    // (the endpoint was reaped with the aborted task, not at idle timeout).
+    let mut job2 = [0u8; 16];
+    assert_eq!(
+        try_receive(engine, &recv_spec, &mut job2),
+        AK_OK,
+        "immediate rebind on port {port}: {}",
+        last_error_text(engine)
+    );
+    wait_for_event(engine, &job2, "listening", Duration::from_secs(20));
+    assert_eq!(ak_job_cancel(engine, job2.as_ptr()), AK_OK);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn cancelled_concurrent_receive_releases_its_port() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let id_dir = tempfile::tempdir().unwrap();
+    make_receiver_identity(id_dir.path());
+    let dst = tempfile::tempdir().unwrap();
+    let port = free_udp_port();
+
+    // once_jobs=2 with no senders: ak-engine parks a detached accept task
+    // owning the endpoint on this port (no stop channel exists for it).
+    let spec = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"any\",\"id_dir\":{},\
+         \"once_jobs\":2,\"timeout_secs\":60}}",
+        path_jstr(dst.path()),
+        path_jstr(id_dir.path())
+    );
+    let mut job = [0u8; 16];
+    assert_eq!(try_receive(engine, &spec, &mut job), AK_OK);
+    thread::sleep(Duration::from_millis(150));
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_PENDING, "still serving before cancel: {json}");
+
+    // Cancel converges (abort + await, then the port is knocked so the
+    // detached accept task drops the endpoint instead of holding it for
+    // the full 60 s accept deadline).
+    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_FAILED);
+    assert!(json.contains("cancelled by caller"), "{json}");
+
+    // The port must be rebindable IMMEDIATELY: a fresh single receive on
+    // the same port starts and reports itself listening.
+    let single = format!(
+        "{{\"out_dir\":{},\"port\":{port},\"expect\":\"any\",\"id_dir\":{},\
+         \"timeout_secs\":30}}",
+        path_jstr(dst.path()),
+        path_jstr(id_dir.path())
+    );
+    let mut job2 = [0u8; 16];
+    assert_eq!(
+        try_receive(engine, &single, &mut job2),
+        AK_OK,
+        "rebind on port {port}: {}",
+        last_error_text(engine)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_listening = false;
+    while Instant::now() < deadline {
+        let (code, line) = poll_big(engine);
+        if code == AK_EVENT {
+            if line_job(&line) == hex16(&job2) && event_name(&line) == "listening" {
+                saw_listening = true;
+                break;
+            }
+        } else {
+            assert_eq!(code, AK_PENDING, "{}", last_error_text(engine));
+        }
+        // Surface the bind failure itself (e.g. AddrInUse) instead of a
+        // bare listening timeout.
+        let (code, json) = result_big(engine, &job2);
+        if code == AK_FAILED {
+            panic!("rebind receive on port {port} failed: {json}");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        saw_listening,
+        "the cancelled port rebinds and listens right away"
+    );
+    assert_eq!(ak_job_cancel(engine, job2.as_ptr()), AK_OK);
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn cancelled_send_job_is_cancelled_and_stays_quiet() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let src = tempfile::tempdir().unwrap();
+    write_file(&src.path().join("f.bin"), b"x");
+    let fp = "ab".repeat(32);
+    let port = free_udp_port();
+    let spec = format!(
+        "{{\"source_roots\":[{}],\"peer\":\"127.0.0.1:{port}\",\"fp_hex\":\"{fp}\",\
+         \"timeout_secs\":30}}",
+        path_jstr(src.path())
+    );
+
+    // The peer never answers; the sender parks in its connect budget.
+    let mut job = [0u8; 16];
+    assert_eq!(try_send(engine, &spec, &mut job), AK_OK);
+    wait_for_event(engine, &job, "connecting", Duration::from_secs(20));
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_PENDING, "still connecting before cancel: {json}");
+
+    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    let (code, json) = result_big(engine, &job);
+    assert_eq!(code, AK_FAILED);
+    assert!(json.contains("cancelled by caller"), "{json}");
+
+    // After cancel returned, the aborted task is reaped: no further events.
+    let mut lines = Vec::new();
+    drain_events(engine, &mut lines);
+    thread::sleep(Duration::from_millis(300));
+    let (code, line) = poll_big(engine);
+    assert_eq!(code, AK_PENDING, "quiet after cancel: {line}");
+    assert!(
+        !lines.iter().any(|l| l.contains("\"event\":\"done\"")),
+        "no done for a cancelled job: {lines:?}"
+    );
+
+    ak_engine_free(engine);
+}
+
+#[test]
+fn del_and_c1_control_characters_are_refused() {
+    let engine = ak_engine_new();
+    assert!(!engine.is_null());
+    let src = tempfile::tempdir().unwrap();
+    write_file(&src.path().join("f.bin"), b"x");
+    let fp = "ab".repeat(32);
+    let dead_port = free_udp_port();
+    let src_field = path_jstr(src.path());
+    let mut job = [0u8; 16];
+
+    let spec_with_name = |name: &str| {
+        format!(
+            "{{\"source_roots\":[{src_field}],\"peer\":\"127.0.0.1:{dead_port}\",\
+             \"fp_hex\":\"{fp}\",\"device_name\":\"{name}\"}}"
+        )
+    };
+    // Escaped DEL and C1 CSI are refused (the JSON escape layer).
+    assert_eq!(
+        try_send(engine, &spec_with_name("a\\u007fb"), &mut job),
+        AK_ERR_INVALID,
+        "escaped DEL U+007F"
+    );
+    assert_eq!(
+        try_send(engine, &spec_with_name("a\\u009bb"), &mut job),
+        AK_ERR_INVALID,
+        "escaped CSI U+009B"
+    );
+    // Raw DEL byte, and raw C1 carried as UTF-8 bytes, are refused too.
+    assert_eq!(
+        try_send(engine, &spec_with_name("a\u{7f}b"), &mut job),
+        AK_ERR_INVALID,
+        "raw DEL byte"
+    );
+    assert_eq!(
+        try_send(engine, &spec_with_name("a\u{9b}b"), &mut job),
+        AK_ERR_INVALID,
+        "raw C1 (two UTF-8 bytes)"
+    );
+    let message = last_error_text(engine);
+    assert!(
+        message.contains("control"),
+        "the refusal names control characters: {message}"
+    );
+
+    // peer_add shares the rule (raw chars a native caller can pass).
+    let id_dir = tempfile::tempdir().unwrap();
+    let path_text = id_dir.path().to_string_lossy().into_owned();
+    for bad in ["a\u{7f}b", "a\u{9b}b", "a\u{85}b"] {
+        let (code, body) = call_peer_add(engine, &path_text, &fp_hex(0x45), Some(bad));
+        assert_eq!((code, body.as_str()), (AK_ERR_INVALID, ""), "name {bad:?}");
+        assert!(last_error_text(engine).contains("control"));
+    }
+
+    // Boundary: U+00A0 (NBSP) is the first NON-control above C1 and passes.
+    let (code, body) = call_peer_add(engine, &path_text, &fp_hex(0x44), Some("a\u{a0}b"));
+    assert_eq!(
+        (code, body.as_str()),
+        (AK_DONE, "{\"peers\":1}"),
+        "NBSP is not a control character"
+    );
+
+    // Only the boundary-clean peer was persisted.
+    let (code, list) = call_peer_list(engine, &path_text);
+    assert_eq!(code, AK_DONE);
+    assert_eq!(
+        array_elements(&list).len(),
+        1,
+        "refused adds paired nothing"
+    );
+
+    ak_engine_free(engine);
+}
+
 #[test]
 fn two_engines_run_loopbacks_without_cross_talk() {
     let threads: Vec<_> = (0..2)
@@ -1401,10 +1841,22 @@ fn jobs_list_after_loopback_lists_completed_records() {
     let wire_job = field_str(&outcome.send_json, "wire_job");
 
     // Receiver side: one completed receive record naming the sender.
+    // Since the engine's record-key isolation (content id + peer +
+    // direction + root), the record id is the per-instance RECORD id —
+    // not the wire content id, and distinct per direction.
     let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
     assert_eq!(code, AK_DONE, "{}", last_error_text(engine));
     let recv_record = single_element(&body);
-    assert_eq!(field_str(&recv_record, "id"), wire_job);
+    assert_eq!(
+        field_str(&recv_record, "id").len(),
+        32,
+        "32-hex id: {recv_record}"
+    );
+    assert_ne!(
+        field_str(&recv_record, "id"),
+        wire_job,
+        "the receive record is keyed per instance, not by the wire content id"
+    );
     assert_eq!(field_str(&recv_record, "direction"), "receive");
     assert_eq!(field_str(&recv_record, "state"), "completed");
     assert_eq!(field_str(&recv_record, "peer"), send_fp);
@@ -1416,11 +1868,17 @@ fn jobs_list_after_loopback_lists_completed_records() {
         "root is the out_dir: {body}"
     );
 
-    // Sender side: one completed send record pinned to the receiver.
+    // Sender side: one completed send record pinned to the receiver, with
+    // its own per-instance record id (direction-isolated from the above).
     let (code, body) = call_jobs_list(engine, &send_id.path().to_string_lossy());
     assert_eq!(code, AK_DONE);
     let send_record = single_element(&body);
-    assert_eq!(field_str(&send_record, "id"), wire_job);
+    assert_eq!(field_str(&send_record, "id").len(), 32);
+    assert_ne!(
+        field_str(&send_record, "id"),
+        field_str(&recv_record, "id"),
+        "send and receive records are keyed separately"
+    );
     assert_eq!(field_str(&send_record, "direction"), "send");
     assert_eq!(field_str(&send_record, "state"), "completed");
     assert_eq!(field_str(&send_record, "peer"), recv_fp);
@@ -2377,10 +2835,17 @@ fn peer_writer_save_failure_is_internal_and_leaves_book_intact() {
     let (code, _) = call_peer_add(engine, &path_text, &a, Some("first"));
     assert_eq!(code, AK_DONE);
 
-    // Block the atomic-write temp slot with a directory: every save now
-    // fails (opening a directory for write is an error on every platform),
-    // which must surface as AK_ERR_INTERNAL naming the book.
-    fs::create_dir_all(id_dir.path().join("peers.book.tmp")).unwrap();
+    // Block the atomic-write temp slots: ak-identity saves via a
+    // per-process unique `peers.book.<pid>.<seq>.tmp` created with
+    // O_EXCL/create_new, so pre-creating a range of seq slots as
+    // DIRECTORIES makes every save fail (opening a directory for write is
+    // an error on every platform) whichever seq comes next. Must surface
+    // as AK_ERR_INTERNAL naming the book.
+    let pid = std::process::id();
+    const BLOCKED_SEQS: u32 = 512;
+    for seq in 0..BLOCKED_SEQS {
+        let _ = fs::create_dir(id_dir.path().join(format!("peers.book.{pid}.{seq}.tmp")));
+    }
     let (code, body) = call_peer_add(engine, &path_text, &b, Some("second"));
     assert_eq!(code, AK_ERR_INTERNAL);
     assert_eq!(body, "");
@@ -2400,8 +2865,10 @@ fn peer_writer_save_failure_is_internal_and_leaves_book_intact() {
     let element = single_element(&list);
     assert_eq!(field_str(&element, "fingerprint"), a);
 
-    // Removing the blocker restores writability.
-    fs::remove_dir_all(id_dir.path().join("peers.book.tmp")).unwrap();
+    // Removing the blockers restores writability.
+    for seq in 0..BLOCKED_SEQS {
+        let _ = fs::remove_dir(id_dir.path().join(format!("peers.book.{pid}.{seq}.tmp")));
+    }
     let (code, body) = call_peer_add(engine, &path_text, &b, None);
     assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
 

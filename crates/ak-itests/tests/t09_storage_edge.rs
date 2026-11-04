@@ -78,36 +78,63 @@ async fn conflict_rename_second_transfer_lands_as_two_with_both_copies_intact() 
     );
     assert_no_part_files(dst.path());
 
-    // Second transfer of the same source: same deterministic job id, full
-    // re-transfer (no part files survived the first commit => nothing to
-    // resume), renamed landing for both conflicting names.
+    // Second transfer of the same source under Rename: since wave 17 the
+    // committed-final fast path (F3/F2) recognizes byte-identical finals as
+    // the job's own committed output, so this is an idempotent full resume —
+    // no re-transfer, no "(2)" copies of unchanged content.
     let second = run_transfer_conflict(&src, dst.path(), 1, ConflictPolicy::Rename).await;
     assert_eq!(
         second.send.job_id, first.send.job_id,
         "identical source must keep the same content identity"
     );
     assert_eq!(
-        second.send.resumed_chunks, 0,
-        "nothing resumed: committed finals are not part files"
+        second.send.resumed_chunks, 2,
+        "both files fully resumed via committed finals"
     );
-    assert_eq!(second.recv.resumed_chunks, 0);
+    assert_eq!(second.recv.resumed_chunks, 2);
+    assert_eq!(
+        common::read_file(dst.path(), "a.txt"),
+        b"first transfer content - complete"
+    );
+    let bin = (0..600u32).map(|i| i as u8).collect::<Vec<_>>();
+    assert_eq!(common::read_file(dst.path(), "nested/b.bin"), bin);
+    assert_no_part_files(dst.path());
+    let tree = common::snapshot_tree(dst.path());
+    assert_eq!(
+        tree.files.len(),
+        2,
+        "no duplicates for identical re-transfer: {:?}",
+        tree.files
+    );
 
-    // Old copies untouched, new (2) copies complete, byte-for-byte.
+    // Rename policy still lands "(2)" copies when the content actually
+    // differs — that is the real conflict the policy exists for.
+    write_file(&src.join("a.txt"), b"second transfer content - changed");
+    let third = run_transfer_conflict(&src, dst.path(), 1, ConflictPolicy::Rename).await;
+    assert_eq!(
+        third.send.resumed_chunks, 1,
+        "b.bin unchanged => resumed; a.txt differs => re-sent"
+    );
     assert_eq!(
         common::read_file(dst.path(), "a.txt"),
         b"first transfer content - complete"
     );
     assert_eq!(
         common::read_file(dst.path(), "a (2).txt"),
-        b"first transfer content - complete"
+        b"second transfer content - changed"
     );
-    let bin = (0..600u32).map(|i| i as u8).collect::<Vec<_>>();
     assert_eq!(common::read_file(dst.path(), "nested/b.bin"), bin);
-    assert_eq!(common::read_file(dst.path(), "nested/b (2).bin"), bin);
+    assert!(
+        !dst.path().join("nested/b (2).bin").exists(),
+        "identical b.bin keeps one copy"
+    );
     assert_no_part_files(dst.path());
-
-    // Exactly the four expected files, nothing else.
     let tree = common::snapshot_tree(dst.path());
-    assert_eq!(tree.files.len(), 4, "unexpected tree: {:?}", tree.files);
+    assert_eq!(
+        tree.files.len(),
+        3,
+        "only the truly conflicting file duplicates: {:?}",
+        tree.files
+    );
     assert_eq!(tree.dirs.len(), 1);
 }

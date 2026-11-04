@@ -181,8 +181,36 @@ fn private_key(bundle: &TlsBundle) -> PrivateKeyDer<'static> {
     PrivateKeyDer::from(PrivatePkcs8KeyDer::from(bundle.key_pkcs8_der.clone()))
 }
 
+/// INV-004 policy flag: this stack disables QUIC active migration on every
+/// endpoint it builds. Locked to `true`; `quinn_server_config` feeds it into
+/// the server config and `DirectEndpoint::active_migration_disabled` reports
+/// it back as a public read-only getter.
+///
+/// API note (verified against the locked registry sources, quinn 0.11.12 +
+/// quinn-proto 0.11.19): the older `TransportConfig::disable_active_migration`
+/// public field no longer exists in this version. The replacement is
+/// `quinn::ServerConfig::migration(false)`, which:
+///
+/// 1. makes the server advertise the RFC 9000 `disable_active_migration`
+///    transport parameter in the handshake (quinn-proto `transport_parameters`
+///    builds the parameter from `!server_config.migration`), so a compliant
+///    peer MUST NOT actively migrate, and
+/// 2. makes the transport itself discard migration-initiating datagrams from
+///    unrecognized remote addresses (quinn-proto `connection` drops them when
+///    `!side.remote_may_migrate()`), so a non-compliant peer's migration
+///    attempt never rebinds the connection.
+///
+/// There is no client-side knob in this quinn version: a quinn client never
+/// initiates active migration, and the server-advertised parameter binds any
+/// compliant client. Defense in depth for a live connection is
+/// `DirectChannel::ensure_path_stable`, which watches
+/// `Connection::remote_address()` and closes defensively on change.
+pub(crate) const MIGRATION_DISABLED: bool = true;
+
 /// Build the QUIC server config: our certificate, mandatory client
-/// certificates verified as self-signed Ed25519, ALPN `ak/1`.
+/// certificates verified as self-signed Ed25519, ALPN `ak/1`, and QUIC active
+/// migration disabled at the transport-parameter level (INV-004; see
+/// [`MIGRATION_DISABLED`]).
 pub(crate) fn quinn_server_config(identity: &TlsBundle) -> io::Result<quinn::ServerConfig> {
     let verifier = Arc::new(SelfSignedClientCertVerifier {
         schemes: provider().signature_verification_algorithms,
@@ -199,12 +227,23 @@ pub(crate) fn quinn_server_config(identity: &TlsBundle) -> io::Result<quinn::Ser
     config.alpn_protocols = alpn_protocols();
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(config))
         .map_err(|e| config_io_err("building QUIC server config", e))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    // INV-004: reject connection migration at the handshake-parameter level.
+    server_config.migration(!MIGRATION_DISABLED);
+    Ok(server_config)
 }
 
 /// Build a QUIC client config presenting our certificate. With `pinned`, the
 /// server certificate must match that fingerprint; without it the config
 /// fails every handshake (see `UnpinnedServerCertVerifier`).
+///
+/// Migration note (INV-004): the client side has no `disable_active_migration`
+/// transport-config knob in quinn 0.11.12 (see [`MIGRATION_DISABLED`]); a
+/// quinn client does not actively migrate, and every endpoint built here also
+/// runs as a server with `migration(false)`, whose advertised
+/// `disable_active_migration` parameter binds this client. `DirectChannel`
+/// still watches `remote_address()` defensively
+/// (`DirectChannel::ensure_path_stable`).
 pub(crate) fn quinn_client_config(
     identity: &TlsBundle,
     pinned: Option<&Fingerprint>,

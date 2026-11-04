@@ -387,3 +387,86 @@ flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
 #   defaultIdentityDir 增 AK_ID_DIR 测试注入（tier-0）。诚实发现：引擎接收侧无自动 TOFU，
 #   配对页'自动记入'文案为前瞻——测试按手动路径断言，文案修正列入待办。
 # 收官回归：Rust 450/0 + clippy 干净；Dart 85/85 + analyze 干净；Flutter 84/84 + analyze 干净；repo check + 12 Python OK。
+
+## Codex 审核与第十七波修复立项（2026-11-04）
+
+# 审核元数据：Codex / gpt-6-astra / reasoning=max，只读审核（静态代码结论，未运行构建/测试/动态攻击）；
+#   范围＝12 个 Rust crate＋依赖链＋文档证据链，重点 ak-wire/ak-engine 并沿调用链核对 ak-storage/ak-store/ak-core。
+#   审核原文归档：reports/codex-review-2026-11-04.md。
+# 问题分级统计：2 项 P1、约 14 项 P2（含子项与跨审交叉确认项）。
+#   P1-1 Offer.chunk_size 未约束：已授权对端发 chunk_size=u32::MAX＋空文件条目（size=0、摘要为空）可绕过
+#   8 MiB 数据帧限制触发约 4 GiB 分配；P1-2 控制流独立空闲计时：多流传输总时长超 idle_timeout 后控制流被
+#   误判空闲关闭，收不到 Finalize、任务无法完成。
+#   P2 要点：跨帧预算与协议关联校验缺失（manifest 页 job_id/page_index 被忽略、不核对 Offer file_count/
+#   total_bytes、Resume 索引不校验、ACK 不核对身份仅减计数）；检查点记录键无方向/对端隔离（同源并发共享
+#   覆盖同一 <job>.akjob）；PROTOCOL 持久确认顺序与实现不符（write_chunk 无 sync、ACK 先于 checkpoint 批次）；
+#   存活连接路径迁移不重授权（INV-004 缺口，t08 明确不覆盖 connection migration）；digest_alg 未知值静默改
+#   BLAKE3；单文件 64 GiB 摘要上限边界未文档化；wire encode 长度校验仅 debug_assert；同路径 .akpart 共享与
+#   已提交文件重试失败（storage 侧交叉确认）等。
+
+# 7 代理修复分工（并行进行中，落地证据由集成者补；本表按立项 brief 记录，如与集成者最终合并有出入以集成为准）：
+# | 代理 | 范围 | 分工 |
+# |---|---|---|
+# | F1 | ak-wire/ak-core | digest_alg 未知值显式拒绝（算法标识透传保留，不再静默按 BLAKE3）＋wire encode 生产路径长度校验 |
+# | F2 | ak-engine/ak-store | 检查点 record_id 分离（方向/对端/目标入记录键）；manifest 页关联校验（job_id/page_index/file_count/total_bytes/累计预算）；Resume 索引唯一/越界/前缀校验；ChunkAck 幂等去重 |
+# | F3 | ak-storage | 冲突原子 no-replace：Windows 平台原子语义＋POSIX link 方案，消除检查-改名竞态窗口 |
+# | F4 | ak-identity | DER 解析规则收敛：按实际结构化子集对齐实现与文档口径（收窄"严格 DER 解析"表述） |
+# | F5 | ak-net/ak-engine | 禁用 QUIC active migration（INV-004 收窄：存活连接不再静默迁移地址）；迁移重授权机制为后续项 |
+# | F6 | ak-engine/ak-storage | 两项 P1：Offer.chunk_size 边界校验（Accept 前检查 1..=max_chunk_bytes、存储层防御、空文件零缓冲）＋任务级统一空闲预算（数据活动刷新控制流计时） |
+# | F7 | docs/CI | 文档/CI 对齐（本节）；文案一律按"修复进行中"表述，落地证据由集成者补 |
+
+# 垫片证据重新归类声明（INV-008 严格口径）：反向跨设备冒烟（宿主→Android，见上文第十六轮）经本地 python
+#   UDP 中继垫片保四元组完成——垫片转发含密文数据报（不解密、不落盘、不看明文），构成数据报转发路径，
+#   明确排除出"纯直连"验收声明；该证据仅证明跨网络栈 QUIC 编解码＋端到端加密连通。正向（Android→宿主
+#   10.0.2.2 slirp 直达）未用垫片，不在此列。真机双端/真实 NAT 验收仍未执行。
+
+# F7 本波落地项（仅文档/CI，2026-11-04）：
+#   ci.yml：全部 cargo 命令（clippy/test/sqlite/doc/portability/release 深测）加 --locked＋注释；cargo fmt
+#     无 --locked 选项且不解析依赖，如实排除（--help 实查）。
+#   SECURITY：①"最小 DER 严格解析"→实际规则列表（TLV 前导零/越界拒绝、三元素结构、SPKI Ed25519 OID＋
+#     32B 匹配、常量时间比较、verify_strict）＋非完整 X.509 模式校验＋F4 收敛中；②FFI"free 后使用返回错误"
+#     →调用方契约：double-free/use-after-free 为 UB（Rustdoc # Safety）；③检查点"互不重叠"→补记录键碰撞
+#     如实（内容派生 job id）＋F2 record_id 分离进行中；④"不静默覆盖"→现状为检查＋改名（含竞态窗口）＋
+#     F3 平台原子 no-replace 进行中；⑤新增存活连接迁移条目：F5 禁用 active migration 进行中＋迁移重授权
+#     后续项；⑥无中继发布门槛节新增 UDP 垫片证据归类（排除出纯直连声明）；⑦FFI 节头现状化（实现已落地
+#     经 C ABI 测试＋第十七波契约增补落地中）。
+#   PROTOCOL：标题与正文删"线缆格式未冻结"（wire v1 已冻结，大端无 JSON 精度问题）；ChunkAck 持久语义改述
+#     （ACK＝内存写入确认，持久边界＝每 16 ACK 检查点批次与 finish 的 fsync＋原子改名，崩溃恢复重哈希 .akpart）；
+#     单文件边界新增（默认 1MiB×65,536 摘要＝64GiB，超限需增大块尺寸或摘要分页——未实现）；digest_alg 未知
+#     显式拒绝（F1 落地中）；manifest 页关联/Resume 校验/ACK 幂等协议描述（F2 落地中）。
+#   ADR-003：状态与背景现状化（ak-ffi 已实现＋Flutter Windows 已发布＋Android 壳/CLI 已实测，"尚未启动"
+#     改为历程记录）；新增"修复波落地中的契约增补"节（expect 必填、F1 拒绝、F2 身份分离、F3 原子 no-replace、
+#     F5 禁 migration、F6 spec 边界收窄——均标落地中）；验证形态节现状化。
+#   ARCHITECTURE：现状列日期 2026-11-04；DirectConnectionManager 行补 active migration 禁用（F5 落地中）；
+#     服务故障节补 INV-004 现状一句话（重连已测、迁移未覆盖）；UI 行"未开始"→部分（Flutter Windows 已发布、
+#     Android 壳实测、移动端后台未开始）。
+# F7 门槛实跑（2026-11-04）：python scripts/check_repository.py → passed（30 md 文件/80 本地链接/388 测试
+#   用例存在/禁依赖 clean）；ci.yml YAML 解析 OK（4 jobs）。Rust/Dart/Flutter 回归由集成者在 crate 修复
+#   （F1–F6）合入后统一执行并回填。
+
+## 第十七波修复闭环（2026-11-04，Codex 审核 → 7 代理并行修复 → 集成者适配）
+
+### 修复矩阵（对照 reports/codex-review-2026-11-04.md 逐条）
+P1-1 Offer.chunk_size 4GiB 分配: wire 解码拒绝（47 测试）+ 引擎 Accept 前复核 + 存储独立 cap——三层
+P1-2 多流控制流 30s 误杀: 任务级统一活动预算（监控器/读取器双层），A/B 实证杀旧代码；超 idle 时序测试通过
+P2 跨帧校验: ManifestAssembler 页序/规模/Offer 对账 + ResumeCollector 清单交叉校验 + AckLedger 幂等（重复/未知 ACK 忽略计数）
+P2 记录隔离: record_id=blake3(content+peer+direction+root)，同源多对端/同机收发不再互覆（两集成测试）
+P2 重试幂等: 引擎提交位 + 存储 committed-final 快速路径（final 摘要匹配即全前缀），同任务重跑零重传
+P2 取消收敛: FFI abort→join(500ms)→knock 唤醒→端口可立即重绑（<0.5s 实测）
+P2 原子提交: 实证推翻'Windows rename 天然 no-replace'（rustc1.99 FileRenameInformationEx 会覆盖！）→统一 hard_link+unlink，FAT 回退已注明
+P2 迁移: 服务端 migration(false)+通告 disable_active_migration+通道 path_changed 绊线（迁移即断连，重连走 t08 已测路径）
+P2 预算前置: recv 头期按类型预算拒绝（4GiB Chunk 头零分配实测）
+P2 Hello 重放: 窗口内签名摘要缓存拒绝（256 容量）
+P2 DER: 最短长度编码/外层 algid OID/SPKI 尾随/TBS INTEGER 规范全收紧（9 结构化畸形用例）
+P2 身份持久化: 排他首建（hard_link 发布，4 线程竞态测试）+ 唯一 tmp + rename 失败绝不删旧
+P0 安全: TlsBundle/DeviceKeyPair Debug 脱敏（哨兵断言）；FFI expect 必填（breaking）；FFI 指针校验先于副作用；DEL/C1 全层统一
+P2 encode 生产校验: try_encode 返错 + encode panic 语义集中
+文档/CI: --locked 全线、六文档收窄、垫片证据按 INV-008 重新归类（已归档）
+
+### 适配（集成者）
+e2e act2/t08/t10×2/Dart jobsList/pollProgress 共 6 处测试按 record_id 与提交位快速路径新语义适配；
+t09 冲突测试重写为'相同内容幂等（无(2)副本）+真实内容差异才改名'双向断言。
+
+$ cargo test --workspace → 507 passed / 0 failed（基线 450 → +57）
+$ cargo clippy --workspace --all-targets -- -D warnings → 干净
+$ dart test → 85/85；$ flutter test → 84/84；repo check → passed

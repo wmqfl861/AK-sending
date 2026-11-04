@@ -21,6 +21,18 @@
 //!   values are errors with a message in the thread-local last-error
 //!   buffer (see [`ak_engine_last_error`]).
 //!
+//! # Memory-safety contract (honest scope)
+//!
+//! Entry points validate everything they CAN observe — null pointers,
+//! buffer capacities, UTF-8, NUL termination — and refuse bad input with a
+//! status code. What they CANNOT observe is lifetime misuse: calling
+//! `ak_engine_free` twice, or using any handle/pointer argument after its
+//! allocation was freed, is **undefined behavior**, not an error return.
+//! There is no cheap, portable way to detect a freed handle, and none is
+//! attempted; single-free and use-before-free are caller obligations, the
+//! same as every C library. (A capacity larger than the real buffer is the
+//! same class of caller bug with the same consequence.)
+//!
 //! `clippy::not_unsafe_ptr_arg_deref` is allowed module-wide: dereferencing
 //! caller-provided pointers under a documented C contract is this module's
 //! entire purpose. The Rust-side concern behind the lint (a safe Rust fn
@@ -159,6 +171,15 @@ fn fail_buffer(need: usize, capacity: usize, what: &str) -> i32 {
 /// Returns an owned `*mut AkEngine`, or null on failure (see the
 /// thread-local last error on the SAME thread; the message is only set on
 /// the thread that observed the failure).
+///
+/// # Safety
+///
+/// SAFETY (caller contract): the returned pointer is OWNED by the caller
+/// and must be released exactly once with `ak_engine_free`. While any call
+/// on the handle is in flight the handle must not be freed; calls on one
+/// handle must be serialized by the caller. Using or freeing a handle
+/// after `ak_engine_free` returned (double free / use-after-free) is
+/// undefined behavior — the ABI cannot and does not detect it.
 #[no_mangle]
 pub extern "C" fn ak_engine_new() -> *mut AkEngine {
     core::clear_last_error();
@@ -177,6 +198,16 @@ pub extern "C" fn ak_engine_new() -> *mut AkEngine {
 /// Destroy an engine handle returned by [`ak_engine_new`]. Frees the
 /// runtime and aborts every still-running job first. Passing null is a
 /// no-op. The handle must not be used after this call.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `engine` must be either null (no-op) or a
+/// live handle from `ak_engine_new` that no other call is using
+/// concurrently. `Box::from_raw` here is the single matching
+/// deallocation for the `Box::into_raw` in `ak_engine_new`; freeing the
+/// same handle twice, or calling ANY function on it after this call
+/// returns, is undefined behavior — the ABI cannot and does not detect
+/// double-free or use-after-free.
 #[no_mangle]
 pub extern "C" fn ak_engine_free(engine: *mut AkEngine) {
     core::clear_last_error();
@@ -199,6 +230,14 @@ pub extern "C" fn ak_engine_free(engine: *mut AkEngine) {
 /// Returns the message byte length (excluding the NUL), `AK_ERR_NULL`
 /// when `buf` is null, or `AK_ERR_BUFFER` when `cap` is too small — the
 /// stored message is NOT modified or truncated, so the retry is lossless.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `buf` must be writable for
+/// `cap` bytes for the duration of the call and must not be modified
+/// concurrently; `cap` must not overstate the real allocation (writes
+/// beyond the true capacity are caller-side undefined behavior). `engine`
+/// is never dereferenced.
 #[no_mangle]
 pub extern "C" fn ak_engine_last_error(
     engine: *const AkEngine,
@@ -221,6 +260,20 @@ pub extern "C" fn ak_engine_last_error(
 /// `spec_json` is a NUL-terminated UTF-8 string. On success (`AK_OK`) the
 /// fresh 16-byte job id is written to `job_out` (exactly 16 bytes). On
 /// failure a negative code is returned and nothing is written.
+///
+/// Argument validation runs BEFORE any side effect: a null `job_out` is
+/// rejected up front, so a start that fails on its output pointer never
+/// spawns a task — the job table, runtime, sockets, and the progress queue
+/// all stay untouched (a caller passing null cannot leave work running
+/// behind a `-1`).
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `spec_json` must be non-null, NUL-terminated,
+/// valid UTF-8, and readable up to its NUL for the duration of the call;
+/// `job_out` must be non-null and writable for 16 bytes for the duration of
+/// the call. The engine handle must come from `ak_engine_new`, must not be
+/// freed concurrently, and calls on it must be serialized by the caller.
 #[no_mangle]
 pub extern "C" fn ak_send_start(
     engine: *mut AkEngine,
@@ -237,6 +290,14 @@ pub extern "C" fn ak_send_start(
             message: "engine handle is null".to_string(),
         });
     };
+    // Null job_out is refused BEFORE the spec is parsed or any task is
+    // spawned: a failed start must never leave side effects behind.
+    if job_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "job_out argument is null".to_string(),
+        });
+    }
     // SAFETY: read_cstr verifies non-null and UTF-8; the borrow is confined
     // to this call, matching the caller's buffer lifetime.
     let spec = match unsafe { read_cstr(spec_json) } {
@@ -255,7 +316,16 @@ pub extern "C" fn ak_send_start(
 }
 
 /// Start a receive job from a JSON spec (schema in the crate header),
-/// same buffer conventions as [`ak_send_start`].
+/// same buffer conventions and null-`job_out`-before-side-effects rule as
+/// [`ak_send_start`].
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `spec_json` must be non-null, NUL-terminated,
+/// valid UTF-8, and readable up to its NUL for the duration of the call;
+/// `job_out` must be non-null and writable for 16 bytes for the duration of
+/// the call. The engine handle must come from `ak_engine_new`, must not be
+/// freed concurrently, and calls on it must be serialized by the caller.
 #[no_mangle]
 pub extern "C" fn ak_receive_start(
     engine: *mut AkEngine,
@@ -270,6 +340,14 @@ pub extern "C" fn ak_receive_start(
             message: "engine handle is null".to_string(),
         });
     };
+    // Null job_out is refused BEFORE the spec is parsed or any task is
+    // spawned (same no-side-effects rule as ak_send_start).
+    if job_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "job_out argument is null".to_string(),
+        });
+    }
     // SAFETY: read_cstr verifies non-null and UTF-8 before use.
     let spec = match unsafe { read_cstr(spec_json) } {
         Ok(spec) => spec,
@@ -293,6 +371,13 @@ pub extern "C" fn ak_receive_start(
 /// the queue is empty, `AK_ERR_BUFFER` when `cap` is too small — the event
 /// stays queued, nothing is lost, and the last-error message names the
 /// needed size — or `AK_ERR_NULL`/`AK_ERR_INTERNAL` on bad arguments.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `buf` must be writable for
+/// `cap` bytes for the duration of the call and must not be modified
+/// concurrently; `cap` must not overstate the real allocation. The engine
+/// handle must be live (see [`ak_engine_free`]).
 #[no_mangle]
 pub extern "C" fn ak_poll_progress(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
     core::clear_last_error();
@@ -335,6 +420,13 @@ pub extern "C" fn ak_poll_progress(engine: *mut AkEngine, buf: *mut c_char, cap:
 /// `AK_FAILED` (2) with an error JSON in `buf` on failure,
 /// `AK_ERR_BUFFER` when `cap` is too small (retry losslessly with a
 /// larger buffer), `AK_ERR_NOT_FOUND` for an unknown job id.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `job` must be readable for 16
+/// bytes for the duration of the call; when non-null, `buf` must be
+/// writable for `cap` bytes and must not be modified concurrently; `cap`
+/// must not overstate the real allocation. The engine handle must be live.
 #[no_mangle]
 pub extern "C" fn ak_job_result(
     engine: *mut AkEngine,
@@ -382,6 +474,19 @@ pub extern "C" fn ak_job_result(
 /// `"cancelled by caller"` and never emits a trailing `done` event.
 ///
 /// Returns `AK_OK`, or `AK_ERR_NOT_FOUND` for an unknown job id.
+///
+/// The cancel converges before returning: the job's task is aborted and
+/// awaited (bounded, see `AkEngine::job_cancel`), so no further progress
+/// events for the job are produced after this call, and for receive jobs
+/// the bound UDP port is released so an immediate rebind on the same port
+/// succeeds.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `job` must be readable for 16
+/// bytes for the duration of the call. The engine handle must be live and
+/// calls on it serialized (this call may block for a bounded few hundred
+/// milliseconds while the aborted task is reaped).
 #[no_mangle]
 pub extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
     core::clear_last_error();
@@ -417,6 +522,13 @@ pub extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
 /// last-error message names the needed size). Note: a corrupt `peers.book`
 /// still succeeds with `"peers":0` and leaves a note in the last-error
 /// buffer — read it right after the call.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `id_dir` must be non-null, NUL-terminated,
+/// valid UTF-8, and readable up to its NUL for the duration of the call;
+/// `buf` (when non-null) must be writable for `cap` bytes and must not be
+/// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
 pub extern "C" fn ak_identity_info(
     engine: *const AkEngine,
@@ -462,6 +574,13 @@ pub extern "C" fn ak_identity_info(
 /// `AK_ERR_BUFFER` when the whole array does not fit — nothing is consumed;
 /// re-issue the call with a larger `cap` (the last-error message names the
 /// needed size).
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `id_dir` must be non-null, NUL-terminated,
+/// valid UTF-8, and readable up to its NUL for the duration of the call;
+/// `buf` (when non-null) must be writable for `cap` bytes and must not be
+/// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
 pub extern "C" fn ak_jobs_list(
     engine: *const AkEngine,
@@ -507,6 +626,13 @@ pub extern "C" fn ak_jobs_list(
 /// corrupt book, or `AK_ERR_BUFFER` when the whole array does not fit —
 /// nothing is consumed; re-issue the call with a larger `cap` (the
 /// last-error message names the needed size).
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `id_dir` must be non-null, NUL-terminated,
+/// valid UTF-8, and readable up to its NUL for the duration of the call;
+/// `buf` (when non-null) must be writable for `cap` bytes and must not be
+/// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
 pub extern "C" fn ak_peer_list(
     engine: *mut AkEngine,
@@ -559,6 +685,15 @@ pub extern "C" fn ak_peer_list(
 /// `id_dir`, or a corrupt book, `AK_ERR_BUFFER` when the count JSON does
 /// not fit (checked BEFORE the save: nothing was persisted; retry with a
 /// larger `cap`), or `AK_ERR_INTERNAL` when the save fails.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `id_dir` and `fingerprint_hex` must be
+/// non-null, NUL-terminated, valid UTF-8, and readable up to their NUL for
+/// the duration of the call; `name` is optional — when non-null it carries
+/// the same string contract. `buf` must be non-null and writable for `cap`
+/// bytes, not modified concurrently; `cap` must not overstate the real
+/// allocation.
 #[no_mangle]
 pub extern "C" fn ak_peer_add(
     engine: *mut AkEngine,
@@ -627,6 +762,14 @@ pub extern "C" fn ak_peer_add(
 /// like add), an empty `id_dir`, or a corrupt book, `AK_ERR_BUFFER` when
 /// the count JSON does not fit (BEFORE the save: nothing was removed;
 /// retry with a larger `cap`), or `AK_ERR_INTERNAL` when the save fails.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `id_dir` and `fingerprint_hex` must be
+/// non-null, NUL-terminated, valid UTF-8, and readable up to their NUL for
+/// the duration of the call. `buf` must be non-null and writable for `cap`
+/// bytes, not modified concurrently; `cap` must not overstate the real
+/// allocation.
 #[no_mangle]
 pub extern "C" fn ak_peer_remove(
     engine: *mut AkEngine,
@@ -672,6 +815,12 @@ pub extern "C" fn ak_peer_remove(
 /// Write the library version string (UTF-8 + NUL) into `buf`, e.g.
 /// `ak-ffi 1 (wire v1, caps 0x0007)`. Returns the written byte length
 /// (excluding the NUL), `AK_ERR_NULL`, or `AK_ERR_BUFFER`.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): when non-null, `buf` must be writable for
+/// `cap` bytes for the duration of the call and must not be modified
+/// concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
 pub extern "C" fn ak_version(buf: *mut c_char, cap: usize) -> i32 {
     core::clear_last_error();

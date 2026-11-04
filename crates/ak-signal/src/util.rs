@@ -20,6 +20,24 @@ pub(crate) fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock milliseconds with a process-wide monotonic guarantee: two
+/// calls never return the same value. Used for Hello timestamps so a client
+/// never signs the exact same Hello bytes twice (the server's replay cache
+/// rejects a repeated signature inside the freshness window; a legitimate
+/// sub-millisecond reconnect would otherwise be indistinguishable from a
+/// replay). The nudge stays within ±1 ms of the true clock, far inside the
+/// ±10 s freshness window.
+pub(crate) fn fresh_now_unix_ms() -> u64 {
+    static LAST: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut now = now_unix_ms();
+    if now <= *last {
+        now = *last + 1;
+    }
+    *last = now;
+    now
+}
+
 pub(crate) fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
 }

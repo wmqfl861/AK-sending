@@ -68,7 +68,7 @@
 //! {
 //!   "out_dir": "C:/inbox",     // required, created when missing
 //!   "port": 7100,              // optional, default 7100
-//!   "expect": "any",           // optional: "any" | "book" | 64-hex | 6-digit code
+//!   "expect": "any",           // REQUIRED: "any" | "book" | 64-hex | 6-digit code
 //!   "conflict": "fail",        // optional: "fail" | "rename"
 //!   "timeout_secs": 30,        // optional idle budget
 //!   "id_dir": "C:/ak/id",      // optional stable identity
@@ -78,7 +78,11 @@
 //! }
 //! ```
 //!
-//! `expect` admission policies: `"any"` accepts everyone (dangerous);
+//! `expect` is REQUIRED (breaking change in this revision): a receive
+//! spec without it is rejected with `AK_ERR_INVALID` and the message
+//! `expect required: any|book|fingerprint|pairing code`. There is no
+//! default — `"any"` accepts everyone and must be stated explicitly.
+//! Admission policies: `"any"` accepts everyone (dangerous);
 //! a 64-hex fingerprint pins one peer; a 6-digit pairing code (with or
 //! without the dash) accepts only the device whose code matches; `"book"`
 //! accepts only fingerprints listed in `<id_dir>/peers.book` — the book is
@@ -89,9 +93,10 @@
 //!
 //! Parser policy (hand-written, no serde): unknown fields are ignored for
 //! forward compatibility; wrong types are errors; string values never
-//! carry control characters — raw or escaped (`\n`, `\u0001`, ...) are
-//! both refused, mirroring the wire codec's two-layer injection defense.
-//! Inputs are capped at 1 MiB, strings at 4096 bytes, nesting at 32.
+//! carry control characters — C0, DEL, or C1 (`\n`, `\u0001`, `\u007f`,
+//! `\u009b`, ...), raw or escaped, are all refused, mirroring the wire
+//! codec's display-string rule exactly. Inputs are capped at 1 MiB,
+//! strings at 4096 bytes, nesting at 32.
 //!
 //! # progress event lines (`ak_poll_progress`)
 //!

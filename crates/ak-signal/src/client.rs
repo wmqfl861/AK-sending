@@ -42,12 +42,16 @@ pub struct SignalClient {
 
 impl SignalClient {
     /// Connect, send a signed Hello, and await Welcome.
+    ///
+    /// The Hello timestamp comes from [`crate::util::fresh_now_unix_ms`], so
+    /// rapid retries never sign identical Hello bytes (which the server's
+    /// replay window would reject).
     pub async fn connect(
         server: SocketAddr,
         key: &DeviceKeyPair,
         name: &str,
     ) -> Result<Self, SignalError> {
-        let hello = codec::signed_hello(key, name, util::now_unix_ms());
+        let hello = codec::signed_hello(key, name, util::fresh_now_unix_ms());
         Self::connect_hello(server, hello).await
     }
 
@@ -215,7 +219,7 @@ pub(crate) mod test_support {
         signing: &SigningKey,
         name: &str,
     ) -> SignalClient {
-        let hello = hello_with_timestamp(signing, name, util::now_unix_ms());
+        let hello = hello_with_timestamp(signing, name, util::fresh_now_unix_ms());
         SignalClient::connect_hello(server, hello).await.unwrap()
     }
 
@@ -225,7 +229,7 @@ pub(crate) mod test_support {
         signing: &SigningKey,
         name: &str,
     ) -> Result<SignalClient, SignalError> {
-        let stale = util::now_unix_ms() - 60_000;
+        let stale = util::fresh_now_unix_ms() - 60_000;
         let hello = hello_with_timestamp(signing, name, stale);
         SignalClient::connect_hello(server, hello).await
     }
@@ -240,7 +244,7 @@ pub(crate) mod test_support {
         // device_id is `signing`'s, but the signature comes from the
         // impostor key, so verification must fail.
         let device_id = device(signing);
-        let timestamp = util::now_unix_ms();
+        let timestamp = util::fresh_now_unix_ms();
         let signature = impostor
             .sign(&hello_signing_bytes(1, &device_id, name, timestamp))
             .to_bytes();

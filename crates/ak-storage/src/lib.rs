@@ -3,8 +3,10 @@
 //! Guarantees (see AGENTS.md): no path escapes (`..`, absolute, drive letters
 //! rejected by `ak_core::manifest`), no symlink races (every existing path
 //! component is re-checked with `symlink_metadata` before use), bounded
-//! memory (streaming digests), and atomic file commit (temp `.akpart` file,
-//! fsync, rename; the final name only appears after the whole digest matches).
+//! memory (streaming digests), and atomic no-replace file commit (temp
+//! `.akpart` file, fsync, then hard-link + unlink; the final name only
+//! appears after the whole digest matches and is never created over an
+//! existing file).
 #![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -94,6 +96,37 @@ fn invalid_input_io(msg: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, msg.into())
 }
 
+/// Defensive storage-side cap on every chunk buffer this crate allocates:
+/// 16 MiB. The engine validates `Offer.chunk_size` against its own limits
+/// (8 MiB) before calling here, but this API must stay safe when driven
+/// directly (review 2026-11-04, issue 1, storage side): an entry prepared
+/// with `chunk_size = u32::MAX` must fail fast with `InvalidInput` instead
+/// of attempting a ~4 GiB allocation. Double insurance with the engine
+/// check, not a replacement for it.
+pub const MAX_CHUNK_BUFFER_BYTES: usize = 16 << 20;
+
+/// Reject a chunk size whose streaming buffer would exceed
+/// [`MAX_CHUNK_BUFFER_BYTES`]. Called before any buffer is allocated.
+fn ensure_chunk_size_within_cap(chunk_size: NonZeroU32) -> io::Result<()> {
+    if chunk_size.get() as usize > MAX_CHUNK_BUFFER_BYTES {
+        return Err(invalid_input_io(format!(
+            "chunk size {} exceeds the storage-side cap of {} bytes",
+            chunk_size.get(),
+            MAX_CHUNK_BUFFER_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// Buffer length for one streaming pass over `total_bytes` in chunks of
+/// `chunk_size`: `min(chunk_size, total_bytes)`. An empty file needs no
+/// buffer at all (zero allocation), and a file shorter than one chunk never
+/// allocates a full chunk. The caller must have run
+/// `ensure_chunk_size_within_cap` first, so the result always fits `usize`.
+fn streaming_buffer_len(chunk_size: NonZeroU32, total_bytes: u64) -> usize {
+    total_bytes.min(u64::from(chunk_size.get())) as usize
+}
+
 fn escape_err() -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, OpenError::Escape)
 }
@@ -132,6 +165,9 @@ impl LocalSource {
     /// root itself is rejected as [`OpenError::RootIsSymlink`] and any symlink
     /// below it as [`OpenError::SymlinkComponent`].
     pub fn open(root: &Path, chunk_size: NonZeroU32) -> Result<Self, OpenError> {
+        // Same defensive cap as the receive side: reject an absurd chunk
+        // size before scan_file allocates its streaming buffer.
+        ensure_chunk_size_within_cap(chunk_size).map_err(OpenError::Io)?;
         let meta = match fs::symlink_metadata(root) {
             Ok(m) => m,
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -422,6 +458,9 @@ impl LocalSaveTarget {
         conflict: ConflictPolicy,
         chunk_size: NonZeroU32,
     ) -> io::Result<LocalFileSink> {
+        // Reject an oversized chunk size at API entry, before any file is
+        // opened or any buffer allocated (review 2026-11-04, issue 1).
+        ensure_chunk_size_within_cap(chunk_size)?;
         let parts = checked_rel_components(entry)?;
         if entry.is_dir {
             ensure_real_dirs(&self.root, &parts)?;
@@ -445,6 +484,28 @@ impl LocalSaveTarget {
             final_path.push(part);
         }
         final_path.push(name);
+        // Already-committed fast path (storage side of the engine retry
+        // idempotence fix, review 2026-11-04): when the final file exists
+        // and its whole digest matches the manifest entry, a previous run
+        // committed this exact content. Return a sink that reports every
+        // chunk as verified and whose finish() is an idempotent success
+        // without rewriting either name — an engine retry after "job
+        // already done" then needs no retransmission and cannot trip the
+        // conflict policy against its own output. A final file with
+        // DIFFERENT content is not a match and falls through to the normal
+        // part-based path, where the conflict policy decides at finish().
+        if let Ok(meta) = fs::symlink_metadata(&final_path) {
+            if meta.file_type().is_file()
+                && meta.len() == entry.size
+                && final_matches_digest(&final_path, entry, chunk_size)?
+            {
+                return Ok(LocalFileSink {
+                    kind: SinkKind::Committed {
+                        chunk_count: entry.chunk_digests.len() as u64,
+                    },
+                });
+            }
+        }
         let part_path = with_part_suffix(&final_path);
         if let Ok(meta) = fs::symlink_metadata(&part_path) {
             if meta.file_type().is_symlink() {
@@ -600,17 +661,41 @@ fn hex_prefix(bytes: &[u8], n: usize) -> String {
     out
 }
 
+/// True when the existing final file's whole BLAKE3 digest matches the
+/// entry. The caller has already checked the length; this streams the file
+/// once with a buffer of `min(chunk_size, size)` (zero allocation for an
+/// empty file, where the empty digest compares directly).
+fn final_matches_digest(
+    final_path: &Path,
+    entry: &FileEntry,
+    chunk_size: NonZeroU32,
+) -> io::Result<bool> {
+    if entry.size == 0 {
+        // Length already checked by the caller: the only remaining
+        // question is whether the manifest digest is the hash of nothing.
+        return Ok(entry.whole_digest == b3(b""));
+    }
+    let mut file = File::open(final_path)?;
+    let mut buf = vec![0u8; streaming_buffer_len(chunk_size, entry.size)];
+    Ok(hash_reader(&mut file, &mut buf)? == entry.whole_digest)
+}
+
 /// Re-verify an existing `.akpart` file chunk by chunk against the manifest,
 /// truncate at the first mismatch or truncation point, position the write
 /// cursor there, and return the verified chunk count. Bounded memory: one
-/// chunk-sized buffer, sequential reads.
+/// buffer of `min(chunk_size, file size)` — no allocation at all for an
+/// empty entry, and a file shorter than one chunk never allocates a full
+/// chunk (the short tail needs less than the chunk size).
 fn verify_part_prefix(
     file: &mut File,
     entry: &FileEntry,
     chunk_size: NonZeroU32,
 ) -> io::Result<u64> {
+    ensure_chunk_size_within_cap(chunk_size)?;
     let plan = ChunkPlan::new(entry.size, chunk_size);
-    let mut buf = vec![0u8; chunk_size.get() as usize];
+    // Every chunk length is min(chunk_size, size - start), so a buffer of
+    // min(chunk_size, size) covers each `want` slice below.
+    let mut buf = vec![0u8; streaming_buffer_len(chunk_size, entry.size)];
     file.rewind()?;
     let mut verified = 0u64;
     for digest in &entry.chunk_digests {
@@ -652,6 +737,13 @@ pub struct LocalFileSink {
 enum SinkKind {
     Directory,
     File(PartState),
+    /// The final file already exists with exactly the manifest content
+    /// (whole digest verified at prepare). Every chunk counts as verified,
+    /// `finish()` is an idempotent success, and neither the final nor the
+    /// part name is touched again.
+    Committed {
+        chunk_count: u64,
+    },
 }
 
 struct PartState {
@@ -674,6 +766,17 @@ impl FileSink for LocalFileSink {
             SinkKind::File(st) => st,
             SinkKind::Directory => {
                 return Err(invalid_input_io("directory entries accept no file chunks"))
+            }
+            SinkKind::Committed { chunk_count } => {
+                // Already stored and verified via the whole digest of the
+                // on-disk final; replaying any in-range chunk is a no-op
+                // (same idempotence as a replayed verified prefix).
+                let _ = data;
+                return if chunk_index < *chunk_count {
+                    Ok(())
+                } else {
+                    Err(invalid_input_io("chunk index out of range"))
+                };
             }
         };
         let idx = usize::try_from(chunk_index)
@@ -713,6 +816,7 @@ impl FileSink for LocalFileSink {
         match &self.kind {
             SinkKind::File(st) => st.verified_prefix,
             SinkKind::Directory => 0,
+            SinkKind::Committed { chunk_count } => *chunk_count,
         }
     }
 
@@ -720,6 +824,7 @@ impl FileSink for LocalFileSink {
         let st = match &mut self.kind {
             SinkKind::File(st) => st,
             SinkKind::Directory => return Ok(()),
+            SinkKind::Committed { .. } => return Ok(()),
         };
         if st.finished {
             return Ok(());
@@ -731,11 +836,26 @@ impl FileSink for LocalFileSink {
                 st.verified_prefix, total
             )));
         }
+        // Defense in depth: `st.chunk_size` was validated at prepare, and
+        // no code path can store a larger one, but the allocation below is
+        // guarded again anyway.
+        ensure_chunk_size_within_cap(st.chunk_size)?;
         st.file.rewind()?;
-        let mut buf = vec![0u8; st.chunk_size.get() as usize];
-        if hash_reader(&mut st.file, &mut buf)? != st.whole_digest {
-            // Keep the part file: its verified prefix is still reusable.
-            return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+        if st.size == 0 {
+            // Empty file: no heap buffer at all. The digest gate still
+            // catches stray bytes a previous session may have left in the
+            // part file (verify_part_prefix normally truncated them).
+            if st.file.metadata()?.len() != 0 || st.whole_digest != b3(b"") {
+                return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+            }
+        } else {
+            // Bounded buffer: min(chunk_size, file size) — a file shorter
+            // than one chunk never allocates the full chunk size.
+            let mut buf = vec![0u8; streaming_buffer_len(st.chunk_size, st.size)];
+            if hash_reader(&mut st.file, &mut buf)? != st.whole_digest {
+                // Keep the part file: its verified prefix is still reusable.
+                return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+            }
         }
         st.file.sync_all()?;
         // Best-effort metadata fidelity: stamp the sender's real mtime onto
@@ -743,10 +863,11 @@ impl FileSink for LocalFileSink {
         // guarantee of finish(); a failed mtime stamp must not fail the
         // transfer, so its error is deliberately dropped.
         let _ = filetime::set_file_mtime(&st.part_path, mtime_file_time(st.mtime_unix_ms));
-        // Pre-check the target so ConflictPolicy::Fail can never silently
-        // replace an existing file (POSIX rename would do so). A concurrent
-        // create between check and rename is still caught by the AlreadyExists
-        // retry below on Windows, where rename onto an existing name fails.
+        // Pre-check keeps the common conflict path cheap and lets the Rename
+        // policy pick a free name before any commit syscall. The atomic
+        // no-replace guarantee itself comes from commit_no_replace below, so
+        // a concurrent create between check and commit is still detected
+        // (AlreadyExists) instead of silently replacing the target.
         let mut target = st.final_path.clone();
         if fs::symlink_metadata(&target).is_ok() {
             match st.conflict {
@@ -756,7 +877,7 @@ impl FileSink for LocalFileSink {
         }
         let mut renames = 0u32;
         loop {
-            match fs::rename(&st.part_path, &target) {
+            match commit_no_replace(&st.part_path, &target) {
                 Ok(()) => {
                     st.finished = true;
                     return Ok(());
@@ -777,12 +898,96 @@ impl FileSink for LocalFileSink {
     }
 
     fn discard(self) {
-        if let SinkKind::File(st) = self.kind {
-            drop(st.file);
-            // Best effort; a vanished part is fine.
-            let _ = fs::remove_file(&st.part_path);
+        match self.kind {
+            SinkKind::File(st) => {
+                drop(st.file);
+                // Best effort; a vanished part is fine.
+                let _ = fs::remove_file(&st.part_path);
+            }
+            // Nothing in flight: the final file stays, no part exists.
+            SinkKind::Directory | SinkKind::Committed { .. } => {}
         }
     }
+}
+
+/// Atomically make `part` visible as `target` WITHOUT ever replacing an
+/// existing file at `target` (review 2026-11-04, atomic no-replace commit).
+///
+/// Both platforms commit through `hard_link(part, target)` + unlink of the
+/// part name: `link(2)` / `CreateHardLinkW` fail with `AlreadyExists` when
+/// the target name exists, and on success the inode is immediately visible
+/// under the final name — link + unlink is the standard atomic no-replace
+/// commit.
+///
+/// Why not `rename`: POSIX `rename(2)` silently replaces an existing
+/// target, and as of the current toolchain std's Windows `rename` does too
+/// (it uses `FileRenameInformationEx` with replace-if-exists semantics —
+/// empirically locked by `windows_rename_replaces_existing_files_is_locked`
+/// on rustc 1.99). Neither platform's rename is a no-replace primitive, so
+/// neither branch uses it as the commit primitive.
+///
+/// Windows fallback: on filesystems without hard-link support (FAT/exFAT
+/// removable drives) the link fails with a not-supported error; the commit
+/// then falls back to rename, where the caller's pre-check is the only
+/// guard, leaving a theoretical check-to-commit race on such volumes (no
+/// atomic no-replace primitive exists there at all).
+///
+/// Contract: `Ok(())` means the content is at `target` and nothing
+/// pre-existing was overwritten; `AlreadyExists` means `target` was left
+/// untouched and `part` still holds the data.
+fn commit_no_replace(part: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        link_then_unlink(part, target)
+    }
+    #[cfg(windows)]
+    {
+        match link_then_unlink(part, target) {
+            Err(e) if hard_links_unsupported(&e) => {
+                // Link-less filesystem: best effort via rename; the
+                // caller's pre-check caught the non-racing conflicts.
+                fs::rename(part, target)
+            }
+            other => other,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No known primitive with no-replace semantics on this target;
+        // refuse rather than risk a silent overwrite via plain rename.
+        let _ = (part, target);
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "atomic no-replace commit is not implemented for this platform",
+        ))
+    }
+}
+
+/// Link `part` to `target` (atomic no-replace claim), then drop the part
+/// name. Shared by every supported platform.
+fn link_then_unlink(part: &Path, target: &Path) -> io::Result<()> {
+    match fs::hard_link(part, target) {
+        Ok(()) => {
+            // The final name is live with the right inode; dropping the old
+            // part name is cleanup. A failure here (e.g. a racing orphan
+            // sweep) must not fail the commit — the file is already durable
+            // under `target`; the stale part name is later reaped by
+            // `discard_orphan_parts`.
+            let _ = fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Windows-only: error codes raised by filesystems without hard-link
+/// support (FAT, exFAT), where `CreateHardLinkW` cannot work at all.
+#[cfg(windows)]
+fn hard_links_unsupported(e: &io::Error) -> bool {
+    // ERROR_INVALID_FUNCTION (1) and ERROR_NOT_SUPPORTED (50) both mean
+    // "this filesystem cannot do that"; std may also map them to
+    // ErrorKind::Unsupported depending on version.
+    e.kind() == ErrorKind::Unsupported || matches!(e.raw_os_error(), Some(1) | Some(50))
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +1078,7 @@ mod tests {
     use super::*;
     use ak_core::manifest::DIGEST_LEN;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::sleep;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -889,16 +1095,25 @@ mod tests {
         unix_ms(fs::symlink_metadata(path).unwrap().modified().unwrap())
     }
 
+    /// Process-wide counter of symlink-dependent assertions the OS could
+    /// not set up (typically Windows without the symlink privilege).
+    /// Counting makes the reduction visible instead of silent (review
+    /// 2026-11-04, test honesty note): each skip prints a numbered SKIP
+    /// line in the test output (run with `--nocapture` to always see it).
+    static SYMLINK_SKIPS: AtomicUsize = AtomicUsize::new(0);
+
     /// Create a symlink; on Windows this needs the symlink privilege. Returns
-    /// false (and prints why) when the OS refuses, so tests can skip honestly.
+    /// false (and prints why, counted) when the OS refuses, so tests skip
+    /// honestly — the SKIP line is printed and counted, never silent.
     fn make_symlink(src: &Path, dst: &Path, dir_link: bool) -> bool {
         match symlink_once(src, dst, dir_link) {
             Ok(()) => true,
             Err(e) => {
+                let n = SYMLINK_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
-                    "SKIP: cannot create symlink at {} ({}); test reduced",
-                    dst.display(),
-                    e
+                    "SKIP #{n}: cannot create symlink at {} ({e}); \
+                     this assertion did NOT run — test reduced",
+                    dst.display()
                 );
                 false
             }
@@ -1379,24 +1594,32 @@ mod tests {
 
     #[test]
     fn conflict_fail_errors_and_rename_generates_free_name() {
-        let content = b"abcdefgh12345678";
-        let (_src_tmp, source, entry) = transfer_entry(content, 8);
+        // Two entries for the SAME final name with DIFFERENT content: a
+        // real conflict. (An identical-content retry is no longer a
+        // conflict: prepare detects the committed final and succeeds
+        // idempotently — see
+        // prepare_after_commit_returns_completed_sink_without_rewriting.)
+        let content_a = b"abcdefgh12345678";
+        let content_b = b"ZZZZZZZZYYYYYYYY"; // same size, different bytes
+        let (_src_tmp_a, source_a, entry_a) = transfer_entry(content_a, 8);
+        let (_src_tmp_b, source_b, entry_b) = transfer_entry(content_b, 8);
         let dst = TempDir::new().unwrap();
         let target = LocalSaveTarget::open(dst.path()).unwrap();
         let final_path = dst.path().join("payload.bin");
 
         let mut first = target
-            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .prepare_file_with_chunk_size(&entry_a, ConflictPolicy::Fail, cs(8))
             .unwrap();
-        write_all_chunks(&mut first, &source, &entry);
+        write_all_chunks(&mut first, &source_a, &entry_a);
         first.finish().unwrap();
-        assert_eq!(fs::read(&final_path).unwrap(), content);
+        assert_eq!(fs::read(&final_path).unwrap(), content_a);
 
-        // Second transfer of the same entry.
+        // Second transfer with different bytes: conflict under Fail.
         let mut second = target
-            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .prepare_file_with_chunk_size(&entry_b, ConflictPolicy::Fail, cs(8))
             .unwrap();
-        write_all_chunks(&mut second, &source, &entry);
+        assert_eq!(second.verified_prefix_chunks(), 0);
+        write_all_chunks(&mut second, &source_b, &entry_b);
         let err = second.finish().err().unwrap();
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
         assert!(
@@ -1407,7 +1630,7 @@ mod tests {
 
         // Retry with Rename: the part resumes fully verified and lands as (2).
         let mut third = target
-            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(8))
+            .prepare_file_with_chunk_size(&entry_b, ConflictPolicy::Rename, cs(8))
             .unwrap();
         assert_eq!(
             third.verified_prefix_chunks(),
@@ -1417,11 +1640,11 @@ mod tests {
         third.finish().unwrap();
         assert_eq!(
             fs::read(dst.path().join("payload (2).bin")).unwrap(),
-            content
+            content_b
         );
         assert_eq!(
             fs::read(&final_path).unwrap(),
-            content,
+            content_a,
             "original untouched"
         );
         assert!(!dst.path().join("payload.bin.akpart").exists());
@@ -1478,6 +1701,244 @@ mod tests {
                 .file_name()
                 .unwrap(),
             "rel (2).txt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Defensive chunk-size cap and bounded buffers (review 2026-11-04 #1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_rejects_chunk_size_above_the_cap_without_allocating() {
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        // Size 0 with zero chunk digests is plan-consistent even for a
+        // giant chunk size: exactly the review's small-frame trigger shape.
+        let entry = FileEntry::new("huge.bin", 0, 0, b3(b""), Vec::new()).unwrap();
+
+        // NonZeroU32::MAX (~4 GiB) must fail fast with InvalidInput instead
+        // of attempting the allocation: the immediate Err is the observable
+        // proof the cap ran first (an attempted OOM would abort instead).
+        let err = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, NonZeroU32::MAX)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cap"), "got: {err}");
+
+        // One byte over the cap is rejected as well...
+        let over = NonZeroU32::new((MAX_CHUNK_BUFFER_BYTES + 1) as u32).unwrap();
+        let err = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, over)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        // ...while exactly the cap is accepted; the empty entry commits with
+        // no chunk buffer allocated at any point.
+        let boundary = NonZeroU32::new(MAX_CHUNK_BUFFER_BYTES as u32).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, boundary)
+            .unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            fs::read(dst.path().join("huge.bin")).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        // Send side carries the same defense at API entry.
+        let src_file = dst.path().join("src.bin");
+        wf(&src_file, b"x");
+        let err = LocalSource::open(&src_file, NonZeroU32::MAX).err().unwrap();
+        assert!(
+            matches!(err, OpenError::Io(ref e) if e.kind() == ErrorKind::InvalidInput),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn short_file_under_large_chunk_size_round_trips_with_clamped_buffer() {
+        // A 10-byte file under a 1 MiB (valid, in-cap) chunk plan: the
+        // streaming buffers are clamped to min(chunk_size, size) = 10, and
+        // the tiny file still round-trips through prepare/write/finish.
+        let content = b"0123456789";
+        let (_src_tmp, source, entry) = transfer_entry(content, 1 << 20);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(1 << 20))
+            .unwrap();
+        assert_eq!(sink.verified_prefix_chunks(), 0);
+        write_all_chunks(&mut sink, &source, &entry);
+        sink.finish().unwrap();
+        assert_eq!(fs::read(dst.path().join("payload.bin")).unwrap(), content);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic no-replace commit (review 2026-11-04, storage item 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commit_no_replace_moves_part_and_never_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let part = tmp.path().join("f.bin.akpart");
+        let target = tmp.path().join("f.bin");
+        wf(&part, b"new-content");
+
+        // Fresh target: commit succeeds, content lands, part name is gone.
+        commit_no_replace(&part, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new-content");
+        assert!(!part.exists());
+
+        // Existing target: AlreadyExists, target untouched, part kept with
+        // its data. Both platform branches go through hard_link (Windows
+        // only falls back to rename on link-less filesystems, which never
+        // happens on NTFS temp dirs), so this contract is exercised on
+        // whichever platform the suite runs.
+        wf(&part, b"newer-content");
+        let err = commit_no_replace(&part, &target).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"new-content");
+        assert_eq!(fs::read(&part).unwrap(), b"newer-content");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_replaces_existing_files_is_locked() {
+        // Locks the OBSERVED std behavior on this toolchain (rustc 1.99):
+        // std::fs::rename on Windows uses FileRenameInformationEx with
+        // replace-if-exists semantics, so it REPLACES an existing target
+        // instead of failing like the historical MoveFileExW path. This is
+        // exactly why commit_no_replace cannot use rename on Windows
+        // either; if this test ever fails with AlreadyExists again, the
+        // std behavior changed back and commit_no_replace's Windows
+        // fallback rationale needs revisiting.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        wf(&a, b"a");
+        wf(&b, b"b");
+        fs::rename(&a, &b).expect("rename replaces existing targets here");
+        assert_eq!(fs::read(&b).unwrap(), b"a", "target was replaced");
+        assert!(!a.exists(), "source name is gone");
+    }
+
+    #[test]
+    fn hard_link_onto_existing_name_fails_natively() {
+        // Locks the platform assumption behind BOTH branches of
+        // commit_no_replace: link(2) / CreateHardLinkW onto an existing
+        // name fails with AlreadyExists instead of replacing it. Runs on
+        // Windows and Unix alike.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        wf(&a, b"a");
+        wf(&b, b"b");
+        let err = fs::hard_link(&a, &b).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&b).unwrap(), b"b", "target untouched");
+        assert_eq!(fs::read(&a).unwrap(), b"a", "source untouched");
+    }
+
+    // -----------------------------------------------------------------------
+    // Already-committed reuse (review 2026-11-04, storage item 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_after_commit_returns_completed_sink_without_rewriting() {
+        let content = b"0123456789abcdefGHIJ"; // 20 bytes, chunk 8 -> 8+8+4
+        let (_src_tmp, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let final_path = dst.path().join("payload.bin");
+        let part_path = dst.path().join("payload.bin.akpart");
+
+        // Full transfer, committed; the part name is gone.
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink, &source, &entry);
+        sink.finish().unwrap();
+        assert!(!part_path.exists());
+
+        // Distinctive old mtime: any rewrite during the retry would move it.
+        let past = unix_ms(SystemTime::now()) - 86_400_000;
+        filetime::set_file_mtime(&final_path, mtime_file_time(past)).unwrap();
+        let mtime_before = mtime_ms(&final_path);
+
+        // Engine retry: part deleted, final present and digest-matching.
+        let mut resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(
+            resumed.verified_prefix_chunks(),
+            entry.chunk_digests.len() as u64,
+            "already-committed final reports every chunk verified"
+        );
+        // Chunk replay is an idempotent no-op; out-of-range still errors.
+        resumed.write_chunk(0, b"01234567").unwrap();
+        assert!(resumed.write_chunk(99, b"x").is_err());
+        resumed.finish().unwrap();
+        resumed.finish().unwrap(); // idempotent success
+
+        assert_eq!(fs::read(&final_path).unwrap(), content);
+        assert_eq!(mtime_ms(&final_path), mtime_before, "final not rewritten");
+        assert!(!part_path.exists(), "no part may be recreated");
+
+        // Same fast path under the Rename policy: no " (2)" duplicate may
+        // be generated against the transfer's own committed output.
+        let again = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Rename, cs(8))
+            .unwrap();
+        assert_eq!(
+            again.verified_prefix_chunks(),
+            entry.chunk_digests.len() as u64
+        );
+        drop(again);
+        assert!(!dst.path().join("payload (2).bin").exists());
+
+        // Empty file: committed detection works with zero chunks too, and
+        // no part file is created for the completed sink.
+        let empty_entry = FileEntry::new("empty.bin", 0, 0, b3(b""), Vec::new()).unwrap();
+        let mut first = target
+            .prepare_file_with_chunk_size(&empty_entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        first.finish().unwrap();
+        let mut second = target
+            .prepare_file_with_chunk_size(&empty_entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(second.verified_prefix_chunks(), 0, "zero chunks, all done");
+        second.finish().unwrap();
+        assert!(!dst.path().join("empty.bin.akpart").exists());
+    }
+
+    #[test]
+    fn final_with_different_content_is_still_a_conflict_not_a_match() {
+        let content = b"0123456789abcdefGHIJ";
+        let (_src_tmp, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let final_path = dst.path().join("payload.bin");
+
+        // Same length (20 bytes) but different bytes: the length pre-check
+        // passes and only the whole-digest comparison rejects the match.
+        wf(&final_path, b"XXXXXXXXXXXXXXXXXXXX");
+
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(
+            sink.verified_prefix_chunks(),
+            0,
+            "no fast path: content differs"
+        );
+        write_all_chunks(&mut sink, &source, &entry);
+        let err = sink.finish().err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&final_path).unwrap(),
+            b"XXXXXXXXXXXXXXXXXXXX",
+            "pre-existing file untouched"
         );
     }
 

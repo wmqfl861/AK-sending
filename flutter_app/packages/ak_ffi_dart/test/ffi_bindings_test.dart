@@ -776,7 +776,7 @@ test('pollProgress: -3 keeps the event queued, retry is lossless',
   final outDir = _newTempDir('p3');
   try {
     final job = engine
-        .receiveStart(AkReceiveSpec(outDir: outDir.path, port: 0, timeoutSecs: 5));
+        .receiveStart(AkReceiveSpec(outDir: outDir.path, port: 0, expect: 'any', timeoutSecs: 5));
     final tiny = processAllocator.allocate<Uint8>(4);
     try {
       // Cap 4 can never hold a real event line; wait until one is queued.
@@ -1034,8 +1034,9 @@ test('jobsList: id_dir loopback persists one completed record per side',
     expect(recvRecords, hasLength(1));
     final recvRecord = recvRecords.single;
     expect(RegExp(r'^[0-9a-f]{32}$').hasMatch(recvRecord.id), isTrue,
-        reason: 'id is the 32-hex wire job id: ${recvRecord.id}');
-    expect(recvRecord.id, wireJob);
+        reason: 'id is the 32-hex per-instance record id: ${recvRecord.id}');
+    expect(recvRecord.id, isNot(wireJob),
+        reason: 'wave 17: record key binds peer+direction+root, not just content');
     expect(recvRecord.direction, 'receive');
     expect(recvRecord.state, 'completed');
     expect(recvRecord.files, totalEntries);
@@ -1048,7 +1049,10 @@ test('jobsList: id_dir loopback persists one completed record per side',
     final sendRecords = engine.jobsList(sendId.path);
     expect(sendRecords, hasLength(1));
     final sendRecord = sendRecords.single;
-    expect(sendRecord.id, wireJob);
+    expect(sendRecord.id, isNot(wireJob),
+        reason: 'wave 17: send record key is the per-instance record id');
+    expect(sendRecord.id, isNot(recvRecord.id),
+        reason: 'direction+root differ => separate records even for one job');
     expect(sendRecord.direction, 'send');
     expect(sendRecord.state, 'completed');
     expect(sendRecord.files, totalEntries);

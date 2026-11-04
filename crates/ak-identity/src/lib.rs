@@ -3,12 +3,15 @@
 //! Each device holds one Ed25519 key pair. The public key is the device
 //! identity; its BLAKE3 digest is the fingerprint used for pairing and
 //! certificate pinning. Private key material never leaves the device and is
-//! never written into coordination-plane messages.
+//! never written into coordination-plane messages — including `Debug`
+//! output, which shows only lengths and digests for key-bearing types.
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -22,6 +25,11 @@ pub const FINGERPRINT_LEN: usize = 32;
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 const SEED_LEN: usize = 32;
+
+/// Monotonic per-process counter. Combined with the PID it makes every
+/// temp-file name unique, so concurrent writers (threads or processes) never
+/// write through the same temp path.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// BLAKE3(public key). Displayed, compared, and pinned everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -131,9 +139,22 @@ pub fn verify_pairing_code(fingerprint: &Fingerprint, code: &str) -> bool {
 }
 
 /// The device key pair. Persistence is a 32-byte seed file, written atomically.
+///
+/// [`fmt::Debug`] is hand-written and shows only public identity data (the
+/// public key and fingerprint); the private seed never reaches `Debug`
+/// output, so keys cannot leak through `{:?}` logging of specs or errors.
 #[derive(Clone)]
 pub struct DeviceKeyPair {
     signing: ed25519_dalek::SigningKey,
+}
+
+impl fmt::Debug for DeviceKeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceKeyPair")
+            .field("public_key", &hex_lower(&self.public_key()))
+            .field("fingerprint", &self.fingerprint().to_hex())
+            .finish()
+    }
 }
 
 impl DeviceKeyPair {
@@ -152,30 +173,117 @@ impl DeviceKeyPair {
 
     /// Load the seed file, or create and persist a new key. The bool says
     /// whether a new key was created.
+    ///
+    /// First creation is exclusive: when several threads or processes race
+    /// on a missing path, exactly one generated key is published; the losers
+    /// discard their own candidate and return the winner's key with
+    /// `created == false`. This path never overwrites an existing seed file
+    /// (use [`DeviceKeyPair::save`] to replace one deliberately).
     pub fn load_or_create(path: &Path) -> io::Result<(Self, bool)> {
-        match fs::read(path) {
-            Ok(seed) => {
-                if seed.len() != SEED_LEN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}: seed file must hold exactly {} bytes, found {}",
-                            path.display(),
-                            SEED_LEN,
-                            seed.len()
-                        ),
-                    ));
+        /// Read and validate an existing seed file; `None` means "not there".
+        fn read_existing(path: &Path) -> io::Result<Option<[u8; SEED_LEN]>> {
+            match fs::read(path) {
+                Ok(seed) => {
+                    if seed.len() != SEED_LEN {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{}: seed file must hold exactly {} bytes, found {}",
+                                path.display(),
+                                SEED_LEN,
+                                seed.len()
+                            ),
+                        ));
+                    }
+                    let mut bytes = [0u8; SEED_LEN];
+                    bytes.copy_from_slice(&seed);
+                    Ok(Some(bytes))
                 }
-                let mut bytes = [0u8; SEED_LEN];
-                bytes.copy_from_slice(&seed);
-                Ok((Self::from_seed(bytes), false))
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err),
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let key = Self::generate();
-                key.save(path)?;
-                Ok((key, true))
+        }
+
+        // Each round either loads the existing seed or tries to exclusively
+        // publish a fresh one. Losing a race just means re-reading, so a
+        // small bound covers any realistic number of contenders.
+        for _ in 0..8 {
+            if let Some(seed) = read_existing(path)? {
+                return Ok((Self::from_seed(seed), false));
             }
-            Err(err) => Err(err),
+            let key = Self::generate();
+            match key.publish_new(path) {
+                Ok(PublishOutcome::Published) => return Ok((key, true)),
+                Ok(PublishOutcome::LostRace) => continue, // take the winner's key
+                Err(err) => {
+                    // The winner may have published between our read and the
+                    // failed write; give the disk one last chance.
+                    if let Some(seed) = read_existing(path)? {
+                        return Ok((Self::from_seed(seed), false));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "{}: seed first-create race lost too many times",
+                path.display()
+            ),
+        ))
+    }
+
+    /// Publish this fresh key at `path` without ever overwriting an existing
+    /// file. The seed is first fsynced into a unique temp file, then
+    /// installed with [`fs::hard_link`], which fails with `AlreadyExists`
+    /// when the destination is taken — unlike [`fs::rename`], which silently
+    /// replaces an existing file on both Windows and Unix. On filesystems
+    /// without hard-link support the fallback is an exclusive `create_new`
+    /// write on the final path itself.
+    fn publish_new(&self, path: &Path) -> io::Result<PublishOutcome> {
+        let seed = self.signing.to_bytes();
+        let temp_path = unique_temp_path(path)?;
+        match exclusive_write_new(&temp_path, &seed) {
+            Ok(PublishOutcome::Published) => {}
+            Ok(PublishOutcome::LostRace) => {
+                // A unique temp name losing a race is practically impossible;
+                // re-reading is always the safe response.
+                let _ = fs::remove_file(&temp_path);
+                return Ok(PublishOutcome::LostRace);
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        }
+        // Fast path: the destination appeared while we were writing our temp.
+        if fs::symlink_metadata(path).is_ok() {
+            let _ = fs::remove_file(&temp_path);
+            return Ok(PublishOutcome::LostRace);
+        }
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(PublishOutcome::Published)
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(PublishOutcome::LostRace)
+            }
+            Err(_) if fs::symlink_metadata(path).is_ok() => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(PublishOutcome::LostRace)
+            }
+            Err(_) => {
+                // Filesystems without hard-link support (some FAT/network
+                // mounts): exclusive-create the final path directly. Still
+                // race-free, only less crash-atomic (a torn write would
+                // leave a short seed file that loading rejects).
+                let outcome = exclusive_write_new(path, &seed);
+                let _ = fs::remove_file(&temp_path);
+                outcome
+            }
         }
     }
 
@@ -214,10 +322,46 @@ impl DeviceKeyPair {
     }
 }
 
-/// Write `bytes` to `path` atomically: same-directory temp file, fsync,
-/// rename. Windows may refuse to rename onto an existing destination that is
-/// open, so remove the destination and retry once before giving up.
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Outcome of trying to establish a file that must not already exist.
+enum PublishOutcome {
+    /// The file was created by this call.
+    Published,
+    /// Someone else created it first; the caller should re-read the disk.
+    LostRace,
+}
+
+/// Create `target` exclusively (`create_new`) and write `seed` into it with
+/// fsync. `LostRace` means the file already existed. A write error after a
+/// successful create removes the torn file this call owns before failing;
+/// any pre-existing file at `target` is never touched.
+fn exclusive_write_new(target: &Path, seed: &[u8; SEED_LEN]) -> io::Result<PublishOutcome> {
+    #[cfg(unix)]
+    let mut options = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.mode(0o600);
+        options
+    };
+    #[cfg(not(unix))]
+    let mut options = fs::OpenOptions::new();
+    let mut file = match options.write(true).create_new(true).open(target) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Ok(PublishOutcome::LostRace)
+        }
+        Err(err) => return Err(err),
+    };
+    if let Err(err) = file.write_all(seed).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(target);
+        return Err(err);
+    }
+    Ok(PublishOutcome::Published)
+}
+
+/// `<dir>/<file_name>.<pid>.<seq>.tmp` — unique per process and per call, in
+/// the destination's directory so the install stays on one filesystem.
+fn unique_temp_path(path: &Path) -> io::Result<PathBuf> {
     let parent = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
@@ -229,10 +373,19 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
             format!("{}: path has no file name", path.display()),
         )
     })?;
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut temp_name = file_name.to_os_string();
-    temp_name.push(".tmp");
-    let temp_path = parent.join(temp_name);
+    temp_name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    Ok(parent.join(temp_name))
+}
 
+/// Write `bytes` to `path` atomically: a uniquely named temp file in the
+/// same directory, fsync, then rename over the destination. If the rename
+/// fails (for example the destination is held open without sharing on
+/// Windows), the error is returned and the pre-existing destination is left
+/// untouched — a failed save must never delete the caller's current file.
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp_path = unique_temp_path(path)?;
     let write = || -> io::Result<()> {
         #[cfg(unix)]
         let mut options = {
@@ -243,11 +396,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         };
         #[cfg(not(unix))]
         let mut options = fs::OpenOptions::new();
-        let mut file = options
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
+        let mut file = options.write(true).create_new(true).open(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()
     };
@@ -255,18 +404,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
     }
-
-    if fs::rename(&temp_path, path).is_err() {
-        if let Err(err) = fs::remove_file(path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                let _ = fs::remove_file(&temp_path);
-                return Err(err);
-            }
-        }
-        if let Err(err) = fs::rename(&temp_path, path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err);
-        }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        // Never remove the destination to force the rename through: the
+        // existing file stays exactly as it was.
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
     }
     Ok(())
 }
@@ -280,6 +422,20 @@ pub struct PeerRecord {
 }
 
 /// Local paired-peer list with atomic file persistence.
+///
+/// ## Peer-name character contract
+///
+/// Peer names are display data: they end up in terminal output, logs and
+/// device lists. To match the display-injection defenses of `ak-wire` and
+/// `ak-signal` coordination strings, a name must not contain Unicode Cc
+/// control characters — C0 `U+0000..=U+001F` (includes TAB, CR, LF and ESC),
+/// DEL `U+007F`, and C1 `U+0080..=U+009F` (includes CSI). Saving folds any
+/// such character to a space, so files this crate writes always reload
+/// cleanly; loading instead *rejects* a stored name that still contains one
+/// (InvalidData), so a tampered or foreign file cannot smuggle escape
+/// sequences into displays. Name producers outside this crate (notably
+/// `ak-cli`'s AKPAIR1 import, which parses names from pasted text) must
+/// apply the same rule at entry before the name ever reaches a `PeerRecord`.
 #[derive(Debug, Default)]
 pub struct PeerBook {
     peers: Vec<PeerRecord>,
@@ -287,11 +443,17 @@ pub struct PeerBook {
 
 const PEERBOOK_MAGIC: &str = "AKPEERS1";
 
-/// One line of the peer book: fingerprint hex, name, paired timestamp.
-/// Tab and newline bytes in a name would break the format, so they become spaces.
+/// Unicode Cc test, identical to the set `ak-wire` rejects in peer-facing
+/// display strings: C0 U+0000..=U+001F, DEL U+007F, C1 U+0080..=U+009F.
+fn is_control_char(c: char) -> bool {
+    matches!(c as u32, 0x00..=0x1F | 0x7F..=0x9F)
+}
+
+/// Fold every control character to a space before a name is written, so
+/// line/field framing survives and the file reloads under the contract above.
 fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| matches!(c, '\t' | '\n' | '\r').then_some(' ').unwrap_or(c))
+        .map(|c| if is_control_char(c) { ' ' } else { c })
         .collect()
 }
 
@@ -335,6 +497,14 @@ impl PeerBook {
                 };
             let fingerprint = Fingerprint::from_hex(fp_hex)
                 .ok_or_else(|| invalid("fingerprint must be 64 hex characters"))?;
+            // Refuse (do not silently rewrite) persisted names with control
+            // characters: rejecting is the display-injection defense used by
+            // ak-wire/ak-signal, and it makes tampering visible instead of
+            // quietly laundering the file. The name itself never appears in
+            // the error.
+            if name.chars().any(is_control_char) {
+                return Err(invalid("peer name contains control characters (C0/DEL/C1)"));
+            }
             let paired_unix_ms: u64 = ts
                 .parse()
                 .map_err(|_| invalid("paired timestamp must be an unsigned integer"))?;
@@ -349,7 +519,8 @@ impl PeerBook {
 
     /// Persist the book atomically in the tab-separated `peers.book` format
     /// (header line, then one `fingerprint\tname\tpaired_unix_ms` line per
-    /// peer, in insertion order).
+    /// peer, in insertion order). Names are folded per the character
+    /// contract on [`PeerBook`] before writing.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut out = String::with_capacity(PEERBOOK_MAGIC.len() + 1 + self.peers.len() * 80);
         out.push_str(PEERBOOK_MAGIC);
@@ -402,6 +573,7 @@ impl PeerBook {
 pub mod tls {
     use super::{DeviceKeyPair, Fingerprint};
     use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+    use std::fmt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// DER content bytes of the Ed25519 algorithm OID (1.3.101.115).
@@ -413,12 +585,44 @@ pub mod tls {
     const MAX_CLOCK_DAYS: i64 = 2_500_000;
 
     /// A self-signed certificate plus its PKCS#8 key, ready for rustls/quinn.
-    /// Debug never exposes key bytes beyond lengths.
-    #[derive(Debug, Clone)]
+    ///
+    /// `Debug` is hand-written: it prints byte lengths and short BLAKE3
+    /// digest prefixes, never the key or certificate bytes themselves. The
+    /// digest prefix still lets operators distinguish two bundles in logs.
+    /// Downstream derived `Debug` (e.g. `ak-engine`'s `SendSpec`/`ReceiveSpec`)
+    /// inherits this redaction automatically.
+    #[derive(Clone)]
     pub struct TlsBundle {
         pub cert_der: Vec<u8>,
         pub key_pkcs8_der: Vec<u8>,
         pub fingerprint: Fingerprint,
+    }
+
+    impl fmt::Debug for TlsBundle {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let cert = format!(
+                "<{} bytes, blake3[:8]={}>",
+                self.cert_der.len(),
+                digest_prefix(&self.cert_der)
+            );
+            let key = format!(
+                "<{} bytes redacted, blake3[:8]={}>",
+                self.key_pkcs8_der.len(),
+                digest_prefix(&self.key_pkcs8_der)
+            );
+            f.debug_struct("TlsBundle")
+                .field("cert_der", &cert)
+                .field("key_pkcs8_der", &key)
+                .field("fingerprint", &self.fingerprint.to_hex())
+                .finish()
+        }
+    }
+
+    /// First 8 BLAKE3 digest bytes as 16 hex characters — enough to tell
+    /// redacted values apart without revealing them.
+    fn digest_prefix(bytes: &[u8]) -> String {
+        let digest = blake3::hash(bytes);
+        super::hex_lower(&digest.as_bytes()[..8])
     }
 
     /// Build the fixed 48-byte PKCS#8 DER for an Ed25519 seed
@@ -516,12 +720,37 @@ pub mod tls {
         full: &'a [u8],
     }
 
+    const TAG_INTEGER: u8 = 0x02;
     const TAG_BIT_STRING: u8 = 0x03;
     const TAG_OID: u8 = 0x06;
     const TAG_SEQUENCE: u8 = 0x30;
 
-    /// Minimal DER cursor: walks definite-length TLV elements, rejecting
-    /// truncated input, indefinite lengths and non-minimal length encodings.
+    /// X.690 §8.3.2: INTEGER contents must be a non-empty, minimal two's
+    /// complement encoding — the first nine bits must be neither all zeroes
+    /// (redundant leading `0x00`) nor all ones (redundant leading `0xFF`).
+    fn integer_is_minimal(content: &[u8]) -> bool {
+        match content {
+            [] => false,
+            [_] => true,
+            [first, second, ..] => {
+                !((*first == 0x00 && second & 0x80 == 0) || (*first == 0xFF && second & 0x80 != 0))
+            }
+        }
+    }
+
+    /// Minimal DER cursor for the shapes this module reads. It walks
+    /// definite-length TLV elements and enforces on every element:
+    ///
+    /// * lengths are definite, use at most 4 length octets, have no leading
+    ///   zero octets, never use the long form to encode a value below 128,
+    ///   and fit inside the remaining input (X.690 minimal-length rule);
+    /// * no element is ever indefinite-length (`0x80`).
+    ///
+    /// The structural rules layered on top are listed on
+    /// [`verify_pinned_certificate`]. Notably *not* checked (accepted as
+    /// opaque bytes that the self-signature commits to): validity dates,
+    /// extensions, issuer/subject semantics, and BOOLEAN canonical form —
+    /// no read path here walks a BOOLEAN.
     struct DerReader<'a> {
         input: &'a [u8],
         pos: usize,
@@ -566,6 +795,12 @@ pub mod tls {
                         return Err(CertError::Malformed);
                     }
                 }
+                // X.690 minimal encoding: a single long-form length octet is
+                // only legal for values >= 128; anything smaller must use the
+                // short form, so e.g. `81 05` is rejected.
+                if count == 1 && len < 0x80 {
+                    return Err(CertError::Malformed);
+                }
                 header_len = 2 + count;
                 len
             };
@@ -599,6 +834,15 @@ pub mod tls {
         if tbs.tag != TAG_SEQUENCE || alg.tag != TAG_SEQUENCE || !inner.done() {
             return Err(CertError::Malformed);
         }
+        // The signature AlgorithmIdentifier must be exactly
+        // SEQUENCE { OID 1.3.101.115 }: Ed25519 parameters are absent
+        // (RFC 8410), and a different declared algorithm must not be
+        // confusable with the Ed25519 verification performed below.
+        let mut alg_fields = DerReader::new(alg.content);
+        let alg_oid = alg_fields.next()?;
+        if alg_oid.tag != TAG_OID || alg_oid.content != ED25519_OID || !alg_fields.done() {
+            return Err(CertError::Malformed);
+        }
         let bits = bit_string_content(&sig)?;
         let signature: [u8; 64] = bits.try_into().map_err(|_| CertError::Malformed)?; // Ed25519 signatures are 64 bytes
         Ok((tbs, signature))
@@ -618,12 +862,20 @@ pub mod tls {
 
     /// Find the Ed25519 SubjectPublicKeyInfo inside a TBS certificate and
     /// return its 32-byte public key. The search is structural: only a
-    /// SEQUENCE of (Ed25519 AlgorithmIdentifier, 32-byte BIT STRING) matches,
-    /// so issuer/subject/validity elements and extensions cannot shadow it.
+    /// SEQUENCE of (Ed25519 AlgorithmIdentifier, 32-byte BIT STRING) with no
+    /// further elements matches, so issuer/subject/validity elements and
+    /// extensions cannot shadow it. Direct INTEGER children of the TBS
+    /// (version/serialNumber) must use their minimal encoding.
     fn spki_ed25519_public_key(tbs_content: &[u8]) -> Result<[u8; 32], CertError> {
         let mut reader = DerReader::new(tbs_content);
         while !reader.done() {
             let child = reader.next()?;
+            if child.tag == TAG_INTEGER {
+                if !integer_is_minimal(child.content) {
+                    return Err(CertError::Malformed);
+                }
+                continue;
+            }
             if child.tag != TAG_SEQUENCE {
                 continue;
             }
@@ -635,11 +887,22 @@ pub mod tls {
             let mut alg_reader = DerReader::new(alg.content);
             let Ok(oid) = alg_reader.next() else { continue };
             if oid.tag != TAG_OID || oid.content != ED25519_OID {
-                continue;
+                continue; // some other algorithm's SPKI — keep looking
+            }
+            // Ed25519 AlgorithmIdentifier is exactly SEQUENCE { OID }; any
+            // element after the OID (parameters) makes the certificate
+            // malformed instead of merely non-matching.
+            if !alg_reader.done() {
+                return Err(CertError::Malformed);
             }
             let Ok(key) = spki.next() else { continue };
             let bits = bit_string_content(&key)?;
-            return bits.try_into().map_err(|_| CertError::Malformed);
+            let public: [u8; 32] = bits.try_into().map_err(|_| CertError::Malformed)?;
+            // No trailing elements after the subject public key.
+            if !spki.done() {
+                return Err(CertError::Malformed);
+            }
+            return Ok(public);
         }
         Err(CertError::Malformed)
     }
@@ -668,6 +931,18 @@ pub mod tls {
     /// Verify a peer certificate against a pinned Ed25519 public key:
     /// parse minimal DER, require the SPKI key to equal `pinned_public`
     /// (constant-time compare) and the self-signature to verify.
+    ///
+    /// The structural rules actually enforced are: exact certificate shape
+    /// `SEQUENCE { TBS SEQUENCE, AlgorithmIdentifier SEQUENCE, BIT STRING }`
+    /// with no trailing bytes at any level; the signature AlgorithmIdentifier
+    /// is exactly `SEQUENCE { OID 1.3.101.115 }`; the SPKI is exactly
+    /// `SEQUENCE { SEQUENCE { OID 1.3.101.115 }, BIT STRING }` (Ed25519
+    /// parameters absent, no trailing elements); BIT STRINGs carry zero
+    /// unused bits; the signature BIT STRING is exactly 64 bytes; TBS-direct
+    /// INTEGER children use minimal two's-complement encoding; every length
+    /// is definite and minimally encoded. Certificate fields outside this
+    /// shape (dates, extensions, names) are only covered by the signature,
+    /// never interpreted.
     pub fn verify_pinned_certificate(
         cert_der: &[u8],
         pinned_public: &[u8; 32],
@@ -795,12 +1070,13 @@ pub mod tls {
                 Vec::new(),
                 vec![0x30],
                 vec![0x30, 0x00],
-                vec![0x30, 0x80],                         // indefinite length
-                vec![0x30, 0x81, 0x00],                   // non-minimal length
+                vec![0x30, 0x80],       // indefinite length
+                vec![0x30, 0x81, 0x00], // non-minimal length
+                vec![0x30, 0x81, 0x05, 0x02, 0x01, 0x00, 0x05, 0x00], // long form < 128
                 vec![0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF], // huge length
                 vec![0x30, 0x84, 0x7F, 0xFF, 0xFF, 0xFF], // length beyond input
-                vec![0x31, 0x00],                         // wrong outer tag
-                vec![0xFF; 512],                          // garbage
+                vec![0x31, 0x00],       // wrong outer tag
+                vec![0xFF; 512],        // garbage
                 truncated,
                 trailing,
                 deep_nesting,
@@ -863,6 +1139,261 @@ pub mod tls {
             )
             .unwrap();
             assert_eq!(key_pair.public_key_raw(), key.public_key().as_slice());
+        }
+
+        #[test]
+        fn tls_bundle_debug_redacts_private_key_material() {
+            let key = DeviceKeyPair::generate();
+            let bundle = make_self_signed(&key);
+            let debug = format!("{bundle:?}");
+
+            // Sentinel: no private-key byte may appear in hex form, from the
+            // raw seed or the embedded PKCS#8 DER (which contains the seed).
+            assert!(
+                !debug.contains(&super::super::hex_lower(&key.signing.to_bytes())),
+                "Debug leaked the private seed: {debug}"
+            );
+            assert!(
+                !debug.contains(&super::super::hex_lower(&bundle.key_pkcs8_der)),
+                "Debug leaked the PKCS#8 DER: {debug}"
+            );
+            // Certificate bytes are public but stay compact: length + digest.
+            assert!(!debug.contains(&super::super::hex_lower(&bundle.cert_der)));
+            assert!(debug.contains("key_pkcs8_der"));
+            assert!(debug.contains("redacted"));
+            assert!(debug.contains(&format!(
+                "blake3[:8]={}",
+                digest_prefix(&bundle.key_pkcs8_der)
+            )));
+            assert!(debug.contains(&bundle.fingerprint.to_hex()));
+
+            // Derived Debug in downstream crates (ak-engine SendSpec/
+            // ReceiveSpec hold a TlsBundle) inherits the redaction: a
+            // wrapper's derived Debug just embeds the manual impl above.
+            let wrapped = format!("{:?}", ("job", &bundle));
+            assert!(!wrapped.contains(&super::super::hex_lower(&key.signing.to_bytes())));
+            assert!(!wrapped.contains(&super::super::hex_lower(&bundle.key_pkcs8_der)));
+        }
+
+        // ---- Structured DER defect corpus -------------------------------
+        //
+        // `synthetic_cert` builds a minimal certificate whose *structure* is
+        // complete, so the clean variant parses all the way to signature
+        // verification (BadSignature with a zero signature). Each defect
+        // below changes exactly one structural detail and must instead fail
+        // as Malformed before the signature is consulted.
+
+        fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(content.len() + 4);
+            out.push(tag);
+            if content.len() < 0x80 {
+                out.push(content.len() as u8);
+            } else if content.len() <= 0xFF {
+                out.extend_from_slice(&[0x81, content.len() as u8]);
+            } else {
+                out.extend_from_slice(&[0x82, (content.len() >> 8) as u8, content.len() as u8]);
+            }
+            out.extend_from_slice(content);
+            out
+        }
+
+        fn der_seq(content: &[u8]) -> Vec<u8> {
+            der_tlv(TAG_SEQUENCE, content)
+        }
+
+        fn der_int(content: &[u8]) -> Vec<u8> {
+            der_tlv(TAG_INTEGER, content)
+        }
+
+        fn der_oid(content: &[u8]) -> Vec<u8> {
+            der_tlv(TAG_OID, content)
+        }
+
+        fn der_bit_string(bits: &[u8]) -> Vec<u8> {
+            let mut content = vec![0u8]; // zero unused bits
+            content.extend_from_slice(bits);
+            der_tlv(TAG_BIT_STRING, &content)
+        }
+
+        fn ed25519_spki(key_bits: &[u8; 32]) -> Vec<u8> {
+            let mut content = der_seq(&der_oid(&ED25519_OID));
+            content.extend_from_slice(&der_bit_string(key_bits));
+            der_seq(&content)
+        }
+
+        fn ed25519_alg_id() -> Vec<u8> {
+            der_seq(&der_oid(&ED25519_OID))
+        }
+
+        /// SEQUENCE { tbs, algid, signature BIT STRING }, the minimal shape
+        /// `split_certificate` accepts.
+        fn synthetic_cert(tbs: &[u8], algid: &[u8], signature: &[u8]) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend_from_slice(tbs);
+            content.extend_from_slice(algid);
+            content.extend_from_slice(&der_bit_string(signature));
+            der_seq(&content)
+        }
+
+        fn clean_synthetic(key: &DeviceKeyPair) -> Vec<u8> {
+            let mut tbs_content = der_int(&[0x00]); // minimal serial 0
+            tbs_content.extend_from_slice(&ed25519_spki(&key.public_key()));
+            synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64])
+        }
+
+        #[test]
+        fn synthetic_minimal_certificate_reaches_signature_check() {
+            let key = DeviceKeyPair::generate();
+            let cert = clean_synthetic(&key);
+            // Structure and pin parse; only the zero signature is wrong, so
+            // the corpus baseline is proven well-formed.
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &key.public_key()),
+                Err(CertError::BadSignature)
+            ));
+            assert!(matches!(
+                self_signed_public_key(&cert),
+                Err(CertError::BadSignature)
+            ));
+        }
+
+        #[test]
+        fn structured_der_defects_are_rejected_as_malformed() {
+            let key = DeviceKeyPair::generate();
+            let public = key.public_key();
+
+            // 1. Non-minimal outer SEQUENCE length: long form (`81`) encoding
+            //    a value below 128. Build the same content by hand.
+            let tbs = der_seq(&ed25519_spki(&public));
+            let mut content = Vec::new();
+            content.extend_from_slice(&tbs);
+            content.extend_from_slice(&ed25519_alg_id());
+            content.extend_from_slice(&der_bit_string(&[0u8; 64]));
+            assert!(
+                content.len() < 0x80,
+                "corpus case needs a short-form length"
+            );
+            let mut non_minimal_seq = vec![0x30, 0x81, content.len() as u8];
+            non_minimal_seq.extend_from_slice(&content);
+            // Control: the same content with a short-form header parses.
+            let mut minimal_seq = vec![0x30, content.len() as u8];
+            minimal_seq.extend_from_slice(&content);
+            assert!(matches!(
+                verify_pinned_certificate(&minimal_seq, &public),
+                Err(CertError::BadSignature)
+            ));
+            assert!(matches!(
+                verify_pinned_certificate(&non_minimal_seq, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 2/3. Non-minimal INTEGER encodings in the TBS serialNumber.
+            for bad_serial in [
+                [0x00u8, 0x01], /* redundant zero */
+                [0xFF, 0x80],   /* redundant sign */
+            ] {
+                let mut tbs_content = der_int(&bad_serial);
+                tbs_content.extend_from_slice(&ed25519_spki(&public));
+                let cert = synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64]);
+                assert!(
+                    matches!(
+                        verify_pinned_certificate(&cert, &public),
+                        Err(CertError::Malformed)
+                    ),
+                    "non-minimal INTEGER {bad_serial:?} accepted"
+                );
+            }
+            // Control: minimal encodings of the same values parse.
+            for good_serial in [[0x01u8], [0x80u8]] {
+                let mut tbs_content = der_int(&good_serial);
+                tbs_content.extend_from_slice(&ed25519_spki(&public));
+                let cert = synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64]);
+                assert!(matches!(
+                    verify_pinned_certificate(&cert, &public),
+                    Err(CertError::BadSignature)
+                ));
+            }
+
+            // 4. Trailing element inside the SPKI after the public key.
+            let mut spki_content = ed25519_alg_id();
+            spki_content.extend_from_slice(&der_bit_string(&public));
+            spki_content.extend_from_slice(&der_int(&[0x01]));
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&der_seq(&spki_content));
+            let cert = synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64]);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 5. Ed25519 AlgorithmIdentifier with parameters (trailing NULL).
+            let mut algid_with_params = der_oid(&ED25519_OID);
+            algid_with_params.extend_from_slice(&[0x05, 0x00]);
+            let spki_with_params = {
+                let mut content = der_seq(&algid_with_params);
+                content.extend_from_slice(&der_bit_string(&public));
+                der_seq(&content)
+            };
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&spki_with_params);
+            let cert = synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64]);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 6. Misplaced algorithm OID: the SPKI algid holds an INTEGER
+            //    before the OID, so the SPKI never matches.
+            let mut misplaced = der_int(&[0x01]);
+            misplaced.extend_from_slice(&der_oid(&ED25519_OID));
+            let spki_misplaced = {
+                let mut content = der_seq(&misplaced);
+                content.extend_from_slice(&der_bit_string(&public));
+                der_seq(&content)
+            };
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&spki_misplaced);
+            let cert = synthetic_cert(&der_seq(&tbs_content), &ed25519_alg_id(), &[0u8; 64]);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 7. Non-minimal BIT STRING length for the signature
+            //    (content 65 bytes as `81 41`).
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&ed25519_spki(&public));
+            let mut inner = Vec::new();
+            inner.extend_from_slice(&der_seq(&tbs_content));
+            inner.extend_from_slice(&ed25519_alg_id());
+            inner.extend_from_slice(&[0x03, 0x81, 0x41, 0x00]);
+            inner.extend_from_slice(&[0u8; 64]);
+            let cert = der_seq(&inner);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 8. Outer (signature) AlgorithmIdentifier with the wrong OID.
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&ed25519_spki(&public));
+            let rsa_oid = der_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D]); // 1.2.840.113549
+            let cert = synthetic_cert(&der_seq(&tbs_content), &der_seq(&rsa_oid), &[0u8; 64]);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
+
+            // 9. Outer AlgorithmIdentifier with trailing parameters.
+            let mut algid = der_oid(&ED25519_OID);
+            algid.extend_from_slice(&[0x05, 0x00]);
+            let mut tbs_content = der_int(&[0x00]);
+            tbs_content.extend_from_slice(&ed25519_spki(&public));
+            let cert = synthetic_cert(&der_seq(&tbs_content), &der_seq(&algid), &[0u8; 64]);
+            assert!(matches!(
+                verify_pinned_certificate(&cert, &public),
+                Err(CertError::Malformed)
+            ));
         }
 
         #[test]
@@ -1122,12 +1653,9 @@ mod tests {
         for len in [0usize, 31, 33, 64, 4096] {
             let path = dir.path().join(format!("seed-{len}.bin"));
             fs::write(&path, vec![7u8; len]).unwrap();
-            // DeviceKeyPair is intentionally not Debug (it holds key material),
-            // so unwrap_err is not available on the success type.
-            let err = match DeviceKeyPair::load_or_create(&path) {
-                Ok(_) => panic!("accepted mis-sized seed file ({len} bytes)"),
-                Err(err) => err,
-            };
+            // DeviceKeyPair's Debug is redacted (public data only), so
+            // unwrap_err cannot leak key material.
+            let err = DeviceKeyPair::load_or_create(&path).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len}");
             assert!(
                 err.to_string().contains(&len.to_string()),
@@ -1138,6 +1666,134 @@ mod tests {
                 "reason lacks context: {err}"
             );
         }
+    }
+
+    #[test]
+    fn device_keypair_debug_shows_public_data_only() {
+        let key = DeviceKeyPair::generate();
+        let debug = format!("{key:?}");
+        // Sentinel: the private seed must never appear in Debug output.
+        assert!(
+            !debug.contains(&hex_lower(&key.signing.to_bytes())),
+            "Debug leaked the private seed: {debug}"
+        );
+        assert!(debug.contains("DeviceKeyPair"));
+        assert!(debug.contains(&hex_lower(&key.public_key())));
+        assert!(debug.contains(&key.fingerprint().to_hex()));
+    }
+
+    #[test]
+    fn concurrent_first_create_publishes_exactly_one_seed() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new("race");
+        let path = Arc::new(dir.path().join("device.seed"));
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    DeviceKeyPair::load_or_create(&path)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread panicked").expect("io error"))
+            .collect();
+
+        // Exactly one thread won the publish race.
+        let created_count = results.iter().filter(|(_, won)| *won).count();
+        assert_eq!(created_count, 1, "created flags: {:?}", {
+            let flags: Vec<bool> = results.iter().map(|(_, won)| *won).collect();
+            flags
+        });
+        // Every thread walked away with the key that is actually on disk.
+        let disk_seed = fs::read(&*path).unwrap();
+        assert_eq!(disk_seed.len(), SEED_LEN);
+        let disk_key = SigningKey::from_bytes(disk_seed.as_slice().try_into().unwrap());
+        let disk_public = disk_key.verifying_key().to_bytes();
+        for (key, _) in &results {
+            assert_eq!(key.public_key(), disk_public);
+        }
+        // Single file at the final path, no temp leftovers.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["device.seed".to_owned()]);
+    }
+
+    #[test]
+    fn atomic_write_fails_cleanly_when_destination_is_a_directory() {
+        let dir = TempDir::new("dir-dest");
+        let path = dir.path().join("device.seed");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep.txt"), b"data").unwrap();
+
+        // rename(file -> existing directory) fails on Windows and Unix alike.
+        assert!(DeviceKeyPair::generate().save(&path).is_err());
+
+        // The destination is preserved exactly and no temp file is left.
+        assert!(path.is_dir());
+        assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"data");
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["device.seed".to_owned()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_destination_seed_is_never_deleted_on_rename_failure() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new("locked-dest");
+        let path = dir.path().join("device.seed");
+        let old = DeviceKeyPair::generate();
+        old.save(&path).unwrap();
+        let old_seed = fs::read(&path).unwrap();
+
+        // Hold the destination with no sharing at all: renames onto it fail,
+        // and the fix under test must leave the old file byte-identical
+        // instead of deleting it to force the rename through.
+        let mut guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(DeviceKeyPair::generate().save(&path).is_err());
+        let mut current = Vec::new();
+        guard.read_to_end(&mut current).unwrap();
+        assert_eq!(current, old_seed);
+        drop(guard);
+        assert_eq!(fs::read(&path).unwrap(), old_seed);
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["device.seed".to_owned()]);
+    }
+
+    #[test]
+    fn load_or_create_failure_leaves_no_files_behind() {
+        let dir = TempDir::new("unwritable");
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, b"not a directory").unwrap();
+        // The parent of the target is a regular file, so no temp file can be
+        // created next to the target.
+        let target = blocker.join("device.seed");
+        assert!(DeviceKeyPair::load_or_create(&target).is_err());
+        assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["blocker".to_owned()]);
     }
 
     #[test]
@@ -1198,26 +1854,72 @@ mod tests {
         let (fp1, rec1) = peer("desk\ttop\nlaptop", 1_700_000_000_000);
         let (fp2, rec2) = peer("Ünïcode 设备", 42);
         let (fp3, rec3) = peer("", 0);
+        let (fp4, rec4) = peer("esc\x1bhere\u{7f}del\u{85}csi\u{9f}end", 7);
 
         let mut book = PeerBook::default();
         book.upsert(rec1);
         book.upsert(rec2);
         book.upsert(rec3);
+        book.upsert(rec4);
         book.save(&path).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("AKPEERS1\n"));
-        assert_eq!(text.lines().count(), 4);
+        assert_eq!(text.lines().count(), 5);
         assert!(text.contains('\t'));
 
         let loaded = PeerBook::load(&path).unwrap();
-        assert_eq!(loaded.iter().count(), 3);
+        assert_eq!(loaded.iter().count(), 4);
         assert_eq!(
             loaded.get(&fp1).map(|r| r.name.as_str()),
             Some("desk top laptop")
         );
         assert_eq!(loaded.get(&fp2).map(|r| r.paired_unix_ms), Some(42));
         assert_eq!(loaded.get(&fp3).map(|r| r.name.as_str()), Some(""));
+        // Every Cc character (C0 ESC, DEL, C1) folded to a space on save, so
+        // our own files always satisfy the load-side contract.
+        assert_eq!(
+            loaded.get(&fp4).map(|r| r.name.as_str()),
+            Some("esc here del csi end")
+        );
+    }
+
+    #[test]
+    fn peerbook_load_rejects_control_character_names() {
+        let dir = TempDir::new("peerbook-control");
+        let fp_hex = DeviceKeyPair::generate().fingerprint().to_hex();
+        // Distinctive sentinel fragments: if one ever shows up in an error
+        // message, the name field is leaking into errors.
+        let cases: Vec<(&str, String)> = vec![
+            ("esc", "esc-\x1b-sentinel".to_owned()),
+            ("del", "del-\u{7f}-sentinel".to_owned()),
+            ("c1-csi", "csi-\u{9b}-sentinel".to_owned()),
+            ("c1-ndx", "ndx-\u{85}-sentinel".to_owned()),
+            ("nul", "nul-\0-sentinel".to_owned()),
+        ];
+        for (label, name) in cases {
+            let path = dir.path().join(format!("case-{label}.txt"));
+            fs::write(&path, format!("AKPEERS1\n{fp_hex}\t{name}\t1\n")).unwrap();
+            let err = PeerBook::load(&path).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "case {label}: {err}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("line") && message.contains("control"),
+                "case {label}: {message}"
+            );
+            assert!(
+                !message.contains("sentinel") && !message.contains(&name),
+                "case {label} leaks field content: {message}"
+            );
+            assert!(
+                !message.contains(&fp_hex),
+                "case {label} leaks fingerprint: {message}"
+            );
+        }
     }
 
     #[test]

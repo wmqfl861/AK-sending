@@ -39,9 +39,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ak_core::handle::ConflictPolicy;
+use ak_core::handle::SaveTarget;
 use ak_engine::{
-    receive_with_addr, send, serve_concurrently, EngineError, Progress, ReceiveSpec, Report,
-    SendSpec,
+    job_id_for, receive_with_addr, send, serve_concurrently, EngineError, Progress, ReceiveSpec,
+    Report, SendSpec,
 };
 use ak_identity::tls::make_self_signed;
 use ak_identity::{
@@ -353,10 +354,19 @@ async fn resume_after_receiver_kill_via_deterministic_job() {
     let send_store = FileCheckpointStore::open(send_ckpt.path()).unwrap();
     let records = send_store.list().unwrap();
     assert_eq!(records.len(), 1, "exactly one send-job checkpoint survives");
-    let job_id = records[0].job_id;
+    // Since wave 17 the checkpoint key is the per-instance record id
+    // (content id + peer + direction + root); the deterministic content id
+    // is re-derived from the unchanged source for the resume assertions.
+    let record_id = records[0].job_id;
+    let probe = ak_storage::LocalSource::open(&src, retry_spec.chunk_size).unwrap();
+    let job_id = job_id_for(
+        &probe.root_name(),
+        <ak_storage::LocalSource as ak_core::handle::SourceHandle>::manifest(&probe),
+    );
     eprintln!(
-        "[e2e act2] job {} receiver killed after {KILL_AFTER_EVENTS} chunk events; part {part_len} bytes survives",
-        job_hex(&job_id)
+        "[e2e act2] job {} (record {}) receiver killed after {KILL_AFTER_EVENTS} chunk events; part {part_len} bytes survives",
+        job_hex(&job_id),
+        job_hex(&record_id)
     );
 
     // Leg 2: same identities, same destination, SAME receiver checkpoint
@@ -422,7 +432,17 @@ async fn resume_after_receiver_kill_via_deterministic_job() {
         "one receive record in the reused receiver checkpoint dir"
     );
     let record = &recv_records[0];
-    assert_eq!(record.job_id, job_id);
+    // Wave 17: the checkpoint key is the per-instance record id binding
+    // (content id + peer + direction + canonical root), not the wire id.
+    let recv_record_id = ak_engine::record_id_for(
+        &job_id,
+        &b_key.fingerprint(),
+        Direction::Receive,
+        ak_storage::LocalSaveTarget::open(dst.path())
+            .expect("reopen destination for canonical root")
+            .root(),
+    );
+    assert_eq!(record.job_id, recv_record_id);
     assert_eq!(record.direction, Direction::Receive);
     assert_eq!(
         record.state, "completed",

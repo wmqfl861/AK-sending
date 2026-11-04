@@ -117,11 +117,17 @@ async fn port_change_reconnect_rechecks_path_and_resumes_the_same_job() {
     );
     assert!(part_path.exists(), "part file survives the disconnect");
 
-    // The task identity leg 1 recorded (deterministic from the source tree).
+    // The task identity leg 1 recorded. Since wave 17 the checkpoint key is
+    // the per-instance record id; the wire identity is re-derived from the
+    // unchanged source (still deterministic) for the resume assertions.
     let store = FileCheckpointStore::open(send_ckpt.path()).unwrap();
     let records = store.list().unwrap();
     assert_eq!(records.len(), 1, "exactly one send-job record after leg 1");
-    let job_id = records[0].job_id;
+    let probe = ak_storage::LocalSource::open(&src, retry_spec.chunk_size).unwrap();
+    let job_id = ak_engine::job_id_for(
+        &probe.root_name(),
+        <ak_storage::LocalSource as ak_core::handle::SourceHandle>::manifest(&probe),
+    );
 
     // ---- Stale address: the old port is dead; refuse, do not fall back -----
     // Honest scope note: on loopback a dead UDP port answers nothing, so the
@@ -211,11 +217,19 @@ async fn port_change_reconnect_rechecks_path_and_resumes_the_same_job() {
     assert!(!part_path.exists(), "commit renames the part file away");
 
     // The one job record now reads completed — strictly after verification.
+    // Wave 17: the key is the per-instance record id (content + peer +
+    // direction + root), re-derived here.
     let final_records = FileCheckpointStore::open(send_ckpt.path())
         .unwrap()
         .list()
         .unwrap();
     assert_eq!(final_records.len(), 1);
-    assert_eq!(final_records[0].job_id, job_id);
+    let send_record_id = ak_engine::record_id_for(
+        &job_id,
+        &receiver_key.fingerprint(),
+        ak_store::Direction::Send,
+        &src,
+    );
+    assert_eq!(final_records[0].job_id, send_record_id);
     assert_eq!(final_records[0].state, "completed");
 }

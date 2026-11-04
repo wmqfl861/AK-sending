@@ -117,7 +117,13 @@ async fn multistream_disconnect_keeps_parts_and_resumes_to_identical_bytes() {
     let store = FileCheckpointStore::open(send_ckpt.path()).unwrap();
     let records = store.list().unwrap();
     assert_eq!(records.len(), 1, "one send-job checkpoint must survive");
-    let job_id = records[0].job_id;
+    // Wave 17: the record key is the per-instance record id; the wire job id
+    // is re-derived from the unchanged source for the identity assertions.
+    let probe = ak_storage::LocalSource::open(&src, leg2_spec.chunk_size).unwrap();
+    let job_id = ak_engine::job_id_for(
+        &probe.root_name(),
+        <ak_storage::LocalSource as ak_core::handle::SourceHandle>::manifest(&probe),
+    );
 
     // Leg 2: same device identities, fresh port, same destination => resume.
     let recv2_ckpt = tempfile::tempdir().unwrap();

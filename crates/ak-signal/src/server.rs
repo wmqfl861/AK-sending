@@ -2,14 +2,17 @@
 //!
 //! Limits (independent of any file quota): per-connection message rate,
 //! bounded candidates, bounded sessions per device, session TTL, Hello
-//! freshness. The server verifies Hello signatures but trusts nothing else;
-//! it never sees file names, manifests, or bytes.
+//! freshness, and a Hello replay window (an exact re-send of an already
+//! accepted signed Hello inside the freshness window is rejected as a
+//! suspected replay — see [`HelloReplayCache`]). The server verifies Hello
+//! signatures but trusts nothing else; it never sees file names, manifests,
+//! or bytes.
 //!
 //! There is intentionally no upload/download/forward route. A test locks the
 //! closed message set so no blob route can appear silently.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -34,11 +37,111 @@ pub const ERR_BAD_REQUEST: u16 = 4;
 /// Signal/Cancel named an unknown or expired session.
 pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 
+/// Capacity of the Hello replay window (accepted-signature digests kept).
+/// Bounded memory: 256 entries x (32-byte digest + Instant) is a few KiB.
+pub const HELLO_REPLAY_CAPACITY: usize = 256;
+
+/// 256-bit digest of (device_id || signature) for the Hello replay cache.
+///
+/// Non-cryptographic (no hash crate is a dependency of this crate's
+/// coordination plane; ak-identity's blake3 use is not re-exported): four
+/// independently seeded splitmix64 lanes over all 96 input bytes, each lane
+/// finishing with its avalanche fold. The only failure modes are (a) an
+/// accidental 256-bit collision — negligible at this cache's scale — causing
+/// a false replay rejection of a legitimately distinct Hello, or (b) an
+/// attacker crafting two distinct valid signatures for the same device that
+/// collide, which first requires breaking Ed25519 uniqueness. Rejected
+/// replays disconnect and may reconnect with a fresh timestamp, so even a
+/// pathological false positive is self-healing on the next attempt.
+fn hello_digest(device_id: &DeviceId, signature: &[u8; 64]) -> [u8; 32] {
+    let mut lanes = [
+        0x243F_6A88_85A3_08D3u64,
+        0x1319_8A2E_0370_7344u64,
+        0xA409_3822_299F_31D0u64,
+        0x082E_FA98_EC4E_6C89u64,
+    ];
+    let absorb = |lanes: &mut [u64; 4], chunk: u64, index: usize| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            *lane = lane
+                .wrapping_add(chunk.rotate_left(((index * 8 + i * 3) % 64) as u32))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15 ^ ((i as u64) << 32));
+        }
+    };
+    let mut input = [0u8; 96];
+    input[..32].copy_from_slice(device_id);
+    input[32..].copy_from_slice(signature);
+    let mut chunks = [0u64; 12];
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        *chunk = u64::from_le_bytes(input[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
+        absorb(&mut lanes, *chunk, index);
+    }
+    let mut out = [0u8; 32];
+    for (i, lane) in lanes.iter().enumerate() {
+        let mut z = *lane;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out[i * 8..i * 8 + 8].copy_from_slice(&z.to_le_bytes());
+    }
+    out
+}
+
+/// Sliding-window memory of accepted Hello signature digests (server-wide,
+/// shared across TCP connections — replays arrive on fresh connections).
+///
+/// Semantics: after a Hello passes signature verification and freshness, its
+/// `(device_id, signature)` digest is looked up among digests admitted within
+/// `hello_max_age`; a hit means the exact signed bytes were already accepted
+/// inside the freshness window and the new copy is a suspected replay. The
+/// connection is refused (ServerError mentioning the replay suspicion, then
+/// disconnect) — an attacker who captured a valid Hello cannot use it to
+/// hijack the device's registration, while a legitimate client reconnects
+/// with a fresh timestamp (a different signature) and passes.
+///
+/// Bounded: at most [`HELLO_REPLAY_CAPACITY`] digests; entries older than the
+/// window are dropped on every admission (and stale replays are already
+/// rejected by the freshness gate, which uses the same window, so expiry
+/// never weakens the check).
+#[derive(Debug, Default)]
+struct HelloReplayCache {
+    seen: VecDeque<([u8; 32], Instant)>,
+}
+
+impl HelloReplayCache {
+    /// Record `digest` seen at `now`. Returns `false` when the same digest
+    /// was already admitted within `window` (replay suspected); returns
+    /// `true` after recording it. `now` is a parameter so tests can exercise
+    /// window expiry without sleeping.
+    fn admit(&mut self, digest: [u8; 32], now: Instant, window: Duration) -> bool {
+        while let Some((_, at)) = self.seen.front() {
+            if now.duration_since(*at) > window {
+                self.seen.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.seen.iter().any(|(seen, _)| *seen == digest) {
+            return false;
+        }
+        if self.seen.len() >= HELLO_REPLAY_CAPACITY {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((digest, now));
+        true
+    }
+}
+
 /// Server limits; every field is a coordination-plane resource cap.
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub session_ttl: Duration,
     pub max_sessions_per_device: usize,
+    /// Hello freshness window; doubles as the Hello replay window — an
+    /// accepted Hello signature digest is remembered for this long, and a
+    /// byte-identical Hello inside the window is rejected as a suspected
+    /// replay (see [`HelloReplayCache`]).
     pub hello_max_age: Duration,
     /// Steady-state frames per second per connection.
     pub frame_rate_per_sec: u32,
@@ -191,6 +294,8 @@ struct Inner {
     devices: HashMap<DeviceId, DeviceEntry>,
     sessions: HashMap<SessionId, SessionEntry>,
     next_conn_id: u64,
+    /// Server-wide Hello replay window (see [`HelloReplayCache`]).
+    hello_replay: HelloReplayCache,
 }
 
 struct Shared {
@@ -430,12 +535,13 @@ async fn process(
     message: CtrlMessage,
 ) -> Flow {
     if state.device.is_none() {
-        let (device_id, timestamp) = match &message {
+        let (device_id, timestamp, signature) = match &message {
             CtrlMessage::Hello {
                 device_id,
                 timestamp_unix_ms,
+                signature,
                 ..
-            } => (*device_id, *timestamp_unix_ms),
+            } => (*device_id, *timestamp_unix_ms, *signature),
             _ => {
                 log::debug!("connection must start with Hello");
                 return Flow::Disconnect;
@@ -456,25 +562,53 @@ async fn process(
             );
             return Flow::Disconnect;
         }
+        // Replay gate: the signature is valid, but if the exact signed bytes
+        // were already accepted inside the freshness window, this copy is a
+        // replay of a captured Hello, not the key holder reconnecting.
+        let digest = hello_digest(&device_id, &signature);
         let conn_id = {
             let mut inner = shared.lock();
-            inner.next_conn_id = inner.next_conn_id.wrapping_add(1);
-            let conn_id = inner.next_conn_id;
-            if let Some(previous) = inner.devices.get(&device_id) {
-                // Same device reconnected: retire the old connection.
-                previous.close.notify_one();
+            if !inner
+                .hello_replay
+                .admit(digest, Instant::now(), shared.limits.hello_max_age)
+            {
+                None
+            } else {
+                inner.next_conn_id = inner.next_conn_id.wrapping_add(1);
+                let conn_id = inner.next_conn_id;
+                if let Some(previous) = inner.devices.get(&device_id) {
+                    // Same device reconnected: retire the old connection.
+                    previous.close.notify_one();
+                }
+                inner.devices.insert(
+                    device_id,
+                    DeviceEntry {
+                        conn_id,
+                        out: out.clone(),
+                        close: state.close.clone(),
+                        candidates: Vec::new(),
+                        peer_ip: state.peer_ip,
+                    },
+                );
+                Some(conn_id)
             }
-            inner.devices.insert(
-                device_id,
-                DeviceEntry {
-                    conn_id,
-                    out: out.clone(),
-                    close: state.close.clone(),
-                    candidates: Vec::new(),
-                    peer_ip: state.peer_ip,
-                },
+        };
+        let Some(conn_id) = conn_id else {
+            log::warn!(
+                "hello from {} rejected: replay suspected (signature already seen in window)",
+                util::hex_prefix(&device_id, 4)
             );
-            conn_id
+            deliver(
+                out,
+                CtrlMessage::ServerError {
+                    code: ERR_BAD_REQUEST,
+                    message:
+                        "replay suspected: hello signature already accepted in the freshness window"
+                            .to_string(),
+                },
+            )
+            .await;
+            return Flow::Disconnect;
         };
         state.device = Some(device_id);
         state.conn_id = conn_id;
@@ -1171,6 +1305,163 @@ mod tests {
             .unwrap();
         drop(second);
         server.stop().await.unwrap();
+    }
+
+    // ---- Hello replay window (signaling security hardening) ----
+
+    /// Read one length-prefixed frame from a raw TCP stream (None on close).
+    async fn read_one_frame(stream: &mut TcpStream) -> Option<CtrlFrame> {
+        let mut header = [0u8; codec::HEADER_LEN];
+        stream.read_exact(&mut header).await.ok()?;
+        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let mut frame = header.to_vec();
+        frame.resize(codec::HEADER_LEN + len, 0);
+        stream
+            .read_exact(&mut frame[codec::HEADER_LEN..])
+            .await
+            .ok()?;
+        CtrlFrame::decode(&frame).ok()
+    }
+
+    /// A properly signed Hello resent byte-for-byte on a second connection
+    /// is rejected as a suspected replay: the attacker sees an error naming
+    /// the replay and a disconnect, and never takes over the registration.
+    /// The same device reconnecting with a fresh signature still passes.
+    #[tokio::test]
+    async fn replayed_hello_signature_is_rejected() {
+        let server = test_support::start(Limits::default()).await;
+        let key = client_support::key(21);
+        let device_id = client_support::device(&key);
+        // fresh_now_unix_ms guarantees the later client_support::connect for
+        // the same key gets a strictly later timestamp (a distinct signature).
+        let timestamp = util::fresh_now_unix_ms();
+        let signature = key
+            .sign(&codec::hello_signing_bytes(
+                1, &device_id, "replay", timestamp,
+            ))
+            .to_bytes();
+        let mut replayed_bytes = Vec::new();
+        CtrlFrame {
+            version: codec::VERSION,
+            message: CtrlMessage::Hello {
+                version: 1,
+                device_id,
+                name: "replay".to_string(),
+                timestamp_unix_ms: timestamp,
+                signature,
+            },
+        }
+        .encode(&mut replayed_bytes);
+
+        // Legitimate first use: Welcome.
+        let mut first = TcpStream::connect(server.tcp).await.unwrap();
+        first.write_all(&replayed_bytes).await.unwrap();
+        match read_one_frame(&mut first).await {
+            Some(frame) => assert!(matches!(frame.message, CtrlMessage::Welcome { .. })),
+            None => panic!("expected Welcome on the first connection"),
+        }
+
+        // Byte-identical replay on a fresh connection: ServerError naming the
+        // replay suspicion, then the connection is cut.
+        let mut second = TcpStream::connect(server.tcp).await.unwrap();
+        second.write_all(&replayed_bytes).await.unwrap();
+        match read_one_frame(&mut second).await {
+            Some(frame) => match frame.message {
+                CtrlMessage::ServerError { code, message } => {
+                    assert_eq!(code, ERR_BAD_REQUEST);
+                    assert!(
+                        message.to_ascii_lowercase().contains("replay"),
+                        "error must name the replay suspicion: {message}"
+                    );
+                }
+                other => panic!("expected ServerError, got {other:?}"),
+            },
+            None => panic!("expected ServerError before the close"),
+        }
+        let mut byte = [0u8; 1];
+        match second.read(&mut byte).await {
+            Ok(0) | Err(_) => {}
+            Ok(_) => panic!("expected the server to close after the replay rejection"),
+        }
+
+        // The same device with a fresh timestamp (new signature) still gets
+        // in — and legitimately replaces its own registration.
+        let fresh = client_support::connect(server.tcp, &key, "replay").await;
+        fresh
+            .register(&["10.9.9.9:7001".parse().unwrap()])
+            .await
+            .unwrap();
+        server.stop().await.unwrap();
+    }
+
+    /// Cache semantics as a pure function: in-window duplicates are replays,
+    /// distinct digests pass, expired entries stop matching, and the memory
+    /// stays bounded at [`HELLO_REPLAY_CAPACITY`] (the evicted oldest digest
+    /// is admitted again rather than falsely flagged).
+    #[test]
+    fn hello_replay_cache_window_and_capacity() {
+        let mut cache = HelloReplayCache::default();
+        let window = Duration::from_secs(10);
+        let t0 = Instant::now();
+        assert!(cache.admit([1; 32], t0, window));
+        assert!(
+            !cache.admit([1; 32], t0 + Duration::from_secs(5), window),
+            "same digest inside the window is a replay"
+        );
+        assert!(
+            cache.admit([2; 32], t0 + Duration::from_secs(5), window),
+            "a distinct digest passes"
+        );
+        assert!(
+            cache.admit([1; 32], t0 + Duration::from_secs(11), window),
+            "the expired entry no longer matches"
+        );
+        // The t0 entry was purged as expired before the re-admit, leaving
+        // the t0+5s entry and the freshly recorded one.
+        assert_eq!(cache.seen.len(), 2);
+
+        // Capacity bound: 256 distinct digests, then one more evicts the
+        // oldest instead of growing.
+        let mut bounded = HelloReplayCache::default();
+        for i in 0..HELLO_REPLAY_CAPACITY {
+            assert!(bounded.admit([i as u8; 32], t0, window));
+        }
+        assert_eq!(bounded.seen.len(), HELLO_REPLAY_CAPACITY);
+        // A non-uniform digest distinct from every uniform pattern above.
+        let mut distinct = [0u8; 32];
+        for (j, byte) in distinct.iter_mut().enumerate() {
+            *byte = j as u8;
+        }
+        assert!(bounded.admit(distinct, t0, window));
+        assert_eq!(
+            bounded.seen.len(),
+            HELLO_REPLAY_CAPACITY,
+            "capacity must not grow beyond the bound"
+        );
+        // The evicted oldest (i = 0) is admitted again — a cache miss, not a
+        // false replay — and only then becomes an in-window duplicate.
+        assert!(bounded.admit([0; 32], t0, window));
+        assert!(!bounded.admit([0; 32], t0, window));
+    }
+
+    /// The replay digest is deterministic, mixes both inputs, and does not
+    /// systematically collide across realistic signature variation.
+    #[test]
+    fn hello_digest_is_deterministic_and_input_sensitive() {
+        let sig = [5u8; 64];
+        let a = hello_digest(&[1; 32], &sig);
+        assert_eq!(a, hello_digest(&[1; 32], &sig), "deterministic");
+        assert_ne!(a, hello_digest(&[2; 32], &sig), "device_id is mixed in");
+        assert_ne!(a, hello_digest(&[1; 32], &[6; 64]), "signature is mixed in");
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1000u64 {
+            let mut sig = [0u8; 64];
+            sig[..8].copy_from_slice(&i.to_le_bytes());
+            assert!(
+                seen.insert(hello_digest(&[1; 32], &sig)),
+                "collision at {i}"
+            );
+        }
     }
 
     // ---- SameEgress hint (review 4.1) ----

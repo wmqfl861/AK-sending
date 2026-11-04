@@ -64,25 +64,36 @@ async fn same_source_chain_changes_job_id_with_content_and_restores_it() {
         "content identity must change when the tree changes"
     );
 
-    // v1 semantics, asserted honestly: a new job is a full re-transfer of the
-    // new tree, not an incremental update (no part files survived run 1).
+    // Wave-17 semantics, asserted honestly: a new job re-transfers only the
+    // files whose content actually changed. The two untouched files
+    // (keep.bin, nested/data.bin) are recognized by the committed-final fast
+    // path (byte-identical finals from run 1) and skipped; the mutated
+    // alpha.txt and the new new.bin are sent fresh.
     assert_eq!(
-        run2.send.resumed_chunks, 0,
-        "new job must be a full re-transfer"
+        run2.send.resumed_chunks, 2,
+        "only the two byte-identical files resume via committed finals"
     );
-    assert_eq!(run2.recv.resumed_chunks, 0);
+    assert_eq!(run2.recv.resumed_chunks, 2);
 
     // Old files untouched (run-1 bytes stay exactly as they were).
     assert_eq!(common::read_file(dst1.path(), "alpha.txt"), ALPHA_V1);
     assert_eq!(common::read_file(dst1.path(), "keep.bin"), KEEP);
     assert_eq!(common::read_file(dst1.path(), "gone.bin"), GONE);
     assert_eq!(common::read_file(dst1.path(), "nested/data.bin"), DATA);
-    // New tree fully on disk: mutated content lands renamed, additions land
-    // at their exact paths.
+    // New tree fully on disk: the mutated file lands renamed (true content
+    // conflict), the addition lands at its exact path, and the byte-identical
+    // unchanged files keep their single run-1 copies (wave-17 fast path — no
+    // "(2)" duplicates of unchanged content).
     assert_eq!(common::read_file(dst1.path(), "alpha (2).txt"), ALPHA_V2);
     assert_eq!(common::read_file(dst1.path(), "new.bin"), NEW);
-    assert_eq!(common::read_file(dst1.path(), "keep (2).bin"), KEEP);
-    assert_eq!(common::read_file(dst1.path(), "nested/data (2).bin"), DATA);
+    assert!(
+        !dst1.path().join("keep (2).bin").exists(),
+        "identical keep.bin keeps one copy"
+    );
+    assert!(
+        !dst1.path().join("nested/data (2).bin").exists(),
+        "identical data.bin keeps one copy"
+    );
     common::assert_no_part_files(dst1.path());
 
     // Completeness: every file of the mutated source has a byte-identical

@@ -29,18 +29,18 @@ flowchart TD
 
 ## 模块和边界
 
-| 模块 | 输入/输出 | 限制 | 现状（2026-11-03） |
+| 模块 | 输入/输出 | 限制 | 现状（2026-11-04） |
 |---|---|---|---|
 | DeviceIdentity | 本机密钥、安全配对、对端指纹 | 私钥不出设备；不信任服务器替换公钥 | 已实现＋测试（`ak-identity`：Ed25519 密钥、BLAKE3 指纹、配对码、PeerBook、自签证书与钉扎验证；私钥暂为用户目录种子文件，未接系统安全存储） |
 | DiscoveryService | 本地服务广播、已知地址候选 | 发现不等于授权；不广播用户文件资料 | 已实现＋测试（`ak-discovery`：手工地址、mDNS、信令候选与本地优先排序；mDNS 为尽力而为） |
 | SignalingService | 有界结构化连接消息 | 无文件正文/清单/哈希/通用 blob | 已实现＋测试（`ak-signal`：TCP 信令服务器/客户端＋内置 STUN；封闭消息集与限频、对抗加固（TCP 帧模糊/STUN 洪泛/限频旁路实测存活）与控制字符注入防护（codec 拒绝 C0/DEL/C1）由测试锁定） |
 | NatTraversalService | 映射发现、候选检查、打洞协调 | 不使用 TURN/relay | 部分（`ak-signal::stun` STUN 映射查询与 `ak-net` 同 socket UDP 打洞已实现并在环回＋本机网卡验证；双栈端点 `bind_dual_stack`、v4-mapped `classify` 展开、`holepunch::bind_dual_stack_udp` 打洞 socket 本机实测可用——含 socket2 `only_v6` Windows 缺陷规避与间歇 `WSAENETUNREACH` 如实记录；真实 NAT/跨网未测，端口映射未启用） |
-| DirectConnectionManager | 已验证实际连接→直连句柄 | 未知路径/代理/relay/身份不符关闭 | 已实现＋测试（`ak-net`：DirectEndpoint/DirectChannel、指纹钉扎、路径分类启发式；并发接收 `ak-engine::serve_concurrently`——一次 bind、每连接独立任务/检查点，失败任务不拖垮他者） |
+| DirectConnectionManager | 已验证实际连接→直连句柄 | 未知路径/代理/relay/身份不符关闭 | 已实现＋测试（`ak-net`：DirectEndpoint/DirectChannel、指纹钉扎、路径分类启发式；并发接收 `ak-engine::serve_concurrently`——一次 bind、每连接独立任务/检查点，失败任务不拖垮他者；QUIC active migration 禁用为第十七波 F5 修复项、落地中——落地前存活连接路径变化不重触发准入，见"服务故障"节 INV-004 现状） |
 | FileTransferEngine | 直连句柄、SourceHandle、SaveTarget | 没有服务器上传客户端；有界缓冲 | 已实现＋测试（`ak-engine`：环回集成测试＋5 GiB 稀疏文件 release 测试；带内 Pause/Resume 与空闲超时已于第二轮实现（能力协商），多根/存储满预检/策略闸门第三至五轮补齐；单次 receive 一个任务、并发接收见 `serve_concurrently`） |
 | FileStorageEngine | 本地授权读写、验证、提交 | 目录越界防护和权限失效处理 | 已实现＋测试（`ak-storage`：扫描、路径越界与符号链接防护、`.akpart` 原子提交、断点续传；长文件名 part 回退命名 `.akpart-<hash16>`——249 字节边界实测缺陷修复，续传兼容，孤儿清理识别两种 part 形态） |
 | TaskStore | SQLite 任务和检查点 | 完成标记必须晚于最终校验/保存 | 已实现＋测试（`ak-store`：file 与 sqlite 双后端——行式文件检查点＋`SqliteCheckpointStore`（可选特性 `sqlite`，rusqlite bundled，默认依赖图零泄漏；事务原子性、双连接 WAL 并发、与文件后端语义等价）；`migrate_file_to_sqlite` 迁移工具：好记录迁移、损坏文件跳过计数） |
 | PlatformLifecycle | 原生后台/通知/权限 | 不假设 UI 生命周期即传输生命周期 | 未开始（无平台适配层） |
-| UI | 命令和进度事件 | 不反复跨语言复制整个文件 | 未开始（`ak-cli` 命令行原型已实现：keygen/fingerprint/send/receive/discover/signal-server/probe，非 UI） |
+| UI | 命令和进度事件 | 不反复跨语言复制整个文件 | 部分（`ak-cli` 命令行原型：keygen/fingerprint/send/receive/discover/signal-server/probe；Flutter Windows GUI 已发布——`flutter_app` 五页 UI＋`packages/ak_ffi_dart` 绑定＋真实窗口 integration test；Android 壳 APK 已装实测，移动端后台生命周期适配未开始） |
 
 ## 接口约定（2026-11-03：下列接口均已实现并有测试）
 
@@ -61,3 +61,4 @@ flowchart TD
 既有稳定直连可继续，控制服务器不充当逐块授权点。新公网连接可能因协调不可用而失败。
 局域网模式离线完成发现/配对；已有授权与凭据不会因账号服务暂不可用被无故清空。
 路径发生变化先停正文，再重新认证/验证；不依靠“曾经是直连”永久放行新路径。
+INV-004 现状（2026-11-04）：重连场景（断线→新连接重建钉扎＋策略闸门）已实现并测试（t08）；存活连接的路径迁移（QUIC active migration/网络切换）尚不重触发准入——第十七波 F5 正在禁用 active migration（修复进行中），迁移重授权机制为后续项。

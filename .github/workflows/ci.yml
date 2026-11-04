@@ -59,18 +59,21 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # cargo test/clippy/doc/check run --locked: manifest/Cargo.lock drift
+      # fails the build instead of CI silently re-resolving dependencies
+      # (cargo fmt resolves no dependencies and takes no --locked).
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Tests (ak-store sqlite backend, bundled C SQLite)
-        run: cargo test -p ak-store --features sqlite
+        run: cargo test --locked -p ak-store --features sqlite
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
 
   # Manual deep test: the release-only #[ignore] suite. Wall time is on the
   # order of minutes (the unit suite is seconds): ak-engine 5 GiB sparse
@@ -88,9 +91,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: ak-engine ignored tests (5 GiB sparse transfer)
-        run: cargo test --release -p ak-engine -- --ignored --nocapture
+        run: cargo test --locked --release -p ak-engine -- --ignored --nocapture
       - name: ak-itests ignored tests (20k files + benches)
-        run: cargo test --release -p ak-itests -- --ignored --nocapture
+        run: cargo test --locked --release -p ak-itests -- --ignored --nocapture
 
   # Cross-target portability matrix: cargo check of the pure-Rust core
   # against non-host triples, mirroring scripts/check_targets.sh (本地脚本
@@ -127,6 +130,6 @@ jobs:
           key: portability-${{ matrix.target }}
       - name: cargo check core matrix packages
         run: >-
-          cargo check -p ak-core -p ak-wire -p ak-identity -p ak-storage
+          cargo check --locked -p ak-core -p ak-wire -p ak-identity -p ak-storage
           -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-cli
           -p ak-ffi --target ${{ matrix.target }}

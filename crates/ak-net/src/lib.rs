@@ -40,6 +40,29 @@
 //!   [`DirectEndpoint::local_addr_display`] for addresses that can actually
 //!   be advertised to peers.
 //!
+//! # Connection migration policy (INV-004)
+//!
+//! QUIC active migration is **disabled** on every endpoint this crate builds:
+//! server configs are created with `migration(false)` (quinn 0.11.12 /
+//! quinn-proto 0.11.19 API — the older `TransportConfig::disable_active_migration`
+//! field was replaced by `ServerConfig::migration`; see the `tls` module
+//! docs), which advertises the RFC 9000 `disable_active_migration` transport
+//! parameter in the handshake and makes the transport discard
+//! migration-initiating datagrams from unrecognized remote addresses. A
+//! compliant peer therefore never rebinds an established connection, and a
+//! non-compliant peer's migration attempt is dropped by the transport.
+//!
+//! Defense in depth: [`DirectChannel`] snapshots the peer address at
+//! handshake completion ([`DirectChannel::established_remote`]) and
+//! [`DirectChannel::path_changed`] / [`DirectChannel::ensure_path_stable`]
+//! compare it with the transport's current `remote_address()` at every
+//! stream-open point, closing the connection (QUIC code 9) if it ever
+//! differs. Until the engine grows a per-path re-authorization mechanism,
+//! the policy is: **a changed path is closed, never silently used**. NAT
+//! rebinding survival is intentionally traded away for this; peers recover
+//! by reconnecting (new handshake, new `authorize`/pin gate), which the
+//! engine's reconnect/recheck path already exercises.
+//!
 //! # Known limitations
 //!
 //! - [`ChannelStats`] byte counts are the QUIC bytes carried inside UDP
@@ -254,6 +277,7 @@ pub struct DirectEndpoint {
     identity: ak_identity::tls::TlsBundle,
     nets: Vec<classify::Net>,
     dual_stack: bool,
+    migration_disabled: bool,
 }
 
 impl DirectEndpoint {
@@ -376,6 +400,7 @@ impl DirectEndpoint {
             identity: identity.clone(),
             nets,
             dual_stack,
+            migration_disabled: tls::MIGRATION_DISABLED,
         })
     }
 
@@ -393,6 +418,23 @@ impl DirectEndpoint {
     /// for why `IPV6_V6ONLY` is not queried).
     pub fn is_dual_stack(&self) -> bool {
         self.dual_stack
+    }
+
+    /// True when this endpoint's QUIC transport rejects active connection
+    /// migration (INV-004 policy; read-only getter for engine/UI wiring).
+    ///
+    /// The flag is fixed at bind time from `tls::MIGRATION_DISABLED`: every
+    /// server config built here disables migration at the transport-parameter
+    /// level (the endpoint advertises `disable_active_migration` and quinn
+    /// discards migration-initiating datagrams), and there is no client-side
+    /// knob in quinn 0.11.12 — see the `tls` module docs for the exact
+    /// registry-source API mapping. Until a path re-authorization mechanism
+    /// lands in the engine, the engine's migration policy is "disabled":
+    /// a migrated path is closed, never silently used. Defense in depth for
+    /// connections that somehow rebind anyway:
+    /// [`DirectChannel::ensure_path_stable`].
+    pub fn active_migration_disabled(&self) -> bool {
+        self.migration_disabled
     }
 
     /// Addresses this endpoint can advertise to peers on every local
@@ -463,10 +505,12 @@ impl DirectEndpoint {
                 "post-handshake fingerprint mismatch".into(),
             ));
         }
+        let established_remote = conn.remote_address();
         Ok(DirectChannel {
             conn,
             fingerprint,
             path: classify::classify(peer.ip(), &self.nets),
+            established_remote,
         })
     }
 
@@ -490,11 +534,13 @@ impl DirectEndpoint {
             conn.close(varint(1), b"unauthorized");
             return Err(ConnectError::Unauthorized);
         }
-        let path = classify::classify(conn.remote_address().ip(), &self.nets);
+        let remote = conn.remote_address();
+        let path = classify::classify(remote.ip(), &self.nets);
         Ok(DirectChannel {
             conn,
             fingerprint,
             path,
+            established_remote: remote,
         })
     }
 
@@ -622,6 +668,9 @@ pub struct DirectChannel {
     pub(crate) conn: quinn::Connection,
     pub(crate) fingerprint: Fingerprint,
     pub(crate) path: PathKind,
+    /// Peer address captured when the handshake completed; the reference
+    /// point for [`DirectChannel::path_changed`] (INV-004 defense in depth).
+    pub(crate) established_remote: SocketAddr,
 }
 
 impl DirectChannel {
@@ -635,8 +684,65 @@ impl DirectChannel {
         self.path
     }
 
+    /// The peer address captured when this channel's handshake completed.
+    /// Stable for the lifetime of the channel; compare with
+    /// [`Self::current_remote`] via [`Self::path_changed`].
+    pub fn established_remote(&self) -> SocketAddr {
+        self.established_remote
+    }
+
+    /// The peer address the transport currently reports. quinn keeps this
+    /// queryable even after the connection closed.
+    pub fn current_remote(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
+    /// True when the transport's current peer address differs from the
+    /// handshake-time address — i.e. the connection path changed underneath
+    /// an established, already-authorized channel (QUIC active migration or
+    /// NAT rebinding).
+    ///
+    /// INV-004 policy note: active migration is disabled at the transport
+    /// level on every endpoint this crate builds (see
+    /// [`DirectEndpoint::active_migration_disabled`]), so a `true` result is
+    /// not expected from a compliant transport stack; it is the defensive
+    /// tripwire for a future re-enabled-migration or transport-behavior
+    /// change. Until the engine grows a per-path re-authorization mechanism,
+    /// the policy is: a changed path is closed, never silently used — call
+    /// [`Self::ensure_path_stable`] (which closes the connection on change)
+    /// or treat `true` as a hard failure.
+    pub fn path_changed(&self) -> bool {
+        self.conn.remote_address() != self.established_remote
+    }
+
+    /// Fail closed unless the peer address still equals the handshake-time
+    /// address: on change, closes the underlying connection (QUIC code 9,
+    /// reason "path migrated") and returns
+    /// [`StreamError::Connection`] naming the migration, so no further
+    /// stream can be opened on a path the engine never re-authorized.
+    ///
+    /// `open_bi`/`accept_bi` run this check at every stream-operation point;
+    /// call it directly at other engine checkpoints (transfer start, resume,
+    /// long-lived loops) for the same defensive close.
+    pub fn ensure_path_stable(&self) -> Result<(), StreamError> {
+        if self.path_changed() {
+            self.conn
+                .close(varint(9), b"path migrated: active migration is disabled");
+            return Err(StreamError::Connection(format!(
+                "peer address migrated from {} to {} on an established channel; \
+                 closing (active migration disabled)",
+                self.established_remote,
+                self.conn.remote_address()
+            )));
+        }
+        Ok(())
+    }
+
     /// Open a new bidirectional stream (client side of a protocol exchange).
+    /// Rejects and defensively closes the connection if the peer address
+    /// changed since the handshake (INV-004; see [`Self::ensure_path_stable`]).
     pub async fn open_bi(&self) -> Result<DirectStream, StreamError> {
+        self.ensure_path_stable()?;
         let (send, recv) = self
             .conn
             .open_bi()
@@ -645,8 +751,11 @@ impl DirectChannel {
         Ok(DirectStream { send, recv })
     }
 
-    /// Accept a bidirectional stream the peer opened (server side).
+    /// Accept a bidirectional stream the peer opened (server side). Rejects
+    /// and defensively closes the connection if the peer address changed
+    /// since the handshake (INV-004; see [`Self::ensure_path_stable`]).
     pub async fn accept_bi(&self) -> Result<DirectStream, StreamError> {
+        self.ensure_path_stable()?;
         let (send, recv) = self
             .conn
             .accept_bi()
@@ -715,12 +824,15 @@ impl DirectStream {
         self.send_bytes(&bytes).await
     }
 
-    /// Read and decode one wire frame under `limits` (exactly one frame;
-    /// a declared payload beyond the budget is rejected before allocating).
+    /// Read and decode one wire frame under `limits` (exactly one frame).
+    /// Both the all-frame hard cap and the per-type payload budget are
+    /// checked on the header alone, so a declared payload beyond either is
+    /// rejected as `Oversized` before any payload buffer is allocated (and
+    /// without waiting for the payload bytes).
     pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
         let mut header = [0u8; ak_wire::HEADER_LEN];
         self.recv_exact(&mut header).await?;
-        let payload_len = payload_len_of(&header)?;
+        let payload_len = header_payload_check(&header, limits)?;
         let mut frame_bytes = header.to_vec();
         frame_bytes.resize(header.len() + payload_len, 0);
         self.recv_exact(&mut frame_bytes[header.len()..]).await?;
@@ -792,10 +904,14 @@ pub struct DirectRecvStream {
 
 impl DirectRecvStream {
     /// Read and decode one wire frame under `limits` on the receive half.
+    /// Both the all-frame hard cap and the per-type payload budget are
+    /// checked on the header alone, so a declared payload beyond either is
+    /// rejected as `Oversized` before any payload buffer is allocated (and
+    /// without waiting for the payload bytes).
     pub async fn recv_frame(&mut self, limits: &Limits) -> Result<Frame, StreamError> {
         let mut header = [0u8; ak_wire::HEADER_LEN];
         self.recv_exact(&mut header).await?;
-        let payload_len = payload_len_of(&header)?;
+        let payload_len = header_payload_check(&header, limits)?;
         let mut frame_bytes = header.to_vec();
         frame_bytes.resize(header.len() + payload_len, 0);
         self.recv_exact(&mut frame_bytes[header.len()..]).await?;
@@ -811,10 +927,24 @@ impl DirectRecvStream {
     }
 }
 
-/// Frozen layout: [version u8][type u16 BE][payload_len u32 BE]. The hard cap
-/// bounds every frame before any allocation (it is far below u32::MAX, so the
-/// cast is lossless).
-fn payload_len_of(header: &[u8; ak_wire::HEADER_LEN]) -> Result<usize, StreamError> {
+/// Frozen layout: [version u8][type u16 BE][payload_len u32 BE]. Both budget
+/// gates below run on the header alone — after reading the 7 header bytes and
+/// before the payload buffer is allocated:
+///
+/// 1. the all-frame hard cap (bounds every type, including unknown ones, far
+///    below `u32::MAX`), then
+/// 2. the per-type payload budget implied by `limits` ([`type_budget`]), so a
+///    small fixed-size type (Accept, Control, ...) can no longer trigger a
+///    hard-cap-sized allocation.
+///
+/// An over-budget declaration returns `Oversized` immediately, without
+/// reading or allocating the payload; unknown types and versions are
+/// rejected at header time too. `Frame::decode` re-validates everything on
+/// the assembled bytes (defense in depth).
+fn header_payload_check(
+    header: &[u8; ak_wire::HEADER_LEN],
+    limits: &Limits,
+) -> Result<usize, StreamError> {
     let declared = u32::from_be_bytes([header[3], header[4], header[5], header[6]]);
     if declared as usize > ak_wire::MAX_FRAME_BYTES {
         return Err(StreamError::Wire(ak_wire::DecodeError::Oversized {
@@ -822,7 +952,66 @@ fn payload_len_of(header: &[u8; ak_wire::HEADER_LEN]) -> Result<usize, StreamErr
             budget: ak_wire::MAX_FRAME_BYTES as u32,
         }));
     }
+    let version = header[0];
+    if version != ak_wire::VERSION {
+        return Err(StreamError::Wire(ak_wire::DecodeError::BadVersion(version)));
+    }
+    let message_type = u16::from_be_bytes([header[1], header[2]]);
+    let Some(budget) = type_budget(message_type, limits) else {
+        return Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(
+            message_type,
+        )));
+    };
+    if declared > budget {
+        return Err(StreamError::Wire(ak_wire::DecodeError::Oversized {
+            declared,
+            budget,
+        }));
+    }
     Ok(declared as usize)
+}
+
+/// Per-type payload upper bound for a wire frame type value, implied by
+/// `limits`: fixed bounds for the small control types, entry-count bounds
+/// for ManifestPage/ResumeRequest, `max_chunk_bytes` for Chunk. This is a
+/// header-only mirror of ak-wire's private `payload_budget` table (not
+/// re-exported), capped at the all-frame hard cap exactly like
+/// `ak_wire::Frame::decode` does.
+///
+/// Sync contract: it must stay at least as large as ak-wire's bound for
+/// every type, or legitimate frames would be rejected at header time. If it
+/// ever drifts looser, `Frame::decode` still enforces the true bound after
+/// the (already type-bounded, at most hard-cap-sized) allocation — a drift
+/// can only loosen the early gate, never bypass decode.
+fn type_budget(message_type: u16, limits: &Limits) -> Option<u32> {
+    let string = u64::from(limits.max_string_bytes);
+    // WireEntry: str(2+string) + bool(1) + size(8) + mtime(8) + alg(1)
+    //            + whole_digest(32) + digests(4 + 32*n).
+    let entry = 56 + string + 32 * u64::from(limits.max_chunk_digests);
+    let bound = match message_type {
+        // proto_version(2) + str(2+string) + public_key(32) + capabilities(2).
+        ak_wire::TYPE_HELLO | ak_wire::TYPE_OFFER => 38 + string,
+        // job_id(16).
+        ak_wire::TYPE_ACCEPT => 16,
+        // job_id(16) + error code(2).
+        ak_wire::TYPE_REJECT => 18,
+        // job_id(16) + page_index(4) + last_page(1) + count(4) + entries.
+        ak_wire::TYPE_MANIFEST_PAGE => 25 + u64::from(limits.max_entries_per_page) * entry,
+        // job_id(16) + file_index(4) + chunk_index(8) + data_len(4) + data.
+        ak_wire::TYPE_CHUNK => 32 + u64::from(limits.max_chunk_bytes),
+        // job_id(16) + file_index(4) + chunk_index(8).
+        ak_wire::TYPE_CHUNK_ACK => 28,
+        // job_id(16) + count(4) + 12 bytes per resume entry + more flag(1).
+        ak_wire::TYPE_RESUME_REQUEST => 21 + 12 * u64::from(limits.max_resume_entries),
+        // job_id(16) + tag/bool(1).
+        ak_wire::TYPE_CONTROL | ak_wire::TYPE_FINAL_ACK => 17,
+        ak_wire::TYPE_FINALIZE => 16,
+        // code(2) + str(2 + error message bytes).
+        ak_wire::TYPE_ERROR => 4 + u64::from(limits.max_error_message_bytes),
+        _ => return None,
+    };
+    let hard_payload_cap = (ak_wire::MAX_FRAME_BYTES - ak_wire::HEADER_LEN) as u64;
+    Some(bound.min(hard_payload_cap) as u32)
 }
 
 /// UDP simultaneous-open probing for NAT traversal (control plane coordinates
@@ -1743,6 +1932,360 @@ mod tests {
             }
             other => panic!("expected Oversized, got {other:?}"),
         }
+    }
+
+    /// A type=Chunk header declaring a 4 GiB payload (far above both the
+    /// per-type budget and the all-frame cap) is rejected as `Oversized` at
+    /// header time, before the payload buffer is allocated or awaited — the
+    /// client never sends any payload bytes, so a pass here proves the fast,
+    /// allocation-free return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_frame_rejects_4gib_chunk_header_before_allocating() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+
+        let mut cstream = client_channel.open_bi().await.expect("client open_bi");
+        // [version 1][type u16 BE = TYPE_CHUNK][payload_len u32 BE = 0xFFFFFFFF]
+        // and nothing else: recv_frame must fail on the header alone.
+        cstream
+            .send_bytes(&[0x01, 0x00, 0x06, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .expect("send oversized chunk header");
+        let mut sstream = server_channel.accept_bi().await.expect("server accept_bi");
+
+        let limits = Limits::default();
+        // Fast return: the 10s timeout below only passes if recv_frame
+        // rejected the header without waiting for payload bytes.
+        let received = tokio::time::timeout(Duration::from_secs(10), sstream.recv_frame(&limits));
+        match received.await.expect("must return without payload bytes") {
+            Err(StreamError::Wire(ak_wire::DecodeError::Oversized { declared, budget })) => {
+                assert_eq!(declared, u32::MAX);
+                // Layer 1: a declaration this far above the all-frame cap is
+                // rejected by the cap gate for every type (the per-type
+                // gate is exercised separately with an in-cap declaration).
+                assert_eq!(budget as usize, ak_wire::MAX_FRAME_BYTES);
+            }
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+    }
+
+    /// A small fixed-size type (Accept: 16-byte budget) declaring a payload
+    /// below the all-frame cap but above its per-type budget is rejected at
+    /// header time (layer 2 of the pre-allocation check) — this is exactly
+    /// the allocation the pre-check removes (previously a hard-cap-sized
+    /// buffer was allocated before decode rejected the frame).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_frame_rejects_per_type_over_budget_before_allocating() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+
+        let mut cstream = client_channel.open_bi().await.expect("client open_bi");
+        // [version 1][type u16 BE = TYPE_ACCEPT][payload_len u32 BE = 64 KiB]
+        // — under MAX_FRAME_BYTES, over the 16-byte Accept budget. No payload
+        // follows; the header alone must decide.
+        cstream
+            .send_bytes(&[0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00])
+            .await
+            .expect("send over-budget accept header");
+        let mut sstream = server_channel.accept_bi().await.expect("server accept_bi");
+
+        let limits = Limits::default();
+        let received = tokio::time::timeout(Duration::from_secs(10), sstream.recv_frame(&limits));
+        match received.await.expect("must return without payload bytes") {
+            Err(StreamError::Wire(ak_wire::DecodeError::Oversized { declared, budget })) => {
+                assert_eq!(declared, 0x01_0000);
+                assert_eq!(budget, 16, "Accept budget is its fixed 16-byte bound");
+            }
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+    }
+
+    /// Header-period rejection table as a pure function: every branch of
+    /// [`header_payload_check`] runs on 7 header bytes with no socket and no
+    /// allocation.
+    #[test]
+    fn header_payload_check_table() {
+        let limits = Limits::default();
+        // type u16 BE, payload_len u32 BE helpers.
+        let header = |ty: u16, declared: u32| {
+            let mut h = [0u8; ak_wire::HEADER_LEN];
+            h[0] = ak_wire::VERSION;
+            h[1..3].copy_from_slice(&ty.to_be_bytes());
+            h[3..7].copy_from_slice(&declared.to_be_bytes());
+            h
+        };
+
+        // Declared exactly at budget: passes the header gates.
+        assert_eq!(
+            header_payload_check(&header(ak_wire::TYPE_ACCEPT, 16), &limits).unwrap(),
+            16
+        );
+        // One byte over the fixed budget: Oversized with the type budget.
+        assert!(matches!(
+            header_payload_check(&header(ak_wire::TYPE_ACCEPT, 17), &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::Oversized {
+                declared: 17,
+                budget: 16
+            }))
+        ));
+        // Chunk at its exact bound (32 + max_chunk_bytes) passes.
+        assert_eq!(
+            header_payload_check(
+                &header(ak_wire::TYPE_CHUNK, 32 + limits.max_chunk_bytes),
+                &limits
+            )
+            .unwrap(),
+            (32 + limits.max_chunk_bytes) as usize
+        );
+        // Chunk one byte over: Oversized with the per-type budget.
+        assert!(matches!(
+            header_payload_check(
+                &header(ak_wire::TYPE_CHUNK, 33 + limits.max_chunk_bytes),
+                &limits
+            ),
+            Err(StreamError::Wire(ak_wire::DecodeError::Oversized { budget, .. }))
+                if budget == 32 + limits.max_chunk_bytes
+        ));
+        // Declared far above the all-frame cap: the cap gate fires first for
+        // every type (here: Chunk declaring 4 GiB).
+        assert!(matches!(
+            header_payload_check(&header(ak_wire::TYPE_CHUNK, u32::MAX), &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::Oversized { budget, .. }))
+                if budget as usize == ak_wire::MAX_FRAME_BYTES
+        ));
+        // Unknown type with an in-cap declaration: rejected at header time.
+        assert!(matches!(
+            header_payload_check(&header(0, 10), &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(0)))
+        ));
+        assert!(matches!(
+            header_payload_check(&header(13, 10), &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(13)))
+        ));
+        // Bad version with an in-cap declaration: rejected at header time.
+        let mut bad_version = header(ak_wire::TYPE_ACCEPT, 16);
+        bad_version[0] = ak_wire::VERSION + 1;
+        assert!(matches!(
+            header_payload_check(&bad_version, &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::BadVersion(v)))
+                if v == ak_wire::VERSION + 1
+        ));
+    }
+
+    /// [`type_budget`] mirrors ak-wire's per-type bounds: fixed small bounds
+    /// for control-ish types, limits-derived bounds for the data-carrying
+    /// ones, hard-cap saturation when limits imply more than one frame may
+    /// carry, and `None` for unknown types.
+    #[test]
+    fn type_budget_bounds_table() {
+        let limits = Limits::default();
+        let string = u32::from(limits.max_string_bytes);
+        assert_eq!(type_budget(ak_wire::TYPE_ACCEPT, &limits), Some(16));
+        assert_eq!(type_budget(ak_wire::TYPE_REJECT, &limits), Some(18));
+        assert_eq!(type_budget(ak_wire::TYPE_CHUNK_ACK, &limits), Some(28));
+        assert_eq!(type_budget(ak_wire::TYPE_CONTROL, &limits), Some(17));
+        assert_eq!(type_budget(ak_wire::TYPE_FINAL_ACK, &limits), Some(17));
+        assert_eq!(type_budget(ak_wire::TYPE_FINALIZE, &limits), Some(16));
+        assert_eq!(type_budget(ak_wire::TYPE_HELLO, &limits), Some(38 + string));
+        assert_eq!(type_budget(ak_wire::TYPE_OFFER, &limits), Some(38 + string));
+        assert_eq!(
+            type_budget(ak_wire::TYPE_ERROR, &limits),
+            Some(4 + u32::from(limits.max_error_message_bytes))
+        );
+        assert_eq!(
+            type_budget(ak_wire::TYPE_CHUNK, &limits),
+            Some(32 + limits.max_chunk_bytes)
+        );
+        assert_eq!(
+            type_budget(ak_wire::TYPE_RESUME_REQUEST, &limits),
+            Some(
+                (21 + 12 * u64::from(limits.max_resume_entries))
+                    .min((ak_wire::MAX_FRAME_BYTES - ak_wire::HEADER_LEN) as u64)
+                    as u32
+            )
+        );
+        let entry =
+            56 + u64::from(limits.max_string_bytes) + 32 * u64::from(limits.max_chunk_digests);
+        assert_eq!(
+            type_budget(ak_wire::TYPE_MANIFEST_PAGE, &limits),
+            Some(
+                (25 + u64::from(limits.max_entries_per_page) * entry)
+                    .min((ak_wire::MAX_FRAME_BYTES - ak_wire::HEADER_LEN) as u64)
+                    as u32
+            )
+        );
+        // Unknown types have no budget.
+        assert_eq!(type_budget(0, &limits), None);
+        assert_eq!(type_budget(13, &limits), None);
+        assert_eq!(type_budget(u16::MAX, &limits), None);
+        // Limits implying payloads beyond the all-frame cap saturate at the
+        // cap (mirroring ak_wire::Frame::decode's budget min).
+        let huge = Limits {
+            max_chunk_bytes: u32::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(
+            type_budget(ak_wire::TYPE_CHUNK, &huge),
+            Some((ak_wire::MAX_FRAME_BYTES - ak_wire::HEADER_LEN) as u32)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // connection migration policy (INV-004)
+    // ------------------------------------------------------------------
+
+    /// Every endpoint this crate builds reports active migration disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_migration_is_disabled_on_every_endpoint() {
+        let (bundle, _) = test_identity();
+        let endpoint = DirectEndpoint::bind(loopback_addr(), &bundle)
+            .await
+            .expect("bind");
+        assert!(
+            endpoint.active_migration_disabled(),
+            "plain-bind endpoint must disable active migration"
+        );
+        match DirectEndpoint::bind_dual_stack(0, &bundle).await {
+            Ok(dual) => assert!(
+                dual.active_migration_disabled(),
+                "dual-stack endpoint must disable active migration"
+            ),
+            Err(e) => eprintln!("skipping dual-stack leg (best-effort): {e}"),
+        }
+    }
+
+    /// Remote-change detection is a pure address comparison: same address is
+    /// stable; any difference in IP or port (including the ::ffff: mapped
+    /// form of the same v4 peer) reads as a changed path.
+    #[test]
+    fn path_change_detection_is_address_sensitive() {
+        let established = SocketAddr::new(v4(192, 168, 1, 9), 4747);
+        let same = SocketAddr::new(v4(192, 168, 1, 9), 4747);
+        let new_port = SocketAddr::new(v4(192, 168, 1, 9), 4748);
+        let new_ip = SocketAddr::new(v4(192, 168, 1, 10), 4747);
+        let mapped = SocketAddr::new(v4m(192, 168, 1, 9), 4747);
+        let v6 = SocketAddr::new(v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), 4747);
+        assert_eq!(established, same, "same address: no change");
+        assert_ne!(established, new_port, "port change is a path change");
+        assert_ne!(established, new_ip, "ip change is a path change");
+        assert_ne!(established, mapped, "v4->mapped rebind is a path change");
+        assert_ne!(established, v6, "family change is a path change");
+    }
+
+    /// A live channel: the handshake-time remote is the dialed server
+    /// address, the path is stable, and the stability check is a no-op that
+    /// does not disturb stream traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_channel_path_is_stable_and_stream_ops_pass_the_gate() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+
+        assert_eq!(client_channel.established_remote(), server_addr);
+        assert_eq!(client_channel.current_remote(), server_addr);
+        assert!(!client_channel.path_changed());
+        assert_eq!(server_channel.established_remote().ip(), v4(127, 0, 0, 1));
+        assert!(!server_channel.path_changed());
+        client_channel.ensure_path_stable().expect("stable path");
+
+        // The gate runs on every stream operation without breaking them.
+        let mut cstream = client_channel.open_bi().await.expect("open_bi passes");
+        cstream.send_bytes(b"still here").await.expect("send");
+        let mut sstream = server_channel.accept_bi().await.expect("accept_bi");
+        let mut buf = [0u8; 10];
+        sstream.recv_exact(&mut buf).await.expect("recv");
+        assert_eq!(&buf, b"still here");
+    }
+
+    /// Simulated migration on an otherwise healthy channel (in-crate field
+    /// mutation stands in for a transport-level rebind): the stability check
+    /// fails closed, closes the connection with code 9, and every subsequent
+    /// stream open fails. This is the defensive-close path INV-004 requires
+    /// on top of disabling migration in the transport config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migrated_channel_fails_closed_and_closes_the_connection() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let mut client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+        assert!(client_channel.healthy());
+
+        // Simulate the transport reinding to a new peer address.
+        client_channel.established_remote =
+            SocketAddr::new(v4(203, 0, 113, 99), server_addr.port() + 1);
+        assert!(client_channel.path_changed());
+
+        let err = client_channel
+            .ensure_path_stable()
+            .expect_err("changed path must fail closed");
+        assert!(
+            matches!(&err, StreamError::Connection(text) if text.contains("migrat")),
+            "error must name the migration: {err:?}"
+        );
+        // The defensive close reached the transport (and the peer).
+        assert!(!client_channel.healthy(), "connection must be closed");
+        for _ in 0..100 {
+            if !server_channel.healthy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!server_channel.healthy(), "peer must see the close");
+        // Stream opens on the migrated channel keep failing.
+        assert!(client_channel.open_bi().await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

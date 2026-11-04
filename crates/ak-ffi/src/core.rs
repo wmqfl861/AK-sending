@@ -352,8 +352,9 @@ pub fn peer_list_json(id_dir: &str) -> Result<String, FfiError> {
 ///   name renames the entry, no name (null or empty) leaves the record
 ///   untouched — so re-running an add is always idempotent;
 /// - a NEW peer without a name is stored as "(unnamed)";
-/// - names must not contain control characters (rejected, never
-///   sanitized) and are capped like every ABI string.
+/// - names must not contain control characters — C0, DEL, or C1, the
+///   `ak-wire` display-string rule (rejected, never sanitized) — and are
+///   capped like every ABI string.
 ///
 /// `cap` is the caller's buffer capacity: the count JSON is pre-flighted
 /// against it BEFORE the save, so `AK_ERR_BUFFER` persists nothing and the
@@ -368,7 +369,7 @@ pub fn peer_add(
         .ok_or_else(|| FfiError::invalid("fingerprint_hex must be 64 hex characters"))?;
     let name = name.filter(|text| !text.is_empty());
     if let Some(text) = name {
-        if text.bytes().any(|byte| byte < 0x20) {
+        if text.chars().any(|unit| json::is_control_char(unit as u32)) {
             return Err(FfiError::invalid(
                 "name must not contain control characters",
             ));
@@ -445,6 +446,14 @@ pub(crate) mod json {
     pub const MAX_STRING_BYTES: usize = 4096;
     /// Nesting cap for arrays/objects, including inside unknown fields.
     pub const MAX_DEPTH: usize = 32;
+
+    /// Control-character rule, byte-for-byte the `ak-wire` display-string
+    /// rule (`matches!(c, 0..=0x1F | 0x7F..=0x9F)`): C0, DEL, and C1 are
+    /// refused in every cross-boundary string — raw or escaped — so no
+    /// layer of the stack accepts what another layer rejects.
+    pub fn is_control_char(code: u32) -> bool {
+        matches!(code, 0..=0x1F | 0x7F..=0x9F)
+    }
 
     /// A parsed JSON value. Numbers keep their raw token; integer-ness is
     /// checked on demand so unknown float fields are skipped, not rejected.
@@ -547,12 +556,24 @@ pub(crate) mod json {
                                 "string value longer than {MAX_STRING_BYTES} bytes"
                             ));
                         }
-                        return String::from_utf8(out)
-                            .map_err(|_| "string value is not valid UTF-8".to_string());
+                        let text = String::from_utf8(out)
+                            .map_err(|_| "string value is not valid UTF-8".to_string())?;
+                        // Final defense for characters that only exist in
+                        // decoded form: C1 controls (U+0080..U+009F) arrive
+                        // as multi-byte UTF-8, never as a raw single byte,
+                        // so the byte-level arms below cannot see them.
+                        if let Some(unit) = text.chars().find(|&c| is_control_char(c as u32)) {
+                            return Err(format!(
+                                "control character U+{:04X} inside string value",
+                                unit as u32
+                            ));
+                        }
+                        return Ok(text);
                     }
-                    b if b < 0x20 => {
+                    b if b < 0x20 || b == 0x7F => {
                         // Injection defense, layer one: a control character
-                        // inside a JSON string value is refused outright.
+                        // (C0 or DEL) inside a JSON string value is refused
+                        // outright; C1 joins via the decoded scan above.
                         return Err(format!(
                             "control character U+{:04X} inside string value at byte {}",
                             b, self.pos
@@ -580,7 +601,7 @@ pub(crate) mod json {
                             }
                             b'u' => {
                                 let code = self.hex4()?;
-                                if code < 0x20 {
+                                if is_control_char(code) {
                                     return Err(format!(
                                         "escape \\u{code:04X} decodes to a control \
                                          character; control characters in values are \
@@ -853,8 +874,19 @@ enum Outcome {
 }
 
 struct Job {
-    handle: tokio::task::JoinHandle<()>,
+    /// The outer task's JoinHandle, taken (and awaited) by the first
+    /// `job_cancel`; `None` afterwards or once reaped.
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     outcome: Arc<Mutex<Outcome>>,
+    /// For `once_jobs > 1` receives: the loopback address the endpoint is
+    /// bound to. `serve_concurrently` runs its accept loop in a DETACHED
+    /// task that owns the endpoint (ak-engine has no stop channel for it),
+    /// so after the outer task is reaped this addr is "knocked" — a failed
+    /// inbound connection attempt wakes the parked accept, which then sees
+    /// its closed channel and drops the endpoint, releasing the UDP port.
+    /// `None` for send jobs and single receives (their endpoint lives
+    /// inside the outer future; reaping it frees the port deterministically).
+    knock: Option<SocketAddr>,
 }
 
 /// Snapshot returned by [`AkEngine::job_result`].
@@ -928,6 +960,7 @@ impl AkEngine {
         job: [u8; 16],
         handle: tokio::task::JoinHandle<()>,
         outcome: &Arc<Mutex<Outcome>>,
+        knock: Option<SocketAddr>,
     ) -> Result<(), FfiError> {
         let mut state = self
             .state
@@ -936,8 +969,9 @@ impl AkEngine {
         state.insert(
             job,
             Arc::new(Job {
-                handle,
+                handle: Mutex::new(Some(handle)),
                 outcome: Arc::clone(outcome),
+                knock,
             }),
         );
         Ok(())
@@ -972,7 +1006,7 @@ impl AkEngine {
             };
             finish(&task_outcome, finished);
         });
-        self.register(job, handle, &outcome)?;
+        self.register(job, handle, &outcome, None)?;
         Ok(job)
     }
 
@@ -986,6 +1020,11 @@ impl AkEngine {
         let job = self.next_job_id();
         let checkpoint_dir = self.checkpoint_dir(&job);
         let (spec, once_jobs) = build_receive_spec(&args, &checkpoint_dir)?;
+        // Concurrent receives park an ak-engine-owned endpoint in a detached
+        // accept task; remember where to knock on cancel (see `Job::knock`).
+        // `build_receive_spec` already rejects `once_jobs > 1` with port 0,
+        // so the port here is the real bound port.
+        let knock = (once_jobs > 1).then(|| SocketAddr::from(([127, 0, 0, 1], spec.bind.port())));
 
         let events = Arc::clone(&self.events);
         let outcome = Arc::new(Mutex::new(Outcome::Running));
@@ -1058,7 +1097,7 @@ impl AkEngine {
             };
             finish(&task_outcome, finished);
         });
-        self.register(job, handle, &outcome)?;
+        self.register(job, handle, &outcome, knock)?;
         Ok(job)
     }
 
@@ -1104,11 +1143,26 @@ impl AkEngine {
         })
     }
 
-    /// Abort a running job. If the abort beat the task's own completion,
-    /// the outcome is stamped `cancelled by caller` and a raced trailing
-    /// `done` event line for this job is removed, so a cancelled job never
-    /// presents a fake completion. A job that had already finished (either
-    /// way) is left untouched.
+    /// Abort a running job and CONVERGE the teardown before returning:
+    ///
+    /// 1. the outer task is aborted;
+    /// 2. its JoinHandle is awaited (bounded to 500 ms) — once that
+    ///    resolves, the future is dropped, and with it every endpoint and
+    ///    channel the task owned: the UDP port of a send job or a
+    ///    `once_jobs = 1` receive is released deterministically, and the
+    ///    task can never emit another progress event;
+    /// 3. for `once_jobs > 1` receives the bound port is knocked (see
+    ///    [`Job::knock`]) so ak-engine's detached accept task drops its
+    ///    endpoint promptly instead of at its accept deadline;
+    /// 4. the outcome is stamped `cancelled by caller` and a raced
+    ///    trailing `done` event line for this job is removed, so a
+    ///    cancelled job never presents a fake completion.
+    ///
+    /// A job that had already finished (either way) is left untouched.
+    ///
+    /// This call may block for a bounded few hundred milliseconds (steps 2
+    /// and 3); it must run on the caller's (non-runtime) thread like every
+    /// other entry point.
     pub fn job_cancel(&self, job: &[u8; 16]) -> Result<(), FfiError> {
         let entry = {
             let state = self
@@ -1120,7 +1174,45 @@ impl AkEngine {
                 .cloned()
                 .ok_or_else(|| FfiError::not_found(format!("unknown job {}", hex16(job))))?
         };
-        entry.handle.abort();
+        {
+            // Fast path: a job that already finished is untouched (the
+            // take/abort/await below would be harmless but pointless).
+            let outcome = entry
+                .outcome
+                .lock()
+                .map_err(|_| FfiError::internal("job outcome lock poisoned"))?;
+            if !matches!(&*outcome, Outcome::Running) {
+                return Ok(());
+            }
+        }
+        // 1-2. Abort, then await the handle with a hard 500 ms cap. After
+        // `abort()` the JoinHandle resolves once the future is dropped; the
+        // cap bounds a task wedged in blocking work instead of hanging the
+        // caller.
+        if let Some(handle) = entry
+            .handle
+            .lock()
+            .map_err(|_| FfiError::internal("job handle lock poisoned"))?
+            .take()
+        {
+            handle.abort();
+            // The timeout future must be CONSTRUCTED inside the async block:
+            // `tokio::time::timeout` binds to the runtime timer driver at
+            // creation, i.e. only after `block_on` entered the context.
+            let _ = self
+                .runtime
+                .block_on(async { tokio::time::timeout(Duration::from_millis(500), handle).await });
+        }
+        // 3. Release a concurrent receive's endpoint. Must run AFTER the
+        // outer task was reaped: only then is the accept task's channel
+        // receiver gone, so the woken accept observes the closed channel,
+        // breaks, and drops the endpoint.
+        if let Some(addr) = entry.knock {
+            self.knock_endpoint(addr);
+        }
+        // 4. Stamp the outcome (unless the task completed on its own in
+        // the race window — then its own terminal state stands) and strip
+        // any queued fake-completion `done` line.
         let mut outcome = entry
             .outcome
             .lock()
@@ -1139,16 +1231,86 @@ impl AkEngine {
         }
         Ok(())
     }
+
+    /// Wake the detached accept task that owns a cancelled concurrent
+    /// receive's endpoint, and confirm the port was actually released. A
+    /// one-shot QUIC connection attempt at `addr` fails fast — the knock
+    /// client pins its OWN (wrong) fingerprint, so the TLS handshake is
+    /// refused on loopback within milliseconds — and the failed inbound
+    /// attempt is exactly what unblocks the parked `accept`, after which
+    /// the accept loop breaks on its closed channel and drops the endpoint
+    /// (freeing the UDP port). A short rebind probe then verifies the
+    /// release from the CALLER's perspective, so `ak_job_cancel` returning
+    /// means an immediate rebind on the same port succeeds (not just that a
+    /// wake-up was sent). Bounded and best-effort: if the endpoint was
+    /// already gone the probe passes instantly; in the worst case the
+    /// accept deadline still bounds cleanup.
+    fn knock_endpoint(&self, addr: SocketAddr) {
+        let port = addr.port();
+        // The rebind probe must use the SAME wildcard form the engine binds
+        // (`0.0.0.0:port`): Windows allows a specific-address bind to
+        // overlap an existing wildcard bind, so only a wildcard probe
+        // reports the port as still held.
+        let probe_addr = SocketAddr::from(([0, 0, 0, 0], port));
+        // Already released (accept task ended on its own)? Then do nothing.
+        if let Ok(probe) = std::net::UdpSocket::bind(probe_addr) {
+            drop(probe);
+            return;
+        }
+        self.runtime.block_on(async move {
+            let key = DeviceKeyPair::generate();
+            let bundle = make_self_signed(&key);
+            let Ok(endpoint) =
+                ak_net::DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &bundle).await
+            else {
+                return;
+            };
+            // Pin the knock client's OWN fingerprint: it can never match the
+            // receiver's certificate, so the handshake is refused quickly
+            // and the TLS alert actually flies (aborting the client early
+            // could leave the server's accept waiting for a client Finished
+            // that never comes). A few attempts cover the case where the
+            // accept loop happened to be between iterations at knock time.
+            let pinned = key.fingerprint();
+            for _ in 0..3 {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    endpoint.connect(addr, &pinned),
+                )
+                .await;
+                // Confirm the release before declaring convergence; the
+                // probe socket is dropped immediately so it cannot itself
+                // hold the port the caller wants to rebind.
+                let mut waited = 0u32;
+                loop {
+                    if let Ok(probe) = std::net::UdpSocket::bind(probe_addr) {
+                        drop(probe);
+                        return;
+                    }
+                    if waited >= 200 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    waited += 10;
+                }
+            }
+        });
+    }
 }
 
 impl Drop for AkEngine {
     fn drop(&mut self) {
         // Abort every still-running job before the runtime goes away; the
         // runtime drop then waits briefly for in-flight blocking work
-        // (chunk reads) only.
+        // (chunk reads) only. Detached helper tasks (the concurrent accept
+        // loop) are torn down with the runtime itself.
         if let Ok(state) = self.state.lock() {
             for job in state.values() {
-                job.handle.abort();
+                if let Ok(mut slot) = job.handle.lock() {
+                    if let Some(handle) = slot.take() {
+                        handle.abort();
+                    }
+                }
             }
         }
     }
@@ -1686,7 +1848,8 @@ fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec,
 /// {
 ///   "out_dir": "C:/inbox",              // required, created when missing
 ///   "port": 7100,                       // optional, default 7100
-///   "expect": "any",                    // "any" | "book" | 64-hex | code
+///   "expect": "any",                    // REQUIRED: "any" | "book" |
+///                                       //   64-hex fingerprint | 6-digit code
 ///   "conflict": "fail",                 // "fail" | "rename"
 ///   "timeout_secs": 30,                 // optional idle budget
 ///   "id_dir": "C:/ak/identity",         // optional stable identity
@@ -1695,6 +1858,11 @@ fn build_send_spec(args: &json::Json, checkpoint_dir: &Path) -> Result<SendSpec,
 ///   "no_internet": false                // optional policy gate
 /// }
 /// ```
+///
+/// `expect` is REQUIRED: a spec without it is `AK_ERR_INVALID` ("expect
+/// required: any|book|fingerprint|pairing code"). There is no default —
+/// "any" accepts everyone and must be stated explicitly by the caller
+/// (breaking change: earlier revisions silently defaulted to "any").
 ///
 /// `expect: "book"` admits only fingerprints in `<id_dir>/peers.book` and
 /// requires that book to exist, parse, and hold at least one peer at start
@@ -1738,7 +1906,11 @@ fn build_receive_spec(
         ));
     }
 
-    let expect_text = field_str(args, "expect", false)?.unwrap_or_else(|| "any".to_string());
+    // `expect` is REQUIRED (breaking change, FFI API rev 1): an accidental
+    // missing field must never widen admission to "accepts everyone". The
+    // caller states its policy explicitly — "any" included.
+    let expect_text = field_str(args, "expect", false)?
+        .ok_or_else(|| FfiError::invalid("expect required: any|book|fingerprint|pairing code"))?;
     let expect = Expect::parse(&expect_text)?;
 
     if let Some(secs) = field_u64(args, "timeout_secs")? {

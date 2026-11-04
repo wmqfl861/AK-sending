@@ -39,7 +39,9 @@
 //! | Error | 12 | code u16 (ErrorCode), message str |
 //!
 //! Every decode validates type, version, length, offsets and resource budgets
-//! against [`Limits`] before allocating memory, and refuses unknown values.
+//! against [`Limits`] before allocating memory, and refuses unknown values;
+//! an Offer's `chunk_size` must lie in `1..=limits.max_chunk_bytes` (it
+//! sizes receiver-side buffers, so a tiny frame must not request huge ones).
 //! For diagnostics, [`type_name`] maps each `type` value in the table above
 //! to its variant name (`6` → `"Chunk"`; `None` outside the closed set), and
 //! [`Message::kind`] reports a message's own type value.
@@ -50,7 +52,9 @@
 #![forbid(unsafe_code)]
 
 use ak_core::error::ErrorCode;
-use ak_core::manifest::{validate_rel_path, FileEntry, DIGEST_LEN};
+use ak_core::manifest::{
+    validate_digest_alg, validate_rel_path, FileEntry, InvalidEntry, DIGEST_LEN,
+};
 
 /// Wire protocol version of frame v1.
 pub const VERSION: u8 = 1;
@@ -172,6 +176,8 @@ pub struct WireEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_unix_ms: i64,
+    /// Digest algorithm identifier, preserved as decoded; converting to
+    /// [`FileEntry`] rejects unknown values instead of rewriting them.
     pub digest_alg: u8,
     pub whole_digest: [u8; DIGEST_LEN],
     pub chunk_digests: Vec<[u8; DIGEST_LEN]>,
@@ -192,16 +198,23 @@ impl From<&FileEntry> for WireEntry {
 }
 
 impl TryFrom<WireEntry> for FileEntry {
-    type Error = ak_core::manifest::InvalidRelPath;
+    type Error = InvalidEntry;
 
     fn try_from(entry: WireEntry) -> Result<Self, Self::Error> {
+        // The algorithm declared on the wire is preserved and must be one
+        // this build knows — an unknown identifier is an error, never a
+        // silent rewrite to BLAKE3 (which would defeat downstream
+        // algorithm checks). Directory entries carry no digests, but their
+        // declaration is validated the same way.
+        validate_digest_alg(entry.digest_alg)?;
         if entry.is_dir {
             FileEntry::directory(&entry.rel_path)
         } else {
-            FileEntry::new(
+            FileEntry::with_digest_alg(
                 &entry.rel_path,
                 entry.size,
                 entry.mtime_unix_ms,
+                entry.digest_alg,
                 entry.whole_digest,
                 entry.chunk_digests,
             )
@@ -333,38 +346,79 @@ pub enum DecodeError {
     Malformed(&'static str),
 }
 
+/// Why [`Frame::try_encode`] refused to encode a frame. Every variant is a
+/// caller bug: builders validate sizes before construction, so a frame that
+/// cannot be represented in the frozen v1 layout must not reach the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EncodeError {
+    #[error("frame version {version} cannot be encoded; this codec writes version {VERSION}")]
+    BadVersion { version: u8 },
+    #[error("string field of {len} bytes overflows the u16 length field")]
+    StringTooLong { len: usize },
+    #[error("length {len} overflows the u32 count field")]
+    CountTooLarge { len: usize },
+    #[error("payload of {len} bytes overflows the u32 payload length field")]
+    PayloadTooLarge { len: usize },
+    #[error("frame of {len} bytes exceeds MAX_FRAME_BYTES ({MAX_FRAME_BYTES})")]
+    FrameTooLarge { len: usize },
+}
+
 impl Frame {
-    /// Append the encoded frame to `out`. Encoding is total and must not fail;
-    /// builders validate lengths before construction.
-    ///
-    /// The `debug_assert!`s below fire only on caller bugs: strings must fit
-    /// the u16 length field, vectors and chunk data the u32 count/length, the
-    /// frame must carry [`VERSION`], and the whole frame must stay within
-    /// [`MAX_FRAME_BYTES`] (decode refuses larger frames, so producing one is
-    /// pointless). Limits-specific bounds such as `max_chunk_bytes` are the
-    /// builder's responsibility; encode takes no limits by design.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        debug_assert_eq!(
-            self.version, VERSION,
-            "ak-wire: this codec only encodes frame version 1"
-        );
+    /// Append the encoded frame to `out`, or return an [`EncodeError`]
+    /// without modifying `out` when the message cannot be represented as a
+    /// frame v1: wrong frame version, a string or vector length overflowing
+    /// its fixed-width field, or a frame exceeding [`MAX_FRAME_BYTES`]
+    /// (decode refuses larger frames, so producing one is pointless).
+    /// Limits-specific bounds such as `max_chunk_bytes` remain the builder's
+    /// responsibility; encode takes no limits by design.
+    pub fn try_encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        if self.version != VERSION {
+            return Err(EncodeError::BadVersion {
+                version: self.version,
+            });
+        }
         let start = out.len();
         out.resize(start + HEADER_LEN, 0);
-        encode_payload(&self.message, out);
-        let payload_len = out.len() - start - HEADER_LEN;
-        debug_assert!(
-            payload_len <= u32::MAX as usize,
-            "ak-wire: payload of {payload_len} bytes overflows the u32 length field; caller bug"
-        );
-        debug_assert!(
-            out.len() - start <= MAX_FRAME_BYTES,
-            "ak-wire: frame of {} bytes exceeds MAX_FRAME_BYTES ({MAX_FRAME_BYTES}); \
-             split the message or tighten limits — caller bug",
-            out.len() - start
-        );
-        out[start] = self.version;
-        out[start + 1..start + 3].copy_from_slice(&type_of(&self.message).to_be_bytes());
-        out[start + 3..start + HEADER_LEN].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        let err = match encode_payload(&self.message, out) {
+            Ok(()) => {
+                let payload_len = out.len() - start - HEADER_LEN;
+                let frame_len = out.len() - start;
+                if let Some(err) = payload_len_error(payload_len) {
+                    err
+                } else if frame_len > MAX_FRAME_BYTES {
+                    EncodeError::FrameTooLarge { len: frame_len }
+                } else {
+                    out[start] = self.version;
+                    out[start + 1..start + 3]
+                        .copy_from_slice(&type_of(&self.message).to_be_bytes());
+                    out[start + 3..start + HEADER_LEN]
+                        .copy_from_slice(&(payload_len as u32).to_be_bytes());
+                    return Ok(());
+                }
+            }
+            Err(err) => err,
+        };
+        out.truncate(start);
+        Err(err)
+    }
+
+    /// Append the encoded frame to `out`. Encoding is total and must not
+    /// fail for well-formed messages; builders validate lengths before
+    /// construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Frame::try_encode`] would return an error — a caller
+    /// bug: the frame must carry [`VERSION`], strings must fit the u16
+    /// length field, vectors and chunk data the u32 count/length field, and
+    /// the whole frame must stay within [`MAX_FRAME_BYTES`]. This keeps the
+    /// historic `debug_assert` panic contract of this method, centralized
+    /// in one place and active in release builds too; callers that can
+    /// construct over-limit messages must use `try_encode` instead.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        if let Err(err) = self.try_encode(out) {
+            panic!("ak-wire: cannot encode frame: {err} — caller bug");
+        }
     }
 
     /// Decode one frame from exactly-sized bytes under the given limits.
@@ -500,7 +554,9 @@ fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Encoding helpers (total; caller bugs surface as debug_assert panics).
+// Encoding helpers: every fixed-width length field is checked in production;
+// `Frame::encode` turns the error into a panic (caller bug), `Frame::try_encode`
+// returns it.
 // ---------------------------------------------------------------------------
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -523,26 +579,36 @@ fn put_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));
 }
 
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    debug_assert!(
-        s.len() <= usize::from(u16::MAX),
-        "ak-wire: string field of {} bytes overflows the u16 length field; caller bug",
-        s.len()
-    );
-    put_u16(out, s.len() as u16);
+fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), EncodeError> {
+    let len = s.len();
+    if len > usize::from(u16::MAX) {
+        return Err(EncodeError::StringTooLong { len });
+    }
+    put_u16(out, len as u16);
     out.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 /// Vector counts and chunk data share the u32 length prefix.
-fn put_len32(out: &mut Vec<u8>, len: usize) {
-    debug_assert!(
-        len <= u32::MAX as usize,
-        "ak-wire: length {len} overflows the u32 count field; caller bug"
-    );
+fn put_len32(out: &mut Vec<u8>, len: usize) -> Result<(), EncodeError> {
+    if len > u32::MAX as usize {
+        return Err(EncodeError::CountTooLarge { len });
+    }
     put_u32(out, len as u32);
+    Ok(())
 }
 
-fn encode_payload(message: &Message, out: &mut Vec<u8>) {
+/// Header payload-length check, factored out so every [`EncodeError`]
+/// branch is testable without building a >4-GiB message.
+fn payload_len_error(payload_len: usize) -> Option<EncodeError> {
+    if payload_len > u32::MAX as usize {
+        Some(EncodeError::PayloadTooLarge { len: payload_len })
+    } else {
+        None
+    }
+}
+
+fn encode_payload(message: &Message, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     match message {
         Message::Hello {
             proto_version,
@@ -551,7 +617,7 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             capabilities,
         } => {
             put_u16(out, *proto_version);
-            put_str(out, device_name);
+            put_str(out, device_name)?;
             out.extend_from_slice(public_key);
             put_u16(out, *capabilities);
         }
@@ -563,7 +629,7 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             chunk_size,
         } => {
             out.extend_from_slice(job_id);
-            put_str(out, root_name);
+            put_str(out, root_name)?;
             put_u64(out, *file_count);
             put_u64(out, *total_bytes);
             put_u32(out, *chunk_size);
@@ -582,15 +648,15 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             out.extend_from_slice(job_id);
             put_u32(out, *page_index);
             put_bool(out, *last_page);
-            put_len32(out, entries.len());
+            put_len32(out, entries.len())?;
             for entry in entries {
-                put_str(out, &entry.rel_path);
+                put_str(out, &entry.rel_path)?;
                 put_bool(out, entry.is_dir);
                 put_u64(out, entry.size);
                 put_i64(out, entry.mtime_unix_ms);
                 out.push(entry.digest_alg);
                 out.extend_from_slice(&entry.whole_digest);
-                put_len32(out, entry.chunk_digests.len());
+                put_len32(out, entry.chunk_digests.len())?;
                 for digest in &entry.chunk_digests {
                     out.extend_from_slice(digest);
                 }
@@ -605,7 +671,7 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             out.extend_from_slice(job_id);
             put_u32(out, *file_index);
             put_u64(out, *chunk_index);
-            put_len32(out, data.len());
+            put_len32(out, data.len())?;
             out.extend_from_slice(data);
         }
         Message::ChunkAck {
@@ -623,7 +689,7 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
             more,
         } => {
             out.extend_from_slice(job_id);
-            put_len32(out, files.len());
+            put_len32(out, files.len())?;
             for file in files {
                 put_u32(out, file.file_index);
                 put_u64(out, file.verified_prefix_chunks);
@@ -646,9 +712,10 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) {
         }
         Message::Error { code, message } => {
             put_u16(out, code.code());
-            put_str(out, message);
+            put_str(out, message)?;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -803,13 +870,35 @@ fn decode_message(
             public_key: cursor.array::<32>()?,
             capabilities: cursor.u16()?,
         },
-        TYPE_OFFER => Message::Offer {
-            job_id: cursor.array::<16>()?,
-            root_name: limited_string(cursor, limits.max_string_bytes)?,
-            file_count: cursor.u64()?,
-            total_bytes: cursor.u64()?,
-            chunk_size: cursor.u32()?,
-        },
+        TYPE_OFFER => {
+            let job_id: JobId = cursor.array::<16>()?;
+            let root_name = limited_string(cursor, limits.max_string_bytes)?;
+            let file_count = cursor.u64()?;
+            let total_bytes = cursor.u64()?;
+            let chunk_size = cursor.u32()?;
+            // The negotiated chunk size drives receiver-side buffer
+            // allocation (one chunk_size-sized buffer per file), so a tiny
+            // Offer frame must not be able to request near-4-GiB buffers:
+            // only 1..=max_chunk_bytes is acceptable.
+            if chunk_size == 0 {
+                return Err(DecodeError::Malformed(
+                    "offer chunk_size must be at least 1 byte",
+                ));
+            }
+            if chunk_size > limits.max_chunk_bytes {
+                return Err(DecodeError::ChunkTooLarge {
+                    len: u64::from(chunk_size),
+                    limit: limits.max_chunk_bytes,
+                });
+            }
+            Message::Offer {
+                job_id,
+                root_name,
+                file_count,
+                total_bytes,
+                chunk_size,
+            }
+        }
         TYPE_ACCEPT => Message::Accept {
             job_id: cursor.array::<16>()?,
         },
@@ -1236,6 +1325,67 @@ mod tests {
         let wire = WireEntry::from(&entry);
         assert_eq!(wire.rel_path, "root/sub/name.bin");
         assert_eq!(FileEntry::try_from(wire).unwrap(), entry);
+    }
+
+    #[test]
+    fn wire_entry_rejects_unknown_digest_alg_instead_of_rewriting() {
+        let mut entry = file_entry("root/f.bin", 1, 1);
+        entry.digest_alg = 1;
+        // Decode preserves the declared algorithm off the wire...
+        let decoded = Frame::decode(
+            &encoded(&Message::ManifestPage {
+                job_id: [1; 16],
+                page_index: 0,
+                last_page: true,
+                entries: vec![entry],
+            }),
+            &Limits::default(),
+        )
+        .unwrap();
+        let Message::ManifestPage { entries, .. } = decoded.message else {
+            panic!("manifest page expected");
+        };
+        assert_eq!(entries[0].digest_alg, 1);
+        // ...and the conversion to FileEntry refuses it, rather than
+        // silently rewriting it to BLAKE3.
+        assert_eq!(
+            FileEntry::try_from(entries.into_iter().next().unwrap()),
+            Err(InvalidEntry::DigestAlg(
+                ak_core::manifest::InvalidDigestAlg(1)
+            ))
+        );
+
+        // Directory entries carry no digests, but their declaration is
+        // validated the same way.
+        let dir = WireEntry {
+            rel_path: "empty-dir".to_owned(),
+            is_dir: true,
+            size: 0,
+            mtime_unix_ms: 0,
+            digest_alg: 7,
+            whole_digest: [0; DIGEST_LEN],
+            chunk_digests: Vec::new(),
+        };
+        assert_eq!(
+            FileEntry::try_from(dir),
+            Err(InvalidEntry::DigestAlg(
+                ak_core::manifest::InvalidDigestAlg(7)
+            ))
+        );
+    }
+
+    #[test]
+    fn wire_entry_conversion_keeps_known_digest_alg() {
+        // file_entry stamps DIGEST_ALG_BLAKE3 (= 0): conversion passes.
+        let entry = file_entry("root/f.bin", 1, 2);
+        let converted = FileEntry::try_from(entry).unwrap();
+        assert_eq!(converted.digest_alg, ak_core::manifest::DIGEST_ALG_BLAKE3);
+        // FileEntry -> WireEntry -> FileEntry is the identity for the known
+        // algorithm.
+        assert_eq!(
+            FileEntry::try_from(WireEntry::from(&converted)).unwrap(),
+            converted
+        );
     }
 
     #[test]
@@ -1785,6 +1935,53 @@ mod tests {
     }
 
     #[test]
+    fn offer_chunk_size_must_be_within_max_chunk_bytes() {
+        let limits = Limits::default();
+        // Both ends of the legal range round-trip.
+        for ok in [1u32, limits.max_chunk_bytes] {
+            assert_round_trips(Message::Offer {
+                job_id: [2; 16],
+                root_name: "photos".to_owned(),
+                file_count: 1,
+                total_bytes: 1 << 20,
+                chunk_size: ok,
+            });
+        }
+
+        let offer_payload = |chunk_size: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[2u8; 16]); // job_id
+            payload.extend_from_slice(&6u16.to_be_bytes()); // root_name len
+            payload.extend_from_slice(b"photos");
+            payload.extend_from_slice(&1u64.to_be_bytes()); // file_count
+            payload.extend_from_slice(&(1u64 << 20).to_be_bytes()); // total_bytes
+            payload.extend_from_slice(&chunk_size.to_be_bytes());
+            payload
+        };
+        // One past the limit (default 8 MiB + 1) is refused from a tiny
+        // frame, with no oversized allocation anywhere; u32::MAX — the
+        // near-4-GiB-allocation scenario from the review — is refused the
+        // same way.
+        for bad in [limits.max_chunk_bytes + 1, u32::MAX] {
+            let buf = frame_of(TYPE_OFFER, &offer_payload(bad));
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &limits),
+                    Err(DecodeError::ChunkTooLarge { len, limit })
+                        if len == u64::from(bad) && limit == limits.max_chunk_bytes
+                ),
+                "offer chunk_size {bad} accepted"
+            );
+        }
+        // Zero is not a chunk size either: the range starts at 1.
+        let buf = frame_of(TYPE_OFFER, &offer_payload(0));
+        assert!(matches!(
+            Frame::decode(&buf, &limits),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn rejects_resume_count_over_limit() {
         let over = u32::from(MAX_RESUME_ENTRIES) + 1;
         let mut payload = Vec::new();
@@ -1888,6 +2085,116 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // try_encode: production length-field validation.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_encode_rejects_wrong_version_and_leaves_out_untouched() {
+        let frame = Frame {
+            version: VERSION + 1,
+            message: Message::Accept { job_id: [1; 16] },
+        };
+        let mut out = b"prefix".to_vec();
+        assert_eq!(
+            frame.try_encode(&mut out),
+            Err(EncodeError::BadVersion {
+                version: VERSION + 1
+            })
+        );
+        assert_eq!(out, b"prefix");
+    }
+
+    #[test]
+    fn try_encode_rejects_strings_over_the_u16_field() {
+        let over = usize::from(u16::MAX) + 1;
+        let frame = Frame {
+            version: VERSION,
+            message: Message::Hello {
+                proto_version: 1,
+                device_name: "d".repeat(over),
+                public_key: [0; 32],
+                capabilities: 0,
+            },
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            frame.try_encode(&mut out),
+            Err(EncodeError::StringTooLong { len: over })
+        );
+        assert!(out.is_empty());
+        // Exactly u16::MAX bytes is the last legal value.
+        let ok = Frame {
+            version: VERSION,
+            message: Message::Hello {
+                proto_version: 1,
+                device_name: "d".repeat(usize::from(u16::MAX)),
+                public_key: [0; 32],
+                capabilities: 0,
+            },
+        };
+        let mut out = Vec::new();
+        assert!(ok.try_encode(&mut out).is_ok());
+        assert_eq!(
+            out.len(),
+            HEADER_LEN + 2 + 2 + usize::from(u16::MAX) + 32 + 2
+        );
+    }
+
+    #[test]
+    fn try_encode_rejects_frames_over_the_hard_cap() {
+        // Chunk data big enough that no length field overflows while the
+        // whole frame does: decode would refuse it, so encoding it is a bug.
+        let frame = Frame {
+            version: VERSION,
+            message: Message::Chunk {
+                job_id: [1; 16],
+                file_index: 0,
+                chunk_index: 0,
+                data: vec![0u8; MAX_FRAME_BYTES],
+            },
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            frame.try_encode(&mut out),
+            Err(EncodeError::FrameTooLarge {
+                len: HEADER_LEN + 32 + MAX_FRAME_BYTES
+            })
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn try_encode_length_field_checks_cover_their_branches() {
+        // put_len32 and the payload-length check, exercised without building
+        // any >4-GiB message (lengths are passed as data here).
+        let mut out = Vec::new();
+        let huge = u32::MAX as usize + 1;
+        assert_eq!(
+            put_len32(&mut out, huge),
+            Err(EncodeError::CountTooLarge { len: huge })
+        );
+        assert!(out.is_empty());
+        assert_eq!(put_len32(&mut out, u32::MAX as usize), Ok(()));
+        assert_eq!(out.len(), 4);
+        assert_eq!(payload_len_error(u32::MAX as usize), None);
+        assert_eq!(
+            payload_len_error(huge),
+            Some(EncodeError::PayloadTooLarge { len: huge })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "caller bug")]
+    fn encode_panics_where_try_encode_errors() {
+        let frame = Frame {
+            version: 0,
+            message: Message::Accept { job_id: [1; 16] },
+        };
+        let mut out = Vec::new();
+        frame.encode(&mut out);
+    }
+
+    // ------------------------------------------------------------------
     // Deterministic fuzz: random and mutated frames never panic.
     // ------------------------------------------------------------------
 
@@ -1916,7 +2223,9 @@ mod tests {
                     root_name: root,
                     file_count: r.next_u64(),
                     total_bytes: r.next_u64(),
-                    chunk_size: r.below(1 << 20) as u32,
+                    // Decode requires 1..=max_chunk_bytes; stay in range so
+                    // round trips keep passing.
+                    chunk_size: (1 + r.below(1 << 20)) as u32,
                 }
             }
             2 => Message::Accept { job_id: job },

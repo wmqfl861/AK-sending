@@ -355,3 +355,14 @@ flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
 #   （注意：主题为浅色而非深色——视觉核验发现与任务描述不符处，界面本身正常。）
 # Android：apk-debug.apk 161MB 构建成功，libak_ffi.so 双 ABI 在包内（x86_64 4.3MB + arm64 3.7MB）；
 #   系统镜像首次下载 zip 损坏已定位（unknown archive @33%），带校验重试循环重装中。
+
+## 跨设备里程碑：Android 模拟器 → Windows 主机真实 QUIC 传输（2026-11-04）
+# 路线：ak-cli 交叉编译 x86_64-linux-android（8,904,736B，ring/rustls 经 NDK clang 全量编译）→
+#   adb push 模拟器 /data/local/tmp → Android 端 ak-cli --version 实跑确认（wire v1 caps 0x0007 release）→
+#   Windows 主机 receiver（--expect any，端口 17900）↔ Android 发送端经 10.0.2.2（模拟器→宿主环回）。
+# 结果：job afe43780da634ea94e8e7e6ec97da314 complete（双端同 job id）——2 条目 5.00 MiB
+#   （5,242,880B 随机 payload.bin + 中文文件名 说明.txt）；Android 端 TOFU 记录主机指纹 499f62ba。
+# 验证：cmp 逐字节一致（payload.bin IDENTICAL / note.txt IDENTICAL）；QUIC+TLS 指纹钉扎握手跨设备真实成立。
+# 层级：真实双进程+跨网络栈（模拟器 NAT 10.0.2.2），非进程内环回；仍非物理双机（模拟器与宿主同机）。
+# 旁证：Android 端 keygen/peers.book/device.key 全功能；GUI APK 装机成功但模拟器 System UI 不稳（三轮 ANR，
+#   应用进程存活+topResumed 确认，GUI 截图受阻——如实记录，CLI 路线已提供跨设备证据）。

@@ -37,6 +37,29 @@
 //! | Finalize | 10 | job_id 16B |
 //! | FinalAck | 11 | job_id 16B, verified bool |
 //! | Error | 12 | code u16 (ErrorCode), message str |
+//! | TaskOpen | 13 | job_id 16B, permit_id 16B, group 32B, group_registry 32B |
+//! | Admission | 14 | job_id 16B, permit_id 16B, granted bool, reason u8 |
+//! | AdmissionAck | 15 | job_id 16B, permit_id 16B |
+//!
+//! ## Scheduler admission frames (types 13-15, wave 20)
+//!
+//! `TaskOpen`/`Admission`/`AdmissionAck` carry the two-dimensional
+//! concurrency admission exchange of docs/contracts/scheduler.md §4/§6
+//! over the device direct channel (never via `ak-signal`). They reuse the
+//! same u16 message-type space, frame layout, budget discipline, boolean
+//! byte rule, closed-enum tag rule and exact-exhaustion trailing rule as
+//! the twelve file-protocol variants — fixed-size payloads of exactly 96,
+//! 34 and 32 bytes, so a tiny frame can never request a large allocation.
+//!
+//! **Capability negotiation (Hello compat):** these three frame types may
+//! only be exchanged after BOTH peers' `Hello` frames carry
+//! [`CAP_SCHEDULER`] (see [`scheduler_frames_allowed`]). The codec itself
+//! still decodes the closed set uniformly — an old peer that never
+//! negotiates the bit simply never receives one of these frames; the
+//! engine (wave 21 wiring) enforces the gate and answers
+//! `PROTOCOL_UNSUPPORTED` instead of falling back. The `reason` byte of
+//! `Admission` is a closed set: 0 = ok, 1 = serial_wait, 2 = capacity,
+//! 3 = stale_permit; anything else is rejected.
 //!
 //! Every decode validates type, version, length, offsets and resource budgets
 //! against [`Limits`] before allocating memory, and refuses unknown values;
@@ -68,6 +91,12 @@ pub const CAP_RESUME: u16 = 0x0001;
 pub const CAP_PAUSE_RESUME: u16 = 0x0002;
 /// Capability bit: parallel per-file QUIC streams are supported.
 pub const CAP_MULTISTREAM: u16 = 0x0004;
+/// Capability bit: this end understands the scheduler admission exchange
+/// (`TaskOpen`/`Admission`/`AdmissionAck`, types 13-15). The three frame
+/// types may only flow when BOTH peers' Hellos carried this bit — see
+/// [`scheduler_frames_allowed`]; the codec itself decodes them uniformly,
+/// and the engine (wave 21 wiring) enforces the gate.
+pub const CAP_SCHEDULER: u16 = 0x0008;
 
 /// Per-frame ceiling for resume entries in one ResumeRequest frame. The
 /// receiver shards its resume answer into consecutive frames of at most
@@ -103,6 +132,12 @@ pub const TYPE_FINALIZE: u16 = 10;
 pub const TYPE_FINAL_ACK: u16 = 11;
 /// Message type value for [`Message::Error`].
 pub const TYPE_ERROR: u16 = 12;
+/// Message type value for [`Message::TaskOpen`] (scheduler admission).
+pub const TYPE_TASK_OPEN: u16 = 13;
+/// Message type value for [`Message::Admission`] (scheduler admission).
+pub const TYPE_ADMISSION: u16 = 14;
+/// Message type value for [`Message::AdmissionAck`] (scheduler admission).
+pub const TYPE_ADMISSION_ACK: u16 = 15;
 
 /// Control tag for [`Control::Pause`].
 pub const CONTROL_PAUSE: u8 = 1;
@@ -111,8 +146,21 @@ pub const CONTROL_CANCEL: u8 = 2;
 /// Control tag for [`Control::Resume`].
 pub const CONTROL_RESUME: u8 = 3;
 
-/// Every message type value; keeps the set closed and iterable.
-const TYPE_VALUES: [u16; 12] = [
+/// `Admission.reason` tag: the permit is granted and live.
+pub const ADMISSION_REASON_OK: u8 = 0;
+/// `Admission.reason` tag: denied for now — a serial-mode constraint says
+/// this code group must finish its current task first (retry later).
+pub const ADMISSION_REASON_SERIAL_WAIT: u8 = 1;
+/// `Admission.reason` tag: denied for now — a numeric admission/queue cap
+/// is exhausted (bounded `BUSY`/retry hint, scheduler.md §7).
+pub const ADMISSION_REASON_CAPACITY: u8 = 2;
+/// `Admission.reason` tag: the permit being acked is unknown or expired;
+/// the sender must resubmit a fresh TaskOpen.
+pub const ADMISSION_REASON_STALE_PERMIT: u8 = 3;
+
+/// Every message type value; keeps the set closed and iterable. The three
+/// scheduler admission types (13-15) extend the same u16 space.
+const TYPE_VALUES: [u16; 15] = [
     TYPE_HELLO,
     TYPE_OFFER,
     TYPE_ACCEPT,
@@ -125,6 +173,9 @@ const TYPE_VALUES: [u16; 12] = [
     TYPE_FINALIZE,
     TYPE_FINAL_ACK,
     TYPE_ERROR,
+    TYPE_TASK_OPEN,
+    TYPE_ADMISSION,
+    TYPE_ADMISSION_ACK,
 ];
 
 /// Smallest possible encoded [`WireEntry`]: 2 + 1 + 8 + 8 + 1 + 32 + 4.
@@ -166,6 +217,24 @@ pub enum Control {
     Pause,
     Cancel,
     Resume,
+}
+
+/// Decision code carried by [`Message::Admission`] (scheduler.md §4/§7
+/// budget discipline): a closed one-byte set mirrored by the
+/// `ADMISSION_REASON_*` constants — decode rejects every other value, in
+/// the same discipline as the Control tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionReason {
+    /// The permit is granted and live (`granted = true`).
+    Ok,
+    /// A serial-mode constraint says this code group must finish its
+    /// current task first; retry after the active task ends.
+    SerialWait,
+    /// A numeric admission/queue cap is exhausted; retry after capacity
+    /// frees up.
+    Capacity,
+    /// The permit being acked is unknown or expired; resubmit TaskOpen.
+    StalePermit,
 }
 
 /// Manifest entry as it appears on the wire.
@@ -292,6 +361,32 @@ pub enum Message {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    /// Scheduler admission, wave 20 (scheduler.md §4/§6): a sender asks the
+    /// receiving owner of a code group for a transfer permit. Only valid
+    /// after both Hellos carried [`CAP_SCHEDULER`]. The `group` field is
+    /// the `code_id` (32-byte form) and `group_registry` the registry
+    /// identity, together forming the `CodeGroupKey`.
+    TaskOpen {
+        job_id: JobId,
+        permit_id: [u8; 16],
+        group: [u8; 32],
+        group_registry: [u8; 32],
+    },
+    /// The receiving side's admission decision for one `permit_id`.
+    /// `granted = true` requires `reason = Ok`; a denial names the closed
+    /// [`AdmissionReason`] so the sender can back off correctly.
+    Admission {
+        job_id: JobId,
+        permit_id: [u8; 16],
+        granted: bool,
+        reason: AdmissionReason,
+    },
+    /// Final handshake of the exchange: the sender confirms it is acting
+    /// on the admission decision, releasing the tentative permit state.
+    AdmissionAck {
+        job_id: JobId,
+        permit_id: [u8; 16],
     },
 }
 
@@ -498,6 +593,9 @@ fn type_of(message: &Message) -> u16 {
         Message::Finalize { .. } => TYPE_FINALIZE,
         Message::FinalAck { .. } => TYPE_FINAL_ACK,
         Message::Error { .. } => TYPE_ERROR,
+        Message::TaskOpen { .. } => TYPE_TASK_OPEN,
+        Message::Admission { .. } => TYPE_ADMISSION,
+        Message::AdmissionAck { .. } => TYPE_ADMISSION_ACK,
     }
 }
 
@@ -520,8 +618,22 @@ pub fn type_name(r#type: u16) -> Option<&'static str> {
         TYPE_FINALIZE => "Finalize",
         TYPE_FINAL_ACK => "FinalAck",
         TYPE_ERROR => "Error",
+        TYPE_TASK_OPEN => "TaskOpen",
+        TYPE_ADMISSION => "Admission",
+        TYPE_ADMISSION_ACK => "AdmissionAck",
         _ => return None,
     })
+}
+
+/// Whether the scheduler admission frames (types 13-15) may flow between
+/// two ends whose Hello `capabilities` were `local` and `remote`: BOTH must
+/// carry [`CAP_SCHEDULER`] (scheduler.md §6; Hello negotiation compat).
+/// A peer without the bit never receives one of these frames and the
+/// engine answers `PROTOCOL_UNSUPPORTED` — no silent fallback. Pure
+/// predicate for the wave-21 engine wiring; the codec itself decodes the
+/// closed set uniformly.
+pub fn scheduler_frames_allowed(local: u16, remote: u16) -> bool {
+    local & CAP_SCHEDULER != 0 && remote & CAP_SCHEDULER != 0
 }
 
 /// Exact payload upper bound for one message type under `limits`, or `None`
@@ -549,6 +661,13 @@ fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
         TYPE_FINALIZE => 16,
         // code(2) + str(2 + error message bytes).
         TYPE_ERROR => 4 + u64::from(limits.max_error_message_bytes),
+        // Scheduler admission frames are fixed-size, limits-independent:
+        // job_id(16) + permit_id(16) + group(32) + group_registry(32).
+        TYPE_TASK_OPEN => 96,
+        // job_id(16) + permit_id(16) + granted(1) + reason(1).
+        TYPE_ADMISSION => 34,
+        // job_id(16) + permit_id(16).
+        TYPE_ADMISSION_ACK => 32,
         _ => return None,
     })
 }
@@ -714,8 +833,56 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) -> Result<(), EncodeErro
             put_u16(out, code.code());
             put_str(out, message)?;
         }
+        Message::TaskOpen {
+            job_id,
+            permit_id,
+            group,
+            group_registry,
+        } => {
+            out.extend_from_slice(job_id);
+            out.extend_from_slice(permit_id);
+            out.extend_from_slice(group);
+            out.extend_from_slice(group_registry);
+        }
+        Message::Admission {
+            job_id,
+            permit_id,
+            granted,
+            reason,
+        } => {
+            out.extend_from_slice(job_id);
+            out.extend_from_slice(permit_id);
+            put_bool(out, *granted);
+            out.push(admission_reason_tag(*reason));
+        }
+        Message::AdmissionAck { job_id, permit_id } => {
+            out.extend_from_slice(job_id);
+            out.extend_from_slice(permit_id);
+        }
     }
     Ok(())
+}
+
+/// Wire tag of an [`AdmissionReason`] (closed set, one byte).
+fn admission_reason_tag(reason: AdmissionReason) -> u8 {
+    match reason {
+        AdmissionReason::Ok => ADMISSION_REASON_OK,
+        AdmissionReason::SerialWait => ADMISSION_REASON_SERIAL_WAIT,
+        AdmissionReason::Capacity => ADMISSION_REASON_CAPACITY,
+        AdmissionReason::StalePermit => ADMISSION_REASON_STALE_PERMIT,
+    }
+}
+
+/// Inverse of [`admission_reason_tag`]; unknown tags are rejected with the
+/// same closed-set discipline as control tags.
+fn admission_reason_from_tag(tag: u8) -> Result<AdmissionReason, DecodeError> {
+    match tag {
+        ADMISSION_REASON_OK => Ok(AdmissionReason::Ok),
+        ADMISSION_REASON_SERIAL_WAIT => Ok(AdmissionReason::SerialWait),
+        ADMISSION_REASON_CAPACITY => Ok(AdmissionReason::Capacity),
+        ADMISSION_REASON_STALE_PERMIT => Ok(AdmissionReason::StalePermit),
+        _ => Err(DecodeError::Malformed("unknown admission reason")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1163,22 @@ fn decode_message(
         TYPE_ERROR => Message::Error {
             code: error_code(cursor)?,
             message: limited_string(cursor, limits.max_error_message_bytes)?,
+        },
+        TYPE_TASK_OPEN => Message::TaskOpen {
+            job_id: cursor.array::<16>()?,
+            permit_id: cursor.array::<16>()?,
+            group: cursor.array::<32>()?,
+            group_registry: cursor.array::<32>()?,
+        },
+        TYPE_ADMISSION => Message::Admission {
+            job_id: cursor.array::<16>()?,
+            permit_id: cursor.array::<16>()?,
+            granted: cursor.boolean()?,
+            reason: admission_reason_from_tag(cursor.u8()?)?,
+        },
+        TYPE_ADMISSION_ACK => Message::AdmissionAck {
+            job_id: cursor.array::<16>()?,
+            permit_id: cursor.array::<16>()?,
         },
         _ => return Err(DecodeError::UnknownType(message_type)),
     })
@@ -1393,12 +1576,14 @@ mod tests {
         for (index, message_type) in TYPE_VALUES.iter().enumerate() {
             assert_eq!(*message_type, index as u16 + 1);
         }
-        assert_eq!(TYPE_VALUES.len(), 12);
+        // Wave 20: the three scheduler admission frames (13-15) extend the
+        // same contiguous u16 space.
+        assert_eq!(TYPE_VALUES.len(), 15);
     }
 
     #[test]
     fn type_names_cover_exactly_the_closed_set() {
-        let expected: [(u16, &str); 12] = [
+        let expected: [(u16, &str); 15] = [
             (TYPE_HELLO, "Hello"),
             (TYPE_OFFER, "Offer"),
             (TYPE_ACCEPT, "Accept"),
@@ -1411,14 +1596,18 @@ mod tests {
             (TYPE_FINALIZE, "Finalize"),
             (TYPE_FINAL_ACK, "FinalAck"),
             (TYPE_ERROR, "Error"),
+            (TYPE_TASK_OPEN, "TaskOpen"),
+            (TYPE_ADMISSION, "Admission"),
+            (TYPE_ADMISSION_ACK, "AdmissionAck"),
         ];
         assert_eq!(expected.len(), TYPE_VALUES.len());
         for (value, name) in expected {
             assert_eq!(type_name(value), Some(name));
         }
         // Everything outside the frozen set is unnamed, symmetric with
-        // DecodeError::UnknownType rejecting the same values.
-        for unknown in [0u16, 13, 999, u16::MAX] {
+        // DecodeError::UnknownType rejecting the same values (16 is the
+        // first value freed by the scheduler frames taking 13-15).
+        for unknown in [0u16, 16, 999, u16::MAX] {
             assert_eq!(type_name(unknown), None, "type {unknown} must be unnamed");
         }
     }
@@ -1510,6 +1699,32 @@ mod tests {
                 Message::Error {
                     code: ErrorCode::StorageFull,
                     message: "no space".to_owned(),
+                },
+            ),
+            // Scheduler admission frames (wave 20).
+            (
+                TYPE_TASK_OPEN,
+                Message::TaskOpen {
+                    job_id: [1; 16],
+                    permit_id: [2; 16],
+                    group: [3; 32],
+                    group_registry: [4; 32],
+                },
+            ),
+            (
+                TYPE_ADMISSION,
+                Message::Admission {
+                    job_id: [1; 16],
+                    permit_id: [2; 16],
+                    granted: false,
+                    reason: AdmissionReason::Capacity,
+                },
+            ),
+            (
+                TYPE_ADMISSION_ACK,
+                Message::AdmissionAck {
+                    job_id: [1; 16],
+                    permit_id: [2; 16],
                 },
             ),
         ];
@@ -1631,6 +1846,22 @@ mod tests {
                 code: ErrorCode::StorageFull,
                 message: "no space".to_owned(),
             },
+            Message::TaskOpen {
+                job_id: [1; 16],
+                permit_id: [2; 16],
+                group: [3; 32],
+                group_registry: [4; 32],
+            },
+            Message::Admission {
+                job_id: [1; 16],
+                permit_id: [2; 16],
+                granted: true,
+                reason: AdmissionReason::Ok,
+            },
+            Message::AdmissionAck {
+                job_id: [1; 16],
+                permit_id: [2; 16],
+            },
         ];
         let bound = Frame::max_len(&limits);
         for message in samples {
@@ -1671,7 +1902,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_types() {
-        for bad in [0u16, 13, 999, u16::MAX] {
+        // 16 is the first free value since the scheduler frames took 13-15.
+        for bad in [0u16, 16, 999, u16::MAX] {
             let buf = frame_of(bad, &[0; 16]);
             assert!(matches!(
                 Frame::decode(&buf, &Limits::default()),
@@ -2362,6 +2594,396 @@ mod tests {
             };
             // Whatever the bytes say, decode must answer, never panic.
             let _ = Frame::decode(&bytes, &limits);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Scheduler admission frames, wave 20 (types 13-15).
+    // ------------------------------------------------------------------
+
+    fn task_open(job: u8, permit: u8) -> Message {
+        Message::TaskOpen {
+            job_id: [job; 16],
+            permit_id: [permit; 16],
+            group: [(job * 3) | 1; 32],
+            group_registry: [(permit * 5) | 2; 32],
+        }
+    }
+
+    #[test]
+    fn scheduler_round_trips_preserve_every_field() {
+        assert_round_trips(task_open(0x11, 0x22));
+        assert_round_trips(Message::TaskOpen {
+            job_id: [0; 16],
+            permit_id: [0xFF; 16],
+            group: [0xAB; 32],
+            group_registry: [0x00; 32],
+        });
+        for granted in [true, false] {
+            for reason in [
+                AdmissionReason::Ok,
+                AdmissionReason::SerialWait,
+                AdmissionReason::Capacity,
+                AdmissionReason::StalePermit,
+            ] {
+                assert_round_trips(Message::Admission {
+                    job_id: [7; 16],
+                    permit_id: [9; 16],
+                    granted,
+                    reason,
+                });
+            }
+        }
+        assert_round_trips(Message::AdmissionAck {
+            job_id: [0xEE; 16],
+            permit_id: [0x01; 16],
+        });
+    }
+
+    #[test]
+    fn scheduler_payload_sizes_are_exact_and_within_budget() {
+        // Fixed sizes: 96 / 34 / 32 payload bytes, +7 header.
+        let open = encoded(&task_open(1, 2));
+        assert_eq!(open.len(), HEADER_LEN + 96);
+        assert_eq!(u32::from_be_bytes([open[3], open[4], open[5], open[6]]), 96);
+
+        let admission = encoded(&Message::Admission {
+            job_id: [1; 16],
+            permit_id: [2; 16],
+            granted: true,
+            reason: AdmissionReason::Ok,
+        });
+        assert_eq!(admission.len(), HEADER_LEN + 34);
+
+        let ack = encoded(&Message::AdmissionAck {
+            job_id: [1; 16],
+            permit_id: [2; 16],
+        });
+        assert_eq!(ack.len(), HEADER_LEN + 32);
+
+        // The budgets are limits-independent: even a 1-byte-string, 1-entry
+        // configuration leaves the fixed-size admission frames intact.
+        let tiny = Limits {
+            max_chunk_bytes: 1,
+            max_entries_per_page: 1,
+            max_string_bytes: 1,
+            max_error_message_bytes: 1,
+            max_resume_entries: 1,
+            max_chunk_digests: 1,
+        };
+        for buf in [&open, &admission, &ack] {
+            assert!(Frame::decode(buf, &tiny).is_ok());
+        }
+    }
+
+    #[test]
+    fn admission_reason_tags_form_a_closed_set() {
+        assert_eq!(ADMISSION_REASON_OK, 0);
+        assert_eq!(ADMISSION_REASON_SERIAL_WAIT, 1);
+        assert_eq!(ADMISSION_REASON_CAPACITY, 2);
+        assert_eq!(ADMISSION_REASON_STALE_PERMIT, 3);
+        let tags = [
+            admission_reason_tag(AdmissionReason::Ok),
+            admission_reason_tag(AdmissionReason::SerialWait),
+            admission_reason_tag(AdmissionReason::Capacity),
+            admission_reason_tag(AdmissionReason::StalePermit),
+        ];
+        assert_eq!(tags, [0, 1, 2, 3]);
+        for tag in 0u8..=3 {
+            assert_eq!(
+                admission_reason_from_tag(tag)
+                    .map(admission_reason_tag)
+                    .ok(),
+                Some(tag)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_types_join_the_contiguous_closed_set() {
+        assert_eq!(
+            (TYPE_TASK_OPEN, TYPE_ADMISSION, TYPE_ADMISSION_ACK),
+            (13, 14, 15)
+        );
+        assert_eq!(type_name(TYPE_TASK_OPEN), Some("TaskOpen"));
+        assert_eq!(type_name(TYPE_ADMISSION), Some("Admission"));
+        assert_eq!(type_name(TYPE_ADMISSION_ACK), Some("AdmissionAck"));
+        for message in [
+            task_open(1, 2),
+            Message::Admission {
+                job_id: [1; 16],
+                permit_id: [2; 16],
+                granted: false,
+                reason: AdmissionReason::StalePermit,
+            },
+            Message::AdmissionAck {
+                job_id: [1; 16],
+                permit_id: [2; 16],
+            },
+        ] {
+            let buf = encoded(&message);
+            // kind(), the encoded header, and type_name all agree.
+            assert_eq!(message.kind(), u16::from_be_bytes([buf[1], buf[2]]));
+            assert_eq!(type_name(message.kind()), type_name(message.kind()));
+        }
+    }
+
+    #[test]
+    fn cap_scheduler_bit_is_disjoint_and_negotiation_needs_both_ends() {
+        assert_eq!(CAP_SCHEDULER, 0x0008);
+        let previous = CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM;
+        assert_eq!(previous, 0x0007);
+        assert_eq!(previous & CAP_SCHEDULER, 0, "bit must not collide");
+
+        // Only when BOTH Hellos carry the bit may types 13-15 flow.
+        assert!(scheduler_frames_allowed(CAP_SCHEDULER, CAP_SCHEDULER));
+        assert!(scheduler_frames_allowed(
+            previous | CAP_SCHEDULER,
+            CAP_SCHEDULER
+        ));
+        assert!(!scheduler_frames_allowed(previous, CAP_SCHEDULER));
+        assert!(!scheduler_frames_allowed(CAP_SCHEDULER, previous));
+        assert!(!scheduler_frames_allowed(previous, previous));
+        assert!(!scheduler_frames_allowed(0, 0));
+        // An old peer (no bit) plus a Hello that still round-trips with the
+        // new bit set: negotiation itself stays wire-compatible.
+        assert_round_trips(Message::Hello {
+            proto_version: 1,
+            device_name: "scheduler-peer".to_owned(),
+            public_key: digest(5),
+            capabilities: previous | CAP_SCHEDULER,
+        });
+    }
+
+    #[test]
+    fn rejects_unknown_admission_reason_tags() {
+        for bad in [4u8, 5, 17, 255] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[1u8; 16]); // job_id
+            payload.extend_from_slice(&[2u8; 16]); // permit_id
+            payload.push(0); // granted
+            payload.push(bad); // reason outside the closed set
+            let buf = frame_of(TYPE_ADMISSION, &payload);
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &Limits::default()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "reason {bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_boolean_granted_bytes() {
+        for bad in [2u8, 0x80, 0xFF] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[1u8; 16]); // job_id
+            payload.extend_from_slice(&[2u8; 16]); // permit_id
+            payload.push(bad); // granted must be 0/1
+            payload.push(ADMISSION_REASON_OK);
+            let buf = frame_of(TYPE_ADMISSION, &payload);
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &Limits::default()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "granted {bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_declared_scheduler_payloads() {
+        // One byte past each fixed budget, refused before any allocation.
+        for (message_type, budget) in [
+            (TYPE_TASK_OPEN, 96u32),
+            (TYPE_ADMISSION, 34),
+            (TYPE_ADMISSION_ACK, 32),
+        ] {
+            let mut buf = frame_of(message_type, &[0; 8]);
+            buf[3..7].copy_from_slice(&(budget + 1).to_be_bytes());
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &Limits::default()),
+                    Err(DecodeError::Oversized { declared, budget: b })
+                        if declared == budget + 1 && b == budget
+                ),
+                "type {message_type} accepted an oversized declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_scheduler_payloads() {
+        // Cut inside each message body, with the declaration matching the
+        // shortened input: decode must report the shortage, never guess.
+        for (message_type, body) in [
+            (TYPE_TASK_OPEN, task_open(1, 2)),
+            (
+                TYPE_ADMISSION,
+                Message::Admission {
+                    job_id: [1; 16],
+                    permit_id: [2; 16],
+                    granted: true,
+                    reason: AdmissionReason::Ok,
+                },
+            ),
+            (
+                TYPE_ADMISSION_ACK,
+                Message::AdmissionAck {
+                    job_id: [1; 16],
+                    permit_id: [2; 16],
+                },
+            ),
+        ] {
+            let full = encoded(&body);
+            for cut in [1usize, 16, 33, 95] {
+                if cut >= full.len() - HEADER_LEN {
+                    continue;
+                }
+                let mut short = full[..HEADER_LEN + cut].to_vec();
+                short[3..7].copy_from_slice(&(cut as u32).to_be_bytes());
+                assert!(
+                    matches!(
+                        Frame::decode(&short, &Limits::default()),
+                        Err(DecodeError::Malformed(_))
+                    ),
+                    "type {message_type} truncated to {cut} accepted"
+                );
+            }
+            // Truncation without fixing the declaration: TruncatedPayload.
+            let mut short = full.clone();
+            short.truncate(full.len() - 1);
+            assert!(matches!(
+                Frame::decode(&short, &Limits::default()),
+                Err(DecodeError::TruncatedPayload { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_in_scheduler_frames() {
+        // One byte after the declared frame.
+        let mut outer = encoded(&task_open(1, 2));
+        outer.push(0);
+        assert!(matches!(
+            Frame::decode(&outer, &Limits::default()),
+            Err(DecodeError::Trailing(1))
+        ));
+        // One extra byte claimed inside the declared length: because the
+        // admission budgets are the exact fixed payload sizes (32 here),
+        // the oversized declaration is refused up front — the fixed-size
+        // budget makes a non-exhausted payload structurally unreachable,
+        // which is stricter than the variable-size messages' Trailing.
+        let mut inner = encoded(&Message::AdmissionAck {
+            job_id: [1; 16],
+            permit_id: [2; 16],
+        });
+        inner.push(0);
+        let declared = (inner.len() - HEADER_LEN) as u32;
+        inner[3..7].copy_from_slice(&declared.to_be_bytes());
+        assert!(matches!(
+            Frame::decode(&inner, &Limits::default()),
+            Err(DecodeError::Oversized {
+                declared: 33,
+                budget: 32
+            })
+        ));
+    }
+
+    #[test]
+    fn scheduler_frames_reject_bad_versions_and_unknown_neighbors() {
+        // Version discipline is unchanged for the new types.
+        let mut buf = encoded(&task_open(1, 2));
+        for bad in [0u8, 2, 255] {
+            buf[0] = bad;
+            assert!(matches!(
+                Frame::decode(&buf, &Limits::default()),
+                Err(DecodeError::BadVersion(v)) if v == bad
+            ));
+        }
+        buf[0] = VERSION;
+        assert!(Frame::decode(&buf, &Limits::default()).is_ok());
+        // The neighbors 12 stays known and 16 stays unknown: the extension
+        // did not widen into a range.
+        assert!(type_name(12).is_some());
+        assert!(type_name(16).is_none());
+        let buf = frame_of(16, &[0; 96]);
+        assert!(matches!(
+            Frame::decode(&buf, &Limits::default()),
+            Err(DecodeError::UnknownType(16))
+        ));
+    }
+
+    #[test]
+    fn fuzzed_scheduler_frames_never_panic() {
+        let mut r = Lcg(0x5c8e_d17e_f00d_cafe);
+        let limits = Limits::default();
+        for i in 0..1500u32 {
+            let message_type = 13 + (r.below(3) as u16);
+            let bytes: Vec<u8> = if i % 2 == 0 {
+                // Random garbage of plausible length for the fixed budgets.
+                (0..r.below(140)).map(|_| r.byte()).collect()
+            } else {
+                // A valid scheduler frame, then 1-3 corruptions.
+                let message = match message_type {
+                    TYPE_ADMISSION => Message::Admission {
+                        job_id: [r.byte(); 16],
+                        permit_id: [r.byte(); 16],
+                        granted: r.byte().is_multiple_of(2),
+                        reason: match r.below(4) {
+                            0 => AdmissionReason::Ok,
+                            1 => AdmissionReason::SerialWait,
+                            2 => AdmissionReason::Capacity,
+                            _ => AdmissionReason::StalePermit,
+                        },
+                    },
+                    TYPE_ADMISSION_ACK => Message::AdmissionAck {
+                        job_id: [r.byte(); 16],
+                        permit_id: [r.byte(); 16],
+                    },
+                    _ => Message::TaskOpen {
+                        job_id: [r.byte(); 16],
+                        permit_id: [r.byte(); 16],
+                        group: [r.byte(); 32],
+                        group_registry: [r.byte(); 32],
+                    },
+                };
+                let mut buf = encoded(&message);
+                for _ in 0..(1 + r.below(3)) {
+                    match r.below(4) {
+                        0 if !buf.is_empty() => {
+                            let at = r.below(buf.len() as u64) as usize;
+                            buf[at] = r.byte();
+                        }
+                        1 if !buf.is_empty() => {
+                            let at = r.below(buf.len() as u64) as usize;
+                            buf.truncate(at);
+                        }
+                        2 => buf.push(r.byte()),
+                        _ => {
+                            let at = r.below(buf.len() as u64 + 1) as usize;
+                            buf.insert(at, r.byte());
+                        }
+                    }
+                }
+                buf
+            };
+            let mut buf = {
+                let mut framed = Vec::with_capacity(HEADER_LEN + bytes.len());
+                framed.push(VERSION);
+                framed.extend_from_slice(&message_type.to_be_bytes());
+                framed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&bytes);
+                framed
+            };
+            let _ = Frame::decode(&buf, &limits);
+            // And the declared-length manipulation must not panic either.
+            if buf.len() >= HEADER_LEN {
+                buf[3..7].copy_from_slice(&r.next_u64().to_be_bytes()[4..8]);
+                let _ = Frame::decode(&buf, &limits);
+            }
         }
     }
 }

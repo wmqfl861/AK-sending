@@ -8,8 +8,20 @@
 //! Wave 19 (B0) delivers the pure scheduler domain model in
 //! [`scheduler`]: two-dimensional concurrency policy, bounded fair queue,
 //! admission decisions and the task/permit state machine that the B6
-//! runtime will drive from a single actor.
+//! runtime drives from a single actor.
+//!
+//! Wave 20 (B6) adds [`runtime`]: the resident session runtime in
+//! Fake-DI form — a scheduler actor owning the core, task-lifecycle
+//! orchestration (backoff, park, cancel), a pairing listener, bounded
+//! event broadcast and drain/cancel shutdown. Real networking is injected
+//! through the `PairingTransport`/`TransferExecutor` traits (wave 21
+//! binds the real adapters), so this crate still performs no networking
+//! and no direct I/O.
 #![forbid(unsafe_code)]
 
 /// Pure scheduler domain model (policy, queue, admission, state machine).
 pub mod scheduler;
+
+/// Resident session runtime (scheduler actor, task lifecycle, listener,
+/// shutdown) over injected Fake/real dependencies.
+pub mod runtime;

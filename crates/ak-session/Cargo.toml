@@ -8,3 +8,4 @@ description = "Shared session application layer: pure scheduler domain model (tw
 [dependencies]
 ak-core = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }

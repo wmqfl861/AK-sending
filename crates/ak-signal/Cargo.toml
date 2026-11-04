@@ -10,8 +10,31 @@ ak-identity = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
+# A3 (client_v2): CSPRNG request ids / nonces (pairing-flow.md: ids come from
+# the OS CSPRNG, never from util::unique_bytes).
+rand = { workspace = true }
+# A3 (client_v2): TLS control connections with registry fingerprint pinning
+# (pairing-flow.md §3). Reuses the rustls already locked in the workspace
+# graph via ak-net (rustls 0.23, ring provider); tokio-rustls is the thin
+# async adapter for it over tokio TcpStream. Declared locally (not in the
+# shared workspace table) to avoid cross-agent edits of the root Cargo.toml.
+rustls = { workspace = true }
+# default-features off: the workspace locks the ring provider (ak-net
+# discipline); tokio-rustls's default would add the aws-lc-rs provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 tempfile = "3"
+
+# A2 (server_v2): the authoritative invite registry backend. Optional so
+# the default dependency graph never links a server-side SQLite — the v2
+# registry server refuses invite operations without it (storage-schema.md
+# part 1). rusqlite stays at the workspace-locked bundled version.
+[features]
+server-persistence = ["dep:rusqlite"]
+
+[dependencies.rusqlite]
+workspace = true
+optional = true

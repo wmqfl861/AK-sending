@@ -7,6 +7,18 @@
 //! `.akpart` file, fsync, then hard-link + unlink; the final name only
 //! appears after the whole digest matches and is never created over an
 //! existing file).
+//!
+//! # Per-task staging namespace (wave 20)
+//!
+//! [`LocalSaveTarget::prepare_file_staged`] writes each task's `.akpart`
+//! files under `<root>/.ak-staging/<task-hex>/...` instead of next to the
+//! final name, so two concurrent tasks aiming at the same destination
+//! never share (or clobber) one in-flight part. Commit stays the same
+//! atomic no-replace [`commit_no_replace`] into the final location. A
+//! legacy same-directory `.akpart` left by a pre-staging run is migrated
+//! into the task's staging tree on prepare and resumed from there;
+//! [`discard_staging`] removes one task's whole staging tree on cancel or
+//! task end without touching any other task's parts.
 #![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -535,6 +547,7 @@ impl LocalSaveTarget {
             chunk_digests: entry.chunk_digests.clone(),
             verified_prefix,
             finished: false,
+            staged: false,
         };
         Ok(LocalFileSink {
             kind: SinkKind::File(state),
@@ -758,6 +771,12 @@ struct PartState {
     chunk_digests: Vec<[u8; DIGEST_LEN]>,
     verified_prefix: u64,
     finished: bool,
+    /// True when the part file lives in this task's staging tree (wave 20).
+    /// Only staged sinks resolve a same-target finish race by content: an
+    /// existing final whose whole digest already matches this sink's
+    /// verified content is reused instead of surfacing as a conflict. The
+    /// unstaged path keeps its exact historical behavior.
+    staged: bool,
 }
 
 impl FileSink for LocalFileSink {
@@ -870,6 +889,20 @@ impl FileSink for LocalFileSink {
         // (AlreadyExists) instead of silently replacing the target.
         let mut target = st.final_path.clone();
         if fs::symlink_metadata(&target).is_ok() {
+            // Staged sinks (wave 20) resolve a same-target race by content:
+            // when the existing final is byte-identical to this sink's
+            // verified content, the concurrent task's commit is reused and
+            // this task's staging part is dropped — "same content: exactly
+            // one commit, one reuse". Unstaged sinks never take this path.
+            if st.staged && staged_target_matches(st, &target)? {
+                // The open handle does not block the unlink: std opens with
+                // FILE_SHARE_DELETE on Windows and POSIX unlink is immune.
+                // Best effort; an undeletable part is later reaped by
+                // discard_staging / discard_orphan_parts.
+                let _ = fs::remove_file(&st.part_path);
+                st.finished = true;
+                return Ok(());
+            }
             match st.conflict {
                 ConflictPolicy::Fail => return Err(conflict_err(&target)),
                 ConflictPolicy::Rename => target = conflict_free_name(&target),
@@ -1071,6 +1104,240 @@ pub fn discard_orphan_parts(root: &Path, older_than: Duration) -> io::Result<u64
         }
     }
     Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Per-task staging namespace (wave 20)
+// ---------------------------------------------------------------------------
+
+/// Directory directly under a save target root holding all per-task
+/// staging trees: `<root>/.ak-staging/<task-hex>/`.
+pub const STAGING_DIR: &str = ".ak-staging";
+
+/// Staging subtree owned by one task: `<root>/.ak-staging/<task_hex>/`,
+/// where `task_hex` is the 32-character lowercase hex of the 16-byte task
+/// id (the wire `transfer_id`/scheduler task identity — B5 passes the same
+/// id on every prepare of a task so same-instance resume reuses its parts).
+/// Pure path arithmetic: no validation, no filesystem access.
+pub fn staging_path(root: &Path, task_id: [u8; 16]) -> PathBuf {
+    root.join(STAGING_DIR).join(hex_prefix(&task_id, 16))
+}
+
+impl LocalSaveTarget {
+    /// [`SaveTarget::prepare_file`] variant that keeps this task's in-flight
+    /// `.akpart` inside its own staging tree
+    /// (`<root>/.ak-staging/<task_hex>/<entry dirs…>/<name>.akpart`)
+    /// instead of next to the final name, so concurrent tasks aiming at
+    /// the same destination never compete for one part file.
+    ///
+    /// Semantics beyond [`LocalSaveTarget::prepare_file_with_chunk_size`]:
+    ///
+    /// * same validation (chunk-size cap, path safety, digest algorithm,
+    ///   chunk-plan consistency), same already-committed fast path, same
+    ///   resume-by-verified-prefix, same atomic no-replace
+    ///   [`commit_no_replace`] at finish;
+    /// * a legacy same-directory `.akpart` (pre-staging run) is moved into
+    ///   this task's staging tree on first prepare and resumed from there —
+    ///   migration only runs when no staging part exists yet, so it can
+    ///   never clobber a longer in-flight staged part;
+    /// * at finish, a same-target race is resolved by content: when the
+    ///   existing final already matches this sink's verified whole digest,
+    ///   that commit is reused (idempotent success, own part dropped);
+    ///   different content still honors the conflict policy (Fail errors,
+    ///   Rename lands as ` (2)`).
+    ///
+    /// The engine calls [`discard_staging`] with the same `task_id` when
+    /// the task reaches a terminal state (cancel or completion cleanup).
+    /// The all-zero task id is reserved (contract sentinel) and rejected.
+    pub fn prepare_file_staged(
+        &self,
+        task_id: [u8; 16],
+        entry: &FileEntry,
+        conflict: ConflictPolicy,
+        chunk_size: NonZeroU32,
+    ) -> io::Result<LocalFileSink> {
+        if task_id == [0u8; 16] {
+            return Err(invalid_input_io(
+                "all-zero task id is reserved and cannot own a staging tree",
+            ));
+        }
+        ensure_chunk_size_within_cap(chunk_size)?;
+        let parts = checked_rel_components(entry)?;
+        if entry.is_dir {
+            ensure_real_dirs(&self.root, &parts)?;
+            return Ok(LocalFileSink {
+                kind: SinkKind::Directory,
+            });
+        }
+        if entry.digest_alg != DIGEST_ALG_BLAKE3 {
+            return Err(invalid_input_io("unsupported digest algorithm"));
+        }
+        let plan = ChunkPlan::new(entry.size, chunk_size);
+        if plan.chunk_count() != entry.chunk_digests.len() as u64 {
+            return Err(invalid_input_io(
+                "entry chunk digests inconsistent with its size and the chunk size",
+            ));
+        }
+        let (name, parents) = parts.split_last().ok_or_else(escape_err)?;
+        ensure_real_dirs(&self.root, parents)?;
+        let mut final_path = self.root.clone();
+        for part in parents {
+            final_path.push(part);
+        }
+        final_path.push(name);
+        // Already-committed fast path, identical to the unstaged variant.
+        if let Ok(meta) = fs::symlink_metadata(&final_path) {
+            if meta.file_type().is_file()
+                && meta.len() == entry.size
+                && final_matches_digest(&final_path, entry, chunk_size)?
+            {
+                return Ok(LocalFileSink {
+                    kind: SinkKind::Committed {
+                        chunk_count: entry.chunk_digests.len() as u64,
+                    },
+                });
+            }
+        }
+        // The staging part mirrors the entry's relative directory
+        // structure inside the task's staging tree, so two files of one
+        // task (and two tasks in one root) can never collide. Every level
+        // is created through ensure_real_dirs: a planted symlink at
+        // `.ak-staging`, at the task level, or at any entry level is
+        // refused before anything is written.
+        let hex = hex_prefix(&task_id, 16);
+        let mut staging_parts: Vec<&OsStr> = vec![OsStr::new(STAGING_DIR), OsStr::new(&hex)];
+        staging_parts.extend(parents.iter().copied());
+        ensure_real_dirs(&self.root, &staging_parts)?;
+        let mut part_path = self.root.clone();
+        for part in &staging_parts {
+            part_path.push(part);
+        }
+        part_path.push(name);
+        let part_path = with_part_suffix(&part_path);
+
+        // Legacy compat: a pre-staging `.akpart` beside the final name is
+        // adopted into this task's staging tree. Only migrate when no
+        // staging part exists yet — Windows rename replaces an existing
+        // destination, and even on POSIX the in-flight staged part is the
+        // fresher one. A legacy leftover that loses the race stays for
+        // discard_orphan_parts to reap.
+        let legacy = with_part_suffix(&final_path);
+        if fs::symlink_metadata(&part_path).is_err() {
+            match fs::symlink_metadata(&legacy) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidInput,
+                            OpenError::SymlinkComponent(legacy),
+                        ));
+                    }
+                    if meta.file_type().is_file() {
+                        fs::rename(&legacy, &part_path)?;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Ok(meta) = fs::symlink_metadata(&part_path) {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    OpenError::SymlinkComponent(part_path),
+                ));
+            }
+        }
+        // No truncate: an existing staged part is verified and resumed.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&part_path)?;
+        let verified_prefix = verify_part_prefix(&mut file, entry, chunk_size)?;
+        let state = PartState {
+            file,
+            final_path,
+            part_path,
+            conflict,
+            size: entry.size,
+            mtime_unix_ms: entry.mtime_unix_ms,
+            chunk_size,
+            whole_digest: entry.whole_digest,
+            chunk_digests: entry.chunk_digests.clone(),
+            verified_prefix,
+            finished: false,
+            staged: true,
+        };
+        Ok(LocalFileSink {
+            kind: SinkKind::File(state),
+        })
+    }
+}
+
+/// Whether the existing final at `target` is a regular file whose whole
+/// BLAKE3 digest equals this staged sink's verified content — the
+/// same-content reuse check of the staging path. Never follows a symlink
+/// and never allocates more than `min(chunk_size, size)`.
+fn staged_target_matches(st: &PartState, target: &Path) -> io::Result<bool> {
+    let meta = match fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        // Vanished between the existence check and here: not a match; the
+        // normal conflict/commit flow re-runs its own checks.
+        Err(_) => return Ok(false),
+    };
+    if !meta.file_type().is_file() || meta.len() != st.size {
+        return Ok(false);
+    }
+    if st.size == 0 {
+        return Ok(st.whole_digest == b3(b""));
+    }
+    let mut file = match File::open(target) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let mut buf = vec![0u8; streaming_buffer_len(st.chunk_size, st.size)];
+    Ok(hash_reader(&mut file, &mut buf)? == st.whole_digest)
+}
+
+/// Remove one task's whole staging tree `<root>/.ak-staging/<task_hex>/`
+/// (cancel path and terminal cleanup helper). Iterative post-order walk,
+/// never follows symlinks (a planted link is itself removed), touches
+/// nothing outside the task's own subtree, and is idempotent: an absent
+/// tree is `Ok(())`. Sibling tasks' trees are untouched.
+pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
+    let top = staging_path(root, task_id);
+    let meta = match fs::symlink_metadata(&top) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(invalid_input_io(format!(
+            "staging path is not a directory: {}",
+            top.display()
+        )));
+    }
+    // Collect directories pre-order (parent before children), then remove
+    // deepest-first; files and symlinks go as soon as they are seen.
+    let mut stack: Vec<PathBuf> = vec![top.clone()];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        dirs.push(dir.clone());
+        for child in fs::read_dir(&dir)? {
+            let path = child?.path();
+            let file_type = fs::symlink_metadata(&path)?.file_type();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    for dir in dirs.into_iter().rev() {
+        fs::remove_dir(&dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2266,6 +2533,369 @@ mod tests {
         assert_eq!(
             fs::read(dst.path().join("docs/2026/note.txt")).unwrap(),
             b"xy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-task staging namespace (wave 20)
+    // -----------------------------------------------------------------------
+
+    const TASK_A: [u8; 16] = [0xAA, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xBB];
+    const TASK_B: [u8; 16] = [0xCC, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xDD];
+
+    #[test]
+    fn staging_path_is_per_task_and_hex_encoded() {
+        let root = Path::new("/dest");
+        let path = staging_path(root, TASK_A);
+        // Tail-component comparison keeps the assertion separator-agnostic.
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "aa0102030405060708090a0b0c0d0ebb"
+        );
+        assert_eq!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            STAGING_DIR
+        );
+        assert_eq!(
+            path.parent().unwrap().parent().unwrap(),
+            root,
+            "staging tree lives directly under the destination root"
+        );
+        // Deterministic per id, distinct across ids.
+        assert_eq!(staging_path(root, TASK_A), staging_path(root, TASK_A));
+        assert_ne!(staging_path(root, TASK_A), staging_path(root, TASK_B));
+        assert_eq!(
+            staging_path(root, [0u8; 16])
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "00000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn staged_transfer_keeps_parts_out_of_destination_and_resumes() {
+        let content = b"0123456789abcdefGHIJ"; // 20 bytes, chunk 8 -> 8+8+4
+        let (_src_tmp, _source, entry) = transfer_entry(content, 8);
+        let mut nested = entry.clone();
+        nested.rel_path = PathBuf::from("docs/2026/note.txt");
+
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let final_path = dst.path().join("docs/2026/note.txt");
+        let staged_part = staging_path(dst.path(), TASK_A).join("docs/2026/note.txt.akpart");
+
+        let mut sink = target
+            .prepare_file_staged(TASK_A, &nested, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        sink.write_chunk(0, b"01234567").unwrap();
+        drop(sink); // interrupted: the part survives inside staging only
+
+        assert!(staged_part.exists(), "part lives in the staging tree");
+        assert!(
+            !dst.path().join("docs/2026/note.txt.akpart").exists(),
+            "no loose part beside the final name"
+        );
+        assert!(!final_path.exists());
+
+        // Same task resumes its own staged prefix.
+        let mut resumed = target
+            .prepare_file_staged(TASK_A, &nested, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(resumed.verified_prefix_chunks(), 1);
+        resumed.write_chunk(1, b"89abcdef").unwrap();
+        resumed.write_chunk(2, b"GHIJ").unwrap();
+        resumed.finish().unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), content);
+        assert!(!staged_part.exists(), "part consumed by the commit");
+        // Staging directory levels survive until task cleanup.
+        assert!(staging_path(dst.path(), TASK_A).join("docs/2026").is_dir());
+        discard_staging(dst.path(), TASK_A).unwrap();
+        assert!(!staging_path(dst.path(), TASK_A).exists());
+        assert_eq!(fs::read(&final_path).unwrap(), content, "final stays");
+
+        // Empty file through the staged path: zero-chunk commit, no part
+        // residue in the destination tree.
+        let empty = FileEntry::new("empty.bin", 0, 0, b3(b""), Vec::new()).unwrap();
+        let mut sink = target
+            .prepare_file_staged(TASK_A, &empty, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            fs::read(dst.path().join("empty.bin")).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(!dst.path().join("empty.bin.akpart").exists());
+    }
+
+    #[test]
+    fn two_tasks_same_target_same_content_commit_once_and_reuse() {
+        let content = b"shared-payload-0123456789"; // 23 bytes, chunk 8 -> 8+8+7
+        let (_tmp_a, source_a, entry_a) = transfer_entry(content, 8);
+        let (_tmp_b, _source_b, entry_b) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let final_path = dst.path().join("payload.bin");
+
+        let mut sink_a = target
+            .prepare_file_staged(TASK_A, &entry_a, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        let mut sink_b = target
+            .prepare_file_staged(TASK_B, &entry_b, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        // Interleaved writes: two live part files, one per task tree.
+        let part_a = staging_path(dst.path(), TASK_A).join("payload.bin.akpart");
+        let part_b = staging_path(dst.path(), TASK_B).join("payload.bin.akpart");
+        assert!(part_a.exists() && part_b.exists());
+        assert_ne!(part_a, part_b);
+        for i in 0..entry_a.chunk_digests.len() as u64 {
+            let range = ChunkPlan::new(entry_a.size, source_a.manifest().chunk_size)
+                .range(i)
+                .unwrap();
+            let len = usize::try_from(range.end - range.start).unwrap();
+            let mut buf = vec![0u8; len];
+            assert_eq!(source_a.read_chunk(0, i, &mut buf).unwrap(), len);
+            sink_a.write_chunk(i, &buf).unwrap();
+            sink_b.write_chunk(i, &buf).unwrap();
+        }
+
+        // First finisher commits; second finisher must REUSE, not conflict
+        // — under Fail policy, success for B is only reachable through the
+        // content-match reuse branch.
+        sink_a.finish().unwrap();
+        sink_b.finish().unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), content);
+        assert!(!part_a.exists() && !part_b.exists(), "both parts consumed");
+        assert!(
+            !dst.path().join("payload (2).bin").exists(),
+            "identical content must not spawn a duplicate"
+        );
+        // Exactly one final name in the destination root (plus the staging
+        // directory): no loose .akpart anywhere in the visible tree.
+        let mut finals: Vec<_> = fs::read_dir(dst.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        finals.sort();
+        assert_eq!(
+            finals,
+            vec![".ak-staging".to_owned(), "payload.bin".to_owned()]
+        );
+    }
+
+    #[test]
+    fn two_tasks_same_target_different_content_one_commit_one_rename() {
+        let content_a = b"AAAAAAAAAAAAAAAA"; // 16 bytes, chunk 8
+        let content_b = b"BBBBBBBBBBBBBBBB"; // same size, different bytes
+        let (_tmp_a, source_a, entry_a) = transfer_entry(content_a, 8);
+        let (_tmp_b, source_b, entry_b) = transfer_entry(content_b, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let final_path = dst.path().join("payload.bin");
+
+        let mut sink_a = target
+            .prepare_file_staged(TASK_A, &entry_a, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink_a, &source_a, &entry_a);
+        sink_a.finish().unwrap();
+
+        let mut sink_b = target
+            .prepare_file_staged(TASK_B, &entry_b, ConflictPolicy::Rename, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink_b, &source_b, &entry_b);
+        sink_b.finish().unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), content_a, "original wins");
+        assert_eq!(
+            fs::read(dst.path().join("payload (2).bin")).unwrap(),
+            content_b,
+            "different content lands under a Rename name"
+        );
+        assert!(
+            !staging_path(dst.path(), TASK_B)
+                .join("payload.bin.akpart")
+                .exists(),
+            "loser's part consumed by its own commit"
+        );
+    }
+
+    #[test]
+    fn two_tasks_different_content_under_fail_keeps_loser_part() {
+        let content_a = b"keep-me-01234567";
+        let content_b = b"loser-89abcdefg";
+        let (_tmp_a, source_a, entry_a) = transfer_entry(content_a, 8);
+        let (_tmp_b, source_b, entry_b) = transfer_entry(content_b, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+
+        let mut sink_a = target
+            .prepare_file_staged(TASK_A, &entry_a, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink_a, &source_a, &entry_a);
+        sink_a.finish().unwrap();
+
+        let mut sink_b = target
+            .prepare_file_staged(TASK_B, &entry_b, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut sink_b, &source_b, &entry_b);
+        let err = sink_b.finish().err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dst.path().join("payload.bin")).unwrap(), content_a);
+        // The loser's fully verified part stays in ITS OWN staging tree for
+        // a policy retry; the destination tree stays clean.
+        let part_b = staging_path(dst.path(), TASK_B).join("payload.bin.akpart");
+        assert!(part_b.exists(), "conflicting part kept in staging");
+        assert!(
+            !dst.path().join("payload.bin.akpart").exists(),
+            "no loose part beside the final name"
+        );
+    }
+
+    #[test]
+    fn cancelling_one_task_never_touches_the_others_parts() {
+        let content = b"0123456789abcdefGHIJ";
+        let (_tmp, _source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let part_b = staging_path(dst.path(), TASK_B).join("payload.bin.akpart");
+
+        let mut sink_a = target
+            .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        let mut sink_b = target
+            .prepare_file_staged(TASK_B, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        sink_a.write_chunk(0, b"01234567").unwrap();
+        sink_b.write_chunk(0, b"01234567").unwrap();
+
+        // Cancel A: the sink-level discard removes only A's own part...
+        sink_a.discard();
+        assert!(!staging_path(dst.path(), TASK_A)
+            .join("payload.bin.akpart")
+            .exists());
+        assert!(part_b.exists(), "B's part must survive A's cancel");
+        // ...and the task-level cleanup removes only A's tree.
+        discard_staging(dst.path(), TASK_A).unwrap();
+        assert!(!staging_path(dst.path(), TASK_A).exists());
+        assert!(part_b.exists(), "B's part still there after A's cleanup");
+        assert!(
+            !dst.path().join("payload.bin").exists(),
+            "nothing committed"
+        );
+
+        // B continues from its untouched part and commits normally.
+        let mut resumed_b = target
+            .prepare_file_staged(TASK_B, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(resumed_b.verified_prefix_chunks(), 1, "B resumes its part");
+        resumed_b.write_chunk(1, b"89abcdef").unwrap();
+        resumed_b.write_chunk(2, b"GHIJ").unwrap();
+        resumed_b.finish().unwrap();
+        assert_eq!(fs::read(dst.path().join("payload.bin")).unwrap(), content);
+    }
+
+    #[test]
+    fn discard_staging_removes_only_that_tasks_tree_and_is_idempotent() {
+        let dst = TempDir::new().unwrap();
+        let tree_a = staging_path(dst.path(), TASK_A);
+        fs::create_dir_all(tree_a.join("deep/dir")).unwrap();
+        wf(&tree_a.join("deep/dir/f.bin.akpart"), b"x");
+        wf(&tree_a.join("top.txt.akpart"), b"y");
+        let tree_b = staging_path(dst.path(), TASK_B);
+        fs::create_dir_all(&tree_b).unwrap();
+        wf(&tree_b.join("keep.bin.akpart"), b"z");
+        let sibling_of_staging = dst.path().join("real-file.txt");
+        wf(&sibling_of_staging, b"keep");
+
+        discard_staging(dst.path(), TASK_A).unwrap();
+        assert!(!tree_a.exists(), "the whole task tree is gone");
+        assert!(tree_b.join("keep.bin.akpart").exists(), "sibling task kept");
+        assert!(sibling_of_staging.exists(), "destination files kept");
+
+        // Idempotent: absent tree is Ok, not NotFound.
+        discard_staging(dst.path(), TASK_A).unwrap();
+        // A planted regular FILE where the task directory belongs refuses
+        // rather than deleting an arbitrary file.
+        wf(&tree_a, b"not-a-dir");
+        assert!(discard_staging(dst.path(), TASK_A).is_err());
+    }
+
+    #[test]
+    fn legacy_sibling_part_migrates_into_staging_and_resumes() {
+        let content = b"0123456789abcdefGHIJ";
+        let (_tmp, _source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let legacy = dst.path().join("payload.bin.akpart");
+        let staged = staging_path(dst.path(), TASK_A).join("payload.bin.akpart");
+
+        // Pre-staging run: classic sink leaves a verified prefix beside the
+        // final name.
+        let mut classic = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        classic.write_chunk(0, b"01234567").unwrap();
+        classic.write_chunk(1, b"89abcdef").unwrap();
+        drop(classic);
+        assert!(legacy.exists());
+
+        // Staged prepare adopts the legacy part into the task tree and
+        // resumes its verified prefix.
+        let mut staged_sink = target
+            .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(staged_sink.verified_prefix_chunks(), 2);
+        assert!(!legacy.exists(), "legacy part moved away, not duplicated");
+        assert!(staged.exists(), "resumed inside the staging tree");
+        assert_eq!(fs::read(&staged).unwrap(), &content[..16]);
+
+        staged_sink.write_chunk(2, b"GHIJ").unwrap();
+        staged_sink.finish().unwrap();
+        assert_eq!(fs::read(dst.path().join("payload.bin")).unwrap(), content);
+        assert!(!staged.exists());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn staged_prepare_rejects_reserved_zero_task_id() {
+        let (_tmp, _source, entry) = transfer_entry(b"01234567", 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let err = target
+            .prepare_file_staged([0u8; 16], &entry, ConflictPolicy::Fail, cs(8))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            !dst.path().join(STAGING_DIR).exists(),
+            "no staging tree created for a rejected id"
+        );
+    }
+
+    #[test]
+    fn staged_prepare_rejects_symlinked_staging_level() {
+        let (_tmp, _source, entry) = transfer_entry(b"01234567", 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let outside = TempDir::new().unwrap();
+        let link = dst.path().join(STAGING_DIR);
+        if !make_symlink(outside.path(), &link, true) {
+            return;
+        }
+        let err = target
+            .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(8))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            outside.path().read_dir().unwrap().next().is_none(),
+            "nothing written through the link"
         );
     }
 }

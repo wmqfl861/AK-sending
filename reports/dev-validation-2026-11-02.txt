@@ -481,3 +481,15 @@ $ dart test → 85/85；$ flutter test → 84/84；repo check → passed
 # A5+B1 store：PairingJournal 四态单调/TaskQueueStore AKREC2 恢复映射（38+sqlite 54，三类崩溃模拟）
 # B0 scheduler：新 crate ak-session——四模式矩阵/FIFO+组间公平/draining/permit（51 测试）
 $ cargo test --workspace → 667/0（基线 507 → +160）；clippy 干净；sqlite 54/54；repo check passed
+
+## 第二十波：v2 服务端/客户端/runtime/准入与staging（2026-11-04，4 并行代理）
+# A2 server_v2：rustls+tokio-rustls TLS1.3（exporter 原样实现）、SQLite 三表（invite_codes 契约逐字）、
+#   claim BEGIN IMMEDIATE 线性化、ghost-pending 统一 PAIR_UNAVAILABLE（无存在性预言机）、全时序至 Ready、
+#   限速双桶、重启恢复（码+挂起事务+状态查询重发）——63 项新测试（特性下 227 全绿）
+# A3 client_v2：TLS 钉扎、单 reader 有界分派（修复 v1 无界 inbox）、幂等 request_id 重试、重连 epoch 重置、
+#   被替换通知——25 集成+9 单元
+# B6 runtime：SessionHandle 七 API、PairingTransport/TransferExecutor 双 trait 注入、四模式时间区间证明、
+#   退避 park+手动 retry、Shutdown Drain/Cancel/超时——28 项新测试（ak-session 79）
+# B2 wire 准入三消息（CAP_SCHEDULER 0x0008、封闭 reason）+ B4 staging 命名空间（同目标并发按内容裁决、
+#   旧 .akpart 迁移兼容、取消隔离）——wire 59/storage 48
+$ cargo test --workspace → 773/0（基线 667 → +106）；sqlite 54；signal+persistence 227；clippy 干净；repo passed

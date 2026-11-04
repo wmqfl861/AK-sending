@@ -631,8 +631,14 @@ impl SchedulerActor {
             let pairing_id = match spec.pairing.clone() {
                 PairingPlan::Ready { pairing_id } => pairing_id,
                 PairingPlan::Redeem { request } => {
-                    // WaitingPairing → redeem → confirm (A3 transcript;
-                    // wave 21 fills the crypto from the pairing module).
+                    // WaitingPairing → redeem → confirm (A3 transcript).
+                    // Wave 21 delivered the real transcript crypto in
+                    // `crate::pairing` (PairingOrchestrator): it owns the
+                    // invite secret, journal and trust book, so flows that
+                    // must reach `PairReady` are orchestrated there and
+                    // submitted as `PairingPlan::Ready`. The transport-level
+                    // confirm below still drives the frames the trait
+                    // models (real adapter: proof + prepared + commit).
                     let accepted = match transport.redeem(request).await {
                         Ok(accepted) => accepted,
                         Err(err) => {
@@ -684,8 +690,13 @@ impl SchedulerActor {
                 }
             }
             sink.phase(handle, TaskPhase::AwaitingAdmission).await;
-            // Wave 21: the real TaskOpen/TaskAdmission handshake (B2/B3)
-            // happens here, then the engine on-channel executor runs.
+            // Wave 21 wiring status: the real `PairingTransport` adapter
+            // (`crate::pairing::RealTransport`) plugs into this runtime via
+            // `RuntimeConfig::transport`, so everything before this point
+            // (redeem/confirm/events) runs against the real registry. The
+            // TaskOpen/TaskAdmission handshake (B2/B3) and the ak-engine
+            // on-channel executor binding remain wave-22 work; the injected
+            // executor still receives admitted tasks here unchanged.
             if let Err(err) = spec.executor.enqueue(handle, spec.clone(), sink.clone()) {
                 sink.finished(handle, FinishOutcome::Failed { error: err.code })
                     .await;

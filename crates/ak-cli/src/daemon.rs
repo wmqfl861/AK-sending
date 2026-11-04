@@ -38,6 +38,16 @@ pub(crate) struct DaemonOptions {
     pub(crate) timeout: u64,
     pub(crate) name: Option<String>,
     pub(crate) json_lines: bool,
+    /// Wave 21: redeem this invite code at startup, then keep receiving.
+    pub(crate) invite_code: Option<String>,
+    /// Wave 21: run the owner-side pairing answer service.
+    pub(crate) pairing: bool,
+    /// Wave 21: scheduler policy pushed via `SessionHandle::set_policy`.
+    pub(crate) same_code: Option<String>,
+    pub(crate) cross_code: Option<String>,
+    /// Registry endpoint (with `registry_fp`); otherwise the saved pin.
+    pub(crate) server: Option<std::net::SocketAddr>,
+    pub(crate) registry_fp: Option<String>,
 }
 
 /// One NDJSON event of the `daemon --json-lines` stream. Field names and
@@ -242,12 +252,140 @@ fn daemon_progress_printer(
     })
 }
 
+/// Map the `--same-code`/`--cross-code` flag words onto the scheduler
+/// policy (pure; unit-tested). Omitted flags keep the contract defaults
+/// (same-code serial, cross-code parallel).
+pub(crate) fn scheduler_policy_from_flags(
+    same_code: Option<&str>,
+    cross_code: Option<&str>,
+) -> Result<ak_session::runtime::SchedulerPolicy> {
+    use ak_session::runtime::SchedulerPolicy;
+    let same = ak_session::scheduler::SameCodeMode::parse(same_code.unwrap_or("serial"))
+        .context("--same-code must be serial or parallel")?;
+    let cross = ak_session::scheduler::CrossCodeMode::parse(cross_code.unwrap_or("parallel"))
+        .context("--cross-code must be serial or parallel")?;
+    let policy = SchedulerPolicy {
+        same_code_mode: same,
+        cross_code_mode: cross,
+        ..SchedulerPolicy::default()
+    };
+    policy
+        .validate()
+        .context("the scheduler policy from --same-code/--cross-code is invalid")?;
+    Ok(policy)
+}
+
+/// Start the session runtime that owns the daemon's scheduling policy and
+/// push the initial policy through `SessionHandle::set_policy`. The
+/// runtime's executor/transport stay in their injected form until the
+/// wave-22 adapter binds `send_on_channel`; today the daemon's transfers
+/// run on the engine loop below, and the runtime is the policy holder the
+/// flags address.
+async fn start_policy_runtime(
+    id: &Path,
+    policy: ak_session::runtime::SchedulerPolicy,
+) -> Result<ak_session::runtime::PolicySwitch> {
+    use ak_session::runtime::{
+        FakePairingTransport, FakeTransferExecutor, RealClock, RuntimeConfig, SessionRuntime,
+    };
+    let (key, _) = crate::load_identity(id)?;
+    let clock: Arc<dyn ak_session::runtime::RuntimeClock> = Arc::new(RealClock::new());
+    let config = RuntimeConfig::new(
+        policy,
+        Arc::clone(&clock),
+        Arc::new(FakePairingTransport::new(false)),
+        Arc::new(FakeTransferExecutor::new(Arc::clone(&clock))),
+        ak_session::runtime::RegistryId::from_bytes(key.public_key()),
+    );
+    // No inbound listener: this runtime instance holds policy only.
+    let mut config = config;
+    config.listener_enabled = false;
+    let handle = SessionRuntime::start(config).context("cannot start the scheduler runtime")?;
+    let switch = handle.set_policy(policy).await.context("set_policy failed")?;
+    Ok(switch)
+}
+
 /// `ak-cli daemon`: resident receive mode (mDNS advertise + receive loop +
 /// event output). See the module docs; Ctrl-C withdraws the announcement
 /// and exits 0.
 pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // Ctrl-C flips the shared shutdown flag; the core loop observes it
+        // alongside everything else.
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = shutdown_tx.send(true);
+    });
+    daemon_core(id, opts, shutdown_rx).await
+}
+
+/// The daemon body, shutdown-driven (the command wrapper only wires
+/// Ctrl-C into the channel). Split so tests can drive a full daemon run
+/// and stop it deterministically.
+pub(crate) async fn daemon_core(
+    id: &Path,
+    opts: DaemonOptions,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let out = DaemonOut::new(opts.json_lines);
     let name = daemon_device_name(opts.name.as_deref())?;
+
+    // Wave 21: scheduler policy flags own the runtime's two-dimensional
+    // concurrency modes.
+    if opts.same_code.is_some() || opts.cross_code.is_some() {
+        let policy =
+            scheduler_policy_from_flags(opts.same_code.as_deref(), opts.cross_code.as_deref())?;
+        let switch = start_policy_runtime(id, policy).await?;
+        out.note(&format!(
+            "scheduler policy: same-code {}, cross-code {} (revision {}, draining {}, admitted {})",
+            policy.same_code_mode.as_str(),
+            policy.cross_code_mode.as_str(),
+            switch.revision,
+            switch.draining,
+            switch.admitted,
+        ));
+    }
+
+    // Wave 21: owner-side pairing service (`--pairing`). Resident: spawned,
+    // stopped by the shared shutdown flag.
+    if opts.pairing {
+        let settings = crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?;
+        let (key, _) = crate::load_identity(id)?;
+        let client = crate::invite::connect_registry(&settings, &key).await?;
+        out.note(&format!(
+            "pairing service: answering redeems for codes in {} (registry {})",
+            id.join(crate::invite::INVITE_STORE_FILE).display(),
+            settings.server
+        ));
+        let json_lines = opts.json_lines;
+        let id_dir = id.to_path_buf();
+        let on_paired = std::sync::Arc::new(move |peer: ak_identity::Fingerprint| {
+            if json_lines {
+                eprintln!("paired with redeemer {}", peer.to_hex());
+            } else {
+                println!("pairing: paired with redeemer {} ({})", peer.short_id(), peer.to_hex());
+            }
+        });
+        tokio::spawn(crate::invite::owner_pairing_loop(
+            client,
+            key,
+            id_dir,
+            shutdown.clone(),
+            on_paired,
+        ));
+    }
+
+    // Wave 21: `--invite-code`: redeem at startup, pair with the owner,
+    // then keep receiving (the owner lands in peers.book, so the book
+    // policy below admits it).
+    if let Some(code) = &opts.invite_code {
+        let settings = crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?;
+        let verified = crate::invite::redeem_and_pair(id, code, &settings).await?;
+        let peer = verified.redeemer_fingerprint();
+        out.note("paired with the code owner:");
+        out.note(&crate::fingerprint_lines("owner", &peer));
+    }
+
     let port = if opts.port == 0 {
         pick_free_port()?
     } else {
@@ -304,6 +442,9 @@ pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()>
     let mut rebind_retries = 0u32;
     let mut first = true;
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let spec = config.iteration_spec();
         let connected_at = Arc::new(Mutex::new(None::<Instant>));
         let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
@@ -335,12 +476,12 @@ pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()>
         }
         let outcome = tokio::select! {
             joined = receiver => joined,
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.changed() => {
                 if let Some(discovery) = mdns.as_mut() {
                     discovery.stop_advertise();
                 }
-                out.event(&DaemonEvent::Stopped { reason: "ctrl-c" });
-                out.text("ctrl-c: daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
+                out.event(&DaemonEvent::Stopped { reason: "shutdown" });
+                out.text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
                 return Ok(());
             }
         };
@@ -399,6 +540,7 @@ pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()>
             Err(join) => bail!("receiver task failed: {join}"),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -433,17 +575,9 @@ mod tests {
     }
 
     /// Parse CLI args and pull out the daemon variant's fields.
-    fn parse_daemon(
-        args: &[&str],
-    ) -> (
-        PathBuf,
-        u16,
-        Option<String>,
-        String,
-        u64,
-        Option<String>,
-        bool,
-    ) {
+    /// Parse CLI args into the daemon options (the full flag surface, wave
+    /// 21 fields included).
+    fn parse_daemon(args: &[&str]) -> DaemonOptions {
         let cli = crate::Cli::try_parse_from(std::iter::once("ak-cli").chain(args.iter().copied()))
             .expect("cli parses");
         match cli.command {
@@ -455,26 +589,52 @@ mod tests {
                 timeout,
                 name,
                 json_lines,
-            } => (out, port, expect, conflict, timeout, name, json_lines),
+                invite_code,
+                pairing,
+                same_code,
+                cross_code,
+                server,
+                registry_fp,
+            } => DaemonOptions {
+                out,
+                port,
+                expect,
+                conflict,
+                timeout,
+                name,
+                json_lines,
+                invite_code,
+                pairing,
+                same_code,
+                cross_code,
+                server,
+                registry_fp,
+            },
             other => panic!("expected daemon, got {other:?}"),
         }
     }
 
     #[test]
     fn daemon_flags_parse_with_defaults() {
-        let (out, port, expect, conflict, timeout, name, json_lines) = parse_daemon(&["daemon"]);
-        assert_eq!(out, PathBuf::from("."));
-        assert_eq!(port, 0);
-        assert_eq!(expect, None);
-        assert_eq!(conflict, "error");
-        assert_eq!(timeout, 30);
-        assert_eq!(name, None);
-        assert!(!json_lines);
+        let opts = parse_daemon(&["daemon"]);
+        assert_eq!(opts.out, PathBuf::from("."));
+        assert_eq!(opts.port, 0);
+        assert_eq!(opts.expect, None);
+        assert_eq!(opts.conflict, "error");
+        assert_eq!(opts.timeout, 30);
+        assert_eq!(opts.name, None);
+        assert!(!opts.json_lines);
+        assert_eq!(opts.invite_code, None);
+        assert!(!opts.pairing);
+        assert_eq!(opts.same_code, None);
+        assert_eq!(opts.cross_code, None);
+        assert_eq!(opts.server, None);
+        assert_eq!(opts.registry_fp, None);
     }
 
     #[test]
     fn daemon_flags_parse_every_override() {
-        let (out, port, expect, conflict, timeout, name, json_lines) = parse_daemon(&[
+        let opts = parse_daemon(&[
             "daemon",
             "--out",
             "D:/inbox",
@@ -489,14 +649,62 @@ mod tests {
             "--name",
             "Alice's laptop",
             "--json-lines",
+            "--invite-code",
+            "AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH",
+            "--pairing",
+            "--same-code",
+            "parallel",
+            "--cross-code",
+            "serial",
+            "--server",
+            "127.0.0.1:7200",
+            "--registry-fp",
+            &"ab".repeat(32),
         ]);
-        assert_eq!(out, PathBuf::from("D:/inbox"));
-        assert_eq!(port, 7555);
-        assert_eq!(expect.as_deref(), Some("any"));
-        assert_eq!(conflict, "rename");
-        assert_eq!(timeout, 9);
-        assert_eq!(name.as_deref(), Some("Alice's laptop"));
-        assert!(json_lines);
+        assert_eq!(opts.out, PathBuf::from("D:/inbox"));
+        assert_eq!(opts.port, 7555);
+        assert_eq!(opts.expect.as_deref(), Some("any"));
+        assert_eq!(opts.conflict, "rename");
+        assert_eq!(opts.timeout, 9);
+        assert_eq!(opts.name.as_deref(), Some("Alice's laptop"));
+        assert!(opts.json_lines);
+        assert_eq!(
+            opts.invite_code.as_deref(),
+            Some("AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH")
+        );
+        assert!(opts.pairing);
+        assert_eq!(opts.same_code.as_deref(), Some("parallel"));
+        assert_eq!(opts.cross_code.as_deref(), Some("serial"));
+        assert_eq!(
+            opts.server,
+            Some("127.0.0.1:7200".parse().unwrap())
+        );
+        assert_eq!(opts.registry_fp.as_deref(), Some(&"ab".repeat(32)[..]));
+    }
+
+    #[test]
+    fn daemon_rejects_bad_policy_words_and_half_registry_flags() {
+        // Bad concurrency words are refused at parse time.
+        assert!(crate::Cli::try_parse_from([
+            "ak-cli", "daemon", "--same-code", "fast"
+        ])
+        .is_err());
+        assert!(crate::Cli::try_parse_from([
+            "ak-cli", "daemon", "--cross-code", "lazy"
+        ])
+        .is_err());
+        // Registry flags must come as a pair.
+        assert!(crate::Cli::try_parse_from([
+            "ak-cli", "daemon", "--server", "127.0.0.1:7200"
+        ])
+        .is_err());
+        assert!(crate::Cli::try_parse_from([
+            "ak-cli",
+            "daemon",
+            "--registry-fp",
+            &"ab".repeat(32),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -742,5 +950,218 @@ mod tests {
             err.to_string().contains("invalid --expect"),
             "error {err} does not name --expect"
         );
+    }
+
+    // ---- wave 21: policy flags + the real loopback pairing smoke ------
+
+    #[test]
+    fn policy_flags_map_onto_the_scheduler_policy() {
+        use ak_session::runtime::SchedulerPolicy;
+        use ak_session::scheduler::{CrossCodeMode, SameCodeMode};
+
+        // Omitted flags keep the contract defaults.
+        let defaults = scheduler_policy_from_flags(None, None).expect("defaults");
+        assert_eq!(defaults.same_code_mode, SameCodeMode::Serial);
+        assert_eq!(defaults.cross_code_mode, CrossCodeMode::Parallel);
+
+        let flipped =
+            scheduler_policy_from_flags(Some("parallel"), Some("serial")).expect("flipped");
+        assert_eq!(flipped.same_code_mode, SameCodeMode::Parallel);
+        assert_eq!(flipped.cross_code_mode, CrossCodeMode::Serial);
+        assert_eq!(
+            flipped,
+            SchedulerPolicy {
+                same_code_mode: SameCodeMode::Parallel,
+                cross_code_mode: CrossCodeMode::Serial,
+                ..SchedulerPolicy::default()
+            }
+        );
+
+        // Unknown words are refused (clap already rejects them at parse
+        // time; the mapper is the second lock for programmatic callers).
+        assert!(scheduler_policy_from_flags(Some("fast"), None).is_err());
+        assert!(scheduler_policy_from_flags(None, Some("lazy")).is_err());
+    }
+
+    #[tokio::test]
+    async fn set_policy_pushes_the_flags_through_the_session_runtime() {
+        let dir = TempDir::new("set-policy");
+        let switch = start_policy_runtime(
+            dir.path(),
+            scheduler_policy_from_flags(Some("parallel"), Some("serial")).unwrap(),
+        )
+        .await
+        .expect("runtime starts and the policy switch applies");
+        assert!(switch.revision >= 1, "a switch happened: {switch:?}");
+    }
+
+    /// The full wave-21 journey on one machine, all real planes: v2
+    /// registry (TLS + SQLite), `invite create`, the owner pairing answer
+    /// (`--pairing` core), `daemon --invite-code` (redeem at startup +
+    /// resident receive), and one real engine send into the daemon —
+    /// both `peers.book` files end up holding the other side.
+    #[tokio::test]
+    async fn invite_pairing_daemon_smoke_one_send_one_receive() {
+        use ak_signal::server_v2::{engine::serve_v2, store::RegistryStore, Limits};
+        use tokio::net::TcpListener;
+
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .is_test(true)
+            .try_init();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir_a = tmp.path().join("owner");
+        let dir_b = tmp.path().join("redeemer");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // 1. Real v2 registry over loopback TLS + SQLite.
+        let registry_key = ak_identity::DeviceKeyPair::generate();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry_addr = listener.local_addr().unwrap();
+        let store = RegistryStore::open(&tmp.path().join("registry.db")).unwrap();
+        let (registry_stop, registry_stop_rx) = tokio::sync::watch::channel(false);
+        let server_key = registry_key.clone();
+        tokio::spawn(async move {
+            let _ = serve_v2(listener, &server_key, store, Limits::default(), registry_stop_rx).await;
+        });
+        let settings = crate::invite::RegistrySettings {
+            server: registry_addr,
+            registry_id: registry_key.public_key(),
+        };
+
+        // 2. `invite create` on the owner side.
+        let first = crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
+            .await
+            .expect("invite create");
+        assert!(first.display.starts_with("AKI1-"), "{}", first.display);
+        assert_eq!(
+            crate::invite::InviteStore::open(&dir_a).load().unwrap().len(),
+            1,
+            "the bearer secret persists for the owner loop"
+        );
+
+        // 3. Owner pairing answer online (`daemon --pairing` core).
+        let (key_a, _) = crate::load_identity(&dir_a).unwrap();
+        let client_a = crate::invite::connect_registry(&settings, &key_a)
+            .await
+            .expect("owner registry client");
+        let (owner_stop, owner_stop_rx) = tokio::sync::watch::channel(false);
+        let paired: Arc<Mutex<Vec<ak_identity::Fingerprint>>> = Arc::new(Mutex::new(Vec::new()));
+        let paired_seen = Arc::clone(&paired);
+        let on_paired = std::sync::Arc::new(move |peer: ak_identity::Fingerprint| {
+            paired_seen.lock().unwrap().push(peer);
+        });
+        let owner_dir = dir_a.clone();
+        let owner_loop = tokio::spawn(crate::invite::owner_pairing_loop(
+            client_a,
+            key_a.clone(),
+            owner_dir,
+            owner_stop_rx,
+            on_paired,
+        ));
+
+        // 4. Redeem on the other side: peers.book records both directions.
+        let verified = crate::invite::redeem_and_pair(&dir_b, &first.display, &settings)
+            .await
+            .expect("redeem pairs with the owner");
+        let fp_a = key_a.fingerprint();
+        let (key_b, _) = crate::load_identity(&dir_b).unwrap();
+        let fp_b = key_b.fingerprint();
+        assert_eq!(verified.owner_fingerprint(), fp_a);
+        let book_a = std::fs::read_to_string(crate::peer_book_path(&dir_a)).unwrap();
+        let book_b = std::fs::read_to_string(crate::peer_book_path(&dir_b)).unwrap();
+        assert!(book_a.contains(&fp_b.to_hex()), "owner book records redeemer: {book_a}");
+        assert!(book_b.contains(&fp_a.to_hex()), "redeemer book records owner: {book_b}");
+        assert_eq!(*paired.lock().unwrap(), vec![fp_b], "owner observed the pairing");
+
+        // 5. `daemon --invite-code` on a SECOND code of the same owner:
+        // redeem at startup, then resident receive.
+        let second = crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
+            .await
+            .expect("second invite");
+        let out_b = tmp.path().join("out-b");
+        std::fs::create_dir_all(&out_b).unwrap();
+        let daemon_port = pick_free_port().unwrap();
+        let registry_fp_hex: String =
+            registry_key.public_key().iter().map(|b| format!("{b:02x}")).collect();
+        let daemon_opts = DaemonOptions {
+            out: out_b.clone(),
+            port: daemon_port,
+            expect: None,
+            conflict: "error".into(),
+            timeout: 30,
+            name: Some("smoke-redeemer".into()),
+            json_lines: true,
+            invite_code: Some(second.display.clone()),
+            pairing: false,
+            same_code: Some("parallel".into()),
+            cross_code: Some("serial".into()),
+            server: Some(registry_addr),
+            registry_fp: Some(registry_fp_hex),
+        };
+        let (daemon_stop, daemon_stop_rx) = tokio::sync::watch::channel(false);
+        let daemon_dir = dir_b.clone();
+        let daemon = tokio::spawn(async move {
+            daemon_core(&daemon_dir, daemon_opts, daemon_stop_rx).await
+        });
+
+        // 6. Wait for the second pairing (owner side observes it), then
+        // send one real file into the daemon's listener.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while paired.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "second pairing never completed (daemon finished early: {})",
+                daemon.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await; // bind settles
+
+        let src = tmp.path().join("smoke-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(src.join("journey.bin"), &payload).unwrap();
+        let identity_a =
+            ak_identity::tls::make_self_signed(&crate::load_identity(&dir_a).unwrap().0);
+        let mut send_spec = ak_engine::SendSpec::new(
+            src.clone(),
+            SocketAddr::from(([127, 0, 0, 1], daemon_port)),
+            fp_b,
+            identity_a,
+        );
+        send_spec.checkpoint_dir = tmp.path().join("checkpoints-a");
+        send_spec.idle_timeout = Duration::from_secs(10);
+
+        let report = loop {
+            match ak_engine::send(send_spec.clone(), &|_| {}).await {
+                Ok(report) => break report,
+                Err(ak_engine::EngineError::Connect(_)) => {
+                    // The daemon is still redeeming/binding; retry briefly.
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon never became reachable for the send"
+                    );
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Err(other) => panic!("send failed: {other:?}"),
+            }
+        };
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, payload.len() as u64);
+        assert_eq!(
+            std::fs::read(out_b.join("journey.bin")).unwrap(),
+            payload,
+            "一发一收: the daemon received byte-identical content"
+        );
+
+        // 7. Deterministic shutdown of every resident piece.
+        let _ = daemon_stop.send(true);
+        daemon.await.unwrap().expect("daemon exits cleanly");
+        let _ = owner_stop.send(true);
+        owner_loop.abort();
+        let _ = registry_stop.send(true);
     }
 }

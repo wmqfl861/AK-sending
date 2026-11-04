@@ -25,3 +25,9 @@ pub mod scheduler;
 /// Resident session runtime (scheduler actor, task lifecycle, listener,
 /// shutdown) over injected Fake/real dependencies.
 pub mod runtime;
+
+/// Automatic pairing orchestration (wave 21, A6): a real v2 control client
+/// over the frozen `ak-signal` registry surface, the
+/// [`runtime::transport::PairingTransport`] adapter over it, and the
+/// owner/redeemer orchestration of the frozen pairing transcript.
+pub mod pairing;

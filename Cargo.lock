@@ -32,11 +32,13 @@ dependencies = [
  "ak-engine",
  "ak-identity",
  "ak-net",
+ "ak-session",
  "ak-signal",
  "ak-storage",
  "ak-store",
  "ak-wire",
  "anyhow",
+ "blake3",
  "clap",
  "clap_complete",
  "env_logger",
@@ -144,6 +146,13 @@ name = "ak-session"
 version = "0.1.0"
 dependencies = [
  "ak-core",
+ "ak-identity",
+ "ak-signal",
+ "ak-store",
+ "blake3",
+ "env_logger",
+ "log",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

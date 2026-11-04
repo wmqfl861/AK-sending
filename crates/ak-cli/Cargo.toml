@@ -11,10 +11,19 @@ ak-discovery = { workspace = true }
 ak-engine = { workspace = true }
 ak-identity = { workspace = true }
 ak-net = { workspace = true }
-ak-signal = { workspace = true }
+# Wave 21 (B7): `server-persistence` is required by `ak-cli registry-server`
+# (the authoritative v2 registry: TLS + SQLite invite store). No plaintext
+# downgrade exists; the feature only links the server-side engine/store.
+ak-signal = { workspace = true, features = ["server-persistence"] }
+# Wave 21 (B7): the pairing orchestration (RegistryClient +
+# PairingOrchestrator) and the scheduler runtime behind
+# `daemon --same-code/--cross-code` (SessionHandle::set_policy). Path dep:
+# ak-session is not (yet) a workspace.dependencies entry.
+ak-session = { path = "../ak-session" }
 ak-storage = { workspace = true }
 ak-wire = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 # ADR-002 controlled addition (clap family, generator only, no I/O side
 # effects): shell completion scripts for `ak-cli completions`.

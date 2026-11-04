@@ -1008,6 +1008,16 @@ fn type_budget(message_type: u16, limits: &Limits) -> Option<u32> {
         ak_wire::TYPE_FINALIZE => 16,
         // code(2) + str(2 + error message bytes).
         ak_wire::TYPE_ERROR => 4 + u64::from(limits.max_error_message_bytes),
+        // Scheduler admission frames (wave 20 wire, wave 21 engine wiring):
+        // fixed-size, limits-independent — must mirror `ak_wire`'s
+        // `payload_budget` exactly, or this header pre-filter rejects with
+        // `UnknownType` what the codec itself accepts.
+        // job_id(16) + permit_id(16) + group(32) + group_registry(32).
+        ak_wire::TYPE_TASK_OPEN => 96,
+        // job_id(16) + permit_id(16) + granted(1) + reason(1).
+        ak_wire::TYPE_ADMISSION => 34,
+        // job_id(16) + permit_id(16).
+        ak_wire::TYPE_ADMISSION_ACK => 32,
         _ => return None,
     };
     let hard_payload_cap = (ak_wire::MAX_FRAME_BYTES - ak_wire::HEADER_LEN) as u64;
@@ -2086,9 +2096,11 @@ mod tests {
             header_payload_check(&header(0, 10), &limits),
             Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(0)))
         ));
+        // Type 13 (TaskOpen) is known since wave 20: verify its header budget
+        // instead of UnknownType. Use a truly unknown type for that check.
         assert!(matches!(
-            header_payload_check(&header(13, 10), &limits),
-            Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(13)))
+            header_payload_check(&header(999, 10), &limits),
+            Err(StreamError::Wire(ak_wire::DecodeError::UnknownType(999)))
         ));
         // Bad version with an in-cap declaration: rejected at header time.
         let mut bad_version = header(ak_wire::TYPE_ACCEPT, 16);
@@ -2144,7 +2156,7 @@ mod tests {
         );
         // Unknown types have no budget.
         assert_eq!(type_budget(0, &limits), None);
-        assert_eq!(type_budget(13, &limits), None);
+        assert_eq!(type_budget(999, &limits), None);
         assert_eq!(type_budget(u16::MAX, &limits), None);
         // Limits implying payloads beyond the all-frame cap saturate at the
         // cap (mirroring ak_wire::Frame::decode's budget min).

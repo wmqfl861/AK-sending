@@ -17,6 +17,7 @@
 mod daemon;
 mod doctor;
 mod errors;
+mod invite;
 
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
@@ -105,6 +106,28 @@ enum Command {
         #[command(subcommand)]
         cmd: PairCommand,
     },
+    /// Pairing invite codes (wave 21): create/list/revoke bearer codes on
+    /// the v2 registry, and redeem one to pair with its owner (then wait
+    /// receiving into --out).
+    Invite {
+        #[command(subcommand)]
+        cmd: InviteCommand,
+    },
+    /// Run the authoritative v2 pairing registry (TLS + SQLite invite
+    /// store; default port 7200). Print its registry id so devices can
+    /// pin it with --registry-fp. No file routes exist on this server.
+    RegistryServer {
+        /// TLS listen port (default 7200, the frozen v2 port).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Listen address override: bare IP (default 0.0.0.0) or full
+        /// `ip:port` (its port wins over --port, with a notice).
+        #[arg(long, value_parser = bind_arg_parser)]
+        bind: Option<BindArg>,
+        /// Registry database file (default `<id-dir>/registry.db`).
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+    },
     /// Receive transfers into a directory. By default keeps serving one job
     /// after another until Ctrl-C; --once handles exactly one job.
     Receive {
@@ -182,6 +205,29 @@ enum Command {
         /// rendering is suppressed and informational notes move to stderr.
         #[arg(long, default_value_t = false)]
         json_lines: bool,
+        /// Redeem an invite code (AKI1-...) at startup, pair with its
+        /// owner, then keep receiving residently (wave 21).
+        #[arg(long)]
+        invite_code: Option<String>,
+        /// Enable the owner-side pairing service: connect the pinned
+        /// registry and answer redeem offers for codes in
+        /// `<id-dir>/invites.store` (wave 21; `ak-cli invite create`
+        /// populates that store).
+        #[arg(long, default_value_t = false)]
+        pairing: bool,
+        /// Same-code-group concurrency pushed to the scheduler runtime via
+        /// SessionHandle::set_policy (wave 21): serial | parallel.
+        #[arg(long, value_parser = ["serial", "parallel"])]
+        same_code: Option<String>,
+        /// Cross-code-group concurrency: serial | parallel.
+        #[arg(long, value_parser = ["serial", "parallel"])]
+        cross_code: Option<String>,
+        /// Registry endpoint ip:port (with --registry-fp; persisted).
+        #[arg(long, requires = "registry_fp")]
+        server: Option<SocketAddr>,
+        /// Registry identity pin, 64 hex characters (with --server).
+        #[arg(long, requires = "server")]
+        registry_fp: Option<String>,
     },
     /// Send files and/or directories to a peer. The first path is the
     /// primary root; further paths join the same job, each keeping its own
@@ -356,6 +402,74 @@ enum PairCommand {
     Import {
         /// The AKPAIR1 text block, e.g. `"$(cat akpair.txt)"`.
         text: String,
+    },
+}
+
+/// The `ak-cli invite` subcommand family (wave 21, B7). Every verb talks
+/// to the pinned v2 registry; `--server`/`--registry-fp` (given together)
+/// persist the pin into `<id-dir>/registry.pin` and later invocations
+/// reuse it.
+#[derive(Debug, Subcommand)]
+enum InviteCommand {
+    /// Generate and register one invite code on the registry, persist its
+    /// bearer secret locally, and print the display form (AKI1-...).
+    Create {
+        /// Code lifetime in seconds (60..=2592000).
+        #[arg(long, conflicts_with = "long_lived")]
+        ttl_secs: Option<u32>,
+        /// No expiry (long-lived code).
+        #[arg(long, default_value_t = false)]
+        long_lived: bool,
+        /// Friendly local label for the code (display only).
+        #[arg(long)]
+        name: Option<String>,
+        /// Registry endpoint ip:port (with --registry-fp; persisted).
+        #[arg(long, requires = "registry_fp")]
+        server: Option<SocketAddr>,
+        /// Registry identity pin, 64 hex characters (with --server).
+        #[arg(long, requires = "server")]
+        registry_fp: Option<String>,
+    },
+    /// List this device's invite codes as the registry knows them (state,
+    /// expiry, revision, masked hint). Never prints the plaintext code.
+    List {
+        #[arg(long, requires = "registry_fp")]
+        server: Option<SocketAddr>,
+        #[arg(long, requires = "server")]
+        registry_fp: Option<String>,
+    },
+    /// Revoke one invite code (32-hex code id from `invite list`) and
+    /// forget the local secret.
+    Revoke {
+        /// Code id, 32 hex characters.
+        code_id: String,
+        #[arg(long, requires = "registry_fp")]
+        server: Option<SocketAddr>,
+        #[arg(long, requires = "server")]
+        registry_fp: Option<String>,
+    },
+    /// Redeem an invite code (AKI1-...), pair with its owner, then wait
+    /// receiving into --out (the owner lands in peers.book first, so the
+    /// accept policy is book-only).
+    Redeem {
+        /// The invite code in its canonical AKI1-... form.
+        code: String,
+        /// Destination directory for received transfers (must exist).
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+        /// Handle exactly one transfer after pairing, then exit.
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Overwrite policy: error (default) or rename.
+        #[arg(long, default_value = "error")]
+        conflict: String,
+        /// Idle timeout in seconds per job.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+        #[arg(long, requires = "registry_fp")]
+        server: Option<SocketAddr>,
+        #[arg(long, requires = "server")]
+        registry_fp: Option<String>,
     },
 }
 
@@ -889,6 +1003,11 @@ impl ExpectPolicy {
         let trimmed = text.trim();
         if trimmed.eq_ignore_ascii_case("any") {
             return Ok(ExpectPolicy::Any);
+        }
+        // Explicit `book` (ffi-v2 §6 note: keep the omitted-default
+        // semantics but accept the word callers copy from the contract).
+        if trimmed.eq_ignore_ascii_case("book") {
+            return Ok(ExpectPolicy::Book(book_path.to_path_buf()));
         }
         let all_code_chars = trimmed
             .bytes()
@@ -2393,6 +2512,271 @@ fn discover_json(candidates: &[ak_discovery::PeerCandidate], book: &PeerBook) ->
     out
 }
 
+// ---------------------------------------------------------------------------
+// invite (wave 21, B7): pair-invite subcommand family
+// ---------------------------------------------------------------------------
+
+/// `ak-cli invite ...`: thin printing layer over the `invite` module
+/// cores (which are unit-tested without a TTY).
+async fn invite_command(id: &Path, cmd: InviteCommand) -> Result<()> {
+    match cmd {
+        InviteCommand::Create {
+            ttl_secs,
+            long_lived,
+            name,
+            server,
+            registry_fp,
+        } => {
+            let ttl = if long_lived {
+                invite::TtlChoice::LongLived
+            } else {
+                invite::TtlChoice::Secs(ttl_secs.unwrap_or(600))
+            };
+            ttl.ttl_secs()?; // fail fast on out-of-range before connecting
+            let settings = invite::resolve_registry(id, server, registry_fp)?;
+            let stored = invite::invite_create(id, ttl, &settings).await?;
+            println!("invite code (bearer credential — treat like a password):");
+            println!("  {}", stored.display);
+            println!(
+                "code id {} revision {} expires {}",
+                stored
+                    .code_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                stored.revision,
+                if stored.expires_ms == 0 {
+                    "never (long-lived)".to_owned()
+                } else {
+                    format_utc_ms(stored.expires_ms)
+                }
+            );
+            if let Some(name) = name {
+                println!("local label: {name}");
+            }
+            println!("pairing answer: keep `ak-cli daemon --pairing` running to redeem it");
+            Ok(())
+        }
+        InviteCommand::List {
+            server,
+            registry_fp,
+        } => {
+            let settings = invite::resolve_registry(id, server, registry_fp)?;
+            let rows = invite::invite_list_rows(id, &settings).await?;
+            if rows.is_empty() {
+                println!("no invite codes (create one with `ak-cli invite create`)");
+                return Ok(());
+            }
+            println!("code-id (32hex)  state    revision  expires              hint");
+            for row in rows {
+                let id_hex: String =
+                    row.code_id.iter().map(|b| format!("{b:02x}")).collect();
+                println!(
+                    "{id_hex}  {:<7}  {:<8}   {:<20}  {}",
+                    format!("{:?}", row.state).to_lowercase(),
+                    row.revision,
+                    if row.expires_ms == 0 {
+                        "never".to_owned()
+                    } else {
+                        format_utc_ms(row.expires_ms)
+                    },
+                    row.hint.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        InviteCommand::Revoke {
+            code_id,
+            server,
+            registry_fp,
+        } => {
+            let settings = invite::resolve_registry(id, server, registry_fp)?;
+            invite::invite_revoke_by_hex(id, &code_id, &settings).await?;
+            println!("invite {code_id} revoked (server confirmed; local secret forgotten)");
+            Ok(())
+        }
+        InviteCommand::Redeem {
+            code,
+            out,
+            once,
+            conflict,
+            timeout,
+            server,
+            registry_fp,
+        } => {
+            let settings = invite::resolve_registry(id, server, registry_fp)?;
+            let verified = invite::redeem_and_pair(id, &code, &settings).await?;
+            let peer = verified.redeemer_fingerprint(); // we are the redeemer
+            println!("paired with the code owner:");
+            print!("{}", fingerprint_lines("owner", &peer));
+            println!(
+                "waiting for transfers into {} (Ctrl-C stops; --once handles one job)",
+                out.display()
+            );
+            if once {
+                receive_one_after_pairing(id, out, &conflict, timeout).await
+            } else {
+                receive_loop_after_pairing(id, out, &conflict, timeout).await
+            }
+        }
+    }
+}
+
+/// One `receive`-style job with the book accept policy (the owner was just
+/// committed into peers.book by the pairing).
+async fn receive_one_after_pairing(
+    id: &Path,
+    out: PathBuf,
+    conflict: &str,
+    timeout: u64,
+) -> Result<()> {
+    let listen = SocketAddr::from(([0, 0, 0, 0], 0));
+    let config = ReceiveLoopConfig::resolve(
+        id,
+        out.clone(),
+        listen,
+        None,
+        conflict,
+        false,
+        timeout,
+        whoami(),
+    )?;
+    for line in expect_policy_lines(&config.policy) {
+        println!("{line}");
+    }
+    let spec = config.iteration_spec();
+    let printer = progress_printer("recv");
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
+    let addr = addr_rx.await.context("receiver failed to bind")?;
+    println!("receiving one transfer into {} (listening on {addr})", out.display());
+    println!("fingerprint (full): {}", config.fingerprint.to_hex());
+    let report = receiver.await.context("receiver task failed")??;
+    report_summary(&report);
+    Ok(())
+}
+
+/// The same sequential loop `receive` runs (Ctrl-C stops), reached after a
+/// successful redeem+pair.
+async fn receive_loop_after_pairing(
+    id: &Path,
+    out: PathBuf,
+    conflict: &str,
+    timeout: u64,
+) -> Result<()> {
+    let listen = SocketAddr::from(([0, 0, 0, 0], 0));
+    let config = ReceiveLoopConfig::resolve(
+        id,
+        out.clone(),
+        listen,
+        None,
+        conflict,
+        false,
+        timeout,
+        whoami(),
+    )?;
+    for line in expect_policy_lines(&config.policy) {
+        println!("{line}");
+    }
+    println!("{FIREWALL_NOTE}");
+    println!("fingerprint (full): {}", config.fingerprint.to_hex());
+    const MAX_REBIND_RETRIES: u32 = 50;
+    let mut rebind_retries = 0u32;
+    loop {
+        let spec = config.iteration_spec();
+        let printer = progress_printer("recv");
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver =
+            tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
+        let _ = addr_rx.await;
+        match receiver.await.context("receiver task failed")? {
+            Ok(report) => {
+                rebind_retries = 0;
+                report_summary(&report);
+                println!("waiting for next sender (Ctrl-C stops)...");
+            }
+            Err(ak_engine::EngineError::Io(err))
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && rebind_retries < MAX_REBIND_RETRIES =>
+            {
+                rebind_retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(error) => {
+                println!("job failed: {error}; still waiting (Ctrl-C stops)");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// registry-server (wave 21, B7): the authoritative v2 pairing registry
+// ---------------------------------------------------------------------------
+
+/// Default registry SQLite location when --db-path is omitted.
+fn registry_db_path(id: &Path) -> PathBuf {
+    id.join("registry.db")
+}
+
+/// Build the server_v2 config from the flags (pure; unit-tested).
+fn registry_server_config(
+    id: &Path,
+    port: Option<u16>,
+    bind: Option<BindArg>,
+    db_path: Option<PathBuf>,
+) -> (ak_signal::server_v2::Config, Option<String>) {
+    const DEFAULT_REGISTRY_PORT: u16 =
+        ak_signal::server_v2::config::DEFAULT_V2_PORT;
+    let (listen, note) =
+        resolve_listen_addr(bind, "--bind", port, "--port", DEFAULT_REGISTRY_PORT);
+    let config = ak_signal::server_v2::Config {
+        listen,
+        db_path: db_path.unwrap_or_else(|| registry_db_path(id)),
+        ..ak_signal::server_v2::Config::default()
+    };
+    (config, note)
+}
+
+/// `ak-cli registry-server`: load/create `<id-dir>/registry.key`, print
+/// the registry pin, serve until Ctrl-C. TLS-only: no plaintext invite
+/// service exists to fall back to.
+async fn registry_server_command(
+    id: &Path,
+    port: Option<u16>,
+    bind: Option<BindArg>,
+    db_path: Option<PathBuf>,
+) -> Result<()> {
+    let key_path = id.join("registry.key");
+    let (registry, created) = DeviceKeyPair::load_or_create(&key_path)?;
+    if created {
+        println!("registry identity written to {}", key_path.display());
+    }
+    let (config, note) = registry_server_config(id, port, bind, db_path);
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    let registry_id: String = registry
+        .public_key()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!(
+        "v2 pairing registry on tls {} (db {}); no file routes exist",
+        config.listen,
+        config.db_path.display()
+    );
+    println!("registry id (pin with --registry-fp): {registry_id}");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ak_signal::server_v2::engine::run_v2(config, &registry, shutdown_rx).await
+    });
+    tokio::signal::ctrl_c().await.ok();
+    let _ = shutdown_tx.send(true);
+    server.await??;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -2409,6 +2793,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Pair { cmd } => pair_command(&id, cmd),
+        Command::Invite { cmd } => invite_command(&id, cmd).await,
+        Command::RegistryServer {
+            port,
+            bind,
+            db_path,
+        } => registry_server_command(&id, port, bind, db_path).await,
         Command::Receive {
             out,
             port,
@@ -2442,6 +2832,12 @@ async fn main() -> Result<()> {
             timeout,
             name,
             json_lines,
+            invite_code,
+            pairing,
+            same_code,
+            cross_code,
+            server,
+            registry_fp,
         } => {
             daemon::daemon_command(
                 &id,
@@ -2453,6 +2849,12 @@ async fn main() -> Result<()> {
                     timeout,
                     name,
                     json_lines,
+                    invite_code,
+                    pairing,
+                    same_code,
+                    cross_code,
+                    server,
+                    registry_fp,
                 },
             )
             .await
@@ -4785,5 +5187,220 @@ mod tests {
         assert!(completions_script(ShellKind::Powershell)
             .unwrap()
             .contains("Register-ArgumentCompleter -Native -CommandName 'ak-cli'"));
+    }
+
+    // ---- wave 21 (B7): invite family + registry-server parsing ----------
+
+    #[test]
+    fn invite_create_parses_ttl_flags_and_registry_pair() {
+        // Defaults: no explicit ttl, not long-lived (600s is applied later).
+        let cli = Cli::try_parse_from(["ak-cli", "invite", "create"]).expect("parses");
+        match cli.command {
+            Command::Invite {
+                cmd:
+                    InviteCommand::Create {
+                        ttl_secs,
+                        long_lived,
+                        name,
+                        server,
+                        registry_fp,
+                    },
+            } => {
+                assert_eq!(ttl_secs, None);
+                assert!(!long_lived);
+                assert_eq!(name, None);
+                assert_eq!(server, None);
+                assert_eq!(registry_fp, None);
+            }
+            other => panic!("expected invite create, got {other:?}"),
+        }
+        // Explicit ttl.
+        let cli = Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "create",
+            "--ttl-secs",
+            "3600",
+            "--name",
+            "desk",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Invite {
+                cmd:
+                    InviteCommand::Create {
+                        ttl_secs,
+                        long_lived,
+                        name,
+                        ..
+                    },
+            } => {
+                assert_eq!(ttl_secs, Some(3600));
+                assert!(!long_lived);
+                assert_eq!(name.as_deref(), Some("desk"));
+            }
+            other => panic!("expected invite create, got {other:?}"),
+        }
+        // Long-lived conflicts with --ttl-secs; registry flags pair up.
+        assert!(Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "create",
+            "--ttl-secs",
+            "60",
+            "--long-lived"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "create",
+            "--server",
+            "127.0.0.1:7200"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "create",
+            "--registry-fp",
+            &"ab".repeat(32)
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "create",
+            "--long-lived",
+            "--server",
+            "127.0.0.1:7200",
+            "--registry-fp",
+            &"ab".repeat(32),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn invite_list_revoke_redeem_parse_their_positionals() {
+        let cli = Cli::try_parse_from(["ak-cli", "invite", "list"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Invite {
+                cmd: InviteCommand::List { .. }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "revoke",
+            &"cd".repeat(16),
+            "--server",
+            "10.0.0.1:7200",
+            "--registry-fp",
+            &"ab".repeat(32),
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Invite {
+                cmd:
+                    InviteCommand::Revoke {
+                        code_id,
+                        server,
+                        registry_fp,
+                    },
+            } => {
+                assert_eq!(code_id, "cd".repeat(16));
+                assert_eq!(server, Some("10.0.0.1:7200".parse().unwrap()));
+                assert_eq!(registry_fp.as_deref(), Some(&"ab".repeat(32)[..]));
+            }
+            other => panic!("expected invite revoke, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "ak-cli",
+            "invite",
+            "redeem",
+            "AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH",
+            "--out",
+            "D:/inbox",
+            "--once",
+            "--conflict",
+            "rename",
+            "--timeout",
+            "7",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Invite {
+                cmd:
+                    InviteCommand::Redeem {
+                        code,
+                        out,
+                        once,
+                        conflict,
+                        timeout,
+                        ..
+                    },
+            } => {
+                assert_eq!(code, "AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH");
+                assert_eq!(out, PathBuf::from("D:/inbox"));
+                assert!(once);
+                assert_eq!(conflict, "rename");
+                assert_eq!(timeout, 7);
+            }
+            other => panic!("expected invite redeem, got {other:?}"),
+        }
+        // A redeem without a code is a usage error.
+        assert!(Cli::try_parse_from(["ak-cli", "invite", "redeem", "--out", "x"]).is_err());
+    }
+
+    #[test]
+    fn registry_server_defaults_to_the_frozen_v2_port() {
+        let id = PathBuf::from("id");
+        let (config, note) = registry_server_config(&id, None, None, None);
+        assert_eq!(
+            config.listen,
+            SocketAddr::from(([0, 0, 0, 0], ak_signal::server_v2::config::DEFAULT_V2_PORT))
+        );
+        assert_eq!(config.db_path, registry_db_path(&id));
+        assert!(note.is_none(), "no note without overrides: {note:?}");
+
+        let (config, _note) =
+            registry_server_config(&id, Some(7300), None, Some(PathBuf::from("C:/reg.sqlite")));
+        assert_eq!(config.listen.port(), 7300);
+        assert_eq!(config.db_path, PathBuf::from("C:/reg.sqlite"));
+
+        // A bare --bind IP keeps the port flag; a full address wins.
+        let (config, _) = registry_server_config(
+            &id,
+            None,
+            Some(BindArg::Ip("127.0.0.1".parse().unwrap())),
+            None,
+        );
+        assert_eq!(
+            config.listen,
+            SocketAddr::from(([127, 0, 0, 1], ak_signal::server_v2::config::DEFAULT_V2_PORT))
+        );
+        let (config, note) = registry_server_config(
+            &id,
+            Some(7300),
+            Some(BindArg::Addr("[::]:7400".parse().unwrap())),
+            None,
+        );
+        assert_eq!(config.listen, "[::]:7400".parse::<SocketAddr>().unwrap());
+        assert!(
+            note.is_some(),
+            "full-address bind explains its port: {note:?}"
+        );
+    }
+
+    #[test]
+    fn expect_accepts_the_explicit_book_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let book_path = peer_book_path(dir.path());
+        let policy = ExpectPolicy::parse("book", &book_path).expect("book parses");
+        assert!(matches!(policy, ExpectPolicy::Book(path) if path == book_path));
+        // Case-insensitive like 'any'.
+        let upper = ExpectPolicy::parse("BOOK", &book_path).expect("BOOK parses");
+        assert!(matches!(upper, ExpectPolicy::Book(_)));
     }
 }

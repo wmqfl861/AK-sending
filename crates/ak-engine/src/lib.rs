@@ -101,6 +101,18 @@
 //! Known v1 limitations still true (deliberate, documented): receiver accepts
 //! one job per `receive()` call — and one job per connection under
 //! [`serve_concurrently`] (one connection = one job).
+//!
+//! Wave 21 on-channel split (scheduler.md §6 wiring, wire unchanged): the
+//! protocol bodies now also run on an already-connected [`DirectChannel`]
+//! handed in by a runtime. [`send_on_channel`] drives the scheduler
+//! admission handshake (TaskOpen → Admission → AdmissionAck, negotiated
+//! through [`ak_wire::CAP_SCHEDULER`]) before the frozen Offer→FinalAck
+//! path; [`receive_on_channel`] is the symmetric receive side, deciding
+//! admission through a caller-supplied decider and staging part files in a
+//! per-task tree (see `ak_storage::prepare_file_staged`). The legacy
+//! `send`/`receive_with_addr`/`serve_concurrently` entries keep their exact
+//! frozen behavior: they self-connect and run the same bodies with
+//! admission absent (no `CAP_SCHEDULER` bit, no TaskOpen, no staging).
 #![forbid(unsafe_code)]
 
 use std::collections::{HashSet, VecDeque};
@@ -120,8 +132,8 @@ use ak_net::{DirectChannel, DirectEndpoint, DirectRecvStream, DirectSendStream, 
 use ak_storage::{LocalSaveTarget, LocalSource};
 use ak_store::{CheckpointStore, Direction, FileCheckpoint, FileCheckpointStore, TaskRecord};
 use ak_wire::{
-    Control, Frame, JobId, Limits, Message, ResumeEntry, WireEntry, CAP_MULTISTREAM,
-    CAP_PAUSE_RESUME, CAP_RESUME,
+    scheduler_frames_allowed, AdmissionReason, Control, Frame, JobId, Limits, Message, ResumeEntry,
+    WireEntry, CAP_MULTISTREAM, CAP_PAUSE_RESUME, CAP_RESUME, CAP_SCHEDULER,
 };
 
 /// Manifest pages are assembled under this byte budget so every page fits a
@@ -275,6 +287,44 @@ impl ReceiveSpec {
     }
 }
 
+/// Scheduler admission context for one on-channel send task (wave 21,
+/// scheduler.md §6). Carries exactly what the three admission frames need:
+/// the scheduler task identity and the two-dimensional code group the task
+/// runs under. Handed to [`send_on_channel`] by the runtime that owns the
+/// connection; the legacy [`send`] path has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionCtx {
+    /// Scheduler task identity. Travels as `TaskOpen.job_id`, mirrors
+    /// `AdmissionAck.job_id`, and — on the receiving side — keys the
+    /// per-task staging tree (`ak_storage::prepare_file_staged`). The
+    /// all-zero id is the contract sentinel and is refused on the wire.
+    pub task_id: [u8; 16],
+    /// The code group this task belongs to (the pairing `code_id` in its
+    /// 32-byte form). The receiver hands this to its admission decider.
+    pub group: [u8; 32],
+    /// Registry identity that owns the group (`TaskOpen.group_registry`).
+    pub group_registry: [u8; 32],
+}
+
+/// Receiver-side admission verdict returned by the decider callback of
+/// [`receive_on_channel`]. `Deny` carries the closed wire
+/// [`AdmissionReason`] the receiver answers with (and the local call fails
+/// with the same reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    /// Grant the permit; the receiver waits for `AdmissionAck` and then
+    /// runs the frozen receive body with per-task staging.
+    Admit,
+    /// Refuse the task; the `Admission` frame carries this reason and the
+    /// call returns [`EngineError::AdmissionDenied`] locally.
+    Deny(AdmissionReason),
+}
+
+/// Receiver-side admission decider callback of [`receive_on_channel`]:
+/// handed the wire `TaskOpen.group` (the 32-byte code id), answers
+/// [`AdmissionDecision`].
+pub type AdmissionDecider<'a> = &'a (dyn Fn(&[u8; 32]) -> AdmissionDecision + Send + Sync);
+
 /// Progress events, distinct per direction so the CLI can render honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -394,6 +444,18 @@ pub enum EngineError {
     /// protocol byte moves.
     #[error("route refused by policy: {0:?}")]
     RouteForbidden(PathKind),
+    /// The scheduler admission handshake refused this task (wave 21).
+    /// On the send side the *peer* denied [`send_on_channel`]'s TaskOpen —
+    /// `SerialWait`/`Capacity` are "retry later" denials, and `StalePermit`
+    /// only surfaces here after the bounded resubmit budget ran out. On
+    /// the receive side it is the local decider's own
+    /// [`AdmissionDecision::Deny`] reason echoed back. No part of the file
+    /// protocol ran: no Offer was sent or accepted.
+    #[error("admission denied: {reason:?}")]
+    AdmissionDenied {
+        /// The closed wire denial cause the handshake ended with.
+        reason: AdmissionReason,
+    },
 }
 
 /// Deterministic job id from source identity (see module docs).
@@ -611,6 +673,195 @@ fn protocol_error(message: impl Into<String>) -> EngineError {
     EngineError::PeerError {
         code: ErrorCode::ProtocolUnsupported,
         message: message.into(),
+    }
+}
+
+/// Bounded TaskOpen resubmit budget when the peer answers a permit with
+/// `StalePermit` (wave 21): the wire contract says "resubmit a fresh
+/// TaskOpen", but an endless stale loop against a broken peer would hang
+/// the task, so the budget caps it and surfaces the denial.
+const MAX_STALE_PERMIT_RESUBMITS: usize = 3;
+
+/// How long the receiver holds the channel open after answering a denied
+/// admission, so the sender observes the decision frame instead of a
+/// connection loss (bounded; see `admission_handshake_receiver`).
+const ADMISSION_DENY_HOLD: Duration = Duration::from_millis(300);
+
+/// Fresh permit id for one TaskOpen attempt: domain-separated blake3 over
+/// the task id, the attempt ordinal and the wall clock. Uniqueness per
+/// attempt is what matters (it is an id, not a secret — the permit's
+/// authenticity comes from the TLS-pinned channel it travels on).
+fn fresh_permit_id(task_id: &[u8; 16], attempt: usize) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"AKPERMIT1");
+    hasher.update(task_id);
+    hasher.update(&(attempt as u64).to_be_bytes());
+    hasher.update(&now_ms().to_be_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
+}
+
+/// Sender side of the scheduler admission handshake (wave 21,
+/// scheduler.md §6): TaskOpen → Admission → AdmissionAck. Only runs after
+/// [`ak_wire::scheduler_frames_allowed`] said both Hellos carry
+/// `CAP_SCHEDULER`. `StalePermit` denials resubmit a fresh TaskOpen under
+/// [`MAX_STALE_PERMIT_RESUBMITS`]; every other denial ends the task with
+/// [`EngineError::AdmissionDenied`] before a single Offer byte moves.
+async fn admission_handshake_sender(
+    tx: &mut DirectSendStream,
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+    ctx: &AdmissionCtx,
+) -> Result<(), EngineError> {
+    let mut attempt = 0usize;
+    loop {
+        let permit_id = fresh_permit_id(&ctx.task_id, attempt);
+        tx.send_frame(&Frame {
+            version: ak_wire::VERSION,
+            message: Message::TaskOpen {
+                job_id: ctx.task_id,
+                permit_id,
+                group: ctx.group,
+                group_registry: ctx.group_registry,
+            },
+        })
+        .await?;
+        attempt += 1;
+        match recv_within(rx, limits, idle).await? {
+            Frame {
+                message:
+                    Message::Admission {
+                        job_id,
+                        permit_id: answer_permit,
+                        granted,
+                        reason,
+                    },
+                ..
+            } => {
+                if job_id != ctx.task_id || answer_permit != permit_id {
+                    return Err(protocol_error(
+                        "admission answer names a different task or permit",
+                    ));
+                }
+                if granted {
+                    if reason != AdmissionReason::Ok {
+                        return Err(protocol_error("granted admission must carry reason ok"));
+                    }
+                    // Final handshake step: the sender confirms it acts on
+                    // the granted permit, releasing the tentative state.
+                    tx.send_frame(&Frame {
+                        version: ak_wire::VERSION,
+                        message: Message::AdmissionAck {
+                            job_id: ctx.task_id,
+                            permit_id,
+                        },
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                match reason {
+                    AdmissionReason::StalePermit if attempt <= MAX_STALE_PERMIT_RESUBMITS => {
+                        // The permit the peer held is gone (expired or
+                        // unknown): resubmit a fresh TaskOpen.
+                        continue;
+                    }
+                    reason => return Err(EngineError::AdmissionDenied { reason }),
+                }
+            }
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        }
+    }
+}
+
+/// Receiver side of the scheduler admission handshake (wave 21): read
+/// TaskOpen, hand the code group to the caller's decider, answer
+/// `Admission`, and — only on grant — wait for `AdmissionAck` before the
+/// frozen receive body runs. Returns the task id that keys the receiver's
+/// per-task staging tree. A denial is answered on the wire and fails the
+/// call locally with the same reason; no Offer is ever read afterwards.
+async fn admission_handshake_receiver(
+    tx: &mut DirectSendStream,
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+    decider: AdmissionDecider<'_>,
+) -> Result<[u8; 16], EngineError> {
+    let (task_id, permit_id, group) = match recv_within(rx, limits, idle).await? {
+        Frame {
+            message:
+                Message::TaskOpen {
+                    job_id,
+                    permit_id,
+                    group,
+                    ..
+                },
+            ..
+        } => (job_id, permit_id, group),
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
+        other => return Err(unexpected(other.message)),
+    };
+    // The all-zero task id is the reserved sentinel (it can never own a
+    // staging tree), so it is a protocol violation here, not a decider
+    // question.
+    if task_id == [0u8; 16] {
+        return Err(protocol_error("task id must not be the all-zero sentinel"));
+    }
+    let (granted, reason) = match decider(&group) {
+        AdmissionDecision::Admit => (true, AdmissionReason::Ok),
+        AdmissionDecision::Deny(reason) => (false, reason),
+    };
+    tx.send_frame(&Frame {
+        version: ak_wire::VERSION,
+        message: Message::Admission {
+            job_id: task_id,
+            permit_id,
+            granted,
+            reason,
+        },
+    })
+    .await?;
+    if !granted {
+        // The wire answer IS the denial; the local call fails with the
+        // same closed reason and no file protocol runs. Hold the
+        // connection briefly first so the denial frame is observably
+        // delivered before the error return drops the channel (the same
+        // discipline as the FinalAck tail hold — an immediate close could
+        // race the frame off the wire and surface as a bare "connection
+        // lost" on the peer instead of the actual decision).
+        tokio::time::sleep(ADMISSION_DENY_HOLD).await;
+        return Err(EngineError::AdmissionDenied { reason });
+    }
+    match recv_within(rx, limits, idle).await? {
+        Frame {
+            message:
+                Message::AdmissionAck {
+                    job_id,
+                    permit_id: acked_permit,
+                },
+            ..
+        } => {
+            if job_id != task_id || acked_permit != permit_id {
+                return Err(protocol_error(
+                    "admission ack names a different task or permit",
+                ));
+            }
+            Ok(task_id)
+        }
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => Err(EngineError::PeerError { code, message }),
+        other => Err(unexpected(other.message)),
     }
 }
 
@@ -1557,11 +1808,20 @@ async fn drain_file_acks(
 
 /// Run one send to completion. Progress callbacks are synchronous and must
 /// be cheap.
-pub async fn send(
-    spec: SendSpec,
-    progress: &(dyn Fn(Progress) + Send + Sync),
-) -> Result<Report, EngineError> {
-    let started = Instant::now();
+/// Source/manifest/checkpoint preparation shared by [`send`] and
+/// [`send_on_channel`]: opens the sources, derives the content job id and
+/// the per-instance record id, and persists the initial sender record
+/// before anything connects.
+struct PreparedSend {
+    sources: Arc<SourceSet>,
+    manifest: Manifest,
+    root_name: String,
+    job_id: JobId,
+    record: TaskRecord,
+    store: FileCheckpointStore,
+}
+
+fn prepare_send(spec: &SendSpec) -> Result<PreparedSend, EngineError> {
     let limits = engine_limits();
     // Engine-side Offer field validation (review round 17, defense in depth
     // with ak-wire's decode budget): a chunk size above the engine limit
@@ -1578,7 +1838,7 @@ pub async fn send(
             ),
         )));
     }
-    let sources = Arc::new(SourceSet::open(&spec)?);
+    let sources = Arc::new(SourceSet::open(spec)?);
     let manifest = sources.manifest.clone();
     let root_name = sources.display_name().to_owned();
     // `job_id` is the content identity the wire speaks; the checkpoint
@@ -1590,15 +1850,99 @@ pub async fn send(
     let record_id = record_id_for(&job_id, &spec.pinned, Direction::Send, &spec.source_root);
 
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
-    let mut record = sender_record(&spec, record_id, &manifest);
+    let record = sender_record(spec, record_id, &manifest);
     store.save(&record).map_err(EngineError::Checkpoint)?;
+    Ok(PreparedSend {
+        sources,
+        manifest,
+        root_name,
+        job_id,
+        record,
+        store,
+    })
+}
 
+pub async fn send(
+    spec: SendSpec,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let started = Instant::now();
+    let prepared = prepare_send(&spec)?;
     progress(Progress::Connecting);
     let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
     let channel = connect_bounded(&endpoint, spec.peer, &spec.pinned, spec.idle_timeout).await?;
     // Policy gate (protocol step 0): a refused path closes the connection
     // before any stream is opened or frame sent.
     gate_channel(&spec.policy, &channel)?;
+    // Legacy path (wave 21 split): self-connected channel, admission absent
+    // — no CAP_SCHEDULER bit, no TaskOpen. Wire-identical to the frozen v1
+    // behavior; see [`send_on_channel`] for the scheduler-admission form.
+    send_channel_body(channel, &spec, prepared, started, None, progress).await
+}
+
+/// Wave-21 on-channel send entry (scheduler.md §6): run the whole send
+/// protocol on an already-connected [`DirectChannel`] the runtime handed
+/// in. Differences from [`send`], and only these:
+///
+/// * no endpoint bind/connect here (the runtime owns the connection);
+/// * the Hello advertises `CAP_SCHEDULER` and, when the peer does too
+///   ([`ak_wire::scheduler_frames_allowed`]), the scheduler admission
+///   handshake runs before the frozen Offer→FinalAck path:
+///   `TaskOpen(task_id, group, group_registry, permit)` → wait
+///   `Admission` → on grant send `AdmissionAck` and continue; on deny
+///   return [`EngineError::AdmissionDenied`] with the closed wire reason
+///   (`StalePermit` resubmits a fresh TaskOpen under a bounded budget);
+/// * a peer without `CAP_SCHEDULER` fails immediately with
+///   `PROTOCOL_UNSUPPORTED` — there is no silent fallback to unadmitted
+///   transfer, because the caller explicitly asked for a scheduled task.
+///
+/// The policy gate still runs on the handed-in channel before any protocol
+/// byte moves, and staging is keyed by the peer's admission decision (the
+/// receiver stages under this `task_id`, not the sender).
+pub async fn send_on_channel(
+    channel: DirectChannel,
+    spec: SendSpec,
+    admission_ctx: AdmissionCtx,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let started = Instant::now();
+    let prepared = prepare_send(&spec)?;
+    // Policy gate: same step-0 refusal for a runtime-provided channel.
+    gate_channel(&spec.policy, &channel)?;
+    send_channel_body(
+        channel,
+        &spec,
+        prepared,
+        started,
+        Some(&admission_ctx),
+        progress,
+    )
+    .await
+}
+
+/// The protocol body shared by [`send`] and [`send_on_channel`]: everything
+/// from the Connected progress event through Hello, (optional) admission,
+/// Offer→Accept, manifest, resume, chunks (single-stream or multistream),
+/// Finalize/FinalAck, and the report. `admission = None` keeps the frozen
+/// no-scheduler wire behavior byte for byte.
+#[allow(clippy::too_many_arguments)]
+async fn send_channel_body(
+    channel: DirectChannel,
+    spec: &SendSpec,
+    prepared: PreparedSend,
+    started: Instant,
+    admission: Option<&AdmissionCtx>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let limits = engine_limits();
+    let PreparedSend {
+        sources,
+        manifest,
+        root_name,
+        job_id,
+        mut record,
+        store,
+    } = prepared;
     let channel = Arc::new(channel);
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
@@ -1610,6 +1954,9 @@ pub async fn send(
     if spec.multistream {
         capabilities |= CAP_MULTISTREAM;
     }
+    if admission.is_some() {
+        capabilities |= CAP_SCHEDULER;
+    }
     tx.send_frame(&hello_frame(
         &spec.device_name,
         &spec.identity,
@@ -1617,6 +1964,22 @@ pub async fn send(
     ))
     .await?;
     let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
+    if let Some(ctx) = admission {
+        // Capability-negotiated gate (scheduler.md §6): admission frames
+        // only flow when BOTH Hellos carry CAP_SCHEDULER. A peer without
+        // the bit cannot silently downgrade a scheduled task to the
+        // unadmitted path — the sender asked for scheduling, so it fails
+        // loudly with the stable protocol-unsupported code.
+        if !scheduler_frames_allowed(capabilities, peer_caps) {
+            return Err(EngineError::PeerError {
+                code: ErrorCode::ProtocolUnsupported,
+                message: "peer does not advertise CAP_SCHEDULER; \
+                          scheduled task admission cannot run"
+                    .into(),
+            });
+        }
+        admission_handshake_sender(&mut tx, &mut rx, &limits, spec.idle_timeout, ctx).await?;
+    }
     let multistream = spec.multistream && (peer_caps & CAP_MULTISTREAM) != 0;
 
     // Offer -> Accept/Reject (receiver consent is mandatory).
@@ -1905,8 +2268,59 @@ pub async fn receive_with_addr(
     let _ = addr_tx.send(local);
     let channel = endpoint.accept(&spec.authorize).await?;
     // One connection through the shared single-job protocol body — the very
-    // same body [`serve_concurrently`] runs per connection.
-    receive_job(channel, &target, &JobSpec::of(&spec), started, progress).await
+    // same body [`serve_concurrently`] runs per connection. Legacy path:
+    // no admission decider, so no CAP_SCHEDULER bit and no staging.
+    receive_job(
+        channel,
+        &target,
+        &JobSpec::of(&spec),
+        started,
+        None,
+        progress,
+    )
+    .await
+}
+
+/// Wave-21 on-channel receive entry (scheduler.md §6): run one receive on
+/// an already-accepted [`DirectChannel`] the runtime handed in, with the
+/// scheduler admission handshake in front of the frozen receive body.
+///
+/// * the Hello advertises `CAP_SCHEDULER`; when the peer's does too
+///   ([`ak_wire::scheduler_frames_allowed`]), the body first reads the
+///   sender's `TaskOpen` and hands its code group to `admission_decider`:
+///   [`AdmissionDecision::Admit`] answers a granted `Admission`, waits for
+///   the sender's `AdmissionAck`, and only then accepts the Offer;
+///   [`AdmissionDecision::Deny`] answers the refusal and fails locally
+///   with [`EngineError::AdmissionDenied`] — no Offer is read;
+/// * an admitted task stages its `.akpart` files under its own per-task
+///   tree (`ak_storage::prepare_file_staged`, keyed by the wire task id)
+///   and the tree is discarded when the task reaches a terminal state
+///   (completion, or cancellation);
+/// * a peer without `CAP_SCHEDULER` simply runs the frozen v1 body
+///   unstaged — the receiver cannot demand scheduling the sender did not
+///   negotiate, and channel-level consent still applies to whatever the
+///   caller did before handing the channel in.
+///
+/// `spec.bind`/`spec.authorize` are unused here (the channel exists); the
+/// destination, conflict policy, checkpoints, idle timeout and policy gate
+/// all still apply exactly as in [`receive_with_addr`].
+pub async fn receive_on_channel(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    admission_decider: AdmissionDecider<'_>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let started = Instant::now();
+    let target = LocalSaveTarget::open(&spec.out_dir)?;
+    receive_job(
+        channel,
+        &target,
+        &JobSpec::of(&spec),
+        started,
+        Some(admission_decider),
+        progress,
+    )
+    .await
 }
 
 /// The per-connection subset of [`ReceiveSpec`] the single-job protocol body
@@ -1984,23 +2398,32 @@ fn committed_file_matches(root: &Path, entry: &ak_core::manifest::FileEntry) -> 
 }
 
 /// One accepted connection driven through the full receive protocol:
-/// policy gate, Hello/Offer/Accept, manifest pages, resume answer, chunk
-/// phase (single-stream or multistream), verify, commit, FinalAck. Both
-/// [`receive_with_addr`] and [`serve_concurrently`] run this verbatim, so
-/// the concurrent path is the single-job path — no protocol divergence.
+/// policy gate, Hello/(optional admission)/Offer/Accept, manifest pages,
+/// resume answer, chunk phase (single-stream or multistream), verify,
+/// commit, FinalAck. [`receive_with_addr`], [`serve_concurrently`] and
+/// [`receive_on_channel`] all run this verbatim, so the concurrent path is
+/// the single-job path — no protocol divergence.
+///
+/// `admission` is the wave-21 scheduler hook: `Some(decider)` advertises
+/// `CAP_SCHEDULER` and, when the peer negotiated it too, runs the
+/// TaskOpen→Admission→AdmissionAck handshake whose task id keys the
+/// per-task staging tree. `None` (the legacy entries) keeps the frozen v1
+/// behavior byte for byte.
 ///
 /// Concurrency isolation when several of these run at once (see module
 /// docs): the checkpoint store is opened per call, and distinct job ids
 /// mean distinct `<job>.akjob` files written atomically by exactly one
 /// task; `target` is shared immutably (`LocalSaveTarget` holds only a
 /// canonicalized root path — no interior mutable state), and different
-/// manifest entries map to different `.akpart` files, so a same-path race
-/// between two jobs is resolved by the per-file conflict policy.
+/// manifest entries map to different `.akpart` files (per-task staging
+/// trees under scheduled admission), so a same-path race between two jobs
+/// is resolved by the per-file conflict policy.
 async fn receive_job(
     channel: DirectChannel,
     target: &LocalSaveTarget,
     spec: &JobSpec,
     started: Instant,
+    admission: Option<AdmissionDecider<'_>>,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, EngineError> {
     let limits = engine_limits();
@@ -2015,13 +2438,30 @@ async fn receive_job(
     let stream = channel.accept_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
+    let capabilities = if admission.is_some() {
+        RECV_CAPABILITIES | CAP_SCHEDULER
+    } else {
+        RECV_CAPABILITIES
+    };
     tx.send_frame(&hello_frame(
         &spec.device_name,
         &spec.identity,
-        RECV_CAPABILITIES,
+        capabilities,
     ))
     .await?;
     let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
+    // Scheduled admission (wave 21): only when BOTH Hellos carry the bit
+    // — a legacy sender (no CAP_SCHEDULER) runs the frozen unstaged body,
+    // exactly as before the split.
+    let staged_task: Option<[u8; 16]> = if scheduler_frames_allowed(capabilities, peer_caps) {
+        let decider = admission.expect("CAP_SCHEDULER is advertised only with a decider");
+        Some(
+            admission_handshake_receiver(&mut tx, &mut rx, &limits, spec.idle_timeout, decider)
+                .await?,
+        )
+    } else {
+        None
+    };
     let multistream = (peer_caps & CAP_MULTISTREAM) != 0;
 
     // Offer -> consent -> Accept. Channel-level consent already happened via
@@ -2224,7 +2664,14 @@ async fn receive_job(
             sinks.push(None);
             continue;
         }
-        let sink = target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?;
+        let sink = match staged_task {
+            // Scheduled task: the part file lives in this task's own
+            // staging tree (`<root>/.ak-staging/<task_hex>/...`), so a
+            // second task aiming at the same destination can never
+            // compete for one `.akpart` (wave 20 staging contract).
+            Some(task) => target.prepare_file_staged(task, entry, spec.conflict, chunk_size)?,
+            None => target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?,
+        };
         let prefix = sink.verified_prefix_chunks();
         if !entry.is_dir {
             resume.push(ResumeEntry {
@@ -2388,7 +2835,17 @@ async fn receive_job(
     .await;
 
     match outcome {
-        Ok(report) => Ok(report),
+        Ok(report) => {
+            // Scheduled task terminal state (success): every file was
+            // committed out of the staging tree, so the tree itself is
+            // pure litter — best-effort removal (the transfer already
+            // succeeded; a cleanup failure must not turn it into an
+            // error).
+            if let Some(task) = staged_task {
+                let _ = ak_storage::discard_staging(target.root(), task);
+            }
+            Ok(report)
+        }
         Err(error) => {
             // Sinks consumed by multistream tasks are already gone; every
             // sink still held here with no verified chunk is pure litter.
@@ -2401,6 +2858,14 @@ async fn receive_job(
                         sink.discard();
                     }
                 }
+            }
+            // Cancellation is the other terminal state whose whole
+            // staging tree is discarded (wave 20 contract: parts holding
+            // verified chunks otherwise survive for resume). Any other
+            // failure keeps the staged parts exactly like the legacy
+            // `.akpart` rule.
+            if let (EngineError::Cancelled, Some(task)) = (&error, staged_task) {
+                let _ = ak_storage::discard_staging(target.root(), task);
             }
             Err(error)
         }
@@ -2540,7 +3005,7 @@ pub async fn serve_concurrently(
                             let forward = move |event: Progress| {
                                 let _ = events.send((index, event));
                             };
-                            (index, receive_job(channel, &shared, &job, Instant::now(), &forward).await)
+                            (index, receive_job(channel, &shared, &job, Instant::now(), None, &forward).await)
                         });
                     }
                     Some(Err(ak_net::ConnectError::Timeout(idle))) => {
@@ -6029,6 +6494,858 @@ mod tests {
         assert!(
             !dst.path().join("owned.bin").exists(),
             "nothing may be committed"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 21: on-channel admission handshake + per-task staging
+    // ------------------------------------------------------------------
+
+    /// A fixed admission context for the on-channel tests: one task id,
+    /// one code group, one registry.
+    fn test_admission_ctx(task_id: [u8; 16]) -> AdmissionCtx {
+        AdmissionCtx {
+            task_id,
+            group: [0x77; 32],
+            group_registry: [0x91; 32],
+        }
+    }
+
+    /// A fake wire peer holding one open bidirectional stream plus the
+    /// objects that keep the connection alive. Used to hand-write
+    /// admission frames against the real engine over real loopback QUIC.
+    struct FakePeer {
+        tx: DirectSendStream,
+        rx: DirectRecvStream,
+        _channel: DirectChannel,
+        _endpoint: DirectEndpoint,
+    }
+
+    fn wire(message: Message) -> Frame {
+        Frame {
+            version: ak_wire::VERSION,
+            message,
+        }
+    }
+
+    fn now_ms_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Bind a loopback endpoint, then spawn the accept + Hello exchange
+    /// (fake speaks first with `capabilities`) so the engine sender can
+    /// start connecting while it runs. Returns the address to connect to,
+    /// the fake's pinned fingerprint, and the join handle that yields the
+    /// fake's stream halves once the Hellos are through.
+    async fn fake_receiver_side(
+        capabilities: u16,
+    ) -> (tokio::task::JoinHandle<FakePeer>, SocketAddr, Fingerprint) {
+        let key = DeviceKeyPair::generate();
+        let identity = ak_identity::tls::make_self_signed(&key);
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &identity)
+            .await
+            .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let fingerprint = key.fingerprint();
+        let task = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let stream = channel.accept_bi().await.unwrap();
+            let (mut tx, mut rx) = stream.split();
+            tx.send_frame(&hello_frame("fake-recv", &identity, capabilities))
+                .await
+                .unwrap();
+            let hello = rx.recv_frame(&engine_limits()).await.unwrap();
+            assert!(
+                matches!(hello.message, Message::Hello { .. }),
+                "engine must hello first: {:?}",
+                hello.message
+            );
+            FakePeer {
+                tx,
+                rx,
+                _channel: channel,
+                _endpoint: endpoint,
+            }
+        });
+        (task, addr, fingerprint)
+    }
+
+    /// Dial the engine's receiver endpoint, open the (sender-side) stream,
+    /// exchange Hello, and hand the fake's halves to the caller.
+    async fn fake_sender_side(
+        addr: SocketAddr,
+        pinned: Fingerprint,
+        capabilities: u16,
+    ) -> FakePeer {
+        let key = DeviceKeyPair::generate();
+        let identity = ak_identity::tls::make_self_signed(&key);
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &identity)
+            .await
+            .unwrap();
+        let channel = endpoint.connect(addr, &pinned).await.unwrap();
+        let stream = channel.open_bi().await.unwrap();
+        let (mut tx, mut rx) = stream.split();
+        tx.send_frame(&hello_frame("fake-send", &identity, capabilities))
+            .await
+            .unwrap();
+        let hello = rx.recv_frame(&engine_limits()).await.unwrap();
+        assert!(
+            matches!(hello.message, Message::Hello { .. }),
+            "engine must hello first: {:?}",
+            hello.message
+        );
+        FakePeer {
+            tx,
+            rx,
+            _channel: channel,
+            _endpoint: endpoint,
+        }
+    }
+
+    fn on_channel_send_spec(
+        src: &Path,
+        peer: SocketAddr,
+        pinned: Fingerprint,
+        identity: TlsBundle,
+    ) -> SendSpec {
+        let mut spec = SendSpec::new(src.to_path_buf(), peer, pinned, identity);
+        spec.checkpoint_dir = std::env::temp_dir().join(format!(
+            "ak-tests-onchannel-send-{}-{}",
+            std::process::id(),
+            now_ms_for_test()
+        ));
+        spec
+    }
+
+    fn on_channel_recv_spec(dst: &Path, identity: TlsBundle) -> ReceiveSpec {
+        let mut spec = ReceiveSpec::new(dst.to_path_buf(), identity);
+        spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        spec.checkpoint_dir = std::env::temp_dir().join(format!(
+            "ak-tests-onchannel-recv-{}-{}",
+            std::process::id(),
+            now_ms_for_test()
+        ));
+        spec
+    }
+
+    /// Read the next TaskOpen from the fake's stream (the engine sender
+    /// just produced one).
+    async fn read_task_open(fake: &mut FakePeer) -> (JobId, [u8; 16], [u8; 32], [u8; 32]) {
+        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+            Message::TaskOpen {
+                job_id,
+                permit_id,
+                group,
+                group_registry,
+            } => (job_id, permit_id, group, group_registry),
+            other => panic!("expected TaskOpen, got {other:?}"),
+        }
+    }
+
+    /// Spawn the engine sender toward `addr` with the test admission
+    /// context (the caller plays the receiving wire peer).
+    fn spawn_on_channel_sender(
+        src: PathBuf,
+        addr: SocketAddr,
+        pinned: Fingerprint,
+        task_id: [u8; 16],
+    ) -> tokio::task::JoinHandle<Result<Report, EngineError>> {
+        tokio::spawn(async move {
+            let key = DeviceKeyPair::generate();
+            let identity = ak_identity::tls::make_self_signed(&key);
+            let spec = on_channel_send_spec(&src, addr, pinned, identity);
+            let dialer =
+                DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &spec.identity)
+                    .await
+                    .unwrap();
+            let channel = dialer.connect(spec.peer, &spec.pinned).await.unwrap();
+            send_on_channel(channel, spec, test_admission_ctx(task_id), &noop).await
+        })
+    }
+
+    /// After the engine sender failed, prove no further frame (no Offer,
+    /// no ManifestPage, no Chunk) can still arrive: the connection is gone.
+    async fn assert_wire_silent_after(fake: &mut FakePeer) {
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = Vec::new();
+            loop {
+                match fake.rx.recv_frame(&engine_limits()).await {
+                    Ok(frame) => frames.push(frame.message),
+                    Err(_) => break frames,
+                }
+            }
+        })
+        .await
+        .expect("the closed connection must end the read loop");
+        assert!(
+            observed.is_empty(),
+            "frames arrived after the denial: {observed:?}"
+        );
+    }
+
+    /// Granted full round trip: real send_on_channel against real
+    /// receive_on_channel, admission granted, file bytes identical, the
+    /// decider saw exactly the wire group, and the per-task staging tree
+    /// was discarded at the terminal state.
+    #[tokio::test]
+    async fn on_channel_admission_granted_completes_full_round_trip() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..30_000u32).map(|i| (i % 199) as u8).collect();
+        write(&src.path().join("granted.bin"), &payload);
+
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let receiver_fp = receiver_key.fingerprint();
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        let task_id: [u8; 16] = [0x42; 16];
+        let ctx = test_admission_ctx(task_id);
+        let seen_groups: Arc<std::sync::Mutex<Vec<[u8; 32]>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decider_groups = Arc::clone(&seen_groups);
+        let decider = move |group: &[u8; 32]| {
+            decider_groups.lock().unwrap().push(*group);
+            AdmissionDecision::Admit
+        };
+
+        let recv_spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            receive_on_channel(channel, recv_spec, &decider, &noop).await
+        });
+
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, receiver_fp, task_id);
+
+        let recv_report = receiver.await.unwrap().expect("receive completes");
+        let send_report = sender.await.unwrap().expect("send completes");
+        assert_eq!(send_report.files, 1);
+        assert_eq!(send_report.bytes, payload.len() as u64);
+        assert_eq!(recv_report.bytes, payload.len() as u64);
+        assert_eq!(fs::read(dst.path().join("granted.bin")).unwrap(), payload);
+        assert_eq!(*seen_groups.lock().unwrap(), vec![ctx.group]);
+        // Terminal-state cleanup: the task's staging tree is gone.
+        assert!(
+            !ak_storage::staging_path(dst.path(), task_id).exists(),
+            "staging tree must be discarded after completion"
+        );
+    }
+
+    /// A SerialWait denial fails the send immediately with the dedicated
+    /// error and not one post-denial frame (no Offer) is ever observable.
+    #[tokio::test]
+    async fn on_channel_deny_serial_wait_fails_immediately_without_offer() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"deny me");
+        let task_id: [u8; 16] = [0x11; 16];
+
+        let (fake_task, addr, fp) = fake_receiver_side(CAP_RESUME | CAP_SCHEDULER).await;
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
+        let mut fake = fake_task.await.unwrap();
+
+        let (job_id, permit_id, group, registry) = read_task_open(&mut fake).await;
+        assert_eq!(job_id, task_id);
+        assert_eq!(group, [0x77; 32]);
+        assert_eq!(registry, [0x91; 32]);
+        fake.tx
+            .send_frame(&wire(Message::Admission {
+                job_id,
+                permit_id,
+                granted: false,
+                reason: AdmissionReason::SerialWait,
+            }))
+            .await
+            .unwrap();
+
+        let err = sender
+            .await
+            .unwrap()
+            .expect_err("SerialWait denial must fail the send");
+        assert!(
+            matches!(
+                err,
+                EngineError::AdmissionDenied {
+                    reason: AdmissionReason::SerialWait
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert_wire_silent_after(&mut fake).await;
+    }
+
+    /// A Capacity denial ends the handshake after exactly one TaskOpen
+    /// (no resubmit — only StalePermit retries) and stays wire-silent.
+    #[tokio::test]
+    async fn on_channel_deny_capacity_is_final_and_silent() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"capacity");
+        let task_id: [u8; 16] = [0x22; 16];
+
+        let (fake_task, addr, fp) = fake_receiver_side(CAP_RESUME | CAP_SCHEDULER).await;
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
+        let mut fake = fake_task.await.unwrap();
+
+        let (job_id, permit_id, _, _) = read_task_open(&mut fake).await;
+        fake.tx
+            .send_frame(&wire(Message::Admission {
+                job_id,
+                permit_id,
+                granted: false,
+                reason: AdmissionReason::Capacity,
+            }))
+            .await
+            .unwrap();
+
+        let err = sender.await.unwrap().expect_err("Capacity denial fails");
+        assert!(
+            matches!(
+                err,
+                EngineError::AdmissionDenied {
+                    reason: AdmissionReason::Capacity
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert_wire_silent_after(&mut fake).await;
+    }
+
+    /// A StalePermit denial makes the sender resubmit a fresh TaskOpen
+    /// (new permit id); the granted second attempt continues into the
+    /// frozen path (the fake then Rejects the Offer — proving the protocol
+    /// resumed after admission, and only after it).
+    #[tokio::test]
+    async fn on_channel_stale_permit_resubmits_fresh_task_open() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"stale permit");
+        let task_id: [u8; 16] = [0x33; 16];
+
+        let (fake_task, addr, fp) = fake_receiver_side(CAP_RESUME | CAP_SCHEDULER).await;
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
+        let mut fake = fake_task.await.unwrap();
+
+        // First attempt: stale.
+        let (job_id, permit_a, _, _) = read_task_open(&mut fake).await;
+        fake.tx
+            .send_frame(&wire(Message::Admission {
+                job_id,
+                permit_id: permit_a,
+                granted: false,
+                reason: AdmissionReason::StalePermit,
+            }))
+            .await
+            .unwrap();
+        // Second attempt: grant, and expect the AdmissionAck.
+        let (job_id, permit_b, _, _) = read_task_open(&mut fake).await;
+        assert_ne!(permit_a, permit_b, "resubmit must use a fresh permit id");
+        assert_eq!(job_id, task_id);
+        fake.tx
+            .send_frame(&wire(Message::Admission {
+                job_id,
+                permit_id: permit_b,
+                granted: true,
+                reason: AdmissionReason::Ok,
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+            Message::AdmissionAck {
+                job_id: acked_job,
+                permit_id,
+            } => {
+                assert_eq!(acked_job, task_id);
+                assert_eq!(permit_id, permit_b);
+            }
+            other => panic!("expected AdmissionAck, got {other:?}"),
+        }
+        // The frozen path now runs: the next frame is the Offer; the fake
+        // rejects it and the sender surfaces the plain rejection.
+        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+            Message::Offer { job_id, .. } => {
+                fake.tx
+                    .send_frame(&wire(Message::Reject {
+                        job_id,
+                        reason: ak_core::error::ErrorCode::TargetRevoked,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected Offer after admission, got {other:?}"),
+        }
+        let err = sender
+            .await
+            .unwrap()
+            .expect_err("the fake rejected the offer");
+        assert!(matches!(err, EngineError::Rejected(_)), "got: {err:?}");
+    }
+
+    /// A peer whose Hello lacks CAP_SCHEDULER cannot silently downgrade a
+    /// scheduled send: PROTOCOL_UNSUPPORTED, before any TaskOpen is sent.
+    #[tokio::test]
+    async fn on_channel_peer_without_scheduler_cap_is_protocol_unsupported() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"no cap");
+        let task_id: [u8; 16] = [0x44; 16];
+
+        let (fake_task, addr, fp) = fake_receiver_side(CAP_RESUME).await;
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
+        let mut fake = fake_task.await.unwrap();
+
+        let err = sender
+            .await
+            .unwrap()
+            .expect_err("peer without CAP_SCHEDULER must be refused");
+        assert!(
+            matches!(
+                &err,
+                EngineError::PeerError {
+                    code: ErrorCode::ProtocolUnsupported,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        // No TaskOpen ever left: the fake sees the connection close with
+        // nothing following its own Hello.
+        assert_wire_silent_after(&mut fake).await;
+    }
+
+    /// Receiver side of a denial: the decider's reason is answered on the
+    /// wire (granted = false) and the local call fails with the same
+    /// reason; no receive body ran (no Offer was ever read).
+    #[tokio::test]
+    async fn receive_on_channel_denial_is_answered_on_the_wire() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &[u8; 32]| AdmissionDecision::Deny(AdmissionReason::Capacity);
+            receive_on_channel(channel, spec, &decider, &noop).await
+        });
+
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        let task_id: [u8; 16] = [0x55; 16];
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: [9; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+            Message::Admission {
+                job_id,
+                permit_id,
+                granted,
+                reason,
+            } => {
+                assert_eq!(job_id, task_id);
+                assert_eq!(permit_id, [9; 16]);
+                assert!(!granted);
+                assert_eq!(reason, AdmissionReason::Capacity);
+            }
+            other => panic!("expected Admission, got {other:?}"),
+        }
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("the decider denied the task");
+        assert!(
+            matches!(
+                err,
+                EngineError::AdmissionDenied {
+                    reason: AdmissionReason::Capacity
+                }
+            ),
+            "got: {err:?}"
+        );
+        // Nothing of the receive body ran: no destination file, no staging.
+        assert!(!ak_storage::staging_path(dst.path(), task_id).exists());
+    }
+
+    /// A grant is not enough: the receiver waits for the sender's
+    /// AdmissionAck before the body — with it missing, the idle timeout
+    /// fires (no Offer is read in the meantime).
+    #[tokio::test]
+    async fn receive_on_channel_grant_waits_for_admission_ack() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        spec.idle_timeout = Duration::from_secs(1);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec, &decider, &noop).await
+        });
+
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        let task_id: [u8; 16] = [0x66; 16];
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: [4; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+            Message::Admission {
+                granted, reason, ..
+            } => {
+                assert!(granted);
+                assert_eq!(reason, AdmissionReason::Ok);
+            }
+            other => panic!("expected granted Admission, got {other:?}"),
+        }
+        // Deliberately never send the AdmissionAck.
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("missing AdmissionAck must time out");
+        assert!(
+            matches!(err, EngineError::IdleTimeout(_) | EngineError::Stream(_)),
+            "got: {err:?}"
+        );
+        assert!(!ak_storage::staging_path(dst.path(), task_id).exists());
+    }
+
+    /// The all-zero task id is the staging sentinel: it is refused as a
+    /// protocol violation, not handed to the decider or the staging layer.
+    #[tokio::test]
+    async fn receive_on_channel_refuses_the_zero_task_sentinel() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec, &decider, &noop).await
+        });
+
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: [0u8; 16],
+                permit_id: [1; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+            }))
+            .await
+            .unwrap();
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("zero task id must be refused");
+        assert!(
+            matches!(
+                &err,
+                EngineError::PeerError {
+                    code: ErrorCode::ProtocolUnsupported,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// Hand-written full send protocol against receive_on_channel with a
+    /// poisoned chunk digest: the verified part file must live inside the
+    /// task's staging tree (not beside the final name), and a retry of the
+    /// same task id resumes from it (verified prefix 1) and completes with
+    /// the tree discarded.
+    #[tokio::test]
+    async fn scheduled_receive_stages_parts_and_resumes_within_the_task_tree() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let pinned = receiver_key.fingerprint();
+
+        const CHUNK: usize = 4096;
+        let payload: Vec<u8> = (0..(CHUNK * 2) as u32).map(|i| (i % 251) as u8).collect();
+        let (a, b) = payload.split_at(CHUNK);
+        let digest = |bytes: &[u8]| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(blake3::hash(bytes).as_bytes());
+            out
+        };
+        let whole = digest(&payload);
+        let chunk_digests = vec![digest(a), digest(b)];
+        let task_id: [u8; 16] = [0xAB; 16];
+        let limits = engine_limits();
+
+        // ---- run 1: correct chunk 0, manifest poisons chunk 1's digest.
+        let mut spec1 = on_channel_recv_spec(dst.path(), receiver_identity.clone());
+        spec1.idle_timeout = Duration::from_secs(5);
+        let receiver1 = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec1, &decider, &noop).await
+        });
+        let mut fake = fake_sender_side(addr, pinned, CAP_RESUME | CAP_SCHEDULER).await;
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: [2; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&limits).await.unwrap().message {
+            Message::Admission { granted, .. } => assert!(granted),
+            other => panic!("expected grant, got {other:?}"),
+        }
+        fake.tx
+            .send_frame(&wire(Message::AdmissionAck {
+                job_id: task_id,
+                permit_id: [2; 16],
+            }))
+            .await
+            .unwrap();
+        let job_id: JobId = [0xCD; 16];
+        fake.tx
+            .send_frame(&wire(Message::Offer {
+                job_id,
+                root_name: "poison".into(),
+                file_count: 1,
+                total_bytes: payload.len() as u64,
+                chunk_size: CHUNK as u32,
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&limits).await.unwrap().message {
+            Message::Accept { job_id: acked } => assert_eq!(acked, job_id),
+            other => panic!("expected Accept, got {other:?}"),
+        }
+        let entry = ak_core::manifest::FileEntry::with_digest_alg(
+            "staged.bin",
+            payload.len() as u64,
+            1_700_000_000_000,
+            ak_core::manifest::DIGEST_ALG_BLAKE3,
+            whole,
+            chunk_digests.clone(),
+        )
+        .unwrap();
+        let mut wire_entry = WireEntry::from(&entry);
+        wire_entry.chunk_digests[1] = [0xEE; 32]; // poisoned
+        fake.tx
+            .send_frame(&wire(Message::ManifestPage {
+                job_id,
+                page_index: 0,
+                last_page: true,
+                entries: vec![wire_entry],
+            }))
+            .await
+            .unwrap();
+        match fake.rx.recv_frame(&limits).await.unwrap().message {
+            Message::ResumeRequest { files, more, .. } => {
+                assert!(!more);
+                assert_eq!(files[0].verified_prefix_chunks, 0, "fresh task");
+            }
+            other => panic!("expected ResumeRequest, got {other:?}"),
+        }
+        for (index, data) in [(0u64, a), (1u64, b)] {
+            fake.tx
+                .send_frame(&wire(Message::Chunk {
+                    job_id,
+                    file_index: 0,
+                    chunk_index: index,
+                    data: data.to_vec(),
+                }))
+                .await
+                .unwrap();
+        }
+        let err = receiver1
+            .await
+            .unwrap()
+            .expect_err("poisoned chunk digest must fail the receive");
+        assert!(
+            !matches!(err, EngineError::AdmissionDenied { .. }),
+            "admission itself succeeded: {err:?}"
+        );
+
+        // Staging landing point: chunk 0 verified inside the task's tree.
+        let staged_part = ak_storage::staging_path(dst.path(), task_id).join("staged.bin.akpart");
+        assert!(
+            staged_part.exists(),
+            "verified part must live in the task staging tree"
+        );
+        assert_eq!(
+            fs::metadata(&staged_part).unwrap().len(),
+            CHUNK as u64,
+            "exactly the verified prefix (chunk 0) survived"
+        );
+        assert!(
+            !dst.path().join("staged.bin").exists(),
+            "nothing committed beside the final name"
+        );
+        assert!(
+            !dst.path().join("staged.bin.akpart").exists(),
+            "no legacy same-directory part file may appear for a scheduled task"
+        );
+
+        // ---- run 2: same task id, corrected digest, resume + completion.
+        // Run 1's endpoint moved into its spawn, so run 2 accepts on a
+        // fresh endpoint bound to a fresh port (same destination dir, which
+        // is what carries the staged prefix).
+        let receiver_key2 = DeviceKeyPair::generate();
+        let receiver_identity2 = ak_identity::tls::make_self_signed(&receiver_key2);
+        let endpoint2 =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity2)
+                .await
+                .unwrap();
+        let addr2 = endpoint2.local_addr().unwrap();
+        let mut spec2 = on_channel_recv_spec(dst.path(), receiver_identity2);
+        spec2.idle_timeout = Duration::from_secs(5);
+        let receiver2 = tokio::spawn(async move {
+            let channel = endpoint2.accept(&|_| true).await.unwrap();
+            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec2, &decider, &noop).await
+        });
+
+        let mut fake2 = fake_sender_side(
+            addr2,
+            receiver_key2.fingerprint(),
+            CAP_RESUME | CAP_SCHEDULER,
+        )
+        .await;
+        fake2
+            .tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: [3; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+            }))
+            .await
+            .unwrap();
+        match fake2.rx.recv_frame(&limits).await.unwrap().message {
+            Message::Admission { granted, .. } => assert!(granted),
+            other => panic!("expected grant, got {other:?}"),
+        }
+        fake2
+            .tx
+            .send_frame(&wire(Message::AdmissionAck {
+                job_id: task_id,
+                permit_id: [3; 16],
+            }))
+            .await
+            .unwrap();
+        fake2
+            .tx
+            .send_frame(&wire(Message::Offer {
+                job_id,
+                root_name: "poison".into(),
+                file_count: 1,
+                total_bytes: payload.len() as u64,
+                chunk_size: CHUNK as u32,
+            }))
+            .await
+            .unwrap();
+        match fake2.rx.recv_frame(&limits).await.unwrap().message {
+            Message::Accept { job_id: acked } => assert_eq!(acked, job_id),
+            other => panic!("expected Accept, got {other:?}"),
+        }
+        fake2
+            .tx
+            .send_frame(&wire(Message::ManifestPage {
+                job_id,
+                page_index: 0,
+                last_page: true,
+                entries: vec![WireEntry::from(&entry)],
+            }))
+            .await
+            .unwrap();
+        match fake2.rx.recv_frame(&limits).await.unwrap().message {
+            Message::ResumeRequest { files, more, .. } => {
+                assert!(!more);
+                assert_eq!(
+                    files[0].verified_prefix_chunks, 1,
+                    "retry of the same task id must resume from the staged prefix"
+                );
+            }
+            other => panic!("expected ResumeRequest, got {other:?}"),
+        }
+        fake2
+            .tx
+            .send_frame(&wire(Message::Chunk {
+                job_id,
+                file_index: 0,
+                chunk_index: 1,
+                data: b.to_vec(),
+            }))
+            .await
+            .unwrap();
+        match fake2.rx.recv_frame(&limits).await.unwrap().message {
+            Message::ChunkAck {
+                job_id: acked,
+                file_index,
+                chunk_index,
+            } => {
+                assert_eq!(acked, job_id);
+                assert_eq!(file_index, 0);
+                assert_eq!(chunk_index, 1);
+            }
+            other => panic!("expected ChunkAck, got {other:?}"),
+        }
+        fake2
+            .tx
+            .send_frame(&wire(Message::Finalize { job_id }))
+            .await
+            .unwrap();
+        match fake2.rx.recv_frame(&limits).await.unwrap().message {
+            Message::FinalAck {
+                job_id: acked,
+                verified,
+            } => {
+                assert_eq!(acked, job_id);
+                assert!(verified);
+            }
+            other => panic!("expected FinalAck, got {other:?}"),
+        }
+        let report = receiver2.await.unwrap().expect("run 2 completes");
+        assert_eq!(report.bytes, payload.len() as u64);
+        assert_eq!(report.resumed_chunks, 1, "one chunk was resumed");
+        assert_eq!(fs::read(dst.path().join("staged.bin")).unwrap(), payload);
+        assert!(
+            !ak_storage::staging_path(dst.path(), task_id).exists(),
+            "terminal state discards the task's staging tree"
         );
     }
 }

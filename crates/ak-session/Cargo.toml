@@ -7,5 +7,24 @@ description = "Shared session application layer: pure scheduler domain model (tw
 
 [dependencies]
 ak-core = { workspace = true }
+# Wave 21 (A6): device keys, invite codes, pairing transcripts, peer book.
+ak-identity = { workspace = true }
+# Wave 21 (A6): v2 control-protocol codec, frozen signature domains and the
+# pinned-TLS dialer of the authoritative registry (public server-side
+# surface). The server engine/store stay behind ak-signal's
+# `server-persistence` feature and are only linked in tests.
+ak-signal = { workspace = true }
+# Wave 21 (A6): the local pairing-transaction journal (`pairing_journal`).
+ak-store = { workspace = true }
+blake3 = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# The e2e pairing tests boot the real v2 registry server (engine + SQLite
+# store), which lives behind this feature. Dev-only: the ak-session library
+# itself never links a server-side SQLite.
+ak-signal = { workspace = true, features = ["server-persistence"] }
+env_logger = { workspace = true }
+tempfile = "3"

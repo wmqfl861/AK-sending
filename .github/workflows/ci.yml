@@ -91,3 +91,42 @@ jobs:
         run: cargo test --release -p ak-engine -- --ignored --nocapture
       - name: ak-itests ignored tests (20k files + benches)
         run: cargo test --release -p ak-itests -- --ignored --nocapture
+
+  # Cross-target portability matrix: cargo check of the pure-Rust core
+  # against non-host triples, mirroring scripts/check_targets.sh (本地脚本
+  # 的 CI 镜像；本地 2026-11-04 实跑结果见 docs/TECH_SELECTION.zh-CN.md
+  # "目标平台矩阵" 小节). Rationale: the local Windows dev host fully checks
+  # the two Android triples via the NDK, but linux-gnu/apple are blocked
+  # there by the ring/blake3 C build scripts (no cross gcc / Apple SDK),
+  # so those triples are checked here on native runners instead.
+  # 注释注明：本 job 镜像本地脚本；仓库尚未推送到 GitHub，故从未在 Actions
+  # runner 上实跑（与整个 workflow 同一状态）。
+  # cargo check does not link; ak-store stays on its default file backend
+  # (no C SQLite), so only rust-std + the platform C toolchain for
+  # ring/blake3 build scripts are required.
+  portability:
+    name: Portability check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: portability-${{ matrix.target }}
+      - name: cargo check core matrix packages
+        run: >-
+          cargo check -p ak-core -p ak-wire -p ak-identity -p ak-storage
+          -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-cli
+          -p ak-ffi --target ${{ matrix.target }}

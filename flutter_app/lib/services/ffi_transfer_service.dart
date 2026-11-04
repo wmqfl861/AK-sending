@@ -138,13 +138,21 @@ final class FfiTransferService implements TransferService {
         : Future<void>.value();
   }
 
-  /// Default identity directory on desktop: `%USERPROFILE%\.ak-sending`
+  /// Default identity directory on desktop: `$AK_ID_DIR` when set (test /
+  /// operator override, wave-16), else `%USERPROFILE%\.ak-sending`
   /// (PathProvider is unavailable for this desktop shell — plain
   /// `Platform.environment`). On Android this is only the provisional value
   /// used until [identityDirReady] resolves [defaultAndroidIdentityDir].
   /// [environment] is injectable for tests.
   static String defaultIdentityDir({Map<String, String>? environment}) {
     final env = environment ?? Platform.environment;
+    // Wave-16 (E2E isolation): explicit operator/test intent wins — the
+    // integration test points the app at a throwaway directory instead of
+    // polluting the real `%USERPROFILE%\.ak-sending`.
+    final overridden = env['AK_ID_DIR'];
+    if (overridden != null && overridden.isNotEmpty) {
+      return overridden;
+    }
     final home = env['USERPROFILE'] ?? env['HOME'] ?? '';
     if (home.isEmpty) {
       return '.ak-sending';
@@ -286,6 +294,15 @@ final class FfiTransferService implements TransferService {
     // (path_provider answers within the first frames; pages never see this).
     if (_isAndroidPlatform) {
       await identityDirReady;
+    } else {
+      // Wave-16 (found by the real-app E2E): never refresh synchronously.
+      // Pages call this from initState — inside the build phase — and the
+      // notify inside [_refreshIdentityUngated] would hit an ALREADY-BUILT
+      // sibling's setState (e.g. PairingPage init → HomePage listener),
+      // throwing "setState() called during build" and erroring the page.
+      // One microtask hop lands the notify after the frame's build scope;
+      // the identity card re-renders one frame later (pages poll, not push).
+      await Future<void>.value();
     }
     return _refreshIdentityUngated();
   }

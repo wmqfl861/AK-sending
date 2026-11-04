@@ -7,11 +7,11 @@
 服务器仅可用于设备发现、信令和 NAT 穿透协调，绝不承载文件数据或密文；ADR-001 不变。
 2026-11-02（第二阶段）：用户指示"继续本地开发，多模块多子代理并行，直到项目完成，不用推送"；本地分支推进，未推送、未部署、未强推、未加许可证。
 
-## 第二至八轮完成内容（2026-11-02 至 2026-11-03，dev/local-parallel）
+## 第二至十五轮完成内容（2026-11-02 至 2026-11-04，dev/local-parallel）
 
-按 ADR-002（采纳评审 D1/D5/D6 路线）完成局域网 CLI 原型全栈：
+按 ADR-002（采纳评审 D1/D5/D6 路线）完成局域网 CLI 原型全栈与桌面/安卓前端：
 
-- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）→ `0140282`（第四、五轮：十并行代理＋接线）→ `9961506`（65,537 边界补记）→ `ab33a46`（第六、七轮：六并行代理＋集成者修复）→ `d1fa222`（六/七轮 BACKLOG 记录）→ `3b39c03`（第八轮：产品流程 e2e/CLI 打磨/文档对齐）→ `cbdb2a4`（第八轮 BACKLOG 记录）。
+- 提交历史：`c13ecb8`（脚手架/接口冻结）→ `925c63d`（六模块并行实现）→ `4a3bf36`（引擎+CLI 集成与验证）→ `911bc31`（第二轮：引擎增强/配对 CLI/存储补强/场景测试）→ `5ac6f2a`（第三轮：四并行代理＋集成者修复）→ `0140282`（第四、五轮：十并行代理＋接线）→ `9961506`（65,537 边界补记）→ `ab33a46`（第六、七轮：六并行代理＋集成者修复）→ `d1fa222`（六/七轮 BACKLOG 记录）→ `3b39c03`（第八轮：产品流程 e2e/CLI 打磨/文档对齐）→ `cbdb2a4`（第八轮 BACKLOG 记录）→ `64c7278`（第九轮：文档收尾/CI 配置/冒烟脚本）→ `40d7d63`（第十轮：ak-ffi C ABI＋ADR-003）→ `7dffa51`（第十一轮：Flutter Windows 桌面端）→ `bc7fa01`（第十二轮：身份导出/簿准入/历史接线）→ `834f42a`（第十三轮：安卓平台移植）→ `6ea65f0`/`1e6a8ab`（第十三轮证据记录＋重启恢复手册；后者随附 ak-ffi peer 三导出与 smoke_android_host.sh）→ `b4fb427`（跨设备里程碑证据记录）→ `f82ff77`（第十四/十五轮集成：配对 UI 真调用、daemon、随机性质套件、安卓存储通道）。
 - 11 个 crate：ak-core（领域）、ak-identity、ak-wire、ak-storage、ak-net、ak-discovery、ak-store、ak-signal、ak-engine、ak-cli、ak-itests（跨 crate 场景测试）。
 - 数据面：QUIC（quinn 0.11）+ rustls/ring + 自签 Ed25519 证书双向钉扎；`DirectChannel` 无公开构造函数（类型约束）；无 relay/TURN 路径，Cargo.lock 依赖扫描锁定。
 - 引擎：完整端到端协议（见 ak-engine 文档），确定性任务 ID、窗口化确认、检查点续传、完成标记晚于校验+落盘；第三轮追加存储满预检（`check_headroom` 决策函数＋STORAGE_FULL 协议路径）与多根合并发送（`extra_roots`/`SourceSet`，`Report.roots`）。
@@ -33,18 +33,24 @@
 
 第十三轮新增（2026-11-04，安卓移植波，提交 `834f42a`＋`6ea65f0` 证据记录；第十至十二轮——ak-ffi C ABI/ak_ffi_dart/Flutter 桌面端接线——逐项见 [BACKLOG](BACKLOG.zh-CN.md)，此处不重复）：`scripts/build_android_ffi.sh` 双 ABI 交叉编译（纯环境变量 linker、NDK 28.2、`llvm-nm` 冻结符号验证、jniLibs 与 target 哈希一致，流程与故障排查见 [ANDROID_BUILD](ANDROID_BUILD.zh-CN.md)）；flutter_app 安卓平台（INTERNET 权限、minSdk 24、tier-0 so 加载、path_provider 身份目录异步解析、应用专属 Download 输出链），flutter test 66/66；apk-debug.apk 161MB 构建成功、双 ABI so 在包内（装机尚未执行）；Windows GUI 首启截图核验通过（配对码/指纹渲染正常，证据见验证记录"第十三轮进行中证据"节）。进行中：AVD 系统镜像重装（首次下载 zip 损坏已定位，unknown archive @33%）→ 模拟器装机与跨设备传输。环境事实：Android SDK/NDK/JDK 布局于 `~/android-toolchain`（`sdk/ndk/` 下 27.2 与 28.2 双版本，脚本自动取最高），Flutter SDK 于 `~/flutter-sdk`（使用前 `export PATH="$USERPROFILE/flutter-sdk/bin:$PATH"`）；模拟器操作经 android-emulator 插件的 23 个工具以 JSON-RPC 直驱 MCP 服务器（约定辅助脚本 `/tmp/mcp_call.py` 发起调用）。
 
+跨设备里程碑（2026-11-04，提交 `b4fb427` 证据记录；reports/dev-validation-2026-11-02.txt"跨设备里程碑"节）：Android 模拟器→Windows 宿主真实 QUIC 传输打通（CLI 路线）——`ak-cli` 交叉编译 x86_64-linux-android（8,904,736B；ring/rustls 的 C 构建经每目标 `CC_*`/`AR_*` 指向 NDK clang/llvm-ar）实跑于模拟器，宿主 receiver（`--expect any`，端口 17900），发送端经 `10.0.2.2`（模拟器→宿主 NAT 环回别名，非物理双机）。job `afe43780da634ea94e8e7e6ec97da314` 双端 complete、同 job id，`cmp` 逐字节一致（5.00 MiB 随机 payload.bin＋中文文件名"说明.txt"）；Android 端 TOFU 记录宿主指纹 499f62ba。层级如实：真实双进程＋跨网络栈，仍非物理双机。GUI 路线受阻如实记录：APK 装机成功但模拟器 System UI 三轮 ANR（应用进程存活＋topResumed 确认），GUI 截图/走查未成——CLI 路线先行提供跨设备证据。
+
+第十四轮新增（2026-11-04，配对链路波；ak-ffi 侧随 `1e6a8ab`，其余随 `f82ff77`）：ak-ffi 配对簿三导出 `ak_peer_list`/`ak_peer_add`/`ak_peer_remove`（缺簿 `[]`、坏簿 `-1`、upsert 保 CLI TOFU 配对时间、坏指纹/控制字符名 `-2`、remove 未知 `-4`；C ABI 测试 23/23）；ak_ffi_dart peers 绑定（PeerEntry 模型＋`-3` 无损重试，dart test 85/85 含 CLI 写簿往返）；Flutter 配对页（簿列表/指纹短式展开/添加表单完整 64 hex 校验/删除二次确认/坏簿内联错误行，flutter test 84/84）；集成者将 `AkEngineDartFacade` peer 三方法由桩切为真实调用，切换点测试升级为真实 facade→C ABI→DLL 往返。逐项证据见 [BACKLOG](BACKLOG.zh-CN.md) 第十四轮节。
+
+第十五轮新增（2026-11-04，提交 `f82ff77`）：`ak-cli daemon` 常驻接收（与 `receive` 共享准入配置、mDNS 广播、失败任务不终止进程；`--json-lines` NDJSON 五型事件流，stdout 逐行可解析；ak-cli 83/83，真实双任务冒烟）；确定性随机性质套件（无依赖 LCG 种子可复现；25 种子随机树传输＋10 种子随机中断续传不变量，release 94.8s 零缺陷；快速回归种子 1/2/3 入默认 `cargo test`）；安卓存储通道（Kotlin MethodChannel `dev.ak/storage`：目录信息/SAF 目录选择/SAF 写闭环探针/持久授权列举，APK 179MB 重建；模拟器端选择器走查待 GUI 路线恢复）。逐项证据见 [BACKLOG](BACKLOG.zh-CN.md) 第十五轮节。AGENTS.md 同日由所有者增补并行开发六规则（见 AGENTS.md，此处不重复）。
+
 ## 实现与验证边界（如实）
 
-- 已验证范围＝本机环回（L2 形态）：QUIC 握手、传输、续传、大文件、CLI 双进程。跨机器、跨网段、公网 NAT 穿透、抓包（L3/L4）未执行。
+- 已验证范围＝本机环回（L2 形态）＋模拟器↔宿主跨设备（CLI 路线：真实双进程、跨网络栈 NAT 形态、逐字节一致）：QUIC 握手、传输、续传、大文件、CLI 双进程。两台物理机器、跨网段、公网 NAT 穿透、抓包（L3/L4）未执行。
 - 打洞：holepunch 探测与 probe 命令已实现并有本地 UDP 互探测试；真实 NAT 环境成功率未测（P0-05）。
-- 移动端/Flutter 现状（第十三轮后如实）：Flutter Windows 桌面端与安卓平台壳已就位（单机/构建级验证）；安卓装机运行、真机验收、移动原生能力（mDNS/SAF/后台生命周期）、性能调优（多流并发、千兆跑满）未开始。
+- 移动端/Flutter 现状（第十五轮后如实）：Flutter Windows 桌面端（含配对页，真 DLL 集成测试）与安卓平台壳＋存储通道（SAF 闭环探针，构建级验证）已就位；安卓 GUI 模拟器走查受阻（System UI ANR，应用进程本身存活）；安卓 mDNS 发现、SAF 选择器实机走查、后台生命周期、真机验收、性能调优（多流并发、千兆跑满）未开始。
 - 已知限制见各 crate 文档与 SECURITY：接收端 available_bytes 为真实实现（fs2）、mtime 尽力回写（filetime）、IPv6 前缀按 /64 简化、probe nonce 非密码学随机（身份由 QUIC 握手承担）、SameEgress 存在反代/CGNAT 误报场景（仅排序提示）。
 
 ## 重启恢复手册（2026-11-04，WHPX 启用后首次重启）
 
 重启原因：Android 模拟器 x86_64 需硬件加速；本机 Hypervisor 在位，已 `Enable-WindowsOptionalFeature HypervisorPlatform`（State=Enabled, RestartNeeded=True）。重启后按序执行：
 
-1. `cd <仓库根>`；`git status` 确认树状态（若有十四波代理半成品文件：ak-ffi peer 导出 / scripts/smoke_android_host.sh，先跑各自验证门槛收尾再提交）。
+1. `cd <仓库根>`；`git status` 确认树状态（重启时列出的十四波半成品文件——ak-ffi peer 导出与 scripts/smoke_android_host.sh——已于 2026-11-04 随 `1e6a8ab`/`f82ff77` 提交收口）。
 2. 验证 WHPX 生效：`emulator -accel-check`（~/android-toolchain/sdk/emulator/）应报 WHPX 可用。
 3. 启模拟器：`emulator.exe -avd ak_test -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim`（后台）→ `adb wait-for-device && adb shell getprop sys.boot_completed` 轮询到 1。
 4. 装 APK：`~/android-toolchain/sdk/platform-tools/adb.exe install -r flutter_app/build/app/outputs/flutter-apk/app-debug.apk`。
@@ -61,9 +67,10 @@ README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 
 ## 下一工程节点
 
-1. 跨设备首证＝模拟器↔主机（第十三轮口径更新）：AVD 就绪后在模拟器内以宿主回环别名 `10.0.2.2` 跑 `receive`/`send`，验证非环回路径与防火墙行为（安卓端 APK 已能构建、装机待验）；两台真实机器（同网段）的真双机实测仍在其后；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。多流并行在环回仅约 1.04–1.06x（第六轮空闲机刷新：单流 93.9 vs 多流 97.9 MiB/s），是否默认启用待双机网卡数据再定。
-2. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
-3. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
-4. Flutter UI（Windows → Android 优先）与移动端后台/存储适配。
-经第十三轮后复核，上述节点顺序不变，唯节点 1 的跨设备首证改为模拟器↔主机起步；Flutter SDK 与 Android 移动工具链已就位（`~/flutter-sdk`、`~/android-toolchain`），本地可执行范围延伸到模拟器装机与 UI 驱动，真双机与真实网络（L3/L4）仍需外部资源。
+1. **首要剩余项＝两台真实物理机器（同网段）双端实测**：跨设备首证的模拟器形态已完成（Android 模拟器→Windows 宿主 CLI 路线，经 `10.0.2.2`，逐字节一致，2026-11-04 里程碑），模拟器路线已通；下一步在物理双机上跑 `ak-cli receive`/`send`（CLI 先行，随后 Flutter GUI 双端），验证真实网卡/防火墙行为；随后 `signal-server` + `probe` 在家宽/热点组合下实测公网直连成功率（P0-05，决定产品文案）。多流并行在环回仅约 1.04–1.06x（第六轮空闲机刷新：单流 93.9 vs 多流 97.9 MiB/s），是否默认启用待物理双机网卡数据再定。
+2. GUI 模拟器验证恢复（受阻记录）：GUI APK 装机成功但模拟器 System UI 不稳（三轮 ANR；应用进程存活＋topResumed 确认），GUI 截图/走查未成——根因排查方向为模拟器 WHPX/镜像稳定性，非应用崩溃；恢复后补 GUI 路线跨设备走查与安卓 SAF 选择器走查。CLI 旁路（模拟器内 ak-cli 实跑＋宿主 receiver）已提供跨设备证据，不阻塞节点 1。
+3. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
+4. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
+5. Flutter UI 双端化（Windows 桌面端已含配对页；Android GUI 走查待节点 2）与移动端后台/存储适配（mDNS、SAF 实机走查、MediaStore）。
+经第十五轮后复核：模拟器跨设备路线已通（CLI），本地可执行范围内的跨设备证据已取得；物理双机与真实网络（L3/L4）仍需外部资源。
 后续开发先读取本文件、AGENTS、ROADMAP 和现有源码；保留已有历史，禁止强推。

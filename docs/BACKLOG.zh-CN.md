@@ -103,12 +103,29 @@
 
 - [x] 双 ABI 交叉编译脚本＋符号验证（安卓构建侧前置）：`scripts/build_android_ffi.sh` 纯环境变量 linker 方案（不新增 `.cargo/config.toml`），一次构建 x86_64-linux-android＋aarch64-linux-android（NDK 28.2，Windows 主机），产物复制进 jniLibs 并以 NDK `llvm-nm -D --defined-only` 抽查冻结符号（ak_engine_new/ak_identity_info/ak_jobs_list）、target 与 jniLibs 两处 SHA-256 一致。产物哈希：x86_64 5,664,296 字节 `6d92792e546fb6f085723d42883e5ea599ee1c0fde8d3e5c4003d54cc392e7a2`；arm64-v8a 5,557,928 字节 `c7f1eaa04bbeb9b55e288af0b502e26d78bf8e6a91914c0dd29168c5026a58cb`。符号验证属静态产物检查，不等价真机运行验证（ANDROID_BUILD 文档标记约定）。
 - [x] flutter_app 安卓平台（P1-04 安卓首端；P0-06 代码侧）：INTERNET 权限（LAN 直传必需，release 只从 main manifest 获得）、minSdk 24（与 NDK clang 的 android24 目标三元组对齐）、tier-0 `libak_ffi.so` 加载（System.loadLibrary 语义，桌面三级 DLL 探测全部跳过）、path_provider 身份目录异步解析（`<应用支持目录>/.ak-sending`，首次引擎读取前等待解析完成）、应用专属 Download 输出链（getDownloadsDirectory → getExternalStorageDirectory+`Download/` → 文档目录+`Download/`；公共 Downloads 导出留待 SAF/MediaStore 后续波次）；flutter test 66/66、analyze 零告警。
-- [x] APK 构建成功且双 ABI so 在包内：apk-debug.apk 161MB（debug 形态，未做 size/strip 优化），libak_ffi.so 双 ABI 随包（包内 x86_64 4.3MB＋arm64 3.7MB）；装机尚未执行。
+- [x] APK 构建成功且双 ABI so 在包内：apk-debug.apk 161MB（debug 形态，未做 size/strip 优化），libak_ffi.so 双 ABI 随包（包内 x86_64 4.3MB＋arm64 3.7MB）；装机当时尚未执行（其后随跨设备里程碑完成，见下节）。
 - [x] Windows GUI 首启截图核验（第十一/十二轮 GUI 的真启动补证）：target/windows_gui_first_launch.png 经视觉模型核验，五页导航与身份卡完整渲染（配对码 146-778 大号展示、指纹 b6998f27），无白屏/崩溃/错版；主题实测浅色、与任务描述不符处如实记录。
-- [ ] 进行中：AVD/模拟器装机与跨设备传输——系统镜像重装中（首次下载 zip 损坏已定位：unknown archive @33%，改带校验重试循环重装）。
-- [ ] 模拟器 UI 驱动验证（截图/操作走查）。
-- [ ] 跨设备实测：模拟器↔主机（10.0.2.2）起步，真双机仍其后。
-- [ ] 安卓 mDNS 发现、SAF/MediaStore 公共目录导出、后台/生命周期适配（P0-06 剩余部分）。
+- [x] AVD/模拟器装机（收口于跨设备里程碑，见下节）：系统镜像带校验重试重装完成、模拟器就绪；CLI 与 GUI 两种 APK 均装机成功；跨设备传输经 CLI 路线打通（逐字节一致）。
+- [ ] 模拟器 UI 驱动验证（截图/操作走查）：GUI 装机成功但模拟器 System UI 不稳（三轮 ANR；应用进程存活＋topResumed 确认），GUI 截图受阻——如实记录，CLI 路线已提供跨设备证据（见下节）。
+- [x] 跨设备实测（模拟器↔主机部分）：见下"跨设备里程碑"节；两台真实机器（物理双机）仍未执行（P0/P3 余项）。
+- [ ] 安卓 mDNS 发现、公共目录导出选择器走查、后台/生命周期适配（P0-06 剩余部分）：SAF 存储通道代码已落地（第十五轮，Kotlin `dev.ak/storage` 四方法含 SAF 写闭环探针，APK 179MB 重建）；模拟器端 SAF 选择器走查待 GUI 路线恢复后执行。
+
+跨设备里程碑（2026-11-04，Android 模拟器→Windows 宿主真实 QUIC 传输，CLI 路线；提交 `b4fb427` 证据记录，reports/dev-validation-2026-11-02.txt"跨设备里程碑"节）：
+
+- [x] 首个跨设备传输组合：`ak-cli` 交叉编译 x86_64-linux-android（8,904,736B；ring/rustls 的 C 构建沿用 build_android_ffi.sh 的每目标 `CC_x86_64_linux_android`/`AR_x86_64_linux_android` 指向 NDK clang/llvm-ar）→ adb push 至模拟器 `/data/local/tmp` → Android 端 `ak-cli --version` 实跑确认（wire v1、caps 0x0007、release）→ Windows 宿主 receiver（`--expect any`，端口 17900）↔ Android 发送端经 `10.0.2.2`（模拟器→宿主 NAT 环回别名）。job `afe43780da634ea94e8e7e6ec97da314` 双端 complete 且同 job id：2 条目 5.00 MiB（5,242,880B 随机 payload.bin＋中文文件名"说明.txt"）；`cmp` 逐字节一致（payload.bin/note.txt 均 IDENTICAL）；QUIC＋TLS 指纹钉扎握手跨设备真实成立；Android 端 TOFU 记录宿主指纹 499f62ba，keygen/peers.book/device.key 全功能。层级如实：真实双进程＋跨网络栈（模拟器 NAT 10.0.2.2），非进程内环回；**仍非物理双机**（模拟器与宿主同机），真实 NAT/公网（P0-05）与抓包（P0-07）未执行。宿主侧配套脚本 `scripts/smoke_android_host.sh`（提交 `1e6a8ab`；`--self-test` 为无设备门槛；Android→宿主方向经 `--fp` 钉扎＋配对码目视核对的安全取舍脚本内如实声明）。
+
+第十四轮（2026-11-04，配对链路波：ak-ffi 三导出→Dart 绑定→Flutter 配对页→集成者切换；ak-ffi 侧随 `1e6a8ab` 提交，其余随 `f82ff77` 集成提交）：
+
+- [x] ak-ffi 配对簿三导出（`ak_peer_list`/`ak_peer_add`/`ak_peer_remove`，crates/ak-ffi/src/shim.rs，schema 冻结于 lib.rs）：缺簿＝`[]`、坏簿＝`AK_ERR_INVALID`（"cannot load peer book"）、列表按指纹排序；add 即 CLI `pair add` 语义——新对等端无名存 `"(unnamed)"`、upsert 改名保原 `paired_unix_ms`、`AK_ERR_BUFFER` 重试幂等、坏指纹与控制字符名 `-2` 拒绝；remove 未知指纹 `-4`、簿原子保存；写路径先试探缓冲再落簿，保存失败 `AK_ERR_INTERNAL` 且簿原样。C ABI 测试 23 项全经导出函数驱动（peer 新增 10 项：缺/空簿、CLI 写簿排序解析、坏簿、add 默认名/upsert 保时/坏输入拒绝、remove 删除与 `-4`、identityInfo 计数联动、预写缓冲、保存失败簿无损）——`cargo test -p ak-ffi`（tests/ffi.rs）23/23。
+- [x] ak_ffi_dart peers 绑定（packages/ak_ffi_dart/lib/src/peers.dart＋bindings/engine 扩展）：`PeerEntry` 模型（fingerprint/name/pairedUnixMs）与三方法 Dart 侧镜像校验（64 hex、`-3` 自动扩容无损重试、`-4` 异常化）；dart test 85/85（peers 新增 9 项：缺簿 `[]` 且零落盘、坏簿 `-2` 不破坏、CLI 写簿往返、upsert 保配对时间、坏指纹/控制字符名、remove 删除/`-4`/坏指纹、identityInfo 簿计数联动）。
+- [x] Flutter 配对页（flutter_app/lib/ui/pages/pairing_page.dart）：簿列表（未命名回退文案、指纹短式 chip 点击展开完整 64 hex）、添加表单（非 hex 内联拒绝；8–63 位前缀按冻结契约提示需完整 64 hex——前缀解析是 CLI 发送侧能力，簿写入要求完整指纹）、删除二次确认（取消保留/确认删除/对端已消失 false 分支）、坏簿内联错误行不崩页；主页"已配对设备 N 台"随簿联动刷新（home_page/app 接线）。flutter test 84/84（配对页 10 项 widget 测试；TransferService 扩 listPeers/addPeer/removePeer，Fake 同步实现）。
+- [x] 集成者切换与真 DLL 升级：`AkEngineDartFacade` peer 三方法由 `UnsupportedError` 桩切为真实 `engine.peerList/peerAdd/peerRemove` 调用（预留一行切换点兑现）；切换点测试升级为真实 facade→C ABI→ak_ffi.dll 往返（services_test.dart "the real AkEngineDartFacade peer seam drives the real DLL (wave-14 integration switched on)"）；84/84 复测通过。
+
+第十五轮（2026-11-04，daemon＋随机性质套件＋安卓存储通道；提交 `f82ff77`）：
+
+- [x] `ak-cli daemon` 常驻接收（crates/ak-cli/src/daemon.rs）：单进程三关切——与 `receive` 共享 `ReceiveLoopConfig` 的身份/准入（两动词解析一致性测试钉死，语义不可漂移）、mDNS 广播（指纹 TXT，与 `discover` 同一记录）、顺序接收循环（单任务失败/超时不终止进程，报告后继续监听，Ctrl-C 撤广播退 0）；`--json-lines` 输出 NDJSON 事件流（listening/job_started/job_done/error/stopped 五型；字段名为脚本面向契约只增不改，调用方字符串全经 json_escape，人读笔记走 stderr 保持 stdout 逐行可解析）。ak-cli 83/83（daemon 单元 7 项：默认/全量旗标解析、NDJSON 精确单行渲染、字符串 JSON 转义、设备名校验回退 whoami、与 receive 身份/准入解析一致、坏 conflict/expect 拒绝）；真实双任务冒烟（同一 daemon 进程连续接收两个 job，事件流完整）。
+- [x] 确定性随机性质套件（crates/ak-itests/tests/property_random.rs＋prop_common.rs）：一切随机出自无依赖 LCG（Knuth 常数），种子完全决定树形/字节/旋钮，断言失败消息带 seed＋生成器摘要、同种子重跑可复现。两套 release 深测（`#[ignore]`，本轮执行 94.8s 零缺陷）：25 种子随机树传输不变量（0-40 文件、单文件 0-512KiB、深 0-6、CJK/内部空格/多点/点前缀/单字符混合名、随机空目录链、chunk_kb∈{16,64,256}、multistream 随机——双端 Report 计数对账、job_id 双端一致、全新目的地 resumed=0、ChunkReceived 恰每 chunk 一次、逐字节一致、无 .akpart 残留）＋10 种子随机中断续传不变量（中断点由第二种子流抽取；leg-1 发送端必须失败关闭、中断仅数据面——0 最终文件/≥1 part 存活/恰一条检查点、同身份重传 resumed≥1 且 job_id 与中断前一致、逐字节一致）。快速回归（种子 1/2/3 缩小版）入默认 `cargo test`。已知限制模块文档声明（全空树/多根不在矩阵、中断为进程内 abort 形态非真实断网注入、"最后一刻完成"竞态以 leg-1 失败关闭断言兜底）。
+- [x] 安卓存储通道（flutter_app/android/app/src/main/kotlin/dev/ak/ak_sending_app/MainActivity.kt，MethodChannel `dev.ak/storage`）：`getStorageInfo`（应用专属 Download 目录＋卷剩余字节＋SAF 持久授权态）、`pickFolder`（ACTION_OPEN_DOCUMENT_TREE；FlutterActivity 非 ComponentActivity，自建 ActivityResultRegistry 经 v2 embedding 路由，无弃用 onActivityResult）、`safWriteTest`（DocumentsContract createDocument→写 1 字节→读回校验→delete，SAF 写路径最小闭环探针）、`listSafPersisted`（uri/read/write/tree/persistedTimeMs）；选择器进行中重复触发与坏 URI 反例处理；APK 重建（apk-debug.apk 179,026,123B，2026-11-04 10:15，debug 形态）。Kotlin 文件头如实声明：本轮保证编译通过与通道闭环设计，模拟器/真机 SAF 选择器走查与 Flutter 侧接线为其后续（Android TV 无选择器返回 null、SAF 授权可被系统收回等限制同处声明）。
 
 ## P0
 

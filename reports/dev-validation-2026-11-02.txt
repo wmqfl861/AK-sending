@@ -366,3 +366,15 @@ flutter build windows --release 成功；打包 17 文件 43.9MB → zip 18.1MB
 # 层级：真实双进程+跨网络栈（模拟器 NAT 10.0.2.2），非进程内环回；仍非物理双机（模拟器与宿主同机）。
 # 旁证：Android 端 keygen/peers.book/device.key 全功能；GUI APK 装机成功但模拟器 System UI 不稳（三轮 ANR，
 #   应用进程存活+topResumed 确认，GUI 截图受阻——如实记录，CLI 路线已提供跨设备证据）。
+
+## 第十六轮（部分）：反向跨设备 + 打包扩展 + 跨平台矩阵（2026-11-04，3 代理）
+# 反向（宿主→安卓）：smoke_android_host.sh --reverse 实跑 PASS——8 MiB+中文名+空目录，
+#   job 40726bc3f15c3dcde778c10f0e3b198f 双端 complete，cmp 逐字节一致；宿主 sender 钉扎安卓指纹。
+#   网络垫片如实：adb forward/reverse 仅 TCP；emu redir udp 的 slirp 回程改写源端口触发
+#   quinn-proto 0.11.19 connection/mod.rs:1131 地址校验丢弃——本地 python UDP 中继保四元组，
+#   垫片内为真实 QUIC/UDP 报文，非真机网络。脚本另修复 MSYS 路径改写破坏原方向 adb 调用的问题。
+# 打包：-IncludeAndroid → 20 文件 64.3MB（android/ak-cli-android-x86_64 + 双 ABI libak_ffi.so，
+#   llvm-nm 符号校验通过），zip 25.6MB；jniLibs 刷新为当前源码构建（f0cfca92…/5,690,264B）。
+# 跨平台矩阵：android 双 ABI 十 crate 全集 check 通过；纯 Rust 子集（ak-core/wire）五 triple 全过；
+#   linux-gnu/apple 全集受阻=宿主无交叉 C 工具链（ring/blake3 cc-rs），零 E-error 属环境非代码；
+#   scripts/check_targets.sh + CI portability job（未实跑如实标注）+ TECH_SELECTION 矩阵节。

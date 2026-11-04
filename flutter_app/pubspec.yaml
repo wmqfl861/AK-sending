@@ -46,6 +46,11 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  # Wave-16 real-app E2E (`integration_test/app_e2e_test.dart`, run with
+  # `flutter test integration_test/app_e2e_test.dart -d windows`).
+  integration_test:
+    sdk: flutter
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your

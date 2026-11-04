@@ -5,6 +5,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -Profile debug
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -SkipFlutter:$false
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -IncludeAndroid
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -OutDir D:\tmp\ak-sending
 #
 # Parameters:
@@ -20,17 +21,35 @@
 #                 ([switch]/[bool] parameters reject them), so this parameter is typed
 #                 [object] and normalized at runtime. Accepted values: $true/$false,
 #                 true/false, 1/0, yes/no, on/off (any case).
+#   -IncludeAndroid
+#                 Defaults to false. A real [switch]: pass it bare
+#                 (-IncludeAndroid) or with a colon (-IncludeAndroid:$true).
+#                 When set, the script:
+#                   1. runs `bash scripts\build_android_ffi.sh` (Git Bash; builds
+#                      libak_ffi.so for x86_64 + aarch64 and stages both into
+#                      flutter_app\android\app\src\main\jniLibs\). Existence of the
+#                      script AND bash is probed first; a build failure is a WARNING,
+#                      never fatal - whatever .so files are then present are still
+#                      probed and packaged (so a pre-built tree works offline).
+#                   2. copies every jniLibs\<abi>\libak_ffi.so into
+#                      <OutDir>\android\jniLibs\<abi>\libak_ffi.so (the layout an
+#                      Android app consumes directly);
+#                   3. if target\x86_64-linux-android\release\ak-cli exists (an ELF
+#                      the ffi build does NOT produce - cross-build ak-cli manually),
+#                      copies it as android\ak-cli-android-x86_64.
+#                 Everything staged lands in MANIFEST.txt automatically.
 #
 # Output:
 #   ak-cli.exe, ak_ffi.dll, README.md (+ LICENSE only if the repo ever gains one),
-#   flutter\ (optional), MANIFEST.txt (SHA256 + size per file), plus a .zip next
-#   to OutDir.
+#   flutter\ (optional), android\ (optional, -IncludeAndroid), MANIFEST.txt (SHA256 +
+#   size per file), plus a .zip next to OutDir.
 
 param(
     [string]$OutDir,
     [ValidateSet('release', 'debug')]
     [string]$Profile = 'release',
-    [object]$SkipFlutter = $true
+    [object]$SkipFlutter = $true,
+    [switch]$IncludeAndroid
 )
 
 $ErrorActionPreference = 'Stop'
@@ -166,12 +185,114 @@ try {
         }
     }
 
-    # --- 5. MANIFEST.txt (SHA256 via Get-FileHash + size, one line per file) ---
+    # --- 5. optional Android artifacts (-IncludeAndroid) ---
+    $androidIncluded = 0
+    if (-not $IncludeAndroid) {
+        Write-Host '==> android artifacts skipped (-IncludeAndroid not set)'
+    }
+    else {
+        # 5a. refresh the cross-compiled .so via the Git Bash build script.
+        #     Existence probes + WARNING on failure: packaging must stay
+        #     usable on a box without the NDK (stale-but-present .so files
+        #     are still picked up below, and the manifest records them).
+        $buildSh = Join-Path $RepoRoot 'scripts\build_android_ffi.sh'
+        $bash = $null
+        foreach ($candidate in @(
+                (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+                (Join-Path $env:ProgramFiles 'Git\usr\bin\bash.exe'),
+                (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe'))) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $bash = $candidate; break }
+        }
+        if (-not $bash) {
+            $bashCmd = Get-Command bash -ErrorAction SilentlyContinue
+            if ($bashCmd -and $bashCmd.Source -notlike '*\System32\bash.exe') { $bash = $bashCmd.Source }
+        }
+        $ffiBuilt = $false
+        if (-not (Test-Path -LiteralPath $buildSh -PathType Leaf)) {
+            Write-Warning "scripts\build_android_ffi.sh not found - skipping the android FFI build (probing staged .so files only)"
+        }
+        elseif (-not $bash) {
+            Write-Warning 'Git Bash (bash.exe) not found - skipping the android FFI build (probing staged .so files only)'
+        }
+        else {
+            Write-Host '==> bash scripts\build_android_ffi.sh (non-fatal on failure)'
+            # PS 5.1 wraps redirected native stderr in NativeCommandError
+            # records (the first one is displayed, and with
+            # $ErrorActionPreference='Stop' it would even abort the script),
+            # so the build runs through Start-Process whose stdout/stderr
+            # redirection is plain Win32 handle redirection - no PowerShell
+            # stream semantics, no error records, output captured to logs.
+            $ffiOut = Join-Path $env:TEMP ('ak_android_ffi_out_' + [Guid]::NewGuid().ToString('N') + '.log')
+            $ffiErr = Join-Path $env:TEMP ('ak_android_ffi_err_' + [Guid]::NewGuid().ToString('N') + '.log')
+            # SDK/NDK discovery lives inside the build script (default
+            # $USERPROFILE\android-toolchain\sdk; see docs\ANDROID_BUILD.zh-CN.md).
+            $proc = Start-Process -FilePath $bash -ArgumentList 'scripts/build_android_ffi.sh' `
+                -WorkingDirectory $RepoRoot -NoNewWindow -Wait -PassThru `
+                -RedirectStandardOutput $ffiOut -RedirectStandardError $ffiErr
+            foreach ($log in @($ffiOut, $ffiErr)) {
+                Get-Content -LiteralPath $log -ErrorAction SilentlyContinue |
+                    ForEach-Object { Write-Host "    $_" }
+                Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+            }
+            $buildExit = $proc.ExitCode
+            if ($buildExit -ne 0) {
+                Write-Warning "build_android_ffi.sh exited $buildExit - continuing with whatever .so files are staged (they may be stale)"
+            }
+            else {
+                $ffiBuilt = $true
+            }
+        }
+
+        # 5b. stage jniLibs\<abi>\libak_ffi.so -> android\jniLibs\<abi>\libak_ffi.so
+        $jniLibs = Join-Path $RepoRoot 'flutter_app\android\app\src\main\jniLibs'
+        $soFiles = @()
+        if (Test-Path -LiteralPath $jniLibs -PathType Container) {
+            $soFiles = @(Get-ChildItem -LiteralPath $jniLibs -Filter 'libak_ffi.so' -Recurse -File -ErrorAction SilentlyContinue)
+        }
+        if ($soFiles.Count -eq 0) {
+            Write-Warning "no libak_ffi.so under $jniLibs - the android\ section of the package will be empty of .so files"
+        }
+        else {
+            $androidOut = Join-Path $OutDirFull 'android'
+            New-Item -ItemType Directory -Path $androidOut -Force | Out-Null
+            foreach ($so in $soFiles) {
+                # expected file shape: ...\jniLibs\<abi>\libak_ffi.so
+                $abi = Split-Path -Leaf (Split-Path -Parent $so.FullName)
+                $abiDir = Join-Path (Join-Path $androidOut 'jniLibs') $abi
+                New-Item -ItemType Directory -Path $abiDir -Force | Out-Null
+                Copy-Item -LiteralPath $so.FullName -Destination $abiDir
+                $androidIncluded++
+            }
+            Write-Host ("==> android: {0} libak_ffi.so staged into android\jniLibs\ (ffi build {1})" -f `
+                    $soFiles.Count, $(if ($ffiBuilt) { 'fresh' } else { 'pre-existing/not rebuilt' }))
+        }
+
+        # 5c. the android ak-cli ELF, if someone cross-built it manually
+        #     (build_android_ffi.sh only builds ak-ffi, so absence is normal).
+        $androidCli = Join-Path $RepoRoot 'target\x86_64-linux-android\release\ak-cli'
+        if (Test-Path -LiteralPath $androidCli -PathType Leaf) {
+            if (-not (Test-Path -LiteralPath (Join-Path $OutDirFull 'android') -PathType Container)) {
+                New-Item -ItemType Directory -Path (Join-Path $OutDirFull 'android') -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $androidCli -Destination (Join-Path $OutDirFull 'android\ak-cli-android-x86_64')
+            $androidIncluded++
+            Write-Host '==> android: ak-cli-android-x86_64 staged (from target\x86_64-linux-android\release\ak-cli)'
+        }
+        else {
+            Write-Host '==> android: target\x86_64-linux-android\release\ak-cli absent (expected: the ffi build does not build ak-cli) - not packaged'
+        }
+        if ($androidIncluded -eq 0) {
+            Write-Warning '-IncludeAndroid was set but nothing android was staged (see the warnings above)'
+        }
+    }
+
+    # --- 6. MANIFEST.txt (SHA256 via Get-FileHash + size, one line per file) ---
     $staged = @(Get-ChildItem -LiteralPath $OutDirFull -Recurse -File | Sort-Object FullName)
     $manifest = New-Object System.Collections.Generic.List[string]
     $manifest.Add('AK-sending Windows package manifest')
     $manifest.Add("version : $Version")
     $manifest.Add("profile : $Profile")
+    $manifest.Add('android : ' + $(if ($androidIncluded -gt 0) { "included ($androidIncluded file(s) under android\)" } else { 'not included' }))
     $manifest.Add("created : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') local time; local packaging only, not uploaded")
     $manifest.Add('format  : SHA256  bytes  relative-path (SHA256 via PowerShell Get-FileHash)')
     $manifest.Add('')
@@ -186,19 +307,20 @@ try {
     [System.IO.File]::WriteAllLines((Join-Path $OutDirFull 'MANIFEST.txt'), $manifest)
     Write-Host "==> wrote MANIFEST.txt ($($staged.Count) file(s) hashed)"
 
-    # --- 6. zip (sibling of OutDir, outside the zipped tree) ---
+    # --- 7. zip (sibling of OutDir, outside the zipped tree) ---
     $zipPath = $OutDirFull + '.zip'
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
     Compress-Archive -Path $OutDirFull -DestinationPath $zipPath
     $zipItem = Get-Item -LiteralPath $zipPath
 
-    # --- 7. summary ---
+    # --- 8. summary ---
     $finalFiles = @(Get-ChildItem -LiteralPath $OutDirFull -Recurse -File)
     $finalBytes = ($finalFiles | Measure-Object -Property Length -Sum).Sum
     Write-Host ''
     Write-Host '==> package summary'
     Write-Host ("    outdir : {0}" -f $OutDirFull)
     Write-Host ("    files  : {0} ({1} bytes total)" -f $finalFiles.Count, $finalBytes)
+    Write-Host ("    android: {0}" -f $(if ($androidIncluded -gt 0) { "included ($androidIncluded file(s) under android\)" } else { 'not included' }))
     Write-Host ("    zip    : {0} ({1} bytes)" -f $zipPath, $zipItem.Length)
     Write-Host '    upload : none (local packaging only; see docs/PUBLISHING.zh-CN.md)'
     exit 0

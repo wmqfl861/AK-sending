@@ -1,6 +1,6 @@
 # 开发总结（面向项目所有者）
 
-生成于 2026-11-03（第九轮，`dev/local-parallel` 分支，未推送）。本文所有数字与结论逐一来自 [开发验证记录](dev-validation-2026-11-02.txt)、[BACKLOG](../docs/BACKLOG.zh-CN.md) 与 [HANDOFF](../docs/HANDOFF.zh-CN.md)，2026-11-03 本轮对关键计数做了复测；本文不引入未经记录的新事实。
+生成于 2026-11-03（第九轮，`dev/local-parallel` 分支，未推送）。本文所有数字与结论逐一来自 [开发验证记录](dev-validation-2026-11-02.txt)、[BACKLOG](../docs/BACKLOG.zh-CN.md) 与 [HANDOFF](../docs/HANDOFF.zh-CN.md)，2026-11-03 本轮对关键计数做了复测；本文不引入未经记录的新事实。2026-11-04 补记：第十至十六轮简表与最新状态一览见文末"第 10-16 轮补章"（Rust 计数于 2026-11-04 本机实测，Dart/Flutter 取集成轮报告值并标注统计口径；正文历史段落保持 2026-11-03 原貌）。
 
 ## 目标（ADR-002 路线）
 
@@ -103,3 +103,29 @@
 4. Flutter UI（Windows → Android 优先）与移动端后台/存储适配。
 
 经第八轮复核上述节点顺序不变；本地可执行范围已尽，余项均需外部资源。
+（2026-11-04 补记：上句为第八轮口径，已被其后进展更新——跨设备首证的模拟器形态已执行，本地可执行范围延伸并兑现；首要剩余项改为两台物理机器双端实测，详见 [HANDOFF](../docs/HANDOFF.zh-CN.md)"下一工程节点"与文末补章。）
+
+## 第 10-16 轮补章（2026-11-04 补记）
+
+九轮总结成文后，项目继续推进七轮（第十至十六轮）并取得首个跨设备里程碑。仓库现共 36 个提交（第九轮时为 20 个）。简表如下（关键数字取各轮验证记录与集成提交说明）：
+
+| 轮 | 日期 | 主题 | 关键数字 | 提交 |
+|---|---|---|---|---|
+| 十 | 11-03 | ak-ffi C ABI 绑定层＋ADR-003 | 9 个导出函数、unsafe 20 块全隔离于 shim、6 项测试全经 C ABI（真实环回/坏 spec 反例/取消/无串扰/并发聚合） | `5851150`、`40d7d63` |
+| 十一 | 11-03 | ak_ffi_dart 纯 Dart 包＋Flutter Windows 桌面端＋打包脚本 | dart test 69/69；flutter test 46/46；`flutter build windows --release` 成功（exe 90,624B＋ak_ffi.dll 4,205,056B 哈希一致）；打包 17 文件 zip 18MB | `b7c4a82`、`37cdf17`、`2875919`、`7dffa51`、`3dab426` |
+| 十二 | 11-03 | 身份导出/簿准入/历史接线（ak-ffi→Dart→Flutter） | workspace 430/0；ak-ffi 13 项（identity_info/jobs_list/expect:book）；dart test 76/76；flutter test 59/59；打包 zip 18.1MB | `bc7fa01` |
+| 十三 | 11-04 | 安卓平台移植＋Windows GUI 首启取证 | 双 ABI libak_ffi.so 交叉编译（x86_64 5,664,296B/arm64 5,557,928B，llvm-nm 符号验证）；flutter test 66/66；apk-debug.apk 161MB；GUI 首启截图视觉核验通过 | `834f42a`、`6ea65f0`、`1e6a8ab` |
+| 里程碑 | 11-04 | 跨设备首证：Android 模拟器→Windows 宿主（CLI 路线） | Android ak-cli 交叉编译 8,904,736B 实跑；job `afe43780` 双端 complete 同 job id；2 条目 5.00 MiB `cmp` 逐字节一致；TOFU 记录宿主指纹；模拟器 NAT（10.0.2.2）形态，非物理双机 | `b4fb427` |
+| 十四 | 11-04 | 配对链路：ak-ffi 三导出→Dart 绑定→Flutter 配对页→集成切换 | ak-ffi C ABI 23 项（peer +10）；dart test 85/85（peers +9 含 CLI 写簿往返）；flutter test 84/84（配对页 10 项；切换点升级真实 facade→C ABI→DLL 往返） | `1e6a8ab`（ffi 侧）、`f82ff77` |
+| 十五 | 11-04 | daemon＋随机性质套件＋安卓存储通道 | ak-cli 83/83（daemon 7 项，NDJSON 五型事件流，双任务冒烟）；性质套件 25 种子传输＋10 种子中断续传不变量 release 94.8s 零缺陷（快速回归入默认 cargo test）；Kotlin SAF 写闭环通道、APK 重建 179MB | `f82ff77` |
+| 十六 | 11-04 | 文档记录轮（本补章；BACKLOG/HANDOFF/TEST_PLAN/DEV_SUMMARY 四文件） | 不改代码；Rust 计数本机实测见下 | 不提交（按指示） |
+
+### 当前状态一览（2026-11-04 实测/报告值，口径逐项标注）
+
+- Rust workspace（2026-11-04 本机实测，`cargo test --workspace --no-fail-fast`）：**449 项通过、1 项 flaky 失败、7 项 ignored（默认运行合计 450 项）**——失败为 `ak-net stats_reflect_real_loopback_transfer`（第四轮既有测试，统计快照帧计数 68 对 66 的时序竞争；单独复跑 3/3 通过，属 flaky 非功能回归，未修复如实记录）。对账：第十二轮 430 ＋ daemon 7 ＋ ak-ffi peer 10 ＋ 性质快速回归 3 ＝ 450，与实测吻合（flaky 项在整 workspace 并行负载下偶发）。
+- `#[ignore]` release 深测 7 项（5 项历史＋2 项性质套件变体）均执行通过；新增：property_random 25 种子随机树传输＋10 种子随机中断续传，release 94.8s 零缺陷。
+- Dart（ak_ffi_dart）：85/85（集成轮报告值，本轮未复跑）；Flutter（flutter_app）：84/84（集成轮报告值，本轮未复跑）。
+- 跨设备：Android 模拟器→Windows 宿主 CLI 组合 1 项，逐字节一致（模拟器 NAT 形态）；GUI 路线受阻于模拟器 System UI ANR（应用进程存活），物理双机/真实 NAT/抓包未执行。
+- 仓库检查（L0）：`python scripts/check_repository.py` 本轮（2026-11-04）通过（banned_dependency_scan=clean、errors=[]）；clippy/doc 本轮未复跑（上一轮全绿记录见第九轮节，第十四/十五轮集成轮未见复跑记录）。
+
+补章事实源：[BACKLOG](../docs/BACKLOG.zh-CN.md) 第十三至十五轮节与跨设备里程碑节、[HANDOFF](../docs/HANDOFF.zh-CN.md) 第十四/十五轮段、[TEST_PLAN](../docs/TEST_PLAN.zh-CN.md) 映射表、[开发验证记录](dev-validation-2026-11-02.txt) 第十二轮验证/第十三轮进行中证据/跨设备里程碑节，及集成提交 `f82ff77` 说明。

@@ -101,6 +101,10 @@ impl Fingerprint {
 }
 
 /// Human-verifiable pairing code derived from the fingerprint: "123-456".
+///
+/// 显示用指纹核对短码，与 [`invite::InviteCode`]（配对邀请码）是不同概念：
+/// this display-only fingerprint check code stays compatible and never
+/// takes part in the invite-code pairing flow.
 pub fn pairing_code(fingerprint: &Fingerprint) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ak-pairing-code");
@@ -1419,6 +1423,20 @@ pub mod tls {
         }
     }
 }
+
+/// Pairing invite codes (`AKI1-...`): CSPRNG generation, Crockford Base32
+/// normalization/parsing, and the domain-separated BLAKE3 `lookup_digest` /
+/// `auth_key` derivations (plan A.2/A.3).
+pub mod invite;
+
+/// Typed pairing transaction transcript and endpoint proofs with
+/// independent verification failures for substituted keys, wrong invite
+/// codes, wrong nonces, and expired proofs (plan A.4 §5, A.5 §3–§4).
+pub mod pairing_txn;
+
+/// Transactional `peers.book` writes with pairing-id replay protection
+/// (plan A.5 §5).
+pub mod peer_store;
 
 #[cfg(test)]
 pub(crate) mod test_util {

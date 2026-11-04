@@ -1,0 +1,10 @@
+[package]
+name = "ak-session"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Shared session application layer: pure scheduler domain model (two-dimensional concurrency, queue, admission); no networking or I/O"
+
+[dependencies]
+ak-core = { workspace = true }
+thiserror = { workspace = true }

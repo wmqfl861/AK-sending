@@ -829,3 +829,17 @@ mod tests {
         assert!(s.save(&record).is_err(), "non-UTF-8 root must be rejected");
     }
 }
+
+/// Local pairing-transaction journal (pairing-code plan A.3 / B.6.4): one
+/// `<hex>.akpair` file per pairing, `pending -> committed -> applied`
+/// phases that only move forward, and secret *references* instead of
+/// secret material.
+pub mod pairing_journal;
+
+/// Scheduler queue persistence (pairing-code plan B.6.1 / B.6.2): queued
+/// task records in AKREC2-domain `q-<hex>.akjob` files, isolated from the
+/// checkpoint records above even when both stores share one directory.
+pub mod queue;
+
+pub use pairing_journal::{PairingJournal, PairingPhase, PairingRecord, PendingPairing};
+pub use queue::{QueueTaskInit, QueuedTask, RecoveryPlan, TaskQueueStore, TaskState};

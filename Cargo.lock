@@ -140,6 +140,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ak-session"
+version = "0.1.0"
+dependencies = [
+ "ak-core",
+ "thiserror",
+]
+
+[[package]]
 name = "ak-signal"
 version = "0.1.0"
 dependencies = [

@@ -472,3 +472,12 @@ $ cargo clippy --workspace --all-targets -- -D warnings → 干净
 $ dart test → 85/85；$ flutter test → 84/84；repo check → passed
 
 5 GiB release 回归（十七波修复后）: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 236.73s
+
+## 第十八/十九波：邀请码配对——契约冻结与基础实现（2026-11-04，5 并行代理）
+# A0 契约：ADR-004 + docs/contracts/ 六文件（157 项与 Codex 计划逐字核对通过）
+# A1 v2 codec：30 变体/预算锁定/方向表穷尽/封闭集（47 测试，与契约零出入）
+# A4 identity：InviteCode(Crockford AKI1)/typed transcript 五查(换钥/换码/过期/nonce/MAC 恒时)/
+#   PeerBookStore 防重放（34 测试，crate 73/73）
+# A5+B1 store：PairingJournal 四态单调/TaskQueueStore AKREC2 恢复映射（38+sqlite 54，三类崩溃模拟）
+# B0 scheduler：新 crate ak-session——四模式矩阵/FIFO+组间公平/draining/permit（51 测试）
+$ cargo test --workspace → 667/0（基线 507 → +160）；clippy 干净；sqlite 54/54；repo check passed

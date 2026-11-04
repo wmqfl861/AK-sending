@@ -1,0 +1,34 @@
+//! Pure scheduler domain model (wave 19, B0).
+//!
+//! Composition of the pieces (contract `docs/contracts/scheduler.md`):
+//!
+//! * [`config::SchedulerPolicy`] — two-dimensional concurrency modes and
+//!   caps, with strict JSON parsing/validation;
+//! * [`key`] — grouping keys, task handles, permits;
+//! * [`queue::FairQueue`] — bounded FIFO with group round-robin fairness
+//!   and O(1) queue-full rejection;
+//! * [`admission::decide`] — the pure four-mode admission decision;
+//! * [`state`] — the contract §9 task states and scheduler events;
+//! * [`core::SchedulerCore`] — the deterministic state machine gluing them
+//!   together, driven by the B6 runtime actor.
+//!
+//! No networking, no clocks, no I/O: everything here is testable with
+//! plain data.
+pub mod admission;
+pub mod config;
+pub mod core;
+pub mod key;
+pub mod queue;
+pub mod state;
+
+pub use admission::{ActiveGroups, ActiveTasks, AdmissionDecision, DenyReason};
+pub use config::{
+    CrossCodeMode, EffectiveLimits, PolicyError, SameCodeMode, SchedulerPolicy,
+    MAX_ACTIVE_CODE_CONNECTIONS, MAX_ACTIVE_TASKS_PER_CODE, MAX_QUEUED_TASKS,
+};
+pub use core::{CancelOutcome, FinishResult, PolicySwitch, SchedulerCore};
+pub use key::{
+    CodeGroupKey, CodeId, Permit, PermitId, PermitState, RegistryId, TaskHandle, TaskId,
+};
+pub use queue::{FairQueue, QueueError};
+pub use state::{FinishOutcome, SchedulerEvent, TaskPhase, TaskState};

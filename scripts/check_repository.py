@@ -26,6 +26,7 @@ WORKSPACE_MEMBERS = [
     "crates/ak-store",
     "crates/ak-signal",
     "crates/ak-engine",
+    "crates/ak-session",
     "crates/ak-cli",
     "crates/ak-itests",
     "crates/ak-ffi",

@@ -13,6 +13,7 @@
 pub mod client;
 /// Signaling wire codec: fixed message set, every field bounded.
 pub mod codec;
+pub mod protocol_v2;
 /// Signaling server (TCP signaling + UDP STUN responder).
 pub mod server;
 /// Minimal STUN binding (RFC 5389 subset).

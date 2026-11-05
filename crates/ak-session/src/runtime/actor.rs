@@ -17,7 +17,9 @@
 use ak_core::error::ErrorCode;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use crate::runtime::clock::RuntimeClock;
 use crate::runtime::error::SessionError;
@@ -112,6 +114,11 @@ struct ShutdownProgress {
     replied: bool,
 }
 
+/// How long the actor waits for one aborted driver task to join before
+/// giving up on it (abort takes effect at the next `await` point, so this
+/// is a generous safety bound, not the expected duration).
+const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The scheduler actor (see the module docs).
 pub(crate) struct SchedulerActor {
     core: SchedulerCore,
@@ -125,6 +132,11 @@ pub(crate) struct SchedulerActor {
     entries: HashMap<TaskId, TaskEntry>,
     /// Tasks with a spawned driver that has not reported a finish yet.
     inflight: HashSet<TaskId>,
+    /// Join handles of the spawned task drivers. Kept so shutdown can
+    /// abort and join every driver before the shutdown caller is answered
+    /// (P1-3: previously the handle was dropped on spawn and a driver
+    /// stuck in pairing/session I/O outlived the runtime).
+    drivers: HashMap<TaskId, JoinHandle<()>>,
     /// Tasks holding their permit while waiting out a retry backoff.
     backoff_waiters: HashSet<TaskId>,
     shutdown: Option<ShutdownProgress>,
@@ -161,6 +173,7 @@ impl SchedulerActor {
             listener_enabled,
             entries: HashMap::new(),
             inflight: HashSet::new(),
+            drivers: HashMap::new(),
             backoff_waiters: HashSet::new(),
             shutdown: None,
             finalized: false,
@@ -179,11 +192,22 @@ impl SchedulerActor {
             }
         }
         let _ = self.listener_stop.send(true);
+        // P1-3: abort and join every remaining driver BEFORE the shutdown
+        // caller is answered, so a summary is a statement about a runtime
+        // whose engine work has actually stopped (the executor `cancel`
+        // calls were already issued in `on_shutdown`/`finalize_shutdown`
+        // and had their chance to wind tasks down cooperatively).
+        self.abort_and_join_drivers().await;
         self.flush_events();
         if let Some(mut progress) = self.shutdown.take() {
             if !progress.replied {
                 progress.replied = true;
                 let summary = self.build_summary(progress.mode, progress.timed_out);
+                self.broadcast(SessionEvent::ShutdownComplete {
+                    completed: summary.completed,
+                    cancelled: summary.cancelled,
+                    timed_out: summary.timed_out,
+                });
                 let _ = progress.reply.send(Ok(summary));
             }
         }
@@ -425,6 +449,10 @@ impl SchedulerActor {
     fn on_finished(&mut self, task: &TaskHandle, outcome: FinishOutcome) {
         let id = task.task_id();
         self.inflight.remove(&id);
+        // The driver ends right after handing the task to its executor;
+        // its join handle is no longer interesting (aborting it later
+        // would be a no-op).
+        self.drivers.remove(&id);
         let Some(entry) = self.entries.get_mut(&id) else {
             return;
         };
@@ -581,8 +609,10 @@ impl SchedulerActor {
         self.finalize_shutdown();
     }
 
-    /// Cancel every non-terminal task, emit the final events and answer
-    /// the shutdown caller.
+    /// Cancel every non-terminal task and mark the runtime finalized. The
+    /// shutdown reply (and the `ShutdownComplete` event) is sent from
+    /// [`SchedulerActor::run`] after the remaining drivers are aborted and
+    /// joined — never while engine work may still be in flight.
     fn finalize_shutdown(&mut self) {
         if self.finalized {
             return;
@@ -599,17 +629,18 @@ impl SchedulerActor {
         self.backoff_waiters.clear();
         self.flush_events();
         self.finalized = true;
-        if let Some(mut progress) = self.shutdown.take() {
-            if !progress.replied {
-                progress.replied = true;
-                let summary = self.build_summary(progress.mode, progress.timed_out);
-                self.broadcast(SessionEvent::ShutdownComplete {
-                    completed: summary.completed,
-                    cancelled: summary.cancelled,
-                    timed_out: summary.timed_out,
-                });
-                let _ = progress.reply.send(Ok(summary));
-            }
+    }
+
+    /// Abort every still-tracked driver task and join it (bounded per
+    /// task). Called once from [`SchedulerActor::run`] after the loop
+    /// exits — a finished driver joins immediately; a stuck one is
+    /// cancelled at its current `await` point, which also drops any
+    /// in-flight pairing/session future it holds.
+    async fn abort_and_join_drivers(&mut self) {
+        let drivers: Vec<JoinHandle<()>> = self.drivers.drain().map(|(_, driver)| driver).collect();
+        for mut driver in drivers {
+            driver.abort();
+            let _ = tokio::time::timeout(DRIVER_JOIN_TIMEOUT, &mut driver).await;
         }
     }
 
@@ -627,7 +658,7 @@ impl SchedulerActor {
         let transport = Arc::clone(&self.transport);
         let sink = ProgressSink::new(self.cmd_tx.clone());
         let handle = TaskHandle::new(task);
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let pairing_id = match spec.pairing.clone() {
                 PairingPlan::Ready { pairing_id } => pairing_id,
                 PairingPlan::Redeem { request } => {
@@ -702,6 +733,7 @@ impl SchedulerActor {
                     .await;
             }
         });
+        self.drivers.insert(task, driver);
     }
 
     // ---- Introspection -------------------------------------------------
@@ -775,5 +807,199 @@ impl SchedulerActor {
             tasks,
             listener: self.listener_stats.view(self.listener_enabled),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! P1-3 shutdown coverage that lives with the actor: a shutdown whose
+    //! deadline expires while a driver is wedged in pairing I/O must
+    //! abort and JOIN that driver before the shutdown summary is
+    //! answered. The wedge is observed through a transport whose
+    //! `open_session` future never resolves and flips a flag when it is
+    //! dropped — exactly what aborting the parked driver does.
+
+    use super::*;
+    use crate::runtime::clock::RealClock;
+    use crate::runtime::executor::FakeTransferExecutor;
+    use crate::runtime::transport::{
+        InviteClaimRequest, InviteClaimed, OpenSessionInfo, PairingError, PairingEvent,
+        PairingFuture, PairingId, PairingReadyInfo, RedeemAccepted, RedeemPayload,
+    };
+    use crate::runtime::types::{PairingPlan, RuntimeConfig, ShutdownMode, TransferDirection};
+    use crate::runtime::{RegistryId, SessionHandle, SessionRuntime, TransferExecutor};
+    use crate::scheduler::key::CodeGroupKey;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    /// `open_session` future that never resolves; sets `dropped` when the
+    /// driver awaiting it is aborted.
+    struct HungOpenSession {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for HungOpenSession {
+        type Output = Result<OpenSessionInfo, PairingError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for HungOpenSession {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct HungTransport {
+        opens: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl PairingTransport for HungTransport {
+        fn claim_invite(&self, _claim: InviteClaimRequest) -> PairingFuture<'_, InviteClaimed> {
+            Box::pin(async { Err(PairingError::rejected("unused")) })
+        }
+
+        fn redeem(&self, _request: RedeemPayload) -> PairingFuture<'_, RedeemAccepted> {
+            Box::pin(async { Err(PairingError::rejected("unused")) })
+        }
+
+        fn confirm_pairing(
+            &self,
+            _confirmation: PairingConfirmation,
+        ) -> PairingFuture<'_, PairingReadyInfo> {
+            Box::pin(async { Err(PairingError::rejected("unused")) })
+        }
+
+        fn open_session(
+            &self,
+            _pairing_id: PairingId,
+            _code_id: crate::scheduler::key::CodeId,
+        ) -> PairingFuture<'_, OpenSessionInfo> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Box::pin(HungOpenSession {
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+
+        fn next_pairing_event(&self) -> PairingFuture<'_, PairingEvent> {
+            Box::pin(std::future::pending())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn wedged_runtime() -> (SessionHandle, Arc<HungTransport>) {
+        let transport = Arc::new(HungTransport::default());
+        let clock = RealClock::shared();
+        let executor = Arc::new(FakeTransferExecutor::new(Arc::clone(&clock)));
+        let mut config = RuntimeConfig::new(
+            SchedulerPolicy::default(),
+            clock,
+            Arc::clone(&transport) as Arc<dyn PairingTransport>,
+            executor as Arc<dyn TransferExecutor>,
+            RegistryId::from_bytes([0x11; 32]),
+        );
+        config.listener_enabled = false;
+        config.shutdown_timeout_ms = 150;
+        let handle = SessionRuntime::start(config).expect("runtime starts");
+        (handle, transport)
+    }
+
+    /// The shutdown timeout aborts (and joins) the wedged driver BEFORE
+    /// the summary reply is sent: at the moment the caller is answered,
+    /// the hung `open_session` future is already dropped.
+    #[tokio::test]
+    async fn shutdown_timeout_aborts_and_joins_stuck_drivers_before_answering() {
+        let (handle, transport) = wedged_runtime();
+        let group = CodeGroupKey::new(
+            RegistryId::from_bytes([0x11; 32]),
+            crate::scheduler::key::CodeId::from_bytes([0x22; 16]),
+        );
+        let executor = Arc::new(FakeTransferExecutor::new(RealClock::shared()));
+        let spec = TransferSpec {
+            group_key: group,
+            pairing: PairingPlan::Ready {
+                pairing_id: PairingId::from_bytes([0x33; 16]),
+            },
+            executor: executor as Arc<dyn TransferExecutor>,
+            direction: TransferDirection::Send,
+            label: "wedged".to_owned(),
+            task_id: None,
+        };
+        handle.enqueue(spec).await.expect("task submitted");
+
+        // The driver reaches (and wedges in) open_session.
+        let deadline = Duration::from_secs(5);
+        tokio::time::timeout(deadline, async {
+            while transport.opens.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("driver reached open_session");
+        assert!(!transport.dropped.load(Ordering::SeqCst));
+
+        let summary = tokio::time::timeout(deadline, handle.shutdown(ShutdownMode::Cancel))
+            .await
+            .expect("shutdown answers within the deadline")
+            .expect("shutdown succeeds");
+        assert!(summary.timed_out, "wedged driver forces the timeout path");
+        // The join happened before the reply: the hung future is gone.
+        assert!(
+            transport.dropped.load(Ordering::SeqCst),
+            "the wedged driver was aborted and joined before the summary"
+        );
+    }
+
+    /// Drain-mode shutdown after natural completion still answers with a
+    /// summary (the new reply path in `run`).
+    #[tokio::test]
+    async fn drain_shutdown_after_completion_answers_through_the_new_reply_path() {
+        let clock = RealClock::shared();
+        let executor = Arc::new(FakeTransferExecutor::new(Arc::clone(&clock)));
+        let mut config = RuntimeConfig::new(
+            SchedulerPolicy::default(),
+            clock,
+            Arc::new(crate::runtime::transport::FakePairingTransport::new(true))
+                as Arc<dyn PairingTransport>,
+            Arc::clone(&executor) as Arc<dyn TransferExecutor>,
+            RegistryId::from_bytes([0x11; 32]),
+        );
+        config.listener_enabled = false;
+        config.shutdown_timeout_ms = 5_000;
+        let handle = SessionRuntime::start(config).expect("runtime starts");
+
+        let group = CodeGroupKey::new(
+            RegistryId::from_bytes([0x11; 32]),
+            crate::scheduler::key::CodeId::from_bytes([0x22; 16]),
+        );
+        let spec = TransferSpec {
+            group_key: group,
+            pairing: PairingPlan::Ready {
+                pairing_id: PairingId::from_bytes([0x44; 16]),
+            },
+            executor: executor as Arc<dyn TransferExecutor>,
+            direction: TransferDirection::Send,
+            label: "quick".to_owned(),
+            task_id: None,
+        };
+        handle.enqueue(spec).await.expect("task submitted");
+        // Default fake script completes in ~100 ms of real time.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let summary =
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown(ShutdownMode::Drain))
+                .await
+                .expect("shutdown answers")
+                .expect("shutdown succeeds");
+        assert!(!summary.timed_out);
+        assert_eq!(summary.completed, 1);
     }
 }

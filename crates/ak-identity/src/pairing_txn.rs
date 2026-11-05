@@ -195,7 +195,11 @@ pub struct PairingRecord {
 /// What the verifier knows independently of the record: the local invite
 /// code's `auth_key`, the nonces this endpoint generated/observed for this
 /// pairing attempt, and its wall clock.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` is hand-written (review 2026-11-05, P2): `auth_key` is derived
+/// from the invite-code secret and must never reach logs. The nonces and
+/// the clock are public transcript material and stay visible.
+#[derive(Clone, Copy)]
 pub struct VerifyExpectations<'a> {
     /// [`InviteCode::auth_key`] of the locally held invite code.
     pub auth_key: &'a [u8; 32],
@@ -206,6 +210,17 @@ pub struct VerifyExpectations<'a> {
     /// Verifier's current time in Unix milliseconds; the record is expired
     /// when `now_unix_ms > transcript.deadline_ms`.
     pub now_unix_ms: u64,
+}
+
+impl std::fmt::Debug for VerifyExpectations<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifyExpectations")
+            .field("auth_key", &"<redacted: invite auth key>")
+            .field("expected_owner_nonce", &self.expected_owner_nonce)
+            .field("expected_redeemer_nonce", &self.expected_redeemer_nonce)
+            .field("now_unix_ms", &self.now_unix_ms)
+            .finish()
+    }
 }
 
 impl PairingRecord {
@@ -639,5 +654,29 @@ mod tests {
         let id_b = random_id16();
         assert_eq!(id_a.len(), 16);
         assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn verify_expectations_debug_redacts_the_auth_key() {
+        // Fixed distinctive bytes: 0xAB = 171 decimal, 0x0B = 11 — none of
+        // the nonce bytes (0x11/0x22) collide with the key bytes, so the
+        // decimal-array form of the key cannot appear via another field.
+        let auth_key = [0xABu8; 32];
+        let owner_nonce = [0x11u8; 32];
+        let redeemer_nonce = [0x22u8; 32];
+        let exp = VerifyExpectations {
+            auth_key: &auth_key,
+            expected_owner_nonce: &owner_nonce,
+            expected_redeemer_nonce: &redeemer_nonce,
+            now_unix_ms: 42,
+        };
+        let rendered = format!("{exp:?}");
+        assert!(rendered.contains("redacted"), "marks the field: {rendered}");
+        assert!(!rendered.contains("171"), "key bytes leaked: {rendered}");
+        let key_hex: String = auth_key.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!rendered.contains(&key_hex), "key hex leaked: {rendered}");
+        // The public material stays visible for debugging.
+        assert!(rendered.contains("now_unix_ms: 42"), "{rendered}");
+        assert!(rendered.contains("expected_owner_nonce"), "{rendered}");
     }
 }

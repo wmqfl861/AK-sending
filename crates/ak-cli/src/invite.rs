@@ -17,8 +17,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -100,14 +102,63 @@ fn hex_to_32(text: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Atomic small-file replace (temp file + rename; on Windows the
-/// destination is removed first so the rename cannot fail with
-/// `AlreadyExists`). Readers see either the old or the new whole file.
-fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+/// Atomic small-file replace, following the `ak-identity` `atomic_write`
+/// discipline (review 2026-11-05, P2 — this file carries bearer secrets):
+/// an EXCLUSIVELY created (`create_new`) temp file with a unique name
+/// (pid + sequence — concurrent writers never share a temp), fsync, then
+/// rename over the destination. Exclusive creation means a file or
+/// symlink planted at a predictable temp name is never written through;
+/// on Unix the secret temp is created 0o600. Readers see either the old
+/// or the new whole file.
+fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    /// Distinguishes concurrent temp files within one process.
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_replace needs a file path",
+        )
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    let temp = parent.join(temp_name);
+
+    let write = || -> io::Result<()> {
+        #[cfg(unix)]
+        let mut options = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.mode(0o600);
+            options
+        };
+        #[cfg(not(unix))]
+        let mut options = std::fs::OpenOptions::new();
+        let mut file = options.write(true).create_new(true).open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    if let Err(err) = write() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    // std's rename replaces an existing destination on POSIX and (current
+    // toolchains) on Windows; the remove-then-rename fallback only covers
+    // std versions without the Windows replace behavior. The gap can at
+    // worst leave the destination absent — never torn (same trade-off as
+    // the ak-identity / ak-store writers).
+    if std::fs::rename(&temp, path).is_ok() {
+        return Ok(());
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
     }
     std::fs::rename(&temp, path)
 }
@@ -178,7 +229,12 @@ pub(crate) async fn connect_registry(
 // ---------------------------------------------------------------------------
 
 /// One stored invite code line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written (review 2026-11-05, P2): `display` is the
+/// bearer credential and must never reach logs — only the masked hint
+/// (best-effort; `<unparseable>` on a corrupted line) and the non-secret
+/// metadata are printed.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct StoredInvite {
     pub(crate) code_id: [u8; 16],
     /// 0 = long-lived.
@@ -186,6 +242,22 @@ pub(crate) struct StoredInvite {
     pub(crate) revision: u64,
     /// Canonical `AKI1-…` display form (the bearer credential).
     pub(crate) display: String,
+}
+
+impl std::fmt::Debug for StoredInvite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hint = self
+            .code()
+            .map(|code| code.code_hint())
+            .unwrap_or_else(|_| "<unparseable>".to_owned());
+        f.debug_struct("StoredInvite")
+            .field("code_id", &hex_16(&self.code_id))
+            .field("expires_ms", &self.expires_ms)
+            .field("revision", &self.revision)
+            .field("display", &"<redacted: bearer secret>")
+            .field("hint", &hint)
+            .finish()
+    }
 }
 
 impl StoredInvite {
@@ -879,5 +951,55 @@ mod tests {
         );
         assert!(TtlChoice::Secs(59).ttl_secs().is_err());
         assert!(TtlChoice::Secs(2_592_001).ttl_secs().is_err());
+    }
+
+    #[test]
+    fn stored_invite_debug_never_leaks_the_bearer_code() {
+        let code = InviteCode::generate();
+        let invite = StoredInvite {
+            code_id: [5; 16],
+            expires_ms: 0,
+            revision: 2,
+            display: code.to_display(),
+        };
+        let rendered = format!("{invite:?}");
+        assert!(
+            !rendered.contains(&invite.display),
+            "Debug must not leak the bearer code: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "marks the field: {rendered}");
+        assert!(
+            rendered.contains(&code.code_hint()),
+            "shows the masked hint: {rendered}"
+        );
+        // A corrupted line degrades to a placeholder instead of echoing the
+        // raw bytes.
+        let corrupt = StoredInvite {
+            display: "not-a-code".to_owned(),
+            ..invite.clone()
+        };
+        assert!(!format!("{corrupt:?}").contains("not-a-code"));
+    }
+
+    #[test]
+    fn atomic_replace_is_exclusive_atomic_and_leaves_no_residue() {
+        let dir = temp_id("atomic");
+        let path = dir.join(INVITE_STORE_FILE);
+        std::fs::write(&path, b"old").unwrap();
+        atomic_replace(&path, b"new-content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-content");
+        // Repeat replaces in place and never leaves temp files behind —
+        // the secret never lingers under a predictable temp name.
+        for i in 0..5 {
+            atomic_replace(&path, format!("v{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"v4");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![INVITE_STORE_FILE.to_owned()], "{names:?}");
+        // A path inside a missing directory fails cleanly without residue.
+        assert!(atomic_replace(&dir.join("nope/f"), b"x").is_err());
     }
 }

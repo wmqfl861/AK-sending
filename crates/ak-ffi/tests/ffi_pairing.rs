@@ -28,9 +28,11 @@ use ak_ffi::{
     ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_result,
     ak_pairing_cancel_op, ak_pairing_create_start, ak_pairing_list_start, ak_pairing_op_result,
     ak_pairing_poll_event, ak_pairing_redeem_start, ak_pairing_revoke_start, ak_pairing_start,
-    ak_poll_progress, ak_receive_start, ak_sched_cancel, ak_sched_enqueue, ak_sched_poll_event,
-    ak_sched_set_policy, ak_sched_snapshot, ak_sched_start, AkEngine, AK_DONE, AK_ERR_BUFFER,
-    AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
+    ak_pairing_stop_start, ak_poll_progress, ak_receive_start, ak_sched_cancel, ak_sched_enqueue,
+    ak_sched_listen_start, ak_sched_poll_event, ak_sched_retry, ak_sched_set_policy,
+    ak_sched_shutdown_start, ak_sched_snapshot, ak_sched_start, ak_sched_task_result, AkEngine,
+    AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT, AK_FAILED,
+    AK_OK, AK_PENDING,
 };
 
 // ---------------------------------------------------------------------------
@@ -1237,4 +1239,282 @@ fn last_error_text(engine: *mut AkEngine) -> String {
     let code = ak_engine_last_error(engine, buf.as_mut_ptr(), buf.len());
     assert!(code >= 0, "last_error itself failed: {code}");
     cbuf_to_string(&buf)
+}
+
+// ---------------------------------------------------------------------------
+// Wave 23 (`sched_ext`): the five exports completing the frozen ffi-v2 §1
+// surface — ak_sched_listen_start (the contract's name for the scheduler
+// start), ak_sched_retry, ak_sched_task_result, ak_sched_shutdown_start,
+// ak_pairing_stop_start.
+// ---------------------------------------------------------------------------
+
+/// Poll one op's result to terminal state by op id (`run_op` mints its own
+/// op; the wave-23 exports hand the op id out directly).
+fn wait_op_result(engine: *mut AkEngine, runtime_id: &[u8; 16], op_id: &[u8; 16]) -> (i32, String) {
+    let mut buf = [0 as c_char; 8192];
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let code = ak_pairing_op_result(
+            engine,
+            runtime_id.as_ptr(),
+            op_id.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
+        assert!(
+            code == AK_PENDING || code == AK_DONE || code == AK_FAILED,
+            "op_result {code}"
+        );
+        if code == AK_DONE || code == AK_FAILED {
+            return (code, cbuf_to_string(&buf));
+        }
+        assert!(Instant::now() < deadline, "op never finished");
+        thread::sleep(Duration::from_millis(15));
+    }
+}
+
+/// Poll the scheduler event queue until one event named `name` shows up.
+fn wait_sched_event(engine: *mut AkEngine, name: &str, secs: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut buf = [0 as c_char; 4096];
+    loop {
+        let code = ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len());
+        assert!(code == AK_EVENT || code == AK_PENDING, "sched poll {code}");
+        if code == AK_EVENT {
+            let line = cbuf_to_string(&buf);
+            if line.contains(&format!("\"event\":\"{name}\"")) {
+                return line;
+            }
+            continue;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sched event {name} never arrived"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The first `tasks[].id` of a snapshot JSON, as 32 hex chars.
+fn first_task_id_hex(snapshot: &str) -> String {
+    snapshot
+        .split("\"id\":\"")
+        .nth(1)
+        .expect("a task id in the snapshot")
+        .chars()
+        .take(32)
+        .collect()
+}
+
+/// Decode 32 hex characters into one 16-byte task id.
+fn task_id_from_hex(hex: &str) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    for (index, slot) in id.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).expect("hex task id");
+    }
+    id
+}
+
+#[test]
+fn sched_listen_start_binds_named_runtime_and_reports_listener_scope() {
+    let pair = paired_fixture();
+    // The contract name binds the scheduler to the NAMED runtime even
+    // when the spec itself names none (the id argument is injected).
+    let spec = CString::new("{\"spec_version\":1,\"same_code\":\"serial\"}").unwrap();
+    let mut op_id = [0u8; 16];
+    assert_eq!(
+        ak_sched_listen_start(
+            pair.engine,
+            pair.a.as_ptr(),
+            spec.as_ptr(),
+            op_id.as_mut_ptr(),
+        ),
+        AK_OK
+    );
+    // The op is immediately terminal and honest about the wave-22 listener
+    // scope cut.
+    let (code, json) = wait_op_result(pair.engine, &pair.a, &op_id);
+    assert_eq!(code, AK_DONE, "{json}");
+    assert!(json.starts_with("{\"op\":\"listen_start\""), "{json}");
+    assert!(json.contains("\"listener_enabled\":false"), "{json}");
+    assert_eq!(field_str(&json, "runtime"), hex16(&pair.a), "{json}");
+
+    // The scheduler really runs under the contract name: snapshot answers.
+    let (code, snapshot) = snapshot_text(pair.engine);
+    assert_eq!(code, AK_DONE, "{snapshot}");
+    assert!(snapshot.contains("\"policy\""), "{snapshot}");
+
+    // One scheduler per engine: a second listen_start is -2.
+    assert_eq!(
+        ak_sched_listen_start(
+            pair.engine,
+            pair.a.as_ptr(),
+            spec.as_ptr(),
+            op_id.as_mut_ptr(),
+        ),
+        AK_ERR_INVALID
+    );
+    // A spec naming a DIFFERENT runtime than the id argument is -2 before
+    // anything is rebound.
+    let conflict = CString::new(format!("{{\"runtime_id\":\"{}\"}}", hex16(&pair.b))).unwrap();
+    assert_eq!(
+        ak_sched_listen_start(
+            pair.engine,
+            pair.a.as_ptr(),
+            conflict.as_ptr(),
+            op_id.as_mut_ptr(),
+        ),
+        AK_ERR_INVALID
+    );
+    // The sched calls that take a runtime id must name the BOUND runtime.
+    assert_eq!(
+        ak_sched_retry(pair.engine, pair.b.as_ptr(), [0x55; 16].as_ptr()),
+        AK_ERR_NOT_FOUND
+    );
+    // Unknown task on the correct binding: -4 as well.
+    assert_eq!(
+        ak_sched_retry(pair.engine, pair.a.as_ptr(), [0x55; 16].as_ptr()),
+        AK_ERR_NOT_FOUND
+    );
+}
+
+#[test]
+fn sched_task_result_tracks_a_real_task_and_retry_rejects_nonparked() {
+    let fixture = transfer_fixture("serial", "parallel", 1, 1, 1, 1, 1);
+    let (max_active, snapshot) = fixture.wait_all_completed(1);
+    assert!(
+        max_active <= 1,
+        "serial same-code mode: {max_active} active"
+    );
+    fixture.assert_files_delivered();
+
+    let task_hex = first_task_id_hex(&snapshot);
+    let task = task_id_from_hex(&task_hex);
+    let engine = fixture.pair.engine;
+    let runtime = fixture.pair.a;
+    let mut buf = [0 as c_char; 4096];
+
+    // AK_DONE with the snapshot-shaped task object, terminal state visible.
+    assert_eq!(
+        ak_sched_task_result(
+            engine,
+            runtime.as_ptr(),
+            task.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        ),
+        AK_DONE
+    );
+    let json = cbuf_to_string(&buf);
+    assert!(json.contains("\"state\":\"Completed\""), "{json}");
+    assert!(json.contains(&format!("\"id\":\"{task_hex}\"")), "{json}");
+
+    // A too-small buffer is -3 and the retry is lossless.
+    let mut tiny = [0 as c_char; 8];
+    assert_eq!(
+        ak_sched_task_result(
+            engine,
+            runtime.as_ptr(),
+            task.as_ptr(),
+            tiny.as_mut_ptr(),
+            tiny.len(),
+        ),
+        AK_ERR_BUFFER
+    );
+    assert_eq!(
+        ak_sched_task_result(
+            engine,
+            runtime.as_ptr(),
+            task.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        ),
+        AK_DONE
+    );
+    assert_eq!(
+        cbuf_to_string(&buf),
+        json,
+        "the -3 retry must re-read the same view"
+    );
+
+    // retry only restarts PARKED tasks: a completed task is -4.
+    assert_eq!(
+        ak_sched_retry(engine, runtime.as_ptr(), task.as_ptr()),
+        AK_ERR_NOT_FOUND
+    );
+    // Unknown task id: -4.
+    assert_eq!(
+        ak_sched_task_result(
+            engine,
+            runtime.as_ptr(),
+            [0x77; 16].as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        ),
+        AK_ERR_NOT_FOUND
+    );
+}
+
+#[test]
+fn sched_shutdown_and_pairing_stop_lifecycle() {
+    let pair = paired_fixture();
+    let spec = CString::new("{\"spec_version\":1}").unwrap();
+    let mut op_id = [0u8; 16];
+    assert_eq!(
+        ak_sched_listen_start(
+            pair.engine,
+            pair.a.as_ptr(),
+            spec.as_ptr(),
+            op_id.as_mut_ptr(),
+        ),
+        AK_OK
+    );
+
+    // Shutdown is ACCEPTED immediately; the summary arrives via the op.
+    let mut shut_op = [0u8; 16];
+    let shut_spec = CString::new("{\"mode\":\"cancel\"}").unwrap();
+    assert_eq!(
+        ak_sched_shutdown_start(
+            pair.engine,
+            pair.a.as_ptr(),
+            shut_spec.as_ptr(),
+            shut_op.as_mut_ptr(),
+        ),
+        AK_OK
+    );
+    let (code, json) = wait_op_result(pair.engine, &pair.a, &shut_op);
+    assert_eq!(code, AK_DONE, "{json}");
+    assert!(json.starts_with("{\"op\":\"shutdown\""), "{json}");
+    assert!(json.contains("\"mode\":\"cancel\""), "{json}");
+    // The frozen shutdown events flowed into the scheduler event queue.
+    assert!(wait_sched_event(pair.engine, "shutdown_started", 5).contains("\"mode\":\"cancel\""));
+    assert!(wait_sched_event(pair.engine, "shutdown_complete", 5).contains("shutdown_complete"));
+
+    // Stopping one pairing runtime does not touch the other: b still runs.
+    let mut stop_op = [0u8; 16];
+    assert_eq!(
+        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        AK_OK
+    );
+    let (code, stopped) = wait_op_result(pair.engine, &pair.b, &stop_op);
+    assert_eq!(code, AK_DONE, "{stopped}");
+    assert!(stopped.starts_with("{\"op\":\"stop\""), "{stopped}");
+    assert!(stopped.contains(&hex16(&pair.b)), "{stopped}");
+    // The runtime_stopped event fired, and later ops on the stopped
+    // runtime fail fast with the stop reason.
+    assert!(wait_event(pair.engine, &pair.b, "runtime_stopped", 5).contains(&hex16(&pair.b)));
+    let (code, json) = run_op(
+        pair.engine,
+        &pair.b,
+        Op::Create("{\"spec_version\":1,\"ttl_secs\":0}"),
+    );
+    assert_eq!(code, AK_FAILED, "{json}");
+    assert!(json.contains("stopped by caller"), "{json}");
+    // The runtime entry stays readable after the stop, so a second stop is
+    // accepted and idempotent (tearing down an already-torn-down runtime
+    // is a no-op that re-records the terminal op).
+    assert_eq!(
+        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        AK_OK
+    );
 }

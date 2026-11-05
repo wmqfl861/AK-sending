@@ -7,14 +7,16 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use super::error::{ClientV2Error, ERR_DEVICE_REPLACED};
 use super::tls;
-use super::Inner;
+use super::{ClientV2, Inner};
 use crate::protocol_v2::{
-    CtrlFrame, CtrlMessage, Nonce32, RegistryId, Role, HEADER_LEN, MAX_FRAME_BYTES, VERSION,
+    CtrlFrame, CtrlMessage, ErrorScope, Nonce32, RegistryId, Role, HEADER_LEN, MAX_FRAME_BYTES,
+    VERSION,
 };
 
 /// One outbound item for the writer task. Unboxed on purpose:
@@ -227,6 +229,13 @@ async fn reader_loop(inner: Arc<Inner>, mut read: ReadHalf<TlsStream<TcpStream>>
                             inner.note_replaced();
                         }
                     }
+                    // Pairing-plane tap BEFORE keyed dispatch: every
+                    // pairing-plane frame is copied to each plane
+                    // subscriber, including offers for pairing ids nobody
+                    // subscribed to yet (see `subscribe_plane`).
+                    if is_pairing_plane(&frame.message) {
+                        fan_out_plane(&inner, &frame.message);
+                    }
                     inner.route_inbound(frame.message);
                 }
                 Err(e) => {
@@ -281,4 +290,78 @@ async fn writer_loop(
     }
     // All senders dropped (reconnect replaced the outbox): close politely.
     let _ = write.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pairing-plane stream (wave 23): the ClientV2 half of the RegistryClient
+// convergence. ak-session's `RegistryClient::subscribe_plane` receives a
+// copy of EVERY pairing-plane frame — including `InviteRedeemOffered` for
+// pairings the client cannot know yet — because the frozen keyed dispatch
+// drops owner-directed offers when nobody subscribed to the (still
+// unknown) pairing id, which makes the owner side of the redeem flow
+// impossible (see that crate's pairing/client.rs docs). This block gives
+// ClientV2 the same stream; the method family can converge into one
+// implementation once the ak-signal opening-exchange constants are
+// reconciled (documented follow-up).
+// ---------------------------------------------------------------------------
+
+/// Whether one inbound frame belongs to the pairing plane: every
+/// pairing-keyed push, the unkeyed server→redeemer `PairChallenge`,
+/// pairing-scoped `PairError`s, and `ServerError` (the same set
+/// `RegistryClient`'s dispatch fans out to its plane subscribers).
+fn is_pairing_plane(message: &CtrlMessage) -> bool {
+    match message {
+        CtrlMessage::InviteRedeemOffered { .. }
+        | CtrlMessage::PairProof { .. }
+        | CtrlMessage::PairReady { .. }
+        | CtrlMessage::PairCommit { .. }
+        | CtrlMessage::PairChallenge { .. }
+        | CtrlMessage::ServerError { .. } => true,
+        CtrlMessage::PairError { scope, .. } => *scope == ErrorScope::Pairing,
+        _ => false,
+    }
+}
+
+/// Copy one pairing-plane frame to every plane tap. Bounded and
+/// non-blocking, exactly like the keyed dispatch: a full tap drops and is
+/// logged, a closed tap is pruned; the reader never awaits.
+fn fan_out_plane(inner: &Inner, message: &CtrlMessage) {
+    let mut taps = inner.plane.lock().expect("client_v2 plane taps poisoned");
+    for tx in taps.iter() {
+        match tx.try_send(message.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("client_v2: plane inbox full, frame dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+    taps.retain(|tx| !tx.is_closed());
+}
+
+impl ClientV2 {
+    /// Subscribe to the pairing plane: a copy of EVERY pairing-plane frame
+    /// this client receives — `InviteRedeemOffered`, `PairProof`,
+    /// `PairCommit`, `PairReady`, the unkeyed server→redeemer
+    /// `PairChallenge`, pairing-scoped `PairError`s, and `ServerError` —
+    /// delivered to a bounded inbox (default inbox capacity; a full inbox
+    /// drops and logs, never wedges the reader).
+    ///
+    /// Equivalent to ak-session `RegistryClient::subscribe_plane`, so the
+    /// orchestrator's owner loop can run on either client: unlike the
+    /// per-pairing stream of [`ClientV2::subscribe_pairing`], the plane
+    /// tap also sees offers for pairing ids this device has not
+    /// (yet) subscribed to — the frozen keyed dispatch alone would drop
+    /// them. Multiple subscribers allowed; the subscription survives
+    /// reconnects (the server re-pushes pending offers on every Hello) and
+    /// ends at [`ClientV2::close`].
+    pub fn subscribe_plane(&self) -> mpsc::Receiver<CtrlMessage> {
+        let (tx, rx) = mpsc::channel(self.inner.config.inbox_capacity.max(1));
+        self.inner
+            .plane
+            .lock()
+            .expect("client_v2 plane taps poisoned")
+            .push(tx);
+        rx
+    }
 }

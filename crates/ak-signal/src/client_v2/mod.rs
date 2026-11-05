@@ -166,6 +166,12 @@ pub(crate) struct Inner {
 
     /// Bounded waiters / subscriptions; see [`dispatch`].
     pub(crate) registry: StdMutex<DispatchRegistry>,
+    /// Pairing-plane taps (wave 23): every pairing-plane frame is copied
+    /// to each BEFORE keyed dispatch — see [`ClientV2::subscribe_plane`]
+    /// (the reader-loop fan-out lives in [`conn`]). Durable across
+    /// reconnects, cleared on [`ClientV2::close`], mirroring the
+    /// ak-session `RegistryClient` plane.
+    pub(crate) plane: StdMutex<Vec<mpsc::Sender<CtrlMessage>>>,
     /// Outbound queue of the live writer task.
     pub(crate) outbox: StdMutex<mpsc::Sender<conn::Outbound>>,
     /// Serializes reconnect/close against each other.
@@ -198,6 +204,7 @@ impl Inner {
             name,
             config,
             registry: StdMutex::new(DispatchRegistry::new()),
+            plane: StdMutex::new(Vec::new()),
             outbox: StdMutex::new(mpsc::channel(1).0),
             lifecycle: AsyncMutex::new(()),
             epoch: AtomicU64::new(0),
@@ -881,6 +888,11 @@ impl ClientV2 {
             .lock()
             .expect("client_v2 registry poisoned")
             .clear_all();
+        self.inner
+            .plane
+            .lock()
+            .expect("client_v2 plane taps poisoned")
+            .clear();
         self.inner.state_tx.send_replace(ConnState::Closed);
     }
 

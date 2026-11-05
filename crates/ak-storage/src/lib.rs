@@ -1,12 +1,25 @@
 //! Local filesystem adapter: source scanning and receive-side save targets.
 //!
 //! Guarantees (see AGENTS.md): no path escapes (`..`, absolute, drive letters
-//! rejected by `ak_core::manifest`), no symlink races (every existing path
-//! component is re-checked with `symlink_metadata` before use), bounded
-//! memory (streaming digests), and atomic no-replace file commit (temp
-//! `.akpart` file, fsync, then hard-link + unlink; the final name only
-//! appears after the whole digest matches and is never created over an
-//! existing file).
+//! rejected by `ak_core::manifest`), symlink defenses (every existing path
+//! component is refused when `symlink_metadata` shows a link, and each
+//! step re-validates immediately before acting), bounded memory (streaming
+//! digests), and atomic no-replace file commit (temp `.akpart` file,
+//! fsync, then hard-link + unlink; the final name only appears after the
+//! whole digest matches and is never created over an existing file).
+//!
+//! # Symlink race posture (review 2026-11-05, P1-2)
+//!
+//! `std` has no `openat2`/no-follow open on Windows, so every check-then-
+//! act sequence below has a residual window: a concurrent local process
+//! that swaps a checked component for a symlink between the check and the
+//! following path operation can still redirect that one operation. The
+//! defenses therefore (a) re-run `symlink_metadata` immediately before
+//! each open/truncate/rename/link/removal, shrinking the window to the
+//! minimum std allows, (b) fail closed when a link is found, and (c)
+//! prefer handle-bound operations (truncation and writes go through the
+//! already-open descriptor, never the path). The window is narrowed, not
+//! eliminated; each site documents its residual risk.
 //!
 //! # Per-task staging namespace (wave 20)
 //!
@@ -18,7 +31,10 @@
 //! legacy same-directory `.akpart` left by a pre-staging run is migrated
 //! into the task's staging tree on prepare and resumed from there;
 //! [`discard_staging`] removes one task's whole staging tree on cancel or
-//! task end without touching any other task's parts.
+//! task end without touching any other task's parts. `.ak-staging` is a
+//! reserved namespace: a manifest rel_path that names it is rejected at
+//! prepare, so received content can never land inside (and be deleted by)
+//! the engine's terminal staging cleanup.
 #![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -141,6 +157,28 @@ fn streaming_buffer_len(chunk_size: NonZeroU32, total_bytes: u64) -> usize {
 
 fn escape_err() -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, OpenError::Escape)
+}
+
+/// Refuse when `path`'s final component is a symlink. This is a
+/// re-validation immediately before a path-based action (open, mtime
+/// stamp, unlink, hard-link claim): std has no openat2/no-follow open on
+/// Windows, so each such check narrows — but cannot eliminate — the
+/// check-to-use window (review 2026-11-05, P1-2). An attacker swapping
+/// the component AFTER this check can still redirect the following
+/// path operation; handle-bound operations (read/write/truncate through
+/// an open descriptor) are immune by construction.
+fn ensure_not_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            OpenError::SymlinkComponent(path.to_path_buf()),
+        )),
+        Ok(_) => Ok(()),
+        // An absent path cannot be a link; the action that follows
+        // (create/open) reports the authoritative error.
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn conflict_err(path: &Path) -> io::Error {
@@ -519,14 +557,12 @@ impl LocalSaveTarget {
             }
         }
         let part_path = with_part_suffix(&final_path);
-        if let Ok(meta) = fs::symlink_metadata(&part_path) {
-            if meta.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    OpenError::SymlinkComponent(part_path),
-                ));
-            }
-        }
+        // Re-validated immediately before the open: a part swapped for a
+        // symlink after an earlier check would otherwise be opened through
+        // the link and its target truncated by the resume pass below.
+        // Residual window (no openat2/no-follow in std): a swap between
+        // this check and the open is still possible (P1-2).
+        ensure_not_symlink(&part_path)?;
         // No truncate: an existing part is verified and resumed in place.
         let mut file = OpenOptions::new()
             .read(true)
@@ -534,7 +570,7 @@ impl LocalSaveTarget {
             .create(true)
             .truncate(false)
             .open(&part_path)?;
-        let verified_prefix = verify_part_prefix(&mut file, entry, chunk_size)?;
+        let verified_prefix = verify_part_prefix(&mut file, &part_path, entry, chunk_size)?;
         let state = PartState {
             file,
             final_path,
@@ -591,6 +627,14 @@ impl SaveTarget for LocalSaveTarget {
 /// accepted, then the full `validate_rel_path` rule set is applied to the
 /// reconstructed `/`-separated path. Callers join the returned components
 /// onto the root themselves; the raw `rel_path` is never joined directly.
+///
+/// Reserved namespace (review 2026-11-05, P2): a component naming the
+/// staging directory `.ak-staging` is rejected — a received file placed
+/// under `<root>/.ak-staging/<task>/…` would be committed inside this
+/// task's own staging tree and then deleted by the engine's terminal
+/// [`discard_staging`] ("success deletes the successful file"). The
+/// comparison is ASCII-case-insensitive because NTFS resolves directory
+/// names case-insensitively by default.
 fn checked_rel_components(entry: &FileEntry) -> io::Result<Vec<&OsStr>> {
     let mut parts = Vec::new();
     let mut joined = String::new();
@@ -598,6 +642,14 @@ fn checked_rel_components(entry: &FileEntry) -> io::Result<Vec<&OsStr>> {
         let Component::Normal(part) = comp else {
             return Err(escape_err());
         };
+        if part
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(STAGING_DIR.as_bytes())
+        {
+            return Err(invalid_input_io(format!(
+                "rel path collides with the reserved staging namespace '{STAGING_DIR}'"
+            )));
+        }
         let s = part.to_str().ok_or_else(escape_err)?;
         if !joined.is_empty() {
             joined.push('/');
@@ -610,8 +662,12 @@ fn checked_rel_components(entry: &FileEntry) -> io::Result<Vec<&OsStr>> {
 }
 
 /// Create `root/parts[..]` level by level. An already-existing level is only
-/// accepted if `symlink_metadata` proves it is a real directory (this is the
-/// symlink-race check: a symlink to a directory would pass `exists()`).
+/// accepted if `symlink_metadata` proves it is a real directory (a symlink
+/// to a directory would pass `exists()`). Honest limitation: without
+/// openat2 this create-then-check sequence still has a swap window
+/// between `create_dir` failing with `AlreadyExists` and the
+/// `symlink_metadata` that classifies the level; every later step
+/// re-validates again (see [`ensure_not_symlink`]).
 fn ensure_real_dirs(root: &Path, parts: &[&OsStr]) -> io::Result<()> {
     let mut current = root.to_path_buf();
     for part in parts {
@@ -699,12 +755,20 @@ fn final_matches_digest(
 /// buffer of `min(chunk_size, file size)` — no allocation at all for an
 /// empty entry, and a file shorter than one chunk never allocates a full
 /// chunk (the short tail needs less than the chunk size).
+///
+/// The truncation targets the already-open descriptor, so a path swap
+/// cannot redirect it; the `part_path` re-validation below is
+/// belt-and-braces (P1-2: re-check before every action on the part path)
+/// and catches a link planted between the caller's pre-open check and
+/// here in time for the mtime/commit steps that DO act on the path.
 fn verify_part_prefix(
     file: &mut File,
+    part_path: &Path,
     entry: &FileEntry,
     chunk_size: NonZeroU32,
 ) -> io::Result<u64> {
     ensure_chunk_size_within_cap(chunk_size)?;
+    ensure_not_symlink(part_path)?;
     let plan = ChunkPlan::new(entry.size, chunk_size);
     // Every chunk length is min(chunk_size, size - start), so a buffer of
     // min(chunk_size, size) covers each `want` slice below.
@@ -877,6 +941,13 @@ impl FileSink for LocalFileSink {
             }
         }
         st.file.sync_all()?;
+        // Every remaining part-path action below (mtime stamp, reuse
+        // unlink, the hard-link claim) is a PATH operation: re-validate the
+        // part path first. set_file_mtime follows symlinks and hard_link
+        // claims the linked inode, so a swapped link must be refused here.
+        // Residual window (no fd-relative mtime/link in std): a swap after
+        // this check can still redirect one operation (P1-2).
+        ensure_not_symlink(&st.part_path)?;
         // Best-effort metadata fidelity: stamp the sender's real mtime onto
         // the part file so it survives the rename. Byte fidelity is the hard
         // guarantee of finish(); a failed mtime stamp must not fail the
@@ -897,8 +968,11 @@ impl FileSink for LocalFileSink {
             if st.staged && staged_target_matches(st, &target)? {
                 // The open handle does not block the unlink: std opens with
                 // FILE_SHARE_DELETE on Windows and POSIX unlink is immune.
-                // Best effort; an undeletable part is later reaped by
-                // discard_staging / discard_orphan_parts.
+                // Re-check the part path after the digest pass (the window
+                // grew while hashing), then drop the part. Best effort; an
+                // undeletable part is later reaped by discard_staging /
+                // discard_orphan_parts.
+                ensure_not_symlink(&st.part_path)?;
                 let _ = fs::remove_file(&st.part_path);
                 st.finished = true;
                 return Ok(());
@@ -910,21 +984,38 @@ impl FileSink for LocalFileSink {
         }
         let mut renames = 0u32;
         loop {
+            // Re-validate right before each claim: the rename/mtime/hash
+            // passes above widened the window again (P1-2).
+            ensure_not_symlink(&st.part_path)?;
             match commit_no_replace(&st.part_path, &target) {
                 Ok(()) => {
                     st.finished = true;
                     return Ok(());
                 }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => match st.conflict {
-                    ConflictPolicy::Fail => return Err(conflict_err(&st.final_path)),
-                    ConflictPolicy::Rename => {
-                        renames += 1;
-                        if renames > 4096 {
-                            return Err(conflict_err(&st.final_path));
-                        }
-                        target = conflict_free_name(&target);
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // A concurrent task claimed the target between the
+                    // pre-check above and this atomic claim (P1-2,
+                    // concurrent-finish adjudication): re-read the target
+                    // and compare whole digests — identical content is a
+                    // REUSE (drop this task's part, succeed idempotently),
+                    // different content keeps the conflict policy.
+                    if st.staged && staged_target_matches(st, &target)? {
+                        ensure_not_symlink(&st.part_path)?;
+                        let _ = fs::remove_file(&st.part_path);
+                        st.finished = true;
+                        return Ok(());
                     }
-                },
+                    match st.conflict {
+                        ConflictPolicy::Fail => return Err(conflict_err(&st.final_path)),
+                        ConflictPolicy::Rename => {
+                            renames += 1;
+                            if renames > 4096 {
+                                return Err(conflict_err(&st.final_path));
+                            }
+                            target = conflict_free_name(&target);
+                        }
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -934,8 +1025,17 @@ impl FileSink for LocalFileSink {
         match self.kind {
             SinkKind::File(st) => {
                 drop(st.file);
-                // Best effort; a vanished part is fine.
-                let _ = fs::remove_file(&st.part_path);
+                // Best effort; a vanished part is fine. A part path that
+                // has become a symlink mid-flight is NOT removed:
+                // remove_file would only delete the link, but the swap
+                // itself signals tampering — leave it to the staging
+                // cleanup / orphan sweep (P1-2).
+                let real = fs::symlink_metadata(&st.part_path)
+                    .map(|m| !m.file_type().is_symlink())
+                    .unwrap_or(true);
+                if real {
+                    let _ = fs::remove_file(&st.part_path);
+                }
             }
             // Nothing in flight: the final file stays, no part exists.
             SinkKind::Directory | SinkKind::Committed { .. } => {}
@@ -1239,14 +1339,9 @@ impl LocalSaveTarget {
                 Err(e) => return Err(e),
             }
         }
-        if let Ok(meta) = fs::symlink_metadata(&part_path) {
-            if meta.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    OpenError::SymlinkComponent(part_path),
-                ));
-            }
-        }
+        // Re-validated immediately before the open (same residual window
+        // as the unstaged path: no openat2/no-follow in std — P1-2).
+        ensure_not_symlink(&part_path)?;
         // No truncate: an existing staged part is verified and resumed.
         let mut file = OpenOptions::new()
             .read(true)
@@ -1254,7 +1349,7 @@ impl LocalSaveTarget {
             .create(true)
             .truncate(false)
             .open(&part_path)?;
-        let verified_prefix = verify_part_prefix(&mut file, entry, chunk_size)?;
+        let verified_prefix = verify_part_prefix(&mut file, &part_path, entry, chunk_size)?;
         let state = PartState {
             file,
             final_path,
@@ -1302,10 +1397,39 @@ fn staged_target_matches(st: &PartState, target: &Path) -> io::Result<bool> {
 
 /// Remove one task's whole staging tree `<root>/.ak-staging/<task_hex>/`
 /// (cancel path and terminal cleanup helper). Iterative post-order walk,
-/// never follows symlinks (a planted link is itself removed), touches
-/// nothing outside the task's own subtree, and is idempotent: an absent
-/// tree is `Ok(())`. Sibling tasks' trees are untouched.
+/// touches nothing outside the task's own subtree, and is idempotent: an
+/// absent tree is `Ok(())`. Sibling tasks' trees are untouched.
+///
+/// Symlink posture (review 2026-11-05, P1-2): the `.ak-staging` PARENT is
+/// verified to be a real directory before anything is read — a link
+/// planted there would otherwise resolve every path below (including the
+/// `top` check, whose `symlink_metadata` only refuses a link at the FINAL
+/// component) into an external tree and make the walk delete it. Each
+/// entry is classified with `symlink_metadata` and re-classified right
+/// before removal; a link found at removal time fails closed instead of
+/// being unlinked. Residual window: std has no fd-relative
+/// remove_file/remove_dir, so a component swapped between its check and
+/// the removal can still be acted on by path — `remove_file` on a
+/// symlink removes the link itself (never its target) on both platforms,
+/// and `remove_dir` refuses non-empty directories, which bounds a
+/// post-check swap to failing or deleting a planted link, not external
+/// data. The destructive parent-link case is closed by the check above.
 pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
+    // The staging PARENT must be a real directory (or absent): a symlink
+    // here would redirect the whole walk outside the receive root.
+    let staging_root = root.join(STAGING_DIR);
+    match fs::symlink_metadata(&staging_root) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    OpenError::SymlinkComponent(staging_root),
+                ));
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
     let top = staging_path(root, task_id);
     let meta = match fs::symlink_metadata(&top) {
         Ok(meta) => meta,
@@ -1319,7 +1443,7 @@ pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
         )));
     }
     // Collect directories pre-order (parent before children), then remove
-    // deepest-first; files and symlinks go as soon as they are seen.
+    // deepest-first; files go as soon as they are seen.
     let mut stack: Vec<PathBuf> = vec![top.clone()];
     let mut dirs: Vec<PathBuf> = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -1330,11 +1454,20 @@ pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
             if file_type.is_dir() {
                 stack.push(path);
             } else {
+                // Re-classify immediately before the removal; a link that
+                // appeared (or was swapped in) since classification fails
+                // closed instead of being unlinked (P1-2).
+                ensure_not_symlink(&path)?;
                 fs::remove_file(&path)?;
             }
         }
     }
     for dir in dirs.into_iter().rev() {
+        // A directory swapped for a symlink after classification must not
+        // be removed by path: remove_dir on a Windows dir-symlink removes
+        // the link (POSIX rmdir refuses); both are non-destructive, but
+        // refusing is the honest fail-closed choice given the swap.
+        ensure_not_symlink(&dir)?;
         fs::remove_dir(&dir)?;
     }
     Ok(())
@@ -2897,5 +3030,164 @@ mod tests {
             outside.path().read_dir().unwrap().next().is_none(),
             "nothing written through the link"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reserved staging namespace (review 2026-11-05, P2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_rejects_rel_paths_entering_the_staging_namespace() {
+        let (_tmp, _source, entry) = transfer_entry(b"0123", 4);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let task_hex = hex_prefix(&TASK_A, 16);
+        let shapes = [
+            format!("{STAGING_DIR}/payload.bin"),
+            format!("{STAGING_DIR}/{task_hex}/payload.bin"),
+            format!("docs/{STAGING_DIR}/nested.bin"),
+            // NTFS resolves directory names case-insensitively: a differently
+            // cased spelling lands in the same directory.
+            ".AK-STAGING/payload.bin".to_owned(),
+        ];
+        for rel in shapes {
+            let mut e = entry.clone();
+            e.rel_path = PathBuf::from(&rel);
+            let err = target
+                .prepare_file_staged(TASK_A, &e, ConflictPolicy::Fail, cs(4))
+                .err()
+                .unwrap_or_else(|| panic!("staged prepare must reject {rel}"));
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{rel}: {err}");
+            assert!(
+                err.to_string().contains("staging namespace"),
+                "{rel}: {err}"
+            );
+            // The shared component check covers the unstaged receive path
+            // too (uniform rejection at every entry point).
+            let err = target
+                .prepare_file_with_chunk_size(&e, ConflictPolicy::Fail, cs(4))
+                .err()
+                .unwrap_or_else(|| panic!("unstaged prepare must reject {rel}"));
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{rel}: {err}");
+        }
+        // Nothing was created anywhere before the rejection.
+        assert!(
+            !dst.path().join(STAGING_DIR).exists(),
+            "no staging tree may be created for rejected entries"
+        );
+        assert!(
+            dst.path().read_dir().unwrap().next().is_none(),
+            "destination stays untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent same-target finish: one commit, one reuse (review
+    // 2026-11-05, P2) — two threads released together after both parts are
+    // fully verified; the loser of the atomic claim must reuse by content,
+    // never fail (Fail policy) nor duplicate (Rename policy).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_staged_finish_same_content_is_one_commit_one_reuse() {
+        use std::sync::{Arc, Barrier};
+
+        // Several chunks so the hash/sync phases give the race room to land
+        // on either side of the pre-check; repeated rounds raise the odds
+        // of exercising the AlreadyExists re-adjudication branch.
+        let content = vec![0xA5u8; 128 * 1024];
+        let chunk: u32 = 16 * 1024;
+        let (_src_tmp, source, entry) = transfer_entry(&content, chunk);
+        for _round in 0..5 {
+            let dst = TempDir::new().unwrap();
+            let target = LocalSaveTarget::open(dst.path()).unwrap();
+            let final_path = dst.path().join("payload.bin");
+
+            let mut sink_a = target
+                .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(chunk))
+                .unwrap();
+            let mut sink_b = target
+                .prepare_file_staged(TASK_B, &entry, ConflictPolicy::Rename, cs(chunk))
+                .unwrap();
+            write_all_chunks(&mut sink_a, &source, &entry);
+            write_all_chunks(&mut sink_b, &source, &entry);
+            let part_a = staging_path(dst.path(), TASK_A).join("payload.bin.akpart");
+            let part_b = staging_path(dst.path(), TASK_B).join("payload.bin.akpart");
+            assert!(part_a.exists() && part_b.exists());
+
+            let barrier = Arc::new(Barrier::new(2));
+            let start_b = Arc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                start_b.wait();
+                sink_a.finish()
+            });
+            barrier.wait();
+            let result_b = sink_b.finish();
+            let result_a = handle.join().expect("finish thread");
+            result_a.expect("first finisher commits");
+            result_b.expect("loser reuses, never fails nor duplicates");
+
+            assert_eq!(fs::read(&final_path).unwrap(), content);
+            assert!(!part_a.exists() && !part_b.exists(), "both parts consumed");
+            assert!(
+                !dst.path().join("payload (2).bin").exists(),
+                "same content must not spawn a duplicate"
+            );
+            let mut finals: Vec<_> = fs::read_dir(dst.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            finals.sort();
+            assert_eq!(
+                finals,
+                vec![STAGING_DIR.to_owned(), "payload.bin".to_owned()],
+                "exactly one final file plus the staging root"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // discard_staging parent-link guard (review 2026-11-05, P1-2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discard_staging_refuses_a_symlinked_staging_parent() {
+        let dst = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        // The attacker's tree: `<outside>/.ak-staging/<task>/…` plus a
+        // victim that must never be touched. `symlink_metadata(top)`
+        // alone would see a real directory under the link.
+        let task_hex = hex_prefix(&TASK_A, 16);
+        let external_task = outside.path().join(STAGING_DIR).join(&task_hex);
+        fs::create_dir_all(&external_task).unwrap();
+        wf(&external_task.join("f.bin.akpart"), b"x");
+        let victim = outside.path().join("victim.txt");
+        wf(&victim, b"keep");
+        if !make_symlink(
+            &outside.path().join(STAGING_DIR),
+            &dst.path().join(STAGING_DIR),
+            true,
+        ) {
+            return;
+        }
+
+        let err = discard_staging(dst.path(), TASK_A).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            external_task.join("f.bin.akpart").exists(),
+            "nothing inside the linked tree was touched"
+        );
+        assert!(victim.exists(), "external victim untouched");
+        // A legit tree next to the refusal still cleans up normally.
+        // (Windows needs remove_dir for a directory symlink.)
+        let link = dst.path().join(STAGING_DIR);
+        fs::remove_file(&link)
+            .or_else(|_| fs::remove_dir(&link))
+            .expect("drop the planted link");
+        let real_tree = staging_path(dst.path(), TASK_B);
+        fs::create_dir_all(real_tree.join("d")).unwrap();
+        wf(&real_tree.join("d/x.akpart"), b"y");
+        discard_staging(dst.path(), TASK_B).unwrap();
+        assert!(!real_tree.exists());
     }
 }

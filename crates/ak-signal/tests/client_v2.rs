@@ -952,6 +952,82 @@ async fn pairing_inbox_receives_offer_and_commit() {
     ));
 }
 
+/// The pairing-plane stream (wave 23, the `RegistryClient::subscribe_plane`
+/// equivalent) must receive a copy of EVERY pairing-plane frame — including
+/// an `InviteRedeemOffered` for a pairing id nobody subscribed to (keyed
+/// dispatch alone drops exactly those owner-directed offers), the unkeyed
+/// server→redeemer `PairChallenge`, and `ServerError` — while frames
+/// OUTSIDE the pairing plane never reach it.
+#[tokio::test]
+async fn plane_stream_receives_frames_for_unknown_pairings() {
+    let fake = FakeRegistry::start().await;
+    let key = DeviceKeyPair::generate();
+    let client = connect(&fake, &key).await;
+
+    let mut plane = client.subscribe_plane();
+
+    // An owner-directed offer for a pairing this client never subscribed
+    // to: the per-pairing dispatch has no inbox for it; only the plane tap
+    // can deliver it (the owner side of the redeem flow depends on this).
+    let unknown = pid(0x3A);
+    fake.send(
+        1,
+        CtrlMessage::InviteRedeemOffered {
+            code_id: [0x3B; 16],
+            code_revision: 1,
+            pairing_id: unknown,
+            redeemer_device_id: [0x3C; 32],
+            redeem: RedeemRequest {
+                request_id: [0x3D; 16],
+                lookup_digest: rng32(0x3E),
+                redeemer_nonce: rng32(0x3F),
+                deadline_ms: u64::MAX,
+                request_mac: rng32(0x40),
+                signature: [0x41; 64],
+            },
+        },
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), plane.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        CtrlMessage::InviteRedeemOffered { .. }
+    ));
+
+    // The unkeyed server→redeemer challenge is a plane event too.
+    let mut transcript: Transcript256 = [0; 256];
+    transcript[56..72].copy_from_slice(&unknown);
+    fake.send(
+        1,
+        CtrlMessage::PairChallenge {
+            transcript,
+            owner_proof: PairProof {
+                mac: rng32(0x42),
+                signature: [0x43; 64],
+            },
+        },
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), plane.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        CtrlMessage::PairChallenge { .. }
+    ));
+
+    // Frames outside the pairing plane never reach the plane stream.
+    fake.send(
+        1,
+        CtrlMessage::Signal {
+            session: [0x44; 16],
+            signal: PeerSignal::Bye,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(plane.try_recv().is_err(), "plane inbox must stay empty");
+}
+
 #[tokio::test]
 async fn session_routing_matches_only_the_opened_session() {
     let mut fake = FakeRegistry::start().await;

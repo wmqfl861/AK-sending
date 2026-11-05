@@ -8,17 +8,22 @@
 //!   to the caller that the caller must free except via explicit APIs.
 //! - Progress is pulled (poll) as small JSON lines, so any language loop
 //!   can render it; errors are status codes plus a message buffer.
-//! - `unsafe` exists ONLY in this crate's shim, each block carrying a
-//!   SAFETY comment; all logic lives in safe functions below the shim.
+//! - `unsafe` exists ONLY in this crate's pointer-shim modules ([`shim`]
+//!   and, since wave 23, [`sched_ext`] for the five exports that complete
+//!   the frozen v2 surface), each block carrying a SAFETY comment; all
+//!   logic lives in safe functions below the shims.
 //!
 //! # Repository unsafe-code exception
 //!
 //! Every other crate in this repository is `#![forbid(unsafe_code)]`; this
 //! crate is the single, deliberate exception, because a C ABI is exactly
 //! the place where raw pointers are the interface. The exception is
-//! contained: [`shim`] holds all `unsafe` blocks (pointer dereference,
-//! `CStr` reads, buffer writes — each with a `SAFETY:` comment covering
-//! non-nullness, lifetime, and UTF-8 validation), while [`core`] is
+//! contained: [`shim`] holds the `unsafe` blocks of the v1 + wave-22
+//! exports (pointer dereference, `CStr` reads, buffer writes — each with a
+//! `SAFETY:` comment covering non-nullness, lifetime, and UTF-8
+//! validation), and [`sched_ext`] (wave 23) holds those of the five
+//! ffi-v2 §1 exports that were still missing, under the identical
+//! discipline, while [`core`] is
 //! compiled with `#![forbid(unsafe_code)]` and owns every line of logic:
 //! the engine handle and job table, JSON parsing/serialization, spec
 //! construction, and progress/report rendering. Panics never cross the
@@ -376,16 +381,80 @@
 //! `ak_sched_start` (`AK_OK` / `-2` / `-4`). `ak_sched_cancel` takes the
 //! 16-byte task id (`AK_OK`; `-4` unknown or already-terminal task).
 //!
+//! # B8 (wave 23): the five exports completing the frozen 18-symbol surface
+//!
+//! `sched_ext` adds the ffi-v2 §1 entries wave 22 left missing, under the
+//! frozen contract signatures — these KEEP the `runtime_id` parameter the
+//! wave-22 `ak_sched_*` exports dropped; on every sched call it must name
+//! the pairing runtime the scheduler is BOUND to (else `-4`, never a
+//! silent rebind):
+//!
+//! * `ak_pairing_stop_start(e, runtime_id, op_id_out)` — REAL: stops the
+//!   runtime (op/owner-loop aborts, spawned best-effort client close),
+//!   flips its phase to a terminal "stopped by caller", emits
+//!   `{"event":"runtime_stopped","runtime":"<32hex>"}`, clears the
+//!   engine's active-runtime pointer when it named this runtime, and
+//!   records the immediately-finished op
+//!   `{"op":"stop","runtime":"<32hex>"}` (readable via
+//!   `ak_pairing_op_result`; later ops on the runtime fail with
+//!   "stopped by caller").
+//! * `ak_sched_listen_start(e, runtime_id, spec_json, op_id_out)` — REAL
+//!   delegation: the contract's name for the scheduler start. Same policy
+//!   spec as `ak_sched_start`; the caller's `runtime_id` is injected when
+//!   the spec names none, and a spec naming a different id is `-2`. The
+//!   op resolves immediately to
+//!   `{"op":"listen_start","runtime":"<32hex>","listener_enabled":false}`
+//!   — the resident inbound listener is the documented wave-22 scope cut
+//!   (`listener_enabled` forced off until the on-channel receive
+//!   executor lands) and is reported, not hidden.
+//! * `ak_sched_retry(e, runtime_id, task_id)` — REAL: the session
+//!   runtime's parked-task restart (`AK_OK`; `-4` unknown/unbound runtime,
+//!   unknown task, or a task that is not parked).
+//! * `ak_sched_task_result(e, runtime_id, task_id, buf, cap)` — REAL:
+//!   writes the single task's view — the same object shape as the
+//!   `ak_sched_snapshot` `tasks[]` entries, terminal states included
+//!   (ffi-v2 §5's terminal-state recovery channel):
+//!
+//! ```json
+//! {"id":"<32hex>","state":"Transferring","group":"<32hex code>",
+//!  "registry":"<64hex>","direction":"send","label":"file.bin","attempts":1,
+//!  "last_error":null,"cancel_requested":false,"parked":null}
+//! ```
+//!
+//! `AK_DONE` when written / `-3` buffer (lossless retry) / `-4` unknown
+//! runtime binding or task.
+//! * `ak_sched_shutdown_start(e, runtime_id, spec_json, op_id_out)` —
+//!   REAL: accepts the shutdown immediately (op id minted, no drain wait
+//!   in the synchronous call) and drives it on the embedded runtime. Spec:
+//!
+//! ```json
+//! {"spec_version":1,"mode":"cancel"}   // "drain" | "cancel", default cancel
+//! ```
+//!
+//! The op resolves via `ak_pairing_op_result` to
+//! `{"op":"shutdown","mode":"cancel","completed":N,"cancelled":N,
+//! "parked":N,"timed_out":false,"listener_stopped":false}` (or
+//! `{"op":"shutdown","error":"..."}`); the frozen
+//! `shutdown_started`/`shutdown_complete` events keep flowing through
+//! `ak_sched_poll_event`. Known limitation: the engine keeps its one
+//! scheduler slot for its lifetime — after `shutdown_complete` a restart
+//! needs a fresh engine handle.
+//!
 //! NOT yet wired to any frontend: verified by Rust-side tests that drive
 //! the C ABI end-to-end (real loopback transfers through the boundary).
 
 mod core;
 mod pairing;
+mod sched_ext;
 mod shim;
 
 pub use crate::core::{
     AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INTERNAL, AK_ERR_INVALID, AK_ERR_NOT_FOUND,
     AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
+};
+pub use crate::sched_ext::{
+    ak_pairing_stop_start, ak_sched_listen_start, ak_sched_retry, ak_sched_shutdown_start,
+    ak_sched_task_result,
 };
 pub use crate::shim::{
     ak_engine_free, ak_engine_last_error, ak_engine_new, ak_identity_info, ak_job_cancel,

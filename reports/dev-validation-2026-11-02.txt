@@ -517,3 +517,47 @@ $ cargo test --workspace → 851/0（基线 773 → +78）；clippy 干净；rep
 
 $ cargo test --workspace → 881/0（基线 851 → +30）；signal+persistence 227；dart 107/107；flutter 108/108；
 $ clippy 干净；repo passed；flutter analyze 零 issue
+
+## 平台验收（2026-11-05，二十二次后）
+Windows GUI release: √ built ak_sending_app.exe
+Android APK debug: √ built app-debug.apk
+Linux check: PASS=2(android) BLOCKED=3(linux-gnu/apple=宿主工具链) FAIL=0
+Android FFI: 双 ABI .so 编译成功；符号门缺 ak_sched_listen_start（契约 vs B8 实际 ak_sched_start 命名差——待统一）
+
+## 终审更正（2026-11-05，Codex gpt-6-astra/max 审核后）
+# 终审原文：reports/codex-review-2026-11-05.md。以下仅收窄/更正本记录既有表述，不删除历史原文；
+# 各条对应行为修复由第二十三波并行修复代理进行中，落地证据由集成者复核后回填。
+1. 第二十波节"ghost-pending 统一 PAIR_UNAVAILABLE（无存在性预言机）"（第 487 行）收窄为：
+   ghost-pending 首响应统一；status 查询与终态响应存在可区分性（终审发现，修复中）。
+   即"无存在性预言机"仅对兑换首响应成立，不覆盖 status 查询与终态响应路径。
+2. 第二十二次节"sched 四模式真传输"（第 509 行）收窄为：FFI 覆盖 serial/parallel、
+   parallel/parallel、parallel/serial 三配置的真实 QUIC 传输；serial/serial 缺真实传输测试；
+   双端策略交集未验证。
+3. 第二十波节"同目标并发按内容裁决"（第 493 行）收窄为：顺序提交+part 隔离已测；
+   两任务同时原子提交竞争未测（终审：现有测试为顺序 finish，不证明提交竞争语义）。
+4. 第二十一波节"新 8 项"（第 501 行）记账更正为"新 9 项"（记账偏差，非测试数量变化）。
+5. 执行器现状澄清：当前 CLI daemon 的 --same-code/--cross-code 走 Fake executor
+   （FakePairingTransport/FakeTransferExecutor，crates/ak-cli/src/daemon.rs——调度策略模型
+   正确但未接真实传输链路）；FFI 经本地 scheduler 执行真实传输，但未完成双端 wire admission
+   （准入上下文与冻结契约脱节，终审 P1，修复中）。四模式矩阵的端到端真传输声明以此口径为准。
+6. FFI 契约对齐现状：B8 实际导出 14 个（ak_pairing_* 8＋ak_sched_* 6），冻结契约
+   docs/contracts/ffi-v2.md 为 18 个名称——缺 ak_pairing_stop_start、ak_sched_retry、
+   ak_sched_task_result、ak_sched_shutdown_start，且契约 ak_sched_listen_start 实际命名
+   为 ak_sched_start（命名差）；与上文平台验收节"符号门缺 ak_sched_listen_start"同源。
+
+## 第二十三次波：Codex 终审修复闭环（2026-11-05，5 并行代理＋集成者）
+# P1-1 恢复验证：digest sidecar（AKDGM1）钉死 transcript，恶意 registry 换钥拒绝（旧自证缺陷已 A/B 实证杀灭）
+# P1-2 staging：逐步 symlink 重检（TOCTOU 缩窗）+ .ak-staging 父目录检查 + 内部命名空间保留
+#   + 并发提交 AlreadyExists 后重读比对（Barrier 两线程恰一提交一复用×5 轮）
+# P1-3 FFI 取消：独立 abort watcher（旧 select 前置禁用缺陷已敏感性验证杀灭）；关停 driver join（不丢句柄）
+# P1-4 引擎准入：AdmissionCtx 私有化+构造校验+指纹复核+接收端不降级；wire TaskOpen/Admission 补
+#   pairing_id/direction/lease 字段（96→113B/34→38B，封闭集兼容规则文档化）
+# P1-5 服务端：TLS accept 30s 超时+256 并发上限+首帧/读/写 deadline+连接任务集中管理
+# P2×6：反枚举统一（ghost status 同形回复）、redeem 幂等（同 request_id 重放原 pairing）、
+#   帧读失步（reader/writer 拆分）、Debug 泄漏×3 脱敏+哨兵、CLI 秘密文件排他原子替换、
+#   FFI 补缺 5 ABI（全部真实现，18 契约符号全在双 ABI .so 验证）
+# 证据收窄：16 条更正（反枚举/四模式/并发裁决三处过强表述收窄，FFI 14/18 差异如实）
+# ak-net 预算镜像同步 113/38（集成者）
+
+$ cargo test --workspace → 918/0；signal+persistence 235；dart 107/107；flutter 108/108；
+$ clippy 干净；repo passed；符号门 5/5 通过

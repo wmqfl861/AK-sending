@@ -146,7 +146,19 @@
 - [x] B5 引擎拆分（第二十一波，`crates/ak-engine`）：`send_on_channel`/`receive_on_channel`（准入三步握手＋staging），既有 49+1 零回归，新 8 项测试。
 - [x] B7 CLI（第二十一波，`crates/ak-cli`）：`invite create/redeem/list/revoke`＋`registry-server`（TLS＋SQLite，默认端口 7200）＋`daemon --invite-code/--same-code/--cross-code`——12 项新测试。
 - [x] 第二十一波集成收口：ak-net type_budget/header_payload_check 测试适配新 wire 类型 13–15；invite.rs clippy 三处修复。收官：`cargo test --workspace` 851/0（773 → +78）；clippy 干净；repo check passed。
-- [ ] B8 FFI 接线（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 入口）：契约已冻结于 `docs/contracts/ffi-v2.md`；截至 `bfc74d7` 未实现，按计划属第二十一至二十二波。
+- [ ] B8 FFI 接线（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 入口）：契约已冻结于 `docs/contracts/ffi-v2.md`；截至 `bfc74d7` 未实现，按计划属第二十一至二十二波。（第二十二波已落地首版 14 导出＋Dart/Flutter 入口，与契约 18 名称的差额见下方"终审发现"P1-4。）
+
+### 终审发现（2026-11-05）
+
+Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex-review-2026-11-05](../reports/codex-review-2026-11-05.md)，归档提交 `4e1bfb9`）产出 5 项 P1；第二十三波修复代理进行中，落地证据由集成者复核后回填。修复落地前，以下事实不得在对外表述中省略：
+
+- [ ] P1-1 恶意 registry 恢复攻击面（新准入上下文未绑定认证材料）：wire `TaskOpen` 缺 `pairing_id`/方向/attempt/`admission_nonce`（`group` 32 字节与冻结契约 `code_id` 16 字节不一致）；`AdmissionCtx` 字段公开可构造、`AdmissionDecider` 仅见 `&[u8;32]` group、引擎解构时丢弃 `group_registry`；接收端对未宣告 `CAP_SCHEDULER` 的对端回退旧 Offer 流程（decider 完全不执行，非 fail-closed）；`send_on_channel` 未校验通道对端指纹==`spec.pinned`。恶意 registry/对端可借恢复或 capability 降级路径取得未授权任务准入（新链路内；恢复/重试路径同样无 pairing_id/attempt/nonce/lease 可核）。修复方向：受控 `AuthorizedTaskContext` 绑定真实通道身份、Ready relation、registry/code/pairing、方向、nonce 与有效 permit，接收 fail-closed。状态：修复中（第二十三波）。
+- [ ] P1-2 接收目录符号链接 TOCTOU 与 staging 清理越界：目录/part 校验与打开均按路径操作（无固定句柄/no-follow 防护），检查与打开之间存在替换竞态；`discard_staging` 仅检查叶子，父 `.ak-staging` 被替换为指向外部树的链接时清理会删除接收根之外的文件；现有测试仅覆盖操作开始前已存在的链接。修复方向：受限目录句柄（Unix `openat`/no-follow/beneath、Windows 目录句柄＋reparse point 拒绝＋身份检查）贯穿创建/打开/提交/递归清理。状态：修复中（第二十三波）。
+- [ ] P1-3 staging 命名空间未隔离：manifest 合法相对路径可进入 `.ak-staging/<task>/` 保留命名空间——远端任务以 `.ak-staging/<T>/x` 为最终路径时，任务成功提交、发送 `FinalAck(verified=true)` 后 `discard_staging` 会把刚提交成功的文件一并删除（无需本地符号链接权限）；其他任务的内部路径同样无隔离。修复方向：staging 移至用户文件树外私有根，或接收入口统一拒绝/映射保留顶层名字。状态：修复中（第二十三波）。
+- [ ] P1-4 生产双端调度未接线：CLI daemon `--same-code/--cross-code` 走 Fake executor（`FakePairingTransport`/`FakeTransferExecutor`——调度策略模型正确但未接真实传输链路）；FFI 经本地 scheduler 执行真实传输，但未完成双端 wire admission（与 P1-1 同源；修复完成前不得接入生产 executor）。附契约差额：FFI 实际 14 导出 vs 冻结契约 18 名称（缺 `ak_pairing_stop_start`/`ak_sched_retry`/`ak_sched_task_result`/`ak_sched_shutdown_start`，且契约 `ak_sched_listen_start` 实际命名 `ak_sched_start`）。状态：待 P1-1 修复完成后接线；FFI 契约对齐修复中。
+- [ ] P1-5 同目标同内容并发提交竞争：同内容复用仅发生在原子提交前的存在性检查，`AlreadyExists` 分支不复核已有内容（`Fail` 下同内容并发一败、`Rename` 下多生成相同副本）；现有测试为顺序 `finish`（验证了顺序冲突处理＋part 隔离，见验证记录"终审更正"第 3 条），不证明两任务同时原子提交的"一次提交、一次复用"。修复方向：`AlreadyExists` 分支按安全句柄重核已存在目标摘要，同内容返回复用；受控 barrier 并发测试断言目标数与结果。状态：修复中（第二十三波）。
+
+终审另有 P2 项与已知边界（on-channel 准入前提前扫描源、引擎检查点仍用 AKREC1 record id 实例隔离未入 AKREC2；FAT/exFAT 无 hard-link 时 rename 回退可覆盖他任务刚创建目标——既有已披露边界）与证据链一致性更正（见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"终审更正"节，共 6 条）。
 
 ## P0
 

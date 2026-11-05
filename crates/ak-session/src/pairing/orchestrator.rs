@@ -43,10 +43,18 @@
 //! learns the authoritative state, and the server's fixed re-sends (the
 //! `PairCommit`/`PairReady` that follow the status reply) let the local
 //! side finish idempotently. Codes re-supplied via `code_hints` restore
-//! full MAC verification; without the secret the recovery verifies the
-//! transcript digest and both Ed25519 signatures only (degraded,
-//! documented) — the MACs were verified before the crash and the commit
-//! is authoritative.
+//! full MAC verification. Without the secret, recovery trusts only a
+//! LOCAL pin: every transcript this device authenticated leaves a
+//! `<pairing hex>.akdgm` sidecar in the journal directory (written
+//! before the `pending` journal entry, so an entry always implies a
+//! pin), and the re-sent `PairCommit` must reproduce that pinned
+//! transcript byte-for-byte (BLAKE3 digest equality over the 256-byte
+//! canonical transcript) plus both Ed25519 signatures under the keys the
+//! pinned transcript names — a malicious registry that swaps device
+//! keys and re-signs cannot satisfy the pin. With neither a code hint
+//! nor a pinned digest the entry is refused outright: the server's
+//! self-reported `Committed`/`Ready` state is never the only evidence
+//! (review 2026-11-05, P1-1).
 //!
 //! ## Abort policy
 //!
@@ -56,7 +64,10 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -114,7 +125,11 @@ impl Default for OrchestratorConfig {
 }
 
 /// A freshly registered invite code, ready to display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written (review 2026-11-05, P2): `display` is the
+/// bearer credential and must never reach logs — only the masked
+/// `hint` and the non-secret metadata are printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreatedInvite {
     /// Canonical display form (`AKI1-XXXX-…`); the bearer credential.
     pub display: String,
@@ -128,6 +143,19 @@ pub struct CreatedInvite {
     pub revision: u64,
     /// The server-visible lookup digest of the code (never a credential).
     pub lookup_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for CreatedInvite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedInvite")
+            .field("display", &"<redacted: bearer secret>")
+            .field("hint", &self.hint)
+            .field("code_id", &hex(&self.code_id))
+            .field("expires_ms", &self.expires_ms)
+            .field("revision", &self.revision)
+            .field("lookup_digest", &"<32-byte public digest>")
+            .finish()
+    }
 }
 
 /// A pairing transaction whose server commit is verified but whose local
@@ -173,6 +201,10 @@ pub struct PairingOrchestrator {
     client: RegistryClient,
     key: DeviceKeyPair,
     journal: Arc<PairingJournal>,
+    /// The journal directory itself: alongside the `.akpair` entries it
+    /// holds the `<pairing hex>.akdgm` authenticated-transcript pins the
+    /// no-code recovery path relies on (see [`PairingOrchestrator::recover`]).
+    journal_dir: PathBuf,
     book_path: PathBuf,
     peer_store: PeerBookStore,
     config: OrchestratorConfig,
@@ -187,8 +219,10 @@ impl PairingOrchestrator {
         id_dir: &Path,
         config: OrchestratorConfig,
     ) -> std::io::Result<Self> {
+        let journal_dir = id_dir.join(JOURNAL_SUBDIR);
         Ok(PairingOrchestrator {
-            journal: Arc::new(PairingJournal::open(&id_dir.join(JOURNAL_SUBDIR))?),
+            journal: Arc::new(PairingJournal::open(&journal_dir)?),
+            journal_dir,
             book_path: id_dir.join(BOOK_NAME),
             client,
             key,
@@ -436,6 +470,14 @@ impl PairingOrchestrator {
             &transcript.owner_device_id,
         )?;
 
+        // Pin the authenticated transcript locally BEFORE the journal
+        // entry (P1-1): the no-code recovery path later compares the
+        // re-sent PairCommit against this digest instead of trusting the
+        // transcript's self-declared keys. Written first so a journal
+        // entry always implies a pin (an orphan pin without an entry is
+        // harmless).
+        self.remember_authenticated_transcript(&transcript)?;
+
         // Journal before exchanging proofs (the crash window that matters).
         let secret_ref = self.remember_code(&code);
         self.journal.record_pending(&PendingPairing {
@@ -621,6 +663,11 @@ impl PairingOrchestrator {
         let bytes = transcript.to_bytes();
         let digest = transcript.transcript_digest();
         let record = local_half_record(&transcript, &auth_key, &self.key, Role::Owner);
+        // The owner constructed this transcript itself (own nonce, MACed
+        // under the invite auth key); pin it before the first frame so a
+        // crash anywhere later in the flow still leaves the local
+        // binding recovery can verify against (P1-1).
+        self.remember_authenticated_transcript(&transcript)?;
         self.client
             .send_pair_challenge(bytes, wire_proof(record.owner_proof))
             .await
@@ -681,10 +728,14 @@ impl PairingOrchestrator {
     ///
     /// `code_hints` are invite codes the operator can still supply (the
     /// running app kept the typed string). A hint matching a record's
-    /// `lookup_digest` restores full MAC verification; without it the
-    /// recovery verifies the transcript digest and both device signatures
-    /// only — the MACs were verified before the crash and the server's
-    /// commit is authoritative. Returns the pairing ids brought to
+    /// `lookup_digest` restores full MAC verification. Without a hint the
+    /// recovery trusts only local evidence: the re-sent `PairCommit` must
+    /// reproduce the record's pinned authenticated-transcript digest (see
+    /// [`PairingOrchestrator::remember_authenticated_transcript`])
+    /// byte-for-byte. An entry with neither a code hint nor a pin is
+    /// refused with an explicit error — the server's self-reported
+    /// `Committed`/`Ready` state is never accepted as the only evidence
+    /// (review 2026-11-05, P1-1). Returns the pairing ids brought to
     /// `applied`.
     pub async fn recover(&self, code_hints: &[InviteCode]) -> Result<Vec<[u8; 16]>, PairFlowError> {
         let mut applied = Vec::new();
@@ -717,6 +768,15 @@ impl PairingOrchestrator {
             };
             match status.state {
                 PairingState::Ready => {
+                    // Even a Ready status needs local corroboration (a
+                    // code hint, or this device's own transcript pin);
+                    // otherwise the server's word alone would mark a
+                    // pairing applied (P1-1).
+                    if !hint_by_lookup.contains_key(&record.lookup_digest)
+                        && self.authenticated_digest(&pairing_id)?.is_none()
+                    {
+                        return Err(recover_unverifiable());
+                    }
                     if wait_ready(&mut plane, pairing_id, [0u8; 32], 10_000)
                         .await
                         .is_ok()
@@ -749,7 +809,19 @@ impl PairingOrchestrator {
                             let now = now_unix_ms().min(transcript.deadline_ms);
                             let _ = verify_commit_full(&commit, &code.auth_key(), now)?;
                         }
-                        None => verify_commit_degraded(&commit)?,
+                        None => {
+                            // No secret: the commit must reproduce the
+                            // locally pinned digest of the transcript this
+                            // device authenticated pre-crash. Without a pin
+                            // there is nothing local to check against —
+                            // refuse rather than fall back to trusting the
+                            // transcript's self-declared keys (P1-1).
+                            let pinned = self.authenticated_digest(&pairing_id)?;
+                            match pinned {
+                                Some(expected) => verify_commit_pinned(&commit, &expected)?,
+                                None => return Err(recover_unverifiable()),
+                            }
+                        }
                     }
                     self.commit_peer(&pairing_id, peer_of(&transcript, self.client.device_id()))?;
                     self.journal.mark_committed(&pairing_id)?;
@@ -795,6 +867,32 @@ impl PairingOrchestrator {
         let secret_ref = random_id16();
         secrets.slots.insert(secret_ref, code.clone());
         secret_ref
+    }
+
+    /// Persist the digest of a transcript this device has authenticated
+    /// (redeemer: owner proof MAC verified; owner: constructed locally)
+    /// as the `<pairing hex>.akdgm` sidecar in the journal directory —
+    /// the pin the no-code recovery path verifies the re-sent
+    /// `PairCommit` against (P1-1). Failing closed: if the pin cannot be
+    /// written, the flow errors instead of silently losing the pin.
+    fn remember_authenticated_transcript(
+        &self,
+        transcript: &PairTranscript,
+    ) -> Result<(), PairFlowError> {
+        write_digest_sidecar(
+            &self.journal_dir,
+            &transcript.pairing_id,
+            &transcript.transcript_digest(),
+        )?;
+        Ok(())
+    }
+
+    /// The pinned digest of the transcript this device authenticated for
+    /// `pairing_id`, if any. `Ok(None)` = no pin (never authenticated, or
+    /// a pre-pin journal). A present-but-corrupt pin is `Err` — fail
+    /// closed, never silently treat it as absent.
+    fn authenticated_digest(&self, pairing_id: &[u8; 16]) -> io::Result<Option<[u8; 32]>> {
+        read_digest_sidecar(&self.journal_dir, pairing_id)
     }
 
     /// Transactional trust-book write (idempotent per pairing id).
@@ -892,15 +990,18 @@ fn verify_commit_full(
     Ok(record.verify_transcript(&expectations)?)
 }
 
-/// Degraded recovery verification without the invite secret: transcript
-/// digest integrity plus both Ed25519 signatures under the keys the
-/// transcript itself names (the MACs were verified pre-crash; the server's
-/// commit is authoritative).
-fn verify_commit_degraded(commit: &CommitView) -> Result<(), PairFlowError> {
+/// Recovery verification without the invite secret (P1-1): the received
+/// `PairCommit` transcript must reproduce the locally pinned digest of a
+/// transcript this device authenticated pre-crash — BLAKE3 digest
+/// equality over the 256-byte canonical transcript is a byte-for-byte
+/// binding, so a registry that swaps device keys (and re-signs under
+/// its own keys, which the pre-fix degraded check happily accepted
+/// because the keys were self-attested) cannot pass. Both Ed25519
+/// signatures are still verified under the keys the now-pinned
+/// transcript names — defense in depth, no longer self-attestation.
+fn verify_commit_pinned(commit: &CommitView, pinned: &[u8; 32]) -> Result<(), PairFlowError> {
     let transcript = PairTranscript::from_bytes(&commit.transcript);
-    let mut digest_bytes = [0u8; 32];
-    digest_bytes.copy_from_slice(blake3::hash(&commit.transcript).as_bytes());
-    if transcript.transcript_digest() != digest_bytes {
+    if &transcript.transcript_digest() != pinned {
         return Err(PairFlowError::Verify(
             ak_identity::pairing_txn::PairingVerifyError::TranscriptDigestMismatch,
         ));
@@ -924,6 +1025,151 @@ fn verify_commit_degraded(commit: &CommitView) -> Result<(), PairFlowError> {
         }
     }
     Ok(())
+}
+
+/// The explicit failure for a journal entry that can no longer be
+/// verified locally: no invite code to re-run the MACs, and no pinned
+/// authenticated transcript. The server's self-reported state is not
+/// evidence (P1-1).
+fn recover_unverifiable() -> PairFlowError {
+    PairFlowError::Local("cannot verify without invite code or authenticated transcript".into())
+}
+
+// ---- authenticated-transcript pin sidecar (P1-1) ---------------------------
+//
+// Every transcript this device authenticated leaves a `<pairing
+// hex>.akdgm` sidecar in the journal directory, written before the
+// `pending` journal entry so an entry always implies a pin. The journal
+// store itself only reads `.akpair` files, so the sidecar never
+// interferes with `load_all`. Crash recovery without the invite secret
+// compares the re-sent `PairCommit` transcript against this pin instead
+// of trusting the transcript's self-declared keys.
+
+/// Version header of the authenticated-digest sidecar.
+const DIGEST_SIDECAR_HEADER: &str = "AKDGM1";
+/// Extension of the sidecar file (never `.akpair`, so the journal's
+/// strict loader ignores it).
+const DIGEST_SIDECAR_EXT: &str = "akdgm";
+/// Distinguishes concurrent sidecar temp files within one process.
+static SIDECAR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically persist the pin: an exclusively created (`create_new`)
+/// unique temp file in the journal directory, fsync, then rename (the
+/// same discipline as the `ak-store` journal writes). Exclusive
+/// creation means a file or symlink planted at the temp name is never
+/// written through; a crash at worst leaves the pin absent, which only
+/// makes recovery refuse — never trust — the entry.
+fn write_digest_sidecar(dir: &Path, pairing_id: &[u8; 16], digest: &[u8; 32]) -> io::Result<()> {
+    let stem = hex(pairing_id);
+    let seq = SIDECAR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        "{stem}.{}.{seq}.{DIGEST_SIDECAR_EXT}.tmp",
+        std::process::id()
+    ));
+    let final_path = dir.join(format!("{stem}.{DIGEST_SIDECAR_EXT}"));
+    let text = format!(
+        "{DIGEST_SIDECAR_HEADER}\npairing {}\ndigest {}\n",
+        hex(pairing_id),
+        hex_bytes(digest)
+    );
+    let write = || -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    };
+    let result = write().and_then(|()| rename_over(&tmp, &final_path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Rename `tmp` over `final_path`; on a std/toolchain where rename
+/// cannot replace an existing destination, remove it first (same
+/// accepted trade-off as the journal store's `rename_replace`: the
+/// remove-then-rename gap can at worst leave the pin absent, and an
+/// absent pin only makes recovery refuse the entry).
+fn rename_over(tmp: &Path, final_path: &Path) -> io::Result<()> {
+    if fs::rename(tmp, final_path).is_ok() {
+        return Ok(());
+    }
+    match fs::remove_file(final_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::rename(tmp, final_path)
+}
+
+/// Read a pairing's pin. `Ok(None)` = absent; a present-but-corrupt
+/// sidecar (bad header, bad hex, wrong pairing id, trailing junk) is
+/// `Err` — fail closed, never silently treat it as absent.
+fn read_digest_sidecar(dir: &Path, pairing_id: &[u8; 16]) -> io::Result<Option<[u8; 32]>> {
+    let path = dir.join(format!("{}.{}", hex(pairing_id), DIGEST_SIDECAR_EXT));
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let invalid = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("authenticated-transcript pin {what}"),
+        )
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(DIGEST_SIDECAR_HEADER) {
+        return Err(invalid("has a bad header"));
+    }
+    let pairing = lines
+        .next()
+        .and_then(|l| l.strip_prefix("pairing "))
+        .ok_or_else(|| invalid("is truncated"))?;
+    let digest = lines
+        .next()
+        .and_then(|l| l.strip_prefix("digest "))
+        .ok_or_else(|| invalid("is truncated"))?;
+    if lines.next().is_some() {
+        return Err(invalid("has trailing lines"));
+    }
+    let pairing = decode_hex_fixed::<16>(pairing).ok_or_else(|| invalid("has a bad pairing id"))?;
+    if &pairing != pairing_id {
+        return Err(invalid("names a different pairing"));
+    }
+    decode_hex_fixed::<32>(digest)
+        .ok_or_else(|| invalid("has a bad digest"))
+        .map(Some)
+}
+
+/// Lowercase hex of an arbitrary byte slice (the 16-byte [`hex`] is
+/// pairing-id specific).
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode exactly `N*2` lowercase-or-uppercase hex chars into fixed
+/// bytes (mirror of the journal store's codec, kept local).
+fn decode_hex_fixed<const N: usize>(text: &str) -> Option<[u8; N]> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        out[i] = (digit(pair[0])?) << 4 | (digit(pair[1])?);
+    }
+    Some(out)
 }
 
 /// Keyed-BLAKE3 MAC over `domain || transcript` — the exact construction
@@ -1112,5 +1358,357 @@ fn map_client(err: ClientError) -> PairFlowError {
     match err {
         ClientError::Pair { code, .. } => PairFlowError::from_pair_code(code),
         other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ak_identity::pairing_txn::PairingVerifyError;
+
+    // ---- P2: Debug redaction sentinel ------------------------------------
+
+    #[test]
+    fn created_invite_debug_never_leaks_the_bearer_code() {
+        let code = InviteCode::generate();
+        let invite = CreatedInvite {
+            display: code.to_display(),
+            hint: code.code_hint(),
+            code_id: [9; 16],
+            expires_ms: 0,
+            revision: 4,
+            lookup_digest: code.lookup_digest(),
+        };
+        let rendered = format!("{invite:?}");
+        assert!(
+            !rendered.contains(&invite.display),
+            "Debug must not leak the bearer code: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "marks the field: {rendered}");
+        assert!(
+            rendered.contains(&invite.hint),
+            "shows the mask: {rendered}"
+        );
+    }
+
+    // ---- P1-1: pinned commit verification ---------------------------------
+
+    fn commit_view_of(transcript: &PairTranscript, record: &PairingRecord) -> CommitView {
+        CommitView {
+            transcript: transcript.to_bytes(),
+            owner_proof: WireProof {
+                mac: record.owner_proof.mac,
+                signature: record.owner_proof.signature,
+            },
+            redeemer_proof: WireProof {
+                mac: record.redeemer_proof.mac,
+                signature: record.redeemer_proof.signature,
+            },
+            commit_revision: 1,
+        }
+    }
+
+    #[test]
+    fn verify_commit_pinned_accepts_authentic_and_rejects_swapped_keys() {
+        let owner = DeviceKeyPair::generate();
+        let redeemer = DeviceKeyPair::generate();
+        let code = InviteCode::generate();
+        let transcript = PairTranscript {
+            registry_id: [0x11; 32],
+            code_id: [0x22; 16],
+            code_revision: 1,
+            pairing_id: [0x33; 16],
+            request_id: [0x44; 16],
+            lookup_digest: code.lookup_digest(),
+            owner_device_id: owner.public_key(),
+            redeemer_device_id: redeemer.public_key(),
+            owner_nonce: [0x55; 32],
+            redeemer_nonce: [0x66; 32],
+            deadline_ms: 4_102_444_800_000, // 2100-01-01T00:00:00Z
+        };
+        let record = PairingRecord::build(transcript, &code.auth_key(), &owner, &redeemer);
+        let pin = transcript.transcript_digest();
+
+        // The authentic commit passes against its pin.
+        let authentic = commit_view_of(&transcript, &record);
+        assert!(verify_commit_pinned(&authentic, &pin).is_ok());
+
+        // Malicious registry (P1-1): swap the owner device key to its own
+        // and re-sign both proofs under the swapped keys. The MACs cannot
+        // be forged without the code secret — and do not need to be, since
+        // this path never checks them; the swapped signatures DO verify
+        // under the keys the tampered transcript names, which is exactly
+        // the self-attestation hole the pin closes.
+        let attacker = DeviceKeyPair::generate();
+        let mut swapped = transcript;
+        swapped.owner_device_id = attacker.public_key();
+        let bytes = swapped.to_bytes();
+        let mac = [0u8; 32];
+        let owner_signed = attacker.sign(&hello2::proof_signed_message(
+            OWNER_PROOF_DOMAIN,
+            &bytes,
+            &mac,
+        ));
+        let redeemer_signed = attacker.sign(&hello2::proof_signed_message(
+            REDEEMER_PROOF_DOMAIN,
+            &bytes,
+            &mac,
+        ));
+        assert!(
+            DeviceKeyPair::verify(
+                &swapped.owner_device_id,
+                &hello2::proof_signed_message(OWNER_PROOF_DOMAIN, &bytes, &mac),
+                &owner_signed
+            ),
+            "sanity: the forged signature self-attests — the old check passed this"
+        );
+        let forged = CommitView {
+            transcript: bytes,
+            owner_proof: WireProof {
+                mac,
+                signature: owner_signed,
+            },
+            redeemer_proof: WireProof {
+                mac,
+                signature: redeemer_signed,
+            },
+            commit_revision: 1,
+        };
+        let err = verify_commit_pinned(&forged, &pin).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PairFlowError::Verify(PairingVerifyError::TranscriptDigestMismatch)
+            ),
+            "swapped-key commit refused: {err:?}"
+        );
+
+        // The authentic commit against the WRONG pin is refused too: the
+        // pin is the authority, not the commit's own structure.
+        assert!(verify_commit_pinned(&authentic, &[0xEE; 32]).is_err());
+    }
+
+    // ---- P1-1: pin sidecar persistence ------------------------------------
+
+    #[test]
+    fn digest_sidecar_roundtrip_is_strict_and_journal_ignores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PairingJournal::open(dir.path()).unwrap();
+        let pairing_id = [0x71; 16];
+        let digest = [0xD3; 32];
+
+        assert_eq!(read_digest_sidecar(dir.path(), &pairing_id).unwrap(), None);
+        write_digest_sidecar(dir.path(), &pairing_id, &digest).unwrap();
+        assert_eq!(
+            read_digest_sidecar(dir.path(), &pairing_id).unwrap(),
+            Some(digest)
+        );
+        // Atomic replace: same value, still exactly one sidecar file.
+        write_digest_sidecar(dir.path(), &pairing_id, &digest).unwrap();
+        assert_eq!(
+            read_digest_sidecar(dir.path(), &pairing_id).unwrap(),
+            Some(digest)
+        );
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "no temp residue: {names:?}");
+        assert!(names[0].ends_with(".akdgm"));
+
+        // The strict journal store coexists with the sidecar.
+        assert!(journal.load_all().unwrap().is_empty());
+        // A different pairing has its own slot.
+        assert_eq!(read_digest_sidecar(dir.path(), &[0x72; 16]).unwrap(), None);
+
+        // Corrupt or foreign variants fail closed, never read as absent.
+        let stem = hex(&pairing_id);
+        let other = hex(&[0x72; 16]);
+        let digest_hex = hex_bytes(&digest);
+        let path = dir.path().join(format!("{stem}.{DIGEST_SIDECAR_EXT}"));
+        let bad_variants = [
+            String::from(""),
+            format!("{DIGEST_SIDECAR_HEADER}\n"),
+            format!("{DIGEST_SIDECAR_HEADER}\npairing zzzz\ndigest {digest_hex}\n"),
+            format!("{DIGEST_SIDECAR_HEADER}\npairing {other}\ndigest {digest_hex}\n"),
+            format!("{DIGEST_SIDECAR_HEADER}\npairing {stem}\ndigest zzzz\n"),
+            format!("{DIGEST_SIDECAR_HEADER}\npairing {stem}\ndigest {digest_hex}\nextra\n"),
+            format!("AKDGM2\npairing {stem}\ndigest {digest_hex}\n"),
+        ];
+        for text in bad_variants {
+            fs::write(&path, text.as_bytes()).unwrap();
+            assert!(
+                read_digest_sidecar(dir.path(), &pairing_id).is_err(),
+                "must fail closed for {text:?}"
+            );
+        }
+    }
+
+    // ---- P1-1: recovery over the real registry -----------------------------
+
+    mod registry {
+        use super::super::*;
+        use ak_signal::server_v2::engine::serve_v2;
+        use ak_signal::server_v2::store::RegistryStore;
+        use ak_signal::server_v2::Limits;
+        use tokio::net::TcpListener;
+        use tokio::sync::watch;
+
+        pub(super) struct TestRegistry {
+            pub addr: std::net::SocketAddr,
+            pub registry_id: [u8; 32],
+            shutdown: watch::Sender<bool>,
+        }
+
+        impl Drop for TestRegistry {
+            fn drop(&mut self) {
+                let _ = self.shutdown.send(true);
+            }
+        }
+
+        pub(super) async fn spawn() -> TestRegistry {
+            let registry_key = DeviceKeyPair::generate();
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind v2 port");
+            let addr = listener.local_addr().expect("local addr");
+            let store = RegistryStore::open_in_memory().expect("open registry store");
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let key = registry_key.clone();
+            tokio::spawn(async move {
+                let _ = serve_v2(listener, &key, store, Limits::default(), shutdown_rx).await;
+            });
+            TestRegistry {
+                addr,
+                registry_id: registry_key.public_key(),
+                shutdown,
+            }
+        }
+    }
+
+    fn test_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            redeem_window_ms: 30_000,
+            ready_wait_ms: 30_000,
+            claim_conflict_retries: 8,
+        }
+    }
+
+    async fn connected_orchestrator(
+        registry: &registry::TestRegistry,
+        name: &str,
+        key: &DeviceKeyPair,
+        dir: &Path,
+    ) -> PairingOrchestrator {
+        let client = RegistryClient::connect(registry.addr, registry.registry_id, key, name)
+            .await
+            .expect("connect to the registry");
+        PairingOrchestrator::open(client, key.clone(), dir, test_config()).expect("open")
+    }
+
+    /// Alice invites, her owner loop runs, Bob redeems up to the verified
+    /// commit, then "crashes" (connection closed, orchestrator dropped)
+    /// before any local apply — the checkpoint recovery resumes from.
+    async fn redeem_to_commit_then_crash(
+        registry: &registry::TestRegistry,
+        b_dir: &Path,
+        b_key: &DeviceKeyPair,
+    ) -> CommittedPairing {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_key = DeviceKeyPair::generate();
+        let a = connected_orchestrator(registry, "alice", &a_key, a_dir.path()).await;
+        let invite = a.create_invite(0).await.expect("claim invite");
+        a.spawn_owner_loop();
+
+        let b = connected_orchestrator(registry, "bob", b_key, b_dir).await;
+        let committed = b
+            .redeem_to_commit(&invite.display)
+            .await
+            .expect("redeem to commit");
+        b.client().close().await;
+        drop(b);
+        committed
+    }
+
+    #[tokio::test]
+    async fn crashed_redeemer_recovers_without_code_via_the_pinned_transcript() {
+        let registry = registry::spawn().await;
+        let b_key = DeviceKeyPair::generate();
+        let b_dir = tempfile::tempdir().unwrap();
+        let journal_dir = b_dir.path().join(JOURNAL_SUBDIR);
+        let committed = redeem_to_commit_then_crash(&registry, b_dir.path(), &b_key).await;
+
+        // The pin landed before the crash window and matches the commit's
+        // transcript exactly.
+        let pin =
+            read_digest_sidecar(&journal_dir, &committed.pairing_id).expect("pin sidecar readable");
+        assert_eq!(
+            pin.as_ref(),
+            Some(&committed.verified.record().transcript.transcript_digest())
+        );
+
+        // Restart WITHOUT the invite code: recovery must succeed purely on
+        // the local pin.
+        let b2 = connected_orchestrator(&registry, "bob", &b_key, b_dir.path()).await;
+        let applied = b2
+            .recover(&[])
+            .await
+            .expect("recovery via the pinned digest");
+        assert_eq!(applied, vec![committed.pairing_id]);
+
+        let records = PairingJournal::open(&journal_dir)
+            .unwrap()
+            .load_all()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].phase, PairingPhase::Applied);
+        assert!(b_dir.path().join(BOOK_NAME).is_file(), "trust book written");
+
+        // Idempotent: nothing left to recover.
+        let again = b2.recover(&[]).await.expect("second recovery");
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_without_code_or_pin_is_refused_not_degraded() {
+        let registry = registry::spawn().await;
+        let b_key = DeviceKeyPair::generate();
+        let b_dir = tempfile::tempdir().unwrap();
+        let journal_dir = b_dir.path().join(JOURNAL_SUBDIR);
+        let committed = redeem_to_commit_then_crash(&registry, b_dir.path(), &b_key).await;
+
+        // Simulate a pre-pin journal (P1-1): the entry exists, but this
+        // device never persisted an authenticated-transcript digest and
+        // the operator supplies no code. The server's re-sent commit —
+        // honest here, hostile in the attack — must NOT be trusted.
+        let pin_path = journal_dir.join(format!(
+            "{}.{}",
+            hex(&committed.pairing_id),
+            DIGEST_SIDECAR_EXT
+        ));
+        fs::remove_file(&pin_path).expect("strip the pin");
+
+        let b2 = connected_orchestrator(&registry, "bob", &b_key, b_dir.path()).await;
+        let err = b2
+            .recover(&[])
+            .await
+            .expect_err("no code and no pin must be refused");
+        match &err {
+            PairFlowError::Local(msg) => assert_eq!(
+                msg,
+                "cannot verify without invite code or authenticated transcript"
+            ),
+            other => panic!("expected the explicit refusal, got {other:?}"),
+        }
+
+        // Nothing was committed locally: the entry stays pending and the
+        // trust book was never written.
+        let records = PairingJournal::open(&journal_dir)
+            .unwrap()
+            .load_all()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].phase, PairingPhase::Pending);
+        assert!(!b_dir.path().join(BOOK_NAME).exists());
     }
 }

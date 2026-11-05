@@ -28,6 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -35,17 +36,20 @@ use ak_identity::pairing_txn::{
     random_id16, random_nonce32, PairTranscript, OWNER_PROOF_DOMAIN, REDEEMER_PROOF_DOMAIN,
 };
 use ak_identity::DeviceKeyPair;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::protocol_v2::{
     CodeId, CtrlFrame, CtrlMessage, DeviceId, Digest32, ErrorScope, PairProof, PairingId,
-    PairingState, RegistryId, RequestId, Role, SessionId, Signature64, StateFilter, CODE_CONFLICT,
-    CURSOR_END, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED, REQUEST_CONFLICT,
-    RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
+    PairingState, RedeemRequest, RegistryId, RequestId, Role, SessionId, Signature64, StateFilter,
+    CODE_CONFLICT, CURSOR_END, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED,
+    REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
 };
-use crate::server_v2::config::{Config, Limits, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SWEEP_INTERVAL};
+use crate::server_v2::config::{
+    Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SWEEP_INTERVAL,
+};
 use crate::server_v2::framing::{read_frame, write_message};
 use crate::server_v2::ratelimit::{SlidingWindow, TokenBucket};
 use crate::server_v2::store::{
@@ -65,6 +69,32 @@ pub const ERR_BAD_REQUEST: u16 = 4;
 pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 
 type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
+
+// ---- resource bounds (P1-5) ---------------------------------------------------
+//
+// Every number here is a hard bound on one dimension of connection
+// sprawl: a peer that opens sockets and never speaks, one that handshakes
+// and never says Hello, one that floods frames, and one that stalls a
+// read or write mid-frame each lose their task within the matching
+// budget instead of pinning memory and a Tokio task forever.
+
+/// Budget for one TLS handshake after the TCP accept.
+const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum simultaneously served TLS connections (accepted-and-counted,
+/// including handshakes in progress); beyond it the handshake completes
+/// and the peer receives one `ServerError` before the disconnect.
+const MAX_LIVE_CONNECTIONS: usize = 256;
+/// Deadline for the client's first frame — the `Hello` answering the
+/// `AuthChallenge` this server sends immediately after the handshake.
+const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(15);
+/// Per-frame read and write budget once the first frame arrived.
+const FRAME_IO_DEADLINE: Duration = Duration::from_secs(30);
+/// Grace period for the reader/writer tasks of a connection to wind down
+/// on their own before the handler aborts them.
+const TEARDOWN_GRACE: Duration = Duration::from_millis(250);
+/// How long a redeemed-attempt idempotency record stays replayable after
+/// its own deadline (retries racing the deadline must still dedup).
+const REDEEM_REPLAY_GRACE: Duration = Duration::from_secs(60);
 
 /// Bind `config.listen`, open the authoritative store at `config.db_path`,
 /// and serve until `shutdown` fires.
@@ -100,6 +130,7 @@ pub async fn serve_v2(
         store,
         limits,
         inner: Mutex::new(Inner::default()),
+        conn_count: AtomicUsize::new(0),
     });
     log::info!(
         "v2 registry server listening on tls {} (registry {})",
@@ -109,24 +140,98 @@ pub async fn serve_v2(
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     loop {
         tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
+            _ = shutdown.changed() => {
+                // P1-5: no connection task may outlive the server. First
+                // signal every live connection's close watch (reader,
+                // writer and handler all subscribe — a Notify would wake
+                // only one of them), then abort whatever is left and join
+                // bounded before returning.
+                let tasks: Vec<JoinHandle<()>> = {
+                    let mut inner = shared.lock();
+                    for entry in inner.conns.values() {
+                        let _ = entry.close.send(true);
+                    }
+                    inner.conn_tasks.drain().map(|(_, task)| task).collect()
+                };
+                for mut task in tasks {
+                    task.abort();
+                    let _ = tokio::time::timeout(TEARDOWN_GRACE, &mut task).await;
+                }
+                return Ok(());
+            }
             _ = tick.tick() => sweep(&shared),
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
-                    let shared = shared.clone();
-                    tokio::spawn(async move {
-                        match shared.acceptor.accept(tcp).await {
-                            Ok(stream) => {
-                                if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
-                                    log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
-                                    return;
-                                }
-                                connection_loop(stream, peer, shared).await;
+                    // Reserve a live-connection slot at accept time: the
+                    // cap must also bound half-open handshakes.
+                    let admitted = shared
+                        .conn_count
+                        .fetch_add(1, Ordering::SeqCst)
+                        < MAX_LIVE_CONNECTIONS;
+                    if !admitted {
+                        shared.conn_count.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    let task_id = admitted.then(|| {
+                        let mut inner = shared.lock();
+                        inner.next_conn_task_id = inner.next_conn_task_id.wrapping_add(1);
+                        inner.next_conn_task_id
+                    });
+                    let conn_shared = shared.clone();
+                    let task = tokio::spawn(async move {
+                        // P1-5: the TLS handshake itself is bounded.
+                        let mut stream = match tokio::time::timeout(
+                            TLS_ACCEPT_TIMEOUT,
+                            conn_shared.acceptor.accept(tcp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(e)) => {
+                                log::debug!("v2 tls handshake with {peer} failed: {e}");
+                                return;
                             }
-                            Err(e) => log::debug!("v2 tls handshake with {peer} failed: {e}"),
+                            Err(_) => {
+                                log::debug!(
+                                    "v2 tls handshake with {peer} exceeded {:?}",
+                                    TLS_ACCEPT_TIMEOUT
+                                );
+                                return;
+                            }
+                        };
+                        if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
+                            log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
+                            return;
+                        }
+                        match task_id {
+                            Some(id) => {
+                                connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
+                                conn_shared.conn_count.fetch_sub(1, Ordering::SeqCst);
+                                let mut inner = conn_shared.lock();
+                                inner.conn_tasks.remove(&id);
+                            }
+                            None => {
+                                // Over the global cap: one bounded
+                                // ServerError, then the connection dies.
+                                log::warn!(
+                                    "v2 connection limit ({MAX_LIVE_CONNECTIONS}) reached; rejecting {peer}"
+                                );
+                                let reply =
+                                    server_error(ERR_SESSION_LIMIT, "connection limit reached");
+                                let sent = tokio::time::timeout(
+                                    FRAME_IO_DEADLINE,
+                                    write_message(&mut stream, &reply, Role::Server),
+                                )
+                                .await;
+                                if matches!(sent, Ok(Ok(()))) {
+                                    let _ = stream.shutdown().await;
+                                }
+                            }
                         }
                     });
+                    if let Some(id) = task_id {
+                        shared.lock().conn_tasks.insert(id, task);
+                    }
                 }
                 Err(e) => {
                     log::warn!("v2 accept failed: {e}");
@@ -142,9 +247,27 @@ pub async fn serve_v2(
 struct ConnEntry {
     conn_id: u64,
     out: mpsc::Sender<CtrlMessage>,
-    close: Arc<Notify>,
+    /// Close signal of this connection (true = torn down). Shared handle:
+    /// the handler owns one, the registry keeps this one so a replacement
+    /// Hello (or the server shutdown) can tear the connection down. A
+    /// watch, not a Notify — reader, writer and handler all wait on it
+    /// and `send(true)` wakes every one of them.
+    close: Arc<watch::Sender<bool>>,
     candidates: Vec<SocketAddr>,
     peer_ip: IpAddr,
+}
+
+/// Resolve once the close watch fires (true) or its sender is gone
+/// (aborted handler): either way this connection is over.
+async fn closed(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -170,9 +293,47 @@ struct Inner {
     sessions: HashMap<SessionId, SessionEntry>,
     session_by_triple: HashMap<(PairingId, CodeId, [u8; 16]), SessionId>,
     ghosts: HashMap<PairingId, Ghost>,
+    /// Redeem idempotency records keyed by the authenticated
+    /// (redeemer, request_id) — the in-memory twin of the store's
+    /// `request_journal` for claim/revoke (same shape, bounded by
+    /// [`JOURNAL_MAX_ROWS`], pruned past deadline + grace).
+    redeem_journal: HashMap<(DeviceId, RequestId), RedeemReplay>,
     next_conn_id: u64,
+    /// Registry of live connection tasks so shutdown can abort them all
+    /// (P1-5); the strict live-connection cap is `Shared::conn_count`,
+    /// this map is the abort list. A task that exits in the tiny window
+    /// before its handle is registered leaves a finished handle behind —
+    /// harmless (abort on a finished task is a no-op) and swept at
+    /// shutdown.
+    conn_tasks: HashMap<u64, JoinHandle<()>>,
+    next_conn_task_id: u64,
     hello_replay: HelloReplayCache,
     global_redeem: Option<SlidingWindow>,
+}
+
+/// One journaled redeem attempt for idempotent retries: the response is a
+/// pure function of these fields, so a retry replays byte-identical
+/// `InviteRedeemPending` frames with the ORIGINAL pairing id.
+#[derive(Clone, Copy)]
+struct RedeemReplay {
+    lookup_digest: Digest32,
+    redeemer_nonce: [u8; 32],
+    request_mac: [u8; 32],
+    deadline_ms: u64,
+    pairing_id: PairingId,
+    expires_at: Instant,
+}
+
+impl RedeemReplay {
+    /// Same redeem attempt (everything the signature binds)? A different
+    /// attempt reusing the request id is a `REQUEST_CONFLICT`, exactly as
+    /// the claim journal treats it.
+    fn matches(&self, redeem: &RedeemRequest) -> bool {
+        self.lookup_digest == redeem.lookup_digest
+            && self.redeemer_nonce == redeem.redeemer_nonce
+            && self.request_mac == redeem.request_mac
+            && self.deadline_ms == redeem.deadline_ms
+    }
 }
 
 struct Shared {
@@ -181,6 +342,10 @@ struct Shared {
     store: RegistryStore,
     limits: Limits,
     inner: Mutex<Inner>,
+    /// Live (accepted, not yet finished) connections — the admission
+    /// counter for [`MAX_LIVE_CONNECTIONS`], reserved atomically at
+    /// accept time and released when the connection task exits.
+    conn_count: AtomicUsize,
 }
 
 impl Shared {
@@ -271,7 +436,7 @@ enum Flow {
 struct ConnState {
     device: Option<DeviceId>,
     conn_id: u64,
-    close: Arc<Notify>,
+    close: Arc<watch::Sender<bool>>,
     peer_ip: IpAddr,
     challenge: Option<[u8; 32]>,
     challenge_expires_ms: u64,
@@ -279,7 +444,7 @@ struct ConnState {
     redeem_window: SlidingWindow,
 }
 
-async fn connection_loop(mut stream: TlsServerStream, peer: SocketAddr, shared: Arc<Shared>) {
+async fn connection_loop(stream: TlsServerStream, peer: SocketAddr, shared: Arc<Shared>) {
     // The exporter is bound to this TLS connection only (rustls 0.23
     // exposes export_keying_material; plan A.5 as specified, no
     // certificate-only fallback).
@@ -290,28 +455,30 @@ async fn connection_loop(mut stream: TlsServerStream, peer: SocketAddr, shared: 
             return;
         }
     };
-    let (out_tx, mut out_rx) = mpsc::channel::<CtrlMessage>(OUTBOX_DEPTH);
+    let (out_tx, out_rx) = mpsc::channel::<CtrlMessage>(OUTBOX_DEPTH);
     let nonce = random_nonce32();
     let expires_ms = now_ms() + shared.limits.hello_max_age.as_millis() as u64;
-    // AuthChallenge first: one nonce, this connection, at most 10 s.
-    if write_message(
-        &mut stream,
-        &CtrlMessage::AuthChallenge {
-            registry_id: shared.registry_id,
-            nonce,
-            expires_ms,
-        },
-        Role::Server,
+    let mut stream = stream;
+    // AuthChallenge first: one nonce, this connection, at most 10 s —
+    // and the write itself under the shared frame budget.
+    let challenge = CtrlMessage::AuthChallenge {
+        registry_id: shared.registry_id,
+        nonce,
+        expires_ms,
+    };
+    let sent = tokio::time::timeout(
+        FRAME_IO_DEADLINE,
+        write_message(&mut stream, &challenge, Role::Server),
     )
-    .await
-    .is_err()
-    {
+    .await;
+    if !matches!(sent, Ok(Ok(()))) {
         return;
     }
+    let (close_tx, close_rx) = watch::channel(false);
     let mut state = ConnState {
         device: None,
         conn_id: 0,
-        close: Arc::new(Notify::new()),
+        close: Arc::new(close_tx),
         peer_ip: peer.ip(),
         challenge: Some(nonce),
         challenge_expires_ms: expires_ms,
@@ -321,23 +488,48 @@ async fn connection_loop(mut stream: TlsServerStream, peer: SocketAddr, shared: 
             Duration::from_secs(60),
         ),
     };
+    // P2 (帧读失步): reading and writing are separate tasks now. The old
+    // loop selected `read_frame` against the outbox; whenever an outbound
+    // message won, the partially-read frame future was DROPPED and the
+    // next read began mid-frame — a protocol desync. Now one reader owns
+    // the read half, one writer owns the write half (the client_v2
+    // pattern), and the handler only ever touches channels. All three
+    // tasks share the close watch: `send(true)` — or the handler's
+    // disappearance — ends all of them; a writer that cannot drain tells
+    // the handler through `writer_dead`.
+    let (read_half, write_half) = tokio::io::split(stream);
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOX_DEPTH);
+    let (writer_dead_tx, mut writer_dead_rx) = mpsc::channel::<()>(1);
+    let mut reader = tokio::spawn(reader_loop(
+        read_half,
+        inbound_tx,
+        close_rx.clone(),
+        FIRST_FRAME_DEADLINE,
+        FRAME_IO_DEADLINE,
+    ));
+    let mut writer = tokio::spawn(writer_loop(
+        write_half,
+        out_rx,
+        close_rx.clone(),
+        writer_dead_tx,
+        FRAME_IO_DEADLINE,
+    ));
+    let mut close_watch = close_rx;
     let mut bucket = TokenBucket::new(shared.limits.frame_rate_per_sec, shared.limits.frame_burst);
     log::debug!("v2 control connection from {peer}");
     loop {
         let bytes = tokio::select! {
-            _ = state.close.notified() => break,
-            message = out_rx.recv() => match message {
-                Some(message) => {
-                    if write_message(&mut stream, &message, Role::Server).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
+            _ = closed(&mut close_watch) => break,
+            // The writer cannot drain (stalled or failed write): the
+            // connection is dead even though the socket may not know it.
+            dead = writer_dead_rx.recv() => match dead {
+                Some(()) => break,
                 None => break,
             },
-            received = read_frame(&mut stream) => match received {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) | Err(_) => break,
+            received = inbound_rx.recv() => match received {
+                Some(bytes) => bytes,
+                // The reader died (deadline, EOF or I/O error).
+                None => break,
             },
         };
         if !bucket.allow() {
@@ -362,9 +554,100 @@ async fn connection_loop(mut stream: TlsServerStream, peer: SocketAddr, shared: 
             Flow::Disconnect => break,
         }
     }
+    // Teardown: wake the reader/writer, unregister, then join both
+    // bounded (abort is the fallback) so neither task outlives the
+    // handler. Dropping `state` afterwards also closes the watch for
+    // anyone still holding a receiver.
+    let _ = state.close.send(true);
     cleanup_connection(&shared, &mut state);
     drop(out_tx);
-    let _ = stream.shutdown().await;
+    join_or_abort(&mut reader).await;
+    join_or_abort(&mut writer).await;
+}
+
+/// Wait for a task to finish within [`TEARDOWN_GRACE`]; abort it if the
+/// grace expires (the task is parked on I/O that will never progress
+/// once its sockets start closing).
+async fn join_or_abort(task: &mut JoinHandle<()>) {
+    if tokio::time::timeout(TEARDOWN_GRACE, &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = (&mut *task).await;
+    }
+}
+
+/// The single reader of one connection: continuously reads frames into
+/// the bounded inbound channel. The first frame (the `Hello` answering
+/// the AuthChallenge) runs under `first_budget`; every later frame under
+/// `steady_budget` ([`FIRST_FRAME_DEADLINE`] / [`FRAME_IO_DEADLINE`] in
+/// production). `read_frame` checks the declared header length against
+/// the 4092-byte payload cap BEFORE any payload allocation, so an
+/// oversized declaration dies here without waiting for the bytes. Any
+/// deadline, EOF or I/O error ends the reader, which closes the channel
+/// and thereby ends the handler.
+async fn reader_loop<R: AsyncRead + Unpin>(
+    mut read: R,
+    inbound: mpsc::Sender<Vec<u8>>,
+    mut close: watch::Receiver<bool>,
+    first_budget: Duration,
+    steady_budget: Duration,
+) {
+    let mut first = true;
+    loop {
+        let budget = if first { first_budget } else { steady_budget };
+        let received = tokio::select! {
+            _ = closed(&mut close) => return,
+            received = tokio::time::timeout(budget, read_frame(&mut read)) => received,
+        };
+        let bytes = match received {
+            Ok(Ok(Some(bytes))) => bytes,
+            // Deadline, clean EOF or I/O error: stop reading.
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
+        };
+        first = false;
+        // Bounded hand-off: a handler this far behind is a flooding
+        // peer, not a slow one — drop the connection.
+        if inbound.try_send(bytes).is_err() {
+            return;
+        }
+    }
+}
+
+/// The single writer of one connection: serializes every outbound frame
+/// through one task (concurrent handlers can never interleave bytes
+/// inside one frame) under the per-frame write budget. A stalled or
+/// failed write tears the whole connection down via `close`.
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut out: mpsc::Receiver<CtrlMessage>,
+    mut close: watch::Receiver<bool>,
+    dead: mpsc::Sender<()>,
+    write_budget: Duration,
+) {
+    loop {
+        let message = tokio::select! {
+            _ = closed(&mut close) => break,
+            message = out.recv() => match message {
+                Some(message) => message,
+                None => break,
+            },
+        };
+        let sent = tokio::time::timeout(
+            write_budget,
+            write_message(&mut write, &message, Role::Server),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            log::debug!("v2 outbound write stalled or failed; closing connection");
+            // Tell the handler this connection is dead (best-effort: it
+            // may already be tearing down).
+            let _ = dead.try_send(());
+            return;
+        }
+    }
+    let _ = write.shutdown().await;
 }
 
 fn cleanup_connection(shared: &Shared, state: &mut ConnState) {
@@ -608,7 +891,7 @@ fn process_hello(
             inner.next_conn_id = inner.next_conn_id.wrapping_add(1);
             let conn_id = inner.next_conn_id;
             if let Some(previous) = inner.conns.get(&device_id) {
-                previous.close.notify_one();
+                let _ = previous.close.send(true);
             }
             inner.conns.insert(
                 device_id,
@@ -1075,6 +1358,45 @@ fn handle_redeem(
         );
         return Flow::Disconnect;
     }
+    // P2 (redeem 幂等): a retry with the same (redeemer, request_id)
+    // replays the ORIGINAL response — minting a fresh pairing id per
+    // retry forked the transaction (a second pending row for a real
+    // code, a second ghost otherwise, and a second offer pushed to the
+    // owner). Same journal discipline as the invite claim path; a
+    // different attempt reusing the id is a REQUEST_CONFLICT.
+    {
+        let inner = shared.lock();
+        let replay = inner.redeem_journal.get(&(me, redeem.request_id)).copied();
+        match replay {
+            Some(flags) if flags.matches(&redeem) => {
+                drop(inner);
+                deliver(
+                    out,
+                    CtrlMessage::InviteRedeemPending {
+                        request_id: redeem.request_id,
+                        pairing_id: flags.pairing_id,
+                        deadline_ms: flags.deadline_ms,
+                    },
+                );
+                return Flow::Continue;
+            }
+            Some(_) => {
+                drop(inner);
+                deliver(
+                    out,
+                    pair_error(
+                        redeem.request_id,
+                        ErrorScope::Request,
+                        redeem.request_id,
+                        REQUEST_CONFLICT,
+                        0,
+                    ),
+                );
+                return Flow::Continue;
+            }
+            None => {}
+        }
+    }
     let code = match shared.store.find_active_code(&redeem.lookup_digest, now) {
         Ok(code) => code,
         Err(e) => {
@@ -1101,6 +1423,15 @@ fn handle_redeem(
                 .begin_pairing(&pairing_id, &me, &redeem, &code, now)
             {
                 Ok(BeginRedeem::Begun) => {
+                    let expires_at =
+                        now_instant + Duration::from_millis(redeem.deadline_ms.saturating_sub(now));
+                    record_redeem_replay(
+                        &mut shared.lock(),
+                        &me,
+                        &redeem,
+                        pairing_id,
+                        expires_at + REDEEM_REPLAY_GRACE,
+                    );
                     deliver(
                         out,
                         CtrlMessage::InviteRedeemPending {
@@ -1153,17 +1484,27 @@ fn handle_redeem(
         // Unknown, expired, revoked, or self-redeem: same pending shape,
         // unified failure at the deadline (no existence oracle).
         _ => {
-            let mut inner = shared.lock();
-            inner.ghosts.insert(
-                pairing_id,
-                Ghost {
-                    requester: me,
-                    request_id: redeem.request_id,
-                    deadline_ms: redeem.deadline_ms,
-                    expires_at: now_instant
-                        + Duration::from_millis(redeem.deadline_ms.saturating_sub(now)),
-                },
-            );
+            let expires_at =
+                now_instant + Duration::from_millis(redeem.deadline_ms.saturating_sub(now));
+            {
+                let mut inner = shared.lock();
+                inner.ghosts.insert(
+                    pairing_id,
+                    Ghost {
+                        requester: me,
+                        request_id: redeem.request_id,
+                        deadline_ms: redeem.deadline_ms,
+                        expires_at,
+                    },
+                );
+                record_redeem_replay(
+                    &mut inner,
+                    &me,
+                    &redeem,
+                    pairing_id,
+                    expires_at + REDEEM_REPLAY_GRACE,
+                );
+            }
             deliver(
                 out,
                 CtrlMessage::InviteRedeemPending {
@@ -1175,6 +1516,40 @@ fn handle_redeem(
         }
     }
     Flow::Continue
+}
+
+/// Bounded insert into the redeem idempotency journal: expired entries
+/// leave first, then arbitrary victims until there is room (the cap is
+/// [`JOURNAL_MAX_ROWS`], same bound as the store's journal).
+fn record_redeem_replay(
+    inner: &mut Inner,
+    redeemer: &DeviceId,
+    redeem: &RedeemRequest,
+    pairing_id: PairingId,
+    expires_at: Instant,
+) {
+    let entry = RedeemReplay {
+        lookup_digest: redeem.lookup_digest,
+        redeemer_nonce: redeem.redeemer_nonce,
+        request_mac: redeem.request_mac,
+        deadline_ms: redeem.deadline_ms,
+        pairing_id,
+        expires_at,
+    };
+    inner
+        .redeem_journal
+        .retain(|_, existing| existing.expires_at > Instant::now());
+    while inner.redeem_journal.len() >= JOURNAL_MAX_ROWS {
+        let victim = *inner
+            .redeem_journal
+            .keys()
+            .next()
+            .expect("len checked above");
+        inner.redeem_journal.remove(&victim);
+    }
+    inner
+        .redeem_journal
+        .insert((*redeemer, redeem.request_id), entry);
 }
 
 // ---- pairing handshakes --------------------------------------------------------
@@ -1535,6 +1910,37 @@ fn handle_status_query(
     request_id: RequestId,
     pairing_id: PairingId,
 ) {
+    // P2 (反枚举): a live ghost of THIS requester answers with the exact
+    // `PairStatusReply` shape a real pending transaction produces.
+    // Before, the ghost fell straight through to the SQLite lookup, hit
+    // `no row`, and answered `PAIR_UNAVAILABLE` immediately — one status
+    // query right after `InviteRedeemPending` told a redeemer whether the
+    // code existed, defeating the unified-deadline design. Ghost and real
+    // now share one answer shape while the attempt is live; after the
+    // deadline the ghost is gone and the same single SQLite query yields
+    // the unified `PAIR_UNAVAILABLE` for both.
+    {
+        let inner = shared.lock();
+        let live_deadline = inner
+            .ghosts
+            .get(&pairing_id)
+            .filter(|ghost| ghost.requester == me && ghost.expires_at > Instant::now())
+            .map(|ghost| ghost.deadline_ms);
+        if let Some(deadline_ms) = live_deadline {
+            drop(inner);
+            deliver(
+                out,
+                CtrlMessage::PairStatusReply {
+                    request_id,
+                    pairing_id,
+                    state: PairingState::Pending,
+                    commit_revision: 0,
+                    deadline_ms,
+                },
+            );
+            return;
+        }
+    }
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         // Unknown or non-participant: one unified answer.
@@ -1823,6 +2229,10 @@ fn sweep(shared: &Shared) {
                 expired_ghosts.push(ghost);
             }
         }
+        // Redeem replay records live only until deadline + grace.
+        inner
+            .redeem_journal
+            .retain(|_, replay| replay.expires_at > Instant::now());
         // Session TTLs (coordination sessions only; data channels are
         // unaffected by coordination-session death).
         let dead: Vec<SessionId> = inner
@@ -1869,6 +2279,7 @@ fn sweep(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_v2::tls;
 
     #[test]
     fn hello_replay_cache_admits_once_per_window() {
@@ -1947,5 +2358,459 @@ mod tests {
         let mut bad = typed;
         bad.deadline_ms = 8_999;
         assert!(!transcript_bindings_ok(&bad, &snapshot, &registry));
+    }
+
+    // ---- integration harness (P1-5 / P2 regression tests) -------------------
+
+    struct TestServer {
+        addr: SocketAddr,
+        registry: DeviceKeyPair,
+        shutdown: watch::Sender<bool>,
+        task: JoinHandle<io::Result<()>>,
+    }
+
+    async fn spawn_server() -> TestServer {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = DeviceKeyPair::generate();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let key = registry.clone();
+        let task = tokio::spawn(async move {
+            serve_v2(listener, &key, store, Limits::default(), shutdown_rx).await
+        });
+        TestServer {
+            addr,
+            registry,
+            shutdown,
+            task,
+        }
+    }
+
+    impl TestServer {
+        fn registry_id(&self) -> RegistryId {
+            self.registry.public_key()
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown.send(true);
+            let joined = tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("serve_v2 returns after shutdown (bounded abort+join)");
+            joined.expect("task join").expect("serve_v2 exits Ok");
+        }
+    }
+
+    struct TestClient {
+        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        key: DeviceKeyPair,
+    }
+
+    impl TestClient {
+        async fn connect(
+            addr: SocketAddr,
+            registry_id: &RegistryId,
+            key: DeviceKeyPair,
+            name: &str,
+        ) -> TestClient {
+            let mut stream = tls::connect_pinned(addr, registry_id)
+                .await
+                .expect("pinned tls handshake");
+            let bytes = read_frame(&mut stream)
+                .await
+                .unwrap()
+                .expect("auth challenge");
+            let CtrlMessage::AuthChallenge {
+                registry_id,
+                nonce,
+                expires_ms,
+            } = CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message
+            else {
+                panic!("first server frame must be AuthChallenge");
+            };
+            assert!(expires_ms > now_ms());
+            let exporter = hello2::exporter_secret_client(stream.get_ref().1).unwrap();
+            let timestamp = now_ms();
+            let signed = hello2::hello2_message(
+                &registry_id,
+                &exporter,
+                u16::from(crate::protocol_v2::VERSION),
+                &key.public_key(),
+                name,
+                timestamp,
+                &nonce,
+            );
+            write_message(
+                &mut stream,
+                &CtrlMessage::Hello {
+                    version: u16::from(crate::protocol_v2::VERSION),
+                    device_id: key.public_key(),
+                    name: name.to_owned(),
+                    timestamp_ms: timestamp,
+                    challenge: nonce,
+                    signature: key.sign(&signed),
+                },
+                Role::Client,
+            )
+            .await
+            .unwrap();
+            let mut client = TestClient { stream, key };
+            match client.recv().await {
+                CtrlMessage::Welcome { .. } => client,
+                other => panic!("expected Welcome, got {other:?}"),
+            }
+        }
+
+        async fn send(&mut self, message: &CtrlMessage) {
+            write_message(&mut self.stream, message, Role::Client)
+                .await
+                .unwrap();
+        }
+
+        async fn recv(&mut self) -> CtrlMessage {
+            let deadline = Duration::from_secs(10);
+            tokio::time::timeout(deadline, async {
+                let bytes = read_frame(&mut self.stream).await.unwrap().expect("frame");
+                CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message
+            })
+            .await
+            .expect("frame within deadline")
+        }
+    }
+
+    /// A signed redeem request over an arbitrary lookup digest (the server
+    /// verifies the signature, never the MAC).
+    fn signed_redeem(
+        key: &DeviceKeyPair,
+        registry_id: &RegistryId,
+        lookup: Digest32,
+        request_id: RequestId,
+        deadline: u64,
+    ) -> RedeemRequest {
+        let redeemer_nonce = random_nonce32();
+        let request_mac = [0x5A; 32];
+        let signature = key.sign(&hello2::redeem_message(
+            registry_id,
+            &lookup,
+            &key.public_key(),
+            &request_id,
+            &redeemer_nonce,
+            deadline,
+            &request_mac,
+        ));
+        RedeemRequest {
+            request_id,
+            lookup_digest: lookup,
+            redeemer_nonce,
+            deadline_ms: deadline,
+            request_mac,
+            signature,
+        }
+    }
+
+    // ---- P2 反枚举 -----------------------------------------------------------
+
+    /// A status query for one's own LIVE ghost answers with the exact
+    /// `PairStatusReply(Pending)` shape a real pending transaction gets.
+    /// Before the fix the ghost fell through to the SQLite lookup and
+    /// answered `PAIR_UNAVAILABLE` immediately — one status query right
+    /// after the redeem pending told a redeemer whether the code existed.
+    #[tokio::test]
+    async fn status_query_of_a_live_ghost_replies_like_a_real_pending_transaction() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut redeemer =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "r").await;
+
+        let deadline = now_ms() + 8_000;
+        let request = signed_redeem(
+            &redeemer.key,
+            &registry_id,
+            [0xC0; 32],
+            random_id16(),
+            deadline,
+        );
+        redeemer.send(&CtrlMessage::InviteRedeem(request)).await;
+        let pairing_id = match redeemer.recv().await {
+            CtrlMessage::InviteRedeemPending {
+                pairing_id,
+                deadline_ms,
+                ..
+            } => {
+                assert_eq!(deadline_ms, deadline);
+                pairing_id
+            }
+            other => panic!("expected InviteRedeemPending, got {other:?}"),
+        };
+
+        redeemer
+            .send(&CtrlMessage::PairStatusQuery {
+                request_id: random_id16(),
+                pairing_id,
+            })
+            .await;
+        match redeemer.recv().await {
+            CtrlMessage::PairStatusReply {
+                pairing_id: answered,
+                state,
+                commit_revision,
+                deadline_ms,
+                ..
+            } => {
+                assert_eq!(answered, pairing_id);
+                assert_eq!(state, PairingState::Pending);
+                assert_eq!(commit_revision, 0);
+                assert_eq!(deadline_ms, deadline);
+            }
+            other => panic!("expected PairStatusReply, got {other:?}"),
+        }
+
+        // Another device probing the same id: still the unified
+        // unavailable (no oracle in either direction).
+        let mut stranger =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "s").await;
+        stranger
+            .send(&CtrlMessage::PairStatusQuery {
+                request_id: random_id16(),
+                pairing_id,
+            })
+            .await;
+        match stranger.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, PAIR_UNAVAILABLE),
+            other => panic!("expected PairError, got {other:?}"),
+        }
+        server.stop().await;
+    }
+
+    // ---- P2 redeem 幂等 --------------------------------------------------------
+
+    /// A retry of the same (redeemer, request_id) replays the ORIGINAL
+    /// pairing id instead of minting a second transaction; a different
+    /// attempt reusing the id is a REQUEST_CONFLICT (same discipline as
+    /// the invite claim journal).
+    #[tokio::test]
+    async fn redeem_retry_with_the_same_request_id_replays_the_original_pairing() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut redeemer =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "r").await;
+
+        let deadline = now_ms() + 8_000;
+        let request_id = random_id16();
+        let request = signed_redeem(
+            &redeemer.key,
+            &registry_id,
+            [0xEE; 32],
+            request_id,
+            deadline,
+        );
+
+        redeemer
+            .send(&CtrlMessage::InviteRedeem(request.clone()))
+            .await;
+        let first = match redeemer.recv().await {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("expected InviteRedeemPending, got {other:?}"),
+        };
+
+        // Identical retry: the same pairing id, the same deadline — no
+        // second ghost, no second pending transaction.
+        redeemer
+            .send(&CtrlMessage::InviteRedeem(request.clone()))
+            .await;
+        match redeemer.recv().await {
+            CtrlMessage::InviteRedeemPending {
+                pairing_id: replayed,
+                deadline_ms,
+                ..
+            } => {
+                assert_eq!(replayed, first, "retry must replay the original pairing id");
+                assert_eq!(deadline_ms, deadline);
+            }
+            other => panic!("expected InviteRedeemPending replay, got {other:?}"),
+        }
+
+        // Same request id, different attempt: REQUEST_CONFLICT.
+        let conflicting = signed_redeem(
+            &redeemer.key,
+            &registry_id,
+            [0xEF; 32],
+            request_id,
+            deadline,
+        );
+        redeemer.send(&CtrlMessage::InviteRedeem(conflicting)).await;
+        match redeemer.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, REQUEST_CONFLICT),
+            other => panic!("expected REQUEST_CONFLICT, got {other:?}"),
+        }
+        server.stop().await;
+    }
+
+    // ---- P1-5 resource bounds ---------------------------------------------------
+
+    /// One connection beyond the global cap completes the TLS handshake
+    /// and receives exactly one ServerError before the disconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn connections_beyond_the_global_cap_are_rejected_with_server_error() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // Hold the cap's worth of live connections (TLS up, challenge
+        // read, never Hello — they stay counted until closed).
+        let mut held = Vec::new();
+        for _ in 0..MAX_LIVE_CONNECTIONS {
+            let mut stream = tls::connect_pinned(server.addr, &registry_id)
+                .await
+                .expect("tls handshake");
+            let bytes = read_frame(&mut stream).await.unwrap().expect("challenge");
+            match CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message {
+                CtrlMessage::AuthChallenge { .. } => {}
+                other => panic!("expected AuthChallenge, got {other:?}"),
+            }
+            held.push(stream);
+        }
+
+        let mut extra = tls::connect_pinned(server.addr, &registry_id)
+            .await
+            .expect("over-cap tls still completes");
+        let bytes = read_frame(&mut extra).await.unwrap().expect("error frame");
+        match CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message {
+            CtrlMessage::ServerError { code, .. } => assert_eq!(code, ERR_SESSION_LIMIT),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+        assert_eq!(
+            read_frame(&mut extra).await.unwrap(),
+            None,
+            "the rejected connection is closed after the error"
+        );
+        drop(held);
+        drop(extra);
+        server.stop().await;
+    }
+
+    /// Shutdown aborts every live connection task and returns promptly.
+    #[tokio::test]
+    async fn shutdown_aborts_live_connection_tasks_and_returns() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut client =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "c").await;
+        let _silent = tls::connect_pinned(server.addr, &registry_id)
+            .await
+            .unwrap();
+
+        let _ = server.shutdown.send(true);
+        let joined = tokio::time::timeout(Duration::from_secs(5), server.task)
+            .await
+            .expect("serve_v2 returns after shutdown");
+        assert!(joined.unwrap().is_ok());
+
+        // The aborted handler closed the client's socket: EOF or an I/O
+        // error promptly, and never another frame.
+        let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client.stream))
+            .await
+            .expect("client socket closes promptly");
+        assert!(
+            frame.as_ref().map(|maybe| maybe.is_none()).unwrap_or(true),
+            "no frame may arrive after shutdown (got {frame:?})"
+        );
+    }
+
+    /// The reader's first-frame budget: a client that completed the
+    /// connection but never speaks loses its task at the budget (real
+    /// budgets are [`FIRST_FRAME_DEADLINE`]; the test injects a tiny one).
+    #[tokio::test]
+    async fn reader_enforces_the_first_frame_deadline_on_silence() {
+        let (client, server_end) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_close_tx, close) = watch::channel(false);
+        let reader = tokio::spawn(reader_loop(
+            server_end,
+            tx,
+            close,
+            Duration::from_millis(75),
+            Duration::from_secs(30),
+        ));
+        // The client half stays open but never speaks: no EOF, no bytes —
+        // only the first-frame budget can end this reader.
+        let _silent_peer = client;
+        let started = Instant::now();
+        assert!(
+            rx.recv().await.is_none(),
+            "reader exits at the first-frame deadline"
+        );
+        reader.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget ended the reader, not the peer"
+        );
+    }
+
+    /// The reader forwards frames while they arrive inside the budget and
+    /// exits once silence outlives the steady budget.
+    #[tokio::test]
+    async fn reader_forwards_frames_then_dies_on_silence() {
+        let (mut client, server_end) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_close_tx, close) = watch::channel(false);
+        let reader = tokio::spawn(reader_loop(
+            server_end,
+            tx,
+            close,
+            Duration::from_secs(30),
+            Duration::from_millis(75),
+        ));
+
+        // One legal client frame passes through the reader untouched.
+        write_message(
+            &mut client,
+            &CtrlMessage::Ping { nonce: [7; 16] },
+            Role::Client,
+        )
+        .await
+        .unwrap();
+        let bytes = rx.recv().await.expect("frame forwarded");
+        assert_eq!(
+            CtrlFrame::decode_as(&bytes, Role::Server).unwrap().message,
+            CtrlMessage::Ping { nonce: [7; 16] }
+        );
+
+        // Then silence: the steady read budget ends the reader.
+        assert!(
+            rx.recv().await.is_none(),
+            "reader exits after the steady deadline"
+        );
+        reader.await.unwrap();
+    }
+
+    /// The writer's write budget: a write that can never drain (1-byte
+    /// duplex buffer, nobody reading) reports the dead connection to the
+    /// handler instead of parking forever.
+    #[tokio::test]
+    async fn writer_stall_tears_the_connection_down() {
+        let (unread, server_end) = tokio::io::duplex(1);
+        let (tx, rx) = mpsc::channel::<CtrlMessage>(4);
+        let (_close_tx, close) = watch::channel(false);
+        let (dead_tx, mut dead_rx) = mpsc::channel::<()>(1);
+        let writer = tokio::spawn(writer_loop(
+            server_end,
+            rx,
+            close,
+            dead_tx,
+            Duration::from_millis(75),
+        ));
+
+        tx.send(CtrlMessage::Pong { nonce: [9; 16] }).await.unwrap();
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), dead_rx.recv())
+            .await
+            .expect("a stalled write reports the dead connection")
+            .expect("the dead signal carries no payload");
+        writer.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the write budget fired, not the test timeout"
+        );
+        drop(unread);
     }
 }

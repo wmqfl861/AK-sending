@@ -37,19 +37,30 @@
 //! | Finalize | 10 | job_id 16B |
 //! | FinalAck | 11 | job_id 16B, verified bool |
 //! | Error | 12 | code u16 (ErrorCode), message str |
-//! | TaskOpen | 13 | job_id 16B, permit_id 16B, group 32B, group_registry 32B |
-//! | Admission | 14 | job_id 16B, permit_id 16B, granted bool, reason u8 |
+//! | TaskOpen | 13 | job_id 16B, permit_id 16B, group 32B, group_registry 32B, pairing_id 16B, direction u8 |
+//! | Admission | 14 | job_id 16B, permit_id 16B, granted bool, reason u8, lease_ms u32 |
 //! | AdmissionAck | 15 | job_id 16B, permit_id 16B |
 //!
-//! ## Scheduler admission frames (types 13-15, wave 20)
+//! ## Scheduler admission frames (types 13-15, wave 20; extended wave 23)
 //!
 //! `TaskOpen`/`Admission`/`AdmissionAck` carry the two-dimensional
 //! concurrency admission exchange of docs/contracts/scheduler.md §4/§6
 //! over the device direct channel (never via `ak-signal`). They reuse the
 //! same u16 message-type space, frame layout, budget discipline, boolean
 //! byte rule, closed-enum tag rule and exact-exhaustion trailing rule as
-//! the twelve file-protocol variants — fixed-size payloads of exactly 96,
-//! 34 and 32 bytes, so a tiny frame can never request a large allocation.
+//! the twelve file-protocol variants — fixed-size payloads of exactly 113,
+//! 38 and 32 bytes, so a tiny frame can never request a large allocation.
+//!
+//! **Wave 23 field extension (breaking, review P1-4):** `TaskOpen` grew
+//! `pairing_id[16]` + `direction u8` (96 → 113 bytes) and `Admission` grew
+//! `lease_ms u32` (34 → 38 bytes), closing the gap to the frozen scheduler
+//! contract's pairing/direction/lease fields; `AdmissionAck` is unchanged.
+//! Compatibility rule: the TYPE_* values stay 13-15, but a wave-20 frame
+//! is the *same type at the old length* — its shorter payload runs out
+//! mid-field and is rejected (`payload ends inside a field`), and
+//! symmetrically a wave-20 decoder sees the new longer frames as oversized.
+//! There is no partial compatibility: both ends must ship the same
+//! version (the two crates move in lockstep in this repository).
 //!
 //! **Capability negotiation (Hello compat):** these three frame types may
 //! only be exchanged after BOTH peers' `Hello` frames carry
@@ -59,7 +70,9 @@
 //! engine (wave 21 wiring) enforces the gate and answers
 //! `PROTOCOL_UNSUPPORTED` instead of falling back. The `reason` byte of
 //! `Admission` is a closed set: 0 = ok, 1 = serial_wait, 2 = capacity,
-//! 3 = stale_permit; anything else is rejected.
+//! 3 = stale_permit; anything else is rejected. The `direction` byte of
+//! `TaskOpen` is a closed set too: 0 = send ([`DIRECTION_SEND`]),
+//! 1 = recv ([`DIRECTION_RECV`]); anything else is rejected.
 //!
 //! Every decode validates type, version, length, offsets and resource budgets
 //! against [`Limits`] before allocating memory, and refuses unknown values;
@@ -157,6 +170,14 @@ pub const ADMISSION_REASON_CAPACITY: u8 = 2;
 /// `Admission.reason` tag: the permit being acked is unknown or expired;
 /// the sender must resubmit a fresh TaskOpen.
 pub const ADMISSION_REASON_STALE_PERMIT: u8 = 3;
+
+/// `TaskOpen.direction` tag (wave 23): the opener of the task is sending
+/// to the peer. A `TaskOpen` is by definition opened by the sending side.
+pub const DIRECTION_SEND: u8 = 0;
+/// `TaskOpen.direction` tag (wave 23): the opener of the task is receiving
+/// from the peer. Kept in the closed set for symmetry with the scheduler
+/// contract's direction field; decode rejects every other value.
+pub const DIRECTION_RECV: u8 = 1;
 
 /// Every message type value; keeps the set closed and iterable. The three
 /// scheduler admission types (13-15) extend the same u16 space.
@@ -362,25 +383,33 @@ pub enum Message {
         code: ErrorCode,
         message: String,
     },
-    /// Scheduler admission, wave 20 (scheduler.md §4/§6): a sender asks the
-    /// receiving owner of a code group for a transfer permit. Only valid
-    /// after both Hellos carried [`CAP_SCHEDULER`]. The `group` field is
-    /// the `code_id` (32-byte form) and `group_registry` the registry
-    /// identity, together forming the `CodeGroupKey`.
+    /// Scheduler admission, wave 20, fields extended wave 23 (scheduler.md
+    /// §4/§6): a sender asks the receiving owner of a code group for a
+    /// transfer permit. Only valid after both Hellos carried
+    /// [`CAP_SCHEDULER`]. The `group` field is the `code_id` (32-byte form)
+    /// and `group_registry` the registry identity, together forming the
+    /// `CodeGroupKey`. Wave 23 added `pairing_id` (the pairing relation
+    /// that selected this peer — one code may be redeemed by several
+    /// devices, scheduler.md §2) and the closed-set `direction` byte.
     TaskOpen {
         job_id: JobId,
         permit_id: [u8; 16],
         group: [u8; 32],
         group_registry: [u8; 32],
+        pairing_id: [u8; 16],
+        direction: u8,
     },
     /// The receiving side's admission decision for one `permit_id`.
     /// `granted = true` requires `reason = Ok`; a denial names the closed
-    /// [`AdmissionReason`] so the sender can back off correctly.
+    /// [`AdmissionReason`] so the sender can back off correctly. Wave 23
+    /// added `lease_ms`: the bounded lease of a granted permit
+    /// (scheduler.md §6 — tentative permits expire); denials carry `0`.
     Admission {
         job_id: JobId,
         permit_id: [u8; 16],
         granted: bool,
         reason: AdmissionReason,
+        lease_ms: u32,
     },
     /// Final handshake of the exchange: the sender confirms it is acting
     /// on the admission decision, releasing the tentative permit state.
@@ -638,7 +667,13 @@ pub fn scheduler_frames_allowed(local: u16, remote: u16) -> bool {
 
 /// Exact payload upper bound for one message type under `limits`, or `None`
 /// for types outside the frozen set. Pure arithmetic on limits, no allocation.
-fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
+///
+/// Public since wave 23: frame readers that pre-filter a header before the
+/// payload buffer is allocated consult this table as the single source of
+/// truth (the engine's admission-frame reader does; ak-net's `recv_frame`
+/// keeps its own frozen mirror for the file-protocol types), so the wave-23
+/// admission sizes cannot drift from a stale copy.
+pub fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
     let string = u64::from(limits.max_string_bytes);
     // WireEntry: str(2+string) + bool(1) + size(8) + mtime(8) + alg(1)
     //            + whole_digest(32) + digests(4 + 32*n).
@@ -661,11 +696,12 @@ fn payload_budget(message_type: u16, limits: &Limits) -> Option<u64> {
         TYPE_FINALIZE => 16,
         // code(2) + str(2 + error message bytes).
         TYPE_ERROR => 4 + u64::from(limits.max_error_message_bytes),
-        // Scheduler admission frames are fixed-size, limits-independent:
-        // job_id(16) + permit_id(16) + group(32) + group_registry(32).
-        TYPE_TASK_OPEN => 96,
-        // job_id(16) + permit_id(16) + granted(1) + reason(1).
-        TYPE_ADMISSION => 34,
+        // Scheduler admission frames are fixed-size, limits-independent.
+        // Wave 23 extension: job_id(16) + permit_id(16) + group(32)
+        // + group_registry(32) + pairing_id(16) + direction(1) = 113.
+        TYPE_TASK_OPEN => 113,
+        // job_id(16) + permit_id(16) + granted(1) + reason(1) + lease_ms(4).
+        TYPE_ADMISSION => 38,
         // job_id(16) + permit_id(16).
         TYPE_ADMISSION_ACK => 32,
         _ => return None,
@@ -838,22 +874,28 @@ fn encode_payload(message: &Message, out: &mut Vec<u8>) -> Result<(), EncodeErro
             permit_id,
             group,
             group_registry,
+            pairing_id,
+            direction,
         } => {
             out.extend_from_slice(job_id);
             out.extend_from_slice(permit_id);
             out.extend_from_slice(group);
             out.extend_from_slice(group_registry);
+            out.extend_from_slice(pairing_id);
+            out.push(*direction);
         }
         Message::Admission {
             job_id,
             permit_id,
             granted,
             reason,
+            lease_ms,
         } => {
             out.extend_from_slice(job_id);
             out.extend_from_slice(permit_id);
             put_bool(out, *granted);
             out.push(admission_reason_tag(*reason));
+            put_u32(out, *lease_ms);
         }
         Message::AdmissionAck { job_id, permit_id } => {
             out.extend_from_slice(job_id);
@@ -1164,17 +1206,35 @@ fn decode_message(
             code: error_code(cursor)?,
             message: limited_string(cursor, limits.max_error_message_bytes)?,
         },
-        TYPE_TASK_OPEN => Message::TaskOpen {
-            job_id: cursor.array::<16>()?,
-            permit_id: cursor.array::<16>()?,
-            group: cursor.array::<32>()?,
-            group_registry: cursor.array::<32>()?,
-        },
+        TYPE_TASK_OPEN => {
+            let job_id: JobId = cursor.array::<16>()?;
+            let permit_id = cursor.array::<16>()?;
+            let group = cursor.array::<32>()?;
+            let group_registry = cursor.array::<32>()?;
+            let pairing_id = cursor.array::<16>()?;
+            let direction = cursor.u8()?;
+            // Closed set, same discipline as the Control/AdmissionReason
+            // tags: only DIRECTION_SEND / DIRECTION_RECV exist on the wire.
+            if direction != DIRECTION_SEND && direction != DIRECTION_RECV {
+                return Err(DecodeError::Malformed(
+                    "task direction must be DIRECTION_SEND or DIRECTION_RECV",
+                ));
+            }
+            Message::TaskOpen {
+                job_id,
+                permit_id,
+                group,
+                group_registry,
+                pairing_id,
+                direction,
+            }
+        }
         TYPE_ADMISSION => Message::Admission {
             job_id: cursor.array::<16>()?,
             permit_id: cursor.array::<16>()?,
             granted: cursor.boolean()?,
             reason: admission_reason_from_tag(cursor.u8()?)?,
+            lease_ms: cursor.u32()?,
         },
         TYPE_ADMISSION_ACK => Message::AdmissionAck {
             job_id: cursor.array::<16>()?,
@@ -1701,7 +1761,7 @@ mod tests {
                     message: "no space".to_owned(),
                 },
             ),
-            // Scheduler admission frames (wave 20).
+            // Scheduler admission frames (wave 20, fields extended wave 23).
             (
                 TYPE_TASK_OPEN,
                 Message::TaskOpen {
@@ -1709,6 +1769,8 @@ mod tests {
                     permit_id: [2; 16],
                     group: [3; 32],
                     group_registry: [4; 32],
+                    pairing_id: [5; 16],
+                    direction: DIRECTION_SEND,
                 },
             ),
             (
@@ -1718,6 +1780,7 @@ mod tests {
                     permit_id: [2; 16],
                     granted: false,
                     reason: AdmissionReason::Capacity,
+                    lease_ms: 0,
                 },
             ),
             (
@@ -1851,12 +1914,15 @@ mod tests {
                 permit_id: [2; 16],
                 group: [3; 32],
                 group_registry: [4; 32],
+                pairing_id: [5; 16],
+                direction: DIRECTION_RECV,
             },
             Message::Admission {
                 job_id: [1; 16],
                 permit_id: [2; 16],
                 granted: true,
                 reason: AdmissionReason::Ok,
+                lease_ms: u32::MAX,
             },
             Message::AdmissionAck {
                 job_id: [1; 16],
@@ -2607,6 +2673,8 @@ mod tests {
             permit_id: [permit; 16],
             group: [(job * 3) | 1; 32],
             group_registry: [(permit * 5) | 2; 32],
+            pairing_id: [(permit * 7) | 4; 16],
+            direction: DIRECTION_SEND,
         }
     }
 
@@ -2618,6 +2686,8 @@ mod tests {
             permit_id: [0xFF; 16],
             group: [0xAB; 32],
             group_registry: [0x00; 32],
+            pairing_id: [0x00; 16],
+            direction: DIRECTION_RECV,
         });
         for granted in [true, false] {
             for reason in [
@@ -2631,8 +2701,30 @@ mod tests {
                     permit_id: [9; 16],
                     granted,
                     reason,
+                    lease_ms: if granted { 30_000 } else { 0 },
                 });
             }
+        }
+        // Wave 23 fields at their extremes: lease 0 and u32::MAX, both
+        // directions of the closed set.
+        for lease in [0u32, u32::MAX] {
+            assert_round_trips(Message::Admission {
+                job_id: [7; 16],
+                permit_id: [9; 16],
+                granted: true,
+                reason: AdmissionReason::Ok,
+                lease_ms: lease,
+            });
+        }
+        for direction in [DIRECTION_SEND, DIRECTION_RECV] {
+            assert_round_trips(Message::TaskOpen {
+                job_id: [3; 16],
+                permit_id: [4; 16],
+                group: [5; 32],
+                group_registry: [6; 32],
+                pairing_id: [7; 16],
+                direction,
+            });
         }
         assert_round_trips(Message::AdmissionAck {
             job_id: [0xEE; 16],
@@ -2642,18 +2734,22 @@ mod tests {
 
     #[test]
     fn scheduler_payload_sizes_are_exact_and_within_budget() {
-        // Fixed sizes: 96 / 34 / 32 payload bytes, +7 header.
+        // Fixed sizes (wave 23): 113 / 38 / 32 payload bytes, +7 header.
         let open = encoded(&task_open(1, 2));
-        assert_eq!(open.len(), HEADER_LEN + 96);
-        assert_eq!(u32::from_be_bytes([open[3], open[4], open[5], open[6]]), 96);
+        assert_eq!(open.len(), HEADER_LEN + 113);
+        assert_eq!(
+            u32::from_be_bytes([open[3], open[4], open[5], open[6]]),
+            113
+        );
 
         let admission = encoded(&Message::Admission {
             job_id: [1; 16],
             permit_id: [2; 16],
             granted: true,
             reason: AdmissionReason::Ok,
+            lease_ms: 30_000,
         });
-        assert_eq!(admission.len(), HEADER_LEN + 34);
+        assert_eq!(admission.len(), HEADER_LEN + 38);
 
         let ack = encoded(&Message::AdmissionAck {
             job_id: [1; 16],
@@ -2715,6 +2811,7 @@ mod tests {
                 permit_id: [2; 16],
                 granted: false,
                 reason: AdmissionReason::StalePermit,
+                lease_ms: 0,
             },
             Message::AdmissionAck {
                 job_id: [1; 16],
@@ -2763,6 +2860,7 @@ mod tests {
             payload.extend_from_slice(&[2u8; 16]); // permit_id
             payload.push(0); // granted
             payload.push(bad); // reason outside the closed set
+            payload.extend_from_slice(&0u32.to_be_bytes()); // lease_ms
             let buf = frame_of(TYPE_ADMISSION, &payload);
             assert!(
                 matches!(
@@ -2782,6 +2880,7 @@ mod tests {
             payload.extend_from_slice(&[2u8; 16]); // permit_id
             payload.push(bad); // granted must be 0/1
             payload.push(ADMISSION_REASON_OK);
+            payload.extend_from_slice(&0u32.to_be_bytes()); // lease_ms
             let buf = frame_of(TYPE_ADMISSION, &payload);
             assert!(
                 matches!(
@@ -2794,11 +2893,81 @@ mod tests {
     }
 
     #[test]
+    fn rejects_direction_bytes_outside_the_closed_set() {
+        // Wave 23: TaskOpen.direction is a closed set (0 = send, 1 = recv);
+        // every other byte is a malformed frame, like the Control and
+        // AdmissionReason tags.
+        assert_eq!((DIRECTION_SEND, DIRECTION_RECV), (0, 1));
+        for bad in [2u8, 3, 0x80, 0xFF] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&[1u8; 16]); // job_id
+            payload.extend_from_slice(&[2u8; 16]); // permit_id
+            payload.extend_from_slice(&[3u8; 32]); // group
+            payload.extend_from_slice(&[4u8; 32]); // group_registry
+            payload.extend_from_slice(&[5u8; 16]); // pairing_id
+            payload.push(bad); // direction outside the closed set
+            let buf = frame_of(TYPE_TASK_OPEN, &payload);
+            assert!(
+                matches!(
+                    Frame::decode(&buf, &Limits::default()),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "direction {bad} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wave_20_length_admission_frames() {
+        // Wave 23 compat rule: a wave-20 TaskOpen (96-byte payload:
+        // job/permit/group/registry, no pairing_id/direction) is the same
+        // TYPE at a stale length — field decode runs past the payload end
+        // instead of guessing. The same holds for a wave-20 Admission
+        // (34 bytes, no lease_ms). AdmissionAck was not extended, so its
+        // wave-20 32-byte frame still decodes: the exchange version boundary
+        // is exactly the two grown messages.
+        let mut open = Vec::new();
+        open.extend_from_slice(&[1u8; 16]); // job_id
+        open.extend_from_slice(&[2u8; 16]); // permit_id
+        open.extend_from_slice(&[3u8; 32]); // group
+        open.extend_from_slice(&[4u8; 32]); // group_registry
+        assert_eq!(open.len(), 96);
+        let buf = frame_of(TYPE_TASK_OPEN, &open);
+        assert!(matches!(
+            Frame::decode(&buf, &Limits::default()),
+            Err(DecodeError::Malformed(_))
+        ));
+
+        let mut admission = Vec::new();
+        admission.extend_from_slice(&[1u8; 16]); // job_id
+        admission.extend_from_slice(&[2u8; 16]); // permit_id
+        admission.push(1); // granted
+        admission.push(ADMISSION_REASON_OK);
+        assert_eq!(admission.len(), 34);
+        let buf = frame_of(TYPE_ADMISSION, &admission);
+        assert!(matches!(
+            Frame::decode(&buf, &Limits::default()),
+            Err(DecodeError::Malformed(_))
+        ));
+
+        let ack = vec![1u8; 32];
+        let buf = frame_of(TYPE_ADMISSION_ACK, &ack);
+        assert!(matches!(
+            Frame::decode(&buf, &Limits::default()),
+            Ok(Frame {
+                message: Message::AdmissionAck { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_oversized_declared_scheduler_payloads() {
-        // One byte past each fixed budget, refused before any allocation.
+        // One byte past each fixed budget (wave 23: 113/38/32), refused
+        // before any allocation.
         for (message_type, budget) in [
-            (TYPE_TASK_OPEN, 96u32),
-            (TYPE_ADMISSION, 34),
+            (TYPE_TASK_OPEN, 113u32),
+            (TYPE_ADMISSION, 38),
             (TYPE_ADMISSION_ACK, 32),
         ] {
             let mut buf = frame_of(message_type, &[0; 8]);
@@ -2827,6 +2996,7 @@ mod tests {
                     permit_id: [2; 16],
                     granted: true,
                     reason: AdmissionReason::Ok,
+                    lease_ms: 30_000,
                 },
             ),
             (
@@ -2838,7 +3008,7 @@ mod tests {
             ),
         ] {
             let full = encoded(&body);
-            for cut in [1usize, 16, 33, 95] {
+            for cut in [1usize, 16, 33, 95, 112] {
                 if cut >= full.len() - HEADER_LEN {
                     continue;
                 }
@@ -2938,6 +3108,7 @@ mod tests {
                             2 => AdmissionReason::Capacity,
                             _ => AdmissionReason::StalePermit,
                         },
+                        lease_ms: r.next_u64() as u32,
                     },
                     TYPE_ADMISSION_ACK => Message::AdmissionAck {
                         job_id: [r.byte(); 16],
@@ -2948,6 +3119,8 @@ mod tests {
                         permit_id: [r.byte(); 16],
                         group: [r.byte(); 32],
                         group_registry: [r.byte(); 32],
+                        pairing_id: [r.byte(); 16],
+                        direction: r.byte() % 2,
                     },
                 };
                 let mut buf = encoded(&message);

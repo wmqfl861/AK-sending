@@ -968,7 +968,7 @@ impl TransferExecutor for FfiSendExecutor {
                     "no engine send spec registered for the task",
                 )
             })?;
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         if let Ok(mut cancels) = self.cancels.lock() {
             cancels.insert(id, cancel_tx);
         }
@@ -977,24 +977,52 @@ impl TransferExecutor for FfiSendExecutor {
         let join = self.handle.spawn(async move {
             sink.phase(task, TaskPhase::Scanning).await;
             sink.phase(task, TaskPhase::Transferring).await;
-            let callback = move |event: ak_engine::Progress| {
-                core::push_event(&progress, &task_hex, None, &event);
+            // P1-3: the transfer runs as its own task so an independent
+            // watcher can hard-abort it. The previous form selected on
+            // `cancel_rx.changed(), if *cancel_rx.borrow()` inline: that
+            // precondition is evaluated only when `select!` is first
+            // polled, the watch starts `false`, so the cancel branch was
+            // permanently disabled and `ak_engine::send` ran
+            // uncancellable.
+            let send = {
+                let progress = Arc::clone(&progress);
+                let task_hex = task_hex.clone();
+                tokio::spawn(async move {
+                    let callback = move |event: ak_engine::Progress| {
+                        core::push_event(&progress, &task_hex, None, &event);
+                    };
+                    ak_engine::send(engine_spec, &callback).await
+                })
             };
-            // Dropping the send future on cancel aborts the transfer and
-            // releases its endpoint; the report then finalizes the task.
-            let outcome = tokio::select! {
-                _ = cancel_rx.changed(), if *cancel_rx.borrow() => {
-                    FinishOutcome::Failed { error: ErrorCode::Cancelled }
-                }
-                report = ak_engine::send(engine_spec, &callback) => {
-                    match report {
-                        Ok(_) => FinishOutcome::Completed,
-                        Err(error) => FinishOutcome::Failed {
-                            error: engine_error_code(&error),
-                        },
+            // Independent cancel watcher: aborting the transfer task drops
+            // the in-flight `send` future, which closes its QUIC endpoint
+            // and releases the socket; the join then finalizes the task.
+            let mut cancel_rx = cancel_rx;
+            let watcher = {
+                let send_abort = send.abort_handle();
+                tokio::spawn(async move {
+                    while cancel_rx.changed().await.is_ok() {
+                        if *cancel_rx.borrow() {
+                            send_abort.abort();
+                            return;
+                        }
                     }
-                }
+                })
             };
+            let outcome = match send.await {
+                Ok(Ok(_)) => FinishOutcome::Completed,
+                Ok(Err(error)) => FinishOutcome::Failed {
+                    error: engine_error_code(&error),
+                },
+                Err(join_error) => FinishOutcome::Failed {
+                    error: if join_error.is_cancelled() {
+                        ErrorCode::Cancelled
+                    } else {
+                        ErrorCode::Internal
+                    },
+                },
+            };
+            watcher.abort();
             if matches!(outcome, FinishOutcome::Completed) {
                 sink.phase(task, TaskPhase::Verifying).await;
                 sink.phase(task, TaskPhase::Committing).await;
@@ -1724,4 +1752,264 @@ fn parse_timeout(secs: u64) -> Result<Duration, FfiError> {
         ));
     }
     Ok(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    //! P1-3 regression coverage: `ak_sched_cancel` (the executor's cancel
+    //! watch) must actually stop the engine transfer. The bug: the
+    //! `select!` cancel branch carried an `if *cancel_rx.borrow()`
+    //! precondition that was evaluated once while the watch still read
+    //! `false`, permanently disabling the branch — `ak_engine::send` ran
+    //! to its idle timeout no matter when the cancel arrived. The fix
+    //! runs the transfer as its own task with an independent watcher
+    //! that hard-aborts it on the flip.
+
+    use super::*;
+    use ak_session::runtime::{SnapshotQuery, TaskState};
+    use std::time::{Duration as StdDuration, Instant};
+
+    const WAIT: StdDuration = StdDuration::from_secs(15);
+    const POLL: StdDuration = StdDuration::from_millis(10);
+
+    async fn wait_until<F, Fut>(what: &str, mut probe: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + WAIT;
+        while !probe().await {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what} (is the P1-3 cancel broken again?)"
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    fn make_executor() -> Arc<FfiSendExecutor> {
+        Arc::new(FfiSendExecutor {
+            handle: tokio::runtime::Handle::current(),
+            specs: StdMutex::new(HashMap::new()),
+            cancels: StdMutex::new(HashMap::new()),
+            tasks: StdMutex::new(HashMap::new()),
+            progress: Arc::new(StdMutex::new(VecDeque::new())),
+        })
+    }
+
+    /// The scheduler runtime exactly as `ak_sched_start` assembles it,
+    /// minus the registry client: real `FfiSendExecutor`, fake (online)
+    /// transport, listener off.
+    fn sched_runtime(executor: Arc<FfiSendExecutor>) -> SessionHandle {
+        let mut config = RuntimeConfig::new(
+            SchedulerPolicy::default(),
+            RealClock::shared(),
+            Arc::new(ak_session::runtime::FakePairingTransport::new(true)),
+            executor,
+            RegistryId::from_bytes([0x55; 32]),
+        );
+        config.listener_enabled = false;
+        SessionRuntime::start(config).expect("scheduler runtime starts")
+    }
+
+    fn transfer_spec(executor: Arc<FfiSendExecutor>, task: TaskId) -> TransferSpec {
+        TransferSpec {
+            group_key: CodeGroupKey::new(
+                RegistryId::from_bytes([0x55; 32]),
+                CodeId::from_bytes([0x66; 16]),
+            ),
+            pairing: PairingPlan::Ready {
+                pairing_id: RtPairingId::from_bytes([0x77; 16]),
+            },
+            executor,
+            direction: TransferDirection::Send,
+            label: "cancel-test".to_owned(),
+            task_id: Some(task),
+        }
+    }
+
+    async fn state_of(handle: &SessionHandle, task: &TaskId) -> Option<TaskState> {
+        let snapshot = handle
+            .snapshot(SnapshotQuery::all())
+            .await
+            .expect("snapshot");
+        snapshot
+            .tasks
+            .iter()
+            .find(|view| &view.task == task)
+            .map(|view| view.state)
+    }
+
+    /// Cancel stops an in-flight engine send whose peer never answers: the
+    /// task finalizes as `Cancelled` within seconds (not at the 120 s
+    /// idle timeout) and the engine task itself has exited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sched_cancel_aborts_an_in_flight_engine_send() {
+        // A bound-but-silent UDP socket: the QUIC handshake retries into a
+        // void, so `ak_engine::send` stays in flight until it is aborted.
+        let blackhole = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind black hole");
+        let peer = blackhole.local_addr().expect("black hole addr");
+        let src = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(src.path().join("payload.bin"), vec![0xA5u8; 4096]).expect("source file");
+        let sender_key = DeviceKeyPair::generate();
+        let mut spec = SendSpec::new(
+            src.path().to_path_buf(),
+            peer,
+            Fingerprint::from_public_key(&DeviceKeyPair::generate().public_key()),
+            make_self_signed(&sender_key),
+        );
+        spec.checkpoint_dir = src.path().join("checkpoints");
+        // Only the cancel may stop this task inside the test window.
+        spec.idle_timeout = StdDuration::from_secs(120);
+
+        let executor = make_executor();
+        let task = TaskId::from_bytes(random_id16());
+        executor
+            .specs
+            .lock()
+            .expect("specs lock")
+            .insert(*task.as_bytes(), spec);
+
+        let handle = sched_runtime(executor.clone());
+        let submitted = handle
+            .enqueue(transfer_spec(executor.clone(), task))
+            .await
+            .expect("task submitted");
+        assert_eq!(submitted, task);
+
+        // The engine task exists: the transfer is genuinely in flight.
+        wait_until("engine task spawned", || async {
+            executor
+                .tasks
+                .lock()
+                .map(|tasks| tasks.contains_key(task.as_bytes()))
+                .unwrap_or(false)
+        })
+        .await;
+        assert_ne!(
+            state_of(&handle, &task).await,
+            Some(TaskState::Cancelled),
+            "task must still be running when the cancel fires"
+        );
+
+        handle.cancel(submitted).await.expect("cancel receipt");
+
+        // The scheduler finalizes the task as Cancelled quickly — with the
+        // disabled-select bug it stayed in CancelRequested until the 120 s
+        // idle timeout failed the transfer.
+        wait_until("task Cancelled", || async {
+            state_of(&handle, &task).await == Some(TaskState::Cancelled)
+        })
+        .await;
+        // And the engine task itself has stopped.
+        wait_until("engine task stopped", || async {
+            executor
+                .tasks
+                .lock()
+                .ok()
+                .and_then(|tasks| tasks.get(task.as_bytes()).map(|join| join.is_finished()))
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// Total bytes under a directory tree (files only).
+    fn tree_bytes(root: &std::path::Path) -> u64 {
+        fn walk(dir: &std::path::Path, total: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    walk(&entry.path(), total);
+                } else {
+                    *total += meta.len();
+                }
+            }
+        }
+        let mut total = 0;
+        walk(root, &mut total);
+        total
+    }
+
+    /// Cancel mid-transfer freezes the delivered bytes: after `ak_sched_
+    /// cancel` the destination tree stops growing (real receiver, real
+    /// `ak_engine` loopback transfer of a 64 MiB file).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sched_cancel_stops_file_transfer_growth() {
+        let src = tempfile::tempdir().expect("src tempdir");
+        let dst = tempfile::tempdir().expect("dst tempdir");
+        let payload = vec![0x3Cu8; 64 << 20];
+        std::fs::write(src.path().join("big.bin"), &payload).expect("write 64 MiB source");
+
+        let sender_key = DeviceKeyPair::generate();
+        let receiver_key = DeviceKeyPair::generate();
+        let mut recv_spec =
+            ak_engine::ReceiveSpec::new(dst.path().to_path_buf(), make_self_signed(&receiver_key));
+        recv_spec.bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        recv_spec.checkpoint_dir = dst.path().join("checkpoints");
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let noop = |_progress: ak_engine::Progress| {};
+            let _ = ak_engine::receive_with_addr(recv_spec, &noop, addr_tx).await;
+        });
+        let peer = addr_rx.await.expect("receiver bound");
+
+        let mut spec = SendSpec::new(
+            src.path().to_path_buf(),
+            peer,
+            Fingerprint::from_public_key(&receiver_key.public_key()),
+            make_self_signed(&sender_key),
+        );
+        spec.checkpoint_dir = src.path().join("checkpoints");
+        spec.idle_timeout = StdDuration::from_secs(120);
+
+        let executor = make_executor();
+        let task = TaskId::from_bytes(random_id16());
+        executor
+            .specs
+            .lock()
+            .expect("specs lock")
+            .insert(*task.as_bytes(), spec);
+        let handle = sched_runtime(executor.clone());
+        let submitted = handle
+            .enqueue(transfer_spec(executor.clone(), task))
+            .await
+            .expect("task submitted");
+
+        // Wait until the transfer is really moving bytes into the tree.
+        wait_until("staging bytes appear", || async {
+            tree_bytes(dst.path()) > 1 << 20
+        })
+        .await;
+
+        let cancel = handle.cancel(submitted).await;
+        if cancel.is_err() {
+            // The loopback transfer beat the polling (all bytes delivered
+            // before the cancel): nothing can grow any more, which is the
+            // assertion's trivial half. The non-trivial half is covered by
+            // `sched_cancel_aborts_an_in_flight_engine_send`.
+            assert_eq!(
+                state_of(&handle, &task).await,
+                Some(TaskState::Completed),
+                "cancel can only fail if the transfer already completed"
+            );
+            return;
+        }
+
+        // Let both sides settle, then the byte count must be frozen: two
+        // samples half a second apart are equal.
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        let first = tree_bytes(dst.path());
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        let second = tree_bytes(dst.path());
+        assert_eq!(first, second, "delivered bytes grew after the cancel");
+        wait_until("task Cancelled", || async {
+            state_of(&handle, &task).await == Some(TaskState::Cancelled)
+        })
+        .await;
+    }
 }

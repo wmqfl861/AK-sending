@@ -1013,9 +1013,9 @@ fn type_budget(message_type: u16, limits: &Limits) -> Option<u32> {
         // `payload_budget` exactly, or this header pre-filter rejects with
         // `UnknownType` what the codec itself accepts.
         // job_id(16) + permit_id(16) + group(32) + group_registry(32).
-        ak_wire::TYPE_TASK_OPEN => 96,
+        ak_wire::TYPE_TASK_OPEN => 113,
         // job_id(16) + permit_id(16) + granted(1) + reason(1).
-        ak_wire::TYPE_ADMISSION => 34,
+        ak_wire::TYPE_ADMISSION => 38,
         // job_id(16) + permit_id(16).
         ak_wire::TYPE_ADMISSION_ACK => 32,
         _ => return None,

@@ -113,6 +113,19 @@
 //! `send`/`receive_with_addr`/`serve_concurrently` entries keep their exact
 //! frozen behavior: they self-connect and run the same bodies with
 //! admission absent (no `CAP_SCHEDULER` bit, no TaskOpen, no staging).
+//!
+//! Wave 23 on-channel hardening (review P1-4): the admission context is
+//! only constructible through the validating [`AdmissionCtx::new`] (it now
+//! also carries the runtime-minted `permit_id` and the `pairing_id` that
+//! travels in `TaskOpen`); the receiver-side decider sees the complete
+//! [`AdmissionRequest`] context (code group + registry + pairing relation);
+//! [`send_on_channel`] re-checks the injected channel's TLS peer against
+//! `spec.pinned` as its very first step and closes on mismatch; and
+//! [`receive_on_channel`] no longer silently downgrades a scheduled receive
+//! when the sender lacks `CAP_SCHEDULER` — it fails with
+//! `PROTOCOL_UNSUPPORTED`, symmetric with the send side. The wire frames
+//! grew accordingly (ak-wire wave 23: `TaskOpen.pairing_id`/`direction`,
+//! `Admission.lease_ms`; both ends must ship the same version).
 #![forbid(unsafe_code)]
 
 use std::collections::{HashSet, VecDeque};
@@ -133,7 +146,7 @@ use ak_storage::{LocalSaveTarget, LocalSource};
 use ak_store::{CheckpointStore, Direction, FileCheckpoint, FileCheckpointStore, TaskRecord};
 use ak_wire::{
     scheduler_frames_allowed, AdmissionReason, Control, Frame, JobId, Limits, Message, ResumeEntry,
-    WireEntry, CAP_MULTISTREAM, CAP_PAUSE_RESUME, CAP_RESUME, CAP_SCHEDULER,
+    WireEntry, CAP_MULTISTREAM, CAP_PAUSE_RESUME, CAP_RESUME, CAP_SCHEDULER, DIRECTION_SEND,
 };
 
 /// Manifest pages are assembled under this byte budget so every page fits a
@@ -168,9 +181,17 @@ const MAX_PARALLEL_STREAMS: usize = 4;
 /// QUIC application-error code for a policy-gate refusal: `0xA0` marks the
 /// AK protocol family, `0x01` the policy gate. An application-space code
 /// (no IANA transport meaning), carried in the CONNECTION_CLOSE frame when
-/// [`authorize_path`] refuses a path so a peer's transport log can name
-/// the reason. No protocol frame precedes it.
+/// [`authorize_path`] refuses a path so a peer's transport log can name the
+/// reason. No protocol frame precedes it.
 const POLICY_GATE_CLOSE_CODE: u32 = 0xA0_01;
+/// QUIC application-error code for the on-channel pinned-identity mismatch
+/// (wave 23, review P1-4): `0xA0` protocol family, `0x02` identity
+/// re-check. Carried in the CONNECTION_CLOSE frame when
+/// [`send_on_channel`] refuses a runtime-injected channel whose TLS peer
+/// fingerprint differs from `spec.pinned` — the identity condition the
+/// legacy [`send`] establishes itself at connect time. No protocol frame
+/// precedes it (not even the admission TaskOpen).
+const PEER_MISMATCH_CLOSE_CODE: u32 = 0xA0_02;
 
 /// Sender-side configuration.
 #[derive(Debug, Clone)]
@@ -288,22 +309,94 @@ impl ReceiveSpec {
 }
 
 /// Scheduler admission context for one on-channel send task (wave 21,
-/// scheduler.md §6). Carries exactly what the three admission frames need:
-/// the scheduler task identity and the two-dimensional code group the task
-/// runs under. Handed to [`send_on_channel`] by the runtime that owns the
-/// connection; the legacy [`send`] path has none.
+/// fields extended wave 23; scheduler.md §4/§6). Carries exactly what the
+/// three admission frames need: the scheduler task identity, the
+/// runtime-minted permit, the two-dimensional code group the task runs
+/// under, and the pairing relation that selected the target device.
+/// Handed to [`send_on_channel`] by the runtime that owns the connection;
+/// the legacy [`send`] path has none.
+///
+/// Not constructible by field assignment from outside this crate (wave 23,
+/// review P1-4): the fields are crate-private and the only public
+/// constructor is the validating [`AdmissionCtx::new`], per the frozen
+/// contract's "admission contexts come from a controlled constructor" rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionCtx {
     /// Scheduler task identity. Travels as `TaskOpen.job_id`, mirrors
     /// `AdmissionAck.job_id`, and — on the receiving side — keys the
     /// per-task staging tree (`ak_storage::prepare_file_staged`). The
-    /// all-zero id is the contract sentinel and is refused on the wire.
-    pub task_id: [u8; 16],
+    /// all-zero id is the contract sentinel and is refused by [`Self::new`]
+    /// and on the wire.
+    pub(crate) task_id: [u8; 16],
+    /// The permit id the owning runtime minted when it granted the local
+    /// tentative permit (scheduler.md §6): attempt 0 of the handshake runs
+    /// on it, and `StalePermit` resubmits derive fresh ids under the
+    /// bounded resubmit budget. Never the all-zero sentinel.
+    pub(crate) permit_id: [u8; 16],
     /// The code group this task belongs to (the pairing `code_id` in its
     /// 32-byte form). The receiver hands this to its admission decider.
+    pub(crate) group: [u8; 32],
+    /// Registry identity that owns the group (`TaskOpen.group_registry`).
+    pub(crate) group_registry: [u8; 32],
+    /// The pairing relation that selected the target device
+    /// (`TaskOpen.pairing_id`, scheduler.md §2: one code may be redeemed by
+    /// several devices, so the task must name which relation it runs on).
+    pub(crate) pairing_id: [u8; 16],
+}
+
+impl AdmissionCtx {
+    /// Controlled constructor, the only way to build an [`AdmissionCtx`]
+    /// (wave 23, review P1-4; scheduler.md §4: the admission context is
+    /// produced by a controlled constructor — a caller cannot bypass
+    /// validation by filling in fields). Validates the full identity set:
+    /// `task_id`/`permit_id` must be non-zero, and `group_registry`/
+    /// `pairing_id` must be non-zero (the all-zero values are the reserved
+    /// sentinels and can never name a real task, permit, registry or
+    /// pairing relation). Returns [`EngineError::InvalidAdmissionCtx`]
+    /// naming the first offending field.
+    pub fn new(
+        task_id: [u8; 16],
+        permit_id: [u8; 16],
+        group: [u8; 32],
+        group_registry: [u8; 32],
+        pairing_id: [u8; 16],
+    ) -> Result<Self, EngineError> {
+        for (field, zero) in [
+            ("task_id", task_id == [0u8; 16]),
+            ("permit_id", permit_id == [0u8; 16]),
+            ("group_registry", group_registry == [0u8; 32]),
+            ("pairing_id", pairing_id == [0u8; 16]),
+        ] {
+            if zero {
+                return Err(EngineError::InvalidAdmissionCtx { field });
+            }
+        }
+        Ok(Self {
+            task_id,
+            permit_id,
+            group,
+            group_registry,
+            pairing_id,
+        })
+    }
+}
+
+/// Receiver-side view of one `TaskOpen` (wave 23, review P1-4): the
+/// complete admission context the decider of [`receive_on_channel`] needs —
+/// the code group, the registry owning it, and the pairing relation the
+/// sender claims. By the time the decider runs, the receiving engine has
+/// already verified the channel identity (TLS-pinned fingerprint) and
+/// refused the all-zero sentinels and a wrong `direction` tag, so the
+/// decider decides on a structurally valid request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionRequest {
+    /// The code group (`TaskOpen.group`, the pairing `code_id` in its
+    /// 32-byte form).
     pub group: [u8; 32],
     /// Registry identity that owns the group (`TaskOpen.group_registry`).
     pub group_registry: [u8; 32],
+    /// Pairing relation the sender claims (`TaskOpen.pairing_id`).
+    pub pairing_id: [u8; 16],
 }
 
 /// Receiver-side admission verdict returned by the decider callback of
@@ -321,9 +414,10 @@ pub enum AdmissionDecision {
 }
 
 /// Receiver-side admission decider callback of [`receive_on_channel`]:
-/// handed the wire `TaskOpen.group` (the 32-byte code id), answers
+/// handed the complete [`AdmissionRequest`] context of the sender's
+/// `TaskOpen` (code group + registry + pairing relation, wave 23), answers
 /// [`AdmissionDecision`].
-pub type AdmissionDecider<'a> = &'a (dyn Fn(&[u8; 32]) -> AdmissionDecision + Send + Sync);
+pub type AdmissionDecider<'a> = &'a (dyn Fn(&AdmissionRequest) -> AdmissionDecision + Send + Sync);
 
 /// Progress events, distinct per direction so the CLI can render honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +549,27 @@ pub enum EngineError {
     AdmissionDenied {
         /// The closed wire denial cause the handshake ended with.
         reason: AdmissionReason,
+    },
+    /// The runtime-injected channel's TLS peer is not the fingerprint the
+    /// spec pins (wave 23, review P1-4). [`send_on_channel`] re-checks, as
+    /// its very first step, the identity condition the legacy [`send`]
+    /// establishes itself at connect time; a mismatched channel is closed
+    /// with [`PEER_MISMATCH_CLOSE_CODE`] before any protocol byte moves —
+    /// not even the sources are scanned.
+    #[error("channel peer {actual} is not the pinned fingerprint {expected}")]
+    PeerMismatch {
+        /// Fingerprint the injected channel actually verified.
+        actual: String,
+        /// Fingerprint the spec pins (hex).
+        expected: String,
+    },
+    /// [`AdmissionCtx::new`] refused an identity field (wave 23): the
+    /// all-zero value is the reserved sentinel and can never key a real
+    /// scheduler task, permit, registry or pairing relation.
+    #[error("invalid admission context: {field} must not be the all-zero sentinel")]
+    InvalidAdmissionCtx {
+        /// Name of the offending field.
+        field: &'static str,
     },
 }
 
@@ -659,6 +774,62 @@ async fn recv_within(
     }
 }
 
+/// Wrap a wire decode failure the way ak-net's stream layer does.
+fn decode_error(err: ak_wire::DecodeError) -> EngineError {
+    EngineError::Stream(ak_net::StreamError::Wire(err))
+}
+
+/// One admission-exchange frame receive (TaskOpen / Admission /
+/// AdmissionAck / Error) under an idle deadline (wave 23). Same two-gate
+/// header discipline as ak-net's `recv_frame` — the all-frame hard cap and
+/// the per-type payload budget both fire on the header alone, before any
+/// payload buffer is allocated — but sourced from
+/// [`ak_wire::payload_budget`] directly: the wave-23 admission payloads
+/// (113/38/32 bytes) grew past the wave-20 mirror table that still governs
+/// ak-net's pre-filter (96/34/32, unchanged for every file-protocol
+/// frame), so admission frames must not pass through it. [`Frame::decode`]
+/// re-validates everything on the assembled bytes, as always.
+async fn recv_admission_frame(
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+) -> Result<Frame, EngineError> {
+    let mut header = [0u8; ak_wire::HEADER_LEN];
+    tokio::time::timeout(idle, rx.recv_exact(&mut header))
+        .await
+        .map_err(|_| EngineError::IdleTimeout(idle))?
+        .map_err(EngineError::Stream)?;
+    let declared = u32::from_be_bytes([header[3], header[4], header[5], header[6]]);
+    if declared as usize > ak_wire::MAX_FRAME_BYTES {
+        return Err(decode_error(ak_wire::DecodeError::Oversized {
+            declared,
+            budget: ak_wire::MAX_FRAME_BYTES as u32,
+        }));
+    }
+    if header[0] != ak_wire::VERSION {
+        return Err(decode_error(ak_wire::DecodeError::BadVersion(header[0])));
+    }
+    let message_type = u16::from_be_bytes([header[1], header[2]]);
+    let Some(budget) = ak_wire::payload_budget(message_type, limits) else {
+        return Err(decode_error(ak_wire::DecodeError::UnknownType(
+            message_type,
+        )));
+    };
+    if u64::from(declared) > budget {
+        return Err(decode_error(ak_wire::DecodeError::Oversized {
+            declared,
+            budget: budget as u32,
+        }));
+    }
+    let mut frame_bytes = header.to_vec();
+    frame_bytes.resize(ak_wire::HEADER_LEN + declared as usize, 0);
+    tokio::time::timeout(idle, rx.recv_exact(&mut frame_bytes[ak_wire::HEADER_LEN..]))
+        .await
+        .map_err(|_| EngineError::IdleTimeout(idle))?
+        .map_err(EngineError::Stream)?;
+    Frame::decode(&frame_bytes, limits).map_err(decode_error)
+}
+
 fn unexpected(message: Message) -> EngineError {
     EngineError::PeerError {
         code: ErrorCode::ProtocolUnsupported,
@@ -686,6 +857,13 @@ const MAX_STALE_PERMIT_RESUBMITS: usize = 3;
 /// admission, so the sender observes the decision frame instead of a
 /// connection loss (bounded; see `admission_handshake_receiver`).
 const ADMISSION_DENY_HOLD: Duration = Duration::from_millis(300);
+
+/// Lease the receiver answers a granted [`Admission`] with, in milliseconds
+/// (wave 23, scheduler.md §6: tentative permits carry a bounded lease and
+/// expire on their own). The receiver holds the tentative permit only until
+/// the sender's `AdmissionAck` or the idle deadline, so the lease mirrors
+/// the default idle budget. Denials carry `0`.
+const ADMISSION_LEASE_MS: u32 = 30_000;
 
 /// Fresh permit id for one TaskOpen attempt: domain-separated blake3 over
 /// the task id, the attempt ordinal and the wall clock. Uniqueness per
@@ -718,7 +896,14 @@ async fn admission_handshake_sender(
 ) -> Result<(), EngineError> {
     let mut attempt = 0usize;
     loop {
-        let permit_id = fresh_permit_id(&ctx.task_id, attempt);
+        // Attempt 0 runs on the runtime-minted permit id (AdmissionCtx::new
+        // guaranteed it non-zero); every StalePermit resubmit derives a
+        // fresh one under the bounded budget.
+        let permit_id = if attempt == 0 {
+            ctx.permit_id
+        } else {
+            fresh_permit_id(&ctx.task_id, attempt)
+        };
         tx.send_frame(&Frame {
             version: ak_wire::VERSION,
             message: Message::TaskOpen {
@@ -726,11 +911,15 @@ async fn admission_handshake_sender(
                 permit_id,
                 group: ctx.group,
                 group_registry: ctx.group_registry,
+                pairing_id: ctx.pairing_id,
+                // The opener of a TaskOpen is by definition the sending
+                // side (the receiver answers with Admission).
+                direction: DIRECTION_SEND,
             },
         })
         .await?;
         attempt += 1;
-        match recv_within(rx, limits, idle).await? {
+        match recv_admission_frame(rx, limits, idle).await? {
             Frame {
                 message:
                     Message::Admission {
@@ -738,6 +927,7 @@ async fn admission_handshake_sender(
                         permit_id: answer_permit,
                         granted,
                         reason,
+                        lease_ms,
                     },
                 ..
             } => {
@@ -749,6 +939,11 @@ async fn admission_handshake_sender(
                 if granted {
                     if reason != AdmissionReason::Ok {
                         return Err(protocol_error("granted admission must carry reason ok"));
+                    }
+                    if lease_ms == 0 {
+                        return Err(protocol_error(
+                            "granted admission must carry a positive lease",
+                        ));
                     }
                     // Final handshake step: the sender confirms it acts on
                     // the granted permit, releasing the tentative state.
@@ -780,12 +975,15 @@ async fn admission_handshake_sender(
     }
 }
 
-/// Receiver side of the scheduler admission handshake (wave 21): read
-/// TaskOpen, hand the code group to the caller's decider, answer
-/// `Admission`, and — only on grant — wait for `AdmissionAck` before the
-/// frozen receive body runs. Returns the task id that keys the receiver's
-/// per-task staging tree. A denial is answered on the wire and fails the
-/// call locally with the same reason; no Offer is ever read afterwards.
+/// Receiver side of the scheduler admission handshake (wave 21, hardened
+/// wave 23): read TaskOpen, refuse the wire-level sentinels and direction
+/// violations, hand the *complete* admission context ([`AdmissionRequest`]:
+/// code group + registry + pairing relation) to the caller's decider,
+/// answer `Admission` (a grant carries the bounded [`ADMISSION_LEASE_MS`]
+/// lease), and — only on grant — wait for `AdmissionAck` before the frozen
+/// receive body runs. Returns the task id that keys the receiver's per-task
+/// staging tree. A denial is answered on the wire and fails the call
+/// locally with the same reason; no Offer is ever read afterwards.
 async fn admission_handshake_receiver(
     tx: &mut DirectSendStream,
     rx: &mut DirectRecvStream,
@@ -793,30 +991,61 @@ async fn admission_handshake_receiver(
     idle: Duration,
     decider: AdmissionDecider<'_>,
 ) -> Result<[u8; 16], EngineError> {
-    let (task_id, permit_id, group) = match recv_within(rx, limits, idle).await? {
-        Frame {
-            message:
-                Message::TaskOpen {
-                    job_id,
-                    permit_id,
+    let (task_id, permit_id, request, direction) =
+        match recv_admission_frame(rx, limits, idle).await? {
+            Frame {
+                message:
+                    Message::TaskOpen {
+                        job_id,
+                        permit_id,
+                        group,
+                        group_registry,
+                        pairing_id,
+                        direction,
+                    },
+                ..
+            } => (
+                job_id,
+                permit_id,
+                AdmissionRequest {
                     group,
-                    ..
+                    group_registry,
+                    pairing_id,
                 },
-            ..
-        } => (job_id, permit_id, group),
-        Frame {
-            message: Message::Error { code, message },
-            ..
-        } => return Err(EngineError::PeerError { code, message }),
-        other => return Err(unexpected(other.message)),
-    };
+                direction,
+            ),
+            Frame {
+                message: Message::Error { code, message },
+                ..
+            } => return Err(EngineError::PeerError { code, message }),
+            other => return Err(unexpected(other.message)),
+        };
     // The all-zero task id is the reserved sentinel (it can never own a
     // staging tree), so it is a protocol violation here, not a decider
-    // question.
+    // question. Wave 23 extends the same fail-closed rule to the pairing
+    // and registry identities — neither can be the all-zero sentinel of a
+    // real Ready relation (mirroring what AdmissionCtx::new enforces on
+    // the sending side) — and to the direction tag: a TaskOpen is opened
+    // by the sending side by definition.
     if task_id == [0u8; 16] {
         return Err(protocol_error("task id must not be the all-zero sentinel"));
     }
-    let (granted, reason) = match decider(&group) {
+    if request.pairing_id == [0u8; 16] {
+        return Err(protocol_error(
+            "pairing id must not be the all-zero sentinel",
+        ));
+    }
+    if request.group_registry == [0u8; 32] {
+        return Err(protocol_error(
+            "group registry must not be the all-zero sentinel",
+        ));
+    }
+    if direction != DIRECTION_SEND {
+        return Err(protocol_error(
+            "TaskOpen must be opened by the sending side",
+        ));
+    }
+    let (granted, reason) = match decider(&request) {
         AdmissionDecision::Admit => (true, AdmissionReason::Ok),
         AdmissionDecision::Deny(reason) => (false, reason),
     };
@@ -827,6 +1056,7 @@ async fn admission_handshake_receiver(
             permit_id,
             granted,
             reason,
+            lease_ms: if granted { ADMISSION_LEASE_MS } else { 0 },
         },
     })
     .await?;
@@ -841,7 +1071,7 @@ async fn admission_handshake_receiver(
         tokio::time::sleep(ADMISSION_DENY_HOLD).await;
         return Err(EngineError::AdmissionDenied { reason });
     }
-    match recv_within(rx, limits, idle).await? {
+    match recv_admission_frame(rx, limits, idle).await? {
         Frame {
             message:
                 Message::AdmissionAck {
@@ -1880,15 +2110,22 @@ pub async fn send(
     send_channel_body(channel, &spec, prepared, started, None, progress).await
 }
 
-/// Wave-21 on-channel send entry (scheduler.md §6): run the whole send
-/// protocol on an already-connected [`DirectChannel`] the runtime handed
-/// in. Differences from [`send`], and only these:
+/// Wave-21 on-channel send entry (scheduler.md §6), hardened wave 23: run
+/// the whole send protocol on an already-connected [`DirectChannel`] the
+/// runtime handed in. Differences from [`send`], and only these:
 ///
+/// * **pinned-identity re-check (wave 23, review P1-4), the first thing
+///   this entry does**: the channel's verified TLS peer fingerprint must
+///   equal `spec.pinned` — the identity condition the legacy [`send`]
+///   establishes itself at connect time. A mismatch returns
+///   [`EngineError::PeerMismatch`] and closes the connection with
+///   [`PEER_MISMATCH_CLOSE_CODE`] before any protocol byte moves (not even
+///   the sources are scanned);
 /// * no endpoint bind/connect here (the runtime owns the connection);
 /// * the Hello advertises `CAP_SCHEDULER` and, when the peer does too
 ///   ([`ak_wire::scheduler_frames_allowed`]), the scheduler admission
 ///   handshake runs before the frozen Offer→FinalAck path:
-///   `TaskOpen(task_id, group, group_registry, permit)` → wait
+///   `TaskOpen(task_id, group, group_registry, pairing, permit)` → wait
 ///   `Admission` → on grant send `AdmissionAck` and continue; on deny
 ///   return [`EngineError::AdmissionDenied`] with the closed wire reason
 ///   (`StalePermit` resubmits a fresh TaskOpen under a bounded budget);
@@ -1905,6 +2142,20 @@ pub async fn send_on_channel(
     admission_ctx: AdmissionCtx,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, EngineError> {
+    // Pinned-identity re-check (wave 23, review P1-4) — before anything
+    // else, including the source scan: the runtime owns the connection,
+    // so the engine re-derives the identity guarantee itself.
+    if channel.peer_fingerprint() != &spec.pinned {
+        let mismatch = EngineError::PeerMismatch {
+            actual: channel.peer_fingerprint().to_hex(),
+            expected: spec.pinned.to_hex(),
+        };
+        channel.close(
+            PEER_MISMATCH_CLOSE_CODE,
+            b"channel peer is not the pinned fingerprint",
+        );
+        return Err(mismatch);
+    }
     let started = Instant::now();
     let prepared = prepare_send(&spec)?;
     // Policy gate: same step-0 refusal for a runtime-provided channel.
@@ -2281,25 +2532,31 @@ pub async fn receive_with_addr(
     .await
 }
 
-/// Wave-21 on-channel receive entry (scheduler.md §6): run one receive on
-/// an already-accepted [`DirectChannel`] the runtime handed in, with the
-/// scheduler admission handshake in front of the frozen receive body.
+/// Wave-21 on-channel receive entry (scheduler.md §6), hardened wave 23:
+/// run one receive on an already-accepted [`DirectChannel`] the runtime
+/// handed in, with the scheduler admission handshake in front of the frozen
+/// receive body.
 ///
 /// * the Hello advertises `CAP_SCHEDULER`; when the peer's does too
 ///   ([`ak_wire::scheduler_frames_allowed`]), the body first reads the
-///   sender's `TaskOpen` and hands its code group to `admission_decider`:
-///   [`AdmissionDecision::Admit`] answers a granted `Admission`, waits for
-///   the sender's `AdmissionAck`, and only then accepts the Offer;
+///   sender's `TaskOpen` and hands its *complete* admission context
+///   ([`AdmissionRequest`]: code group + registry + pairing relation) to
+///   `admission_decider`: [`AdmissionDecision::Admit`] answers a granted
+///   `Admission` (with the bounded lease), waits for the sender's
+///   `AdmissionAck`, and only then accepts the Offer;
 ///   [`AdmissionDecision::Deny`] answers the refusal and fails locally
 ///   with [`EngineError::AdmissionDenied`] — no Offer is read;
 /// * an admitted task stages its `.akpart` files under its own per-task
 ///   tree (`ak_storage::prepare_file_staged`, keyed by the wire task id)
 ///   and the tree is discarded when the task reaches a terminal state
 ///   (completion, or cancellation);
-/// * a peer without `CAP_SCHEDULER` simply runs the frozen v1 body
-///   unstaged — the receiver cannot demand scheduling the sender did not
-///   negotiate, and channel-level consent still applies to whatever the
-///   caller did before handing the channel in.
+/// * a peer without `CAP_SCHEDULER` is refused (wave 23, review P1-4):
+///   this entry exists precisely for scheduled tasks, so a legacy sender
+///   cannot silently downgrade the receive to the unadmitted body — the
+///   call fails with `PROTOCOL_UNSUPPORTED` and the channel closes,
+///   symmetric with the send side's refusal. (The legacy
+///   `receive_with_addr`/`serve_concurrently` entries still run the frozen
+///   unstaged body for their own connections.)
 ///
 /// `spec.bind`/`spec.authorize` are unused here (the channel exists); the
 /// destination, conflict policy, checkpoints, idle timeout and policy gate
@@ -2450,15 +2707,26 @@ async fn receive_job(
     ))
     .await?;
     let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
-    // Scheduled admission (wave 21): only when BOTH Hellos carry the bit
-    // — a legacy sender (no CAP_SCHEDULER) runs the frozen unstaged body,
-    // exactly as before the split.
+    // Scheduled admission (wave 21): only when BOTH Hellos carry the bit.
+    // Wave 23 (review P1-4) closes the downgrade hole: when this call
+    // carries a decider (i.e. it is `receive_on_channel`, which exists
+    // precisely for scheduled tasks), a sender without CAP_SCHEDULER is
+    // refused with PROTOCOL_UNSUPPORTED and the channel closes — the
+    // frozen unstaged body is reserved for the legacy entries, whose
+    // `admission` is None.
     let staged_task: Option<[u8; 16]> = if scheduler_frames_allowed(capabilities, peer_caps) {
         let decider = admission.expect("CAP_SCHEDULER is advertised only with a decider");
         Some(
             admission_handshake_receiver(&mut tx, &mut rx, &limits, spec.idle_timeout, decider)
                 .await?,
         )
+    } else if admission.is_some() {
+        return Err(EngineError::PeerError {
+            code: ErrorCode::ProtocolUnsupported,
+            message: "peer does not advertise CAP_SCHEDULER; \
+                      scheduled task admission cannot run"
+                .into(),
+        });
     } else {
         None
     };
@@ -6502,13 +6770,12 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A fixed admission context for the on-channel tests: one task id,
-    /// one code group, one registry.
+    /// one runtime-minted permit, one code group, one registry, one
+    /// pairing relation. Built through the validating constructor like
+    /// production code.
     fn test_admission_ctx(task_id: [u8; 16]) -> AdmissionCtx {
-        AdmissionCtx {
-            task_id,
-            group: [0x77; 32],
-            group_registry: [0x91; 32],
-        }
+        AdmissionCtx::new(task_id, [0x5C; 16], [0x77; 32], [0x91; 32], [0xB3; 16])
+            .expect("test admission context is valid")
     }
 
     /// A fake wire peer holding one open bidirectional stream plus the
@@ -6632,16 +6899,52 @@ mod tests {
     }
 
     /// Read the next TaskOpen from the fake's stream (the engine sender
-    /// just produced one).
-    async fn read_task_open(fake: &mut FakePeer) -> (JobId, [u8; 16], [u8; 32], [u8; 32]) {
-        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
+    /// just produced one) through the admission-frame reader, so the
+    /// wave-23 113-byte payload passes the header budget gate. Returns
+    /// every field: job, permit, group, registry, pairing, direction.
+    async fn read_task_open(
+        fake: &mut FakePeer,
+    ) -> (JobId, [u8; 16], [u8; 32], [u8; 32], [u8; 16], u8) {
+        match recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .message
+        {
             Message::TaskOpen {
                 job_id,
                 permit_id,
                 group,
                 group_registry,
-            } => (job_id, permit_id, group, group_registry),
+                pairing_id,
+                direction,
+            } => (
+                job_id,
+                permit_id,
+                group,
+                group_registry,
+                pairing_id,
+                direction,
+            ),
             other => panic!("expected TaskOpen, got {other:?}"),
+        }
+    }
+
+    /// Read the next Admission from the fake's stream through the
+    /// admission-frame reader (the wave-23 38-byte payload).
+    async fn read_admission(fake: &mut FakePeer) -> (JobId, [u8; 16], bool, AdmissionReason, u32) {
+        match recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .message
+        {
+            Message::Admission {
+                job_id,
+                permit_id,
+                granted,
+                reason,
+                lease_ms,
+            } => (job_id, permit_id, granted, reason, lease_ms),
+            other => panic!("expected Admission, got {other:?}"),
         }
     }
 
@@ -6688,8 +6991,9 @@ mod tests {
 
     /// Granted full round trip: real send_on_channel against real
     /// receive_on_channel, admission granted, file bytes identical, the
-    /// decider saw exactly the wire group, and the per-task staging tree
-    /// was discarded at the terminal state.
+    /// decider saw exactly the wire admission context (group + registry +
+    /// pairing, wave 23), the grant carried the bounded lease, and the
+    /// per-task staging tree was discarded at the terminal state.
     #[tokio::test]
     async fn on_channel_admission_granted_completes_full_round_trip() {
         let src = tempfile::tempdir().unwrap();
@@ -6708,11 +7012,11 @@ mod tests {
 
         let task_id: [u8; 16] = [0x42; 16];
         let ctx = test_admission_ctx(task_id);
-        let seen_groups: Arc<std::sync::Mutex<Vec<[u8; 32]>>> =
+        let seen_requests: Arc<std::sync::Mutex<Vec<AdmissionRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let decider_groups = Arc::clone(&seen_groups);
-        let decider = move |group: &[u8; 32]| {
-            decider_groups.lock().unwrap().push(*group);
+        let decider_requests = Arc::clone(&seen_requests);
+        let decider = move |request: &AdmissionRequest| {
+            decider_requests.lock().unwrap().push(*request);
             AdmissionDecision::Admit
         };
 
@@ -6730,7 +7034,17 @@ mod tests {
         assert_eq!(send_report.bytes, payload.len() as u64);
         assert_eq!(recv_report.bytes, payload.len() as u64);
         assert_eq!(fs::read(dst.path().join("granted.bin")).unwrap(), payload);
-        assert_eq!(*seen_groups.lock().unwrap(), vec![ctx.group]);
+        // Wave 23: the decider saw the complete admission context — the
+        // code group, the registry and the pairing relation the sender's
+        // AdmissionCtx carried.
+        assert_eq!(
+            *seen_requests.lock().unwrap(),
+            vec![AdmissionRequest {
+                group: ctx.group,
+                group_registry: ctx.group_registry,
+                pairing_id: ctx.pairing_id,
+            }]
+        );
         // Terminal-state cleanup: the task's staging tree is gone.
         assert!(
             !ak_storage::staging_path(dst.path(), task_id).exists(),
@@ -6750,16 +7064,21 @@ mod tests {
         let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
         let mut fake = fake_task.await.unwrap();
 
-        let (job_id, permit_id, group, registry) = read_task_open(&mut fake).await;
+        let (job_id, permit_id, group, registry, pairing, direction) =
+            read_task_open(&mut fake).await;
         assert_eq!(job_id, task_id);
+        assert_eq!(permit_id, [0x5C; 16], "attempt 0 runs on the ctx permit");
         assert_eq!(group, [0x77; 32]);
         assert_eq!(registry, [0x91; 32]);
+        assert_eq!(pairing, [0xB3; 16]);
+        assert_eq!(direction, ak_wire::DIRECTION_SEND);
         fake.tx
             .send_frame(&wire(Message::Admission {
                 job_id,
                 permit_id,
                 granted: false,
                 reason: AdmissionReason::SerialWait,
+                lease_ms: 0,
             }))
             .await
             .unwrap();
@@ -6792,13 +7111,14 @@ mod tests {
         let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
         let mut fake = fake_task.await.unwrap();
 
-        let (job_id, permit_id, _, _) = read_task_open(&mut fake).await;
+        let (job_id, permit_id, _, _, _, _) = read_task_open(&mut fake).await;
         fake.tx
             .send_frame(&wire(Message::Admission {
                 job_id,
                 permit_id,
                 granted: false,
                 reason: AdmissionReason::Capacity,
+                lease_ms: 0,
             }))
             .await
             .unwrap();
@@ -6831,18 +7151,20 @@ mod tests {
         let mut fake = fake_task.await.unwrap();
 
         // First attempt: stale.
-        let (job_id, permit_a, _, _) = read_task_open(&mut fake).await;
+        let (job_id, permit_a, _, _, _, _) = read_task_open(&mut fake).await;
+        assert_eq!(permit_a, [0x5C; 16], "attempt 0 runs on the ctx permit");
         fake.tx
             .send_frame(&wire(Message::Admission {
                 job_id,
                 permit_id: permit_a,
                 granted: false,
                 reason: AdmissionReason::StalePermit,
+                lease_ms: 0,
             }))
             .await
             .unwrap();
         // Second attempt: grant, and expect the AdmissionAck.
-        let (job_id, permit_b, _, _) = read_task_open(&mut fake).await;
+        let (job_id, permit_b, _, _, _, _) = read_task_open(&mut fake).await;
         assert_ne!(permit_a, permit_b, "resubmit must use a fresh permit id");
         assert_eq!(job_id, task_id);
         fake.tx
@@ -6851,6 +7173,7 @@ mod tests {
                 permit_id: permit_b,
                 granted: true,
                 reason: AdmissionReason::Ok,
+                lease_ms: ADMISSION_LEASE_MS,
             }))
             .await
             .unwrap();
@@ -6932,7 +7255,7 @@ mod tests {
         let spec = on_channel_recv_spec(dst.path(), receiver_identity);
         let receiver = tokio::spawn(async move {
             let channel = endpoint.accept(&|_| true).await.unwrap();
-            let decider = |_: &[u8; 32]| AdmissionDecision::Deny(AdmissionReason::Capacity);
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Deny(AdmissionReason::Capacity);
             receive_on_channel(channel, spec, &decider, &noop).await
         });
 
@@ -6945,23 +7268,17 @@ mod tests {
                 permit_id: [9; 16],
                 group: [0x77; 32],
                 group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
             }))
             .await
             .unwrap();
-        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
-            Message::Admission {
-                job_id,
-                permit_id,
-                granted,
-                reason,
-            } => {
-                assert_eq!(job_id, task_id);
-                assert_eq!(permit_id, [9; 16]);
-                assert!(!granted);
-                assert_eq!(reason, AdmissionReason::Capacity);
-            }
-            other => panic!("expected Admission, got {other:?}"),
-        }
+        let (job_id, permit_id, granted, reason, lease_ms) = read_admission(&mut fake).await;
+        assert_eq!(job_id, task_id);
+        assert_eq!(permit_id, [9; 16]);
+        assert!(!granted);
+        assert_eq!(reason, AdmissionReason::Capacity);
+        assert_eq!(lease_ms, 0, "denials carry no lease");
         let err = receiver
             .await
             .unwrap()
@@ -6996,7 +7313,7 @@ mod tests {
         spec.idle_timeout = Duration::from_secs(1);
         let receiver = tokio::spawn(async move {
             let channel = endpoint.accept(&|_| true).await.unwrap();
-            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
             receive_on_channel(channel, spec, &decider, &noop).await
         });
 
@@ -7009,18 +7326,18 @@ mod tests {
                 permit_id: [4; 16],
                 group: [0x77; 32],
                 group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
             }))
             .await
             .unwrap();
-        match fake.rx.recv_frame(&engine_limits()).await.unwrap().message {
-            Message::Admission {
-                granted, reason, ..
-            } => {
-                assert!(granted);
-                assert_eq!(reason, AdmissionReason::Ok);
-            }
-            other => panic!("expected granted Admission, got {other:?}"),
-        }
+        let (_, _, granted, reason, lease_ms) = read_admission(&mut fake).await;
+        assert!(granted);
+        assert_eq!(reason, AdmissionReason::Ok);
+        assert_eq!(
+            lease_ms, ADMISSION_LEASE_MS,
+            "grants carry the bounded lease"
+        );
         // Deliberately never send the AdmissionAck.
         let err = receiver
             .await
@@ -7048,7 +7365,7 @@ mod tests {
         let spec = on_channel_recv_spec(dst.path(), receiver_identity);
         let receiver = tokio::spawn(async move {
             let channel = endpoint.accept(&|_| true).await.unwrap();
-            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
             receive_on_channel(channel, spec, &decider, &noop).await
         });
 
@@ -7060,6 +7377,8 @@ mod tests {
                 permit_id: [1; 16],
                 group: [0x77; 32],
                 group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
             }))
             .await
             .unwrap();
@@ -7077,6 +7396,374 @@ mod tests {
             ),
             "got: {err:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 23: on-channel hardening (review P1-4)
+    // ------------------------------------------------------------------
+
+    /// AdmissionCtx::new is the controlled constructor: a valid identity
+    /// set builds the context, and every all-zero field is refused with the
+    /// dedicated error naming the offender — the context cannot be
+    /// assembled by field assignment from outside the crate.
+    #[test]
+    fn admission_ctx_constructor_validates_every_identity_field() {
+        let ctx = AdmissionCtx::new([1; 16], [2; 16], [3; 32], [4; 32], [5; 16])
+            .expect("a fully non-zero identity set is valid");
+        assert_eq!(
+            ctx,
+            AdmissionCtx {
+                task_id: [1; 16],
+                permit_id: [2; 16],
+                group: [3; 32],
+                group_registry: [4; 32],
+                pairing_id: [5; 16],
+            }
+        );
+        for (field, attempt) in [
+            (
+                "task_id",
+                AdmissionCtx::new([0; 16], [2; 16], [3; 32], [4; 32], [5; 16]),
+            ),
+            (
+                "permit_id",
+                AdmissionCtx::new([1; 16], [0; 16], [3; 32], [4; 32], [5; 16]),
+            ),
+            (
+                "group_registry",
+                AdmissionCtx::new([1; 16], [2; 16], [3; 32], [0; 32], [5; 16]),
+            ),
+            (
+                "pairing_id",
+                AdmissionCtx::new([1; 16], [2; 16], [3; 32], [4; 32], [0; 16]),
+            ),
+        ] {
+            match attempt {
+                Err(EngineError::InvalidAdmissionCtx { field: named }) => {
+                    assert_eq!(named, field, "the error must name the offending field");
+                }
+                other => panic!("all-zero {field} must be refused, got {other:?}"),
+            }
+        }
+        // The all-zero group is deliberately NOT refused by the constructor
+        // (the wave-23 contract lists task/permit/registry/pairing); the
+        // receiver-side decider remains the authority over code groups.
+        assert!(AdmissionCtx::new([1; 16], [2; 16], [0; 32], [4; 32], [5; 16]).is_ok());
+    }
+
+    /// A runtime-injected channel whose TLS peer is NOT the pinned
+    /// fingerprint is refused as the very first step of `send_on_channel`
+    /// (review P1-4): PeerMismatch, connection closed with the dedicated
+    /// code, and not one protocol byte (no stream, no Hello, no TaskOpen).
+    #[tokio::test]
+    async fn send_on_channel_refuses_a_channel_to_the_wrong_peer() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"wrong peer");
+        let task_id: [u8; 16] = [0x88; 16];
+
+        // A real loopback peer the channel actually connects to...
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let fp = receiver_key.fingerprint();
+
+        // ...but the spec pins a DIFFERENT device's fingerprint.
+        let pinned = DeviceKeyPair::generate().fingerprint();
+        let pinned_for_spec = pinned;
+        let sender = tokio::spawn(async move {
+            let key = DeviceKeyPair::generate();
+            let identity = ak_identity::tls::make_self_signed(&key);
+            let spec = on_channel_send_spec(src.path(), addr, pinned_for_spec, identity);
+            let dialer =
+                DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &spec.identity)
+                    .await
+                    .unwrap();
+            // Connect to the REAL peer so the channel itself is healthy —
+            // only the pinned identity check can refuse it.
+            let channel = dialer.connect(spec.peer, &fp).await.unwrap();
+            send_on_channel(channel, spec, test_admission_ctx(task_id), &noop).await
+        });
+
+        // The peer observes the refusal as a closed connection on which no
+        // stream was ever opened — not even the engine's Hello moved.
+        let observer = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let stream = channel.accept_bi().await;
+            assert!(
+                stream.is_err(),
+                "no stream may be opened after a pinned-identity refusal"
+            );
+        });
+
+        let err = sender
+            .await
+            .unwrap()
+            .expect_err("a channel to the wrong peer must be refused");
+        match &err {
+            EngineError::PeerMismatch { actual, expected } => {
+                assert_eq!(actual, &fp.to_hex(), "actual peer is the connected one");
+                assert_eq!(expected, &pinned.to_hex());
+            }
+            other => panic!("expected PeerMismatch, got {other:?}"),
+        }
+        observer.await.unwrap();
+    }
+
+    /// The reverse direction of the send-side refusal (the gap review
+    /// P1-4 called out): `receive_on_channel` exists for scheduled tasks,
+    /// so a legacy sender whose Hello lacks CAP_SCHEDULER must NOT be
+    /// silently downgraded into the unadmitted receive body. It fails with
+    /// PROTOCOL_UNSUPPORTED, the channel closes, and nothing is received.
+    #[tokio::test]
+    async fn receive_on_channel_refuses_a_sender_without_scheduler_cap() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec, &decider, &noop).await
+        });
+
+        // A legacy sender: no CAP_SCHEDULER, straight to its Offer. Inline
+        // dial (not fake_sender_side): the engine's refusal-close races the
+        // fake's read of the engine's Hello, so both outcomes are accepted
+        // — what the test pins down is the refusal itself, below.
+        let sender_key = DeviceKeyPair::generate();
+        let sender_identity = ak_identity::tls::make_self_signed(&sender_key);
+        let sender_endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_identity)
+                .await
+                .unwrap();
+        let channel = sender_endpoint
+            .connect(addr, &receiver_key.fingerprint())
+            .await
+            .unwrap();
+        let stream = channel.open_bi().await.unwrap();
+        let (mut tx, mut rx) = stream.split();
+        tx.send_frame(&hello_frame("fake-send", &sender_identity, CAP_RESUME))
+            .await
+            .unwrap();
+        let _ = rx.recv_frame(&engine_limits()).await;
+        let mut fake = FakePeer {
+            tx,
+            rx,
+            _channel: channel,
+            _endpoint: sender_endpoint,
+        };
+        // The Offer write itself may also race the refusal-close; what
+        // matters is that the engine never reads it as an unadmitted
+        // receive.
+        let _ = fake
+            .tx
+            .send_frame(&wire(Message::Offer {
+                job_id: [0x9; 16],
+                root_name: "legacy".into(),
+                file_count: 1,
+                total_bytes: 1,
+                chunk_size: 1024,
+            }))
+            .await;
+
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("a legacy sender must not be downgraded into the receive body");
+        assert!(
+            matches!(
+                &err,
+                EngineError::PeerError {
+                    code: ErrorCode::ProtocolUnsupported,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        // The engine's own Hello was its last byte; the connection is gone
+        // and nothing was written to the destination.
+        assert_wire_silent_after(&mut fake).await;
+        assert_eq!(
+            fs::read_dir(dst.path()).unwrap().count(),
+            0,
+            "no file may land from a refused legacy sender"
+        );
+    }
+
+    /// Wire-level fail-closed checks in front of the decider (wave 23): a
+    /// TaskOpen with the all-zero pairing id, the all-zero registry, or a
+    /// recv-direction tag is a protocol violation — the decider is never
+    /// consulted, the call fails with PROTOCOL_UNSUPPORTED and no staging
+    /// appears. Mirrors `AdmissionCtx::new` on the sending side.
+    #[tokio::test]
+    async fn receive_on_channel_refuses_sentinel_and_wrong_direction_task_opens() {
+        for case in ["zero pairing id", "zero registry", "recv direction"] {
+            let dst = tempfile::tempdir().unwrap();
+            let receiver_key = DeviceKeyPair::generate();
+            let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+            let endpoint =
+                DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                    .await
+                    .unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+            let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&consulted);
+            let receiver = tokio::spawn(async move {
+                let channel = endpoint.accept(&|_| true).await.unwrap();
+                let decider = move |_: &AdmissionRequest| {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    AdmissionDecision::Admit
+                };
+                receive_on_channel(channel, spec, &decider, &noop).await
+            });
+
+            let mut fake =
+                fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER)
+                    .await;
+            let task_id: [u8; 16] = [0x99; 16];
+            fake.tx
+                .send_frame(&wire(Message::TaskOpen {
+                    job_id: task_id,
+                    permit_id: [7; 16],
+                    group: [0x77; 32],
+                    group_registry: match case {
+                        "zero registry" => [0u8; 32],
+                        _ => [0x91; 32],
+                    },
+                    pairing_id: match case {
+                        "zero pairing id" => [0u8; 16],
+                        _ => [0xB3; 16],
+                    },
+                    direction: match case {
+                        "recv direction" => ak_wire::DIRECTION_RECV,
+                        _ => ak_wire::DIRECTION_SEND,
+                    },
+                }))
+                .await
+                .unwrap();
+
+            let err = receiver.await.unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    EngineError::PeerError {
+                        code: ErrorCode::ProtocolUnsupported,
+                        ..
+                    }
+                ),
+                "{case}: got {err:?}"
+            );
+            assert!(
+                !consulted.load(std::sync::atomic::Ordering::SeqCst),
+                "{case}: the decider must not be consulted"
+            );
+            assert!(
+                !ak_storage::staging_path(dst.path(), task_id).exists(),
+                "{case}: no staging may appear"
+            );
+        }
+    }
+
+    /// A wave-20-length TaskOpen (96-byte payload, before pairing_id and
+    /// direction existed) is rejected on a real channel — the same-type
+    /// shorter frame runs out mid-field; the two versions do not
+    /// interoperate (both ends must ship the same version).
+    #[tokio::test]
+    async fn receive_on_channel_refuses_wave_20_length_task_open() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
+            receive_on_channel(channel, spec, &decider, &noop).await
+        });
+
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        // Hand-crafted wave-20 frame: job(16) + permit(16) + group(32)
+        // + registry(32) = 96 payload bytes, no pairing_id/direction.
+        let task_id: [u8; 16] = [0xAA; 16];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&task_id);
+        payload.extend_from_slice(&[7u8; 16]);
+        payload.extend_from_slice(&[0x77u8; 32]);
+        payload.extend_from_slice(&[0x91u8; 32]);
+        assert_eq!(payload.len(), 96);
+        let mut bytes = vec![ak_wire::VERSION];
+        bytes.extend_from_slice(&ak_wire::TYPE_TASK_OPEN.to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        fake.tx.send_bytes(&bytes).await.unwrap();
+
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("the wave-20 frame must be rejected");
+        assert!(
+            matches!(err, EngineError::Stream(_)),
+            "decode must reject the stale length, got {err:?}"
+        );
+        assert!(!ak_storage::staging_path(dst.path(), task_id).exists());
+    }
+
+    /// A grant must carry a positive lease (wave 23): the sender refuses a
+    /// granted Admission with lease_ms = 0 as a protocol violation and
+    /// stays wire-silent afterwards.
+    #[tokio::test]
+    async fn on_channel_granted_admission_with_zero_lease_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        write(&src.path().join("f.bin"), b"no lease");
+        let task_id: [u8; 16] = [0xBB; 16];
+
+        let (fake_task, addr, fp) = fake_receiver_side(CAP_RESUME | CAP_SCHEDULER).await;
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, fp, task_id);
+        let mut fake = fake_task.await.unwrap();
+
+        let (job_id, permit_id, _, _, _, _) = read_task_open(&mut fake).await;
+        fake.tx
+            .send_frame(&wire(Message::Admission {
+                job_id,
+                permit_id,
+                granted: true,
+                reason: AdmissionReason::Ok,
+                lease_ms: 0,
+            }))
+            .await
+            .unwrap();
+
+        let err = sender
+            .await
+            .unwrap()
+            .expect_err("a granted admission with a zero lease must be refused");
+        assert!(
+            matches!(
+                &err,
+                EngineError::PeerError {
+                    code: ErrorCode::ProtocolUnsupported,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        // No AdmissionAck, no Offer: the handshake failed closed.
+        assert_wire_silent_after(&mut fake).await;
     }
 
     /// Hand-written full send protocol against receive_on_channel with a
@@ -7114,7 +7801,7 @@ mod tests {
         spec1.idle_timeout = Duration::from_secs(5);
         let receiver1 = tokio::spawn(async move {
             let channel = endpoint.accept(&|_| true).await.unwrap();
-            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
             receive_on_channel(channel, spec1, &decider, &noop).await
         });
         let mut fake = fake_sender_side(addr, pinned, CAP_RESUME | CAP_SCHEDULER).await;
@@ -7124,13 +7811,13 @@ mod tests {
                 permit_id: [2; 16],
                 group: [0x77; 32],
                 group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
             }))
             .await
             .unwrap();
-        match fake.rx.recv_frame(&limits).await.unwrap().message {
-            Message::Admission { granted, .. } => assert!(granted),
-            other => panic!("expected grant, got {other:?}"),
-        }
+        let (_, _, granted, _, _) = read_admission(&mut fake).await;
+        assert!(granted);
         fake.tx
             .send_frame(&wire(Message::AdmissionAck {
                 job_id: task_id,
@@ -7235,7 +7922,7 @@ mod tests {
         spec2.idle_timeout = Duration::from_secs(5);
         let receiver2 = tokio::spawn(async move {
             let channel = endpoint2.accept(&|_| true).await.unwrap();
-            let decider = |_: &[u8; 32]| AdmissionDecision::Admit;
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
             receive_on_channel(channel, spec2, &decider, &noop).await
         });
 
@@ -7252,13 +7939,13 @@ mod tests {
                 permit_id: [3; 16],
                 group: [0x77; 32],
                 group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
             }))
             .await
             .unwrap();
-        match fake2.rx.recv_frame(&limits).await.unwrap().message {
-            Message::Admission { granted, .. } => assert!(granted),
-            other => panic!("expected grant, got {other:?}"),
-        }
+        let (_, _, granted, _, _) = read_admission(&mut fake2).await;
+        assert!(granted);
         fake2
             .tx
             .send_frame(&wire(Message::AdmissionAck {

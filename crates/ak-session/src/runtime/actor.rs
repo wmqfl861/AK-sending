@@ -119,6 +119,14 @@ struct ShutdownProgress {
 /// is a generous safety bound, not the expected duration).
 const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Build a real actor command channel for in-crate tests (the same
+/// bounded kind the runtime owns), so executors can be driven through a
+/// genuine [`ProgressSink`](crate::runtime::ProgressSink).
+#[cfg(test)]
+pub(crate) fn test_command_channel() -> (mpsc::Sender<Command>, mpsc::Receiver<Command>) {
+    mpsc::channel(64)
+}
+
 /// The scheduler actor (see the module docs).
 pub(crate) struct SchedulerActor {
     core: SchedulerCore,
@@ -659,8 +667,13 @@ impl SchedulerActor {
         let sink = ProgressSink::new(self.cmd_tx.clone());
         let handle = TaskHandle::new(task);
         let driver = tokio::spawn(async move {
-            let pairing_id = match spec.pairing.clone() {
-                PairingPlan::Ready { pairing_id } => pairing_id,
+            // Pairing resolution: `Local` skips the signaling plane
+            // entirely (a resident bind/accept listener has no session to
+            // open toward a still-unknown peer); `Ready` has its relation;
+            // `Redeem` finishes the A3 transcript first.
+            let resolved = match spec.pairing.clone() {
+                PairingPlan::Local => None,
+                PairingPlan::Ready { pairing_id } => Some(pairing_id),
                 PairingPlan::Redeem { request } => {
                     // WaitingPairing → redeem → confirm (A3 transcript).
                     // Wave 21 delivered the real transcript crypto in
@@ -689,7 +702,7 @@ impl SchedulerActor {
                         proof: [0u8; 96],
                     };
                     match transport.confirm_pairing(confirmation).await {
-                        Ok(ready) => ready.pairing_id,
+                        Ok(ready) => Some(ready.pairing_id),
                         Err(err) => {
                             sink.finished(
                                 handle,
@@ -704,20 +717,22 @@ impl SchedulerActor {
                 }
             };
             sink.phase(handle, TaskPhase::WaitingDirect).await;
-            match transport
-                .open_session(pairing_id, spec.group_key.code_id)
-                .await
-            {
-                Ok(_) => {}
-                Err(err) => {
-                    sink.finished(
-                        handle,
-                        FinishOutcome::Failed {
-                            error: err.error_code(),
-                        },
-                    )
-                    .await;
-                    return;
+            if let Some(pairing_id) = resolved {
+                match transport
+                    .open_session(pairing_id, spec.group_key.code_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => {
+                        sink.finished(
+                            handle,
+                            FinishOutcome::Failed {
+                                error: err.error_code(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
             sink.phase(handle, TaskPhase::AwaitingAdmission).await;

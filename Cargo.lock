@@ -149,7 +149,9 @@ name = "ak-session"
 version = "0.1.0"
 dependencies = [
  "ak-core",
+ "ak-engine",
  "ak-identity",
+ "ak-net",
  "ak-signal",
  "ak-store",
  "blake3",

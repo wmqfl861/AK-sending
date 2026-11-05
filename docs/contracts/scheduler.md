@@ -172,28 +172,28 @@ struct GroupQueue {
 
 ```text
 TaskOpen
-  registry_id[32]
-  code_id[16]
+  job_id[16]
+  permit_id[16]
+  group[32]
+  group_registry[32]
   pairing_id[16]
-  transfer_id[16]
   direction:u8
-  attempt:u32
-  admission_nonce[16]
 
 TaskAdmission
-  transfer_id[16]
-  admission_nonce[16]
-  decision:u8          // ready | queued | rejected
+  job_id[16]
   permit_id[16]
+  granted:bool
+  reason:u8
   lease_ms:u32
-  retry_after_ms:u32
-  reason:u16
 
 TaskAdmissionAck
-  transfer_id[16]
+  job_id[16]
   permit_id[16]
-  admission_nonce[16]
 ```
+
+> 上述字段布局与 `ak-wire` 实现冻结（wave-23）：TaskOpen payload 113B（tag 13）、
+> TaskAdmission payload 38B（tag 14）、TaskAdmissionAck payload 32B（tag 15）。
+> `direction`: 0=send 1=recv；`granted`: 0/1；`reason`: 0=ok 1=serial_wait 2=capacity 3=stale_permit。
 
 这组消息只经设备直连传输，**不经 `ak-signal`**。
 

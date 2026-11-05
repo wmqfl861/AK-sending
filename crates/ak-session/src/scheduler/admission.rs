@@ -132,8 +132,9 @@ pub enum DenyReason {
     /// A serial-mode constraint holds: same-code serial with a task active
     /// in this group, or cross-code serial with another group active.
     WaitingSerialMode,
-    /// A numeric cap is exhausted: per-code active tasks, or active code
-    /// connections for a group that is not active yet.
+    /// A numeric cap is exhausted: per-code active tasks, active code
+    /// connections for a group that is not active yet, or the global
+    /// `max_active_tasks` ceiling (wave 24).
     WaitingCapacity,
 }
 
@@ -183,7 +184,9 @@ impl AdmissionDecision {
 ///    (1 under same-code serial) → [`DenyReason::WaitingCapacity`];
 /// 4. the group is not active and the active-code-connection cap is
 ///    exhausted (1 under cross-code serial) → [`DenyReason::WaitingCapacity`];
-/// 5. otherwise [`AdmissionDecision::Admit`].
+/// 5. the total active-task count across all groups reached the global
+///    `max_active_tasks` cap (wave 24) → [`DenyReason::WaitingCapacity`];
+/// 6. otherwise [`AdmissionDecision::Admit`].
 pub fn decide(
     policy: &SchedulerPolicy,
     active_groups: &ActiveGroups,
@@ -209,5 +212,65 @@ pub fn decide(
     if !group_is_active && active_groups.len() >= limits.max_active_groups as usize {
         return AdmissionDecision::Deny(DenyReason::WaitingCapacity);
     }
+    // Wave-24 global cap: no further admission once this many tasks hold
+    // permits, regardless of how they distribute over groups. The cap is
+    // 1..=64, so the `usize` bound always fits the `u32` counter.
+    if active_tasks.total() >= policy.max_active_tasks as u32 {
+        return AdmissionDecision::Deny(DenyReason::WaitingCapacity);
+    }
     AdmissionDecision::Admit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::key::{CodeId, RegistryId};
+
+    fn group(n: u8) -> CodeGroupKey {
+        CodeGroupKey::new(RegistryId::from_bytes([n; 32]), CodeId::from_bytes([n; 16]))
+    }
+
+    /// The wave-24 global cap: parallel/parallel with
+    /// `max_active_tasks = 8`, eight active tasks spread over eight groups
+    /// — the ninth task (of a fresh group, so no per-group or group-count
+    /// cap is in the way) is denied with `WaitingCapacity`.
+    #[test]
+    fn global_active_tasks_cap_denies_the_ninth_task() {
+        let policy = SchedulerPolicy {
+            same_code_mode: SameCodeMode::Parallel,
+            cross_code_mode: CrossCodeMode::Parallel,
+            max_active_tasks_per_code: 4,
+            max_active_code_connections: 16,
+            max_queued_tasks: 256,
+            max_active_tasks: 8,
+            ..SchedulerPolicy::default()
+        };
+        let groups: Vec<CodeGroupKey> = (1..=9).map(group).collect();
+        let active_groups = ActiveGroups::from_keys(groups.iter().take(8).copied());
+        let active_tasks = ActiveTasks::from_counts(groups.iter().take(8).map(|key| (*key, 1)));
+        // Sanity: with a cap of 8 the ninth (fresh group, per-group and
+        // group-count caps nowhere near) is denied by the global cap alone.
+        assert_eq!(
+            decide(&policy, &active_groups, &active_tasks, &groups[8]),
+            AdmissionDecision::Deny(DenyReason::WaitingCapacity)
+        );
+        // The same probe with only 7 active admits: the global cap is the
+        // deciding check.
+        let active_groups_7 = ActiveGroups::from_keys(groups.iter().take(7).copied());
+        let active_tasks_7 = ActiveTasks::from_counts(groups.iter().take(7).map(|key| (*key, 1)));
+        assert_eq!(
+            decide(&policy, &active_groups_7, &active_tasks_7, &groups[8]),
+            AdmissionDecision::Admit
+        );
+        // A larger global cap lifts the denial (the cap, not another check,
+        // was the cause).
+        let lifted = SchedulerPolicy {
+            max_active_tasks: 9,
+            ..policy
+        };
+        assert_eq!(
+            decide(&lifted, &active_groups, &active_tasks, &groups[8]),
+            AdmissionDecision::Admit
+        );
+    }
 }

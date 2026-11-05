@@ -65,26 +65,42 @@ fn json_round_trip_uses_frozen_field_names() {
     assert_eq!(
         json,
         "{\"same_code_mode\":\"parallel\",\"cross_code_mode\":\"serial\",\
-         \"max_active_tasks_per_code\":7,\"max_active_code_groups\":3,\
-         \"max_queued_tasks\":99}"
+         \"max_active_tasks\":16,\"max_active_tasks_per_code\":7,\
+         \"max_active_code_groups\":3,\"max_queued_tasks\":99,\
+         \"max_queued_tasks_per_code\":99,\"max_pending_admissions\":16}"
     );
     assert_eq!(SchedulerPolicy::from_json(&json).unwrap(), policy);
     // Default document is byte-stable.
     assert_eq!(
         SchedulerPolicy::default().to_json(),
         "{\"same_code_mode\":\"serial\",\"cross_code_mode\":\"parallel\",\
-         \"max_active_tasks_per_code\":4,\"max_active_code_groups\":4,\
-         \"max_queued_tasks\":256}"
+         \"max_active_tasks\":16,\"max_active_tasks_per_code\":4,\
+         \"max_active_code_groups\":4,\"max_queued_tasks\":256,\
+         \"max_queued_tasks_per_code\":16,\"max_pending_admissions\":16}"
     );
 }
 
 #[test]
 fn json_parses_the_full_contract_sample() {
+    // Wave 24: the three runtime-bound knobs are stored, so the sample (8/
+    // 64/32) parses to exactly those caps on top of the wave-19 defaults.
     let policy = SchedulerPolicy::from_json(CONTRACT_SAMPLE).unwrap();
-    assert_eq!(policy, SchedulerPolicy::default());
+    assert_eq!(policy.same_code_mode, SameCodeMode::Serial);
+    assert_eq!(policy.cross_code_mode, CrossCodeMode::Parallel);
+    assert_eq!(policy.max_active_tasks_per_code, 4);
+    assert_eq!(policy.max_active_code_connections, 4);
+    assert_eq!(policy.max_queued_tasks, 256);
+    assert_eq!(policy.max_active_tasks, 8);
+    assert_eq!(policy.max_queued_tasks_per_code, 64);
+    assert_eq!(policy.max_pending_admissions, 32);
     // Whitespace-free variant parses identically.
     let compact = CONTRACT_SAMPLE.replace([' ', '\n'], "");
     assert_eq!(SchedulerPolicy::from_json(&compact).unwrap(), policy);
+    // And the parsed sample re-serializes stably.
+    assert_eq!(
+        SchedulerPolicy::from_json(&policy.to_json()).unwrap(),
+        policy
+    );
 }
 
 #[test]

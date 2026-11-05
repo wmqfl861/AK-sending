@@ -61,6 +61,14 @@ pub enum PairingPlan {
         /// The fixed redeem request (A3 `InviteRedeem` shape).
         request: RedeemPayload,
     },
+    /// No signaling-plane round-trip at all (wave 24): the task runs a
+    /// local bind/accept (the daemon's resident receive loop) and goes
+    /// straight from admission to its executor. The driver reports the
+    /// `WaitingDirect`/`AwaitingAdmission` phases and skips
+    /// [`PairingTransport::open_session`](crate::runtime::PairingTransport::open_session):
+    /// a resident listener has no signaling session to open toward the
+    /// still-unknown connecting peer.
+    Local,
 }
 
 /// One submitted transfer task.

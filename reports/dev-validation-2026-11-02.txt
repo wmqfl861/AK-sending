@@ -561,3 +561,17 @@ Android FFI: 双 ABI .so 编译成功；符号门缺 ak_sched_listen_start（契
 
 $ cargo test --workspace → 918/0；signal+persistence 235；dart 107/107；flutter 108/108；
 $ clippy 干净；repo passed；符号门 5/5 通过
+
+## 第二十四次波：调度上限+daemon真接线+Linux+合同检查+攻击测试+BACKLOG纠偏（2026-11-05，4 并行代理）
+# 调度三上限：max_active_tasks/max_queued_tasks_per_code/max_pending_admissions 实现并接入 admission/queue/core（18 新测试）
+# daemon 真接线：--same-code/--cross-code/--invite-code/--registry-fp 触发 RealTransport+SessionRuntime，
+#   接收循环经 SessionHandle.enqueue（真 QUIC 传输，字节一致），不再用 Fake executor
+# RealTransferExecutor：包装 receive_with_addr，完整 §9 相位序列，错误码映射，abort 式取消
+# Linux Flutter runner：CMake+libak_ffi.so 三级探测+BUILD.md（本机无法构建，如实记录）
+# 合同一致性检查：scripts/check_contracts.py 五维自动对齐（wire 预算/FFI 符号/调度配置/错误码/控制面预算）
+#   —— 5/5 PASS（修复 scheduler.md §6 与 wave-23 实现的预算漂移 + parser bool 支持）
+# 攻击与中断测试 19 项：恶意 registry 换钥端到端拒绝/取消后字节数冻结×2/并发存储 Barrier×5/双端策略交集+热码不饿死
+# BACKLOG 纠偏：13 项已完成项勾选（全部经代码验证）；支持矩阵/CHANGELOG/ROADMAP 更新
+
+$ cargo test --workspace → 955/0；dart 107/107；flutter 108/108；
+$ clippy 干净；contracts 5/5 PASS；repo passed

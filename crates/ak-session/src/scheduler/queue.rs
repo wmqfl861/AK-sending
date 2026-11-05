@@ -7,6 +7,9 @@
 //!   length counter — accepting or rejecting an enqueue never scans the
 //!   queued items (the plan calls this out explicitly: no scan, no
 //!   connection, no silent drop of older tasks).
+//! * **Per-code bound (wave 24)**: `enqueue` also rejects once the task's
+//!   own group holds `per_group_capacity` items, so one hot code cannot
+//!   monopolize the whole queue. O(1) against the group's deque length.
 //! * **Same-group FIFO**: tasks of one group leave in arrival order.
 //! * **Group round-robin**: after a group yields one task it rotates to the
 //!   back of the ready ring, so a hot code cannot starve other codes.
@@ -19,9 +22,10 @@ use crate::scheduler::key::{CodeGroupKey, TaskId};
 /// Why an enqueue was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QueueError {
-    /// The queue is at capacity; the enqueue was rejected without scanning
-    /// and without touching any queued item (wire-facing name `QUEUE_FULL`,
-    /// contract §7).
+    /// The queue is at capacity (globally, or for the task's own code
+    /// group); the enqueue was rejected without scanning and without
+    /// touching any queued item (wire-facing name `QUEUE_FULL`, contract
+    /// §7).
     #[error("QUEUE_FULL")]
     QueueFull,
     /// The task id is already queued; ids are unique per submission.
@@ -31,7 +35,7 @@ pub enum QueueError {
 
 /// Bounded FIFO queue with group-level round-robin fairness.
 ///
-/// Invariants (relied on by [`SchedulerCore`](crate::scheduler::core::SchedulerCore)):
+/// Invariants (relied on by [`SchedulerCore`](crate::scheduler::SchedulerCore)):
 ///
 /// * `ready` contains exactly the groups holding at least one queued task,
 ///   in rotation order;
@@ -40,22 +44,41 @@ pub enum QueueError {
 #[derive(Debug, Clone)]
 pub struct FairQueue {
     capacity: usize,
+    per_group_capacity: usize,
     groups: HashMap<CodeGroupKey, VecDeque<TaskId>>,
     ready: VecDeque<CodeGroupKey>,
     index: HashMap<TaskId, CodeGroupKey>,
 }
 
 impl FairQueue {
-    /// Create a queue accepting at most `capacity` items.
+    /// Create a queue accepting at most `capacity` items with no separate
+    /// per-group bound (each group may fill the whole queue).
     ///
     /// # Panics
     ///
     /// Panics if `capacity` is zero; the frozen policy range guarantees
     /// `max_queued_tasks >= 1`.
     pub fn new(capacity: usize) -> Self {
+        Self::with_caps(capacity, usize::MAX)
+    }
+
+    /// Create a queue accepting at most `capacity` items in total and
+    /// `per_group_capacity` items per code group (the wave-24
+    /// `max_queued_tasks_per_code` knob; the global bound is checked
+    /// first, so a per-group bound above the total simply never fires).
+    ///
+    /// # Panics
+    ///
+    /// Panics if either bound is zero.
+    pub fn with_caps(capacity: usize, per_group_capacity: usize) -> Self {
         assert!(capacity >= 1, "queue capacity must be at least 1");
+        assert!(
+            per_group_capacity >= 1,
+            "per-group queue capacity must be at least 1"
+        );
         FairQueue {
             capacity,
+            per_group_capacity,
             groups: HashMap::new(),
             ready: VecDeque::new(),
             index: HashMap::new(),
@@ -67,6 +90,11 @@ impl FairQueue {
         self.capacity
     }
 
+    /// Maximum number of queued items for one code group.
+    pub fn per_group_capacity(&self) -> usize {
+        self.per_group_capacity
+    }
+
     /// Adjust the capacity. Never below the current length: shrinking below
     /// the live backlog keeps the bound for *new* enqueues without dropping
     /// or reordering anything already queued (contract §7: no automatic
@@ -74,6 +102,19 @@ impl FairQueue {
     pub fn set_capacity(&mut self, capacity: usize) {
         assert!(capacity >= 1, "queue capacity must be at least 1");
         self.capacity = capacity.max(self.index.len());
+    }
+
+    /// Adjust the per-group capacity. Never below the largest live group
+    /// backlog: shrinking keeps the bound for *new* enqueues of that group
+    /// without dropping or reordering anything already queued (same
+    /// contract §7 discipline as [`FairQueue::set_capacity`]).
+    pub fn set_per_group_capacity(&mut self, per_group_capacity: usize) {
+        assert!(
+            per_group_capacity >= 1,
+            "per-group queue capacity must be at least 1"
+        );
+        let live_max = self.groups.values().map(VecDeque::len).max().unwrap_or(0);
+        self.per_group_capacity = per_group_capacity.max(live_max);
     }
 
     /// Number of queued items (O(1)).
@@ -103,14 +144,18 @@ impl FairQueue {
 
     /// Append a task to its group's FIFO.
     ///
-    /// O(1): the capacity check compares the live length counter and never
-    /// scans the queued items. A group appearing for the first time joins
-    /// the back of the ready ring.
+    /// O(1): the capacity checks compare the live length counters and never
+    /// scan the queued items. The global bound fires first, then the
+    /// per-group bound (`max_queued_tasks_per_code`, wave 24). A group
+    /// appearing for the first time joins the back of the ready ring.
     pub fn enqueue(&mut self, group: &CodeGroupKey, task: TaskId) -> Result<(), QueueError> {
         if self.index.contains_key(&task) {
             return Err(QueueError::DuplicateTask);
         }
         if self.index.len() >= self.capacity {
+            return Err(QueueError::QueueFull);
+        }
+        if self.group_len(group) >= self.per_group_capacity {
             return Err(QueueError::QueueFull);
         }
         self.index.insert(task, *group);
@@ -353,6 +398,61 @@ mod tests {
         assert!(q.enqueue(&g, task(4)).is_ok());
         let mut popped = Vec::new();
         while let Some(t) = q.pop_for(&g) {
+            popped.push(t);
+        }
+        assert_eq!(popped, vec![task(1), task(2), task(3), task(4)]);
+    }
+
+    // ---- wave 24: the per-group queue bound ------------------------------
+
+    #[test]
+    fn per_group_bound_rejects_at_the_boundary_without_touching_others() {
+        let a = group(1);
+        let mut q = FairQueue::with_caps(16, 2);
+        assert_eq!(q.per_group_capacity(), 2);
+        assert!(q.enqueue(&a, task(1)).is_ok());
+        assert!(q.enqueue(&a, task(2)).is_ok());
+        // Third item of the SAME group is refused even though the global
+        // queue is nearly empty.
+        assert_eq!(q.enqueue(&a, task(3)), Err(QueueError::QueueFull));
+        assert_eq!(q.len(), 2, "the refused enqueue changed nothing");
+        // A different group is unaffected by group 1's saturation.
+        assert!(q.enqueue(&group(2), task(3)).is_ok());
+        // Freeing one slot of the hot group admits exactly one more.
+        assert!(q.cancel(&task(1)));
+        assert!(q.enqueue(&a, task(4)).is_ok());
+        assert_eq!(q.enqueue(&a, task(5)), Err(QueueError::QueueFull));
+    }
+
+    #[test]
+    fn global_bound_still_fires_first_when_tighter() {
+        let a = group(1);
+        let b = group(2);
+        let mut q = FairQueue::with_caps(3, 512); // per-group bound never fires
+        for n in 1..=3 {
+            q.enqueue(&a, task(n)).unwrap();
+        }
+        assert_eq!(q.enqueue(&b, task(9)), Err(QueueError::QueueFull));
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn set_per_group_capacity_never_drops_or_reorders() {
+        let a = group(1);
+        let mut q = FairQueue::with_caps(16, 4);
+        for n in 1..=3 {
+            q.enqueue(&a, task(n)).unwrap();
+        }
+        // Shrinking below the live group backlog clamps to the backlog.
+        q.set_per_group_capacity(1);
+        assert_eq!(q.per_group_capacity(), 3);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.enqueue(&a, task(4)), Err(QueueError::QueueFull));
+        // Raising the bound admits more of the same group.
+        q.set_per_group_capacity(5);
+        assert!(q.enqueue(&a, task(4)).is_ok());
+        let mut popped = Vec::new();
+        while let Some(t) = q.pop_for(&a) {
             popped.push(t);
         }
         assert_eq!(popped, vec![task(1), task(2), task(3), task(4)]);

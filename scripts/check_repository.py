@@ -145,6 +145,23 @@ def check(root: Path) -> dict:
             checked_links += 1
     source_files = sorted((root / "crates").rglob("*.rs"))
     rust_tests = sum(p.read_text(encoding="utf-8").count("#[test]") for p in source_files)
+    # Contract consistency vs the frozen docs/contracts (wave-24 advisory
+    # add-on, Codex final review #1). Appended call only: any drift or crash
+    # reported here is a WARNING, never a gate failure, so every check above
+    # keeps its exact previous behavior.
+    contract_consistency: dict = {"status": "not-run"}
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "ak_check_contracts", Path(__file__).with_name("check_contracts.py")
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        contract_consistency = module.summarize(root)
+    except Exception as exc:  # noqa: BLE001 - advisory, degrade to a warning
+        contract_consistency = {"status": "warning", "error": repr(exc)}
     return {
         "level": "L0_static_repository_only",
         "passed": not errors,
@@ -153,6 +170,7 @@ def check(root: Path) -> dict:
         "rust_test_cases_present_not_executed": rust_tests,
         "banned_dependency_scan": "clean" if not violations else violations,
         "network_tests_executed": False,
+        "contract_consistency_warning": contract_consistency,
         "errors": errors,
     }
 

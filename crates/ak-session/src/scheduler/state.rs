@@ -97,6 +97,19 @@ impl TaskState {
                 | TaskState::Committing
         )
     }
+
+    /// States counted by the wave-24 `max_pending_admissions` bound: the
+    /// task holds its permit but has not entered the transfer service yet
+    /// (pairing resolution, direct-path establishment, admission
+    /// handshake). Distinct from [`TaskState::is_waiting_phase`]:
+    /// `WaitingPermission` sits *past* admission, so it does not hold a
+    /// pending-admission slot.
+    pub fn is_pending_admission(&self) -> bool {
+        matches!(
+            self,
+            TaskState::WaitingPairing | TaskState::WaitingDirect | TaskState::AwaitingAdmission
+        )
+    }
 }
 
 impl std::fmt::Display for TaskState {

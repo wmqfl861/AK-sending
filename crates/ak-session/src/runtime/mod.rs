@@ -44,6 +44,7 @@ pub mod error;
 pub mod executor;
 pub mod handle;
 pub mod listener;
+pub mod real_executor;
 pub mod transport;
 pub mod types;
 
@@ -54,6 +55,7 @@ pub use executor::{
 };
 pub use handle::{SessionHandle, SessionRuntime};
 pub use listener::{ListenerStats, RuntimeListener};
+pub use real_executor::{RealFailure, RealOutcome, RealTransferExecutor};
 pub use transport::{
     FakePairingTransport, InviteClaimRequest, InviteClaimed, OpenSessionInfo, PairingConfirmation,
     PairingError, PairingEvent, PairingFuture, PairingId, PairingReadyInfo, PairingTransport,

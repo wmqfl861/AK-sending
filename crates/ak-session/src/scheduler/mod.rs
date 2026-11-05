@@ -24,7 +24,9 @@ pub mod state;
 pub use admission::{ActiveGroups, ActiveTasks, AdmissionDecision, DenyReason};
 pub use config::{
     CrossCodeMode, EffectiveLimits, PolicyError, SameCodeMode, SchedulerPolicy,
-    MAX_ACTIVE_CODE_CONNECTIONS, MAX_ACTIVE_TASKS_PER_CODE, MAX_QUEUED_TASKS,
+    DEFAULT_MAX_ACTIVE_TASKS, DEFAULT_MAX_PENDING_ADMISSIONS, DEFAULT_MAX_QUEUED_TASKS_PER_CODE,
+    MAX_ACTIVE_CODE_CONNECTIONS, MAX_ACTIVE_TASKS, MAX_ACTIVE_TASKS_PER_CODE,
+    MAX_PENDING_ADMISSIONS, MAX_QUEUED_TASKS, MAX_QUEUED_TASKS_PER_CODE,
 };
 pub use core::{CancelOutcome, FinishResult, PolicySwitch, SchedulerCore};
 pub use key::{

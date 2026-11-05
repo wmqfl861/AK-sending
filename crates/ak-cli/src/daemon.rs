@@ -254,7 +254,8 @@ fn daemon_progress_printer(
 
 /// Map the `--same-code`/`--cross-code` flag words onto the scheduler
 /// policy (pure; unit-tested). Omitted flags keep the contract defaults
-/// (same-code serial, cross-code parallel).
+/// (same-code serial, cross-code parallel, and the wave-24 caps
+/// 16/16/16).
 pub(crate) fn scheduler_policy_from_flags(
     same_code: Option<&str>,
     cross_code: Option<&str>,
@@ -275,37 +276,193 @@ pub(crate) fn scheduler_policy_from_flags(
     Ok(policy)
 }
 
-/// Start the session runtime that owns the daemon's scheduling policy and
-/// push the initial policy through `SessionHandle::set_policy`. The
-/// runtime's executor/transport stay in their injected form until the
-/// wave-22 adapter binds `send_on_channel`; today the daemon's transfers
-/// run on the engine loop below, and the runtime is the policy holder the
-/// flags address.
-async fn start_policy_runtime(
+/// The daemon's wired session runtime (wave 24): the real
+/// [`RealTransport`] over the pinned v2 registry client, the real
+/// [`RealTransferExecutor`] receive kernel as the inbound executor, and
+/// the initial [`SchedulerPolicy`] from the flags. The daemon's own
+/// receive loop is the resident consumer of pairing events, so the
+/// runtime's listener stays off (it would double-bind the receive port);
+/// retries are disabled (`max_attempts = 1`) because the daemon loop
+/// itself is the retry: it re-enqueues a fresh receive task per
+/// iteration.
+struct WiredRuntime {
+    handle: ak_session::runtime::SessionHandle,
+    /// The pinned registry identity (the scheduler group's registry half).
+    registry_id: [u8; 32],
+}
+
+/// Start the wired runtime (see [`WiredRuntime`]). `default_executor` is
+/// the never-used listener slot (the listener is disabled).
+async fn start_wired_runtime(
     id: &Path,
+    settings: &crate::invite::RegistrySettings,
     policy: ak_session::runtime::SchedulerPolicy,
-) -> Result<ak_session::runtime::PolicySwitch> {
+    default_executor: Arc<ak_session::runtime::RealTransferExecutor>,
+) -> Result<WiredRuntime> {
     use ak_session::runtime::{
-        FakePairingTransport, FakeTransferExecutor, RealClock, RuntimeConfig, SessionRuntime,
+        RealClock, RetryPolicy, RuntimeClock, RuntimeConfig, SessionRuntime, TransferExecutor,
     };
     let (key, _) = crate::load_identity(id)?;
-    let clock: Arc<dyn ak_session::runtime::RuntimeClock> = Arc::new(RealClock::new());
-    let config = RuntimeConfig::new(
+    let client = crate::invite::connect_registry(settings, &key).await?;
+    let transport = ak_session::pairing::RealTransport::new(client);
+    let clock: Arc<dyn RuntimeClock> = Arc::new(RealClock::new());
+    let mut config = RuntimeConfig::new(
         policy,
-        Arc::clone(&clock),
-        Arc::new(FakePairingTransport::new(false)),
-        Arc::new(FakeTransferExecutor::new(Arc::clone(&clock))),
-        ak_session::runtime::RegistryId::from_bytes(key.public_key()),
+        clock,
+        Arc::new(transport) as Arc<dyn ak_session::runtime::PairingTransport>,
+        default_executor as Arc<dyn TransferExecutor>,
+        ak_session::runtime::RegistryId::from_bytes(settings.registry_id),
     );
-    // No inbound listener: this runtime instance holds policy only.
-    let mut config = config;
+    // The daemon loop is the resident receive path; the runtime listener
+    // would submit competing receive tasks on the same port.
     config.listener_enabled = false;
+    // One attempt per enqueued receive: the loop itself rebinds.
+    config.retry = RetryPolicy {
+        max_attempts: 1,
+        initial_backoff_ms: 0,
+        max_backoff_ms: 0,
+        multiplier: 1,
+    };
     let handle = SessionRuntime::start(config).context("cannot start the scheduler runtime")?;
-    let switch = handle
-        .set_policy(policy)
+    Ok(WiredRuntime {
+        handle,
+        registry_id: settings.registry_id,
+    })
+}
+
+/// Best-effort session shutdown at daemon exit: cancel in-flight work,
+/// join the actor (bounded by the handle's own join timeout, plus an
+/// outer bound so a wedged engine abort cannot delay the exit beyond a
+/// second here).
+async fn stop_wired_runtime(handle: &ak_session::runtime::SessionHandle) {
+    use ak_session::runtime::ShutdownMode;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.shutdown(ShutdownMode::Cancel),
+    )
+    .await;
+}
+
+/// How one receive iteration failed (mirrors the direct loop's error
+/// matching so both paths share the response arms).
+enum JobFailure {
+    /// A peer outside the accept policy was rejected.
+    Unauthorized,
+    /// The bind lost a port race (the loop retries with backoff).
+    AddrInUse,
+    /// Anything else; `message` is bounded sanitized text.
+    Other { message: String },
+}
+
+/// One iteration of the wired receive loop: enqueue a fresh real receive
+/// task into the session runtime and watch its lifecycle on the event
+/// stream. Returns the submit result (the task id) plus the armed
+/// executor to read the outcome from once the task settles.
+async fn enqueue_wired_receive(
+    wired: &WiredRuntime,
+    spec: ak_engine::ReceiveSpec,
+    printer: Arc<dyn Fn(ak_engine::Progress) + Send + Sync>,
+    addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
+) -> (
+    Result<ak_session::runtime::TransferId, String>,
+    Arc<ak_session::runtime::RealTransferExecutor>,
+) {
+    use ak_session::runtime::real_executor::RealTransferExecutor;
+    use ak_session::runtime::{
+        CodeGroupKey, CodeId, PairingPlan, RegistryId, TransferDirection, TransferExecutor,
+        TransferSpec,
+    };
+    let executor = Arc::new(RealTransferExecutor::receive(
+        spec,
+        Some(addr_tx),
+        Some(printer),
+    ));
+    // The resident listener's anonymous group: every iteration shares the
+    // pinned registry identity; the all-zero code id is the local sentinel
+    // for "the loop's own group" (it never reaches the wire on the Local
+    // plan, and it keeps every iteration inside one code group so the
+    // same-code policy governs the whole loop as one code).
+    let group = CodeGroupKey::new(
+        RegistryId::from_bytes(wired.registry_id),
+        CodeId::from_bytes([0u8; 16]),
+    );
+    let submit = wired.handle.enqueue(TransferSpec {
+        group_key: group,
+        pairing: PairingPlan::Local,
+        executor: executor.clone() as Arc<dyn TransferExecutor>,
+        direction: TransferDirection::Receive,
+        label: "daemon-receive".to_owned(),
+        task_id: None,
+    });
+    let submitted = submit
         .await
-        .context("set_policy failed")?;
-    Ok(switch)
+        .map_err(|err| format!("cannot enqueue the receive task: {err}"));
+    (submitted, executor)
+}
+
+/// Classify a settled wired receive from the executor's outcome record.
+fn classify_wired_outcome(
+    executor: &ak_session::runtime::RealTransferExecutor,
+    task: &ak_session::runtime::TransferId,
+) -> Result<ak_engine::Report, JobFailure> {
+    use ak_session::runtime::real_executor::RealOutcome;
+    match executor.outcome(task) {
+        Some(RealOutcome::Completed { report }) => Ok(report),
+        Some(RealOutcome::Failed(failure)) => Err(classify_real_failure(&failure)),
+        None => Err(JobFailure::Other {
+            message: "the receive task ended without an engine outcome".to_owned(),
+        }),
+    }
+}
+
+/// Map the executor's stable failure classification onto the loop's
+/// failure kinds (the same distinctions the direct path's `EngineError`
+/// match makes).
+fn classify_real_failure(failure: &ak_session::runtime::RealFailure) -> JobFailure {
+    use ak_core::error::ErrorCode;
+    match failure.code {
+        ErrorCode::AuthFailed => JobFailure::Unauthorized,
+        ErrorCode::StorageError if failure.io_kind == Some(std::io::ErrorKind::AddrInUse) => {
+            JobFailure::AddrInUse
+        }
+        _ => JobFailure::Other {
+            message: failure.message.clone(),
+        },
+    }
+}
+
+/// Watch the runtime event stream until `task` reaches a terminal-for-
+/// the-loop scheduler event (finished, parked — retries are disabled so
+/// the single allowed failure parks — or cancelled), then classify.
+async fn watch_wired_task(
+    events: &mut tokio::sync::broadcast::Receiver<ak_session::runtime::SessionEvent>,
+    executor: &ak_session::runtime::RealTransferExecutor,
+    task: ak_session::runtime::TransferId,
+) -> Result<ak_engine::Report, JobFailure> {
+    use ak_session::runtime::SessionEvent;
+    use ak_session::scheduler::SchedulerEvent;
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        let mine = match &event {
+            SessionEvent::Scheduler(SchedulerEvent::TaskFinished { task: t, .. })
+            | SessionEvent::Scheduler(SchedulerEvent::TaskCancelled { task: t, .. }) => {
+                t.task_id() == task
+            }
+            // Parking is a runtime-level event (the scheduler core's
+            // `pause` emits nothing); with retries disabled it is the
+            // terminal state of a failed receive.
+            SessionEvent::TaskParked { task: t, .. } => *t == task,
+            _ => false,
+        };
+        if mine {
+            break;
+        }
+    }
+    classify_wired_outcome(executor, &task)
 }
 
 /// `ak-cli daemon`: resident receive mode (mDNS advertise + receive loop +
@@ -333,26 +490,33 @@ pub(crate) async fn daemon_core(
     let out = DaemonOut::new(opts.json_lines);
     let name = daemon_device_name(opts.name.as_deref())?;
 
-    // Wave 21: scheduler policy flags own the runtime's two-dimensional
-    // concurrency modes.
-    if opts.same_code.is_some() || opts.cross_code.is_some() {
-        let policy =
-            scheduler_policy_from_flags(opts.same_code.as_deref(), opts.cross_code.as_deref())?;
-        let switch = start_policy_runtime(id, policy).await?;
-        out.note(&format!(
-            "scheduler policy: same-code {}, cross-code {} (revision {}, draining {}, admitted {})",
-            policy.same_code_mode.as_str(),
-            policy.cross_code_mode.as_str(),
-            switch.revision,
-            switch.draining,
-            switch.admitted,
-        ));
-    }
+    // Wave 24: any of the scheduler/pairing flags switches the daemon onto
+    // the WIRED session runtime — real registry transport
+    // (`RealTransport`) plus the real engine receive kernel behind the
+    // scheduler (`RealTransferExecutor`), with the receive loop entering
+    // through `SessionHandle::enqueue`. Without them the direct engine
+    // loop below runs byte-for-byte as before (compatibility gate).
+    let wired_mode = opts.same_code.is_some()
+        || opts.cross_code.is_some()
+        || opts.invite_code.is_some()
+        || opts.registry_fp.is_some();
+    let registry = if wired_mode {
+        Some(crate::invite::resolve_registry(
+            id,
+            opts.server,
+            opts.registry_fp.clone(),
+        )?)
+    } else {
+        None
+    };
 
     // Wave 21: owner-side pairing service (`--pairing`). Resident: spawned,
     // stopped by the shared shutdown flag.
     if opts.pairing {
-        let settings = crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?;
+        let settings = match registry {
+            Some(settings) => settings,
+            None => crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?,
+        };
         let (key, _) = crate::load_identity(id)?;
         let client = crate::invite::connect_registry(&settings, &key).await?;
         out.note(&format!(
@@ -384,10 +548,13 @@ pub(crate) async fn daemon_core(
 
     // Wave 21: `--invite-code`: redeem at startup, pair with the owner,
     // then keep receiving (the owner lands in peers.book, so the book
-    // policy below admits it).
+    // policy below admits it). In wired mode the registry settings were
+    // resolved once above.
     if let Some(code) = &opts.invite_code {
-        let settings = crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?;
-        let verified = crate::invite::redeem_and_pair(id, code, &settings).await?;
+        let settings = registry
+            .as_ref()
+            .expect("invite-code implies the wired registry settings");
+        let verified = crate::invite::redeem_and_pair(id, code, settings).await?;
         let peer = verified.owner_fingerprint(); // the code owner is the peer
         out.note("paired with the code owner:");
         out.note(&crate::fingerprint_lines("owner", &peer));
@@ -416,6 +583,44 @@ pub(crate) async fn daemon_core(
         out.note(&line);
     }
     out.note(FIREWALL_NOTE);
+
+    // Wave 24: start the wired session runtime (flags → policy; pinned
+    // registry → real transport; the loop below enqueues real receive
+    // tasks per iteration). The `default_executor` slot is never used —
+    // the resident listener is disabled because the daemon loop itself is
+    // the resident receive path.
+    let wired_runtime = if wired_mode {
+        let settings = registry.as_ref().expect("checked above");
+        let policy =
+            scheduler_policy_from_flags(opts.same_code.as_deref(), opts.cross_code.as_deref())?;
+        let default_executor = Arc::new(ak_session::runtime::RealTransferExecutor::receive(
+            config.iteration_spec(),
+            None,
+            None,
+        ));
+        let wired = start_wired_runtime(id, settings, policy, default_executor).await?;
+        let switch = wired
+            .handle
+            .set_policy(policy)
+            .await
+            .context("set_policy failed")?;
+        out.note(&format!(
+            "scheduler runtime: registry {} (wired); same-code {}, cross-code {}, caps \
+             active/queued-per-code/pending {}/{}/{} (revision {}, draining {}, admitted {})",
+            settings.server,
+            policy.same_code_mode.as_str(),
+            policy.cross_code_mode.as_str(),
+            policy.max_active_tasks,
+            policy.max_queued_tasks_per_code,
+            policy.max_pending_admissions,
+            switch.revision,
+            switch.draining,
+            switch.admitted,
+        ));
+        Some(wired)
+    } else {
+        None
+    };
 
     // Advertise the same TXT record `discover` reads (fp + name), on the
     // fixed port. mDNS is a discovery hint, not authorization and not a
@@ -456,6 +661,99 @@ pub(crate) async fn daemon_core(
         let connected_at = Arc::new(Mutex::new(None::<Instant>));
         let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+
+        // Wave 24 wired branch: the iteration runs inside the session
+        // runtime (enqueue → admission → real executor → engine).
+        if let Some(wired) = wired_runtime.as_ref() {
+            // Subscribe BEFORE the submit: a broadcast receiver only sees
+            // messages sent after it existed, and a lightning-fast task
+            // must not be able to finish before the watcher is armed.
+            let mut events = wired.handle.subscribe();
+            let (submitted, executor) = enqueue_wired_receive(wired, spec, printer, addr_tx).await;
+            let task = match submitted {
+                Ok(task) => task,
+                Err(message) => {
+                    out.event(&DaemonEvent::Error { message: &message });
+                    out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+            if first {
+                let addr = addr_rx.await.context("receiver failed to bind")?;
+                out.event(&DaemonEvent::Listening {
+                    addr: &addr.to_string(),
+                    port: addr.port(),
+                    fingerprint: &fp.to_hex(),
+                    name: &name,
+                    mdns: mdns_ok,
+                });
+                out.text(&format!(
+                    "daemon listening on {addr} into {} (name {name})",
+                    config.out.display()
+                ));
+                out.text(&crate::fingerprint_lines("fingerprint", &fp));
+                out.text(&format!("pairing code: {}", ak_identity::pairing_code(&fp)));
+                out.text("waiting for sender (Ctrl-C stops)...");
+                first = false;
+            } else {
+                let _ = addr_rx.await;
+            }
+            let watcher = watch_wired_task(&mut events, &executor, task);
+            tokio::pin!(watcher);
+            let outcome = tokio::select! {
+                result = &mut watcher => result,
+                _ = shutdown.changed() => {
+                    if let Some(discovery) = mdns.as_mut() {
+                        discovery.stop_advertise();
+                    }
+                    out.event(&DaemonEvent::Stopped { reason: "shutdown" });
+                    out.text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
+                    stop_wired_runtime(&wired.handle).await;
+                    return Ok(());
+                }
+            };
+            match outcome {
+                Ok(report) => {
+                    rebind_retries = 0;
+                    emit_job_done(&out, &connected_at, &report);
+                    out.text("waiting for next sender (Ctrl-C stops)...");
+                }
+                Err(JobFailure::Unauthorized) => {
+                    out.event(&DaemonEvent::Error {
+                        message: "rejected a peer outside the accept policy",
+                    });
+                    out.text(
+                        "rejected a peer outside the accept policy; still waiting (Ctrl-C stops)",
+                    );
+                }
+                Err(JobFailure::AddrInUse) if rebind_retries < MAX_REBIND_RETRIES => {
+                    rebind_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(failure) => {
+                    let message = match &failure {
+                        JobFailure::AddrInUse => {
+                            "bind failed: address already in use (retry budget exhausted)"
+                                .to_owned()
+                        }
+                        JobFailure::Other { message } => message.clone(),
+                        JobFailure::Unauthorized => {
+                            "rejected a peer outside the accept policy".to_owned()
+                        }
+                    };
+                    out.event(&DaemonEvent::Error { message: &message });
+                    out.text(&format!(
+                        "job failed: {message}; still listening (Ctrl-C stops)"
+                    ));
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            continue;
+        }
+
+        // Direct branch (no registry/scheduler flags): the engine loop as
+        // it always ran.
         let receiver =
             tokio::spawn(
                 async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
@@ -495,28 +793,7 @@ pub(crate) async fn daemon_core(
         match outcome {
             Ok(Ok(report)) => {
                 rebind_retries = 0;
-                if out.json_lines {
-                    // Duration spans job_started (handshake) to completion;
-                    // if no Connected event was seen, fall back to the
-                    // engine's own report duration.
-                    let started = connected_at
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    let duration_ms = started
-                        .map(|at| at.elapsed().as_millis())
-                        .unwrap_or_else(|| report.duration.as_millis());
-                    out.event(&DaemonEvent::JobDone {
-                        id: &job_id_hex(&report),
-                        files: report.files,
-                        bytes: report.bytes,
-                        duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
-                        resumed: report.resumed_chunks,
-                        peer: report.peer_fingerprint.as_deref(),
-                    });
-                } else {
-                    crate::report_summary(&report);
-                }
+                emit_job_done(&out, &connected_at, &report);
                 out.text("waiting for next sender (Ctrl-C stops)...");
             }
             Ok(Err(EngineError::Connect(ak_net::ConnectError::Unauthorized))) => {
@@ -547,7 +824,36 @@ pub(crate) async fn daemon_core(
             Err(join) => bail!("receiver task failed: {join}"),
         }
     }
+    if let Some(wired) = &wired_runtime {
+        stop_wired_runtime(&wired.handle).await;
+    }
     Ok(())
+}
+
+/// Emit the job-done NDJSON event / text summary shared by both loop
+/// branches. Duration spans `job_started` (handshake) to completion; if
+/// no `Connected` event was seen, the engine's own report duration is
+/// used.
+fn emit_job_done(out: &DaemonOut, connected_at: &Arc<Mutex<Option<Instant>>>, report: &Report) {
+    if out.json_lines {
+        let started = connected_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let duration_ms = started
+            .map(|at| at.elapsed().as_millis())
+            .unwrap_or_else(|| report.duration.as_millis());
+        out.event(&DaemonEvent::JobDone {
+            id: &job_id_hex(report),
+            files: report.files,
+            bytes: report.bytes,
+            duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
+            resumed: report.resumed_chunks,
+            peer: report.peer_fingerprint.as_deref(),
+        });
+    } else {
+        crate::report_summary(report);
+    }
 }
 
 #[cfg(test)]
@@ -956,10 +1262,14 @@ mod tests {
         use ak_session::runtime::SchedulerPolicy;
         use ak_session::scheduler::{CrossCodeMode, SameCodeMode};
 
-        // Omitted flags keep the contract defaults.
+        // Omitted flags keep the contract defaults — including the wave-24
+        // caps (16/16/16).
         let defaults = scheduler_policy_from_flags(None, None).expect("defaults");
         assert_eq!(defaults.same_code_mode, SameCodeMode::Serial);
         assert_eq!(defaults.cross_code_mode, CrossCodeMode::Parallel);
+        assert_eq!(defaults.max_active_tasks, 16);
+        assert_eq!(defaults.max_queued_tasks_per_code, 16);
+        assert_eq!(defaults.max_pending_admissions, 16);
 
         let flipped =
             scheduler_policy_from_flags(Some("parallel"), Some("serial")).expect("flipped");
@@ -982,14 +1292,198 @@ mod tests {
 
     #[tokio::test]
     async fn set_policy_pushes_the_flags_through_the_session_runtime() {
-        let dir = TempDir::new("set-policy");
-        let switch = start_policy_runtime(
-            dir.path(),
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = TestRegistry::start(tmp.path()).await;
+        let default_executor = ak_session::runtime::RealTransferExecutor::receive(
+            loopback_receive_spec(&tmp.path().join("unused-out"), throwaway_identity()),
+            None,
+            None,
+        );
+        let wired = start_wired_runtime(
+            &dir,
+            &registry.settings,
             scheduler_policy_from_flags(Some("parallel"), Some("serial")).unwrap(),
+            Arc::new(default_executor),
         )
         .await
-        .expect("runtime starts and the policy switch applies");
+        .expect("wired runtime starts against the real registry transport");
+        let switch = wired
+            .handle
+            .set_policy(scheduler_policy_from_flags(Some("parallel"), Some("serial")).unwrap())
+            .await
+            .expect("the live set_policy round trip applies");
         assert!(switch.revision >= 1, "a switch happened: {switch:?}");
+        // The wave-24 caps flow into the runtime's policy.
+        let snapshot = wired
+            .handle
+            .snapshot(ak_session::runtime::SnapshotQuery::all())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.policy.max_active_tasks, 16);
+        assert_eq!(snapshot.policy.max_queued_tasks_per_code, 16);
+        assert_eq!(snapshot.policy.max_pending_admissions, 16);
+        stop_wired_runtime(&wired.handle).await;
+        registry.stop().await;
+    }
+
+    /// The wave-24 wired receive path through the FULL session stack: a
+    /// real registry (TLS transport up), a real `RealTransferExecutor`
+    /// receive armed on a loopback port, submitted through
+    /// `SessionHandle::enqueue` (admission → driver → executor), fed by a
+    /// real legacy `ak_engine::send`. This is the daemon's wired
+    /// iteration in miniature (`--invite-code`/flags mode).
+    #[tokio::test]
+    async fn wired_enqueue_completes_a_real_transfer_through_the_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let registry = TestRegistry::start(tmp.path()).await;
+
+        let default_executor = ak_session::runtime::RealTransferExecutor::receive(
+            loopback_receive_spec(&tmp.path().join("default-out"), throwaway_identity()),
+            None,
+            None,
+        );
+        let wired = start_wired_runtime(
+            &dir,
+            &registry.settings,
+            scheduler_policy_from_flags(Some("parallel"), None).unwrap(),
+            Arc::new(default_executor),
+        )
+        .await
+        .expect("wired runtime starts");
+
+        // The iteration's receive task: a fresh one-shot executor bound to
+        // an auto-assigned loopback port with the daemon identity,
+        // exactly like the daemon loop builds it.
+        let (key, identity) = crate::load_identity(&dir).unwrap();
+        let receiver_fp = key.fingerprint();
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(ak_session::runtime::RealTransferExecutor::receive(
+            loopback_receive_spec(&out, identity),
+            Some(addr_tx),
+            None,
+        ));
+        let group = ak_session::runtime::CodeGroupKey::new(
+            ak_session::runtime::RegistryId::from_bytes(registry.settings.registry_id),
+            ak_session::runtime::CodeId::from_bytes([0u8; 16]),
+        );
+        let task = wired
+            .handle
+            .enqueue(ak_session::runtime::TransferSpec {
+                group_key: group,
+                pairing: ak_session::runtime::PairingPlan::Local,
+                executor: executor.clone() as Arc<dyn ak_session::runtime::TransferExecutor>,
+                direction: ak_session::runtime::TransferDirection::Receive,
+                label: "wired-loopback".to_owned(),
+                task_id: None,
+            })
+            .await
+            .expect("the receive task enters the scheduler");
+
+        let bound = tokio::time::timeout(Duration::from_secs(10), addr_rx)
+            .await
+            .expect("bound in time")
+            .expect("addr delivered");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("wired.bin"), &payload).unwrap();
+        let sender_key = ak_identity::DeviceKeyPair::generate();
+        let sender_identity = ak_identity::tls::make_self_signed(&sender_key);
+        let mut send_spec = ak_engine::SendSpec::new(src, bound, receiver_fp, sender_identity);
+        send_spec.idle_timeout = Duration::from_secs(20);
+        let report =
+            tokio::time::timeout(Duration::from_secs(30), ak_engine::send(send_spec, &|_| {}))
+                .await
+                .expect("send finishes")
+                .expect("send succeeds");
+        assert_eq!(report.files, 1);
+
+        // The task reaches terminal Completed in the runtime and the file
+        // landed byte-identical.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = wired
+                .handle
+                .snapshot(ak_session::runtime::SnapshotQuery::one(task))
+                .await
+                .unwrap();
+            if let Some(view) = snapshot.tasks.first() {
+                if view.state == ak_session::scheduler::TaskState::Completed {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the wired task never completed");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        match executor.outcome(&task) {
+            Some(ak_session::runtime::RealOutcome::Completed { report }) => {
+                assert_eq!(report.bytes, payload.len() as u64);
+            }
+            other => panic!("expected a completed outcome, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(out.join("wired.bin")).unwrap(), payload);
+
+        stop_wired_runtime(&wired.handle).await;
+        registry.stop().await;
+    }
+
+    /// A real v2 test registry (TLS + SQLite) shared by the wired tests.
+    struct TestRegistry {
+        settings: crate::invite::RegistrySettings,
+        stop_tx: tokio::sync::watch::Sender<bool>,
+        join: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestRegistry {
+        async fn start(root: &Path) -> Self {
+            use ak_signal::server_v2::{engine::serve_v2, store::RegistryStore, Limits};
+            let key = ak_identity::DeviceKeyPair::generate();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let store = RegistryStore::open(&root.join("registry.db")).unwrap();
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let server_key = key.clone();
+            let join = tokio::spawn(async move {
+                let _ = serve_v2(listener, &server_key, store, Limits::default(), stop_rx).await;
+            });
+            TestRegistry {
+                settings: crate::invite::RegistrySettings {
+                    server: addr,
+                    registry_id: key.public_key(),
+                },
+                stop_tx,
+                join,
+            }
+        }
+
+        async fn stop(self) {
+            let _ = self.stop_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.join).await;
+        }
+    }
+
+    /// A loopback receive spec on an auto-assigned port (accept anyone),
+    /// presenting `identity` so a test sender can pin its fingerprint.
+    fn loopback_receive_spec(
+        out: &Path,
+        identity: ak_identity::tls::TlsBundle,
+    ) -> ak_engine::ReceiveSpec {
+        let mut spec = ak_engine::ReceiveSpec::new(out.to_path_buf(), identity);
+        spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        spec.idle_timeout = Duration::from_secs(20);
+        spec.authorize = Box::new(|_| true);
+        spec
+    }
+
+    /// A throwaway TLS identity for the never-used default-executor slot.
+    fn throwaway_identity() -> ak_identity::tls::TlsBundle {
+        ak_identity::tls::make_self_signed(&ak_identity::DeviceKeyPair::generate())
     }
 
     /// The full wave-21 journey on one machine, all real planes: v2

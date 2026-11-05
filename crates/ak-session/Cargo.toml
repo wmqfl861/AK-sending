@@ -7,6 +7,13 @@ description = "Shared session application layer: pure scheduler domain model (tw
 
 [dependencies]
 ak-core = { workspace = true }
+# Wave 24: the real transfer executor adapter (`runtime/real_executor.rs`)
+# drives the engine's receive entry behind the `TransferExecutor` trait,
+# and classifies `EngineError::Connect` onto the stable error codes (the
+# net error taxonomy lives here). No cycle: neither crate depends on
+# ak-session.
+ak-engine = { workspace = true }
+ak-net = { workspace = true }
 # Wave 21 (A6): device keys, invite codes, pairing transcripts, peer book.
 ak-identity = { workspace = true }
 # Wave 21 (A6): v2 control-protocol codec, frozen signature domains and the

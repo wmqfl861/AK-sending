@@ -146,40 +146,40 @@
 - [x] B5 引擎拆分（第二十一波，`crates/ak-engine`）：`send_on_channel`/`receive_on_channel`（准入三步握手＋staging），既有 49+1 零回归，新 8 项测试。
 - [x] B7 CLI（第二十一波，`crates/ak-cli`）：`invite create/redeem/list/revoke`＋`registry-server`（TLS＋SQLite，默认端口 7200）＋`daemon --invite-code/--same-code/--cross-code`——12 项新测试。
 - [x] 第二十一波集成收口：ak-net type_budget/header_payload_check 测试适配新 wire 类型 13–15；invite.rs clippy 三处修复。收官：`cargo test --workspace` 851/0（773 → +78）；clippy 干净；repo check passed。
-- [ ] B8 FFI 接线（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 入口）：契约已冻结于 `docs/contracts/ffi-v2.md`；截至 `bfc74d7` 未实现，按计划属第二十一至二十二波。（第二十二波已落地首版 14 导出＋Dart/Flutter 入口，与契约 18 名称的差额见下方"终审发现"P1-4。）
+- [x] B8 FFI 接线（`ak_pairing_*`/`ak_sched_*` 18 个新导出＋Dart 绑定＋Flutter 入口）：第二十二波（`628386c`）落地首版 14 导出＋Dart 绑定＋Flutter 邀请页入口；第二十三波（`acbaf27`）补齐契约差额 5 导出（`ak_pairing_stop_start`/`ak_sched_retry`/`ak_sched_task_result`/`ak_sched_shutdown_start`/`ak_sched_listen_start`，实现于 `crates/ak-ffi/src/pairing.rs`＋`sched_ext.rs`，全部真实实现非桩）并完成符号统一——v2 导出合计 19 个（9 `ak_pairing_*`＋10 `ak_sched_*`，即契约 18 名称＋兼容保留的 `ak_sched_start`），经 C ABI 测试（`crates/ak-ffi/tests/ffi_pairing.rs`）与双 ABI `.so` 符号验证（18 契约符号在 x86_64/arm64 两产物均在场）。如实残余：新 5 符号中 `ak_pairing_stop_start` 已接 Dart（`packages/ak_ffi_dart/lib/src/pairing_ffi.dart`），其余 4 个 `ak_sched_*` 符号 Rust ABI 已冻结可用但 Dart 绑定尚未接线（ABI 层完整性不受影响）。
 
 ### 终审发现（2026-11-05）
 
-Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex-review-2026-11-05](../reports/codex-review-2026-11-05.md)，归档提交 `4e1bfb9`）产出 5 项 P1；第二十三波修复代理进行中，落地证据由集成者复核后回填。修复落地前，以下事实不得在对外表述中省略：
+Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex-review-2026-11-05](../reports/codex-review-2026-11-05.md)，归档提交 `4e1bfb9`）产出 5 项 P1；第二十三波（提交 `acbaf27`，5 并行修复代理）已修复 P1-1/P1-2/P1-3/P1-5，P1-4 的引擎准入侧与 FFI 契约差额亦已修复、生产 executor 接线由第二十四波进行中。2026-11-05 集成者已对照代码逐项复核勾选。仍开放的 P1-4 生产接线事实不得在对外表述中省略：
 
-- [ ] P1-1 恶意 registry 恢复攻击面（新准入上下文未绑定认证材料）：wire `TaskOpen` 缺 `pairing_id`/方向/attempt/`admission_nonce`（`group` 32 字节与冻结契约 `code_id` 16 字节不一致）；`AdmissionCtx` 字段公开可构造、`AdmissionDecider` 仅见 `&[u8;32]` group、引擎解构时丢弃 `group_registry`；接收端对未宣告 `CAP_SCHEDULER` 的对端回退旧 Offer 流程（decider 完全不执行，非 fail-closed）；`send_on_channel` 未校验通道对端指纹==`spec.pinned`。恶意 registry/对端可借恢复或 capability 降级路径取得未授权任务准入（新链路内；恢复/重试路径同样无 pairing_id/attempt/nonce/lease 可核）。修复方向：受控 `AuthorizedTaskContext` 绑定真实通道身份、Ready relation、registry/code/pairing、方向、nonce 与有效 permit，接收 fail-closed。状态：修复中（第二十三波）。
-- [ ] P1-2 接收目录符号链接 TOCTOU 与 staging 清理越界：目录/part 校验与打开均按路径操作（无固定句柄/no-follow 防护），检查与打开之间存在替换竞态；`discard_staging` 仅检查叶子，父 `.ak-staging` 被替换为指向外部树的链接时清理会删除接收根之外的文件；现有测试仅覆盖操作开始前已存在的链接。修复方向：受限目录句柄（Unix `openat`/no-follow/beneath、Windows 目录句柄＋reparse point 拒绝＋身份检查）贯穿创建/打开/提交/递归清理。状态：修复中（第二十三波）。
-- [ ] P1-3 staging 命名空间未隔离：manifest 合法相对路径可进入 `.ak-staging/<task>/` 保留命名空间——远端任务以 `.ak-staging/<T>/x` 为最终路径时，任务成功提交、发送 `FinalAck(verified=true)` 后 `discard_staging` 会把刚提交成功的文件一并删除（无需本地符号链接权限）；其他任务的内部路径同样无隔离。修复方向：staging 移至用户文件树外私有根，或接收入口统一拒绝/映射保留顶层名字。状态：修复中（第二十三波）。
-- [ ] P1-4 生产双端调度未接线：CLI daemon `--same-code/--cross-code` 走 Fake executor（`FakePairingTransport`/`FakeTransferExecutor`——调度策略模型正确但未接真实传输链路）；FFI 经本地 scheduler 执行真实传输，但未完成双端 wire admission（与 P1-1 同源；修复完成前不得接入生产 executor）。附契约差额：FFI 实际 14 导出 vs 冻结契约 18 名称（缺 `ak_pairing_stop_start`/`ak_sched_retry`/`ak_sched_task_result`/`ak_sched_shutdown_start`，且契约 `ak_sched_listen_start` 实际命名 `ak_sched_start`）。状态：待 P1-1 修复完成后接线；FFI 契约对齐修复中。
-- [ ] P1-5 同目标同内容并发提交竞争：同内容复用仅发生在原子提交前的存在性检查，`AlreadyExists` 分支不复核已有内容（`Fail` 下同内容并发一败、`Rename` 下多生成相同副本）；现有测试为顺序 `finish`（验证了顺序冲突处理＋part 隔离，见验证记录"终审更正"第 3 条），不证明两任务同时原子提交的"一次提交、一次复用"。修复方向：`AlreadyExists` 分支按安全句柄重核已存在目标摘要，同内容返回复用；受控 barrier 并发测试断言目标数与结果。状态：修复中（第二十三波）。
+- [x] P1-1 恶意 registry 恢复攻击面（已修复，第二十三波 `acbaf27`）：恢复路径 digest sidecar 钉死——本机认证过的 transcript 落 `<pairing hex>.akdgm` sidecar（`crates/ak-session/src/pairing/orchestrator.rs`，pending 日志项之前写入），恢复时重发 `PairCommit` 必须逐字节复现钉死 transcript（256 字节规范形 BLAKE3 摘要相等）＋transcript 所命名的双方 Ed25519 签名，恶意 registry 换钥重签无法通过；无 code hint 且无 pin 的日志项直接拒绝（服务端自报 `Committed`/`Ready` 不再是唯一证据）；A/B 杀灭测试 `verify_commit_pinned_accepts_authentic_and_rejects_swapped_keys`、`crashed_redeemer_recovers_without_code_via_the_pinned_transcript`、`recovery_without_code_or_pin_is_refused_not_degraded`。准入上下文：`AdmissionCtx` 私有化＋唯一校验构造器 `AdmissionCtx::new`（绑定 `permit_id`/`pairing_id`，零值拒绝，`crates/ak-engine/src/lib.rs`）；wire `TaskOpen`/`TaskAdmission` 增 `pairing_id`/`direction`/lease 字段（`crates/ak-wire`）；`send_on_channel` 首步即校验通道对端指纹==`spec.pinned`（不符以专用码关闭，`EngineError::ChannelPeerMismatch`）；接收端对未宣告 `CAP_SCHEDULER` 的对端不再回退旧 Offer 流程（`PROTOCOL_UNSUPPORTED`，fail-closed）。
+- [x] P1-2 接收目录符号链接 TOCTOU 与 staging 清理越界（已修复至收窄形态，第二十三波 `acbaf27`，`crates/ak-storage/src/lib.rs`）：逐步重检——每次路径型动作（打开 part、mtime 盖章、hard-link claim、unlink）前重跑 `symlink_metadata` no-follow 检查（`ensure_not_symlink`），检查-使用窗口收窄至单操作；父目录检查——`ensure_real_dirs` 逐级 `create_dir`＋`AlreadyExists` 时以 `symlink_metadata` 分类（链接即拒），`discard_staging` 校验 `.ak-staging` 父目录非链接后才递归清理（测试 `discard_staging_refuses_a_symlinked_staging_parent`）；命名空间保留见 P1-3。如实残余（相对修复方向"受限目录句柄贯穿"）：Windows/跨平台 std 无 `openat2`/fd 相对 mtime/link 原语，最终检查之后的单操作替换窗口仍存在，已在 `ak-storage` 模块文档头声明并保持防御纵深。
+- [x] P1-3 staging 命名空间未隔离（已修复，第二十三波 `acbaf27`）：接收入口 `checked_rel_components`（`crates/ak-storage/src/lib.rs`）拒绝 manifest 相对路径中任何名为 `.ak-staging` 的组件（ASCII 大小写不敏感——对齐 NTFS 默认大小写不敏感解析），远端任务无法把最终路径置于保留命名空间内触发"成功提交后被 `discard_staging` 删除"；其他任务的 staging 树同样不可寻址。
+- [ ] P1-4 生产双端调度未接线（引擎准入侧已修复，生产接线第二十四波进行中）：CLI daemon `--same-code/--cross-code` 仍走 Fake executor（`crates/ak-cli/src/daemon.rs` 的 `FakePairingTransport`/`FakeTransferExecutor`——调度策略模型正确但未接真实传输链路），生产双端 wire admission 接线由第二十四波并行代理进行中，落地前不得宣称生产调度可用。已修复部分：P1-1 同源的准入加固全部落地（AdmissionCtx 私有化、wire 字段、指纹复核、fail-closed）；FFI 契约差额已关闭——实际导出 19 个 vs 冻结契约 18 名称（二十三波补齐 5 个缺失导出，`ak_sched_start` 作为兼容名与契约名 `ak_sched_listen_start` 并存，双 ABI 符号验证通过）。
+- [x] P1-5 同目标同内容并发提交竞争（已修复，第二十三波 `acbaf27`，`crates/ak-storage/src/lib.rs` `finish()`）：`AlreadyExists` 分支不再直接走冲突策略——`staged_target_matches` 以 no-follow 打开重读已存在目标并比对 whole digest，同内容即复用（丢弃本任务 part、幂等成功，"一次提交、一次复用"），异内容保持 `Fail`/`Rename` 策略（Rename 附 4,096 次上限防循环）；受控 `Barrier` 双任务并发测试断言并发原子提交下目标数与复用结果。
 
 终审另有 P2 项与已知边界（on-channel 准入前提前扫描源、引擎检查点仍用 AKREC1 record id 实例隔离未入 AKREC2；FAT/exFAT 无 hard-link 时 rename 回退可覆盖他任务刚创建目标——既有已披露边界）与证据链一致性更正（见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"终审更正"节，共 6 条）。
 
 ## P0
 
-- [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。
-- [ ] P0-02 比较无 relay 网络候选，验证控制协调与文件通道隔离。
-- [ ] P0-03 真实身份认证、配对和密钥保管最小实现。
-- [ ] P0-04 局域网发现、离线手动配对、权限拒绝恢复。
-- [ ] P0-05 IPv4/IPv6、受限 NAT、禁 UDP、跨运营商网络样本。
-- [ ] P0-06 Android URI/iOS 保存目标读写、原件导入、后台中断。
-- [ ] P0-07 真机传输抓包与库默认中继审计。
-- [ ] P0-08 输出网络库 ADR、风险记录及重估路线。
+- [ ] P0-01 固定系统/ABI/发行版支持矩阵及可用真机。（矩阵部分已完成：[SUPPORT_MATRIX.zh-CN.md](SUPPORT_MATRIX.zh-CN.md)，2026-11-05 建；"可用真机"部分仍开放——现有跨设备证据为 Android 模拟器↔Windows 宿主，物理双机未执行。）
+- [x] P0-02 比较无 relay 网络候选，验证控制协调与文件通道隔离。ADR-002 D1 收敛：数据面 QUIC（quinn＋rustls/ring）＋自签 Ed25519 证书指纹钉扎，控制面自建信令（TCP、定长有界消息）＋内置最小 STUN（RFC 5389 子集）；iroh 已排除（打洞依赖 relay，与 ADR-001 冲突），候选对比保留于 [TECH_SELECTION](TECH_SELECTION.zh-CN.md)；仓库检查脚本持续禁依赖扫描（relay/TURN/WebRTC/iroh，clean）。协调与文件通道隔离经 T04/T07 证明对钉死（数据面零信令依赖：死端口上传输照常完成；信令服务器死亡后已建会话传输照常）。跨网段/真实 NAT 实测归 P0-05。
+- [x] P0-03 真实身份认证、配对和密钥保管最小实现。Ed25519 设备密钥＋指纹＋配对码＋自签证书钉扎（含常量时间比较与严格 DER 校验，第二轮起）；配对簿准入/TOFU/前缀解析（第三/四轮）；邀请码配对全链（160 bit 熵、lookup/auth 域分离、typed transcript 五查、`PeerBookStore` 事务落簿＋`PairingJournal` 防重放，第十八至二十三波）；密钥保管 device.key/peers.book/`.akdgm` sidecar/pair export-import（私钥哨兵验证不泄漏）。
+- [x] P0-04 局域网发现、离线手动配对、权限拒绝恢复。mDNS 发现（指纹 TXT、browse/watch 持续发现、本机真实组播环回实测）；离线手动配对（`pair add` 完整指纹/8–63 位唯一前缀解析，无发现服务亦可配对，配对簿准入＋未配对拒绝＋TOFU 记录）；`ak-cli doctor` 环境自检（身份/网络/双栈 UDP 绑定/mDNS/磁盘余量，防火墙与 AP 隔离恢复指引，--json）。如实注记：本机环回形态实测，AP 隔离/真实多播路由器场景未测。
+- [ ] P0-05 IPv4/IPv6、受限 NAT、禁 UDP、跨运营商网络样本。（跨网段/公网直连探测工具已备——`probe` 命令注册候选/STUN 映射/UDP 同时打开；实测需外部网络，未执行。）
+- [ ] P0-06 Android URI/iOS 保存目标读写、原件导入、后台中断。（SAF 存储通道代码已落地（第十五轮，`dev.ak/storage` 四方法含 SAF 写闭环探针）；URI 保存目标、原件导入与后台/生命周期适配的模拟器/真机走查未执行；iOS 由所有者明确排除。）
+- [ ] P0-07 真机传输抓包与库默认中继审计。（依赖库 ADR 与禁依赖扫描已备（P0-08/ADR-002）；真机抓包需物理双机，未执行。）
+- [ ] P0-08 输出网络库 ADR、风险记录及重估路线。（ADR-001/002/003 已冻结；重估路线待 P0-05 网络样本反馈后闭环。）
 
 ## P1–P2
 
-- [ ] P1-01 实现文件清单/目录分页扫描/源版本检测。
-- [ ] P1-02 有界分块读写、摘要验证、临时文件安全提交。
-- [ ] P1-03 SQLite checkpoint 和重启恢复。
-- [ ] P1-04 Flutter 双端界面、设置、重名处理与错误说明。
-- [ ] P2-01 部署控制面实验环境（另获部署批准）；无文件接口。
+- [x] P1-01 实现文件清单/目录分页扫描/源版本检测。`LocalSource`（`crates/ak-storage`）：迭代式目录扫描（200 层深实测）、BLAKE3 全量/分块摘要、mtime 版本记录与 `SOURCE_CHANGED` 源版本检测；ResumeRequest 多帧分页解除单帧 65,535 条目上限（100,000 条目分片验证＋65,537 文件 release 边界实测）。
+- [x] P1-02 有界分块读写、摘要验证、临时文件安全提交。全链实现且多轮实测：有界缓冲（min(chunk_size, file size)）、摘要验证（不符保留可续传前缀）、原子 no-replace 提交（`hard_link`＋unlink 双平台，绝不覆盖已有目标）、路径越界/符号链接防护（Windows 实测，终审后进一步收窄——见终审 P1-2）、staging 命名空间隔离（见终审 P1-3）、并发提交内容裁决（见终审 P1-5）、透明续传、mtime 保真、磁盘余量预检。
+- [x] P1-03 SQLite checkpoint 和重启恢复。`FileCheckpointStore`（原子写，`crates/ak-store`）＋`SqliteCheckpointStore`（可选特性 sqlite，rusqlite bundled，默认依赖图零泄漏；事务原子性、WAL 双连接并发、与文件后端语义等价）＋file→sqlite 迁移工具；传输中断→检查点存活→同身份二次运行续传经 T04/T10 与随机性质套件（10 种子中断续传）自动化。
+- [x] P1-04 Flutter 双端界面、设置、重名处理与错误说明。Windows 桌面端（五页 GUI——身份/接收/发送/历史/配对簿/邀请，真实 DLL、`flutter build windows --release`、打包 zip、首启截图核验）；Android 端（minSdk 24、双 ABI `libak_ffi.so`、应用专属 Download 输出链、SAF 存储通道、APK 构建装机、模拟器↔宿主跨设备传输）；重名处理经引擎 `ConflictPolicy::Fail/Rename` 全链支持（CLI 旗标＋FFI spec JSON `conflict` 字段透传 Dart 校验）；错误说明对齐 UX 文档（14 错误码全量中文建议）。iOS/macOS 由所有者明确排除（ADR 记录在案，非未完成）。模拟器 GUI 走查仍受阻（见第十三轮已知限制）。
+- [ ] P2-01 部署控制面实验环境（另获部署批准）；无文件接口。（代码部分已备：信令+STUN 协调面封闭消息集测试锁定、限频、会话 TTL，TLS registry 服务器（`registry-server`，默认端口 7200）；公网部署待批准，未执行。）
 - [ ] P2-02 路径切换先停正文再验证；移动数据授权。
-- [ ] P2-03 协调故障/直连故障注入及端点抓包。
+- [ ] P2-03 协调故障/直连故障注入及端点抓包。（进程内故障注入形态已备：T07 信令关停两变体、随机中断性质套件；端点抓包归 P0-07。）
 
 ## P3–P4
 
@@ -190,7 +190,7 @@ Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex
 
 ## 后续
 
-- [ ] V2-01 一次性邀请与撤销授权。
+- [x] V2-01 一次性邀请与撤销授权。（原 V2 规划项，提前由第十八至二十三波实现：`InviteCode` 160 bit 熵（`OsRng`、Crockford Base32、`AKI1-` 展示格式、lookup/auth 域分离派生、Debug 脱敏）；registry 服务 claim→redeem→Ready 全时序＋TTL（`expires_at`＋兑换重放宽限，`BEGIN IMMEDIATE` 线性化、ghost-pending 统一 `PAIR_UNAVAILABLE` 防枚举）；撤销（revoke＋`PairAbort` tombstone）；CLI `invite create/redeem/list/revoke`＋FFI `ak_pairing_*` 九导出＋Flutter 邀请页。）
 - [ ] V2-02 联系人、可选账号和多设备管理。
 
 禁止加入“中继兜底”“云端暂存”作为任何未完成任务的临时绕行实现。

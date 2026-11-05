@@ -176,11 +176,22 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(height: 4),
                 Row(
                   children: [
-                    SelectableText(
-                      pairingCode,
-                      key: const ValueKey('home_pairing_code'),
-                      style: theme.textTheme.displaySmall
-                          ?.copyWith(fontWeight: FontWeight.w700),
+                    // Flexible: at phone widths (~294dp inside the card)
+                    // displaySmall + the copy button measured 21px past
+                    // the viewport; the code keeps its size whenever it
+                    // fits and only shrinks (with FittedBox scaling, so
+                    // the digits stay legible rather than ellipsizing a
+                    // 7-char code) on narrow surfaces / large text scale.
+                    Flexible(
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: SelectableText(
+                          pairingCode,
+                          key: const ValueKey('home_pairing_code'),
+                          style: theme.textTheme.displaySmall
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                      ),
                     ),
                     const SizedBox(width: 12),
                     IconButton.outlined(
@@ -204,10 +215,19 @@ class _HomePageState extends State<HomePage> {
                         Icon(Icons.how_to_reg,
                             size: 16, color: scheme.outline),
                         const SizedBox(width: 6),
-                        Text(
-                          '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
-                          key: const ValueKey('home_peers_count'),
-                          style: theme.textTheme.bodySmall,
+                        // Flexible + ellipsis: on phone widths this row
+                        // measured 34px past the viewport (real-device
+                        // wave-25 finding); the label shrinks and the
+                        // trailing "（配对簿 peers.book）" ellipsizes
+                        // instead of overflowing. Desktop widths render
+                        // the full label unchanged.
+                        Flexible(
+                          child: Text(
+                            '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
+                            key: const ValueKey('home_peers_count'),
+                            style: theme.textTheme.bodySmall,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
                         const SizedBox(width: 4),
                         Icon(Icons.chevron_right,

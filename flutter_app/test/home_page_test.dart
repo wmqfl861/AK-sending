@@ -1,6 +1,7 @@
 import 'package:ak_sending_app/ui/pages/home_page.dart';
 import 'package:ak_sending_app/ui/service/transfer_service.dart';
-import 'package:flutter/material.dart' show ValueKey;
+import 'package:flutter/material.dart'
+    show MaterialApp, Scaffold, ValueKey;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -138,5 +139,29 @@ void main() {
     expect(find.textContaining('已配对设备：0'), findsOneWidget);
     // Empty pairing code renders as the honest empty snapshot, no crash.
     expect(find.byKey(const ValueKey('home_pairing_code')), findsOneWidget);
+  });
+
+  // Wave-25 real-device finding: at phone widths (~390dp) the
+  // pairing-book row measured 34px past the viewport (RenderFlex
+  // overflow, visible yellow/black stripes on the emulator). The fix
+  // wraps the label in Flexible + ellipsis. Desktop-width tests
+  // (pumpPage forces 1280px) never exercised this — hence a dedicated
+  // narrow-surface regression test.
+  testWidgets('identity card does not overflow on phone width (390dp)',
+      (tester) async {
+    final fake = FakeTransferService();
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+        MaterialApp(home: Scaffold(body: HomePage(service: fake))));
+    await tester.pump();
+
+    // The two fixed-content rows (pairing code at displaySmall, peers
+    // count) must shrink (FittedBox / ellipsis) instead of overflowing.
+    expect(find.textContaining('已配对设备：0 台'), findsOneWidget);
+    expect(find.byKey(const ValueKey('home_pairing_code')), findsOneWidget);
+    expect(tester.takeException(), isNull,
+        reason: 'RenderFlex overflow surfaces as a layout exception '
+            '(yellow/black stripes before the wave-25 fix)');
   });
 }

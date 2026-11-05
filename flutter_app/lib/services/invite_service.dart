@@ -178,7 +178,9 @@ final class PairingStartConfig {
   /// Registry endpoint as `ip:port`.
   final String registryAddress;
 
-  /// Pinned registry identity, 32 hex characters.
+  /// Pinned registry identity, 64 hex characters — the registry's raw
+  /// 32-byte Ed25519 public key (pairing_ffi.dart validates this shape;
+  /// wave-25 aligned it with the engine's `hex32` -> `[u8; 32]` parse).
   final String registryIdHex;
 
   /// Device name advertised to the registry (≤64 chars).
@@ -191,10 +193,14 @@ final class PairingStartConfig {
   final int redeemWindowMs;
 
   /// Loopback TEST placeholder (integrator overrides with the real
-  /// registry endpoint/identity).
+  /// registry endpoint/identity). 64-hex placeholder: the registry pin
+  /// is the raw 32-byte Ed25519 public key, so the placeholder must pass
+  /// the same 64-hex validation the real pin goes through (wave-25 fix:
+  /// the old 32-hex placeholder failed `ak_pairing_start` spec building
+  /// the moment the binding's validation was aligned with the engine).
   static const PairingStartConfig defaults = PairingStartConfig(
     registryAddress: '127.0.0.1:7101',
-    registryIdHex: '00112233445566778899aabbccddeeff',
+    registryIdHex: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
   );
 }
 

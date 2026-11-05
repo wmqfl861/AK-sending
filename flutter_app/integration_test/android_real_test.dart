@@ -53,18 +53,20 @@
 ///     never auto-accepted); print the fingerprint on the server host with
 ///     `ak-cli registry-server`.
 ///
-///     KNOWN CONTRACT MISMATCH (wave-25 finding, recorded honestly by the
-///     step): the ENGINE requires `registry_id` as exactly 64 hex chars
-///     (crates/ak-ffi/src/pairing.rs `hex32` → `[u8; 32]`; the CLI pin
-///     file agrees: `AKREG1 <addr> <64hex>`), while the wave-22 DART spec
-///     validator accepts only exactly 32 hex
-///     (`AkPairingStartSpec.toJson`, packages/ak_ffi_dart). The two
-///     acceptance ranges are disjoint, so a real 64-hex pin is rejected
-///     Dart-side (`AkSpecException`) before the engine is reached, and the
-///     wave-22 32-hex placeholder (`PairingStartConfig.defaults`) is
-///     rejected engine-side ("must be exactly 64 hex characters"). Until
-///     the Dart validator is aligned, step (d) against a real registry
-///     FAILS at that boundary and the recorded error IS the evidence.
+///     REGISTRY ID SHAPE (aligned mid-wave-25): the engine requires
+///     `registry_id` as exactly 64 hex chars (crates/ak-ffi/src/pairing.rs
+///     `hex32` → `[u8; 32]`; the CLI pin file agrees: `AKREG1 <addr>
+///     <64hex>`); the wave-22 Dart validator initially accepted only 32
+///     hex — disjoint from the engine, so a real pin could never pass —
+///     and commit 3bc75e0 (wave-25 real-registry wiring) aligned the Dart
+///     side to 64 hex. `PairingStartConfig.defaults` briefly kept the old
+///     32-hex placeholder (default-config runtime start threw
+///     `AkSpecException` at the validator); the follow-up wave-25 fix
+///     extended the placeholder to 64 hex, so a DEFAULT-config start now
+///     passes spec validation again (it still cannot reach a registry at
+///     the loopback placeholder address — that failure surfaces as the
+///     invite page's offline state, which is the honest expected shape
+///     when no AK_REGISTRY_ADDR is defined).
 ///  5. Identity isolation: on Android there is no `$AK_ID_DIR` — the app
 ///     sandbox dir resolved by path_provider
 ///     (`/data/user/0/dev.ak.ak_sending_app/files/.ak-sending`) is used
@@ -78,6 +80,7 @@
 /// ═══════════════════════════════════════════════════════════════════════
 library;
 
+import 'dart:async' show TimeoutException;
 import 'dart:io' show Platform;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart' show normalizeInviteCode;
@@ -98,8 +101,8 @@ import 'package:integration_test/integration_test.dart';
 /// the real-server step should be skipped.
 const String _registryAddr = String.fromEnvironment('AK_REGISTRY_ADDR');
 
-/// Pinned registry identity (64 hex; see the header's mismatch note),
-/// passed at compile time alongside [_registryAddr].
+/// Pinned registry identity (64 hex; see the header's "REGISTRY ID SHAPE"
+/// note), passed at compile time alongside [_registryAddr].
 const String _registryIdHex = String.fromEnvironment('AK_REGISTRY_ID');
 
 /// The SAF storage channel of the real MainActivity host (wave-15 Kotlin).
@@ -213,9 +216,18 @@ Finder _key(String value) =>
 Finder _railLabel(String text) =>
     find.descendant(of: find.byType(NavigationRail), matching: find.text(text));
 
-/// Pumps frames with real-time pacing until [isSatisfied] (Android plugin
+/// Waits until [isSatisfied] with real-time pacing (Android plugin
 /// round-trips and engine calls run on the real clock under the
-/// integration-test binding); dumps a text sample on timeout.
+/// integration-test binding). CHECK FIRST, pump only while unsatisfied,
+/// and keep the frame rate LOW (~4 fps): on the WHPX emulator a sustained
+/// forced-frame load on the Impeller/swiftshader pipeline was observed to
+/// destabilize the whole emulator (wave-25 runs 1/3 died mid-loop), so
+/// this loop buys progress with as few frames as possible.
+///
+/// Every `pump` await carries its own wall-clock guard: a WEDGED frame
+/// (slow Impeller/swiftshader first frames, or a system-side activity
+/// relaunch mid-frame) surfaces as a [TimeoutException] recorded by the
+/// surrounding [_step] instead of hanging the whole journey in silence.
 Future<void> _pumpUntil(
   WidgetTester tester, {
   required bool Function() isSatisfied,
@@ -224,16 +236,28 @@ Future<void> _pumpUntil(
 }) async {
   final deadline = DateTime.now().add(timeout);
   while (DateTime.now().isBefore(deadline)) {
-    await tester.pump(const Duration(milliseconds: 50));
-    await Future<void>.delayed(const Duration(milliseconds: 50));
     if (isSatisfied()) {
       return;
     }
+    await tester.pump(const Duration(milliseconds: 250)).timeout(
+        const Duration(seconds: 60),
+        onTimeout: () => throw TimeoutException(
+            'pump wedged for 60s waiting for: $what'));
+    await Future<void>.delayed(const Duration(milliseconds: 250));
   }
   _log('TIMEOUT waiting for: $what');
   _log('texts now: ${_allTexts(tester).take(30).toList()}');
   fail('timed out after $timeout waiting for: $what');
 }
+
+/// `pumpWidget` with the same wedged-frame guard (see [_pumpUntil]).
+Future<void> _pumpWidget(WidgetTester tester, Widget app) =>
+    tester.pumpWidget(app).timeout(
+      const Duration(seconds: 120),
+      onTimeout: () => throw TimeoutException(
+          'pumpWidget wedged for 120s (first frame never settled — '
+          'slow renderer or system-side activity relaunch)'),
+    );
 
 /// Switches to a rail tab by its label, verified by an ONSTAGE marker of
 /// the target page, retrying the tap — a lost tap must fail loudly.
@@ -355,11 +379,11 @@ void main() {
           await _transfer.identityDirReady;
           _log('identity dir anchored: ${_transfer.identityDir}');
 
-          await tester.pumpWidget(AkSendingApp(service: _transfer));
+          await _pumpWidget(tester, AkSendingApp(service: _transfer));
           await _pumpUntil(
             tester,
             what: 'HomePage identity card (key home_pairing_code)',
-            timeout: const Duration(seconds: 30),
+            timeout: const Duration(seconds: 90),
             isSatisfied: () =>
                 _key('home_pairing_code').evaluate().isNotEmpty,
           );
@@ -400,7 +424,7 @@ void main() {
           await _pumpUntil(
             tester,
             what: 'pairing code to fill in (engine identityInfo via the .so)',
-            timeout: const Duration(seconds: 60),
+            timeout: const Duration(seconds: 120),
             isSatisfied: () => RegExp(r'^\d{3}-\d{3}$').hasMatch(
                 _selectableData(tester, _key('home_pairing_code')) ?? ''),
           );
@@ -550,7 +574,7 @@ void main() {
       _log('journey steps done in ${stopwatch.elapsed}');
       _summarize();
     },
-    timeout: const Timeout(Duration(minutes: 10)),
+    timeout: const Timeout(Duration(minutes: 15)),
     semanticsEnabled: false,
   );
 }

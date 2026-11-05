@@ -132,6 +132,12 @@ final class FfiTransferService implements TransferService {
     _resultPoller = Timer.periodic(resultPollInterval, (_) => _pollResults());
     _status = _deriveStatus(); // e.g. error right away on an open failure
 
+    // Wave-25: registry endpoint of the invite pairing runtime resolves
+    // from the environment (AK_REGISTRY_ADDR / AK_REGISTRY_ID) — the same
+    // operator-override pattern as AK_ID_DIR above; null (loopback
+    // placeholder) when unset. A later explicit assignment still wins.
+    inviteStartConfig = inviteConfigFromEnvironment();
+
     // Android: resolve the real identity directory from path_provider and
     // re-anchor every facade call / job spec on it (the sync desktop probe
     // above stays as a harmless provisional until the answer lands).
@@ -162,6 +168,29 @@ final class FfiTransferService implements TransferService {
     }
     final separator = Platform.isWindows ? r'\' : '/';
     return '$home$separator.ak-sending';
+  }
+
+  /// Wave-25 (real-registry wiring): resolves the invite pairing-start
+  /// registry configuration from the environment — `AK_REGISTRY_ADDR`
+  /// (`ip:port` of the deployed coordination service, e.g.
+  /// `122.51.121.24:7200`) and `AK_REGISTRY_ID` (the pinned registry
+  /// identity — 64 hex, the raw 32-byte Ed25519 public key). BOTH must
+  /// be set; an unset or partial
+  /// environment returns null so the invite service falls back to
+  /// [PairingStartConfig.defaults] (the loopback TEST placeholder).
+  /// Shape validation stays with the engine — a malformed address or id
+  /// surfaces as the runtime's own start failure on the invite page,
+  /// never as a silent empty state. [environment] is injectable for
+  /// tests.
+  static PairingStartConfig? inviteConfigFromEnvironment(
+      {Map<String, String>? environment}) {
+    final env = environment ?? Platform.environment;
+    final address = env['AK_REGISTRY_ADDR']?.trim() ?? '';
+    final idHex = env['AK_REGISTRY_ID']?.trim().toLowerCase() ?? '';
+    if (address.isEmpty || idHex.isEmpty) {
+      return null;
+    }
+    return PairingStartConfig(registryAddress: address, registryIdHex: idHex);
   }
 
   /// Android default identity directory: `<app support>/.ak-sending` via
@@ -290,8 +319,19 @@ final class FfiTransferService implements TransferService {
   /// honest "unsupported" signal of the UI contract.
   FfiInviteService? _inviteService;
 
-  /// Optional pairing-start overrides injected by `main.dart` wiring
-  /// (daemon `--signal-*` equivalents); see [PairingStartConfig].
+  /// Optional pairing-start overrides for the lazily-created
+  /// [FfiInviteService] (daemon `--signal-*` equivalents); see
+  /// [PairingStartConfig].
+  ///
+  /// Wave-25 (real-registry wiring): initialized from the environment by
+  /// the constructor — `AK_REGISTRY_ADDR` (`ip:port` of the deployed
+  /// coordination service) + `AK_REGISTRY_ID` (the pinned registry
+  /// identity, 64 hex), see [inviteConfigFromEnvironment]. Unset/partial
+  /// environment keeps the null default, i.e. the loopback TEST
+  /// placeholder of [PairingStartConfig.defaults]. An explicit assignment
+  /// by the app shell after construction still wins, as long as it lands
+  /// before the first [inviteService] read (the config is consumed once,
+  /// when `FfiInviteService.fromFacade` is invoked).
   PairingStartConfig? inviteStartConfig;
 
   @override

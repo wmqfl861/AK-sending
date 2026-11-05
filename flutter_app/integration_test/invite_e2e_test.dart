@@ -1,18 +1,17 @@
-/// Real-app E2E (wave 22): the 配对邀请码 (pairing invite-code) page journey
-/// against the REAL Windows desktop app process (real window, real DLL-backed
-/// `FfiTransferService` for the identity/pairing-book side), with the invite
-/// domain driven by an injected **FakeInviteService** (timeline-driven) that
-/// implements the REAL `InviteService` contract
-/// (lib/services/invite_service.dart).
+/// Real-app E2E (wave 22, integrated wave 25): the 配对邀请码 (pairing
+/// invite-code) page journey against the REAL Windows desktop app process
+/// (real window, real DLL-backed `FfiTransferService`), driving the REAL
+/// `lib/ui/pages/invite_page.dart` with the REAL `FfiInviteService` over
+/// the deployed coordination registry (AK_REGISTRY_ADDR / AK_REGISTRY_ID).
 ///
-/// The invite page (`lib/ui/pages/invite_page.dart`) is being written by the
-/// parallel page agent this wave. Per the repo's parallel rule #4
-/// (AGENTS.md: 后棒可按冻结契约先行开发（Fake/占位），前棒落地后由集成者一行
-/// 切换接线), this test ships the full journey NOW against a contract
-/// stand-in page + the Fake service, and exposes ONE construction site for
-/// the integrator to flip once the real page lands (search "INTEGRATION
-/// SWITCH" below). The journey's key-based assertions are the frozen UI
-/// contract and stay unchanged after the switch.
+/// History: wave 22 shipped this journey against a contract stand-in page
+/// + a timeline-driven FakeInviteService (kept below for rollback); wave
+/// 25 flipped the INTEGRATION SWITCH — `_buildInvitePage()` renders the
+/// real page and `main()` resolves the invite service through the REAL
+/// `TransferService.inviteService` seam (`FfiInviteService.fromFacade`,
+/// the exact wiring the app shell uses). The journey's key-based
+/// assertions are the frozen UI contract and stayed unchanged; the
+/// `[fake-mode]`-marked assertions no-op when `_fake` is null.
 ///
 /// ═══════════════════════════════════════════════════════════════════════
 ///  UI KEY CONTRACT — for the invite-page agent (mirror these exactly)
@@ -105,14 +104,23 @@
 ///  export PATH="$USERPROFILE/flutter-sdk/bin:$PATH"
 ///  export AK_ID_DIR="$(cygpath -w "$(mktemp -d "${TMPDIR:-/tmp}/ak-e2e-id-XXXXXX")")"
 ///  export AK_FFI_DLL="$(cd .. && pwd -W)/target/release/ak_ffi.dll"
+///  export AK_REGISTRY_ADDR=122.51.121.24:7200
+///  export AK_REGISTRY_ID=8f012017f57cfef1a3e74e90fa1e13a5f6ffbed3a9ddeecb98f819e002f94f36
 ///  flutter test integration_test/invite_e2e_test.dart -d windows
 ///  ```
 ///
 ///  AK_ID_DIR is REQUIRED (marker-guarded throwaway dir; wiped by the test —
 ///  the real %USERPROFILE%\.ak-sending is never touched). AK_FFI_DLL is
 ///  belt-and-braces; the dev-relative `../target/release/ak_ffi.dll` probe
-///  also works from the flutter_app CWD. Real TLS/registry round-trips are
-///  the NEXT acceptance wave; this wave is Fake-driven by design.
+///  also works from the flutter_app CWD. AK_REGISTRY_ADDR / AK_REGISTRY_ID
+///  are REQUIRED since wave 25 (real-registry mode): the coordination
+///  service endpoint and its pinned registry identity — consumed by
+///  `FfiTransferService.inviteConfigFromEnvironment` into the
+///  `FfiInviteService` pairing-start config. The successful-redeem pairing
+///  dance (fake steps 6-7) needs a FOREIGN device's code and is therefore
+///  skipped in real-registry mode (single-machine E2E cannot drive the
+///  owner side of a real pairing); create/list/revoke/toggles and the
+///  illegal-redeem local reject run against the REAL server.
 /// ═══════════════════════════════════════════════════════════════════════
 library;
 
@@ -123,6 +131,8 @@ import 'dart:io' show Directory, File, Platform;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show
+        AkPairingStartSpec,
+        AkSpecException,
         InvitationRevokedEvent,
         InviteCreated,
         InviteState,
@@ -139,6 +149,7 @@ import 'package:ak_sending_app/services/ffi_transfer_service.dart'
 import 'package:ak_sending_app/services/invite_service.dart'
     show InviteService, InviteTtlKind, SchedulerPreference;
 import 'package:ak_sending_app/ui/pages/home_page.dart' show HomePage;
+import 'package:ak_sending_app/ui/pages/invite_page.dart' show InvitePage;
 import 'package:ak_sending_app/ui/service/transfer_service.dart'
     show TransferService;
 
@@ -154,13 +165,17 @@ late final Directory _receiverIdDir;
 late final FfiTransferService _transfer;
 
 // ═════════════════════════════════════════════════════════════════════════
-// INTEGRATION SWITCH — the ONE construction site to flip after the real
-// page/service land (see also _JourneyShell._buildInvitePage):
+// INTEGRATION SWITCH — FLIPPED in wave 25 (see also
+// _JourneyShell._buildInvitePage):
 //
-//   Wave 22 (now):     _fake = FakeInviteService(identityDir: ...);
-//                     _inviteService = _fake!;
-//   After integration: _fake = null;
-//                     _inviteService = FfiInviteService.fromFacade(...);
+//   Wave 22 (past):  _fake = FakeInviteService(identityDir: ...);
+//                    _inviteService = _fake!;
+//   Wave 25 (now):   _fake = null;
+//                    _inviteService = _transfer.inviteService
+//                        (FfiInviteService.fromFacade over the shared
+//                        engine; registry endpoint from AK_REGISTRY_ADDR /
+//                        AK_REGISTRY_ID via FfiTransferService's
+//                        inviteStartConfig initialization)
 //
 // The journey assertions marked "[fake-mode]" read `_fake` and no-op when
 // it is null; every key-based assertion runs against BOTH drivers.
@@ -448,425 +463,6 @@ class _InvitePairingLink {
 }
 
 // -----------------------------------------------------------------------------
-// Contract stand-in invite page (frozen keys; swapped at integration).
-// -----------------------------------------------------------------------------
-
-/// The contract stand-in for `lib/ui/pages/invite_page.dart`: implements the
-/// frozen UI contract (keys + interactions above) against any real
-/// [InviteService]. Real window, real widgets, real dialogs — the journey
-/// below exercises exactly what the real page must implement.
-class _StandInInvitePage extends StatefulWidget {
-  const _StandInInvitePage({required this.service});
-
-  final InviteService service;
-
-  @override
-  State<_StandInInvitePage> createState() => _StandInInvitePageState();
-}
-
-class _StandInInvitePageState extends State<_StandInInvitePage> {
-  final TextEditingController _redeemController = TextEditingController();
-
-  List<InviteSummary> _rows = const <InviteSummary>[];
-  final Map<String, String> _hints = <String, String>{};
-  final List<PairingEvent> _feed = <PairingEvent>[];
-  SchedulerPreference _preference = SchedulerPreference.defaults;
-  String? _redeemError;
-  StreamSubscription<PairingEvent>? _subscription;
-  bool _busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _subscription = widget.service.events.listen((event) {
-      if (!mounted) return;
-      setState(() => _feed.add(event));
-    });
-    unawaited(_bootstrap());
-  }
-
-  @override
-  void dispose() {
-    unawaited(_subscription?.cancel());
-    _redeemController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _bootstrap() async {
-    final rows = await widget.service.listInvites(includeTerminal: true);
-    final preference = await widget.service.loadSchedulerPreference();
-    if (!mounted) return;
-    setState(() {
-      _rows = rows;
-      _preference = preference;
-    });
-  }
-
-  Future<void> _reloadRows() async {
-    final rows = await widget.service.listInvites(includeTerminal: true);
-    if (!mounted) return;
-    setState(() => _rows = rows);
-  }
-
-  Future<void> _createCode() async {
-    final ttl = await _showTtlDialog();
-    if (ttl == null) return; // cancelled
-    setState(() => _busy = true);
-    try {
-      final created = await widget.service.createInvite(ttl: ttl);
-      // The plaintext code is a bearer credential: show it exactly ONCE,
-      // remember only the masked hint for the list.
-      _hints[created.summary.codeId] = inviteCodeHint(created.invitationCode);
-      await _reloadRows();
-      if (mounted) await _showOneTimeCode(created.invitationCode);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<InviteTtlKind?> _showTtlDialog() {
-    return showDialog<InviteTtlKind>(
-      context: context,
-      builder: (dialogContext) => _TtlDialog(),
-    );
-  }
-
-  Future<void> _showOneTimeCode(String code) {
-    return showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('邀请码已生成'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('完整邀请码仅展示这一次，请立即保存并分享：'),
-            const SizedBox(height: 8),
-            SelectableText(
-              code,
-              key: const ValueKey<String>('invite_code_once_text'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            key: const ValueKey<String>('invite_code_once_close'),
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('我已保存'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _revokeCode(InviteSummary row) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('撤销邀请码'),
-        content: const Text('撤销后该码不能再被兑换，已完成的配对不受影响。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            key: const ValueKey<String>('invite_revoke_confirm'),
-            onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('确认撤销'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    setState(() => _busy = true);
-    try {
-      await widget.service.revokeInvite(row.codeId);
-      await _reloadRows();
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _redeem() async {
-    final text = _redeemController.text;
-    setState(() => _redeemError = null);
-    try {
-      await widget.service.redeemInvite(text);
-      // Accepted/pending: the outcome arrives on the event feed.
-    } on FormatException catch (error) {
-      if (mounted) setState(() => _redeemError = error.message);
-    }
-  }
-
-  Future<void> _savePreference(SchedulerPreference preference) async {
-    await widget.service.saveSchedulerPreference(preference);
-    if (mounted) setState(() => _preference = preference);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    // SingleChildScrollView + Column (NOT a ListView): every child stays
-    // BUILT regardless of scroll offset, so key-based reads/taps never
-    // depend on lazy-build timing inside the ~600 px test window.
-    return SingleChildScrollView(
-      key: const ValueKey<String>('invite_page'),
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('配对邀请码', style: theme.textTheme.headlineSmall),
-          const SizedBox(height: 4),
-          Text(
-            '码本身即授权：持有者可与本设备配对（owner 在线自动处理）',
-            style: theme.textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
-
-          // -- Scheduler preference -----------------------------------------
-          Text('任务调度', style: theme.textTheme.titleMedium),
-          SwitchListTile(
-            key: const ValueKey<String>('same_code_toggle'),
-            title: const Text('同码并行（same_code）'),
-            subtitle: const Text('关闭 = 同一邀请码同时只跑一个任务'),
-            value: _preference.sameCodeMode == SchedCodeMode.parallel,
-            onChanged: _busy
-                ? null
-                : (v) => unawaited(
-                    _savePreference(
-                      SchedulerPreference(
-                        sameCodeMode: v
-                            ? SchedCodeMode.parallel
-                            : SchedCodeMode.serial,
-                        crossCodeMode: _preference.crossCodeMode,
-                      ),
-                    ),
-                  ),
-          ),
-          SwitchListTile(
-            key: const ValueKey<String>('cross_code_toggle'),
-            title: const Text('跨码并行（cross_code）'),
-            subtitle: const Text('关闭 = 不同邀请码之间也串行'),
-            value: _preference.crossCodeMode == SchedCodeMode.parallel,
-            onChanged: _busy
-                ? null
-                : (v) => unawaited(
-                    _savePreference(
-                      SchedulerPreference(
-                        sameCodeMode: _preference.sameCodeMode,
-                        crossCodeMode: v
-                            ? SchedCodeMode.parallel
-                            : SchedCodeMode.serial,
-                      ),
-                    ),
-                  ),
-          ),
-          const SizedBox(height: 8),
-
-          // -- Generate ------------------------------------------------------
-          FilledButton.icon(
-            key: const ValueKey<String>('invite_create_btn'),
-            icon: const Icon(Icons.add_link),
-            label: const Text('生成邀请码'),
-            onPressed: _busy ? null : () => unawaited(_createCode()),
-          ),
-          const SizedBox(height: 16),
-
-          // -- Own codes -----------------------------------------------------
-          Text('我的邀请码', style: theme.textTheme.titleMedium),
-          const SizedBox(height: 4),
-          if (_rows.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 16),
-              child: Text('暂无邀请码', key: ValueKey<String>('invite_empty')),
-            )
-          else
-            ..._rows.map(_codeTile),
-          const SizedBox(height: 16),
-
-          // -- Redeem --------------------------------------------------------
-          Text('兑换邀请码', style: theme.textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  key: const ValueKey<String>('invite_code_input'),
-                  controller: _redeemController,
-                  decoration: const InputDecoration(
-                    hintText: 'AKI1-XXXX-XXXX-…（收到对方分享的邀请码）',
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              FilledButton(
-                key: const ValueKey<String>('invite_redeem_btn'),
-                onPressed: () => unawaited(_redeem()),
-                child: const Text('兑换'),
-              ),
-            ],
-          ),
-          if (_redeemError != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                _redeemError!,
-                key: const ValueKey<String>('invite_redeem_error'),
-                style: TextStyle(color: theme.colorScheme.error),
-              ),
-            ),
-          const SizedBox(height: 16),
-
-          // -- Live pairing-event feed --------------------------------------
-          Text('配对事件', style: theme.textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Container(
-            key: const ValueKey<String>('invite_events'),
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              border: Border.all(color: theme.dividerColor),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: _feed.isEmpty
-                ? const Text('暂无事件')
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      for (var i = 0; i < _feed.length; i++)
-                        Text(
-                          _feedLine(_feed[i]),
-                          key: ValueKey<String>('invite_event_$i'),
-                        ),
-                    ],
-                  ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _feedLine(PairingEvent event) {
-    final clock = _clockOf(event.atMs);
-    if (event is ServiceOnlineEvent) return '$clock · 配对服务已连接';
-    if (event is PeerPreparedEvent) return '$clock · 配对事务已持久化';
-    if (event is PairingCompleteEvent) {
-      final peer = event.peer;
-      final short = peer.length >= 8 ? peer.substring(0, 8) : peer;
-      return '$clock · 配对完成 · 对端指纹 $short';
-    }
-    if (event is InvitationRevokedEvent) return '$clock · 邀请码已撤销';
-    return '$clock · ${event.name}';
-  }
-
-  String _two(int v) => v.toString().padLeft(2, '0');
-
-  String _clockOf(int? atMs) {
-    final local = atMs == null
-        ? DateTime.now()
-        : DateTime.fromMillisecondsSinceEpoch(atMs);
-    return '${_two(local.hour)}:${_two(local.minute)}:${_two(local.second)}';
-  }
-
-  Widget _codeTile(InviteSummary row) {
-    final theme = Theme.of(context);
-    final stateText = switch (row.state) {
-      InviteState.active => '有效',
-      InviteState.revoked => '已撤销',
-      InviteState.expired => '已过期',
-    };
-    final ttlText = row.expiresMs == 0
-        ? '长期有效'
-        : row.expiresMs - row.createdMs >= 3600 * 1000
-        ? '${(row.expiresMs - row.createdMs) ~/ (3600 * 1000)} 小时有效'
-        : '${(row.expiresMs - row.createdMs) ~/ (60 * 1000)} 分钟有效';
-    final hint = _hints[row.codeId] ?? '${row.codeId.substring(0, 8)}…';
-    return Card(
-      child: ListTile(
-        title: Text(
-          hint,
-          key: ValueKey<String>('invite_code_hint_${row.codeId}'),
-        ),
-        subtitle: Text(
-          '创建于 ${_clockOf(row.createdMs)} · $ttlText',
-          key: ValueKey<String>('invite_time_${row.codeId}'),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              stateText,
-              key: ValueKey<String>('invite_state_${row.codeId}'),
-              style: TextStyle(
-                color: row.state == InviteState.active
-                    ? theme.colorScheme.primary
-                    : theme.colorScheme.outline,
-              ),
-            ),
-            IconButton(
-              key: ValueKey<String>('invite_revoke_${row.codeId}'),
-              icon: const Icon(Icons.link_off),
-              tooltip: '撤销',
-              onPressed: row.state == InviteState.active
-                  ? () => unawaited(_revokeCode(row))
-                  : null,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// TTL choice dialog of the create flow (the frozen two-kind enum).
-class _TtlDialog extends StatefulWidget {
-  @override
-  State<_TtlDialog> createState() => _TtlDialogState();
-}
-
-class _TtlDialogState extends State<_TtlDialog> {
-  InviteTtlKind _selected = InviteTtlKind.longLived;
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('生成邀请码'),
-      content: RadioGroup<InviteTtlKind>(
-        groupValue: _selected,
-        onChanged: (value) =>
-            setState(() => _selected = value ?? InviteTtlKind.longLived),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            RadioListTile<InviteTtlKind>(
-              key: const ValueKey<String>('invite_ttl_long'),
-              title: const Text('长期有效'),
-              value: InviteTtlKind.longLived,
-            ),
-            RadioListTile<InviteTtlKind>(
-              key: const ValueKey<String>('invite_ttl_short'),
-              title: const Text('短期 1 小时'),
-              value: InviteTtlKind.shortLived,
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
-        ),
-        TextButton(
-          key: const ValueKey<String>('invite_create_confirm'),
-          onPressed: () => Navigator.of(context).pop(_selected),
-          child: const Text('确认'),
-        ),
-      ],
-    );
-  }
-}
-
-// -----------------------------------------------------------------------------
 // Journey shell: real HomePage + the invite page, NavigationRail like app.dart.
 // -----------------------------------------------------------------------------
 
@@ -886,16 +482,17 @@ class _JourneyShell extends StatefulWidget {
 class _JourneyShellState extends State<_JourneyShell> {
   int _index = 0;
 
-  // ═══════════════ INTEGRATION SWITCH (the ONE line to flip) ══════════════
-  // Wave 22 (now): the contract stand-in page driven by the injected Fake
-  //   (the real lib/ui/pages/invite_page.dart is being written in parallel
-  //   and reads the service through the TransferService.inviteService seam).
-  // After it lands the integrator replaces the body below with
-  //   InvitePage(service: widget.invite)     // ← the one line
-  // plus the import. All key-based journey assertions stay UNCHANGED (they
-  // are the frozen contract); the `_fake`-marked ones no-op automatically.
+  // ═══════════════ INTEGRATION SWITCH — flipped in wave 25 ═══════════════
+  // The REAL lib/ui/pages/invite_page.dart: the invite service is injected
+  // directly (same instance the journey shell holds) AND the transfer
+  // service is passed so the scheduler runtime-apply path
+  // (InvitePage → TransferService.setSchedulerPolicy) runs exactly like
+  // the app shell's `InvitePage(transfer: service)` wiring in app.dart.
+  // All key-based journey assertions stay UNCHANGED (they are the frozen
+  // contract); the `_fake`-marked ones no-op automatically.
   // ═══════════════════════════════════════════════════════════════════════
-  Widget _buildInvitePage() => _StandInInvitePage(service: widget.invite);
+  Widget _buildInvitePage() =>
+      InvitePage(service: widget.invite, transfer: widget.transfer);
 
   @override
   Widget build(BuildContext context) {
@@ -968,6 +565,55 @@ void _setUpFixture() {
       '"$_idDirMarker"; refusing to wipe an unrecognized directory.',
     );
   }
+  // Wave-25 real-registry contract: the invite journey must drive the
+  // DEPLOYED coordination service, never silently fall back to the
+  // loopback placeholder (that would hang the bootstrap with opaque
+  // timeouts instead of failing fast).
+  final registryAddr = Platform.environment['AK_REGISTRY_ADDR'] ?? '';
+  final registryId = Platform.environment['AK_REGISTRY_ID'] ?? '';
+  if (registryAddr.isEmpty || registryId.isEmpty) {
+    throw StateError(
+      'AK_REGISTRY_ADDR / AK_REGISTRY_ID are not set. Real-registry '
+      'contract (wave 25): the invite journey drives the deployed '
+      'coordination service (AK_REGISTRY_ADDR=ip:port) pinned to its '
+      'registry identity (AK_REGISTRY_ID, the 64-hex raw registry public '
+      'key the registry-server prints). See the runner contract in this '
+      'file\'s library doc.',
+    );
+  }
+  // The ENGINE contract (ak-ffi pairing.rs, mirror of ak-cli's
+  // AKREG1 <addr> <64hex> pin file): the pin is EXACTLY 64 hex — the
+  // server's raw ed25519 public key.
+  if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(registryId)) {
+    throw StateError(
+      'AK_REGISTRY_ID must be exactly 64 hex characters (the raw '
+      'registry public key; ak-cli calls it --registry-fp); got '
+      '${registryId.length} chars.',
+    );
+  }
+  // Fail fast when the frozen ak_ffi_dart binding cannot carry the pin:
+  // the engine takes 64 hex, but the wave-22 Dart binding still
+  // validates registry_id as 32 hex — surfacing that as an instant,
+  // pinpointed error beats a 45 s bootstrap timeout that only shows the
+  // same reason on the page. Once the binding matches the engine (64),
+  // this probe passes silently and the journey proceeds.
+  try {
+    AkPairingStartSpec(
+      registry: registryAddr,
+      registryIdHex: registryId,
+      idDir: idDirEnv,
+    ).toJsonString();
+  } on AkSpecException catch (error) {
+    throw StateError(
+      'the ak_ffi_dart pairing-start spec rejects the registry pin: '
+      '$error. The ENGINE (ak_pairing_start, crates/ak-ffi/src/'
+      'pairing.rs) and ak-cli both take the 64-hex raw registry public '
+      'key — the binding\'s 32-hex validation in '
+      'packages/ak_ffi_dart/lib/src/pairing_ffi.dart '
+      '(AkPairingStartSpec.toJson) is stale. Fix the binding (accept 64 '
+      'hex), then re-run this journey unchanged.',
+    );
+  }
   _receiverIdDir = Directory(idDirEnv);
   if (_receiverIdDir.existsSync()) {
     for (final entity in _receiverIdDir.listSync()) {
@@ -978,7 +624,9 @@ void _setUpFixture() {
   }
   _log(
     'fixture: AK_ID_DIR=${_receiverIdDir.path} '
-    'AK_FFI_DLL=${Platform.environment['AK_FFI_DLL'] ?? '<unset>'}',
+    'AK_FFI_DLL=${Platform.environment['AK_FFI_DLL'] ?? '<unset>'} '
+    'AK_REGISTRY_ADDR=$registryAddr '
+    'AK_REGISTRY_ID=$registryId',
   );
 }
 
@@ -1108,6 +756,33 @@ int _eventCount(WidgetTester tester) {
   return n;
 }
 
+/// Row registry ids discovered from the rendered `invite_code_hint_<id>`
+/// keys, in render order. Real-registry mode has no fake introspection:
+/// the server assigns the ids, so the journey reads them back from the
+/// UI (the honest path — what the user sees is what is asserted).
+List<String> _rowIds(WidgetTester tester) {
+  const prefix = 'invite_code_hint_';
+  final ids = <String>[];
+  for (final element in find
+      .byWidgetPredicate(
+        (widget) {
+          if (widget is! Text) {
+            return false;
+          }
+          final key = widget.key;
+          return key is ValueKey<String> && key.value.startsWith(prefix);
+        },
+        skipOffstage: false,
+      )
+      .evaluate()) {
+    final key = (element.widget as Text).key;
+    if (key is ValueKey<String>) {
+      ids.add(key.value.substring(prefix.length));
+    }
+  }
+  return ids;
+}
+
 /// Every Text/SelectableText data string in the tree (diagnostics).
 List<String> _allTexts(WidgetTester tester) {
   final texts = <String>[];
@@ -1147,14 +822,30 @@ void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   // Services: the REAL DLL-backed transfer service (identity + pairing
-  // book truth) and the injected invite service (fake this wave).
+  // book truth) and — since wave 25 — the REAL FfiInviteService over the
+  // same borrowed engine (the TransferService.inviteService seam; the
+  // exact wiring the app shell uses), pinned to the deployed registry
+  // via AK_REGISTRY_ADDR / AK_REGISTRY_ID.
   _transfer = FfiTransferService();
   // ── INTEGRATION SWITCH construction site (see the top of this file) ──
-  _fake = FakeInviteService(identityDir: _receiverIdDir.path);
-  _inviteService = _fake!;
-  _pairingLink = _fake == null
-      ? null
-      : _InvitePairingLink(invite: _inviteService, transfer: _transfer);
+  // Wave 25 (real registry): the FakeInviteService is retired. The real
+  // service is resolved through the transfer seam so the journey proves
+  // the app-shell wiring path end to end (FfiTransferService constructs
+  // it with FfiInviteService.fromFacade + its env-resolved
+  // inviteStartConfig + the AK_ID_DIR identity provider).
+  _fake = null;
+  final realInvite = _transfer.inviteService;
+  if (realInvite == null) {
+    throw StateError(
+      'FfiTransferService.inviteService is unavailable: the real engine '
+      '(ak_ffi.dll with the ak_pairing_*/ak_sched_* exports) must load '
+      'first — got version "${_transfer.version()}"',
+    );
+  }
+  _inviteService = realInvite;
+  // Fake-mode only (the real pairing runtime writes peers.book through
+  // the engine itself; no synthetic event link is needed).
+  _pairingLink = null;
 
   tearDownAll(() async {
     // Best-effort cleanup of pure test artifacts.
@@ -1176,8 +867,8 @@ void main() {
 
   testWidgets(
     'invite journey: empty → create(长期/1h, one-time code) → '
-    'illegal/legal redeem → pairingComplete → home peers 0→1 → revoke '
-    'tombstone → scheduler toggles persist',
+    'illegal redeem → [fake only: legal redeem → pairingComplete → '
+    'home peers 0→1] → revoke tombstone → scheduler toggles persist',
     (tester) async {
       final stopwatch = Stopwatch()..start();
       _log('journey start');
@@ -1242,14 +933,32 @@ void main() {
       await _pumpUntil(
         tester,
         what: 'invite page bootstrap (empty code list)',
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 45),
         isSatisfied: () => _textData(tester, _key('invite_empty')) == '暂无邀请码',
       );
-      expect(
-        _eventCount(tester),
-        0,
-        reason: 'the event feed starts empty (runtime not started yet)',
-      );
+      if (_fake != null) {
+        expect(
+          _eventCount(tester),
+          0,
+          reason: 'the event feed starts empty (runtime not started yet)',
+        );
+      } else {
+        // Real-registry mode: the bootstrap's first listInvites already
+        // started the pairing runtime — service_online is on the feed by
+        // now (this doubles as the live-registry connection proof).
+        expect(
+          find
+              .descendant(
+                of: _key('invite_events'),
+                matching: find.textContaining('配对服务已连接',
+                    skipOffstage: false),
+              )
+              .evaluate()
+              .isNotEmpty,
+          isTrue,
+          reason: 'the real registry connection emitted service_online',
+        );
+      }
       expect(
         _switchValue(tester, 'same_code_toggle'),
         isFalse,
@@ -1284,27 +993,42 @@ void main() {
       await _pumpUntil(
         tester,
         what: 'one-time code dialog after the create op',
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 30),
         isSatisfied: () =>
             (_selectableData(tester, _key('invite_code_once_text')) ?? '')
                 .startsWith('AKI1-'),
       );
       final onceCode =
           _selectableData(tester, _key('invite_code_once_text')) ?? '';
-      expect(
-        onceCode,
-        _fake!.createdCodes.first, // [fake-mode]
-        reason: 'the one-time code is exactly what the service returned',
-      );
+      final fake3 = _fake;
+      if (fake3 != null) {
+        expect(
+          onceCode,
+          fake3.createdCodes.first, // [fake-mode]
+          reason: 'the one-time code is exactly what the service returned',
+        );
+      } else {
+        // Real-registry mode: the server minted the secret — assert it is
+        // a canonical AKI1 Crockford code via the REAL validator.
+        expect(
+          () => normalizeInviteCode(onceCode),
+          returnsNormally,
+          reason: 'a real registry code must pass normalizeInviteCode',
+        );
+      }
       await tester.tap(_key('invite_code_once_close'));
-      final firstId = _fake!.rows.first.codeId; // [fake-mode]
       await _pumpUntil(
         tester,
         what: 'created row to appear in the list',
-        timeout: const Duration(seconds: 10),
-        isSatisfied: () =>
-            _key('invite_code_hint_$firstId').evaluate().isNotEmpty,
+        timeout: const Duration(seconds: 20),
+        isSatisfied: () => _rowIds(tester).isNotEmpty,
       );
+      // The row id is discovered from the UI (the server assigned it; no
+      // fake introspection in real-registry mode).
+      final firstId = _rowIds(tester).first;
+      if (fake3 != null) {
+        expect(firstId, fake3.rows.first.codeId); // [fake-mode]
+      }
       await tester.ensureVisible(_key('invite_code_hint_$firstId'));
       expect(
         _textData(tester, _key('invite_code_hint_$firstId')),
@@ -1341,7 +1065,12 @@ void main() {
         isTrue,
         reason: 'the runtime start emitted service_online on the feed',
       );
-      expect(_eventCount(tester), 1, reason: 'one feed line so far');
+      if (_fake != null) {
+        expect(_eventCount(tester), 1, reason: 'one feed line so far');
+      }
+      // Real-registry mode does not pin the count here: the bootstrap's
+      // setSchedulerPolicy also echoes a policy_changed event onto the
+      // feed, so the line count is engine-dependent.
       _log(
         'step3 ok: 1h code created, one-time code shown, row 有效 '
         '(${stopwatch.elapsed})',
@@ -1366,19 +1095,24 @@ void main() {
       await _pumpUntil(
         tester,
         what: 'second one-time code dialog',
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 30),
         isSatisfied: () =>
             (_selectableData(tester, _key('invite_code_once_text')) ?? '')
                 .startsWith('AKI1-'),
       );
       await tester.tap(_key('invite_code_once_close'));
-      final secondId = _fake!.rows[1].codeId; // [fake-mode]
       await _pumpUntil(
         tester,
         what: 'long-term entry row to render',
-        timeout: const Duration(seconds: 10),
-        isSatisfied: () => _key('invite_time_$secondId').evaluate().isNotEmpty,
+        timeout: const Duration(seconds: 20),
+        isSatisfied: () => _rowIds(tester).length >= 2,
       );
+      // The NEW row (not present before this create) is the long-lived
+      // one — order-independent discovery from the rendered keys.
+      final secondId = _rowIds(tester).firstWhere((id) => id != firstId);
+      if (_fake != null) {
+        expect(secondId, _fake!.rows[1].codeId); // [fake-mode]
+      }
       await tester.ensureVisible(_key('invite_time_$secondId'));
       expect(
         _textData(tester, _key('invite_time_$secondId')),
@@ -1394,7 +1128,7 @@ void main() {
       // undefined Crockford symbols (charset excludes I/L/O/U).
       const illegalCode = 'AKI1-ABCD-EFG1-OOPS-UVWX-QRST-YZ23-CDEF-GH1J';
       final eventsBeforeIllegal = _eventCount(tester);
-      final registryCallsBefore = _fake!.redeemRegistryCalls.length;
+      final registryCallsBefore = _fake?.redeemRegistryCalls.length ?? 0;
       await _enterText(tester, 'invite_code_input', illegalCode);
       await _tapVisible(
         tester,
@@ -1412,13 +1146,16 @@ void main() {
         isNotNull,
         reason: 'the FormatException reason renders inline',
       );
-      expect(
-        _fake!.redeemRegistryCalls.length,
-        registryCallsBefore,
-        reason:
-            '格式错误在本地拒绝 (§11): a malformed code never reaches '
-            'the registry round-trip',
-      );
+      final fake5 = _fake;
+      if (fake5 != null) {
+        expect(
+          fake5.redeemRegistryCalls.length,
+          registryCallsBefore,
+          reason:
+              '格式错误在本地拒绝 (§11): a malformed code never reaches '
+              'the registry round-trip',
+        );
+      }
       expect(
         _eventCount(tester),
         eventsBeforeIllegal,
@@ -1434,73 +1171,90 @@ void main() {
       // the ASCII lowercase→uppercase normalization of contract §1); the
       // feed updates in real time, phase by phase.
       // -------------------------------------------------------------------
-      final legalLower = _fake!.foreignCode.toLowerCase();
-      await _enterText(tester, 'invite_code_input', legalLower);
-      await _tapVisible(
-        tester,
-        find.byKey(const ValueKey<String>('invite_redeem_btn')),
-      );
-      await _pumpUntil(
-        tester,
-        what: 'feed phase 1: 配对事务已持久化 (peer_prepared)',
-        timeout: const Duration(seconds: 10),
-        isSatisfied: () => find
-            .descendant(
-              of: _key('invite_events'),
-              matching: find.textContaining('配对事务已持久化', skipOffstage: false),
-            )
-            .evaluate()
-            .isNotEmpty,
-      );
-      // The registry saw exactly the well-formed legal code (normalized).
-      expect(_fake!.redeemRegistryCalls, [
-        _fake!.foreignCode,
-      ], reason: 'the legal code (and only it) caused a registry round-trip');
-      await _pumpUntil(
-        tester,
-        what: 'feed phase 2: 配对完成 with the owner fingerprint',
-        timeout: const Duration(seconds: 15),
-        isSatisfied: () => find
-            .descendant(
-              of: _key('invite_events'),
-              matching: find.textContaining(
-                '配对完成 · 对端指纹 '
-                '${FakeInviteService.foreignFingerprint.substring(0, 8)}',
-                skipOffstage: false,
-              ),
-            )
-            .evaluate()
-            .isNotEmpty,
-      );
-      _log(
-        'step6 ok: legal redeem (lowercase normalized) → '
-        'pairing_complete in feed (${stopwatch.elapsed})',
-      );
+      final fake67 = _fake;
+      if (fake67 == null) {
+        // Real-registry mode: a SUCCESSFUL redeem needs a FOREIGN
+        // device's invite code with its owner online — a single-machine
+        // E2E cannot drive the owner side of a real pairing. The redeem
+        // SERVICE path (local Crockford reject above) and the registry
+        // round-trips of create/list/revoke below are what this wave
+        // proves against the live server. Known limitation, honestly
+        // skipped (wave-25 integration report).
+        _log(
+          'steps 6-7 SKIPPED (real-registry mode): legal-redeem pairing '
+          'dance needs a second device (${stopwatch.elapsed})',
+        );
+      } else {
+        final legalLower = fake67.foreignCode.toLowerCase();
+        await _enterText(tester, 'invite_code_input', legalLower);
+        await _tapVisible(
+          tester,
+          find.byKey(const ValueKey<String>('invite_redeem_btn')),
+        );
+        await _pumpUntil(
+          tester,
+          what: 'feed phase 1: 配对事务已持久化 (peer_prepared)',
+          timeout: const Duration(seconds: 10),
+          isSatisfied: () => find
+              .descendant(
+                of: _key('invite_events'),
+                matching:
+                    find.textContaining('配对事务已持久化', skipOffstage: false),
+              )
+              .evaluate()
+              .isNotEmpty,
+        );
+        // The registry saw exactly the well-formed legal code (normalized).
+        expect(fake67.redeemRegistryCalls, [
+          fake67.foreignCode,
+        ], reason: 'the legal code (and only it) caused a registry round-trip');
+        await _pumpUntil(
+          tester,
+          what: 'feed phase 2: 配对完成 with the owner fingerprint',
+          timeout: const Duration(seconds: 15),
+          isSatisfied: () => find
+              .descendant(
+                of: _key('invite_events'),
+                matching: find.textContaining(
+                  '配对完成 · 对端指纹 '
+                  '${FakeInviteService.foreignFingerprint.substring(0, 8)}',
+                  skipOffstage: false,
+                ),
+              )
+              .evaluate()
+              .isNotEmpty,
+        );
+        _log(
+          'step6 ok: legal redeem (lowercase normalized) → '
+          'pairing_complete in feed (${stopwatch.elapsed})',
+        );
 
-      // -------------------------------------------------------------------
-      // Step 7 — Home linkage: pairing_complete folded into the pairing
-      // book (fake event → service-layer addPeer + refreshIdentity) →
-      // HomePage count 0 → 1, peers.book on disk (REAL engine write).
-      // -------------------------------------------------------------------
-      await _pumpUntil(
-        tester,
-        what: 'HomePage pairing-book count to follow the pairing (0 → 1)',
-        timeout: const Duration(seconds: 20),
-        isSatisfied: () => (_textData(tester, _key('home_peers_count')) ?? '')
-            .contains('已配对设备：1 台'),
-      );
-      expect(
-        File('${_receiverIdDir.path}${Platform.pathSeparator}peers.book')
-            .existsSync(),
-        isTrue,
-        reason:
-            'disk truth: the real engine persisted peers.book under '
-            'AK_ID_DIR via the pairing link',
-      );
-      _log(
-        'step7 ok: home peers 0→1, peers.book on disk '
-        '(${stopwatch.elapsed})',
-      );
+        // -----------------------------------------------------------------
+        // Step 7 — Home linkage: pairing_complete folded into the pairing
+        // book (fake event → service-layer addPeer + refreshIdentity) →
+        // HomePage count 0 → 1, peers.book on disk (REAL engine write).
+        // -----------------------------------------------------------------
+        await _pumpUntil(
+          tester,
+          what: 'HomePage pairing-book count to follow the pairing (0 → 1)',
+          timeout: const Duration(seconds: 20),
+          isSatisfied: () =>
+              (_textData(tester, _key('home_peers_count')) ?? '')
+                  .contains('已配对设备：1 台'),
+        );
+        expect(
+          File('${_receiverIdDir.path}${Platform.pathSeparator}peers.book')
+              .existsSync(),
+          isTrue,
+          reason:
+              'disk truth: the real engine persisted peers.book under '
+              'AK_ID_DIR via the pairing link',
+        );
+        _log(
+          'step7 ok: home peers 0→1, peers.book on disk '
+          '(${stopwatch.elapsed})',
+        );
+      }
 
       // -------------------------------------------------------------------
       // Step 8 — Revoke the 1 h code via the confirm dialog; the row stays
@@ -1517,7 +1271,7 @@ void main() {
       await _pumpUntil(
         tester,
         what: 'row state to flip to 已撤销 (tombstone stays listed)',
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 30),
         isSatisfied: () =>
             _textData(tester, _key('invite_state_$firstId')) == '已撤销',
       );
@@ -1608,9 +1362,11 @@ void main() {
         reason: 'cross_code=serial persists across tab switches',
       );
       expect(
-        (await _fake!.loadSchedulerPreference()).sameCodeMode,
+        (await _inviteService.loadSchedulerPreference()).sameCodeMode,
         SchedCodeMode.parallel,
-        reason: 'service-level reload sees the persisted preference',
+        reason:
+            'service-level reload sees the persisted preference (the real '
+            'FfiInviteService reads the same scheduler_prefs.json)',
       );
       _log(
         'step9 ok: same_code serial→parallel, cross_code parallel→serial, '

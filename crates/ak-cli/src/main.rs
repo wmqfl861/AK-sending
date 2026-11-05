@@ -82,7 +82,7 @@ fn version_line_static() -> &'static str {
     version,
     long_version = version_line_static(),
     about = "AK-sending direct-only prototype",
-    after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> [more paths...] --to <ip:7100> --fp <fingerprint>\n\nFingerprints accept the full 64 hex characters or a unique 8-63 character\nprefix of a peer already in peers.book. Multiple send paths travel in one\njob; each keeps its own top-level name on the receiver (paths with the same\nname must be sent in separate runs).\nAll transfers are direct device-to-device; no server ever carries file data."
+    after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> [more paths...] --to <ip:7100[,ip2:7100...]> --fp <fingerprint>\n\nFingerprints accept the full 64 hex characters or a unique 8-63 character\nprefix of a peer already in peers.book. Multiple send paths travel in one\njob; each keeps its own top-level name on the receiver (paths with the same\nname must be sent in separate runs). --to accepts comma-separated address\ncandidates (private/LAN addresses are tried first, each with a 3s connect\ntimeout before the next is attempted).\nAll transfers are direct device-to-device; no server ever carries file data."
 )]
 struct Cli {
     /// Identity directory holding device.key, peers.book, checkpoints
@@ -239,9 +239,18 @@ enum Command {
         /// further paths are extra roots in the same job.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Peer address ip:port.
-        #[arg(long)]
-        to: SocketAddr,
+        /// Peer address ip:port, or comma-separated candidates
+        /// (`--to "1.2.3.4:7000,5.6.7.8:7000"`; IPv6 as `[v6]:port`).
+        /// Private/LAN addresses are tried before public ones and each
+        /// address gets a 3-second connect timeout before the next is
+        /// attempted (wave 25 multi-NIC fallback).
+        #[arg(
+            long,
+            required = true,
+            value_delimiter = ',',
+            value_parser = to_addr_parser
+        )]
+        to: Vec<SocketAddr>,
         /// Peer fingerprint pinned for this transfer: 64 hex characters, or
         /// a unique 8-63 character prefix of a peer already in peers.book.
         /// Get it from the peer device via `ak-cli pair code`.
@@ -541,6 +550,20 @@ impl BindArg {
 /// clap value parser bridging [`BindArg::parse`] errors into help output.
 fn bind_arg_parser(text: &str) -> Result<BindArg, String> {
     BindArg::parse(text).map_err(|err| err.to_string())
+}
+
+/// clap value parser for one `--to` address item (the flag itself splits on
+/// commas via `value_delimiter`). Whitespace around an item is trimmed so
+/// `--to "1.2.3.4:7000, 5.6.7.8:7000"` parses; anything that is not a full
+/// socket address is an explicit error naming the expected shapes.
+fn to_addr_parser(text: &str) -> Result<SocketAddr, String> {
+    let trimmed = text.trim();
+    trimmed.parse::<SocketAddr>().map_err(|_| {
+        format!(
+            "invalid peer address {trimmed:?}: expected ip:port (`1.2.3.4:7100`) or \
+             [v6]:port (`[2001:db8::1]:7100`); comma-separate multiple candidates"
+        )
+    })
 }
 
 /// Combine a bind flag with the (optional, explicitly given) port flag and
@@ -2207,6 +2230,94 @@ pub(crate) fn expect_policy_lines(policy: &ExpectPolicy) -> Vec<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Address candidates (wave 25): what a sender can dial on this host
+// ---------------------------------------------------------------------------
+
+/// One address a sender can try on this host: an IPv4 interface address
+/// (public or LAN) carrying the listen port, plus its classification label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddressCandidate {
+    pub(crate) addr: SocketAddr,
+    /// "lan" (RFC1918 private) or "public"; display-only.
+    pub(crate) label: &'static str,
+}
+
+/// Filter local interface networks down to dialable IPv4 candidates for
+/// `port`: IPv4 only (the mDNS path already advertises v6), no loopback
+/// (127.x -- `local_nets` drops loopback interfaces, this is the defensive
+/// second lock), no link-local (169.254.x), deduped by address, interface
+/// order preserved. Pure over `nets` so the filtering itself is testable
+/// without interfaces.
+pub(crate) fn candidates_from_nets(
+    nets: &[ak_net::classify::Net],
+    port: u16,
+) -> Vec<AddressCandidate> {
+    let mut out: Vec<AddressCandidate> = Vec::new();
+    for net in nets {
+        let IpAddr::V4(v4) = net.addr else {
+            continue; // IPv6 stays out of the printed candidate list
+        };
+        if v4.is_loopback() || v4.is_link_local() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|candidate| candidate.addr.ip() == IpAddr::V4(v4))
+        {
+            continue;
+        }
+        let label = if ak_net::classify::is_ipv4_private(v4) {
+            "lan"
+        } else {
+            "public"
+        };
+        out.push(AddressCandidate {
+            addr: SocketAddr::new(IpAddr::V4(v4), port),
+            label,
+        });
+    }
+    out
+}
+
+/// Live version of [`candidates_from_nets`] over the real interfaces.
+/// Enumeration failure (or no IPv4 interface) yields an empty list: the
+/// candidates block is a hint, the bound listen address is always printed.
+pub(crate) fn address_candidates(port: u16) -> Vec<AddressCandidate> {
+    ak_net::classify::local_nets()
+        .map(|nets| candidates_from_nets(&nets, port))
+        .unwrap_or_default()
+}
+
+/// The human candidates block ("address candidates (try these):" plus one
+/// aligned line per address). Empty input renders no lines at all.
+pub(crate) fn address_candidates_lines(candidates: &[AddressCandidate]) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let width = candidates
+        .iter()
+        .map(|candidate| candidate.addr.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec!["address candidates (try these):".to_owned()];
+    for candidate in candidates {
+        lines.push(format!(
+            "  {:<width$} ({})",
+            candidate.addr, candidate.label
+        ));
+    }
+    lines
+}
+
+/// The `candidates` values of the daemon's NDJSON `listening` event.
+pub(crate) fn address_candidates_json(candidates: &[AddressCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.addr.to_string())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_command(
     id: &Path,
@@ -2292,6 +2403,12 @@ async fn receive_command(
             let addr = addr_rx.await.context("receiver failed to bind")?;
             println!("receiving into {}", out.display());
             println!("address: {addr}");
+            // Wave 25: 0.0.0.0:PORT is useless to a sender on a multi-NIC
+            // host (VPN + real NIC) -- also list every interface address the
+            // peer can dial, labeled lan/public.
+            for line in address_candidates_lines(&address_candidates(addr.port())) {
+                println!("{line}");
+            }
             println!("{}", fingerprint_lines("fingerprint", &fp));
             println!("pairing code: {}", ak_identity::pairing_code(&fp));
             println!("waiting for sender (Ctrl-C stops)...");
@@ -2368,13 +2485,249 @@ fn duplicate_roots_error(err: &EngineError) -> Option<&std::io::Error> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// send: multi-address candidates with automatic fallback (wave 25)
+// ---------------------------------------------------------------------------
+
+/// Per-address connect deadline of the send fallback: an address that has
+/// not completed the QUIC+TLS handshake within this budget is abandoned for
+/// the next candidate. Transfers that already connected are NOT bound by it
+/// (see [`attempt_send_to`]).
+const SEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Brief pause between address attempts: the failed attempt's QUIC endpoint
+/// releases its UDP socket asynchronously after drop, so an immediate rebind
+/// on an explicit --port could hit AddrInUse (same reasoning as the receive
+/// loop's rebind retries).
+const SEND_ATTEMPT_PAUSE: Duration = Duration::from_millis(150);
+
+/// Sender-side LAN preference for one target: RFC1918 private IPv4 (and any
+/// loopback) sorts before public IPv4 and IPv6. Reuses
+/// `ak_net::classify::is_ipv4_private`; the classification is a routing
+/// hint, never an authorization.
+fn send_target_prefers_lan(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => ak_net::classify::is_ipv4_private(v4),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Dedupe the --to list, then stably sort it LAN-first. Stable: the user's
+/// order survives within the LAN group and within the public group.
+pub(crate) fn order_send_targets(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut ordered: Vec<SocketAddr> = Vec::with_capacity(targets.len());
+    for addr in targets {
+        if !ordered.contains(&addr) {
+            ordered.push(addr);
+        }
+    }
+    ordered.sort_by_key(|addr| !send_target_prefers_lan(addr));
+    ordered
+}
+
+/// Why one address attempt failed (wave 25 fallback bookkeeping).
+#[derive(Debug)]
+struct AttemptFailure {
+    addr: SocketAddr,
+    /// One-line reason for the aggregate error and the progress line.
+    reason: String,
+    /// The original engine error (kept for the friendly-hint mapping).
+    err: EngineError,
+    /// True when the engine had already reported `Connected`: a
+    /// transfer-phase failure another address cannot fix.
+    after_connect: bool,
+}
+
+impl AttemptFailure {
+    /// The connect-deadline failure of [`attempt_send_to`].
+    fn connect_timeout(addr: SocketAddr) -> Self {
+        AttemptFailure {
+            addr,
+            reason: format!(
+                "timeout after {}s (no QUIC handshake)",
+                SEND_CONNECT_TIMEOUT.as_secs()
+            ),
+            err: EngineError::IdleTimeout(SEND_CONNECT_TIMEOUT),
+            after_connect: false,
+        }
+    }
+
+    /// Short tag for the `[send] failed (...)` progress line.
+    fn short(&self) -> String {
+        if self.reason.starts_with("timeout") {
+            "timeout".to_owned()
+        } else {
+            clip_line(self.reason.split(['\n', '\r']).next().unwrap_or(""), 60).to_owned()
+        }
+    }
+}
+
+/// Single-line rendering of an engine error for progress/summary lines
+/// (multi-line Display output would garble the fallback report).
+fn one_line_reason(err: &EngineError) -> String {
+    let text = err.to_string();
+    let first = text.split(['\n', '\r']).next().unwrap_or("");
+    clip_line(first, 120).to_owned()
+}
+
+/// One full engine send against a single address, bounded by
+/// [`SEND_CONNECT_TIMEOUT`] for the connect phase only: the engine future
+/// is raced against the deadline until it reports `Progress::Connected`;
+/// a connected transfer then runs to completion unbounded (a real transfer
+/// legitimately outlives 3 seconds). The connected flag is set from the
+/// progress callback, which the engine invokes synchronously inside the
+/// polled future, so there is no cross-task race.
+async fn attempt_send_to(
+    spec: SendSpec,
+    printer: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, AttemptFailure> {
+    let addr = spec.peer;
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = connected.clone();
+    let wrapped = move |progress: Progress| {
+        if matches!(progress, Progress::Connected { .. }) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        printer(progress);
+    };
+    let send = ak_engine::send(spec, &wrapped);
+    tokio::pin!(send);
+    let result = match tokio::time::timeout(SEND_CONNECT_TIMEOUT, send.as_mut()).await {
+        Ok(result) => result,
+        Err(_deadline_elapsed) => {
+            if connected.load(std::sync::atomic::Ordering::Relaxed) {
+                // Connected inside the deadline; from here the transfer is
+                // governed by its own idle budget, not the connect deadline.
+                send.await
+            } else {
+                return Err(AttemptFailure::connect_timeout(addr));
+            }
+        }
+    };
+    let after_connect = connected.load(std::sync::atomic::Ordering::Relaxed);
+    result.map_err(|err| AttemptFailure {
+        addr,
+        reason: one_line_reason(&err),
+        err,
+        after_connect,
+    })
+}
+
+/// Drive the wave-25 address fallback: try each target in order through
+/// `attempt`. A connect-phase failure moves to the next address; a failure
+/// after the connection was established is returned immediately (another
+/// address cannot fix a protocol/transfer failure); the first success
+/// returns its report. Total failure returns every (address, reason) pair
+/// for the aggregate error. Progress lines print only for multi-address
+/// runs, so single-address output stays identical to the classic CLI.
+async fn run_send_fallback<F, Fut>(
+    targets: &[SocketAddr],
+    mut attempt: F,
+) -> Result<Report, Vec<AttemptFailure>>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<Report, AttemptFailure>>,
+{
+    let total = targets.len();
+    let mut failures: Vec<AttemptFailure> = Vec::new();
+    for (index, addr) in targets.iter().copied().enumerate() {
+        if total > 1 && index == 0 {
+            println!("[send] trying 1/{total}: {addr}...");
+        }
+        match attempt(addr).await {
+            Ok(report) => return Ok(report),
+            Err(failure) => {
+                let next = index + 1;
+                if total > 1 && next < total {
+                    // The spec's announcement line doubles as the "trying"
+                    // line for the next candidate.
+                    println!(
+                        "[send] failed ({}), trying {}/{total}: {}...",
+                        failure.short(),
+                        next + 1,
+                        targets[next]
+                    );
+                    tokio::time::sleep(SEND_ATTEMPT_PAUSE).await;
+                } else if total > 1 {
+                    println!("[send] failed ({})", failure.short());
+                }
+                let after_connect = failure.after_connect;
+                failures.push(failure);
+                if after_connect {
+                    // This address connected; the transfer itself failed.
+                    // No other candidate can help -- surface it now.
+                    return Err(failures);
+                }
+            }
+        }
+    }
+    Err(failures)
+}
+
+/// Build the final error from the fallback failures. A single-address run
+/// keeps the classic wording exactly (engine error, friendly hint as
+/// context); a multi-address run lists every attempted address with its own
+/// reason (or, for a post-connect failure, names the connected address and
+/// the untried candidates).
+fn send_failures_error(failures: Vec<AttemptFailure>, targets: &[SocketAddr]) -> anyhow::Error {
+    // Address-independent input problems keep their dedicated friendly copy
+    // regardless of how many addresses were tried.
+    for failure in &failures {
+        if let Some(io) = duplicate_roots_error(&failure.err) {
+            return anyhow::Error::msg(format!(
+                "two paths have the same name: please send them in separate runs ({io})"
+            ));
+        }
+    }
+    let mut failures = failures;
+    let last = failures
+        .pop()
+        .expect("run_send_fallback returns at least one failure");
+    let hint = errors::friendly_send_hint(&last.err);
+    let base = anyhow::Error::from(last.err);
+    if targets.len() == 1 {
+        // Single address: byte-for-byte the classic error path.
+        return match hint {
+            Some(hint) => base.context(hint),
+            None => base,
+        };
+    }
+    let mut message = if last.after_connect {
+        let untried: Vec<String> = targets
+            .iter()
+            .filter(|addr| !failures.iter().any(|f| f.addr == **addr) && **addr != last.addr)
+            .map(|addr| addr.to_string())
+            .collect();
+        let untried = if untried.is_empty() {
+            String::new()
+        } else {
+            format!(" (untried: {})", untried.join(", "))
+        };
+        format!(
+            "connected to {} but the transfer failed: {}{untried}",
+            last.addr, last.reason
+        )
+    } else {
+        let mut message = format!("all {} peer address attempts failed:", targets.len());
+        for failure in &failures {
+            message.push_str(&format!("\n  {}: {}", failure.addr, failure.reason));
+        }
+        message.push_str(&format!("\n  {}: {}", last.addr, last.reason));
+        message
+    };
+    if let Some(hint) = &hint {
+        message.push_str(&format!("\n{hint}"));
+    }
+    base.context(message)
+}
+
 // Options arrive flat from clap; grouping them into a struct here would only
 // mirror the enum variant one-to-one (same allowance as the engine drivers).
 #[allow(clippy::too_many_arguments)]
 async fn send_command(
     id: &Path,
     paths: Vec<PathBuf>,
-    to: SocketAddr,
+    to: Vec<SocketAddr>,
     fp_text: String,
     port: u16,
     conflict: String,
@@ -2385,38 +2738,52 @@ async fn send_command(
     let (key, bundle) = load_identity(id)?;
     let pinned = resolve_fingerprint_arg(&fp_text, &peer_book_path(id))?;
     let (root, extras) = send_roots(&paths)?;
+    let targets = order_send_targets(to);
     println!(
         "sending {} path(s) to peer {} (its pairing code must be {})",
         1 + extras.len(),
         pinned.short_id(),
         ak_identity::pairing_code(&pinned)
     );
-    let mut spec = SendSpec::new(root, to, pinned, bundle);
-    for extra in extras {
-        spec.add_root(extra);
+    if targets.len() > 1 {
+        println!(
+            "peer addresses (LAN first): {}",
+            targets
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
-    spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
-    spec.conflict = conflict_policy(&conflict)?;
-    spec.checkpoint_dir = checkpoint_dir(id);
-    spec.device_name = whoami();
-    spec.idle_timeout = idle_timeout_from_secs(timeout);
-    spec.multistream = multistream;
-    spec.policy.allow_internet = !no_internet;
-    let _ = key;
+    let conflict = conflict_policy(&conflict)?;
+    let checkpoints = checkpoint_dir(id);
+    let idle = idle_timeout_from_secs(timeout);
+    let device_name = whoami();
     let printer = progress_printer("send");
-    let report = match ak_engine::send(spec, &*printer).await {
-        Ok(report) => report,
-        Err(err) => {
-            if let Some(io) = duplicate_roots_error(&err) {
-                bail!("two paths have the same name: please send them in separate runs ({io})");
-            }
-            // Friendly copy for the common failure shapes; the hint rides as
-            // an anyhow context so the original error chain stays visible.
-            if let Some(hint) = errors::friendly_send_hint(&err) {
-                return Err(anyhow::Error::from(err).context(hint));
-            }
-            return Err(err.into());
+    let _ = key;
+    // One engine send per address; the spec is rebuilt per attempt because
+    // SendSpec carries the peer address. The shared pieces are borrowed (not
+    // moved) so the closure stays FnMut across attempts.
+    let (root, extras, bundle, checkpoints, device_name) =
+        (&root, &extras, &bundle, &checkpoints, &device_name);
+    let printer = printer.as_ref();
+    let attempt = |addr: SocketAddr| async move {
+        let mut spec = SendSpec::new(root.clone(), addr, pinned, bundle.clone());
+        for extra in extras.iter() {
+            spec.add_root(extra.clone());
         }
+        spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
+        spec.conflict = conflict;
+        spec.checkpoint_dir = checkpoints.clone();
+        spec.device_name = device_name.clone();
+        spec.idle_timeout = idle;
+        spec.multistream = multistream;
+        spec.policy.allow_internet = !no_internet;
+        attempt_send_to(spec, printer).await
+    };
+    let report = match run_send_fallback(&targets, attempt).await {
+        Ok(report) => report,
+        Err(failures) => return Err(send_failures_error(failures, &targets)),
     };
     report_summary(&report);
     // TOFU: remember a successfully reached receiver.
@@ -3055,7 +3422,7 @@ fn path_kind_name(path: PathKind) -> &'static str {
 }
 
 /// JSON string-array of already-stringified values ([] when empty).
-fn json_string_array(items: &[String]) -> String {
+pub(crate) fn json_string_array(items: &[String]) -> String {
     if items.is_empty() {
         return "[]".to_owned();
     }
@@ -3858,6 +4225,400 @@ mod tests {
             "duplicate transfer root names: [x]",
         ));
         assert!(duplicate_roots_error(&not_found).is_none());
+    }
+
+    // -- wave 25: multi-address --to ------------------------------------------
+
+    #[test]
+    fn send_to_flag_parses_single_multiple_space_and_ipv6() {
+        let fp = "a".repeat(64);
+        let parse_to = |to: &str| -> Vec<SocketAddr> {
+            let cli = cli_of(&["send", "x.bin", "--to", to, "--fp", &fp]);
+            let Command::Send { to, .. } = cli.command else {
+                panic!("expected send subcommand");
+            };
+            to
+        };
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+
+        // Single address stays a one-element list (classic compatibility).
+        assert_eq!(parse_to("1.2.3.4:7000"), vec![addr("1.2.3.4:7000")]);
+        // Comma-separated candidates, with and without spaces after commas.
+        assert_eq!(
+            parse_to("1.2.3.4:7000,5.6.7.8:7000"),
+            vec![addr("1.2.3.4:7000"), addr("5.6.7.8:7000")]
+        );
+        assert_eq!(
+            parse_to("1.2.3.4:7000, 5.6.7.8:7000"),
+            vec![addr("1.2.3.4:7000"), addr("5.6.7.8:7000")]
+        );
+        // IPv6 must be bracketed; mixed families parse in one list.
+        assert_eq!(
+            parse_to("[2001:db8::1]:7000,1.2.3.4:7000"),
+            vec![addr("[2001:db8::1]:7000"), addr("1.2.3.4:7000")]
+        );
+        // Repeated --to flags accumulate into the same candidate list.
+        let cli = cli_of(&[
+            "send",
+            "x.bin",
+            "--to",
+            "1.2.3.4:7000",
+            "--to",
+            "5.6.7.8:7000",
+            "--fp",
+            &fp,
+        ]);
+        let Command::Send { to, .. } = cli.command else {
+            panic!("expected send subcommand");
+        };
+        assert_eq!(to, vec![addr("1.2.3.4:7000"), addr("5.6.7.8:7000")]);
+
+        // Missing --to, junk entries, bare IPs, hostnames and stray empty
+        // items (trailing comma) are all refused at parse time.
+        assert!(Cli::try_parse_from(["ak-cli", "send", "x.bin", "--fp", &fp]).is_err());
+        for bad in [
+            "1.2.3.4",
+            "1.2.3.4:7000,",
+            "1.2.3.4:7000,,5.6.7.8:7000",
+            "example.com:7000",
+            "1.2.3.4:7000,nope",
+            "2001:db8::1:7000", // unbracketed v6 is not a socket address
+        ] {
+            let argv = ["ak-cli", "send", "x.bin", "--to", bad, "--fp", &fp];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "unexpectedly accepted --to {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_send_targets_dedupes_and_puts_lan_first() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let ordered = order_send_targets(vec![
+            addr("103.236.80.135:7000"), // public (VPN egress)
+            addr("192.168.1.100:7000"),  // LAN
+            addr("[2001:db8::1]:7000"),  // IPv6
+            addr("10.1.2.3:7000"),       // LAN
+            addr("192.168.1.100:7000"),  // duplicate of an earlier target
+            addr("172.20.0.9:7000"),     // LAN (172.16-31 range)
+            addr("172.32.0.1:7000"),     // public (outside 16-31)
+        ]);
+        // LAN group first in input order (deduped), then public+v6 in input
+        // order (v6 came before 172.32.0.1 in the input and the sort is
+        // stable within the two groups).
+        assert_eq!(
+            ordered,
+            vec![
+                addr("192.168.1.100:7000"),
+                addr("10.1.2.3:7000"),
+                addr("172.20.0.9:7000"),
+                addr("103.236.80.135:7000"),
+                addr("[2001:db8::1]:7000"),
+                addr("172.32.0.1:7000"),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_from_nets_filters_and_labels_ipv4() {
+        let net = |ip: &str| ak_net::classify::Net {
+            addr: ip.parse().unwrap(),
+            prefix_len: 24,
+        };
+        let nets = vec![
+            net("127.0.0.1"),      // loopback (defensive second lock)
+            net("169.254.7.7"),    // link-local (DHCP failure / VPN ghost)
+            net("192.168.1.100"),  // LAN
+            net("103.236.80.135"), // public
+            net("fe80::1"),        // v6 link-local: no v6 in the list at all
+            net("2001:db8::2"),    // v6 global
+            net("192.168.1.100"),  // duplicate interface address
+            net("10.8.0.2"),       // LAN (VPN-typical private range)
+        ];
+        let candidates = candidates_from_nets(&nets, 57210);
+        let rendered: Vec<String> = candidates
+            .iter()
+            .map(|candidate| format!("{} ({})", candidate.addr, candidate.label))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "192.168.1.100:57210 (lan)".to_owned(),
+                "103.236.80.135:57210 (public)".to_owned(),
+                "10.8.0.2:57210 (lan)".to_owned(),
+            ]
+        );
+        // The NDJSON `listening` values are bare socket addresses.
+        assert_eq!(
+            address_candidates_json(&candidates),
+            vec![
+                "192.168.1.100:57210".to_owned(),
+                "103.236.80.135:57210".to_owned(),
+                "10.8.0.2:57210".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn address_candidates_lines_render_aligned_block() {
+        // Nothing to advertise: no lines at all (the bind address line above
+        // still names the port).
+        assert!(address_candidates_lines(&[]).is_empty());
+        let candidate = |ip: &str, label: &'static str| AddressCandidate {
+            addr: SocketAddr::new(ip.parse().unwrap(), 57210),
+            label,
+        };
+        let lines = address_candidates_lines(&[
+            candidate("103.236.80.135", "public"),
+            candidate("192.168.1.100", "lan"),
+        ]);
+        assert_eq!(lines[0], "address candidates (try these):");
+        // Column alignment: the shorter LAN address pads to the public one.
+        assert_eq!(lines[1], "  103.236.80.135:57210 (public)");
+        assert_eq!(lines[2], "  192.168.1.100:57210  (lan)");
+    }
+
+    /// A connect-deadline-shaped failure for the driver tests.
+    fn fake_timeout_failure(addr: SocketAddr) -> AttemptFailure {
+        AttemptFailure::connect_timeout(addr)
+    }
+
+    /// A minimal finished report for the driver tests.
+    fn fake_report(bytes: u64) -> Report {
+        Report {
+            job_id: [7u8; 16],
+            files: 1,
+            bytes,
+            duration: Duration::from_millis(1),
+            resumed_chunks: 0,
+            peer_fingerprint: None,
+            roots: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_driver_moves_to_next_address_on_connect_failure() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let targets = vec![addr("192.168.1.100:7000"), addr("10.0.0.5:7000")];
+        let tried = std::sync::Mutex::new(Vec::new());
+        let (seen, targets) = (&tried, &targets);
+        let attempt = |addr: SocketAddr| async move {
+            seen.lock().unwrap().push(addr);
+            if addr == targets[0] {
+                Err(fake_timeout_failure(addr))
+            } else {
+                Ok(fake_report(42))
+            }
+        };
+        let report = run_send_fallback(targets, attempt)
+            .await
+            .expect("the second address delivers");
+        assert_eq!(report.bytes, 42);
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![addr("192.168.1.100:7000"), addr("10.0.0.5:7000")],
+            "tried in order, stopped at success"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_driver_reports_every_attempt_when_all_fail() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let targets = vec![
+            addr("192.168.1.100:7000"),
+            addr("10.0.0.5:7000"),
+            addr("103.236.80.135:7000"),
+        ];
+        let attempt = |addr: SocketAddr| async move { Err(fake_timeout_failure(addr)) };
+        let failures = run_send_fallback(&targets, attempt)
+            .await
+            .expect_err("all dead");
+        assert_eq!(failures.iter().map(|f| f.addr).collect::<Vec<_>>(), targets);
+        assert!(
+            failures
+                .iter()
+                .all(|f| f.reason.starts_with("timeout after 3s")),
+            "every reason names the deadline: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_driver_stops_at_first_post_connect_failure() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let targets = vec![addr("192.168.1.100:7000"), addr("10.0.0.5:7000")];
+        // The first address connects and then the transfer fails: another
+        // candidate cannot help, so the driver must surface it immediately.
+        let targets_ref = &targets;
+        let attempt = |addr: SocketAddr| async move {
+            if addr == targets_ref[0] {
+                Err(AttemptFailure {
+                    addr,
+                    reason: "peer vanished mid-transfer".to_owned(),
+                    err: EngineError::PeerClosed,
+                    after_connect: true,
+                })
+            } else {
+                panic!("the second address must not be tried after connect");
+            }
+        };
+        let failures = run_send_fallback(&targets, attempt)
+            .await
+            .expect_err("fatal");
+        assert_eq!(
+            failures.len(),
+            1,
+            "only the connected failure: {failures:?}"
+        );
+        assert_eq!(failures[0].addr, targets[0]);
+        assert!(failures[0].after_connect);
+    }
+
+    #[test]
+    fn send_failures_error_keeps_single_address_wording_classic() {
+        let addr: SocketAddr = "1.2.3.4:7000".parse().unwrap();
+        let error = send_failures_error(
+            vec![AttemptFailure {
+                addr,
+                reason: "connect failed: io error: timed out".to_owned(),
+                err: EngineError::Connect(ak_net::ConnectError::Timeout(SEND_CONNECT_TIMEOUT)),
+                after_connect: false,
+            }],
+            &[addr],
+        );
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("peer address attempts failed"),
+            "single-address errors stay classic: {text}"
+        );
+        assert!(text.contains("connect failed"), "{text}");
+        // The friendly idle-timeout hint rides as context for hinted shapes.
+        let hinted = send_failures_error(
+            vec![AttemptFailure {
+                addr,
+                reason: "idle timeout".to_owned(),
+                err: EngineError::IdleTimeout(SEND_CONNECT_TIMEOUT),
+                after_connect: false,
+            }],
+            &[addr],
+        );
+        let text = format!("{hinted:#}");
+        assert!(text.contains("断点已保留"), "hint attached: {text}");
+    }
+
+    #[test]
+    fn send_failures_error_lists_every_attempt_for_multi_address_runs() {
+        let lan: SocketAddr = "192.168.1.100:7000".parse().unwrap();
+        let public: SocketAddr = "103.236.80.135:7000".parse().unwrap();
+        let error = send_failures_error(
+            vec![
+                fake_timeout_failure(lan),
+                AttemptFailure {
+                    addr: public,
+                    reason: "connect failed: io error: connection refused".to_owned(),
+                    err: EngineError::Connect(ak_net::ConnectError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    ))),
+                    after_connect: false,
+                },
+            ],
+            &[lan, public],
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("all 2 peer address attempts failed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("192.168.1.100:7000: timeout after 3s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("103.236.80.135:7000: connect failed"),
+            "{text}"
+        );
+    }
+
+    /// The full wave-25 fallback against the real engine: the first address
+    /// is a black hole (a bound UDP socket that never answers the QUIC
+    /// handshake, so the 3-second connect deadline fires), the second is a
+    /// live loopback receiver -- the send must land on the second and
+    /// deliver byte-identical content.
+    #[tokio::test]
+    async fn send_fallback_times_out_dead_address_and_lands_on_live_one() {
+        let dir = TempDir::new("send-fallback-live");
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("black hole bind");
+        let dead = blackhole.local_addr().expect("black hole addr");
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_fp = receiver_key.fingerprint();
+        let mut recv_spec = ReceiveSpec::new(
+            out.clone(),
+            ak_identity::tls::make_self_signed(&receiver_key),
+        );
+        recv_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        recv_spec.idle_timeout = Duration::from_secs(20);
+        recv_spec.authorize = Box::new(|_| true);
+        recv_spec.checkpoint_dir = dir.path().join("recv-checkpoints");
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver =
+            tokio::spawn(
+                async move { ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await },
+            );
+        let live = addr_rx.await.expect("receiver bound");
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("fallback.bin"), &payload).unwrap();
+
+        // Both targets are loopback (LAN tier), so the given order survives:
+        // dead first, live second -- exactly the multi-NIC user story.
+        let targets = order_send_targets(vec![dead, live]);
+        assert_eq!(targets, vec![dead, live]);
+
+        let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+        let (root, checkpoints, sender_bundle) =
+            (&src, &dir.path().join("send-checkpoints"), &sender_bundle);
+        let printer: &(dyn Fn(Progress) + Send + Sync) = &|_| {};
+        let started = Instant::now();
+        let attempt = |addr: SocketAddr| async move {
+            let mut spec = SendSpec::new(root.clone(), addr, receiver_fp, sender_bundle.clone());
+            spec.idle_timeout = Duration::from_secs(20);
+            spec.checkpoint_dir = checkpoints.clone();
+            attempt_send_to(spec, printer).await
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_send_fallback(&targets, attempt),
+        )
+        .await
+        .expect("bounded run")
+        .expect("the live address delivers");
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, payload.len() as u64);
+        // The dead address consumed the full connect deadline before the
+        // fallback moved on.
+        assert!(
+            started.elapsed() >= SEND_CONNECT_TIMEOUT,
+            "the dead address must burn the 3s connect deadline"
+        );
+        assert_eq!(
+            std::fs::read(out.join("fallback.bin")).unwrap(),
+            payload,
+            "byte-identical delivery through the fallback path"
+        );
+        let recv_report = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("receiver joins")
+            .expect("receiver task ok")
+            .expect("receive ok");
+        assert_eq!(recv_report.bytes, payload.len() as u64);
     }
 
     #[test]

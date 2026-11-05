@@ -55,14 +55,17 @@ pub(crate) struct DaemonOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaemonEvent<'a> {
     /// Emitted once per daemon run after the first successful bind: the
-    /// concrete listen address, this device's fingerprint and name, and
-    /// whether the mDNS announcement went out.
+    /// concrete listen address, this device's fingerprint and name, whether
+    /// the mDNS announcement went out, and the wave-25 `candidates` list
+    /// (every dialable local interface address carrying the listen port --
+    /// what a sender should feed `--to` on a multi-NIC host).
     Listening {
         addr: &'a str,
         port: u16,
         fingerprint: &'a str,
         name: &'a str,
         mdns: bool,
+        candidates: &'a [String],
     },
     /// A sender completed the handshake (its verified fingerprint in hex);
     /// the transfer itself starts now.
@@ -96,12 +99,15 @@ impl DaemonEvent<'_> {
                 fingerprint,
                 name,
                 mdns,
+                candidates,
             } => format!(
                 "{{\"type\":\"listening\",\"addr\":\"{}\",\"port\":{port},\
-                 \"fingerprint\":\"{}\",\"name\":\"{}\",\"mdns\":{mdns}}}",
+                 \"fingerprint\":\"{}\",\"name\":\"{}\",\"mdns\":{mdns},\
+                 \"candidates\":{}}}",
                 crate::json_escape(addr),
                 crate::json_escape(fingerprint),
-                crate::json_escape(name)
+                crate::json_escape(name),
+                crate::json_string_array(candidates)
             ),
             DaemonEvent::JobStarted { peer } => format!(
                 "{{\"type\":\"job_started\",\"peer\":\"{}\"}}",
@@ -566,6 +572,15 @@ pub(crate) async fn daemon_core(
         opts.port
     };
     let listen = SocketAddr::from(([0, 0, 0, 0], port));
+    // Wave 25: the addresses a sender can actually dial on this host (every
+    // non-loopback, non-link-local IPv4 interface address carrying the
+    // fixed port). Computed once -- the port never changes across loop
+    // iterations -- and shared by the human candidates block and the
+    // NDJSON `listening` event. Empty when enumeration fails or no IPv4
+    // interface exists (the block is a hint; the bind address is reported
+    // regardless).
+    let candidate_addrs = crate::address_candidates(port);
+    let candidates_json = crate::address_candidates_json(&candidate_addrs);
     // The same identity/admission/checkpoint wiring `receive` resolves:
     // one config, two verbs.
     let config = ReceiveLoopConfig::resolve(
@@ -626,6 +641,15 @@ pub(crate) async fn daemon_core(
     // fixed port. mDNS is a discovery hint, not authorization and not a
     // hard dependency: when multicast is unavailable the daemon degrades
     // to manual `--to` connections (REVIEW 4.3).
+    //
+    // Wave 25 verification (no mDNS code change needed): advertise() uses
+    // `enable_addr_auto()`, so the mDNS daemon registers EVERY host
+    // interface address (real NIC and VPN alike) as A/AAAA records -- the
+    // TXT record carries only `fp` and `name`, never an IP, so there is no
+    // VPN-priority problem inside TXT. The browsing side (`discover`)
+    // receives every resolved address and `ak_discovery::rank` sorts
+    // same-LAN candidates first, mirroring the send fallback's LAN-first
+    // order.
     let mut mdns: Option<ak_discovery::MdnsDiscovery> = None;
     let mut mdns_ok = false;
     match ak_discovery::MdnsDiscovery::new() {
@@ -687,11 +711,15 @@ pub(crate) async fn daemon_core(
                     fingerprint: &fp.to_hex(),
                     name: &name,
                     mdns: mdns_ok,
+                    candidates: &candidates_json,
                 });
                 out.text(&format!(
                     "daemon listening on {addr} into {} (name {name})",
                     config.out.display()
                 ));
+                for line in crate::address_candidates_lines(&candidate_addrs) {
+                    out.text(&line);
+                }
                 out.text(&crate::fingerprint_lines("fingerprint", &fp));
                 out.text(&format!("pairing code: {}", ak_identity::pairing_code(&fp)));
                 out.text("waiting for sender (Ctrl-C stops)...");
@@ -766,11 +794,15 @@ pub(crate) async fn daemon_core(
                 fingerprint: &fp.to_hex(),
                 name: &name,
                 mdns: mdns_ok,
+                candidates: &candidates_json,
             });
             out.text(&format!(
                 "daemon listening on {addr} into {} (name {name})",
                 config.out.display()
             ));
+            for line in crate::address_candidates_lines(&candidate_addrs) {
+                out.text(&line);
+            }
             out.text(&crate::fingerprint_lines("fingerprint", &fp));
             out.text(&format!("pairing code: {}", ak_identity::pairing_code(&fp)));
             out.text("waiting for sender (Ctrl-C stops)...");
@@ -1013,6 +1045,12 @@ mod tests {
     #[test]
     fn daemon_events_render_exact_single_line_ndjson() {
         let fp_hex = "ab".repeat(32);
+        // Wave 25 candidates: real interface addresses a sender can dial.
+        let candidates = vec![
+            "103.236.80.135:53112".to_owned(),
+            "192.168.1.100:53112".to_owned(),
+        ];
+        let no_candidates: Vec<String> = Vec::new();
         let events = [
             DaemonEvent::Listening {
                 addr: "0.0.0.0:53112",
@@ -1020,6 +1058,7 @@ mod tests {
                 fingerprint: &fp_hex,
                 name: "Alice",
                 mdns: true,
+                candidates: &candidates,
             }
             .to_json_line(),
             DaemonEvent::Listening {
@@ -1028,6 +1067,7 @@ mod tests {
                 fingerprint: &fp_hex,
                 name: "Bob",
                 mdns: false,
+                candidates: &no_candidates,
             }
             .to_json_line(),
             DaemonEvent::JobStarted { peer: &fp_hex }.to_json_line(),
@@ -1059,14 +1099,16 @@ mod tests {
             events[0],
             format!(
                 "{{\"type\":\"listening\",\"addr\":\"0.0.0.0:53112\",\"port\":53112,\
-                 \"fingerprint\":\"{fp_hex}\",\"name\":\"Alice\",\"mdns\":true}}"
+                 \"fingerprint\":\"{fp_hex}\",\"name\":\"Alice\",\"mdns\":true,\
+                 \"candidates\":[\"103.236.80.135:53112\", \"192.168.1.100:53112\"]}}"
             )
         );
         assert_eq!(
             events[1],
             format!(
                 "{{\"type\":\"listening\",\"addr\":\"[::]:7100\",\"port\":7100,\
-                 \"fingerprint\":\"{fp_hex}\",\"name\":\"Bob\",\"mdns\":false}}"
+                 \"fingerprint\":\"{fp_hex}\",\"name\":\"Bob\",\"mdns\":false,\
+                 \"candidates\":[]}}"
             )
         );
         assert_eq!(
@@ -1118,6 +1160,7 @@ mod tests {
             fingerprint: "00",
             name: "A\\lice\"x",
             mdns: false,
+            candidates: &["192.168.1.100:1".to_owned()],
         }
         .to_json_line();
         assert!(

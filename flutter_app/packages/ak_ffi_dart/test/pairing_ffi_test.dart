@@ -75,6 +75,7 @@ void main() {
   group('spec JSON 构造（与引擎解析器对齐）', () {
     test('create/redeem 规格逐字段匹配引擎解析字段', () {
       const rid = '0123456789abcdef0123456789abcdef';
+      // const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
       expect(
         AkInviteCreateSpec(requestId: rid, ttlSecs: 0).toJson(),
         {'spec_version': 1, 'request_id': rid, 'ttl_secs': 0},
@@ -103,6 +104,7 @@ void main() {
     test('request_id / ttl_secs / code_id / limit 的镜像校验在到达 FFI 前拒绝',
         () {
       const rid = '0123456789abcdef0123456789abcdef';
+      // const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
       expect(() => AkInviteCreateSpec(requestId: 'zz', ttlSecs: 0).toJson(),
           throwsA(isA<AkSpecException>()));
       expect(() => AkInviteCreateSpec(ttlSecs: 30).toJson(),
@@ -135,15 +137,16 @@ void main() {
     });
 
     test('start spec：registry/registry_id/id_dir 必填，解析器镜像校验', () {
-      const rid = '0123456789abcdef0123456789abcdef';
+      // const rid = '0123456789abcdef0123456789abcdef';
+      const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
       final json = AkPairingStartSpec(
         registry: '127.0.0.1:7101',
-        registryIdHex: rid,
+        registryIdHex: regId,
         idDir: r'C:\Users\me\.ak-sending',
         deviceName: 'desk',
       ).toJson();
       expect(json['registry'], '127.0.0.1:7101');
-      expect(json['registry_id'], rid);
+      expect(json['registry_id'], regId);
       expect(json['id_dir'], r'C:\Users\me\.ak-sending');
       expect(json['device_name'], 'desk');
       expect(json['owner_loop'], isTrue, reason: '常驻 owner 循环默认开启');
@@ -151,7 +154,7 @@ void main() {
       expect(
           () => AkPairingStartSpec(
                   registry: 'ak.example.com:7101',
-                  registryIdHex: rid,
+                  registryIdHex: regId,
                   idDir: '/id')
               .toJson(),
           throwsA(isA<AkSpecException>()),
@@ -163,12 +166,12 @@ void main() {
           throwsA(isA<AkSpecException>()));
       expect(
           () => AkPairingStartSpec(
-                  registry: '127.0.0.1:7101', registryIdHex: rid, idDir: '')
+                  registry: '127.0.0.1:7101', registryIdHex: regId, idDir: '')
               .toJson(),
           throwsA(isA<AkSpecException>()));
       expect(
           AkPairingStartSpec(
-                  registry: '[::1]:7101', registryIdHex: rid, idDir: '/id')
+                  registry: '[::1]:7101', registryIdHex: regId, idDir: '/id')
               .toJson()['registry'],
           '[::1]:7101',
           reason: '括号 IPv6 字面量可用');
@@ -240,6 +243,7 @@ void main() {
 
   group('sched spec 构造', () {
     const rid = '0123456789abcdef0123456789abcdef';
+      // const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
     const pid = 'fedcba0987654321fedcba0987654321';
 
     test('enqueue 规格逐字段匹配 ffi-v2.md §4 冻结示例', () {
@@ -495,6 +499,7 @@ void main() {
       final fake = FakePairingCalls();
       final runtime = PairingFfi(calls: fake).start(_startSpec());
       const rid = '0123456789abcdef0123456789abcdef';
+      // const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
       final created = runtime.createInvite(requestId: rid, ttlSecs: 3600);
       expect(created.kind, PairingOpKind.create);
@@ -764,7 +769,7 @@ void main() {
 
 AkPairingStartSpec _startSpec() => AkPairingStartSpec(
     registry: '127.0.0.1:7101',
-    registryIdHex: '00112233445566778899aabbccddeeff',
+    registryIdHex: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
     idDir: '/tmp/ak');
 
 /// One scripted op outcome: [pendingPolls] polls answer `AK_PENDING`,

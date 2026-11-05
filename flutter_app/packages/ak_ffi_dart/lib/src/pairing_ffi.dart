@@ -113,7 +113,8 @@ void _checkRequestId(String requestId) {
 ///
 /// Wire fields as parsed by the wave-22 engine (crates/ak-ffi/src/
 /// pairing.rs, `pairing_start`): REQUIRED `registry` (an `ip:port`
-/// coordination endpoint), `registry_id` (32 hex) and `id_dir`; OPTIONAL
+/// coordination endpoint), `registry_id` (64 hex — the registry's raw
+/// 32-byte Ed25519 public key) and `id_dir`; OPTIONAL
 /// `device_name` (≤64 chars), `owner_loop` (default true — the resident
 /// auto-pairing loop, pairing-flow.md §4) and `redeem_window_ms`
 /// (1000..119000, default 90000). Unknown fields are ignored, so the
@@ -132,8 +133,9 @@ class AkPairingStartSpec {
   /// rejected, like the receive `peer` field).
   final String registry;
 
-  /// Pinned registry identity, 32 hex characters (pairing-flow.md §3:
-  /// unknown pins are never auto-accepted).
+  /// Pinned registry identity: 64 hex characters encoding the registry's
+  /// raw 32-byte Ed25519 public key (pairing-flow.md §3: unknown pins are
+  /// never auto-accepted).
   final String registryIdHex;
 
   /// Identity directory of this runtime owner (created when missing);
@@ -158,8 +160,10 @@ class AkPairingStartSpec {
     if (!_isIpPort(registry)) {
       throw AkSpecException('字段 "registry" 不是 ip:port 地址："$registry"');
     }
-    if (RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(registryIdHex) == false) {
-      throw const AkSpecException('字段 "registry_id" 必须是 32 个十六进制字符');
+    // Registry pin is the raw 32-byte Ed25519 public key = 64 hex chars
+    // (matching the Rust engine's decode_hex_into in ak-ffi/src/pairing.rs).
+    if (RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(registryIdHex) == false) {
+      throw const AkSpecException('字段 "registry_id" 必须是 64 个十六进制字符（32 字节公钥）');
     }
     if (idDir.isEmpty) {
       throw const AkSpecException('字段 "id_dir" 不能为空');

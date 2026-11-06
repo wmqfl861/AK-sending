@@ -20,9 +20,12 @@
 //! - **Direction in the type layer**: [`CtrlMessage::direction`] plus the
 //!   `_as` frame entry points make an illegally-directed frame an error,
 //!   not a runtime convention.
-//! - **No secrets, no blobs**: lookup digests, fixed proofs and bounded
-//!   addresses only; plaintext invite codes never appear on this plane
-//!   (they live in ak-identity per plan A.2/A.7-A4).
+//! - **No secrets, no payload data**: lookup digests, fixed proofs and
+//!   bounded addresses only; plaintext invite codes never appear on this
+//!   plane (they live in ak-identity per plan A.2/A.7-A4). The one
+//!   wave-28 exception is the opaque, size-bounded [`EndpointBlob`]
+//!   (connection-settings hints, ≤512 bytes, signature-uncovered)
+//!   riding the trailing extension section of four extended tags.
 //!
 //! This module is pure codec: TLS transport, the SQLite registry, and
 //! Hello-v2 signature verification (which binds the TLS exporter) belong to
@@ -40,9 +43,11 @@ pub use frame::{
     CtrlFrame, DecodeError, EncodeError, HEADER_LEN, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, VERSION,
 };
 pub use message::{
-    AbortReason, CodeId, ConnectionId, CtrlMessage, DeviceId, Digest32, ErrorScope, InviteState,
-    InviteSummary, Mac32, Nonce32, PairProof, PairingId, PairingState, RedeemRequest, RegistryId,
-    RequestId, SessionId, Signature64, StateFilter, Transcript256, CURSOR_END, CURSOR_START,
+    AbortReason, CodeId, ConnectionId, CtrlMessage, DeviceId, Digest32, EndpointBlob, ErrorScope,
+    InviteState, InviteSummary, Mac32, Nonce32, PairProof, PairingId, PairingState, RedeemRequest,
+    RegistryId, RequestId, SessionId, Signature64, StateFilter, Transcript256, CURSOR_END,
+    CURSOR_START, ENDPOINT_BLOB_MAX_BYTES, EXT_FLAGS_KNOWN, EXT_MAX_REDEEMS_FLAG,
+    EXT_ENDPOINT_FLAG,
 };
 pub use peer_signal::PeerSignal;
 
@@ -59,9 +64,10 @@ pub const MIN_INVITE_LIMIT: u8 = 1;
 /// InviteList page-size upper bound.
 pub const MAX_INVITE_LIMIT: u8 = 32;
 
-// Fixed business error codes (plan A.6) for convenient access at the
-// module root; also available as `protocol_v2::message::*`.
+// Fixed business error codes (plan A.6, plus the wave-28 addition) for
+// convenient access at the module root; also available as
+// `protocol_v2::message::*`.
 pub use message::{
-    CODE_CONFLICT, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED, REQUEST_CONFLICT,
-    RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
+    CODE_CONFLICT, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED, REDEEM_EXHAUSTED,
+    REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
 };

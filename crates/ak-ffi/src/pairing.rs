@@ -101,6 +101,16 @@ pub(crate) struct V2State {
     pub active: Option<[u8; 16]>,
     /// The single scheduler runtime (`ak_sched_start`).
     pub sched: Option<Arc<SchedRt>>,
+    /// B8 (wave 28) task plane: one entry per `ak_task_start`, keyed by
+    /// runtime id (`ak_task_*`; see [`crate::task`]). Task runtime ids
+    /// share the 16-byte space with pairing runtime ids but a different
+    /// table — the `ak_pairing_op_result`/`ak_pairing_poll_event` exports
+    /// fall through to this table when the pairing lookup misses.
+    pub tasks: HashMap<[u8; 16], Arc<crate::task::TaskRt>>,
+    /// The engine-shared task-code table (`ak_task_create_code` /
+    /// `ak_task_join`), keyed by the normalized display code. An `Arc` so
+    /// the async op bodies mutate it without borrowing the engine.
+    pub task_codes: Arc<StdMutex<HashMap<String, crate::task::TaskCodeEntry>>>,
 }
 
 /// Connection phase of one pairing runtime.

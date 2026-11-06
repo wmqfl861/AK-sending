@@ -170,6 +170,10 @@ pub(crate) fn stable_code(
         EngineError::Cancelled => (ErrorCode::Cancelled, None),
         EngineError::RouteForbidden(_) => (ErrorCode::RouteForbidden, None),
         EngineError::AdmissionDenied { .. } => (ErrorCode::ProtocolUnsupported, None),
+        // The local user declined through a TransferConsent hook (wave 28):
+        // the peer already saw the DECLINED wire frame (LocalPermissionDenied
+        // under the hood); the scheduler-visible code mirrors it.
+        EngineError::ConsentDeclined { .. } => (ErrorCode::LocalPermissionDenied, None),
         EngineError::InvalidAdmissionCtx { .. } | EngineError::PeerMismatch { .. } => {
             (ErrorCode::PeerMismatch, None)
         }

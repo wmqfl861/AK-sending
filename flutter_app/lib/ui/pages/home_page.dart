@@ -1,86 +1,379 @@
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show formatPairingCode;
+/// Wave-28 home (「连接」 tab): the two pairing actions (生成配对码 /
+/// 输入配对码) plus the live 「当前连接」 list. No IP/port/fingerprint
+/// forms anywhere — the whole page runs on one-time pairing codes.
+library;
+
+import 'dart:async' show StreamSubscription;
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/services.dart'
+    show
+        Clipboard,
+        ClipboardData,
+        FilteringTextInputFormatter,
+        TextInputFormatter;
 
-import '../service/transfer_service.dart';
-import '../widgets/fingerprint_chip.dart';
+import '../service/file_pick_gateway.dart';
+import '../service/pairing_flow_controller.dart';
+import '../service/simple_transfer_service.dart';
+import '../widgets/task_connection_views.dart';
+import 'connection_detail_page.dart';
 
-/// Status dot color for each [TransferServiceStatus].
-Color statusDotColor(TransferServiceStatus status, ColorScheme scheme) {
-  switch (status) {
-    case TransferServiceStatus.idle:
-      return scheme.outline;
-    case TransferServiceStatus.listening:
-      return Colors.green;
-    case TransferServiceStatus.busy:
-      return scheme.primary;
-    case TransferServiceStatus.error:
-      return scheme.error;
-  }
-}
-
-/// Status dot label for each [TransferServiceStatus].
-String statusLabel(TransferServiceStatus status) {
-  switch (status) {
-    case TransferServiceStatus.idle:
-      return '就绪';
-    case TransferServiceStatus.listening:
-      return '监听中';
-    case TransferServiceStatus.busy:
-      return '传输中';
-    case TransferServiceStatus.error:
-      return '服务异常';
-  }
-}
-
-/// Home: this device's identity card (device id, two-line fingerprint,
-/// large pairing code with copy), the live service status dot, and quick
-/// entries into Receive / Send.
+/// Home page: pairing flows + current connections.
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.service, this.onGoTab});
+  const HomePage({
+    super.key,
+    required this.service,
+    this.picker = const PluginFilePickGateway(),
+  });
 
-  final TransferService service;
+  final SimpleTransferService service;
 
-  /// Jump to a shell tab index (0..5; 4 = the Pairing tab); wired by the
-  /// NavigationRail shell.
-  final void Function(int index)? onGoTab;
+  /// File/folder picker seam, passed down to connection detail pages so
+  /// tests inject a fake (the shell injects its own).
+  final FilePickGateway picker;
 
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
+  late final PairingFlowController _flow;
+  StreamSubscription<List<TaskConnection>>? _connectionsSub;
+  List<TaskConnection> _connections = const [];
+
+  /// True while the join-code input panel is open (the 输入配对码 action).
+  bool _joinInputOpen = false;
+
   @override
   void initState() {
     super.initState();
-    widget.service.addStatusListener(_onStatus);
-    // Real identity read at startup (engine.identityInfo through the
-    // service); the card first renders the cached/degraded snapshot and
-    // re-renders once this lands.
-    _refreshIdentity();
+    _flow = PairingFlowController(widget.service)
+      ..addListener(_onFlowChanged);
+    _connectionsSub = widget.service.connections.listen(
+      (snapshot) {
+        if (mounted) {
+          setState(() => _connections = snapshot);
+        }
+      },
+      onError: (Object _) {},
+    );
   }
 
   @override
   void dispose() {
-    widget.service.removeStatusListener(_onStatus);
+    _flow.removeListener(_onFlowChanged);
+    _flow.dispose();
+    _connectionsSub?.cancel();
     super.dispose();
   }
 
-  void _onStatus() {
+  void _onFlowChanged() {
     if (mounted) setState(() {});
   }
 
-  Future<void> _refreshIdentity() async {
-    await widget.service.refreshIdentity();
-    if (mounted) setState(() {});
+  Future<void> _chooseRoleAndCreate() async {
+    final role = await showModalBottomSheet<TaskRole>(
+      context: context,
+      builder: (context) => const _RoleSheet(),
+    );
+    if (role != null && mounted) {
+      await _flow.startCreate(role);
+    }
   }
 
-  Future<void> _copyPairingCode(String code) async {
+  void _openConnection(TaskConnection connection) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ConnectionDetailPage(
+          service: widget.service,
+          connectionId: connection.id,
+          picker: widget.picker,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ListView(
+      key: const ValueKey('home_page'),
+      padding: const EdgeInsets.all(16),
+      children: [
+        Text('连接', style: theme.textTheme.headlineSmall),
+        const SizedBox(height: 4),
+        Text('无需设置任何信息——一个配对码即可互传文件',
+            style: theme.textTheme.bodySmall),
+        const SizedBox(height: 16),
+        if (_flow.active)
+          _PairingFlowView(
+            controller: _flow,
+            onJoinRetry: () => setState(() => _joinInputOpen = true),
+          )
+        else if (_joinInputOpen)
+          _JoinInputPanel(
+            onSubmit: (code) => _flow.startJoin(code),
+            onCancel: () => setState(() => _joinInputOpen = false),
+          )
+        else
+          _HomeActions(
+            onCreateCode: _chooseRoleAndCreate,
+            onJoinCode: () => setState(() => _joinInputOpen = true),
+          ),
+        const SizedBox(height: 24),
+        _ConnectionsSection(
+          connections: _connections,
+          onOpen: _openConnection,
+        ),
+      ],
+    );
+  }
+}
+
+/// The empty state's two big actions.
+class _HomeActions extends StatelessWidget {
+  const _HomeActions({required this.onCreateCode, required this.onJoinCode});
+
+  final VoidCallback onCreateCode;
+  final VoidCallback onJoinCode;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        FilledButton.icon(
+          key: const ValueKey('home_create_code_button'),
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 20),
+          ),
+          onPressed: onCreateCode,
+          icon: const Icon(Icons.qr_code_2, size: 28),
+          label: const Text('生成配对码', style: TextStyle(fontSize: 18)),
+        ),
+        const SizedBox(height: 12),
+        FilledButton.tonalIcon(
+          key: const ValueKey('home_join_code_button'),
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 20),
+          ),
+          onPressed: onJoinCode,
+          icon: const Icon(Icons.keyboard, size: 28),
+          label: const Text('输入配对码', style: TextStyle(fontSize: 18)),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '「生成配对码」把码告诉对方；「输入配对码」输入对方给的码。',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodySmall,
+        ),
+      ],
+    );
+  }
+}
+
+/// Bottom sheet: pick the direction the new pairing declares.
+class _RoleSheet extends StatelessWidget {
+  const _RoleSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('这次配对用来做什么？', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text('方向在配对后固定；反向传输需要重新配对。',
+                style: theme.textTheme.bodySmall),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              key: const ValueKey('role_send_button'),
+              style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16)),
+              onPressed: () => Navigator.of(context).pop(TaskRole.send),
+              icon: const Icon(Icons.upload),
+              label: const Text('我要发送（把文件发给对方）'),
+            ),
+            const SizedBox(height: 8),
+            FilledButton.tonalIcon(
+              key: const ValueKey('role_receive_button'),
+              style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16)),
+              onPressed: () => Navigator.of(context).pop(TaskRole.receive),
+              icon: const Icon(Icons.download),
+              label: const Text('我要接收（接收对方发来的文件）'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The join-code input form (加入流 first step): auto-uppercase,
+/// hyphen-tolerant, live normalized-length counter.
+class _JoinInputPanel extends StatefulWidget {
+  const _JoinInputPanel({required this.onSubmit, required this.onCancel});
+
+  final ValueChanged<String> onSubmit;
+  final VoidCallback onCancel;
+
+  @override
+  State<_JoinInputPanel> createState() => _JoinInputPanelState();
+}
+
+class _JoinInputPanelState extends State<_JoinInputPanel> {
+  final TextEditingController _controller = TextEditingController();
+
+  static final TextInputFormatter _upperCase = TextInputFormatter.withFunction(
+    (oldValue, newValue) => newValue.copyWith(text: newValue.text.toUpperCase()),
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final normalizedLength = normalizeJoinCode(_controller.text).length;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('输入对方的配对码', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 12),
+            TextField(
+              key: const ValueKey('join_code_field'),
+              controller: _controller,
+              autofocus: true,
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp('[0-9A-Za-z-]')),
+                _upperCase,
+              ],
+              textCapitalization: TextCapitalization.characters,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: normalizedLength == 8
+                  ? (_) => widget.onSubmit(_controller.text)
+                  : null,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                hintText: '例如 K3P7-QM2X',
+                helperText: '大小写、连字符均可，自动识别',
+                counterText: '',
+              ),
+              maxLength: 9,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 22,
+                letterSpacing: 2,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text('$normalizedLength/8 位',
+                key: const ValueKey('join_code_counter'),
+                style: theme.textTheme.bodySmall),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              key: const ValueKey('join_submit_button'),
+              onPressed: normalizedLength == 8
+                  ? () => widget.onSubmit(_controller.text)
+                  : null,
+              icon: const Icon(Icons.link),
+              label: const Text('配对'),
+            ),
+            TextButton(
+              key: const ValueKey('join_cancel_button'),
+              onPressed: widget.onCancel,
+              child: const Text('取消'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Renders the active flow phase (code display / waiting / probe /
+/// success / failure) driven by [PairingFlowController].
+class _PairingFlowView extends StatelessWidget {
+  const _PairingFlowView({required this.controller, required this.onJoinRetry});
+
+  final PairingFlowController controller;
+  final VoidCallback onJoinRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final phase = controller.phase;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          child: switch (phase) {
+            PairingFlowPhase.creating => const _FlowProgress(
+                key: ValueKey('flow_creating'), label: '正在生成配对码…'),
+            PairingFlowPhase.awaitingPeer => _CodeShownView(controller: controller),
+            PairingFlowPhase.joining => const _FlowProgress(
+                key: ValueKey('flow_joining'), label: '正在配对…'),
+            PairingFlowPhase.paired => const _FlowProgress(
+                key: ValueKey('flow_paired'), label: '配对成功，正在建立连接…'),
+            PairingFlowPhase.probing => const _FlowProgress(
+                key: ValueKey('flow_probing'), label: '正在测试连通性…'),
+            PairingFlowPhase.success => _FlowSuccessView(controller: controller),
+            PairingFlowPhase.failed || null => _FlowFailedView(
+                controller: controller, onJoinRetry: onJoinRetry),
+          },
+        ),
+      ),
+    );
+  }
+}
+
+/// Spinner + label row for the indeterminate flow phases.
+class _FlowProgress extends StatelessWidget {
+  const _FlowProgress({super.key, required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        const SizedBox(
+          width: 24,
+          height: 24,
+          child: CircularProgressIndicator(strokeWidth: 2.5),
+        ),
+        const SizedBox(width: 16),
+        Expanded(child: Text(label, style: Theme.of(context).textTheme.bodyLarge)),
+      ],
+    );
+  }
+}
+
+/// 大号配对码（等宽）+ 复制 + 等待动画.
+class _CodeShownView extends StatelessWidget {
+  const _CodeShownView({required this.controller});
+
+  final PairingFlowController controller;
+
+  Future<void> _copy(BuildContext context, String code) async {
     await Clipboard.setData(ClipboardData(text: code));
-    if (mounted) {
+    if (context.mounted) {
       ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-        SnackBar(
-            content: Text('已复制配对码 $code'),
+        SnackBar(content: Text('已复制配对码 $code'),
             duration: const Duration(seconds: 2)),
       );
     }
@@ -89,200 +382,227 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    final info = widget.service.deviceInfo();
-    final status = widget.service.status;
-    final pairingCode = _normalizePairingCode(info.pairingCode);
-
-    return ListView(
-      padding: const EdgeInsets.all(24),
+    final code = controller.code?.code ?? '';
+    final role = controller.code?.role;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text('主页', style: theme.textTheme.headlineSmall),
+        Row(
+          children: [
+            Text('我的配对码', style: theme.textTheme.titleMedium),
+            const SizedBox(width: 8),
+            if (role != null)
+              Chip(
+                label: Text(taskRoleShortLabel(role)),
+                visualDensity: VisualDensity.compact,
+              ),
+          ],
+        ),
         const SizedBox(height: 8),
-        Text('设备直连传输 · 无中继、无云端暂存',
-            style: theme.textTheme.bodySmall),
-        const SizedBox(height: 16),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    CircleAvatar(
-                      backgroundColor: scheme.primaryContainer,
-                      child: Icon(Icons.computer,
-                          color: scheme.onPrimaryContainer),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(info.deviceName,
-                              style: theme.textTheme.titleLarge),
-                          Text('设备 ID：${_deviceId(info)}',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                  fontFamily: 'monospace')),
-                        ],
-                      ),
-                    ),
-                    Tooltip(
-                      message: statusLabel(status),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 10,
-                            height: 10,
-                            decoration: BoxDecoration(
-                              color: statusDotColor(status, scheme),
-                              shape: BoxShape.circle,
-                            ),
-                          ),
-                          const SizedBox(width: 6),
-                          Text(statusLabel(status)),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const Divider(height: 32),
-                if (info.identityCreated)
-                  Padding(
-                    key: const ValueKey('home_identity_created'),
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: Row(
-                      children: [
-                        Icon(Icons.auto_awesome,
-                            size: 18, color: scheme.primary),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            '首次已创建身份：本机已生成新的设备身份并写入身份目录。',
-                            style: theme.textTheme.bodySmall
-                                ?.copyWith(color: scheme.primary),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                Text('本机指纹', style: theme.textTheme.labelLarge),
-                FingerprintChip(fingerprintHex: info.fingerprintHex),
-                const SizedBox(height: 16),
-                Text('配对码（告知发送方，或让其扫码）',
-                    style: theme.textTheme.labelLarge),
-                const SizedBox(height: 4),
-                Row(
-                  children: [
-                    // Flexible: at phone widths (~294dp inside the card)
-                    // displaySmall + the copy button measured 21px past
-                    // the viewport; the code keeps its size whenever it
-                    // fits and only shrinks (with FittedBox scaling, so
-                    // the digits stay legible rather than ellipsizing a
-                    // 7-char code) on narrow surfaces / large text scale.
-                    Flexible(
-                      child: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        child: SelectableText(
-                          pairingCode,
-                          key: const ValueKey('home_pairing_code'),
-                          style: theme.textTheme.displaySmall
-                              ?.copyWith(fontWeight: FontWeight.w700),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    IconButton.outlined(
-                      icon: const Icon(Icons.copy),
-                      tooltip: '复制配对码',
-                      onPressed: () => _copyPairingCode(pairingCode),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                // Wave-14 linkage: tapping the pairing-book row jumps to
-                // the Pairing tab (index 4) where the book is managed.
-                InkWell(
-                  borderRadius: BorderRadius.circular(8),
-                  onTap: () => widget.onGoTab?.call(4),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.how_to_reg,
-                            size: 16, color: scheme.outline),
-                        const SizedBox(width: 6),
-                        // Flexible + ellipsis: on phone widths this row
-                        // measured 34px past the viewport (real-device
-                        // wave-25 finding); the label shrinks and the
-                        // trailing "（配对簿 peers.book）" ellipsizes
-                        // instead of overflowing. Desktop widths render
-                        // the full label unchanged.
-                        Flexible(
-                          child: Text(
-                            '已配对设备：${info.peersCount} 台（配对簿 peers.book）',
-                            key: const ValueKey('home_peers_count'),
-                            style: theme.textTheme.bodySmall,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        Icon(Icons.chevron_right,
-                            size: 16, color: scheme.outline),
-                      ],
-                    ),
+        Row(
+          children: [
+            // FittedBox keeps the 8-char code on screen at 390dp and
+            // under large text scale without ellipsizing.
+            Expanded(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: SelectableText(
+                  code,
+                  key: const ValueKey('flow_pairing_code'),
+                  style: theme.textTheme.displayMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    fontFamily: 'monospace',
+                    letterSpacing: 4,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  '对端可在发送页输入此配对码完成配对；'
-                  '本机接收时的准入策略在"接收"页设置。',
-                  style: theme.textTheme.bodySmall,
-                ),
-              ],
+              ),
             ),
-          ),
+            const SizedBox(width: 8),
+            IconButton.outlined(
+              key: const ValueKey('flow_copy_code'),
+              icon: const Icon(Icons.copy),
+              tooltip: '复制配对码',
+              onPressed: () => _copy(context, code),
+            ),
+          ],
         ),
         const SizedBox(height: 16),
         Row(
+          key: const ValueKey('flow_waiting'),
           children: [
-            Expanded(
-              child: FilledButton.icon(
-                icon: const Icon(Icons.download),
-                label: const Text('接收文件'),
-                onPressed: () => widget.onGoTab?.call(1),
-              ),
+            const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: FilledButton.tonalIcon(
-                icon: const Icon(Icons.upload),
-                label: const Text('发送文件'),
-                onPressed: () => widget.onGoTab?.call(2),
+              child: Text(
+                '等待对方输入配对码…配对成功后自动测试连通。',
+                style: theme.textTheme.bodyMedium,
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            key: const ValueKey('flow_cancel_button'),
+            onPressed: controller.reset,
+            child: const Text('取消配对'),
+          ),
         ),
       ],
     );
   }
 }
 
-/// Short display id: first 8 chars of the (lowercased) fingerprint.
-String _deviceId(DeviceInfo info) {
-  final hex = info.fingerprintHex.toLowerCase();
-  return hex.length >= 8 ? hex.substring(0, 8) : hex;
+/// 连接成功（连通测试通过）.
+class _FlowSuccessView extends StatelessWidget {
+  const _FlowSuccessView({required this.controller});
+
+  final PairingFlowController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final connection = controller.connection;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.green.shade600, size: 40),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('连接成功',
+                      key: const ValueKey('flow_success'),
+                      style: theme.textTheme.titleLarge
+                          ?.copyWith(color: Colors.green.shade700)),
+                  if (connection != null)
+                    Text(
+                      '连通测试通过：${connection.peerName}'
+                      '（${taskRoleShortLabel(connection.role)}）',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        FilledButton.icon(
+          key: const ValueKey('flow_done_button'),
+          onPressed: controller.reset,
+          icon: const Icon(Icons.check),
+          label: const Text('完成'),
+        ),
+      ],
+    );
+  }
 }
 
-/// Canonical `123-456` display; falls back to the raw text when the
-/// service-provided code does not match the expected shape.
-String _normalizePairingCode(String code) {
-  try {
-    return formatPairingCode(code);
-  } on FormatException {
-    return code;
+/// 失败态：可读原因 + 重试/重新输入.
+class _FlowFailedView extends StatelessWidget {
+  const _FlowFailedView({required this.controller, required this.onJoinRetry});
+
+  final PairingFlowController controller;
+  final VoidCallback onJoinRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isJoin = controller.kind == PairingFlowKind.join;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.error_outline, color: theme.colorScheme.error, size: 32),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                controller.error ?? '配对失败，请重试。',
+                key: const ValueKey('flow_error'),
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  color: theme.colorScheme.error,
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        FilledButton.icon(
+          key: const ValueKey('flow_retry_button'),
+          onPressed: isJoin
+              ? () {
+                  controller.reset();
+                  onJoinRetry();
+                }
+              : () => controller.startCreate(controller.code?.role ??
+                  controller.connection?.role ??
+                  TaskRole.send),
+          icon: const Icon(Icons.refresh),
+          label: Text(isJoin ? '重新输入配对码' : '重试'),
+        ),
+        TextButton(
+          key: const ValueKey('flow_back_button'),
+          onPressed: controller.reset,
+          child: const Text('返回'),
+        ),
+      ],
+    );
+  }
+}
+
+/// 「当前连接」 list section.
+class _ConnectionsSection extends StatelessWidget {
+  const _ConnectionsSection({
+    required this.connections,
+    required this.onOpen,
+  });
+
+  final List<TaskConnection> connections;
+  final ValueChanged<TaskConnection> onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Text('当前连接',
+                key: const ValueKey('connections_header'),
+                style: theme.textTheme.titleMedium),
+            const SizedBox(width: 8),
+            Text('（${connections.length}）', style: theme.textTheme.bodySmall),
+          ],
+        ),
+        const SizedBox(height: 4),
+        if (connections.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Text(
+              '暂无连接。生成或输入配对码后，连接会显示在这里。',
+              key: const ValueKey('connections_empty'),
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline),
+            ),
+          )
+        else
+          ...connections.map(
+            (connection) => ConnectionCard(
+              connection: connection,
+              onOpen: () => onOpen(connection),
+            ),
+          ),
+      ],
+    );
   }
 }

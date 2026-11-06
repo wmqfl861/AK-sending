@@ -63,6 +63,44 @@ pub const INVITE_SUMMARY_BYTES: usize = 41;
 /// Size of the fixed `InviteRedeem` request structure.
 pub const REDEEM_REQUEST_BYTES: usize = 184;
 
+// ---- wave-28 endpoint extension (optional, backward compatible) ------------
+//
+// The v1 minimal pairing model (wave-28) exchanges each side's local
+// connection settings alongside the existing claim/redeem/pairing frames.
+// The mount is a trailing *extension section* inside the declared payload
+// of four extended tags (`InviteClaim` 0x0A, `InviteRedeem` 0x10,
+// `InviteRedeemOffered` 0x12, `PairCommit` 0x16): absent section ⇒ the
+// payload is byte-identical to the frozen legacy shape, so old peers and
+// old shapes decode unchanged. The section is NOT a generic extension
+// hole: exactly two fields exist (endpoint blob, claim redeem cap), the
+// flag bits outside them are refused, and only the four extended tags may
+// carry one.
+
+/// Opaque endpoint blob carried verbatim by the wave-28 extension section:
+/// the owner/redeemer connection settings (upper layers suggest JSON with
+/// a candidate-address array, device name and direction declaration).
+/// The codec only fixes the size bound (1..=[`ENDPOINT_BLOB_MAX_BYTES`]
+/// bytes); encoding and validation of the contents belong to the upper
+/// layers, and the blob is deliberately NOT covered by the redeem or
+/// pairing signatures (connectivity hints, not credentials).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointBlob(pub Vec<u8>);
+
+/// Byte cap of one [`EndpointBlob`] (wave-28).
+pub const ENDPOINT_BLOB_MAX_BYTES: usize = 512;
+/// Extension flag: endpoint blob present (all four extended tags).
+pub const EXT_ENDPOINT_FLAG: u8 = 0x01;
+/// Extension flag: `max_redeems:u32` present (`InviteClaim` only).
+pub const EXT_MAX_REDEEMS_FLAG: u8 = 0x02;
+/// All defined extension flag bits.
+pub const EXT_FLAGS_KNOWN: u8 = EXT_ENDPOINT_FLAG | EXT_MAX_REDEEMS_FLAG;
+/// Max trailing extension section on the endpoint-only tags:
+/// flags(1) + len(2) + [`ENDPOINT_BLOB_MAX_BYTES`].
+pub const EXT_SECTION_ENDPOINT_ONLY: usize = 1 + 2 + ENDPOINT_BLOB_MAX_BYTES;
+/// Max trailing extension section on `InviteClaim`: additionally
+/// `max_redeems:u32`.
+pub const EXT_SECTION_CLAIM: usize = EXT_SECTION_ENDPOINT_ONLY + 4;
+
 /// All-zero 16-byte cursor: `InviteList.cursor` sentinel meaning "start at
 /// the beginning". Never issued to a real object.
 pub const CURSOR_START: CodeId = [0u8; 16];
@@ -90,8 +128,8 @@ pub const CANCEL_PAYLOAD: usize = 16;
 pub const SERVER_ERROR_MAX_PAYLOAD: usize = 132;
 /// AuthChallenge: 32+32+8.
 pub const AUTH_CHALLENGE_PAYLOAD: usize = 72;
-/// InviteClaim: 16+32+4.
-pub const INVITE_CLAIM_PAYLOAD: usize = 52;
+/// InviteClaim: 16+32+4 plus the optional wave-28 extension section.
+pub const INVITE_CLAIM_PAYLOAD: usize = 52 + EXT_SECTION_CLAIM;
 /// InviteClaimed: 16+16+8+8+8.
 pub const INVITE_CLAIMED_PAYLOAD: usize = 56;
 /// InviteList: 16+16+1+1.
@@ -102,20 +140,20 @@ pub const INVITE_LIST_PAGE_MAX_PAYLOAD: usize = 1345;
 pub const INVITE_REVOKE_PAYLOAD: usize = 40;
 /// InviteRevoked: 16+16+8+8.
 pub const INVITE_REVOKED_PAYLOAD: usize = 48;
-/// InviteRedeem: the fixed `RedeemRequest` structure.
-pub const INVITE_REDEEM_PAYLOAD: usize = REDEEM_REQUEST_BYTES;
+/// InviteRedeem: fixed `RedeemRequest` plus the optional wave-28 section.
+pub const INVITE_REDEEM_PAYLOAD: usize = REDEEM_REQUEST_BYTES + EXT_SECTION_ENDPOINT_ONLY;
 /// InviteRedeemPending: 16+16+8.
 pub const INVITE_REDEEM_PENDING_PAYLOAD: usize = 40;
-/// InviteRedeemOffered: 16+8+16+32+184.
-pub const INVITE_REDEEM_OFFERED_PAYLOAD: usize = 256;
+/// InviteRedeemOffered: 16+8+16+32+184 plus the optional wave-28 section.
+pub const INVITE_REDEEM_OFFERED_PAYLOAD: usize = 256 + EXT_SECTION_ENDPOINT_ONLY;
 /// PairChallenge: 256+96.
 pub const PAIR_CHALLENGE_PAYLOAD: usize = TRANSCRIPT_BYTES + PAIR_PROOF_BYTES;
 /// PairProof: 16+32+96.
 pub const PAIR_PROOF_PAYLOAD: usize = 144;
 /// PairPrepared: 16+32+64.
 pub const PAIR_PREPARED_PAYLOAD: usize = 112;
-/// PairCommit: 256+96+96+64+64+8.
-pub const PAIR_COMMIT_PAYLOAD: usize = 584;
+/// PairCommit: 256+96+96+64+64+8 plus the optional wave-28 section.
+pub const PAIR_COMMIT_PAYLOAD: usize = 584 + EXT_SECTION_ENDPOINT_ONLY;
 /// PairApplied: 16+32+8+64.
 pub const PAIR_APPLIED_PAYLOAD: usize = 120;
 /// PairReady: 16+32+8+64+64.
@@ -155,6 +193,10 @@ pub const REVISION_CONFLICT: u16 = 0x2106;
 pub const PROTOCOL_UNSUPPORTED: u16 = 0x2107;
 /// Authoritative registry storage unavailable.
 pub const STORAGE_UNAVAILABLE: u16 = 0x2108;
+/// Wave-28 single-redemption cap reached: the code row's `max_redeems`
+/// budget of committed pairings is exhausted (0 = unlimited, the legacy
+/// default). Returned immediately (no deferred deadline semantics).
+pub const REDEEM_EXHAUSTED: u16 = 0x2109;
 
 // ---- Closed enums --------------------------------------------------------
 // The contract freezes `scope`/`state`/`reason` as closed enums without
@@ -419,6 +461,16 @@ pub(super) fn is_known_type(ty: u8) -> bool {
     (MIN_TYPE..=MAX_TYPE).contains(&ty)
 }
 
+/// True for the four wave-28 extended tags whose payload may carry the
+/// trailing endpoint/claim extension section. Every other tag keeps the
+/// strict frozen shape: any trailing byte is `DecodeError::Trailing`.
+pub(super) fn is_extended_type(ty: u8) -> bool {
+    matches!(
+        ty,
+        TYPE_INVITE_CLAIM | TYPE_INVITE_REDEEM | TYPE_INVITE_REDEEM_OFFERED | TYPE_PAIR_COMMIT
+    )
+}
+
 /// The closed v2 client<->server message set (one frame payload each; the
 /// type-byte mapping and every direction are locked by tests).
 ///
@@ -665,7 +717,27 @@ impl CtrlMessage {
     }
 }
 
-pub(super) fn encode_payload(message: &CtrlMessage, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+/// Encode one message payload. `endpoint` / `max_redeems` carry the
+/// wave-28 extension fields: both `None` writes the byte-identical legacy
+/// shape; any combination is only legal on the extended tags
+/// ([`is_extended_type`]), and `max_redeems` additionally only on
+/// `InviteClaim`. Mirrored budgets are validated before anything is
+/// written, exactly like every frozen field.
+pub(super) fn encode_payload(
+    message: &CtrlMessage,
+    endpoint: Option<&EndpointBlob>,
+    max_redeems: Option<u32>,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let ty = message.type_byte();
+    let want_endpoint = endpoint.is_some();
+    let want_cap = max_redeems.is_some();
+    if (want_endpoint || want_cap) && !is_extended_type(ty) {
+        return Err(EncodeError::BadExtension { ty });
+    }
+    if want_cap && ty != TYPE_INVITE_CLAIM {
+        return Err(EncodeError::BadExtension { ty });
+    }
     match message {
         CtrlMessage::Hello {
             version,
@@ -946,6 +1018,30 @@ pub(super) fn encode_payload(message: &CtrlMessage, out: &mut Vec<u8>) -> Result
         CtrlMessage::Ping { nonce } => out.extend_from_slice(nonce),
         CtrlMessage::Pong { nonce } => out.extend_from_slice(nonce),
     }
+    // wave-28 trailing extension section (absent ⇒ legacy bytes).
+    let mut flags = 0u8;
+    if want_endpoint {
+        flags |= EXT_ENDPOINT_FLAG;
+    }
+    if want_cap {
+        flags |= EXT_MAX_REDEEMS_FLAG;
+    }
+    if flags != 0 {
+        out.push(flags);
+        if let Some(blob) = endpoint {
+            if blob.0.is_empty() || blob.0.len() > ENDPOINT_BLOB_MAX_BYTES {
+                return Err(EncodeError::EndpointBlobSize {
+                    len: blob.0.len(),
+                    limit: ENDPOINT_BLOB_MAX_BYTES,
+                });
+            }
+            put_u16(out, blob.0.len() as u16);
+            out.extend_from_slice(&blob.0);
+        }
+        if let Some(cap) = max_redeems {
+            put_u32(out, cap);
+        }
+    }
     Ok(())
 }
 
@@ -971,7 +1067,15 @@ fn put_redeem(out: &mut Vec<u8>, redeem: &RedeemRequest) {
     out.extend_from_slice(&redeem.signature);
 }
 
-pub(super) fn decode_payload(ty: u8, payload: &[u8]) -> Result<CtrlMessage, DecodeError> {
+/// Decode one message payload. Returns the message plus the decoded
+/// wave-28 extension fields (`None, None` for the legacy shape). The
+/// extension section is validated before any blob is allocated:
+/// undefined flag bits, the `max_redeems` flag off `InviteClaim`,
+/// out-of-budget blob lengths and leftover bytes are all refused.
+pub(super) fn decode_payload(
+    ty: u8,
+    payload: &[u8],
+) -> Result<(CtrlMessage, Option<EndpointBlob>, Option<u32>), DecodeError> {
     let mut cur = Cur::new(payload);
     let message = match ty {
         TYPE_HELLO => CtrlMessage::Hello {
@@ -1168,10 +1272,58 @@ pub(super) fn decode_payload(ty: u8, payload: &[u8]) -> Result<CtrlMessage, Deco
         _ => return Err(DecodeError::UnknownType(ty)),
     };
     let trailing = cur.remaining();
-    if trailing > 0 {
-        return Err(DecodeError::Trailing(trailing));
+    let (endpoint, max_redeems) = if is_extended_type(ty) {
+        decode_extension(ty, &mut cur)?
+    } else {
+        if trailing > 0 {
+            return Err(DecodeError::Trailing(trailing));
+        }
+        (None, None)
+    };
+    Ok((message, endpoint, max_redeems))
+}
+
+/// Parse the wave-28 trailing extension section of one extended tag:
+/// `flags:u8` then, per flag, `len:u16 + blob` (endpoint) and/or
+/// `max_redeems:u32` (claim only). A cursor at the end of the frozen
+/// fields is the legacy shape (`None, None`); anything else must parse
+/// exactly and leave no leftovers.
+fn decode_extension(
+    ty: u8,
+    cur: &mut Cur<'_>,
+) -> Result<(Option<EndpointBlob>, Option<u32>), DecodeError> {
+    if cur.remaining() == 0 {
+        return Ok((None, None));
     }
-    Ok(message)
+    let flags = cur.u8()?;
+    if flags & !EXT_FLAGS_KNOWN != 0 || flags == 0 {
+        return Err(DecodeError::BadExtensionFlags(flags));
+    }
+    if flags & EXT_MAX_REDEEMS_FLAG != 0 && ty != TYPE_INVITE_CLAIM {
+        return Err(DecodeError::BadExtension { ty });
+    }
+    let endpoint = if flags & EXT_ENDPOINT_FLAG != 0 {
+        let len = cur.u16()? as usize;
+        if len == 0 || len > ENDPOINT_BLOB_MAX_BYTES {
+            return Err(DecodeError::EndpointBlobSize {
+                len,
+                limit: ENDPOINT_BLOB_MAX_BYTES,
+            });
+        }
+        Some(EndpointBlob(cur.take(len)?.to_vec()))
+    } else {
+        None
+    };
+    let max_redeems = if flags & EXT_MAX_REDEEMS_FLAG != 0 {
+        Some(cur.u32()?)
+    } else {
+        None
+    };
+    let leftover = cur.remaining();
+    if leftover > 0 {
+        return Err(DecodeError::Trailing(leftover));
+    }
+    Ok((endpoint, max_redeems))
 }
 
 fn get_summary(cur: &mut Cur<'_>) -> Result<InviteSummary, DecodeError> {

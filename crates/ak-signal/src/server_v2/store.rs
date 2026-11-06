@@ -51,7 +51,14 @@ use crate::server_v2::config::{
 
 /// Registry schema version (`PRAGMA user_version`). Bump only with a
 /// migration that preserves tombstones and uniqueness records.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// Wave-28 bumped 1 → 2: `invite_codes` gained `owner_endpoint BLOB NULL`
+/// and `max_redeems INTEGER NOT NULL DEFAULT 0`; `pairing_transactions`
+/// gained `owner_endpoint BLOB NULL` and `redeemer_endpoint BLOB NULL`
+/// (both snapshotted at redeem time). The v1→v2 migration is additive
+/// `ALTER TABLE ... ADD COLUMN` statements — tombstones, uniqueness
+/// records and every pre-existing row survive verbatim.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Why a store operation failed at the storage layer. Business outcomes
 /// are typed decisions, not errors.
@@ -86,9 +93,11 @@ fn blob_req<const N: usize>(value: Vec<u8>) -> rusqlite::Result<[u8; N]> {
 
 // ---- DDL -----------------------------------------------------------------
 
-/// `invite_codes` — contract DDL verbatim (storage-schema.md §2). SQLite
-/// reads `BLOB(32)` as BLOB affinity; length is checked app-side. No
-/// plaintext code, no `auth_key`, no MAC material — ever.
+/// `invite_codes` — contract DDL (storage-schema.md §2) plus the wave-28
+/// columns `owner_endpoint` / `max_redeems`. SQLite reads `BLOB(32)` as
+/// BLOB affinity; length is checked app-side (endpoint blobs are bounded
+/// by the codec at 512 bytes). No plaintext code, no `auth_key`, no MAC
+/// material — ever.
 const DDL_INVITE_CODES: &str = "
 CREATE TABLE IF NOT EXISTS invite_codes (
   lookup_digest       BLOB(32) PRIMARY KEY,
@@ -99,14 +108,19 @@ CREATE TABLE IF NOT EXISTS invite_codes (
   state               TEXT NOT NULL CHECK (state IN ('active','revoked','expired')),
   revision            INTEGER NOT NULL,
   create_request_id   BLOB(16) NOT NULL,
+  owner_endpoint      BLOB NULL,
+  max_redeems         INTEGER NOT NULL DEFAULT 0,
   UNIQUE (owner_device_id, create_request_id)
 );";
 
 /// `pairing_transactions` — fixed transcript, both proofs, and the
-/// Prepared/Commit/Applied lifecycle (storage-schema.md §3). Proof
-/// columns fill in as endpoint messages arrive; `commit_revision` is the
-/// code revision at commit time (== the transcript's `code_revision`
-/// binding).
+/// Prepared/Commit/Applied lifecycle (storage-schema.md §3), plus the
+/// wave-28 endpoint columns: `owner_endpoint` is snapshotted from the
+/// code row and `redeemer_endpoint` from the redeem frame when the
+/// transaction begins, so the commit/offer paths re-serve them verbatim.
+/// Proof columns fill in as endpoint messages arrive; `commit_revision`
+/// is the code revision at commit time (== the transcript's
+/// `code_revision` binding).
 const DDL_PAIRING_TRANSACTIONS: &str = "
 CREATE TABLE IF NOT EXISTS pairing_transactions (
   pairing_id                  BLOB(16) PRIMARY KEY,
@@ -132,6 +146,8 @@ CREATE TABLE IF NOT EXISTS pairing_transactions (
   redeemer_signature          BLOB(64) NOT NULL,
   deadline_unix_ms            INTEGER NOT NULL,
   code_revision               INTEGER NOT NULL,
+  owner_endpoint              BLOB NULL,
+  redeemer_endpoint           BLOB NULL,
   created_unix_ms             INTEGER NOT NULL,
   updated_unix_ms             INTEGER NOT NULL
 );";
@@ -223,12 +239,21 @@ pub struct AbortedPairing {
     pub redeemer: DeviceId,
 }
 
-/// A live, redeemable code as found by lookup.
+/// Raw column shape of the active-code lookup (`find_active_code`):
+/// code_id, owner, revision, owner endpoint, redeem cap.
+type ActiveCodeRow = (Vec<u8>, Vec<u8>, i64, Option<Vec<u8>>, i64);
+
+/// A live, redeemable code as found by lookup. `owner_endpoint` /
+/// `max_redeems` are the wave-28 columns (None / 0 for legacy claims).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveCode {
     pub code_id: CodeId,
     pub owner: DeviceId,
     pub revision: u64,
+    /// Owner connection settings claimed with the code (wave-28).
+    pub owner_endpoint: Option<Vec<u8>>,
+    /// 0 = unlimited (legacy default); ≥1 caps committed pairings.
+    pub max_redeems: u32,
 }
 
 /// Result of registering a redeem attempt.
@@ -237,10 +262,14 @@ pub enum BeginRedeem {
     Begun,
     OwnerPendingLimit,
     GlobalPendingLimit,
+    /// Wave-28 single-redemption cap: the code already has
+    /// `max_redeems` committed (or later) pairings.
+    RedeemExhausted,
 }
 
 /// Everything the engine needs to re-serve one pending redeem offer to a
-/// (re)connecting owner.
+/// (re)connecting owner. `redeemer_endpoint` is the redeemer's wave-28
+/// connection settings, re-attached to `InviteRedeemOffered`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingOffer {
     pub pairing_id: PairingId,
@@ -248,6 +277,7 @@ pub struct PendingOffer {
     pub code_revision: u64,
     pub redeemer: DeviceId,
     pub redeem: RedeemRequest,
+    pub redeemer_endpoint: Option<Vec<u8>>,
 }
 
 /// Result of storing one endpoint's `PairPrepared` (with the commit
@@ -284,7 +314,9 @@ pub enum AppliedDecision {
     NotFound,
 }
 
-/// Full durable view of one pairing transaction.
+/// Full durable view of one pairing transaction. `owner_endpoint` /
+/// `redeemer_endpoint` are the wave-28 connection settings snapshotted
+/// at redeem time (served with `PairCommit` / `InviteRedeemOffered`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingSnapshot {
     pub pairing_id: PairingId,
@@ -306,6 +338,8 @@ pub struct PairingSnapshot {
     pub redeemer_prepared_signature: Option<Signature64>,
     pub owner_applied_signature: Option<Signature64>,
     pub redeemer_applied_signature: Option<Signature64>,
+    pub owner_endpoint: Option<Vec<u8>>,
+    pub redeemer_endpoint: Option<Vec<u8>>,
 }
 
 /// Result of aborting a pairing.
@@ -361,6 +395,18 @@ impl RegistryStore {
                 "{DDL_INVITE_CODES}\n{DDL_PAIRING_TRANSACTIONS}\n{DDL_PAIRING_RELATIONS}\n{DDL_REQUEST_JOURNAL}\n{DDL_INDEXES}"
             ))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version == 1 {
+            // Wave-28 migration (1 → 2): additive columns only — every
+            // tombstone, uniqueness record and pre-existing row survives
+            // verbatim. ADD COLUMN fails loudly if the layout already
+            // matches, so a partially-migrated file cannot pass silently.
+            conn.execute_batch(
+                "ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL;
+                 ALTER TABLE invite_codes ADD COLUMN max_redeems INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE pairing_transactions ADD COLUMN owner_endpoint BLOB NULL;
+                 ALTER TABLE pairing_transactions ADD COLUMN redeemer_endpoint BLOB NULL;",
+            )?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion(version));
         }
@@ -398,13 +444,21 @@ impl RegistryStore {
         )
     }
 
-    /// Register one invite code (`pairing-flow.md` §5).
+    /// Register one invite code (`pairing-flow.md` §5). Wave-28: the
+    /// claim may carry the owner endpoint blob (stored on the code row,
+    /// served to redeemers with `PairCommit`) and a redeem cap (0 =
+    /// unlimited legacy semantics). Both are part of the idempotency
+    /// body: same `request_id` + same content replays the original
+    /// `InviteClaimed`, different content is `REQUEST_CONFLICT`.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &self,
         owner: &DeviceId,
         request_id: &RequestId,
         lookup_digest: &Digest32,
         ttl_secs: u32,
+        max_redeems: u32,
+        owner_endpoint: Option<&[u8]>,
         now_ms: u64,
     ) -> Result<ClaimOutcome, StoreError> {
         if ttl_secs != 0 && !(INVITE_TTL_MIN_SECS..=INVITE_TTL_MAX_SECS).contains(&ttl_secs) {
@@ -412,7 +466,7 @@ impl RegistryStore {
             // with a protocol error before reaching the store.
             return Ok(ClaimOutcome::RequestConflict);
         }
-        let body = claim_body(lookup_digest, ttl_secs);
+        let body = claim_body(lookup_digest, ttl_secs, max_redeems, owner_endpoint);
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Idempotency first: same owner+request_id replays or conflicts.
@@ -508,15 +562,17 @@ impl RegistryStore {
         tx.execute(
             "INSERT INTO invite_codes
              (lookup_digest, code_id, owner_device_id, created_unix_ms, expires_unix_ms,
-              state, revision, create_request_id)
-             VALUES (?1,?2,?3,?4,?5,'active',1,?6)",
+              state, revision, create_request_id, owner_endpoint, max_redeems)
+             VALUES (?1,?2,?3,?4,?5,'active',1,?6,?7,?8)",
             params![
                 lookup_digest.as_slice(),
                 code_id.as_slice(),
                 owner.as_slice(),
                 now_ms as i64,
                 expires_unix_ms,
-                request_id.as_slice()
+                request_id.as_slice(),
+                owner_endpoint,
+                max_redeems as i64
             ],
         )?;
         journal_put(&tx, owner, request_id, "claim", &body, &response, now_ms)?;
@@ -651,7 +707,8 @@ impl RegistryStore {
         })
     }
 
-    /// Find a live code by lookup digest (redeem path).
+    /// Find a live code by lookup digest (redeem path), including the
+    /// wave-28 endpoint/cap columns.
     pub fn find_active_code(
         &self,
         lookup_digest: &Digest32,
@@ -659,20 +716,23 @@ impl RegistryStore {
     ) -> Result<Option<ActiveCode>, StoreError> {
         let conn = self.lock();
         Self::expire_codes_within(&conn, now_ms)?;
-        let row: Option<(Vec<u8>, Vec<u8>, i64)> = conn
+        let row: Option<ActiveCodeRow> = conn
             .query_row(
-                "SELECT code_id, owner_device_id, revision FROM invite_codes
+                "SELECT code_id, owner_device_id, revision, owner_endpoint, max_redeems
+                 FROM invite_codes
                  WHERE lookup_digest=?1 AND state='active'
                    AND (expires_unix_ms IS NULL OR expires_unix_ms > ?2)",
                 params![lookup_digest.as_slice(), now_ms as i64],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        Ok(row.and_then(|(code, owner, revision)| {
+        Ok(row.and_then(|(code, owner, revision, owner_endpoint, max_redeems)| {
             Some(ActiveCode {
                 code_id: blob::<16>(Some(code))?,
                 owner: blob::<32>(Some(owner))?,
                 revision: revision.max(0) as u64,
+                owner_endpoint,
+                max_redeems: max_redeems.max(0) as u32,
             })
         }))
     }
@@ -680,17 +740,34 @@ impl RegistryStore {
     // -- pairing_transactions ------------------------------------------------
 
     /// Register a redeem attempt as a pending transaction. `redeemer` is
-    /// the authenticated connection's device id (never client-supplied).
+    /// the authenticated connection's device id (never client-supplied);
+    /// `redeemer_endpoint` is the redeemer's wave-28 connection settings.
+    /// Wave-28 cap: when the code row carries `max_redeems ≥ 1` and that
+    /// many committed (or later) pairings already exist, the attempt is
+    /// refused up front with [`BeginRedeem::RedeemExhausted`] — aborted or
+    /// expired attempts never consume the budget.
     pub fn begin_pairing(
         &self,
         pairing_id: &PairingId,
         redeemer: &DeviceId,
         redeem: &RedeemRequest,
         code: &ActiveCode,
+        redeemer_endpoint: Option<&[u8]>,
         now_ms: u64,
     ) -> Result<BeginRedeem, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if code.max_redeems > 0 {
+            let committed: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pairing_transactions
+                 WHERE code_id=?1 AND state IN ('committed','applied','ready')",
+                params![code.code_id.as_slice()],
+                |row| row.get(0),
+            )?;
+            if committed >= i64::from(code.max_redeems) {
+                return Ok(BeginRedeem::RedeemExhausted);
+            }
+        }
         let owner_pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pairing_transactions
              WHERE owner_device_id=?1 AND state='pending'",
@@ -712,8 +789,8 @@ impl RegistryStore {
             "INSERT INTO pairing_transactions
              (pairing_id, request_id, code_id, lookup_digest, owner_device_id, redeemer_device_id,
               state, redeemer_nonce, request_mac, redeemer_signature, deadline_unix_ms,
-              code_revision, created_unix_ms, updated_unix_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?11,?12,?12)",
+              code_revision, owner_endpoint, redeemer_endpoint, created_unix_ms, updated_unix_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10,?11,?12,?13,?14,?14)",
             params![
                 pairing_id.as_slice(),
                 redeem.request_id.as_slice(),
@@ -726,6 +803,8 @@ impl RegistryStore {
                 redeem.signature.as_slice(),
                 redeem.deadline_ms as i64,
                 code.revision as i64,
+                code.owner_endpoint,
+                redeemer_endpoint,
                 now_ms as i64
             ],
         )?;
@@ -743,7 +822,7 @@ impl RegistryStore {
         let mut stmt = conn.prepare(
             "SELECT pairing_id, code_id, code_revision, redeemer_device_id,
                     request_id, lookup_digest, redeemer_nonce, deadline_unix_ms,
-                    request_mac, redeemer_signature
+                    request_mac, redeemer_signature, redeemer_endpoint
              FROM pairing_transactions
              WHERE owner_device_id=?1 AND state='pending' AND owner_proof_mac IS NULL
              ORDER BY created_unix_ms",
@@ -1076,7 +1155,7 @@ impl RegistryStore {
                         redeemer_proof_mac, redeemer_proof_signature,
                         owner_prepared_signature, redeemer_prepared_signature,
                         owner_applied_signature, redeemer_applied_signature,
-                        request_id
+                        request_id, owner_endpoint, redeemer_endpoint
                  FROM pairing_transactions WHERE pairing_id=?1",
                 params![pairing_id.as_slice()],
                 map_pairing_snapshot,
@@ -1262,6 +1341,8 @@ fn map_pairing_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<PairingSnap
         owner_applied_signature: blob::<64>(row.get::<_, Option<Vec<u8>>>(17)?),
         redeemer_applied_signature: blob::<64>(row.get::<_, Option<Vec<u8>>>(18)?),
         request_id: blob_req::<16>(row.get::<_, Vec<u8>>(19)?)?,
+        owner_endpoint: row.get(20)?,
+        redeemer_endpoint: row.get(21)?,
     })
 }
 
@@ -1286,6 +1367,7 @@ fn map_pending_offer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingOffer> 
             request_mac: blob_req::<32>(row.get::<_, Vec<u8>>(8)?)?,
             signature: blob_req::<64>(row.get::<_, Vec<u8>>(9)?)?,
         },
+        redeemer_endpoint: row.get(10)?,
     })
 }
 
@@ -1336,10 +1418,20 @@ fn abort_pending_for_code(
     Ok(aborted)
 }
 
-fn claim_body(lookup_digest: &Digest32, ttl_secs: u32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(36);
+fn claim_body(
+    lookup_digest: &Digest32,
+    ttl_secs: u32,
+    max_redeems: u32,
+    owner_endpoint: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(44);
     body.extend_from_slice(lookup_digest);
     body.extend_from_slice(&ttl_secs.to_be_bytes());
+    body.extend_from_slice(&max_redeems.to_be_bytes());
+    body.push(u8::from(owner_endpoint.is_some()));
+    if let Some(endpoint) = owner_endpoint {
+        body.extend_from_slice(endpoint);
+    }
     body
 }
 
@@ -1497,7 +1589,7 @@ mod tests {
         let store = RegistryStore::open_in_memory().unwrap();
         let now = 1_000_000u64;
         let first = store
-            .claim(&owner(1), &[7; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[7; 16], &lookup(1), 0, 0, None, now)
             .unwrap();
         let ClaimOutcome::Claimed {
             code_id, revision, ..
@@ -1510,7 +1602,7 @@ mod tests {
 
         // Same request id + same content: the exact original response.
         let retry = store
-            .claim(&owner(1), &[7; 16], &lookup(1), 0, now + 10)
+            .claim(&owner(1), &[7; 16], &lookup(1), 0, 0, None, now + 10)
             .unwrap();
         match retry {
             ClaimOutcome::Replay(bytes) => {
@@ -1522,7 +1614,7 @@ mod tests {
 
         // Same request id, different content: conflict.
         let conflict = store
-            .claim(&owner(1), &[7; 16], &lookup(9), 0, now + 20)
+            .claim(&owner(1), &[7; 16], &lookup(9), 0, 0, None, now + 20)
             .unwrap();
         assert_eq!(conflict, ClaimOutcome::RequestConflict);
     }
@@ -1533,21 +1625,21 @@ mod tests {
         let now = 1_000_000u64;
         assert!(matches!(
             store
-                .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+                .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
                 .unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
         // Another owner, another request, same code digest.
         assert_eq!(
             store
-                .claim(&owner(2), &[2; 16], &lookup(1), 0, now)
+                .claim(&owner(2), &[2; 16], &lookup(1), 0, 0, None, now)
                 .unwrap(),
             ClaimOutcome::CodeConflict
         );
         // Same owner, another request, same digest.
         assert_eq!(
             store
-                .claim(&owner(1), &[3; 16], &lookup(1), 0, now)
+                .claim(&owner(1), &[3; 16], &lookup(1), 0, 0, None, now)
                 .unwrap(),
             ClaimOutcome::CodeConflict
         );
@@ -1557,22 +1649,22 @@ mod tests {
     fn ttl_out_of_contract_range_never_persists() {
         let store = RegistryStore::open_in_memory().unwrap();
         assert_eq!(
-            store.claim(&owner(1), &[1; 16], &lookup(1), 59, 1).unwrap(),
+            store.claim(&owner(1), &[1; 16], &lookup(1), 59, 0, None, 1).unwrap(),
             ClaimOutcome::RequestConflict
         );
         assert_eq!(
             store
-                .claim(&owner(1), &[1; 16], &lookup(1), INVITE_TTL_MAX_SECS + 1, 1)
+                .claim(&owner(1), &[1; 16], &lookup(1), INVITE_TTL_MAX_SECS + 1, 0, None, 1)
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
         // 60 s is the minimum legal TTL; long-lived is 0.
         assert!(matches!(
-            store.claim(&owner(1), &[2; 16], &lookup(2), 60, 1).unwrap(),
+            store.claim(&owner(1), &[2; 16], &lookup(2), 60, 0, None, 1).unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
         assert!(matches!(
-            store.claim(&owner(1), &[3; 16], &lookup(3), 0, 1).unwrap(),
+            store.claim(&owner(1), &[3; 16], &lookup(3), 0, 0, None, 1).unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
     }
@@ -1582,7 +1674,7 @@ mod tests {
         let store = RegistryStore::open_in_memory().unwrap();
         let now = 1_000_000u64;
         let ClaimOutcome::Claimed { code_id, .. } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1641,7 +1733,7 @@ mod tests {
             code_id,
             ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 60, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 60, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1674,7 +1766,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3u8 {
             let ClaimOutcome::Claimed { code_id, .. } = store
-                .claim(&owner(1), &[i + 1; 16], &lookup(i), 0, now + i as u64)
+                .claim(&owner(1), &[i + 1; 16], &lookup(i), 0, 0, None, now + i as u64)
                 .unwrap()
             else {
                 unreachable!()
@@ -1714,7 +1806,7 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1723,6 +1815,8 @@ mod tests {
             code_id,
             owner: owner(1),
             revision,
+            owner_endpoint: None,
+            max_redeems: 0,
         };
         let redeem = RedeemRequest {
             request_id: [2; 16],
@@ -1735,7 +1829,7 @@ mod tests {
         let pairing_id = [0xAA; 16];
         assert_eq!(
             store
-                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -1755,7 +1849,7 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1764,6 +1858,8 @@ mod tests {
             code_id,
             owner: owner(1),
             revision,
+            owner_endpoint: None,
+            max_redeems: 0,
         };
         let redeem = RedeemRequest {
             request_id: [2; 16],
@@ -1775,7 +1871,7 @@ mod tests {
         };
         let pairing_id = [0xBB; 16];
         store
-            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
             .unwrap();
         // Owner challenge with the transcript digest.
         let transcript = [0x11u8; 256];
@@ -1868,7 +1964,7 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1877,6 +1973,8 @@ mod tests {
             code_id,
             owner: owner(1),
             revision,
+            owner_endpoint: None,
+            max_redeems: 0,
         };
         let redeem = RedeemRequest {
             request_id: [2; 16],
@@ -1888,7 +1986,7 @@ mod tests {
         };
         let pairing_id = [0xCC; 16];
         store
-            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
             .unwrap();
         let transcript = [0x22u8; 256];
         let digest = crate::server_v2::hello2::transcript_digest(&transcript);
@@ -1943,7 +2041,7 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -1952,6 +2050,8 @@ mod tests {
             code_id,
             owner: owner(1),
             revision,
+            owner_endpoint: None,
+            max_redeems: 0,
         };
         let redeem = RedeemRequest {
             request_id: [2; 16],
@@ -1963,7 +2063,7 @@ mod tests {
         };
         let pairing_id = [0xDD; 16];
         store
-            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
             .unwrap();
         let report = store.expire_due(now + 999).unwrap();
         assert!(report.aborted.is_empty());
@@ -1983,7 +2083,7 @@ mod tests {
         };
         let pairing2 = [0xEE; 16];
         store
-            .begin_pairing(&pairing2, &owner(3), &redeem2, &code, now)
+            .begin_pairing(&pairing2, &owner(3), &redeem2, &code, None, now)
             .unwrap();
         let transcript = [0u8; 256];
         let digest = crate::server_v2::hello2::transcript_digest(&transcript);
@@ -2037,7 +2137,7 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
             .unwrap()
         else {
             unreachable!()
@@ -2046,6 +2146,8 @@ mod tests {
             code_id,
             owner: owner(1),
             revision,
+            owner_endpoint: None,
+            max_redeems: 0,
         };
         let redeem = RedeemRequest {
             request_id: [2; 16],
@@ -2057,7 +2159,7 @@ mod tests {
         };
         let pairing_id = [0xAB; 16];
         store
-            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+            .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
             .unwrap();
         let transcript = [0u8; 256];
         let digest = crate::server_v2::hello2::transcript_digest(&transcript);
@@ -2099,6 +2201,294 @@ mod tests {
     }
 
     #[test]
+    fn claim_persists_endpoint_and_cap_with_replay_semantics() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let endpoint = vec![0xA7; 128];
+        let first = store
+            .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, Some(&endpoint), now)
+            .unwrap();
+        assert!(matches!(first, ClaimOutcome::Claimed { .. }));
+        // The lookup path serves the wave-28 columns.
+        let code = store.find_active_code(&lookup(1), now).unwrap().unwrap();
+        assert_eq!(code.owner_endpoint.as_deref(), Some(&endpoint[..]));
+        assert_eq!(code.max_redeems, 1);
+        // Same request + same content: replay (idempotency carries the
+        // new fields in the body).
+        let retry = store
+            .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, Some(&endpoint), now + 10)
+            .unwrap();
+        assert!(matches!(retry, ClaimOutcome::Replay(_)));
+        // Same request, different endpoint or cap: REQUEST_CONFLICT.
+        assert_eq!(
+            store
+                .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, Some(&[0x00; 8]), now + 20)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(1), &[7; 16], &lookup(1), 0, 2, Some(&endpoint), now + 30)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, None, now + 40)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // Legacy claim (no endpoint, cap 0) stores the defaults.
+        assert!(matches!(
+            store
+                .claim(&owner(2), &[8; 16], &lookup(2), 0, 0, None, now)
+                .unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+        let legacy = store.find_active_code(&lookup(2), now).unwrap().unwrap();
+        assert_eq!(legacy.owner_endpoint, None);
+        assert_eq!(legacy.max_redeems, 0);
+    }
+
+    #[test]
+    fn begin_pairing_snapshots_both_endpoint_blobs() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let owner_blob = vec![0x11; 64];
+        let ClaimOutcome::Claimed {
+            code_id, revision, ..
+        } = store
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, Some(&owner_blob), now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code = ActiveCode {
+            code_id,
+            owner: owner(1),
+            revision,
+            owner_endpoint: Some(owner_blob.clone()),
+            max_redeems: 0,
+        };
+        let redeem = RedeemRequest {
+            request_id: [2; 16],
+            lookup_digest: lookup(1),
+            redeemer_nonce: [3; 32],
+            deadline_ms: now + 120_000,
+            request_mac: [4; 32],
+            signature: [5; 64],
+        };
+        let redeemer_blob = vec![0x22; 96];
+        let pairing_id = [0x9E; 16];
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, Some(&redeemer_blob), now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        // The offer served back to the owner carries the redeemer blob.
+        let offers = store.pending_offers_for_owner(&owner(1)).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].redeemer_endpoint.as_deref(), Some(&redeemer_blob[..]));
+        // The snapshot carries both sides for the commit path.
+        let snapshot = store.pairing_snapshot(&pairing_id).unwrap().unwrap();
+        assert_eq!(snapshot.owner_endpoint.as_deref(), Some(&owner_blob[..]));
+        assert_eq!(snapshot.redeemer_endpoint.as_deref(), Some(&redeemer_blob[..]));
+    }
+
+    #[test]
+    fn max_redeems_counts_committed_pairings_only() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let ClaimOutcome::Claimed {
+            code_id, revision, ..
+        } = store
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 1, None, now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code = ActiveCode {
+            code_id,
+            owner: owner(1),
+            revision,
+            owner_endpoint: None,
+            max_redeems: 1,
+        };
+        let redeem = |seed: u8, deadline: u64| RedeemRequest {
+            request_id: [seed; 16],
+            lookup_digest: lookup(1),
+            redeemer_nonce: [seed + 1; 32],
+            deadline_ms: deadline,
+            request_mac: [seed + 2; 32],
+            signature: [seed + 3; 64],
+        };
+        let pairing_a = [0xCA; 16];
+        let pairing_b = [0xCB; 16];
+        // First redeemer begins: allowed.
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        // A second pending attempt does NOT consume the cap (only
+        // committed pairings count).
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        // Abort B; A completes through commit (challenge + proof first).
+        store.abort_pairing(&pairing_b, now).unwrap();
+        let transcript = [0x33u8; 256];
+        let digest = crate::server_v2::hello2::transcript_digest(&transcript);
+        assert!(store
+            .store_owner_challenge(
+                &pairing_a,
+                &owner(1),
+                &transcript,
+                &digest,
+                &PairProof { mac: [6; 32], signature: [7; 64] },
+                now
+            )
+            .unwrap());
+        assert!(store
+            .store_redeemer_proof(
+                &pairing_a,
+                &owner(2),
+                &digest,
+                &PairProof { mac: [8; 32], signature: [9; 64] },
+                now
+            )
+            .unwrap());
+        for side in [owner(1), owner(2)] {
+            store
+                .store_prepared_and_try_commit(&pairing_a, &side, &[9; 64], &digest, now)
+                .unwrap();
+        }
+        assert_eq!(
+            store.pairing_snapshot(&pairing_a).unwrap().unwrap().state,
+            PairingState::Committed
+        );
+        // Cap reached: a new redeemer is refused up front.
+        assert_eq!(
+            store
+                .begin_pairing(&[0xCC; 16], &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::RedeemExhausted
+        );
+        // Unlimited codes (legacy default) keep admitting.
+        assert!(matches!(
+            store
+                .claim(&owner(5), &[2; 16], &lookup(5), 0, 0, None, now)
+                .unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_preserving_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.sqlite");
+        {
+            // A pre-wave-28 (schema v1) database, exactly as wave 18-27
+            // wrote it: no endpoint columns, no cap column.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE invite_codes (
+                   lookup_digest       BLOB(32) PRIMARY KEY,
+                   code_id             BLOB(16) UNIQUE NOT NULL,
+                   owner_device_id     BLOB(32) NOT NULL,
+                   created_unix_ms     INTEGER NOT NULL,
+                   expires_unix_ms     INTEGER NULL,
+                   state               TEXT NOT NULL,
+                   revision            INTEGER NOT NULL,
+                   create_request_id   BLOB(16) NOT NULL,
+                   UNIQUE (owner_device_id, create_request_id)
+                 );
+                 CREATE TABLE pairing_transactions (
+                   pairing_id                  BLOB(16) PRIMARY KEY,
+                   request_id                  BLOB(16) NOT NULL,
+                   code_id                     BLOB(16) NOT NULL,
+                   lookup_digest               BLOB(32) NOT NULL,
+                   owner_device_id             BLOB(32) NOT NULL,
+                   redeemer_device_id          BLOB(32) NOT NULL,
+                   state                       TEXT NOT NULL,
+                   transcript                  BLOB(256),
+                   transcript_digest           BLOB(32),
+                   owner_proof_mac             BLOB(32),
+                   owner_proof_signature       BLOB(64),
+                   redeemer_proof_mac          BLOB(32),
+                   redeemer_proof_signature    BLOB(64),
+                   owner_prepared_signature    BLOB(64),
+                   redeemer_prepared_signature BLOB(64),
+                   commit_revision             INTEGER,
+                   owner_applied_signature     BLOB(64),
+                   redeemer_applied_signature  BLOB(64),
+                   redeemer_nonce              BLOB(32) NOT NULL,
+                   request_mac                 BLOB(32) NOT NULL,
+                   redeemer_signature          BLOB(64) NOT NULL,
+                   deadline_unix_ms            INTEGER NOT NULL,
+                   code_revision               INTEGER NOT NULL,
+                   created_unix_ms             INTEGER NOT NULL,
+                   updated_unix_ms             INTEGER NOT NULL
+                 );
+                 CREATE TABLE pairing_relations (
+                   pairing_id         BLOB(16) PRIMARY KEY,
+                   code_id            BLOB(16) NOT NULL,
+                   lookup_digest      BLOB(32) NOT NULL,
+                   owner_device_id    BLOB(32) NOT NULL,
+                   redeemer_device_id BLOB(32) NOT NULL,
+                   transcript_digest  BLOB(32) NOT NULL,
+                   commit_revision    INTEGER NOT NULL,
+                   completed_unix_ms  INTEGER NOT NULL
+                 );
+                 CREATE TABLE request_journal (
+                   owner_device_id BLOB(32) NOT NULL,
+                   request_id      BLOB(16) NOT NULL,
+                   request_kind    TEXT NOT NULL,
+                   request_body    BLOB NOT NULL,
+                   response        BLOB NOT NULL,
+                   created_unix_ms INTEGER NOT NULL,
+                   PRIMARY KEY (owner_device_id, request_id)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO invite_codes
+                 (lookup_digest, code_id, owner_device_id, created_unix_ms, expires_unix_ms,
+                  state, revision, create_request_id)
+                 VALUES (?1,?2,?3,1000,NULL,'active',1,?4)",
+                params![&lookup(1).as_slice(), &[0x42u8; 16].as_slice(), &owner(1).as_slice(), &[9u8; 16].as_slice()],
+            )
+            .unwrap();
+        }
+        // Reopening with the wave-28 build migrates 1 → 2 additively.
+        let store = RegistryStore::open(&path).unwrap();
+        {
+            let conn = store.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+        // The v1 row survived and reads with the legacy defaults.
+        let code = store.find_active_code(&lookup(1), 2_000).unwrap().unwrap();
+        assert_eq!(code.code_id, [0x42u8; 16]);
+        assert_eq!(code.owner_endpoint, None);
+        assert_eq!(code.max_redeems, 0);
+        // The migrated tables accept wave-28 writes.
+        assert!(matches!(
+            store
+                .claim(&owner(1), &[1; 16], &lookup(9), 0, 1, Some(&[0x0F; 32]), 2_000)
+                .unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+    }
+    #[test]
     fn restart_reopen_preserves_codes_and_pending_transactions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reg.sqlite");
@@ -2112,7 +2502,7 @@ mod tests {
                 revision,
                 ..
             } = store
-                .claim(&owner(1), &[1; 16], &lookup(1), 0, now)
+                .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, None, now)
                 .unwrap()
             else {
                 unreachable!()
@@ -2122,6 +2512,8 @@ mod tests {
                 code_id: id,
                 owner: owner(1),
                 revision,
+                owner_endpoint: None,
+                max_redeems: 0,
             };
             let redeem = RedeemRequest {
                 request_id: [2; 16],
@@ -2132,7 +2524,7 @@ mod tests {
                 signature: [5; 64],
             };
             store
-                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, now)
+                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, None, now)
                 .unwrap();
         }
         // Process restart: same file, fresh connection.
@@ -2148,7 +2540,7 @@ mod tests {
         // The claimed code is not re-issuable after restart either.
         assert_eq!(
             store
-                .claim(&owner(9), &[8; 16], &lookup(1), 0, now + 2)
+                .claim(&owner(9), &[8; 16], &lookup(1), 0, 0, None, now + 2)
                 .unwrap(),
             ClaimOutcome::CodeConflict
         );

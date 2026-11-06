@@ -591,6 +591,11 @@ fn legacy_error_code(err: &EngineError) -> (ak_core::error::ErrorCode, Option<st
         EngineError::Cancelled => (ErrorCode::Cancelled, None),
         EngineError::RouteForbidden(_) => (ErrorCode::RouteForbidden, None),
         EngineError::AdmissionDenied { .. } => (ErrorCode::ProtocolUnsupported, None),
+        // Wave 28: the receiving user declined through a TransferConsent
+        // hook; the peer already saw the DECLINED wire frame (mapped onto
+        // LocalPermissionDenied by the engine), the scheduler code mirrors
+        // it (same mapping as ak-session's real executor).
+        EngineError::ConsentDeclined { .. } => (ErrorCode::LocalPermissionDenied, None),
         EngineError::InvalidAdmissionCtx { .. } | EngineError::PeerMismatch { .. } => {
             (ErrorCode::PeerMismatch, None)
         }

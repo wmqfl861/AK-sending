@@ -53,6 +53,7 @@
 pub mod client;
 pub mod error;
 pub mod orchestrator;
+pub mod task;
 pub mod transport;
 
 pub use ak_identity::pairing_txn::VerifiedPairing;
@@ -60,6 +61,12 @@ pub use client::{ClientConfig, ClientState, RegistryClient};
 pub use error::{ClientError, PairFlowError};
 pub use orchestrator::{
     redeem_request_mac, CommittedPairing, CreatedInvite, OrchestratorConfig, PairingOrchestrator,
-    PersistedCodeSource, BOOK_NAME, JOURNAL_SUBDIR,
+    PersistedCodeSource, TaskRedeem, BOOK_NAME, JOURNAL_SUBDIR,
+};
+pub use task::{
+    decode_endpoint_blob, encode_endpoint_blob, order_candidates_lan_first, probe_peer,
+    ActiveTask, CandidateFailure, PeerEndpoint, ProbeOptions, ProbeOutcome, TaskCode,
+    TaskDirection, TaskDisconnectReason, TaskError, TaskEvent, TaskPairing, TaskPairingConfig,
+    TaskPaired, ENDPOINT_BLOB_MAX_BYTES, ENDPOINT_BLOB_MAX_CANDIDATES, TASK_CODE_TTL_SECS,
 };
 pub use transport::RealTransport;

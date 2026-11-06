@@ -2,6 +2,7 @@
 
 > **冻结于第十八波（2026-11-04），修改需集成者核准并同步 ADR-004。**
 > §1 已按 **2026-11-05 wave-26 集成者 ABI 裁决**改为实际已发布导出的形态（裁决记录见 §1 末尾）；其余章节仍为第十八波冻结稿，本次随裁决补充 §2 幂等/停止细则与 §4 `peer` 必填说明。
+> **2026-11-06 wave-28 增补 §8**：v1 极简配对任务面（`ak_task_*` 八导出）按 §1 裁决第 4 条的“新增符号扩展”路径落地——不改不动任何已发布签名；`check_contracts.py` 检查 2 的“18 个冻结签名”口径仅数 ```c 围栏，§8 用 ```abi 围栏因此不在其内。
 > 事实源：`docs/plans/pairing-code-plan-part2.md` B.7、B.8 节。本文为 B8（`crates/ak-ffi`）与 Dart 绑定（`packages/ak_ffi_dart`）的契约。沿用 ADR-003：句柄式 C ABI、调用方缓冲区、原生异步执行、轮询取结果。网络等待不能发生在同步 FFI 调用里。
 
 ## 1. 新 C ABI 签名（冻结：实际已发布形态）
@@ -321,3 +322,125 @@ signal-server
 
 - 指针先检；`-3` 无副作用；异步请求；取消/释放；真实 DLL 双实例 e2e。
 - B7（CLI）侧另按 B.9 表验证：旧命令回归；两进程入队仍串行；同身份不重复登录；秘密不进输出日志。
+
+## 8. 任务面扩展：`ak_task_*` 八导出（wave-28 冻结，按 §1 裁决第 4 条新增符号）
+
+v1 极简配对的产品模型（用户冻结）：三动作——生成任务码（选角色）/ 输码加入 / 连接列表+断开；连接后发送方选文件发送，接收方收到请求可接受/拒绝；设置仅一个默认保存文件夹。**全程零 IP/端口/指纹进 UI。** 本节符号全部为新增，已发布签名的参数形状一字不动；除下表两个例外，状态码、`-3` 无损重试、`request_id` 幂等、`last_error` 全路径等纪律与 §2/§3 完全一致。
+
+> 本节签名用 ```abi 围栏（非 ```c）：检查 2 的 18 签名口径只数 §1 的 c 围栏，任务面导出在其符号集核对范围之外（前缀 `ak_task_` 不属于 `ak_pairing_`/`ak_sched_` 前缀过滤器），两侧约定以本表为准。
+
+```abi
+int32_t ak_task_start(
+    AkEngine *engine,
+    const char *spec_json,
+    uint8_t runtime_id_out[16]);
+
+int32_t ak_task_create_code(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const char *role_and_cands_json,
+    uint8_t op_id_out[16]);
+
+int32_t ak_task_join(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const char *code_and_cands_json,
+    uint8_t op_id_out[16]);
+
+int32_t ak_task_send(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const uint8_t conn_id[16],
+    const char *paths_json,
+    uint8_t op_id_out[16]);
+
+int32_t ak_task_list(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    char *buf,
+    size_t cap);
+
+int32_t ak_task_disconnect(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const uint8_t task_id[16]);
+
+int32_t ak_task_set_save_dir(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const char *path);
+
+int32_t ak_task_consent(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    const uint8_t job_id[16],
+    int32_t accept);
+```
+
+**结果与事件通道不新增符号**（wave-28 裁决）：任务 op 结果经既有 `ak_pairing_op_result(engine, runtime_id, op_id, buf, cap)` 读取、事件经既有 `ak_pairing_poll_event(engine, runtime_id, buf, cap)` 读取、取消经 `ak_pairing_cancel_op`——`runtime_id` 指任务运行时即可；两平面表不相交，配对平面先查、未命中落任务面，`-4` 语义不变。
+
+### 8.1 spec JSON
+
+```json
+// ak_task_start（注册中心配置沿用现有环境/dart-define 解析：Dart 层
+// 从 AK_REGISTRY_ADDR/AK_REGISTRY_ID 或 --dart-define 编译默认解析后传入）
+{"spec_version":1,
+ "registry":"127.0.0.1:7200","registry_id":"<64hex>",
+ "id_dir":"C:/ak/id","device_name":"phone","save_dir":"D:/inbox"}
+
+// ak_task_create_code
+{"spec_version":1,"role":"sender|receiver",
+ "candidates":["192.168.1.4:7000"],"ttl_secs":0,"request_id":"<32hex>"}
+
+// ak_task_join
+{"spec_version":1,"code":"AKT1-XXXX-XXXX-XXXX",
+ "candidates":[],"request_id":"<32hex>"}
+
+// ak_task_send（paths 为本地路径数组）
+{"spec_version":1,"paths":["C:/pick/a.jpg"],"request_id":"<32hex>"}
+```
+
+`ak_task_start` 校验并保存 registry 端点与 pin、在 `id_dir` 下引导身份；默认保存夹为 `<id_dir>/downloads`。`role` 决定生码方角色，加入方得对侧角色；receiver 角色生码会先绑定真实常驻接收端（wildcard bind），候选拨号地址由本机接口推导（接口 IPv4 + 显式 loopback 兜底，LAN 优先排序）。
+
+### 8.2 op 结果 JSON（经 ak_pairing_op_result）
+
+```json
+{"op":"task_create_code","code":"AKT1-XXXX-XXXX-XXXX","role":"receiver",
+ "code_id":"<32hex>","expires_ms":0,"endpoint":"192.168.1.4:53112"}
+{"op":"task_join","conn":"<32hex>","role":"sender",
+ "peer_endpoint":"192.168.1.4:53112","probe":"unverified"}
+{"op":"task_send","conn":"<32hex>","files":2,"bytes":123456,
+ "peer":"192.168.1.4:53112"}
+// 失败形态同配对面：{"op":"task_join","error":"unknown task code \"…\""}
+```
+
+### 8.3 事件类型（经 ak_pairing_poll_event，任务运行时）
+
+```json
+{"event":"runtime_ready","runtime":"<32hex>"}
+{"event":"op_done","op_id":"<32hex>","op":"task_create_code|task_join|task_send"}
+{"event":"op_failed","op_id":"<32hex>","op":"…"}
+{"event":"connected","conn":"<32hex>","role":"sender|receiver",
+ "peer_endpoint":"ip:port","code":"AKT1-…"}
+{"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":null}
+{"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
+ "root":"photos","files":3,"bytes":123456}
+{"event":"done","conn":"<32hex>","files":3,"bytes":123456}
+{"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed"}
+```
+
+`ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
+"connections":[{"conn":"<32hex>","role":"sender","state":
+"probing|connected|disconnected","peer_endpoint":"ip:port","code":"AKT1-…"}]}`。
+
+### 8.4 行为语义（冻结）
+
+- **幂等**：三个异步 op 均按 `request_id` 幂等（同 id 同 spec → 原 op id 与原答案；同 id 异 spec → `-2`；判定先于一切副作用）。
+- **发送**：`ak_task_send` 走既有引擎发送，对端 endpoint 候选按 LAN 优先排序逐个尝试；连接预算沿用 wave-26 P1-01 的 10 秒分拆预算（自引擎 `Connecting` 信号起算，源扫描不计入；连接建立后不再受其约束），候选间短暂停顿后回退；连接后失败不再换址重试。
+- **接收同意**：接收方常驻接收以 ak-engine 的 Offer 级 `TransferConsent` 回调为闸——每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件，挂起直至 `ak_task_consent` 决定或 **30 秒窗口自动拒绝**（绝不自动接受）；拒绝经 DECLINED 线上语义告知对端、零字节落盘。`ak_task_consent` 对未知/已决定请求返回 `-4`。
+- **断开**：`ak_task_disconnect` 幂等；双侧经 `disconnected` 事件得知（本侧 `local`，对侧 `peer`）。
+- **发送/接收进度**：进入引擎级 `ak_poll_progress` 队列（发送行 `job` 为连接 id、接收行为码 id 的 32hex）。
+
+### 8.5 诚实边界（wave-28 并行分工）
+
+ak-session 侧的注册中心中继（`create_task_code`/`join_task_code`/`probe_peer`/`PeerEndpoint`/`TaskDisconnected`，代理 B）落地前：任务码表为**引擎本地共享表**（同引擎内两个运行时可配对，跨引擎/跨设备 join 以 “unknown task code” 诚实失败）；加入方钉扎的公钥取自本地码表条目（中继落地后由 `PeerEndpoint` 携带）；`probe_result` 的 `reachable` 恒为 `null`（join 结果 `probe:"unverified"`）。以上槽位在 `crates/ak-ffi/src/task.rs` 以 `WAVE-28/B-PENDING` 标注，并由 `#[ignore]` 测试锁定契约。接收端 Offer 级同意已接通 ak-engine 落地版 `receive_with_addr_consent`（非占位）。

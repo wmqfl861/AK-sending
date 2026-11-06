@@ -173,6 +173,17 @@ pub struct CommittedPairing {
     pub peer_fingerprint: Fingerprint,
 }
 
+/// Result of [`PairingOrchestrator::redeem_task`] (wave 28): the finished
+/// pairing plus the initiator's endpoint blob as relayed by the registry.
+#[derive(Debug, Clone)]
+pub struct TaskRedeem {
+    /// The fully verified, applied pairing.
+    pub verified: VerifiedPairing,
+    /// The initiator's endpoint blob carried by `PairCommit`; `None` when
+    /// the code was claimed by a pre-wave-28 peer.
+    pub owner_endpoint: Option<Vec<u8>>,
+}
+
 /// In-memory invite registry: `secret_ref → code` plus `code_id` metadata.
 #[derive(Debug, Default)]
 struct Secrets {
@@ -294,6 +305,34 @@ impl PairingOrchestrator {
         request_id: [u8; 16],
         ttl_secs: u32,
     ) -> Result<CreatedInvite, PairFlowError> {
+        self.create_invite_extended(request_id, ttl_secs, None, 0)
+            .await
+    }
+
+    /// Wave-28 task-code claim: the v1 minimal pairing model. Identical to
+    /// [`PairingOrchestrator::create_invite_with_request_id`] except the
+    /// claim frame carries the initiator's endpoint blob (stored on the
+    /// code row, relayed to the joiner inside `PairCommit`) and
+    /// `max_redeems = 1` — one code pairs exactly once; a second redeem
+    /// is refused with the dedicated `REDEEM_EXHAUSTED` business error.
+    pub async fn create_task_invite(
+        &self,
+        request_id: [u8; 16],
+        ttl_secs: u32,
+        endpoint: ak_signal::protocol_v2::EndpointBlob,
+    ) -> Result<CreatedInvite, PairFlowError> {
+        self.create_invite_extended(request_id, ttl_secs, Some(endpoint), 1)
+            .await
+    }
+
+    /// Shared claim path (plain or task-shaped).
+    async fn create_invite_extended(
+        &self,
+        request_id: [u8; 16],
+        ttl_secs: u32,
+        endpoint: Option<ak_signal::protocol_v2::EndpointBlob>,
+        max_redeems: u32,
+    ) -> Result<CreatedInvite, PairFlowError> {
         let mut request_id = request_id;
         let mut budget = self.config.claim_conflict_retries.max(1);
         loop {
@@ -309,7 +348,13 @@ impl PairingOrchestrator {
             };
             match self
                 .client
-                .invite_claim_with_id(request_id, code.lookup_digest(), ttl_secs)
+                .invite_claim_task(
+                    request_id,
+                    code.lookup_digest(),
+                    ttl_secs,
+                    endpoint.clone(),
+                    max_redeems,
+                )
                 .await
             {
                 Ok(claimed) => {
@@ -371,8 +416,31 @@ impl PairingOrchestrator {
     /// `PairReady` (see the module docs for the sequence).
     pub async fn redeem(&self, code_str: &str) -> Result<VerifiedPairing, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
-        let committed = self.redeem_to_commit_on(code_str, &mut plane).await?;
+        let committed = self.redeem_to_commit_on(code_str, &mut plane, None).await?;
         self.finish_committed(committed, &mut plane).await
+    }
+
+    /// Wave-28 task-code redeem: the v1 minimal pairing model. Identical
+    /// to [`PairingOrchestrator::redeem`] except the redeem frame carries
+    /// the joiner's endpoint blob (forwarded to the code owner inside
+    /// `InviteRedeemOffered`), and the returned [`TaskRedeem`] also hands
+    /// back the initiator's blob the registry relayed inside `PairCommit`
+    /// (`None` when the initiator predates the wave-28 extension).
+    pub async fn redeem_task(
+        &self,
+        code_str: &str,
+        endpoint: ak_signal::protocol_v2::EndpointBlob,
+    ) -> Result<TaskRedeem, PairFlowError> {
+        let mut plane = self.client.subscribe_plane();
+        let committed = self
+            .redeem_to_commit_on(code_str, &mut plane, Some(endpoint))
+            .await?;
+        let owner_endpoint = self.client.take_endpoint_blob(committed.pairing_id);
+        let verified = self.finish_committed(committed, &mut plane).await?;
+        Ok(TaskRedeem {
+            verified,
+            owner_endpoint,
+        })
     }
 
     /// [`PairingOrchestrator::redeem`] stopping right after the verified
@@ -382,7 +450,7 @@ impl PairingOrchestrator {
         code_str: &str,
     ) -> Result<CommittedPairing, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
-        self.redeem_to_commit_on(code_str, &mut plane).await
+        self.redeem_to_commit_on(code_str, &mut plane, None).await
     }
 
     /// Finish a committed pairing: trust-book apply, journal marks, the
@@ -421,6 +489,7 @@ impl PairingOrchestrator {
         &self,
         code_str: &str,
         plane: &mut mpsc::Receiver<CtrlMessage>,
+        endpoint: Option<ak_signal::protocol_v2::EndpointBlob>,
     ) -> Result<CommittedPairing, PairFlowError> {
         let code = InviteCode::parse(code_str)?;
         let auth_key = code.auth_key();
@@ -448,18 +517,19 @@ impl PairingOrchestrator {
             deadline,
             &request_mac,
         ));
-        let ack = self
-            .client
-            .invite_redeem(ak_signal::protocol_v2::RedeemRequest {
-                request_id,
-                lookup_digest: code.lookup_digest(),
-                redeemer_nonce: nonce,
-                deadline_ms: deadline,
-                request_mac,
-                signature,
-            })
-            .await
-            .map_err(map_client)?;
+        let request = ak_signal::protocol_v2::RedeemRequest {
+            request_id,
+            lookup_digest: code.lookup_digest(),
+            redeemer_nonce: nonce,
+            deadline_ms: deadline,
+            request_mac,
+            signature,
+        };
+        let ack = match endpoint {
+            Some(blob) => self.client.invite_redeem_with_endpoint(request, blob).await,
+            None => self.client.invite_redeem(request).await,
+        }
+        .map_err(map_client)?;
         let pairing_id = ack.pairing_id;
 
         // ← PairChallenge (relayed owner transcript + owner proof).
@@ -600,6 +670,30 @@ impl PairingOrchestrator {
         &self,
         on_paired: Option<std::sync::Arc<dyn Fn(Fingerprint) + Send + Sync>>,
     ) -> JoinHandle<()> {
+        self.spawn_owner_loop_inner(on_paired.map(|sink| {
+            std::sync::Arc::new(move |verified: VerifiedPairing| {
+                sink(verified.redeemer_fingerprint())
+            }) as std::sync::Arc<dyn Fn(VerifiedPairing) + Send + Sync>
+        }))
+    }
+
+    /// Wave-28 owner loop with the full verified record reported per
+    /// committed pairing (the task layer reads the redeemer's endpoint
+    /// blob off the relayed offer through
+    /// [`RegistryClient::take_endpoint_blob`]).
+    pub fn spawn_owner_loop_verified(
+        &self,
+        on_paired: Option<std::sync::Arc<dyn Fn(VerifiedPairing) + Send + Sync>>,
+    ) -> JoinHandle<()> {
+        self.spawn_owner_loop_inner(on_paired)
+    }
+
+    /// Shared owner-loop body (fingerprint- and record-shaped wrappers
+    /// above).
+    fn spawn_owner_loop_inner(
+        &self,
+        on_paired: Option<std::sync::Arc<dyn Fn(VerifiedPairing) + Send + Sync>>,
+    ) -> JoinHandle<()> {
         let orchestrator = self.clone();
         // Subscribe synchronously: an offer pushed between `spawn` and the
         // task's first poll would otherwise be dropped with no subscriber.
@@ -644,7 +738,7 @@ impl PairingOrchestrator {
                                 if let Some(on_paired) = on_paired.as_ref() {
                                     // The redeemer is this daemon's peer
                                     // (the owner loop runs on the owner).
-                                    on_paired(verified.redeemer_fingerprint());
+                                    on_paired(verified);
                                 }
                             }
                             Err(err) => {

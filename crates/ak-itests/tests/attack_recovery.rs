@@ -292,6 +292,7 @@ async fn swapped_key_commit_from_a_malicious_registry_is_refused_by_the_pin() {
             &redeemer_key.public_key(),
             &redeem,
             &code,
+            None, // wave-28: endpoint blob (this attack path carries none)
             now
         )
         .expect("begin"),

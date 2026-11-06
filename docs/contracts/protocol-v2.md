@@ -68,7 +68,7 @@ code_id[16] | state:u8 | created_ms:u64 | expires_ms:u64 | revision:u64
 
 | Tag | 变体 | 字段 | Payload 预算 |
 |---|---|---|---:|
-| `0x0A` | `InviteClaim` | `request_id:16, lookup_digest:32, ttl_secs:u32` | 52 |
+| `0x0A` | `InviteClaim` | `request_id:16, lookup_digest:32, ttl_secs:u32`（＋wave-28 扩展段，见第 10a 节） | ≤571 |
 | `0x0B` | `InviteClaimed` | `request_id:16, code_id:16, created_ms:u64, expires_ms:u64, revision:u64` | 56 |
 | `0x0C` | `InviteList` | `request_id:16, cursor:16, limit:u8, state_filter:u8` | 34 |
 | `0x0D` | `InviteListPage` | `request_id:16, next_cursor:16, count:u8, entries:[InviteSummary; ≤32]` | ≤1345 |
@@ -126,13 +126,13 @@ signature = Ed25519.Sign(
 
 | Tag | 变体 | 字段 | Payload 预算 |
 |---|---|---|---:|
-| `0x10` | `InviteRedeem` | `request_id:16, lookup_digest:32, redeemer_nonce:32, deadline_ms:u64, request_mac:32, signature:64` | 184 |
+| `0x10` | `InviteRedeem` | `request_id:16, lookup_digest:32, redeemer_nonce:32, deadline_ms:u64, request_mac:32, signature:64`（＋wave-28 扩展段，见第 10a 节） | ≤699 |
 | `0x11` | `InviteRedeemPending` | `request_id:16, pairing_id:16, deadline_ms:u64` | 40 |
-| `0x12` | `InviteRedeemOffered` | `code_id:16, code_revision:u64, pairing_id:16, redeemer_device_id:32, redeem:InviteRedeem的固定字段` | 256 |
+| `0x12` | `InviteRedeemOffered` | `code_id:16, code_revision:u64, pairing_id:16, redeemer_device_id:32, redeem:InviteRedeem的固定字段`（＋wave-28 扩展段，见第 10a 节） | ≤771 |
 | `0x13` | `PairChallenge` | `transcript:256, owner_proof:96` | 352 |
 | `0x14` | `PairProof` | `pairing_id:16, transcript_digest:32, redeemer_proof:96` | 144 |
 | `0x15` | `PairPrepared` | `pairing_id:16, transcript_digest:32, signature:64` | 112 |
-| `0x16` | `PairCommit` | `transcript:256, owner_proof:96, redeemer_proof:96, owner_prepared_signature:64, redeemer_prepared_signature:64, commit_revision:u64` | 584 |
+| `0x16` | `PairCommit` | `transcript:256, owner_proof:96, redeemer_proof:96, owner_prepared_signature:64, redeemer_prepared_signature:64, commit_revision:u64`（＋wave-28 扩展段，见第 10a 节） | ≤1099 |
 | `0x17` | `PairApplied` | `pairing_id:16, transcript_digest:32, commit_revision:u64, signature:64` | 120 |
 | `0x18` | `PairReady` | `pairing_id:16, transcript_digest:32, commit_revision:u64, owner_applied_signature:64, redeemer_applied_signature:64` | 184 |
 | `0x19` | `PairStatusQuery` | `request_id:16, pairing_id:16` | 32 |
@@ -210,7 +210,58 @@ signature = Ed25519.Sign(
 
 ## 10. 尾随字节与其他拒绝规则
 
-- 尾随字节全部拒绝：解码 payload 后剩余任何字节即为非法帧。
+- 尾随字节全部拒绝：解码 payload 后剩余任何字节即为非法帧（第 10a 节的扩展段是声明长度**内部**的受控结构，不属于此条所述尾随字节）。
 - 未定义 tag 拒绝：封闭集测试应穷举全部 256 个 tag，分别验证版本、类型、方向、长度和状态限制；不能仅把原来的“1–8 合法”改成一个更大的连续范围后结束测试。
 - 超长、截断、非法阶段由生产编码/解码拒绝（A1 验证门槛）。
 - 端口 0 拒绝（`SocketAddr`）；`state_filter` 仅接受已定义位、`limit` 为 1–32（第 4 节）。
+
+## 10a. wave-28 修订：端点扩展段与单次兑换（v1 极简配对模型）
+
+> **第二十八波修订（2026-11-06）。** 四个扩展 tag 的 payload 末尾可携带一个**可选扩展段**；其余规则不变。扩展段不是通用扩展口：只有两个已定义字段，未定义 flags 位、错误 tag 上的字段、超预算长度、段内尾随字节全部拒绝。
+
+背景（v1 冻结产品模型）：一个随机码 = 一次传输任务，恰好两个对象。发起方（owner）在 `InviteClaim` 时上传本机连接设置；加入方（redeemer）在 `InviteRedeem` 时上传本机连接设置；服务器原样透传，使双方在**既有帧**上一次往返拿到对端设置。全程 UI 不暴露 IP/端口/指纹。
+
+### 扩展段布局（声明长度内部，冻结字段之后）
+
+```text
+扩展段 := flags:u8 [endpoint_len:u16 + blob] [max_redeems:u32]
+flags 位 0x01 = endpoint blob（四个扩展 tag 均可）
+flags 位 0x02 = max_redeems:u32（仅 InviteClaim）
+```
+
+- 段不存在（冻结字段后 0 字节）＝旧形状，字节与第十八波冻结布局逐字节一致；编码侧两个字段全空时也**必须**省略整个段。
+- `endpoint blob`：1..=512 字节，原样透传（建议 JSON：候选地址数组＋设备名＋方向声明），编解码与语义校验归上层；**不受** redeem/配对签名覆盖（连接提示，不是凭证）。
+- `max_redeems`：0＝无限（旧默认），1＝一码一任务；编码侧仅允许挂在 `InviteClaim`。
+- `flags == 0x00`、未定义位、或段内有剩余字节：拒绝。
+
+### 挂载点与预算更新
+
+| Tag | 帧角色 | 语义 | Payload 预算（旧 → 新） |
+|---|---|---|---:|
+| `0x0A InviteClaim` | owner → 服务端 | owner endpoint 存入码行；`max_redeems` 存入码行 | 52 → ≤571 |
+| `0x10 InviteRedeem` | redeemer → 服务端 | redeemer endpoint 存入配对事务 | 184 → ≤699 |
+| `0x12 InviteRedeemOffered` | 服务端 → owner | 携带 redeemer endpoint（随 offer 一次送达 owner） | 256 → ≤771 |
+| `0x16 PairCommit` | 服务端 → 双方 | 携带 owner endpoint（redeemer 在权威 Commit 点拿到） | 584 → ≤1099 |
+
+预算算术：`InviteClaim`＝52＋1（flags）＋2＋512＋4（u32 cap）＝571；其余三个 tag＝旧预算＋1＋2＋512。全部仍远低于 4092 帧上限。
+
+### Rust 挂载形状（`crates/ak-signal`，类型名冻结）
+
+```rust
+pub struct EndpointBlob(pub Vec<u8>);          // ≤512B，原样透传
+
+pub struct CtrlFrame {
+    pub message: CtrlMessage,                  // 30 个变体形状不变
+    pub endpoint: Option<EndpointBlob>,        // wave-28 扩展段
+    pub max_redeems: Option<u32>,              // 仅 InviteClaim
+}
+```
+
+扩展字段挂在**帧层**（`CtrlFrame`）而非 `CtrlMessage` 变体上：消息枚举与全部旧帧字节保持不变，`CtrlFrame::new(message)` 产生的就是旧形状；`CtrlFrame` 新增 `with_endpoint` / `with_max_redeems` 构造器。编码侧在非扩展 tag 上设置任一字段为 `EncodeError::BadExtension`。
+
+### 单次兑换语义（与 `pairing-flow.md` §12a 同步）
+
+- 码行新增 `max_redeems`（默认 0＝无限，兼容旧流；create 可传 1）。
+- 计数口径＝该码名下 **committed/applied/ready** 状态的配对事务数；pending/aborted 不消耗额度。
+- 达到上限后，新的（不同 request_id 的）redeem 立即返回 `PairError`，错误码 `0x2109 REDEEM_EXHAUSTED`（scope＝Code，object＝code_id）。
+- 幂等/回放语义不变：同 `(redeemer, request_id)` 重放仍返回原 `InviteRedeemPending`；claim 侧同 `request_id` 同内容仍重放原 `InviteClaimed`。

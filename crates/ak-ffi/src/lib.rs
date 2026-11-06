@@ -458,11 +458,45 @@
 //!
 //! NOT yet wired to any frontend: verified by Rust-side tests that drive
 //! the C ABI end-to-end (real loopback transfers through the boundary).
+//!
+//! # B8 (wave 28): the v1 minimal-pairing task plane (`ak_task_*`)
+//!
+//! Contract: `docs/contracts/ffi-v2.md` §8 (new symbols per the §1
+//! ruling's extension path; no published signature changed). The three
+//! frozen actions — generate a task code with a chosen role / join by
+//! entering a code / connection list + disconnect — plus sender sends,
+//! receiver offer-level consent, and the one default save folder. Zero
+//! IP/port/fingerprint crosses the UI.
+//!
+//! Op results and events add NO symbols: the task plane reads through
+//! the existing `ak_pairing_op_result` / `ak_pairing_poll_event` /
+//! `ak_pairing_cancel_op` exports with a task runtime id (the pairing
+//! lookup falls through to the task table on a miss). Event types:
+//! `runtime_ready`, `op_done`/`op_failed`, `connected`,
+//! `probe_result` (`reachable:null` until ak-session `probe_peer`),
+//! `incoming_request` (held for `ak_task_consent` or the 30 s
+//! auto-decline), `done`, `disconnected` (bilateral).
+//!
+//! Wave-28 integrator wiring (final shape): create/join run through
+//! ak-session's REAL registry relay (`create_task_code_with_ttl` /
+//! `join_task_code` over a per-runtime `TaskPairing`), pairing delivers
+//! the peer endpoint both ways, probes report real reachability (the
+//! receiver's candidates carry an echo-responder port so the UDP probe
+//! exchange is genuinely confirmable), and remote disconnects surface on
+//! the peer device (`TaskDisconnected{ByPeer}` → the `disconnected`
+//! event). The engine-local code table remains only as a same-engine
+//! cache/display lookup; cross-engine joins go through the registry.
+//! The receiver-side offer-level consent is REAL (ak-engine's
+//! `receive_with_addr_consent`), and `ak_task_send` runs REAL engine
+//! sends over LAN-first candidates under the split 10 s connect budget
+//! with automatic fallback (the wave-25/26 CLI driver, P1-01 shape).
 
 mod core;
 mod pairing;
 mod sched_ext;
 mod shim;
+mod task;
+mod task_ext;
 
 pub use crate::core::{
     AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INTERNAL, AK_ERR_INVALID, AK_ERR_NOT_FOUND,
@@ -479,4 +513,8 @@ pub use crate::shim::{
     ak_pairing_revoke_start, ak_pairing_start, ak_peer_add, ak_peer_list, ak_peer_remove,
     ak_poll_progress, ak_receive_start, ak_sched_cancel, ak_sched_enqueue, ak_sched_poll_event,
     ak_sched_set_policy, ak_sched_snapshot, ak_sched_start, ak_send_start, ak_version,
+};
+pub use crate::task_ext::{
+    ak_task_consent, ak_task_create_code, ak_task_disconnect, ak_task_join, ak_task_list,
+    ak_task_send, ak_task_set_save_dir, ak_task_start,
 };

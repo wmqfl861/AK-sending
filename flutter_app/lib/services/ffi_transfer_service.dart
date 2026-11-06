@@ -175,8 +175,12 @@ final class FfiTransferService implements TransferService {
   /// (`ip:port` of the deployed coordination service, e.g.
   /// `122.51.121.24:7200`) and `AK_REGISTRY_ID` (the pinned registry
   /// identity — 64 hex, the raw 32-byte Ed25519 public key). BOTH must
-  /// be set; an unset or partial
-  /// environment returns null so the invite service falls back to
+  /// be present; precedence: the runtime environment first (tests and
+  /// operator overrides), then COMPILED defaults
+  /// (`--dart-define=AK_REGISTRY_ADDR=... --dart-define=AK_REGISTRY_ID=...`
+  /// — the only way a standalone phone install gets a real registry, since
+  /// Android apps have no environment). Unset or partial configuration
+  /// returns null so the invite service falls back to
   /// [PairingStartConfig.defaults] (the loopback TEST placeholder).
   /// Shape validation stays with the engine — a malformed address or id
   /// surfaces as the runtime's own start failure on the invite page,
@@ -185,8 +189,14 @@ final class FfiTransferService implements TransferService {
   static PairingStartConfig? inviteConfigFromEnvironment(
       {Map<String, String>? environment}) {
     final env = environment ?? Platform.environment;
-    final address = env['AK_REGISTRY_ADDR']?.trim() ?? '';
-    final idHex = env['AK_REGISTRY_ID']?.trim().toLowerCase() ?? '';
+    // Compiled fallback: empty when the build passed no --dart-define,
+    // so unpinned desktop/test builds keep the null (placeholder) path.
+    const compiledAddress = String.fromEnvironment('AK_REGISTRY_ADDR');
+    const compiledId = String.fromEnvironment('AK_REGISTRY_ID');
+    final address =
+        env['AK_REGISTRY_ADDR']?.trim() ?? compiledAddress.trim();
+    final idHex = env['AK_REGISTRY_ID']?.trim().toLowerCase() ??
+        compiledId.trim().toLowerCase();
     if (address.isEmpty || idHex.isEmpty) {
       return null;
     }

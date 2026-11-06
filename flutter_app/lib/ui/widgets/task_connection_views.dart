@@ -1,0 +1,123 @@
+/// Shared views/labels for [TaskConnection] rows (wave-28): the home-page
+/// card and the detail page render direction and state through these.
+library;
+
+import 'package:flutter/material.dart';
+
+import '../service/simple_transfer_service.dart';
+
+/// Direction label from MY point of view (frozen one-way connection).
+String taskRoleLabel(TaskRole role) =>
+    role == TaskRole.send ? '我发送 → 对方' : '对方 → 我接收';
+
+/// Short direction chip text.
+String taskRoleShortLabel(TaskRole role) =>
+    role == TaskRole.send ? '发送' : '接收';
+
+/// Live-state label (list card + detail page).
+String connectionStateLabel(TaskConnectionState state) => switch (state) {
+      TaskConnectionState.connecting => '建立中',
+      TaskConnectionState.testing => '测试中',
+      TaskConnectionState.connected => '已连接',
+      TaskConnectionState.disconnected => '已断开',
+    };
+
+Color _connectionStateColor(
+    TaskConnectionState state, ColorScheme scheme) => switch (state) {
+      TaskConnectionState.connecting => scheme.tertiary,
+      TaskConnectionState.testing => scheme.secondary,
+      TaskConnectionState.connected => Colors.green,
+      TaskConnectionState.disconnected => scheme.error,
+    };
+
+/// Rounded state chip (label + tinted background).
+class ConnectionStateChip extends StatelessWidget {
+  const ConnectionStateChip({super.key, required this.state});
+
+  final TaskConnectionState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = _connectionStateColor(state, scheme);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        connectionStateLabel(state),
+        key: ValueKey('conn_state_${state.name}'),
+        style: TextStyle(
+          color: color,
+          fontWeight: FontWeight.w600,
+          fontSize: 12,
+        ),
+      ),
+    );
+  }
+}
+
+/// One live connection row of the home page's 「当前连接」 section:
+/// peer name + direction + state. Tapping opens the detail page.
+class ConnectionCard extends StatelessWidget {
+  const ConnectionCard({
+    super.key,
+    required this.connection,
+    required this.onOpen,
+  });
+
+  final TaskConnection connection;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onOpen,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Icon(
+                connection.role == TaskRole.send
+                    ? Icons.upload_outlined
+                    : Icons.download_outlined,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Phone-width guard: long peer names ellipsize instead
+                    // of overflowing next to the state chip.
+                    Text(
+                      connection.peerName,
+                      key: ValueKey('conn_card_name_${connection.id}'),
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleMedium,
+                    ),
+                    Text(
+                      taskRoleLabel(connection.role),
+                      key: ValueKey('conn_card_role_${connection.id}'),
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              ConnectionStateChip(state: connection.state),
+              const SizedBox(width: 4),
+              Icon(Icons.chevron_right, color: theme.colorScheme.outline),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

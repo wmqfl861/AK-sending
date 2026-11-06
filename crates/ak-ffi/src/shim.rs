@@ -1064,6 +1064,10 @@ pub extern "C" fn ak_pairing_revoke_start(
 /// NOT consumed — retry losslessly with a larger `cap`; a create op never
 /// regenerates its code), `AK_ERR_NOT_FOUND` for an unknown runtime or op.
 ///
+/// B8 (wave 28) task plane: when `runtime_id` names a TASK runtime (of
+/// `ak_task_start`) the same export reads that plane's ops — the op-result
+/// channel is shared, no new symbol (ffi-v2 task-plane table).
+///
 /// # Safety
 ///
 /// SAFETY (caller contract): `runtime_id`/`op_id` non-null and readable
@@ -1094,11 +1098,22 @@ pub extern "C" fn ak_pairing_op_result(
         Ok(id) => id,
         Err(error) => return fail(error),
     };
-    match guarded(|| v2::pairing_op_result(engine, &runtime_id, &op_id)) {
+    match guarded(|| {
+        // Pairing plane first; a runtime-id miss falls through to the
+        // wave-28 task plane before the -4 leaves the boundary.
+        match v2::pairing_op_result(engine, &runtime_id, &op_id) {
+            Ok(result) => Ok(result),
+            Err(error) => match crate::task::task_op_result_maybe(engine, &runtime_id, &op_id) {
+                Ok(Some(result)) => Ok(result),
+                Ok(None) => Err(error),
+                Err(task_error) => Err(task_error),
+            },
+        }
+    }) {
         Ok(v2::OpResult::Running) => AK_PENDING,
         Ok(v2::OpResult::Finished { ok, json }) => {
             // SAFETY: write_cstr checks null/bounds itself and writes only
-            // within the caller-provided capacity; a TooSmall result leaves
+            // within the caller's capacity; a TooSmall result leaves
             // the stored JSON unconsumed.
             match unsafe { write_cstr(buf, cap, &json) } {
                 Ok(_) if ok => AK_DONE,
@@ -1120,6 +1135,12 @@ pub extern "C" fn ak_pairing_op_result(
 /// `AK_EVENT` (1) when written, `AK_PENDING` (0) when none is queued,
 /// `AK_ERR_BUFFER` when `cap` is too small (the event is pushed back —
 /// nothing is lost), `AK_ERR_NOT_FOUND` for an unknown runtime.
+///
+/// B8 (wave 28) task plane: when `runtime_id` names a TASK runtime (of
+/// `ak_task_start`) the same export pops that plane's event queue — the
+/// event channel is shared and carries the extended task event types
+/// (`runtime_ready` / `op_done` / `op_failed` / `connected` /
+/// `probe_result` / `incoming_request` / `done` / `disconnected`).
 ///
 /// # Safety
 ///
@@ -1145,23 +1166,36 @@ pub extern "C" fn ak_pairing_poll_event(
         Ok(id) => id,
         Err(error) => return fail(error),
     };
-    let line = match guarded(|| v2::pairing_poll_event(engine, &runtime_id)) {
+    let line = match guarded(|| {
+        // Pairing plane first: its Ok(None) means a KNOWN pairing runtime
+        // with an empty queue (AK_PENDING — never a task runtime, the
+        // tables are disjoint), so only the -4 miss falls through to the
+        // wave-28 task plane.
+        match v2::pairing_poll_event(engine, &runtime_id) {
+            Ok(option) => Ok(option),
+            Err(error) => match crate::task::task_poll_event_maybe(engine, &runtime_id) {
+                Ok(Some((line, _queue))) => Ok(line),
+                Ok(None) => Err(error),
+                Err(task_error) => Err(task_error),
+            },
+        }
+    }) {
         Ok(Some(line)) => line,
         Ok(None) => return AK_PENDING,
         Err(error) => return fail(error),
     };
     // SAFETY: write_cstr checks null/bounds itself and writes only within
-    // the caller-provided capacity.
+    // the caller's provided capacity.
     match unsafe { write_cstr(buf, cap, &line) } {
         Ok(_) => AK_EVENT,
         Err(WriteError::TooSmall { need, capacity }) => {
-            if let Err(error) = v2::pairing_push_event_front(engine, &runtime_id, line) {
+            if let Err(error) = push_pairing_or_task_event_front(engine, &runtime_id, line) {
                 return fail(error);
             }
             fail_buffer(need, capacity, "a pairing event")
         }
         Err(WriteError::NullBuffer) => {
-            if let Err(error) = v2::pairing_push_event_front(engine, &runtime_id, line) {
+            if let Err(error) = push_pairing_or_task_event_front(engine, &runtime_id, line) {
                 return fail(error);
             }
             core::set_last_error("buf argument is null");
@@ -1170,8 +1204,27 @@ pub extern "C" fn ak_pairing_poll_event(
     }
 }
 
+/// Push one event line back to the owning plane's queue (pairing first,
+/// then the wave-28 task plane) — the `-3`/null-buffer pushback of
+/// [`ak_pairing_poll_event`].
+fn push_pairing_or_task_event_front(
+    engine: &AkEngine,
+    runtime_id: &[u8; 16],
+    line: String,
+) -> Result<(), FfiError> {
+    match v2::pairing_push_event_front(engine, runtime_id, line.clone()) {
+        Ok(()) => Ok(()),
+        Err(error) => match crate::task::task_push_event_front_maybe(engine, runtime_id, line) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(error),
+            Err(task_error) => Err(task_error),
+        },
+    }
+}
+
 /// Cancel one op: `AK_OK`, or `AK_ERR_NOT_FOUND` for an unknown runtime or
-/// op. A finished op is left untouched.
+/// op. A finished op is left untouched. B8 (wave 28): also cancels TASK
+/// ops (the shared op channel's cancel half).
 ///
 /// # Safety
 ///
@@ -1200,7 +1253,16 @@ pub extern "C" fn ak_pairing_cancel_op(
         Ok(id) => id,
         Err(error) => return fail(error),
     };
-    match guarded(|| v2::pairing_cancel_op(engine, &runtime_id, &op_id)) {
+    match guarded(|| {
+        match v2::pairing_cancel_op(engine, &runtime_id, &op_id) {
+            Ok(()) => Ok(()),
+            Err(error) => match crate::task::task_cancel_op_maybe(engine, &runtime_id, &op_id) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(error),
+                Err(task_error) => Err(task_error),
+            },
+        }
+    }) {
         Ok(()) => AK_OK,
         Err(error) => fail(error),
     }

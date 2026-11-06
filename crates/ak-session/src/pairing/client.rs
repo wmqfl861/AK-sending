@@ -60,10 +60,10 @@ use ak_identity::pairing_txn::random_id16;
 use ak_identity::DeviceKeyPair;
 use ak_signal::client_v2::{ClaimedInvite, PairStatus, RedeemAck, RevokedInvite};
 use ak_signal::protocol_v2::{
-    CodeId, CtrlFrame, CtrlMessage, DeviceId, Digest32, ErrorScope, InviteSummary, PairProof,
-    PairingId, RedeemRequest, RegistryId, Role, Signature64, StateFilter, Transcript256,
+    CodeId, CtrlFrame, CtrlMessage, DeviceId, Digest32, EndpointBlob, ErrorScope, InviteSummary,
+    PairProof, PairingId, RedeemRequest, RegistryId, Role, Signature64, StateFilter, Transcript256,
 };
-use ak_signal::server_v2::framing::{read_frame, write_message};
+use ak_signal::server_v2::framing::{read_frame, write_frame, write_message};
 use ak_signal::server_v2::hello2;
 use ak_signal::server_v2::tls as registry_tls;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -144,6 +144,12 @@ struct Dispatch {
     /// Pairing-plane subscribers: every pairing-plane frame, `ServerError`
     /// and pairing-scoped `PairError`, copied to each.
     plane: Vec<mpsc::Sender<CtrlMessage>>,
+    /// Wave-28 endpoint blobs relayed by extended frames
+    /// (`InviteRedeemOffered`: the redeemer's settings; `PairCommit`: the
+    /// owner's), keyed by pairing id and stored BEFORE the carrier frame
+    /// is dispatched, so a subscriber that just saw the frame can
+    /// [`RegistryClient::take_endpoint_blob`] it exactly once.
+    endpoint_blobs: HashMap<PairingId, Vec<u8>>,
 }
 
 impl Dispatch {
@@ -167,7 +173,7 @@ struct ClientInner {
     config: ClientConfig,
 
     dispatch: StdMutex<Dispatch>,
-    outbox: StdMutex<mpsc::Sender<CtrlMessage>>,
+    outbox: StdMutex<mpsc::Sender<CtrlFrame>>,
     lifecycle: AsyncMutex<()>,
 
     epoch: AtomicU64,
@@ -180,8 +186,29 @@ struct ClientInner {
 
 impl ClientInner {
     /// Route one inbound frame (single-reader context, no await inside).
-    fn route(&self, message: CtrlMessage) {
+    /// Wave-28: the extension section is peeled off first — an endpoint
+    /// blob on `InviteRedeemOffered` / `PairCommit` lands in the dispatch
+    /// side-map keyed by the frame's pairing id BEFORE the carrier message
+    /// fans out, so the flow that consumes the frame can take the blob
+    /// with no ordering race.
+    fn route(&self, frame: CtrlFrame) {
+        let message = frame.message;
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
+        if let Some(EndpointBlob(blob)) = frame.endpoint {
+            let pairing_id = match &message {
+                CtrlMessage::InviteRedeemOffered { pairing_id, .. } => Some(*pairing_id),
+                CtrlMessage::PairCommit { transcript, .. } => {
+                    Some(transcript_pairing_id(transcript))
+                }
+                _ => None,
+            };
+            if let Some(pairing_id) = pairing_id {
+                dispatch
+                    .endpoint_blobs
+                    .entry(pairing_id)
+                    .or_insert_with(|| blob.clone());
+            }
+        }
         let mut delivered = false;
         match &message {
             CtrlMessage::InviteClaimed { request_id, .. }
@@ -271,17 +298,23 @@ impl ClientInner {
     }
 
     /// Fail every one-shot waiter (disconnect) — their receivers observe a
-    /// closed channel and map it to `ConnectionLost`/`Replaced`.
+    /// closed channel and map it to `ConnectionLost`/`Replaced`. Relayed
+    /// endpoint blobs of pairings that never completed drop with them.
     fn clear_waiters(&self) {
-        self.dispatch
-            .lock()
-            .expect("client dispatch lock")
-            .waiters
-            .clear();
+        let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
+        dispatch.waiters.clear();
+        dispatch.endpoint_blobs.clear();
     }
 
-    /// Queue one frame for the writer (bounded, non-blocking).
+    /// Queue one plain message for the writer (bounded, non-blocking).
     fn send_frame(&self, message: CtrlMessage) -> Result<(), ClientError> {
+        self.send_frame_with(CtrlFrame::new(message))
+    }
+
+    /// Queue one full frame — message plus optional wave-28 extension
+    /// section (endpoint blob on `InviteClaim`/`InviteRedeem`, claim
+    /// `max_redeems`) — for the writer (bounded, non-blocking).
+    fn send_frame_with(&self, frame: CtrlFrame) -> Result<(), ClientError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ClientError::Closed);
         }
@@ -289,7 +322,7 @@ impl ClientInner {
             return Err(ClientError::Offline);
         }
         let tx = self.outbox.lock().expect("client outbox lock").clone();
-        match tx.try_send(message) {
+        match tx.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 log::debug!("pairing client: writer queue full, frame dropped");
@@ -387,6 +420,12 @@ impl RegistryClient {
         self.inner.key.public_key()
     }
 
+    /// The wire-legal display name this client Hello'd with (wave 28:
+    /// task-pairing endpoint blobs carry it as the human-readable label).
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+
     /// Sign one of the frozen control-plane domains with this device's key
     /// (crate-internal use: the [`crate::pairing::RealTransport`] adapter
     /// signs `PairPrepared` confirmations here).
@@ -461,6 +500,22 @@ impl RegistryClient {
         rx
     }
 
+    /// Take (once) the wave-28 endpoint blob a relayed frame carried for
+    /// `pairing_id`: the redeemer's settings off `InviteRedeemOffered`
+    /// (owner side) or the owner's settings off `PairCommit` (redeemer
+    /// side). The blob is stored before its carrier frame is dispatched,
+    /// so a flow that just consumed the frame on any inbox or the plane
+    /// finds it here; `None` means the peer predates the extension or the
+    /// blob was already taken.
+    pub fn take_endpoint_blob(&self, pairing_id: PairingId) -> Option<Vec<u8>> {
+        self.inner
+            .dispatch
+            .lock()
+            .expect("client dispatch lock")
+            .endpoint_blobs
+            .remove(&pairing_id)
+    }
+
     // ---- request API -------------------------------------------------------
 
     /// Register a freshly generated invite code by lookup digest (fresh
@@ -484,16 +539,49 @@ impl RegistryClient {
         lookup_digest: Digest32,
         ttl_secs: u32,
     ) -> Result<ClaimedInvite, ClientError> {
-        let response = self
-            .roundtrip(
-                request_id,
-                CtrlMessage::InviteClaim {
-                    request_id,
-                    lookup_digest,
-                    ttl_secs,
-                },
-            )
-            .await?;
+        self.invite_claim_frame(request_id, lookup_digest, ttl_secs, None, 0)
+            .await
+    }
+
+    /// Wave-28 task-code claim ([`RegistryClient::invite_claim_with_id`
+    /// semantics]) with the endpoint blob and the redeem cap of the v1
+    /// model riding the frame's extension section: `endpoint` is the
+    /// initiator's connection settings the registry stores on the code row
+    /// and relays to the joiner inside `PairCommit`; `max_redeems = 1`
+    /// makes the code single-use (0 = unlimited, the legacy default).
+    pub async fn invite_claim_task(
+        &self,
+        request_id: [u8; 16],
+        lookup_digest: Digest32,
+        ttl_secs: u32,
+        endpoint: Option<EndpointBlob>,
+        max_redeems: u32,
+    ) -> Result<ClaimedInvite, ClientError> {
+        self.invite_claim_frame(request_id, lookup_digest, ttl_secs, endpoint, max_redeems)
+            .await
+    }
+
+    /// Shared claim round-trip (plain or task-shaped).
+    async fn invite_claim_frame(
+        &self,
+        request_id: [u8; 16],
+        lookup_digest: Digest32,
+        ttl_secs: u32,
+        endpoint: Option<EndpointBlob>,
+        max_redeems: u32,
+    ) -> Result<ClaimedInvite, ClientError> {
+        let mut frame = CtrlFrame::new(CtrlMessage::InviteClaim {
+            request_id,
+            lookup_digest,
+            ttl_secs,
+        });
+        if let Some(blob) = endpoint {
+            frame = frame.with_endpoint(blob);
+        }
+        if max_redeems > 0 {
+            frame = frame.with_max_redeems(max_redeems);
+        }
+        let response = self.roundtrip_frame(request_id, frame).await?;
         match response {
             CtrlMessage::InviteClaimed {
                 code_id,
@@ -606,10 +694,33 @@ impl RegistryClient {
     /// Start a redeem attempt with the fixed request structure (built by
     /// the orchestrator). On timeout the same request id is re-sent.
     pub async fn invite_redeem(&self, redeem: RedeemRequest) -> Result<RedeemAck, ClientError> {
+        self.invite_redeem_frame(redeem, None).await
+    }
+
+    /// Wave-28 task-code redeem ([`RegistryClient::invite_redeem`
+    /// semantics]) with the joiner's endpoint blob riding the frame's
+    /// extension section: the registry stores it on the pairing row and
+    /// forwards it to the code owner inside `InviteRedeemOffered`.
+    pub async fn invite_redeem_with_endpoint(
+        &self,
+        redeem: RedeemRequest,
+        endpoint: EndpointBlob,
+    ) -> Result<RedeemAck, ClientError> {
+        self.invite_redeem_frame(redeem, Some(endpoint)).await
+    }
+
+    /// Shared redeem round-trip (plain or task-shaped).
+    async fn invite_redeem_frame(
+        &self,
+        redeem: RedeemRequest,
+        endpoint: Option<EndpointBlob>,
+    ) -> Result<RedeemAck, ClientError> {
         let request_id = redeem.request_id;
-        let response = self
-            .roundtrip(request_id, CtrlMessage::InviteRedeem(redeem))
-            .await?;
+        let mut frame = CtrlFrame::new(CtrlMessage::InviteRedeem(redeem));
+        if let Some(blob) = endpoint {
+            frame = frame.with_endpoint(blob);
+        }
+        let response = self.roundtrip_frame(request_id, frame).await?;
         match response {
             CtrlMessage::InviteRedeemPending {
                 pairing_id,
@@ -895,6 +1006,16 @@ impl RegistryClient {
         key: [u8; 16],
         message: CtrlMessage,
     ) -> Result<CtrlMessage, ClientError> {
+        self.roundtrip_frame(key, CtrlFrame::new(message)).await
+    }
+
+    /// [`RegistryClient::roundtrip`] at frame level — the re-send carries
+    /// the identical bytes, wave-28 extension section included.
+    async fn roundtrip_frame(
+        &self,
+        key: [u8; 16],
+        frame: CtrlFrame,
+    ) -> Result<CtrlMessage, ClientError> {
         let attempts = self.inner.config.request_retries.saturating_add(1);
         let timeout = self.inner.config.response_timeout;
         for _attempt in 1..=attempts {
@@ -910,7 +1031,7 @@ impl RegistryClient {
                 inner: &self.inner,
                 key,
             };
-            self.inner.send_frame(message.clone())?;
+            self.inner.send_frame_with(frame.clone())?;
             match tokio::time::timeout(timeout, rx).await {
                 Err(_elapsed) => continue, // same id, same bytes, again
                 Ok(Ok(response)) => return Ok(response),
@@ -1078,10 +1199,15 @@ async fn read_with_timeout<R: AsyncRead + Unpin>(
         .ok_or(ClientError::ConnectionLost)
 }
 
-fn decode_server(bytes: &[u8]) -> Result<CtrlMessage, ClientError> {
+fn decode_server_frame(bytes: &[u8]) -> Result<CtrlFrame, ClientError> {
     CtrlFrame::decode_as(bytes, Role::Client)
-        .map(|frame| frame.message)
         .map_err(|e| ClientError::Protocol(format!("undecodable server frame: {e}")))
+}
+
+/// The plain message of one server frame (extension discarded) — the
+/// opening-exchange reader, which never sees extended frames.
+fn decode_server(bytes: &[u8]) -> Result<CtrlMessage, ClientError> {
+    decode_server_frame(bytes).map(|frame| frame.message)
 }
 
 /// The single reader: consumes every frame and routes it to the bounded
@@ -1089,8 +1215,8 @@ fn decode_server(bytes: &[u8]) -> Result<CtrlMessage, ClientError> {
 async fn reader_loop<R: AsyncRead + Unpin>(inner: Arc<ClientInner>, mut read: R, epoch: u64) {
     loop {
         match read_frame(&mut read).await {
-            Ok(Some(bytes)) => match decode_server(&bytes) {
-                Ok(message) => inner.route(message),
+            Ok(Some(bytes)) => match decode_server_frame(&bytes) {
+                Ok(frame) => inner.route(frame),
                 Err(e) => {
                     log::debug!("pairing client: decode error, dropping connection: {e}");
                     inner.on_disconnect(epoch);
@@ -1116,11 +1242,11 @@ async fn reader_loop<R: AsyncRead + Unpin>(inner: Arc<ClientInner>, mut read: R,
 async fn writer_loop<W: AsyncWrite + Unpin>(
     inner: Arc<ClientInner>,
     mut write: W,
-    mut rx: mpsc::Receiver<CtrlMessage>,
+    mut rx: mpsc::Receiver<CtrlFrame>,
     epoch: u64,
 ) {
-    while let Some(message) = rx.recv().await {
-        if let Err(e) = write_message(&mut write, &message, Role::Client).await {
+    while let Some(frame) = rx.recv().await {
+        if let Err(e) = write_frame(&mut write, &frame, Role::Client).await {
             log::debug!("pairing client: write failed, dropping connection: {e}");
             inner.on_disconnect(epoch);
             return;

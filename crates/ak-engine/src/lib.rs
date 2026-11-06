@@ -667,6 +667,49 @@ pub struct Report {
     pub roots: Vec<String>,
 }
 
+/// Summary of one offered transfer, handed to a [`TransferConsent`]
+/// callback at the Offer handling point (wave 28): everything the receiving
+/// user needs to make the accept/decline decision before a single payload
+/// byte or disk write happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentInfo {
+    /// The offered job (matches the wire `Offer.job_id`).
+    pub job_id: JobId,
+    /// Offered root name (the sender's label for the payload).
+    pub root_name: String,
+    /// Number of files the offer announces.
+    pub file_count: u64,
+    /// Total payload bytes the offer announces.
+    pub total_bytes: u64,
+}
+
+/// Optional receive-side consent hook (wave 28): invoked once per receive
+/// with the offer summary; `false` refuses the transfer — the peer is told
+/// over the wire with the DECLINED semantics ([`DECLINED_WIRE_CODE`], see
+/// also [`EngineError::ConsentDeclined`]) and the connection closes before
+/// anything is written to disk. `None` (every pre-wave-28 entry) keeps the
+/// frozen behavior: the offer is accepted automatically.
+pub type TransferConsent = Arc<dyn Fn(&ConsentInfo) -> bool + Send + Sync>;
+
+/// Wire code of a user declination (wave 28). The closed `ErrorCode` set
+/// (frozen, ak-wire) has no dedicated DECLINED value, so the refusal rides
+/// [`ErrorCode::LocalPermissionDenied`] — "this endpoint's user refused" —
+/// with the fixed [`DECLINED_MESSAGE`] text so peers can tell a declination
+/// from a filesystem permission failure.
+pub const DECLINED_WIRE_CODE: ErrorCode = ErrorCode::LocalPermissionDenied;
+
+/// Fixed message text of the DECLINED refusal frame.
+pub const DECLINED_MESSAGE: &str = "DECLINED: receiving user declined the transfer";
+
+/// Bounded drain wait after the DECLINED frame (wave 28): the refusal is
+/// a user decision the peer must see, so after sending the frame and
+/// half-closing the send stream the receiver holds the connection until
+/// the peer reacts (a well-behaved sender drops the connection on an
+/// Error frame) or this bound expires — never longer. Without it the
+/// immediate channel teardown on return could discard an unsent frame
+/// (the same best-effort trade the frozen refusal paths accept).
+const DECLINED_DRAIN_WAIT: Duration = Duration::from_millis(500);
+
 /// Transfer failure taxonomy: connect/stream errors, peer refusals and
 /// errors, timeouts, checkpoint/io problems, verification failure, and the
 /// policy-gate refusal ([`EngineError::RouteForbidden`]).
@@ -742,6 +785,16 @@ pub enum EngineError {
     InvalidAdmissionCtx {
         /// Name of the offending field.
         field: &'static str,
+    },
+    /// The receiving user declined the offered transfer through a
+    /// [`TransferConsent`] hook (wave 28). The peer was told over the wire
+    /// with the DECLINED semantics ([`DECLINED_WIRE_CODE`]) and the
+    /// connection was closed at the Offer handling point: no part file, no
+    /// checkpoint record, nothing was written.
+    #[error("declined by the receiving user: job {job_id:?}")]
+    ConsentDeclined {
+        /// The refused job (the wire `Offer.job_id`).
+        job_id: JobId,
     },
 }
 
@@ -2719,6 +2772,21 @@ pub async fn receive_with_addr(
     progress: &(dyn Fn(Progress) + Send + Sync),
     addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
 ) -> Result<Report, EngineError> {
+    receive_with_addr_consent(spec, progress, addr_tx, None).await
+}
+
+/// [`receive_with_addr`] with the optional receive-side user-consent hook
+/// (wave 28): `Some(callback)` is asked once at the Offer handling point
+/// with the offer summary ([`ConsentInfo`]); `false` answers the DECLINED
+/// error frame to the peer, closes the connection and fails with
+/// [`EngineError::ConsentDeclined`] before any payload byte is written.
+/// `None` is the frozen automatic-accept behavior.
+pub async fn receive_with_addr_consent(
+    spec: ReceiveSpec,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
+    consent: Option<TransferConsent>,
+) -> Result<Report, EngineError> {
     let started = Instant::now();
     let target = LocalSaveTarget::open(&spec.out_dir)?;
 
@@ -2736,6 +2804,7 @@ pub async fn receive_with_addr(
         started,
         None,
         progress,
+        consent.as_ref(),
     )
     .await
 }
@@ -2775,6 +2844,22 @@ pub async fn receive_on_channel(
     admission_decider: AdmissionDecider<'_>,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, EngineError> {
+    receive_on_channel_consent(channel, spec, admission_decider, progress, None).await
+}
+
+/// [`receive_on_channel`] with the optional receive-side user-consent hook
+/// (wave 28): `Some(callback)` is asked once at the Offer handling point
+/// with the offer summary ([`ConsentInfo`]); `false` answers the DECLINED
+/// error frame to the peer, closes the connection and fails with
+/// [`EngineError::ConsentDeclined`] before any payload byte is written.
+/// `None` is the frozen automatic-accept behavior.
+pub async fn receive_on_channel_consent(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    admission_decider: AdmissionDecider<'_>,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    consent: Option<TransferConsent>,
+) -> Result<Report, EngineError> {
     let started = Instant::now();
     let target = LocalSaveTarget::open(&spec.out_dir)?;
     receive_job(
@@ -2784,6 +2869,7 @@ pub async fn receive_on_channel(
         started,
         Some(admission_decider),
         progress,
+        consent.as_ref(),
     )
     .await
 }
@@ -2898,6 +2984,23 @@ pub async fn receive_on_channel_preadmitted(
     open: TaskOpenAdmission,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, EngineError> {
+    receive_on_channel_preadmitted_consent(channel, spec, open, progress, None).await
+}
+
+/// [`receive_on_channel_preadmitted`] with the optional receive-side
+/// user-consent hook (wave 28): `Some(callback)` is asked once at the Offer
+/// handling point with the offer summary ([`ConsentInfo`]); `false` answers
+/// the DECLINED error frame to the peer, closes the connection and fails
+/// with [`EngineError::ConsentDeclined`] before any payload byte is
+/// written. `None` is the frozen automatic-accept behavior — the daemon's
+/// default until the UI wires a prompt.
+pub async fn receive_on_channel_preadmitted_consent(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    open: TaskOpenAdmission,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    consent: Option<TransferConsent>,
+) -> Result<Report, EngineError> {
     let started = Instant::now();
     let target = LocalSaveTarget::open(&spec.out_dir)?;
     let job = JobSpec::of(&spec);
@@ -2992,6 +3095,7 @@ pub async fn receive_on_channel_preadmitted(
         started,
         &store,
         progress,
+        consent.as_ref(),
     )
     .await
 }
@@ -3047,6 +3151,7 @@ pub async fn receive_after_hello(
         started,
         &store,
         progress,
+        None,
     )
     .await
 }
@@ -3160,6 +3265,7 @@ async fn receive_job(
     started: Instant,
     admission: Option<AdmissionDecider<'_>>,
     progress: &(dyn Fn(Progress) + Send + Sync),
+    consent: Option<&TransferConsent>,
 ) -> Result<Report, EngineError> {
     let limits = engine_limits();
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
@@ -3179,6 +3285,7 @@ async fn receive_job(
         started,
         &store,
         progress,
+        consent,
     )
     .await
 }
@@ -3261,12 +3368,18 @@ async fn receive_admission_stage(
     }
 }
 
-/// The frozen receive body (wave 27 split out of `receive_job` verbatim):
+/// The frozen receive body (wave 27 split out of `receive_job` verbatim;
+/// wave 28 adds the optional `consent` hook):
 /// everything from Offer/Accept through manifest pages, resume answer,
 /// chunk phase (single-stream or multistream), verify, commit, FinalAck
 /// and the terminal-state staging cleanup. `staged_task` is the per-task
 /// staging key under scheduled admission (`None` = legacy `.akpart`
-/// beside the final name).
+/// beside the final name). `consent` is the optional receive-side
+/// user decision at the Offer handling point: `None` accepts every offer
+/// (the frozen pre-wave-28 behavior, byte for byte), `Some` asks the
+/// callback and — on `false` — answers the DECLINED error frame, closes
+/// the connection and fails with [`EngineError::ConsentDeclined`]
+/// before any disk write of the payload.
 #[allow(clippy::too_many_arguments)]
 async fn receive_frozen_body(
     channel: DirectChannel,
@@ -3279,6 +3392,7 @@ async fn receive_frozen_body(
     started: Instant,
     store: &FileCheckpointStore,
     progress: &(dyn Fn(Progress) + Send + Sync),
+    consent: Option<&TransferConsent>,
 ) -> Result<Report, EngineError> {
     let limits = engine_limits();
     let multistream = (peer_caps & CAP_MULTISTREAM) != 0;
@@ -3296,19 +3410,20 @@ async fn receive_frozen_body(
     // to keep waiting instead of consuming their single accept. Wire
     // rejections (oversized headers, budget violations) still surface
     // verbatim — only `Connection` losses are a hang-up.
-    let (job_id, file_count, total_bytes, offered_chunk_size) =
+    let (job_id, root_name, file_count, total_bytes, offered_chunk_size) =
         match recv_within(&mut rx, &limits, spec.idle_timeout).await {
             Ok(Frame {
                 message:
                     Message::Offer {
                         job_id,
+                        root_name,
                         file_count,
                         total_bytes,
                         chunk_size,
                         ..
                     },
                 ..
-            }) => (job_id, file_count, total_bytes, chunk_size),
+            }) => (job_id, root_name, file_count, total_bytes, chunk_size),
             Ok(Frame {
                 message: Message::Error { code, message },
                 ..
@@ -3355,6 +3470,39 @@ async fn receive_frozen_body(
         files: file_count,
         bytes: total_bytes,
     });
+    // Receive-side user consent (wave 28): the one decision point between
+    // the validated Offer and the Accept. `None` (every pre-wave-28 entry)
+    // falls straight through — the frames below are byte-identical to the
+    // frozen behavior. A `false` answer tells the peer with the DECLINED
+    // error frame (existing Error-frame semantics; see
+    // [`DECLINED_WIRE_CODE`]), fails locally with
+    // [`EngineError::ConsentDeclined`] and lets the channel close — no
+    // Accept, no sink, no checkpoint record, nothing on disk.
+    if let Some(consent) = consent {
+        let info = ConsentInfo {
+            job_id,
+            root_name: root_name.clone(),
+            file_count,
+            total_bytes,
+        };
+        if !consent(&info) {
+            let _ = tx
+                .send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::Error {
+                        code: DECLINED_WIRE_CODE,
+                        message: DECLINED_MESSAGE.into(),
+                    },
+                })
+                .await;
+            // Half-close our send side, then hold the connection until the
+            // peer reacts (see [`DECLINED_DRAIN_WAIT`]) so the frame is on
+            // the wire before the teardown that follows this return.
+            let _ = tx.finish();
+            let _ = tokio::time::timeout(DECLINED_DRAIN_WAIT, rx.recv_frame(&limits)).await;
+            return Err(EngineError::ConsentDeclined { job_id });
+        }
+    }
     tx.send_frame(&Frame {
         version: ak_wire::VERSION,
         message: Message::Accept { job_id },
@@ -3839,7 +3987,7 @@ pub async fn serve_concurrently(
                             let forward = move |event: Progress| {
                                 let _ = events.send((index, event));
                             };
-                            (index, receive_job(channel, &shared, &job, Instant::now(), None, &forward).await)
+                            (index, receive_job(channel, &shared, &job, Instant::now(), None, &forward, None).await)
                         });
                     }
                     Some(Err(ak_net::ConnectError::Timeout(idle))) => {
@@ -8603,6 +8751,337 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Wave 28: receive-side transfer consent (TransferConsent hook)
+    // ------------------------------------------------------------------
+
+    /// One scheduled receive driven by the hand-written fake up to (and
+    /// just past) the Offer. Holds the live channel so the connection
+    /// outlives the harness unless the receiver itself ends it.
+    struct ConsentHarness {
+        receiver: tokio::task::JoinHandle<Result<Report, EngineError>>,
+        tx: Option<DirectSendStream>,
+        rx: Option<DirectRecvStream>,
+        _channel: DirectChannel,
+        _endpoint: DirectEndpoint,
+        job_id: JobId,
+        task_id: [u8; 16],
+        dst: tempfile::TempDir,
+        checkpoint_dir: PathBuf,
+        _ckpt_keepalive: tempfile::TempDir,
+        /// Set when `early_reader` was requested: a task blocked on the
+        /// stream BEFORE the Offer moved, collecting every frame the
+        /// receiver sends until the stream ends. This is the only
+        /// deterministic way to observe a refusal frame — the receiver
+        /// closes the connection right after sending it, so a reader that
+        /// starts afterwards races the CONNECTION_CLOSE and loses.
+        frames: Option<tokio::task::JoinHandle<Vec<Message>>>,
+    }
+
+    impl ConsentHarness {
+        async fn send(&mut self, message: Message) {
+            self.tx
+                .as_mut()
+                .expect("harness tx")
+                .send_frame(&wire(message))
+                .await
+                .unwrap();
+        }
+
+        /// Next receiver frame, skipping the receiver's Hello (identity
+        /// bearing, irrelevant to the frame comparisons here).
+        async fn next_frame(&mut self) -> Message {
+            let rx = self.rx.as_mut().expect("harness rx");
+            let frame = rx.recv_frame(&engine_limits()).await.unwrap();
+            match frame.message {
+                Message::Hello { .. } => rx.recv_frame(&engine_limits()).await.unwrap().message,
+                message => message,
+            }
+        }
+    }
+
+    /// Bind a receiver running `receive_on_channel_consent` with an
+    /// always-admitting decider, exchange Hello/TaskOpen/Admission/Ack and
+    /// send the Offer. `consent` is the hook under test; `early_reader`
+    /// additionally parks a frame reader on the stream before the Offer
+    /// (see [`ConsentHarness::frames`]).
+    async fn consent_harness(
+        consent: Option<TransferConsent>,
+        offered_files: u64,
+        offered_bytes: u64,
+        early_reader: bool,
+    ) -> ConsentHarness {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        spec.idle_timeout = Duration::from_secs(5);
+        // Isolated checkpoint dir: the shared helper's millisecond-stamped
+        // path collides between parallel tests, and the zero-disk-write
+        // assertion below must see only this run's writes.
+        let ckpt = tempfile::tempdir().unwrap();
+        spec.checkpoint_dir = ckpt.path().to_path_buf();
+        let checkpoint_dir = spec.checkpoint_dir.clone();
+        let receiver = tokio::spawn(async move {
+            let channel = endpoint.accept(&|_| true).await.unwrap();
+            let decider = |_: &AdmissionRequest| AdmissionDecision::Admit;
+            receive_on_channel_consent(channel, spec, &decider, &noop, consent).await
+        });
+        let fake = fake_sender_side(addr, receiver_key.fingerprint(), CAP_SCHEDULER).await;
+        let FakePeer {
+            tx,
+            mut rx,
+            _channel,
+            _endpoint,
+        } = fake;
+        let mut tx = tx;
+        let task_id: [u8; 16] = [0x5C; 16];
+        tx.send_frame(&wire(Message::TaskOpen {
+            job_id: task_id,
+            permit_id: [2; 16],
+            group: [0x77; 32],
+            group_registry: [0x91; 32],
+            pairing_id: [0xB3; 16],
+            direction: ak_wire::DIRECTION_SEND,
+        }))
+        .await
+        .unwrap();
+        // Admission (granted) — read through the admission-frame reader.
+        match recv_admission_frame(&mut rx, &engine_limits(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .message
+        {
+            Message::Admission { granted, .. } => {
+                assert!(granted, "the admission decider always admits here")
+            }
+            other => panic!("expected Admission, got {other:?}"),
+        }
+        tx.send_frame(&wire(Message::AdmissionAck {
+            job_id: task_id,
+            permit_id: [2; 16],
+        }))
+        .await
+        .unwrap();
+        let job_id: JobId = [0xCD; 16];
+        let (frames, rx) = if early_reader {
+            (
+                Some(tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    while let Ok(frame) = rx.recv_frame(&engine_limits()).await {
+                        seen.push(frame.message);
+                    }
+                    seen
+                })),
+                None,
+            )
+        } else {
+            (None, Some(rx))
+        };
+        tx.send_frame(&wire(Message::Offer {
+            job_id,
+            root_name: "consent-demo".into(),
+            file_count: offered_files,
+            total_bytes: offered_bytes,
+            chunk_size: 4096,
+        }))
+        .await
+        .unwrap();
+        ConsentHarness {
+            receiver,
+            tx: Some(tx),
+            rx,
+            _channel,
+            _endpoint,
+            job_id,
+            task_id,
+            dst,
+            checkpoint_dir,
+            _ckpt_keepalive: ckpt,
+            frames,
+        }
+    }
+
+    /// A declining consent must: answer exactly one DECLINED error frame
+    /// (existing Error-frame semantics — the closed code set maps DECLINED
+    /// onto LocalPermissionDenied with the frozen message), never send an
+    /// Accept, fail locally with `ConsentDeclined`, close the connection,
+    /// and leave nothing on disk (no part file, no final file, no
+    /// checkpoint record).
+    #[tokio::test]
+    async fn consent_decline_sends_declined_error_and_writes_nothing() {
+        let harness = consent_harness(Some(Arc::new(|_: &ConsentInfo| false)), 2, 4096, true).await;
+
+        // The wire answer, observed by the early reader: exactly one
+        // DECLINED error frame and then the connection ends.
+        let frames = harness.frames.expect("early reader").await.unwrap();
+        assert_eq!(
+            frames,
+            vec![Message::Error {
+                code: DECLINED_WIRE_CODE,
+                message: DECLINED_MESSAGE.to_string(),
+            }],
+            "the DECLINED frame and nothing else (no Accept)"
+        );
+
+        let err = harness
+            .receiver
+            .await
+            .unwrap()
+            .expect_err("the declining consent must fail the receive");
+        match err {
+            EngineError::ConsentDeclined { job_id } => assert_eq!(job_id, harness.job_id),
+            other => panic!("expected ConsentDeclined, got {other:?}"),
+        }
+
+        // Zero disk writes: the destination holds no part file and no
+        // final file (staged and legacy landing points both checked), and
+        // the checkpoint store wrote no record.
+        assert!(
+            harness.dst.path().read_dir().unwrap().next().is_none(),
+            "destination must stay empty"
+        );
+        assert!(
+            !ak_storage::staging_path(harness.dst.path(), harness.task_id).exists(),
+            "no per-task staging tree"
+        );
+        let records = harness
+            .checkpoint_dir
+            .read_dir()
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(records, 0, "no checkpoint record may exist");
+    }
+
+    /// An accepting consent sees exactly the offered summary (job id, root
+    /// name, file count, total bytes) — the numbers the UI prompt shows.
+    #[tokio::test]
+    async fn consent_callback_receives_the_offered_summary() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<ConsentInfo>));
+        let sink = Arc::clone(&seen);
+        let mut harness = consent_harness(
+            Some(Arc::new(move |info: &ConsentInfo| {
+                *sink.lock().unwrap() = Some(info.clone());
+                true
+            })),
+            2,
+            12_345,
+            false,
+        )
+        .await;
+        // The consent accepted: the next frame is the plain Accept.
+        match harness.next_frame().await {
+            Message::Accept { job_id } => assert_eq!(job_id, harness.job_id),
+            other => panic!("an accepting consent must Accept, got {other:?}"),
+        }
+        let info = seen.lock().unwrap().clone().expect("callback ran");
+        assert_eq!(info.job_id, harness.job_id);
+        assert_eq!(info.root_name, "consent-demo");
+        assert_eq!(info.file_count, 2);
+        assert_eq!(info.total_bytes, 12_345);
+        // The receiver now waits for the manifest; hang the fake up and
+        // collect the failure — anything but ConsentDeclined.
+        harness.tx = None;
+        drop(harness.rx.take());
+        let outcome = harness.receiver.await.unwrap();
+        assert!(
+            !matches!(outcome, Err(EngineError::ConsentDeclined { .. })),
+            "accepting consent must not decline: {outcome:?}"
+        );
+    }
+
+    /// `Some(always-true)` must be byte-for-byte the `None` path: the
+    /// receiver's wire frames (after the identity-bearing Hello) and the
+    /// final report of one complete transfer are identical between the
+    /// frozen entry and the consented entry.
+    #[tokio::test]
+    async fn consent_accept_path_is_byte_identical_to_the_default() {
+        const CHUNK: usize = 4096;
+        let payload: Vec<u8> = (0..(CHUNK * 2) as u32).map(|i| (i % 251) as u8).collect();
+        let digest = |bytes: &[u8]| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(blake3::hash(bytes).as_bytes());
+            out
+        };
+        let (a, b) = payload.split_at(CHUNK);
+        let entry = ak_core::manifest::FileEntry::with_digest_alg(
+            "consent-identical.bin",
+            payload.len() as u64,
+            1_700_000_000_000,
+            ak_core::manifest::DIGEST_ALG_BLAKE3,
+            digest(&payload),
+            vec![digest(a), digest(b)],
+        )
+        .unwrap();
+
+        /// One complete hand-written scheduled transfer; collects every
+        /// receiver frame after its Hello plus the final report.
+        async fn one_run(
+            consent: Option<TransferConsent>,
+            payload: &[u8],
+            entry: &ak_core::manifest::FileEntry,
+        ) -> (Vec<Message>, Report) {
+            let mut harness = consent_harness(consent, 1, payload.len() as u64, false).await;
+            let mut frames = Vec::new();
+            frames.push(harness.next_frame().await); // Accept
+            harness
+                .send(Message::ManifestPage {
+                    job_id: harness.job_id,
+                    page_index: 0,
+                    last_page: true,
+                    entries: vec![WireEntry::from(entry)],
+                })
+                .await;
+            frames.push(harness.next_frame().await); // ResumeRequest
+            for (index, data) in [(0u64, &payload[..CHUNK]), (1u64, &payload[CHUNK..])] {
+                harness
+                    .send(Message::Chunk {
+                        job_id: harness.job_id,
+                        file_index: 0,
+                        chunk_index: index,
+                        data: data.to_vec(),
+                    })
+                    .await;
+                frames.push(harness.next_frame().await); // ChunkAck
+            }
+            harness
+                .send(Message::Finalize {
+                    job_id: harness.job_id,
+                })
+                .await;
+            frames.push(harness.next_frame().await); // FinalAck
+            let report = harness.receiver.await.unwrap().expect("run completes");
+            (frames, report)
+        }
+
+        let (plain_frames, plain_report) = one_run(None, &payload, &entry).await;
+        let consent = Some(Arc::new(|_: &ConsentInfo| true) as TransferConsent);
+        let (consent_frames, consent_report) = one_run(consent, &payload, &entry).await;
+
+        // Every protocol frame after the Hello is identical.
+        assert_eq!(
+            plain_frames, consent_frames,
+            "an accepting consent changes nothing on the wire"
+        );
+        assert_eq!(
+            plain_frames.len(),
+            5,
+            "Accept, ResumeRequest, 2x ChunkAck, FinalAck"
+        );
+        // The reports agree on everything deterministic (duration and the
+        // peer fingerprint are per-run by construction).
+        assert_eq!(plain_report.job_id, consent_report.job_id);
+        assert_eq!(plain_report.files, consent_report.files);
+        assert_eq!(plain_report.bytes, consent_report.bytes);
+        assert_eq!(plain_report.resumed_chunks, consent_report.resumed_chunks);
+        assert_eq!(plain_report.roots, consent_report.roots);
+    }
+
+    // ------------------------------------------------------------------
     // Wave 27: daemon scheduler handshake + pre-admitted receive
     // ------------------------------------------------------------------
 
@@ -8683,14 +9162,13 @@ mod tests {
         }
         // The handshake did NOT answer admission: nothing of the
         // Admission/Ack exchange may have moved yet.
-        match tokio::time::timeout(
+        if let Ok(Ok(frame)) = tokio::time::timeout(
             Duration::from_secs(1),
             recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_millis(200)),
         )
         .await
         {
-            Ok(Ok(frame)) => panic!("handshake must stay silent, saw {:?}", frame.message),
-            _ => {}
+            panic!("handshake must stay silent, saw {:?}", frame.message);
         }
     }
 
@@ -8732,14 +9210,13 @@ mod tests {
         }
         // Nothing of the admission exchange may have been answered and no
         // file protocol ran on this channel from the engine side.
-        match tokio::time::timeout(
+        if let Ok(Ok(frame)) = tokio::time::timeout(
             Duration::from_secs(1),
             recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_millis(200)),
         )
         .await
         {
-            Ok(Ok(frame)) => panic!("legacy arm must stay silent, saw {:?}", frame.message),
-            _ => {}
+            panic!("legacy arm must stay silent, saw {:?}", frame.message);
         }
     }
 
@@ -9126,14 +9603,13 @@ mod tests {
         );
         // No Admission was answered: the fake sees the closed connection,
         // never a granted frame.
-        match tokio::time::timeout(
+        if let Ok(Ok(frame)) = tokio::time::timeout(
             Duration::from_secs(2),
             recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_secs(1)),
         )
         .await
         {
-            Ok(Ok(frame)) => panic!("no Admission may be answered, saw {:?}", frame.message),
-            _ => {}
+            panic!("no Admission may be answered, saw {:?}", frame.message);
         }
     }
 }

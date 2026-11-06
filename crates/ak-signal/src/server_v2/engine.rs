@@ -42,15 +42,15 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::protocol_v2::{
-    CodeId, CtrlFrame, CtrlMessage, DeviceId, Digest32, ErrorScope, PairProof, PairingId,
-    PairingState, RedeemRequest, RegistryId, RequestId, Role, SessionId, Signature64, StateFilter,
-    CODE_CONFLICT, CURSOR_END, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED,
-    REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
+    CodeId, CtrlFrame, CtrlMessage, DeviceId, Digest32, EndpointBlob, ErrorScope, PairProof,
+    PairingId, PairingState, RedeemRequest, RegistryId, RequestId, Role, SessionId, Signature64,
+    StateFilter, CODE_CONFLICT, CURSOR_END, PAIR_UNAVAILABLE, PROTOCOL_UNSUPPORTED, RATE_LIMITED,
+    REDEEM_EXHAUSTED, REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
 };
 use crate::server_v2::config::{
     Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SWEEP_INTERVAL,
 };
-use crate::server_v2::framing::{read_frame, write_message};
+use crate::server_v2::framing::{read_frame, write_frame, write_message};
 use crate::server_v2::ratelimit::{SlidingWindow, TokenBucket};
 use crate::server_v2::store::{
     AbortDecision, AppliedDecision, BeginRedeem, ClaimOutcome, DueReport, PairingSnapshot,
@@ -246,7 +246,7 @@ pub async fn serve_v2(
 
 struct ConnEntry {
     conn_id: u64,
-    out: mpsc::Sender<CtrlMessage>,
+    out: mpsc::Sender<CtrlFrame>,
     /// Close signal of this connection (true = torn down). Shared handle:
     /// the handler owns one, the registry keeps this one so a replacement
     /// Hello (or the server shutdown) can tear the connection down. A
@@ -358,13 +358,14 @@ impl Shared {
     /// Bounded outbound push: the per-connection outbox is `OUTBOX_DEPTH`
     /// deep; a full queue drops the message (recoverable via
     /// `PairStatusQuery` resends) instead of blocking any handler.
-    fn deliver(&self, device: &DeviceId, message: CtrlMessage) {
+    /// Accepts a full frame or a plain message (`From<CtrlMessage>`).
+    fn deliver<F: Into<CtrlFrame>>(&self, device: &DeviceId, frame: F) {
         let tx = {
             let inner = self.lock();
             inner.conns.get(device).map(|entry| entry.out.clone())
         };
         match tx {
-            Some(tx) => deliver(&tx, message),
+            Some(tx) => deliver(&tx, frame.into()),
             None => log::debug!(
                 "device {} offline; message dropped",
                 util::hex_prefix(device, 4)
@@ -381,10 +382,16 @@ impl Shared {
     }
 }
 
-fn deliver(tx: &mpsc::Sender<CtrlMessage>, message: CtrlMessage) {
-    if let Err(e) = tx.try_send(message) {
+fn deliver<F: Into<CtrlFrame>>(tx: &mpsc::Sender<CtrlFrame>, frame: F) {
+    if let Err(e) = tx.try_send(frame.into()) {
         log::debug!("outbound queue full or closed; message dropped: {e}");
     }
+}
+
+/// Free-function convenience of [`deliver`] for plain messages (the
+/// wave-28 extension stays empty).
+fn deliver_msg(tx: &mpsc::Sender<CtrlFrame>, message: CtrlMessage) {
+    deliver(tx, CtrlFrame::new(message));
 }
 
 fn pair_error(
@@ -455,7 +462,7 @@ async fn connection_loop(stream: TlsServerStream, peer: SocketAddr, shared: Arc<
             return;
         }
     };
-    let (out_tx, out_rx) = mpsc::channel::<CtrlMessage>(OUTBOX_DEPTH);
+    let (out_tx, out_rx) = mpsc::channel::<CtrlFrame>(OUTBOX_DEPTH);
     let nonce = random_nonce32();
     let expires_ms = now_ms() + shared.limits.hello_max_age.as_millis() as u64;
     let mut stream = stream;
@@ -542,14 +549,14 @@ async fn connection_loop(stream: TlsServerStream, peer: SocketAddr, shared: Arc<
         }
         // Direction legality at decode: a client may not emit
         // server-to-client types (decode_as enforces the frozen table).
-        let message = match CtrlFrame::decode_as(&bytes, Role::Server) {
-            Ok(frame) => frame.message,
+        let frame = match CtrlFrame::decode_as(&bytes, Role::Server) {
+            Ok(frame) => frame,
             Err(e) => {
                 log::debug!("undecodable v2 frame from {peer}: {e}");
                 break;
             }
         };
-        match process(&shared, &mut state, &out_tx, message) {
+        match process(&shared, &mut state, &out_tx, frame) {
             Flow::Continue => {}
             Flow::Disconnect => break,
         }
@@ -621,22 +628,22 @@ async fn reader_loop<R: AsyncRead + Unpin>(
 /// failed write tears the whole connection down via `close`.
 async fn writer_loop<W: AsyncWrite + Unpin>(
     mut write: W,
-    mut out: mpsc::Receiver<CtrlMessage>,
+    mut out: mpsc::Receiver<CtrlFrame>,
     mut close: watch::Receiver<bool>,
     dead: mpsc::Sender<()>,
     write_budget: Duration,
 ) {
     loop {
-        let message = tokio::select! {
+        let frame = tokio::select! {
             _ = closed(&mut close) => break,
-            message = out.recv() => match message {
-                Some(message) => message,
+            frame = out.recv() => match frame {
+                Some(frame) => frame,
                 None => break,
             },
         };
         let sent = tokio::time::timeout(
             write_budget,
-            write_message(&mut write, &message, Role::Server),
+            write_frame(&mut write, &frame, Role::Server),
         )
         .await;
         if !matches!(sent, Ok(Ok(()))) {
@@ -681,20 +688,20 @@ fn cleanup_connection(shared: &Shared, state: &mut ConnState) {
 fn process(
     shared: &Shared,
     state: &mut ConnState,
-    out: &mpsc::Sender<CtrlMessage>,
-    message: CtrlMessage,
+    out: &mpsc::Sender<CtrlFrame>,
+    mut frame: CtrlFrame,
 ) -> Flow {
     if state.device.is_none() {
-        return process_hello(shared, state, out, message);
+        return process_hello(shared, state, out, frame.message);
     }
     let me = state.device.unwrap_or([0u8; 32]);
-    match message {
+    match frame.message {
         CtrlMessage::Hello { .. } => {
             log::debug!("duplicate Hello on authenticated v2 connection");
             Flow::Disconnect
         }
         CtrlMessage::Ping { nonce } => {
-            deliver(out, CtrlMessage::Pong { nonce });
+            deliver_msg(out, CtrlMessage::Pong { nonce });
             Flow::Continue
         }
         CtrlMessage::InviteClaim {
@@ -702,7 +709,18 @@ fn process(
             lookup_digest,
             ttl_secs,
         } => {
-            handle_claim(shared, out, me, request_id, lookup_digest, ttl_secs);
+            // wave-28: the claim's extension section carries the owner
+            // endpoint blob and the optional redeem cap.
+            handle_claim(
+                shared,
+                out,
+                me,
+                request_id,
+                lookup_digest,
+                ttl_secs,
+                frame.endpoint.take(),
+                frame.max_redeems.take().unwrap_or(0),
+            );
             Flow::Continue
         }
         CtrlMessage::InviteList {
@@ -722,7 +740,12 @@ fn process(
             handle_revoke(shared, out, me, request_id, code_id, expected_revision);
             Flow::Continue
         }
-        CtrlMessage::InviteRedeem(redeem) => handle_redeem(shared, state, out, me, redeem),
+        // wave-28: the redeem's extension section carries the redeemer
+        // endpoint blob (forwarded to the owner with the offer).
+        CtrlMessage::InviteRedeem(redeem) => {
+            let endpoint = frame.endpoint.take();
+            handle_redeem(shared, state, out, me, redeem, endpoint)
+        }
         CtrlMessage::PairChallenge {
             transcript,
             owner_proof,
@@ -819,7 +842,7 @@ fn process(
 fn process_hello(
     shared: &Shared,
     state: &mut ConnState,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     message: CtrlMessage,
 ) -> Flow {
     let CtrlMessage::Hello {
@@ -911,7 +934,7 @@ fn process_hello(
             "hello from {} rejected: replay suspected",
             util::hex_prefix(&device_id, 4)
         );
-        deliver(out, server_error(ERR_BAD_REQUEST, "replay suspected"));
+        deliver_msg(out, server_error(ERR_BAD_REQUEST, "replay suspected"));
         return Flow::Disconnect;
     }
     state.device = Some(device_id);
@@ -924,7 +947,7 @@ fn process_hello(
             .unwrap_or(0)
     };
     log::info!("v2 device {} online", util::hex_prefix(&device_id, 4));
-    deliver(
+    deliver_msg(
         out,
         CtrlMessage::Welcome {
             session_ttl_secs: shared.limits.session_ttl.as_secs() as u32,
@@ -941,16 +964,17 @@ fn catchup_after_hello(shared: &Shared, me: &DeviceId) {
     match shared.store.pending_offers_for_owner(me) {
         Ok(offers) => {
             for offer in offers {
-                shared.deliver(
-                    me,
-                    CtrlMessage::InviteRedeemOffered {
-                        code_id: offer.code_id,
-                        code_revision: offer.code_revision,
-                        pairing_id: offer.pairing_id,
-                        redeemer_device_id: offer.redeemer,
-                        redeem: offer.redeem,
-                    },
-                );
+                let mut frame = CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+                    code_id: offer.code_id,
+                    code_revision: offer.code_revision,
+                    pairing_id: offer.pairing_id,
+                    redeemer_device_id: offer.redeemer,
+                    redeem: offer.redeem,
+                });
+                if let Some(blob) = offer.redeemer_endpoint {
+                    frame = frame.with_endpoint(EndpointBlob(blob));
+                }
+                shared.deliver(me, frame);
             }
         }
         Err(e) => log::error!("pending offer catch-up failed: {e}"),
@@ -1054,20 +1078,23 @@ impl HelloReplayCache {
 
 // ---- invite management --------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn handle_claim(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     request_id: RequestId,
     lookup_digest: Digest32,
     ttl_secs: u32,
+    owner_endpoint: Option<EndpointBlob>,
+    max_redeems: u32,
 ) {
     if ttl_secs != 0
         && !(crate::server_v2::config::INVITE_TTL_MIN_SECS
             ..=crate::server_v2::config::INVITE_TTL_MAX_SECS)
             .contains(&ttl_secs)
     {
-        deliver(
+        deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1080,9 +1107,15 @@ fn handle_claim(
         return;
     }
     let now = now_ms();
-    match shared
-        .store
-        .claim(&me, &request_id, &lookup_digest, ttl_secs, now)
+    match shared.store.claim(
+        &me,
+        &request_id,
+        &lookup_digest,
+        ttl_secs,
+        max_redeems,
+        owner_endpoint.as_ref().map(|blob| blob.0.as_slice()),
+        now,
+    )
     {
         Ok(ClaimOutcome::Claimed {
             code_id,
@@ -1090,7 +1123,7 @@ fn handle_claim(
             expires_ms,
             revision,
         }) => {
-            deliver(
+            deliver_msg(
                 out,
                 CtrlMessage::InviteClaimed {
                     request_id,
@@ -1101,8 +1134,8 @@ fn handle_claim(
                 },
             );
         }
-        Ok(ClaimOutcome::Replay(bytes)) => deliver(out, decode_stored(&bytes)),
-        Ok(ClaimOutcome::RequestConflict) => deliver(
+        Ok(ClaimOutcome::Replay(bytes)) => deliver_msg(out, decode_stored(&bytes)),
+        Ok(ClaimOutcome::RequestConflict) => deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1112,7 +1145,7 @@ fn handle_claim(
                 0,
             ),
         ),
-        Ok(ClaimOutcome::CodeConflict) => deliver(
+        Ok(ClaimOutcome::CodeConflict) => deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1122,7 +1155,7 @@ fn handle_claim(
                 0,
             ),
         ),
-        Ok(ClaimOutcome::RateLimited) => deliver(
+        Ok(ClaimOutcome::RateLimited) => deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1132,7 +1165,7 @@ fn handle_claim(
                 60_000,
             ),
         ),
-        Ok(ClaimOutcome::ResourceLimit) => deliver(
+        Ok(ClaimOutcome::ResourceLimit) => deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1144,7 +1177,7 @@ fn handle_claim(
         ),
         Err(e) => {
             log::error!("claim storage failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     request_id,
@@ -1172,7 +1205,7 @@ fn decode_stored(bytes: &[u8]) -> CtrlMessage {
 
 fn handle_list(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     request_id: RequestId,
     cursor: CodeId,
@@ -1187,7 +1220,7 @@ fn handle_list(
             } else {
                 CURSOR_END
             };
-            deliver(
+            deliver_msg(
                 out,
                 CtrlMessage::InviteListPage {
                     request_id,
@@ -1198,7 +1231,7 @@ fn handle_list(
         }
         Err(e) => {
             log::error!("list storage failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     request_id,
@@ -1214,7 +1247,7 @@ fn handle_list(
 
 fn handle_revoke(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     request_id: RequestId,
     code_id: CodeId,
@@ -1230,7 +1263,7 @@ fn handle_revoke(
             revoked_ms,
             aborted,
         }) => {
-            deliver(
+            deliver_msg(
                 out,
                 CtrlMessage::InviteRevoked {
                     request_id,
@@ -1244,8 +1277,8 @@ fn handle_revoke(
                 notify_pairing_unavailable(shared, &pairing.redeemer, pairing.pairing_id);
             }
         }
-        Ok(RevokeOutcome::Replay(bytes)) => deliver(out, decode_stored(&bytes)),
-        Ok(RevokeOutcome::RequestConflict) => deliver(
+        Ok(RevokeOutcome::Replay(bytes)) => deliver_msg(out, decode_stored(&bytes)),
+        Ok(RevokeOutcome::RequestConflict) => deliver_msg(
             out,
             pair_error(
                 request_id,
@@ -1255,20 +1288,20 @@ fn handle_revoke(
                 0,
             ),
         ),
-        Ok(RevokeOutcome::RevisionConflict) => deliver(
+        Ok(RevokeOutcome::RevisionConflict) => deliver_msg(
             out,
             pair_error(request_id, ErrorScope::Code, code_id, REVISION_CONFLICT, 0),
         ),
         Ok(RevokeOutcome::Unavailable) => {
             // Unknown, foreign, or terminal — one answer.
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(request_id, ErrorScope::Code, code_id, PAIR_UNAVAILABLE, 0),
             );
         }
         Err(e) => {
             log::error!("revoke storage failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     request_id,
@@ -1291,14 +1324,15 @@ fn notify_pairing_unavailable(shared: &Shared, device: &DeviceId, pairing_id: Pa
 fn handle_redeem(
     shared: &Shared,
     state: &mut ConnState,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     redeem: crate::protocol_v2::RedeemRequest,
+    redeemer_endpoint: Option<EndpointBlob>,
 ) -> Flow {
     let now_instant = Instant::now();
     // Budget rejections run before the lookup and are immediate.
     if !state.redeem_window.allow_at(now_instant) {
-        deliver(
+        deliver_msg(
             out,
             pair_error(
                 redeem.request_id,
@@ -1312,7 +1346,7 @@ fn handle_redeem(
     }
     let (global_ok, retry) = shared.global_redeem_allows(now_instant);
     if !global_ok {
-        deliver(
+        deliver_msg(
             out,
             pair_error(
                 redeem.request_id,
@@ -1328,7 +1362,7 @@ fn handle_redeem(
     // Deadline sanity (one attempt spans at most 120 s, contract §8).
     if redeem.deadline_ms <= now || redeem.deadline_ms > now + REDEEM_MAX_WINDOW.as_millis() as u64
     {
-        deliver(
+        deliver_msg(
             out,
             pair_error(
                 redeem.request_id,
@@ -1370,7 +1404,7 @@ fn handle_redeem(
         match replay {
             Some(flags) if flags.matches(&redeem) => {
                 drop(inner);
-                deliver(
+                deliver_msg(
                     out,
                     CtrlMessage::InviteRedeemPending {
                         request_id: redeem.request_id,
@@ -1382,7 +1416,7 @@ fn handle_redeem(
             }
             Some(_) => {
                 drop(inner);
-                deliver(
+                deliver_msg(
                     out,
                     pair_error(
                         redeem.request_id,
@@ -1401,7 +1435,7 @@ fn handle_redeem(
         Ok(code) => code,
         Err(e) => {
             log::error!("redeem lookup failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     redeem.request_id,
@@ -1418,10 +1452,14 @@ fn handle_redeem(
     match code {
         // A live code owned by someone else: the real redeem path.
         Some(code) if code.owner != me => {
-            match shared
-                .store
-                .begin_pairing(&pairing_id, &me, &redeem, &code, now)
-            {
+            match shared.store.begin_pairing(
+                &pairing_id,
+                &me,
+                &redeem,
+                &code,
+                redeemer_endpoint.as_ref().map(|blob| blob.0.as_slice()),
+                now,
+            ) {
                 Ok(BeginRedeem::Begun) => {
                     let expires_at =
                         now_instant + Duration::from_millis(redeem.deadline_ms.saturating_sub(now));
@@ -1432,7 +1470,7 @@ fn handle_redeem(
                         pairing_id,
                         expires_at + REDEEM_REPLAY_GRACE,
                     );
-                    deliver(
+                    deliver_msg(
                         out,
                         CtrlMessage::InviteRedeemPending {
                             request_id: redeem.request_id,
@@ -1442,20 +1480,23 @@ fn handle_redeem(
                     );
                     // Owner online: offer immediately; offline: the
                     // pending row waits and is pushed on the owner's next
-                    // Hello (catch-up in process_hello).
-                    shared.deliver(
-                        &code.owner,
-                        CtrlMessage::InviteRedeemOffered {
-                            code_id: code.code_id,
-                            code_revision: code.revision,
-                            pairing_id,
-                            redeemer_device_id: me,
-                            redeem,
-                        },
-                    );
+                    // Hello (catch-up in process_hello). Wave-28: the
+                    // redeemer's endpoint rides the offer frame, so the
+                    // owner has the peer settings in this one push.
+                    let mut offer = CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+                        code_id: code.code_id,
+                        code_revision: code.revision,
+                        pairing_id,
+                        redeemer_device_id: me,
+                        redeem,
+                    });
+                    if let Some(blob) = redeemer_endpoint {
+                        offer = offer.with_endpoint(blob);
+                    }
+                    shared.deliver(&code.owner, offer);
                 }
                 Ok(BeginRedeem::OwnerPendingLimit | BeginRedeem::GlobalPendingLimit) => {
-                    deliver(
+                    deliver_msg(
                         out,
                         pair_error(
                             redeem.request_id,
@@ -1466,9 +1507,24 @@ fn handle_redeem(
                         ),
                     );
                 }
+                // Wave-28 single-redemption cap: immediate, explicit —
+                // no deferred deadline semantics (the code is known to
+                // exist; the redeemer already holds it).
+                Ok(BeginRedeem::RedeemExhausted) => {
+                    deliver_msg(
+                        out,
+                        pair_error(
+                            redeem.request_id,
+                            ErrorScope::Code,
+                            code.code_id,
+                            REDEEM_EXHAUSTED,
+                            0,
+                        ),
+                    );
+                }
                 Err(e) => {
                     log::error!("begin pairing failure: {e}");
-                    deliver(
+                    deliver_msg(
                         out,
                         pair_error(
                             redeem.request_id,
@@ -1505,7 +1561,7 @@ fn handle_redeem(
                     expires_at + REDEEM_REPLAY_GRACE,
                 );
             }
-            deliver(
+            deliver_msg(
                 out,
                 CtrlMessage::InviteRedeemPending {
                     request_id: redeem.request_id,
@@ -1702,15 +1758,23 @@ fn handle_pair_proof(
     }
 }
 
-fn commit_message(snapshot: &PairingSnapshot) -> Option<CtrlMessage> {
-    Some(CtrlMessage::PairCommit {
+/// The authoritative commit frame. Wave-28: the owner endpoint snapshot
+/// rides the extension section, so the redeemer receives the owner's
+/// connection settings at the same commit point (identical frame to both
+/// participants; the owner merely sees its own blob again).
+fn commit_message(snapshot: &PairingSnapshot) -> Option<CtrlFrame> {
+    let mut frame = CtrlFrame::new(CtrlMessage::PairCommit {
         transcript: snapshot.transcript?,
         owner_proof: snapshot.owner_proof.clone()?,
         redeemer_proof: snapshot.redeemer_proof.clone()?,
         owner_prepared_signature: snapshot.owner_prepared_signature?,
         redeemer_prepared_signature: snapshot.redeemer_prepared_signature?,
         commit_revision: snapshot.commit_revision?,
-    })
+    });
+    if let Some(blob) = &snapshot.owner_endpoint {
+        frame = frame.with_endpoint(EndpointBlob(blob.clone()));
+    }
+    Some(frame)
 }
 
 fn ready_message(snapshot: &PairingSnapshot) -> Option<CtrlMessage> {
@@ -1725,7 +1789,7 @@ fn ready_message(snapshot: &PairingSnapshot) -> Option<CtrlMessage> {
 
 fn handle_prepared(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     pairing_id: PairingId,
     transcript_digest: Digest32,
@@ -1735,7 +1799,7 @@ fn handle_prepared(
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
-            deliver(out, unavailable([0u8; 16], pairing_id));
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
     };
@@ -1743,7 +1807,7 @@ fn handle_prepared(
         || snapshot.transcript_digest != Some(transcript_digest)
         || now > snapshot.deadline_ms
     {
-        deliver(out, unavailable([0u8; 16], pairing_id));
+        deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
     let signed = hello2::prepared_message(&pairing_id, &transcript_digest);
@@ -1752,7 +1816,7 @@ fn handle_prepared(
             "prepared from {} rejected: signature",
             util::hex_prefix(&me, 4)
         );
-        deliver(out, unavailable([0u8; 16], pairing_id));
+        deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
     let decision = shared.store.store_prepared_and_try_commit(
@@ -1784,7 +1848,7 @@ fn handle_prepared(
         Ok(PreparedDecision::Unavailable) => {
             // The aborting path (revoke, sweep, explicit abort) already
             // notified both participants; tell only the sender.
-            deliver(out, unavailable([0u8; 16], pairing_id));
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
         Ok(PreparedDecision::ResourceLimit) => {
             if let Some(fresh) = shared.store.pairing_snapshot(&pairing_id).ok().flatten() {
@@ -1800,11 +1864,11 @@ fn handle_prepared(
             }
         }
         Ok(PreparedDecision::NotFound) => {
-            deliver(out, unavailable([0u8; 16], pairing_id));
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
         Err(e) => {
             log::error!("prepared storage failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     [0u8; 16],
@@ -1820,7 +1884,7 @@ fn handle_prepared(
 
 fn handle_applied(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     pairing_id: PairingId,
     transcript_digest: Digest32,
@@ -1831,7 +1895,7 @@ fn handle_applied(
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
-            deliver(out, unavailable([0u8; 16], pairing_id));
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
     };
@@ -1842,7 +1906,7 @@ fn handle_applied(
             PairingState::Committed | PairingState::Applied | PairingState::Ready
         )
     {
-        deliver(out, unavailable([0u8; 16], pairing_id));
+        deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
     let signed = hello2::applied_message(&pairing_id, &transcript_digest, commit_revision);
@@ -1851,7 +1915,7 @@ fn handle_applied(
             "applied from {} rejected: signature",
             util::hex_prefix(&me, 4)
         );
-        deliver(out, unavailable([0u8; 16], pairing_id));
+        deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
     let decision = shared.store.store_applied(
@@ -1873,7 +1937,7 @@ fn handle_applied(
             }
         }
         Ok(AppliedDecision::RevisionConflict) => {
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     [0u8; 16],
@@ -1885,11 +1949,11 @@ fn handle_applied(
             );
         }
         Ok(AppliedDecision::NotFound) => {
-            deliver(out, unavailable([0u8; 16], pairing_id));
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
         Err(e) => {
             log::error!("applied storage failure: {e}");
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     [0u8; 16],
@@ -1905,7 +1969,7 @@ fn handle_applied(
 
 fn handle_status_query(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     request_id: RequestId,
     pairing_id: PairingId,
@@ -1928,7 +1992,7 @@ fn handle_status_query(
             .map(|ghost| ghost.deadline_ms);
         if let Some(deadline_ms) = live_deadline {
             drop(inner);
-            deliver(
+            deliver_msg(
                 out,
                 CtrlMessage::PairStatusReply {
                     request_id,
@@ -1945,15 +2009,15 @@ fn handle_status_query(
         Ok(Some(snapshot)) => snapshot,
         // Unknown or non-participant: one unified answer.
         Ok(None) | Err(_) => {
-            deliver(out, unavailable(request_id, pairing_id));
+            deliver_msg(out, unavailable(request_id, pairing_id));
             return;
         }
     };
     if snapshot.owner != me && snapshot.redeemer != me {
-        deliver(out, unavailable(request_id, pairing_id));
+        deliver_msg(out, unavailable(request_id, pairing_id));
         return;
     }
-    deliver(
+    deliver_msg(
         out,
         CtrlMessage::PairStatusReply {
             request_id,
@@ -1968,13 +2032,13 @@ fn handle_status_query(
     // PairReady.
     match snapshot.state {
         PairingState::Committed | PairingState::Applied => {
-            if let Some(message) = commit_message(&snapshot) {
-                deliver(out, message);
+            if let Some(frame) = commit_message(&snapshot) {
+                deliver(out, frame);
             }
         }
         PairingState::Ready => {
-            if let Some(message) = ready_message(&snapshot) {
-                deliver(out, message);
+            if let Some(frame) = ready_message(&snapshot) {
+                deliver(out, frame);
             }
         }
         _ => {}
@@ -1983,7 +2047,7 @@ fn handle_status_query(
 
 fn handle_abort(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     request_id: RequestId,
     pairing_id: PairingId,
@@ -1992,7 +2056,7 @@ fn handle_abort(
     let snapshot = shared.store.pairing_snapshot(&pairing_id);
     let participant = matches!(&snapshot, Ok(Some(s)) if s.owner == me || s.redeemer == me);
     if !participant {
-        deliver(out, unavailable(request_id, pairing_id));
+        deliver_msg(out, unavailable(request_id, pairing_id));
         return;
     }
     match shared.store.abort_pairing(&pairing_id, now_ms()) {
@@ -2008,7 +2072,7 @@ fn handle_abort(
         }
         Ok(AbortDecision::NotAbortable) => {
             // Committed transactions must be recovered, not dropped.
-            deliver(
+            deliver_msg(
                 out,
                 pair_error(
                     request_id,
@@ -2020,7 +2084,7 @@ fn handle_abort(
             );
         }
         Ok(AbortDecision::NotFound) => {
-            deliver(out, unavailable(request_id, pairing_id));
+            deliver_msg(out, unavailable(request_id, pairing_id));
         }
         Err(e) => log::error!("abort storage failure: {e}"),
     }
@@ -2031,7 +2095,7 @@ fn handle_abort(
 #[allow(clippy::too_many_arguments)]
 fn handle_connect(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     target: DeviceId,
     pairing_id: PairingId,
@@ -2039,7 +2103,7 @@ fn handle_connect(
     connection_id: [u8; 16],
 ) {
     if target == me {
-        deliver(out, server_error(ERR_BAD_REQUEST, "self connect"));
+        deliver_msg(out, server_error(ERR_BAD_REQUEST, "self connect"));
         return;
     }
     // v2 sessions are keyed by the verified triple: a completed pairing
@@ -2050,7 +2114,7 @@ fn handle_connect(
         .relation_exists(&pairing_id, &code_id, &me, &target)
         .unwrap_or(false);
     if !verified {
-        deliver(
+        deliver_msg(
             out,
             pair_error(
                 [0u8; 16],
@@ -2065,7 +2129,7 @@ fn handle_connect(
     let mut inner = shared.lock();
     if !inner.conns.contains_key(&target) {
         drop(inner);
-        deliver(
+        deliver_msg(
             out,
             server_error(ERR_UNKNOWN_DEVICE, "target device not online"),
         );
@@ -2096,7 +2160,7 @@ fn handle_connect(
         || target_count >= shared.limits.max_sessions_per_device
     {
         drop(inner);
-        deliver(
+        deliver_msg(
             out,
             server_error(ERR_SESSION_LIMIT, "session limit reached"),
         );
@@ -2163,7 +2227,7 @@ fn announce_session(
 
 fn handle_signal(
     shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
+    out: &mpsc::Sender<CtrlFrame>,
     me: DeviceId,
     session: SessionId,
     signal: crate::protocol_v2::PeerSignal,
@@ -2171,7 +2235,7 @@ fn handle_signal(
     let inner = shared.lock();
     let Some(entry) = inner.sessions.get(&session) else {
         drop(inner);
-        deliver(
+        deliver_msg(
             out,
             server_error(ERR_SESSION_NOT_FOUND, "session not found"),
         );
@@ -2180,7 +2244,7 @@ fn handle_signal(
     if !entry.endpoints.contains(&me) {
         drop(inner);
         // Unknown and non-member sessions look identical (no oracle).
-        deliver(
+        deliver_msg(
             out,
             server_error(ERR_SESSION_NOT_FOUND, "session not found"),
         );
@@ -2315,6 +2379,8 @@ mod tests {
             redeemer_prepared_signature: None,
             owner_applied_signature: None,
             redeemer_applied_signature: None,
+            owner_endpoint: None,
+            redeemer_endpoint: None,
         };
         let typed = PairTranscript {
             registry_id: registry,
@@ -2789,7 +2855,7 @@ mod tests {
     #[tokio::test]
     async fn writer_stall_tears_the_connection_down() {
         let (unread, server_end) = tokio::io::duplex(1);
-        let (tx, rx) = mpsc::channel::<CtrlMessage>(4);
+        let (tx, rx) = mpsc::channel::<CtrlFrame>(4);
         let (_close_tx, close) = watch::channel(false);
         let (dead_tx, mut dead_rx) = mpsc::channel::<()>(1);
         let writer = tokio::spawn(writer_loop(
@@ -2800,7 +2866,9 @@ mod tests {
             Duration::from_millis(75),
         ));
 
-        tx.send(CtrlMessage::Pong { nonce: [9; 16] }).await.unwrap();
+        tx.send(CtrlFrame::new(CtrlMessage::Pong { nonce: [9; 16] }))
+            .await
+            .unwrap();
         let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(5), dead_rx.recv())
             .await
@@ -2813,4 +2881,380 @@ mod tests {
         );
         drop(unread);
     }
+
+    // ---- wave-28 endpoint exchange (frame extension e2e) --------------------
+
+    impl TestClient {
+        async fn send_frame(&mut self, frame: &CtrlFrame) {
+            crate::server_v2::framing::write_frame(&mut self.stream, frame, Role::Client)
+                .await
+                .unwrap();
+        }
+
+        async fn recv_frame(&mut self) -> CtrlFrame {
+            let deadline = Duration::from_secs(10);
+            tokio::time::timeout(deadline, async {
+                let bytes = read_frame(&mut self.stream).await.unwrap().expect("frame");
+                CtrlFrame::decode_as(&bytes, Role::Client).unwrap()
+            })
+            .await
+            .expect("frame within deadline")
+        }
+    }
+
+    /// Drive both participants from a live pending redeem to the
+    /// authoritative commit: owner PairChallenge, redeemer PairProof,
+    /// both PairPrepared. Returns the transcript bytes and digest.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_to_commit(
+        owner: &mut TestClient,
+        redeemer: &mut TestClient,
+        registry_id: &RegistryId,
+        code_id: CodeId,
+        lookup: Digest32,
+        pairing_id: PairingId,
+        request_id: RequestId,
+        redeemer_nonce: [u8; 32],
+        deadline: u64,
+    ) -> ([u8; 256], Digest32) {
+        let transcript = PairTranscript {
+            registry_id: *registry_id,
+            code_id,
+            code_revision: 1,
+            pairing_id,
+            request_id,
+            lookup_digest: lookup,
+            owner_device_id: owner.key.public_key(),
+            redeemer_device_id: redeemer.key.public_key(),
+            owner_nonce: [0x0D; 32],
+            redeemer_nonce,
+            deadline_ms: deadline,
+        };
+        let bytes = transcript.to_bytes();
+        let owner_proof = PairProof {
+            mac: [0x11; 32],
+            signature: owner
+                .key
+                .sign(&hello2::proof_signed_message(OWNER_PROOF_DOMAIN, &bytes, &[0x11; 32])),
+        };
+        owner
+            .send(&CtrlMessage::PairChallenge {
+                transcript: bytes,
+                owner_proof: owner_proof.clone(),
+            })
+            .await;
+        match redeemer.recv().await {
+            CtrlMessage::PairChallenge {
+                transcript,
+                owner_proof: relayed,
+            } => {
+                assert_eq!(transcript, bytes);
+                assert_eq!(relayed, owner_proof);
+            }
+            other => panic!("expected relayed PairChallenge, got {other:?}"),
+        }
+        let digest = hello2::transcript_digest(&bytes);
+        let redeemer_proof = PairProof {
+            mac: [0x22; 32],
+            signature: redeemer
+                .key
+                .sign(&hello2::proof_signed_message(REDEEMER_PROOF_DOMAIN, &bytes, &[0x22; 32])),
+        };
+        redeemer
+            .send(&CtrlMessage::PairProof {
+                pairing_id,
+                transcript_digest: digest,
+                redeemer_proof: redeemer_proof.clone(),
+            })
+            .await;
+        match owner.recv().await {
+            CtrlMessage::PairProof {
+                transcript_digest,
+                redeemer_proof: relayed,
+                ..
+            } => {
+                assert_eq!(transcript_digest, digest);
+                assert_eq!(relayed, redeemer_proof);
+            }
+            other => panic!("expected relayed PairProof, got {other:?}"),
+        }
+        owner
+            .send(&CtrlMessage::PairPrepared {
+                pairing_id,
+                transcript_digest: digest,
+                signature: owner.key.sign(&hello2::prepared_message(&pairing_id, &digest)),
+            })
+            .await;
+        redeemer
+            .send(&CtrlMessage::PairPrepared {
+                pairing_id,
+                transcript_digest: digest,
+                signature: redeemer.key.sign(&hello2::prepared_message(&pairing_id, &digest)),
+            })
+            .await;
+        (bytes, digest)
+    }
+
+    /// Wave-28 end to end: the owner's connection settings claimed with
+    /// the code and the redeemer's settings sent with the redeem both
+    /// reach the opposite side, byte-identical, riding the existing
+    /// offer/commit frames (no extra round trips).
+    #[tokio::test]
+    async fn endpoint_blobs_reach_both_sides_byte_identical() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut owner =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
+        let mut redeemer =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "r").await;
+
+        let owner_blob = EndpointBlob(vec![0xA1; 217]);
+        let redeemer_blob = EndpointBlob(vec![0xB2; 333]);
+        let lookup: Digest32 = [0x7C; 32];
+
+        // Claim with the owner endpoint (no cap: legacy multi-pairing).
+        let claim_request = random_id16();
+        owner
+            .send_frame(
+                &CtrlFrame::new(CtrlMessage::InviteClaim {
+                    request_id: claim_request,
+                    lookup_digest: lookup,
+                    ttl_secs: 0,
+                })
+                .with_endpoint(owner_blob.clone()),
+            )
+            .await;
+        let code_id = match owner.recv_frame().await.message {
+            CtrlMessage::InviteClaimed { code_id, .. } => code_id,
+            other => panic!("expected InviteClaimed, got {other:?}"),
+        };
+
+        // Redeem with the redeemer endpoint.
+        let deadline = now_ms() + 8_000;
+        let redeem = signed_redeem(&redeemer.key, &registry_id, lookup, random_id16(), deadline);
+        let request_id = redeem.request_id;
+        let redeemer_nonce = redeem.redeemer_nonce;
+        redeemer
+            .send_frame(
+                &CtrlFrame::new(CtrlMessage::InviteRedeem(redeem))
+                    .with_endpoint(redeemer_blob.clone()),
+            )
+            .await;
+        let pairing_id = match redeemer.recv_frame().await.message {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("expected InviteRedeemPending, got {other:?}"),
+        };
+
+        // The owner's offer carries the redeemer endpoint verbatim.
+        let offered = owner.recv_frame().await;
+        match &offered.message {
+            CtrlMessage::InviteRedeemOffered {
+                code_id: offered_code,
+                pairing_id: offered_pairing,
+                ..
+            } => {
+                assert_eq!(*offered_code, code_id);
+                assert_eq!(*offered_pairing, pairing_id);
+            }
+            other => panic!("expected InviteRedeemOffered, got {other:?}"),
+        }
+        assert_eq!(
+            offered.endpoint,
+            Some(redeemer_blob.clone()),
+            "redeemer endpoint must ride the offer byte-identical"
+        );
+
+        // Complete the pairing; the redeemer's PairCommit carries the
+        // owner endpoint verbatim.
+        drive_to_commit(
+            &mut owner,
+            &mut redeemer,
+            &registry_id,
+            code_id,
+            lookup,
+            pairing_id,
+            request_id,
+            redeemer_nonce,
+            deadline,
+        )
+        .await;
+        let commit = redeemer.recv_frame().await;
+        match &commit.message {
+            CtrlMessage::PairCommit {
+                commit_revision, ..
+            } => assert_eq!(*commit_revision, 1),
+            other => panic!("expected PairCommit, got {other:?}"),
+        }
+        assert_eq!(
+            commit.endpoint,
+            Some(owner_blob.clone()),
+            "owner endpoint must ride the commit byte-identical"
+        );
+        // The owner's own commit copy also carries its blob (same fixed
+        // frame to both participants; no third party is involved).
+        let owner_commit = owner.recv_frame().await;
+        assert!(matches!(owner_commit.message, CtrlMessage::PairCommit { .. }));
+        assert_eq!(owner_commit.endpoint, Some(owner_blob.clone()));
+        server.stop().await;
+    }
+
+    /// `max_redeems=1`: after one committed pairing the code is dead for
+    /// every other redeemer — the second, different redeemer is rejected
+    /// immediately with the dedicated `REDEEM_EXHAUSTED` code (no
+    /// deferred-deadline ghost semantics).
+    #[tokio::test]
+    async fn single_redeem_cap_rejects_the_second_redeemer() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut owner =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
+        let mut first =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "a").await;
+
+        let lookup: Digest32 = [0x5E; 32];
+        let claim_request = random_id16();
+        owner
+            .send_frame(
+                &CtrlFrame::new(CtrlMessage::InviteClaim {
+                    request_id: claim_request,
+                    lookup_digest: lookup,
+                    ttl_secs: 0,
+                })
+                .with_endpoint(EndpointBlob(vec![0xC3; 64]))
+                .with_max_redeems(1),
+            )
+            .await;
+        let code_id = match owner.recv_frame().await.message {
+            CtrlMessage::InviteClaimed { code_id, .. } => code_id,
+            other => panic!("expected InviteClaimed, got {other:?}"),
+        };
+
+        // First redeemer completes through the commit.
+        let deadline = now_ms() + 8_000;
+        let redeem = signed_redeem(&first.key, &registry_id, lookup, random_id16(), deadline);
+        let request_id = redeem.request_id;
+        let redeemer_nonce = redeem.redeemer_nonce;
+        first
+            .send(&CtrlMessage::InviteRedeem(redeem))
+            .await;
+        let pairing_id = match first.recv().await {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("expected InviteRedeemPending, got {other:?}"),
+        };
+        let _offer = owner.recv_frame().await; // offer push
+        drive_to_commit(
+            &mut owner,
+            &mut first,
+            &registry_id,
+            code_id,
+            lookup,
+            pairing_id,
+            request_id,
+            redeemer_nonce,
+            deadline,
+        )
+        .await;
+        let _ = first.recv_frame().await; // PairCommit to the redeemer
+        let _ = owner.recv_frame().await; // PairCommit to the owner
+
+        // A second, different redeemer: immediate, explicit rejection.
+        let mut second =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "b").await;
+        let second_deadline = now_ms() + 8_000;
+        let second_redeem = signed_redeem(
+            &second.key,
+            &registry_id,
+            lookup,
+            random_id16(),
+            second_deadline,
+        );
+        let second_request = second_redeem.request_id;
+        second
+            .send(&CtrlMessage::InviteRedeem(second_redeem))
+            .await;
+        match second.recv().await {
+            CtrlMessage::PairError {
+                request_id,
+                scope,
+                object_id,
+                code,
+                ..
+            } => {
+                assert_eq!(request_id, second_request);
+                assert_eq!(code, REDEEM_EXHAUSTED);
+                assert_eq!(scope, ErrorScope::Code);
+                assert_eq!(object_id, code_id);
+            }
+            other => panic!("expected REDEEM_EXHAUSTED PairError, got {other:?}"),
+        }
+        server.stop().await;
+    }
+
+    /// The same request id replaying a completed capped redeem still gets
+    /// the original pending answer (idempotency unchanged by the cap).
+    #[tokio::test]
+    async fn redeem_replay_semantics_survive_the_cap() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut owner =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
+        let mut redeemer =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "r").await;
+
+        let lookup: Digest32 = [0x6F; 32];
+        owner
+            .send_frame(
+                &CtrlFrame::new(CtrlMessage::InviteClaim {
+                    request_id: random_id16(),
+                    lookup_digest: lookup,
+                    ttl_secs: 0,
+                })
+                .with_max_redeems(1),
+            )
+            .await;
+        let code_id = match owner.recv_frame().await.message {
+            CtrlMessage::InviteClaimed { code_id, .. } => code_id,
+            other => panic!("expected InviteClaimed, got {other:?}"),
+        };
+        let deadline = now_ms() + 8_000;
+        let redeem = signed_redeem(&redeemer.key, &registry_id, lookup, random_id16(), deadline);
+        let request_id = redeem.request_id;
+        let redeemer_nonce = redeem.redeemer_nonce;
+        redeemer
+            .send(&CtrlMessage::InviteRedeem(redeem.clone()))
+            .await;
+        let pairing_id = match redeemer.recv().await {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("expected InviteRedeemPending, got {other:?}"),
+        };
+        let _offer = owner.recv_frame().await;
+        drive_to_commit(
+            &mut owner,
+            &mut redeemer,
+            &registry_id,
+            code_id,
+            lookup,
+            pairing_id,
+            request_id,
+            redeemer_nonce,
+            deadline,
+        )
+        .await;
+        let _ = redeemer.recv_frame().await; // PairCommit
+
+        // Same request id retry after the cap is in force: the original
+        // result replays, not a fresh REDEEM_EXHAUSTED.
+        redeemer
+            .send(&CtrlMessage::InviteRedeem(redeem))
+            .await;
+        match redeemer.recv().await {
+            CtrlMessage::InviteRedeemPending {
+                pairing_id: replayed,
+                ..
+            } => assert_eq!(replayed, pairing_id),
+            other => panic!("expected replayed InviteRedeemPending, got {other:?}"),
+        }
+        server.stop().await;
+    }
+
 }

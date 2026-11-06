@@ -37,6 +37,8 @@ invite_codes
 - 撤销、过期后不复用旧码：保留最小 tombstone（至少 lookup、终态及必要版本信息），不允许通过删除记录重新激活旧码。
 - `expires_unix_ms` 为 NULL（或协议层 `expires_ms=0`）表示长期有效。
 
+**wave-28 修订（schema v1→v2，增量迁移）**：`invite_codes` 增 `owner_endpoint BLOB NULL`（发起方连接设置，≤512B 透传 blob，随 claim 扩展段到达）与 `max_redeems INTEGER NOT NULL DEFAULT 0`（0=不限，1=任务码单次兑换；额度只计 committed/applied/ready 事务，pending/aborted 不消耗；耗尽后新 redeemer 得 `0x2109 REDEEM_EXHAUSTED`，同 request_id 重放幂等不变）；`pairing_transactions` 增 `owner_endpoint BLOB NULL`/`redeemer_endpoint BLOB NULL`（兑换时刻快照，双端点交付依据）。endpoint blob 是连接提示而非凭证，不受 transcript 签名覆盖。
+
 ### 3. `pairing_transactions` 表（冻结）
 
 计划原文定义其内容为：

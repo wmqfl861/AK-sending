@@ -11,7 +11,7 @@
 //! [`super::direction`]).
 
 use super::direction::Role;
-use super::message::{self, CtrlMessage};
+use super::message::{self, CtrlMessage, EndpointBlob};
 
 /// Signaling protocol version (frame header byte 0). v1 stays at 1; v2 is
 /// never negotiated down to plaintext v1 frames.
@@ -44,6 +44,10 @@ pub enum EncodeError {
     BadStateFilter(u8),
     #[error("payload {len} bytes exceeds cap {cap}")]
     PayloadTooLarge { len: usize, cap: usize },
+    #[error("endpoint blob of {len} bytes outside 1..={limit}")]
+    EndpointBlobSize { len: usize, limit: usize },
+    #[error("type {ty:#04x} carries no wave-28 extension section")]
+    BadExtension { ty: u8 },
     #[error("type {ty:#04x} must not be sent by {sender:?}")]
     WrongDirection { ty: u8, sender: Role },
 }
@@ -77,6 +81,12 @@ pub enum DecodeError {
     BadInviteLimit(u8),
     #[error("state filter byte 0x{0:02x} uses undefined bits")]
     BadStateFilter(u8),
+    #[error("extension flags 0x{0:02x} use undefined or empty bits")]
+    BadExtensionFlags(u8),
+    #[error("endpoint blob of {len} bytes outside 1..={limit}")]
+    EndpointBlobSize { len: usize, limit: usize },
+    #[error("type {ty:#04x} carries no wave-28 extension section")]
+    BadExtension { ty: u8 },
     #[error("leftover {0} trailing bytes")]
     Trailing(usize),
     #[error("type {ty:#04x} must not be sent by {sender:?}")]
@@ -84,24 +94,62 @@ pub enum DecodeError {
 }
 
 /// One version-2 signaling frame. The version byte is fixed at
-/// [`VERSION`]; only the message varies.
+/// [`VERSION`]; only the message varies. The wave-28 fields
+/// ([`endpoint`](CtrlFrame::endpoint), [`max_redeems`](CtrlFrame::max_redeems))
+/// ride an optional trailing section inside the declared payload of the
+/// four extended tags — `CtrlFrame::new` leaves them empty, producing
+/// bytes identical to the frozen legacy shape, so pre-wave-28 peers and
+/// shapes interoperate unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtrlFrame {
     pub message: CtrlMessage,
+    /// Wave-28 endpoint blob: connection settings carried verbatim.
+    /// Legal on `InviteClaim` (owner settings, stored on the code row),
+    /// `InviteRedeem` (redeemer settings, forwarded to the owner inside
+    /// `InviteRedeemOffered`) and `PairCommit` (owner settings relayed
+    /// down to the redeemer at the authoritative commit point).
+    pub endpoint: Option<EndpointBlob>,
+    /// Wave-28 claim redeem cap (`InviteClaim` only): 0 = unlimited (the
+    /// legacy default), 1 = the v1 "one code, one task" model. Encoding
+    /// refuses the field on every other type.
+    pub max_redeems: Option<u32>,
+}
+
+impl From<CtrlMessage> for CtrlFrame {
+    fn from(message: CtrlMessage) -> Self {
+        CtrlFrame::new(message)
+    }
 }
 
 impl CtrlFrame {
     pub fn new(message: CtrlMessage) -> Self {
-        CtrlFrame { message }
+        CtrlFrame {
+            message,
+            endpoint: None,
+            max_redeems: None,
+        }
+    }
+
+    /// Attach the wave-28 endpoint blob (builder-style).
+    pub fn with_endpoint(mut self, blob: EndpointBlob) -> Self {
+        self.endpoint = Some(blob);
+        self
+    }
+
+    /// Attach the wave-28 claim redeem cap (builder-style).
+    pub fn with_max_redeems(mut self, cap: u32) -> Self {
+        self.max_redeems = Some(cap);
+        self
     }
 
     /// Append the frame to `out`. Fallible by contract: every field budget
-    /// (string caps, candidate/entry counts, candidate ports) is validated
-    /// before writing, and the final payload length is checked against the
-    /// frame cap instead of being truncated or wrapped.
+    /// (string caps, candidate/entry counts, candidate ports, the wave-28
+    /// extension section) is validated before writing, and the final
+    /// payload length is checked against the frame cap instead of being
+    /// truncated or wrapped.
     pub fn try_encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut payload = Vec::new();
-        message::encode_payload(&self.message, &mut payload)?;
+        message::encode_payload(&self.message, self.endpoint.as_ref(), self.max_redeems, &mut payload)?;
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(EncodeError::PayloadTooLarge {
                 len: payload.len(),
@@ -163,8 +211,12 @@ impl CtrlFrame {
         if bytes.len() > end {
             return Err(DecodeError::Trailing(bytes.len() - end));
         }
-        let message = message::decode_payload(ty, &bytes[HEADER_LEN..end])?;
-        Ok(CtrlFrame { message })
+        let (message, endpoint, max_redeems) = message::decode_payload(ty, &bytes[HEADER_LEN..end])?;
+        Ok(CtrlFrame {
+            message,
+            endpoint,
+            max_redeems,
+        })
     }
 
     /// [`CtrlFrame::decode`] with direction legality enforced: the frame is

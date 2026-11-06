@@ -43,19 +43,30 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Opti
     Ok(Some(frame))
 }
 
-/// Encode and write one message as sent by `sender`. Encoding is fallible
-/// per contract (`try_encode_as`): an over-budget message is an I/O error,
-/// never a truncated frame, and an illegally-directed message is refused.
+/// Encode and write one frame (message plus optional wave-28 extension
+/// section) as sent by `sender`. Encoding is fallible per contract
+/// (`try_encode_as`): an over-budget frame is an I/O error, never a
+/// truncated frame, and an illegally-directed message is refused.
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &CtrlFrame,
+    sender: Role,
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(HEADER_LEN + 64);
+    frame
+        .try_encode_as(sender, &mut buf)
+        .map_err(|e| invalid_data(encode_context(&e)))?;
+    writer.write_all(&buf).await
+}
+
+/// Encode and write one plain message (no wave-28 extension) as sent by
+/// `sender`; convenience wrapper over [`write_frame`].
 pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &CtrlMessage,
     sender: Role,
 ) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(HEADER_LEN + 64);
-    CtrlFrame::new(message.clone())
-        .try_encode_as(sender, &mut buf)
-        .map_err(|e| invalid_data(encode_context(&e)))?;
-    writer.write_all(&buf).await
+    write_frame(writer, &CtrlFrame::new(message.clone()), sender).await
 }
 
 fn encode_context(error: &EncodeError) -> &'static str {

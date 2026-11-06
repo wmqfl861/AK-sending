@@ -1,6 +1,7 @@
 # 配对流程契约（claim / redeem / revoke 时序、错误码、防暴力）
 
 > **冻结于第十八波（2026-11-04），修改需集成者核准并同步 ADR-004。**
+> **第二十八波修订（2026-11-06）：端点交换扩展段与单次兑换语义，见第 4a、6a、12a 节；第 12 节错误表新增 `0x2109`。**
 > 事实源：`docs/plans/pairing-code-plan-part2.md` A.2、A.3、A.5、A.6 节。本文为 A2（服务端事务）、A4（邀请码与信任簿事务）、A6（自动配对编排）的契约；数字与计划原文逐字一致。消息字段与预算见 `protocol-v2.md`，数据库表见 `storage-schema.md`。
 
 ## 1. 命名、码格式与生成方（冻结）
@@ -73,6 +74,16 @@ TLS 解决链路窃听与假协调端问题；**仅有 TLS 不足以防止被入
 - owner 离线时本次尝试进入等待并按期限失败，客户端可退避重试。
 
 同一码允许 owner 与多个 redeemer 分别配对。B、C 都兑换 A 的码，只产生 A↔B 和 A↔C 信任；不产生 B↔C 信任，也不允许 A 替它们转发文件。
+
+## 4a. wave-28 修订：单次兑换（v1 极简配对模型）
+
+第 4 节的“一码多配对”仍是默认（`max_redeems=0`＝无限，兼容旧流）。wave-28 起 `InviteClaim` 可携带 `max_redeems`（帧层扩展段，见 `protocol-v2.md` §10a）：
+
+- `max_redeems=1` 是 v1 极简模型：一码＝一次传输任务＝恰好两个对象；一次配对 Commit 后该码即失效。
+- 计数口径为该码名下 **committed/applied/ready** 状态的配对事务数；pending、aborted、过期尝试不消耗额度（一次失败尝试不会杀掉码）。
+- 达到上限后，新的（不同 `request_id` 的）redeem 尝试**立即**返回 `PairError 0x2109 REDEEM_EXHAUSTED`（scope＝Code，object＝code_id）——该路径不做“统一期限”延迟：redeemer 已持有码本身，不存在存在性泄露新增面。
+- 幂等/回放语义不变：同 `(redeemer, request_id)` 重放仍返回原 `InviteRedeemPending`（第 11 节防枚举形状不变）；claim 侧同 `request_id` 同内容（含扩展段内容）仍重放原 `InviteClaimed`。
+- 服务器实现：`invite_codes` 表新增 `max_redeems INTEGER NOT NULL DEFAULT 0` 列（schema v2，迁移为增量 `ALTER TABLE`，见第 12a 节末）。
 
 ## 5. claim：并发登记与幂等（冻结）
 
@@ -180,6 +191,27 @@ signature = Ed25519.Sign(
 ```
 
 `PairTranscript`（256 字节）字段布局见 `protocol-v2.md` 第 5 节。使用库提供的成熟 MAC/派生实现和恒定时间验证接口，不手写密码学原语。整个认证协议仍需独立审阅与固定测试向量，不能仅凭采用成熟哈希算法就宣称协议已经被证明安全。
+
+## 6a. wave-28 修订：连接设置（端点）交换
+
+v1 极简模型要求“双方都要拿到对方的连接设置，各自做一次连通性测试”。端点交换搭第 6 节既有帧的**帧层扩展段**（`protocol-v2.md` §10a，`EndpointBlob` ≤512B 原样透传、上层建议 JSON：候选地址数组＋设备名＋方向声明），不新增往返：
+
+```text
+A->>S: InviteClaim(+owner_endpoint, +max_redeems?)     ; owner 设置存入码行
+B->>S: InviteRedeem(+redeemer_endpoint)                ; redeemer 设置存入配对事务
+S-->>A: InviteRedeemOffered(+redeemer_endpoint)         ; owner 一次拿到对端设置
+   ...（transcript 证明流程不变，第 6 节）...
+S-->>B: PairCommit(+owner_endpoint)                     ; redeemer 在权威 Commit 点拿到
+S-->>A: PairCommit(+owner_endpoint)                     ; 同一固定帧，owner 仅重见己方数据
+```
+
+冻结约束：
+
+- 扩展段不存在＝旧形状，字节不变；旧客户端与旧服务器行为完全不变。
+- 两个 blob 都是**连接提示，不是凭证**：不受 redeem/配对签名覆盖；实际连接仍走第 10 节的候选交换与 QUIC 证书钉扎/路径闸门。上层不得把 blob 当作身份证明。
+- 断开配对（`max_redeems=1` 下完成一次配对）即码失效（第 4a 节）。
+- 存储：`invite_codes.owner_endpoint BLOB NULL`；`pairing_transactions` 在 redeem 开始时快照 `owner_endpoint`/`redeemer_endpoint` 两列（schema v2）。
+- `InviteRedeemOffered` 内嵌的 `redeem` 固定结构保持 184 字节不变，redeemer endpoint 挂在帧层而非该结构内（第 6 节“固定结构”约束继续成立）。
 
 ## 7. 防中间人：换钥检测与换码检测（冻结）
 
@@ -319,11 +351,20 @@ PeerBookStore::apply_pairing(
 0x2106 REVISION_CONFLICT
 0x2107 PROTOCOL_UNSUPPORTED
 0x2108 STORAGE_UNAVAILABLE
+0x2109 REDEEM_EXHAUSTED
 ```
 
 `CODE_CONFLICT` 仅用于高熵随机码登记冲突，不提供公开“检查某码是否存在”的接口。
 
 `ServerError` 保留有界旧类错误；邀请码业务错误走固定 `PairError`（tag `0x1C`，含 `retry_after_ms`），不回显用户输入。
+
+## 12a. wave-28 修订：`0x2109 REDEEM_EXHAUSTED` 与存储变更
+
+- `0x2109 REDEEM_EXHAUSTED`（第二十八波新增）：码行 `max_redeems ≥ 1` 且已达到 committed 配对数上限时，对新 redeemer 的立即拒绝码（scope＝Code，object＝code_id，`retry_after_ms=0`）。语义与第 4a 节同步。
+- 存储变更（registry schema v1 → v2，迁移为增量 `ALTER TABLE`，保留全部 tombstone/唯一性记录）：
+  - `invite_codes` ＋ `owner_endpoint BLOB NULL`、`max_redeems INTEGER NOT NULL DEFAULT 0`；
+  - `pairing_transactions` ＋ `owner_endpoint BLOB NULL`、`redeemer_endpoint BLOB NULL`（redeem 开始时从码行/redeem 帧快照）。
+- `storage-schema.md` 的 DDL 附录待集成者随本次修订一并同步（本波协议/服务器代理的文档权限不含该文件）。
 
 ## 13. 安全边界补充（第十七波边界全部保留）
 

@@ -1338,6 +1338,12 @@ impl Drop for AkEngine {
             if let Some(sched) = &v2.sched {
                 sched.teardown(&self.runtime);
             }
+            // B8 (wave 28) task runtimes: same discipline — wake every
+            // blocked consent gate with a decline FIRST, then abort the
+            // op/resident-receiver tasks (see `TaskRt::teardown`).
+            for rt in v2.tasks.values() {
+                rt.teardown(&self.runtime);
+            }
         }
     }
 }
@@ -1416,6 +1422,13 @@ fn event_name(event: &Progress) -> &'static str {
         Progress::FinalAck { .. } => "final_ack",
         Progress::Done => "done",
     }
+}
+
+/// The wire event name of one [`Progress`] (B8 wave 28: shared with the
+/// task plane's progress forwarding, which renders `ak_poll_progress`
+/// lines under the conn/code id).
+pub(crate) fn progress_name(event: &Progress) -> &'static str {
+    event_name(event)
 }
 
 fn event_fields(event: &Progress) -> Vec<(&'static str, Field<'_>)> {

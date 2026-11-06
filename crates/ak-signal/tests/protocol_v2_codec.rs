@@ -20,8 +20,9 @@ use std::net::SocketAddr;
 
 use ak_signal::protocol_v2::{
     self as v2, AbortReason, CtrlFrame, CtrlMessage, DecodeError, Direction, EncodeError,
-    ErrorScope, InviteState, InviteSummary, PairProof, PairingState, PeerSignal, RedeemRequest,
-    Role, StateFilter, CURSOR_END, CURSOR_START, HEADER_LEN, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES,
+    EndpointBlob, ErrorScope, InviteState, InviteSummary, PairProof, PairingState, PeerSignal,
+    RedeemRequest, Role, StateFilter, CURSOR_END, CURSOR_START, ENDPOINT_BLOB_MAX_BYTES,
+    EXT_ENDPOINT_FLAG, EXT_MAX_REDEEMS_FLAG, HEADER_LEN, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES,
     VERSION,
 };
 
@@ -684,6 +685,9 @@ fn budget_table_locked() {
         (0x1E, m::PONG_PAYLOAD),
     ];
     // The frozen numbers themselves, independent of the module constants.
+    // Wave-28: the four extended tags (0x0A/0x10/0x12/0x16) grew by the
+    // optional trailing extension section (flags+u16 len+512-byte blob,
+    // claim additionally u32 max_redeems); every other tag is unchanged.
     let frozen: &[(u8, usize)] = &[
         (0x01, 204),
         (0x02, 8),
@@ -694,19 +698,19 @@ fn budget_table_locked() {
         (0x07, 16),
         (0x08, 132),
         (0x09, 72),
-        (0x0A, 52),
+        (0x0A, 571),
         (0x0B, 56),
         (0x0C, 34),
         (0x0D, 1345),
         (0x0E, 40),
         (0x0F, 48),
-        (0x10, 184),
+        (0x10, 699),
         (0x11, 40),
-        (0x12, 256),
+        (0x12, 771),
         (0x13, 352),
         (0x14, 144),
         (0x15, 112),
-        (0x16, 584),
+        (0x16, 1099),
         (0x17, 120),
         (0x18, 184),
         (0x19, 32),
@@ -719,6 +723,65 @@ fn budget_table_locked() {
     for ((ty, constant), (_, number)) in expected.iter().zip(frozen) {
         assert_eq!(constant, number, "budget constant drift for tag {ty:#04x}");
     }
+    // The four extended tags hit their budgets with a full extension
+    // section (512-byte blob, claim with max_redeems); the frozen 26
+    // legacy shapes are exact as before.
+    let blob = EndpointBlob(vec![0xE5; v2::ENDPOINT_BLOB_MAX_BYTES]);
+    let extended: Vec<(u8, CtrlFrame)> = vec![
+        (
+            0x0A,
+            CtrlFrame::new(CtrlMessage::InviteClaim {
+                request_id: [0x0A; 16],
+                lookup_digest: [0x0B; 32],
+                ttl_secs: u32::MAX,
+            })
+            .with_endpoint(blob.clone())
+            .with_max_redeems(u32::MAX),
+        ),
+        (
+            0x10,
+            CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x10)))
+                .with_endpoint(blob.clone()),
+        ),
+        (
+            0x12,
+            CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+                code_id: [0x12; 16],
+                code_revision: u64::MAX,
+                pairing_id: [0x13; 16],
+                redeemer_device_id: [0x14; 32],
+                redeem: redeem(0x15),
+            })
+            .with_endpoint(blob.clone()),
+        ),
+        (
+            0x16,
+            CtrlFrame::new(CtrlMessage::PairCommit {
+                transcript: [0xBB; v2::message::TRANSCRIPT_BYTES],
+                owner_proof: proof(5),
+                redeemer_proof: proof(7),
+                owner_prepared_signature: [0x0E; 64],
+                redeemer_prepared_signature: [0x0F; 64],
+                commit_revision: u64::MAX,
+            })
+            .with_endpoint(blob.clone()),
+        ),
+    ];
+    for (ty, frame) in extended {
+        let mut bytes = Vec::new();
+        frame.try_encode(&mut bytes).unwrap();
+        let budget = frozen
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .map(|(_, b)| *b)
+            .unwrap();
+        assert_eq!(
+            bytes.len() - HEADER_LEN,
+            budget,
+            "tag {ty:#04x}: maximal extended sample must hit its budget exactly"
+        );
+        assert!(bytes.len() <= MAX_FRAME_BYTES);
+    }
     for message in all_variants() {
         let ty = message.type_byte();
         let bytes = encode(&message);
@@ -727,6 +790,17 @@ fn budget_table_locked() {
             .find(|(t, _)| *t == ty)
             .map(|(_, b)| *b)
             .unwrap();
+        if matches!(ty, 0x0A | 0x10 | 0x12 | 0x16) {
+            // Legacy shape of an extended tag: exactly the pre-wave-28 size.
+            let legacy = match ty {
+                0x0A => 52,
+                0x10 => 184,
+                0x12 => 256,
+                _ => 584,
+            };
+            assert_eq!(bytes.len() - HEADER_LEN, legacy);
+            continue;
+        }
         assert_eq!(
             bytes.len() - HEADER_LEN,
             budget,
@@ -878,6 +952,10 @@ fn every_variant_rejects_trailing_byte() {
     for message in all_variants() {
         let mut bytes = encode(&message);
         bytes.push(0);
+        // The appended byte sits outside the declared length, so the
+        // frame layer refuses it for every tag — extended or not — before
+        // payload parsing; the wave-28 section lives INSIDE the declared
+        // payload and is exercised by the crafted-payload tests below.
         assert!(matches!(
             CtrlFrame::decode(&bytes),
             Err(DecodeError::Trailing(1))
@@ -1446,4 +1524,288 @@ fn business_error_code_constants_frozen() {
         code: v2::CODE_CONFLICT,
         retry_after_ms: 0,
     });
+}
+
+// ---- wave-28 endpoint extension -------------------------------------------
+
+/// Frame-level round-trip through the plain and direction-aware paths.
+fn roundtrip_frame(frame: CtrlFrame) {
+    let mut bytes = Vec::new();
+    frame.try_encode(&mut bytes).unwrap();
+    assert!(bytes.len() <= MAX_FRAME_BYTES);
+    assert_eq!(bytes[0], VERSION);
+    assert_eq!(CtrlFrame::decode(&bytes).unwrap(), frame);
+    let sender = if frame.message.allows_sender(Role::Client) {
+        Role::Client
+    } else {
+        Role::Server
+    };
+    let mut directed = Vec::new();
+    frame.try_encode_as(sender, &mut directed).unwrap();
+    assert_eq!(directed, bytes);
+    assert_eq!(
+        CtrlFrame::decode_as(&bytes, sender.opposite()).unwrap(),
+        frame
+    );
+}
+
+fn sample_blob(seed: u8, len: usize) -> EndpointBlob {
+    EndpointBlob(vec![seed; len])
+}
+
+#[test]
+fn endpoint_extension_roundtrips_on_all_four_tags() {
+    let blob = sample_blob(0x5A, 300);
+    // Claim: endpoint + cap (owner side, client to server).
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::InviteClaim {
+            request_id: [1; 16],
+            lookup_digest: [2; 32],
+            ttl_secs: 0,
+        })
+        .with_endpoint(blob.clone())
+        .with_max_redeems(1),
+    );
+    // Redeem: endpoint (redeemer side).
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x33))).with_endpoint(blob.clone()),
+    );
+    // Offered: endpoint relayed to the owner.
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+            code_id: [3; 16],
+            code_revision: 7,
+            pairing_id: [4; 16],
+            redeemer_device_id: [5; 32],
+            redeem: redeem(0x34),
+        })
+        .with_endpoint(blob.clone()),
+    );
+    // Commit: owner endpoint down to the redeemer.
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::PairCommit {
+            transcript: [0xEE; v2::message::TRANSCRIPT_BYTES],
+            owner_proof: proof(1),
+            redeemer_proof: proof(2),
+            owner_prepared_signature: [3; 64],
+            redeemer_prepared_signature: [4; 64],
+            commit_revision: 9,
+        })
+        .with_endpoint(blob.clone()),
+    );
+    // Cap without endpoint: flags = 0x02 only.
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::InviteClaim {
+            request_id: [1; 16],
+            lookup_digest: [2; 32],
+            ttl_secs: 60,
+        })
+        .with_max_redeems(0), // 0 = explicitly unlimited
+    );
+}
+
+/// No extension fields ⇒ bytes identical to the frozen legacy shape, and
+/// legacy payloads decode with both extension slots empty (old peers and
+/// old frames interoperate unchanged).
+#[test]
+fn extension_absent_is_byte_identical_legacy_shape() {
+    for message in [
+        CtrlMessage::InviteClaim {
+            request_id: [1; 16],
+            lookup_digest: [2; 32],
+            ttl_secs: 0,
+        },
+        CtrlMessage::InviteRedeem(redeem(0x10)),
+        CtrlMessage::InviteRedeemOffered {
+            code_id: [3; 16],
+            code_revision: 1,
+            pairing_id: [4; 16],
+            redeemer_device_id: [5; 32],
+            redeem: redeem(0x11),
+        },
+        CtrlMessage::PairCommit {
+            transcript: [0x00; v2::message::TRANSCRIPT_BYTES],
+            owner_proof: proof(1),
+            redeemer_proof: proof(2),
+            owner_prepared_signature: [3; 64],
+            redeemer_prepared_signature: [4; 64],
+            commit_revision: 1,
+        },
+    ] {
+        let legacy = encode(&message); // CtrlFrame::new: no extension
+        let frame = CtrlFrame::decode(&legacy).unwrap();
+        assert!(frame.endpoint.is_none());
+        assert!(frame.max_redeems.is_none());
+        // Re-encoding the decoded frame reproduces the same bytes.
+        let mut again = Vec::new();
+        frame.try_encode(&mut again).unwrap();
+        assert_eq!(again, legacy);
+    }
+}
+
+/// Byte-exact section layout: flags byte, u16 BE length, blob, u32 BE cap.
+#[test]
+fn extension_section_wire_layout_byte_exact() {
+    let blob_bytes: Vec<u8> = (0..77u16).map(|i| (i % 251) as u8).collect();
+    let frame = CtrlFrame::new(CtrlMessage::InviteClaim {
+        request_id: [0x11; 16],
+        lookup_digest: [0x22; 32],
+        ttl_secs: 86_400,
+    })
+    .with_endpoint(EndpointBlob(blob_bytes.clone()))
+    .with_max_redeems(0x0102_0304);
+    let bytes = {
+        let mut out = Vec::new();
+        frame.try_encode(&mut out).unwrap();
+        out
+    };
+    let payload = &bytes[HEADER_LEN..];
+    // 52 frozen bytes, then flags 0x03, len 77 BE, blob, cap BE.
+    assert_eq!(payload.len(), 52 + 1 + 2 + 77 + 4);
+    assert_eq!(payload[52], EXT_ENDPOINT_FLAG | EXT_MAX_REDEEMS_FLAG);
+    assert_eq!(&payload[53..55], &(77u16).to_be_bytes());
+    assert_eq!(&payload[55..55 + 77], &blob_bytes[..]);
+    assert_eq!(&payload[55 + 77..], &0x0102_0304u32.to_be_bytes());
+
+    // Offered: 256 frozen bytes, flags 0x01, len, blob.
+    let frame = CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+        code_id: [3; 16],
+        code_revision: 1,
+        pairing_id: [4; 16],
+        redeemer_device_id: [5; 32],
+        redeem: redeem(0x12),
+    })
+    .with_endpoint(EndpointBlob(blob_bytes.clone()));
+    let mut out = Vec::new();
+    frame.try_encode(&mut out).unwrap();
+    let payload = &out[HEADER_LEN..];
+    assert_eq!(payload.len(), 256 + 1 + 2 + 77);
+    assert_eq!(payload[256], EXT_ENDPOINT_FLAG);
+    assert_eq!(&payload[257..259], &(77u16).to_be_bytes());
+    assert_eq!(&payload[259..], &blob_bytes[..]);
+}
+
+#[test]
+fn err_endpoint_blob_budget() {
+    let over = sample_blob(0x61, ENDPOINT_BLOB_MAX_BYTES + 1);
+    // Encode: mirrored budget validation.
+    for message in [
+        CtrlMessage::InviteClaim {
+            request_id: [1; 16],
+            lookup_digest: [2; 32],
+            ttl_secs: 0,
+        },
+        CtrlMessage::InviteRedeem(redeem(0x40)),
+    ] {
+        assert!(matches!(
+            CtrlFrame::new(message.clone())
+                .with_endpoint(over.clone())
+                .try_encode(&mut Vec::new()),
+            Err(EncodeError::EndpointBlobSize { len: 513, limit: 512 })
+        ));
+    }
+    // Empty blob is not a legal field either.
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x41)))
+            .with_endpoint(EndpointBlob(Vec::new()))
+            .try_encode(&mut Vec::new()),
+        Err(EncodeError::EndpointBlobSize { len: 0, .. })
+    ));
+    // Decode: declared over-budget and zero lengths are refused before
+    // any allocation.
+    for len in [0u16, (ENDPOINT_BLOB_MAX_BYTES + 1) as u16] {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 16]); // request_id
+        payload.extend_from_slice(&[0u8; 32]); // lookup_digest
+        payload.extend_from_slice(&4u32.to_be_bytes()); // ttl
+        payload.push(EXT_ENDPOINT_FLAG);
+        payload.extend_from_slice(&len.to_be_bytes());
+        assert!(matches!(
+            CtrlFrame::decode(&wrap(0x0A, &payload)),
+            Err(DecodeError::EndpointBlobSize { .. })
+        ));
+    }
+    // Exactly-full 512-byte blob passes.
+    let full = sample_blob(0x62, ENDPOINT_BLOB_MAX_BYTES);
+    roundtrip_frame(
+        CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x42))).with_endpoint(full),
+    );
+}
+
+#[test]
+fn err_extension_flags_and_tag_rules() {
+    // Encode: extension fields are refused on non-extended tags.
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::Ping { nonce: [1; 16] })
+            .with_endpoint(sample_blob(1, 16))
+            .try_encode(&mut Vec::new()),
+        Err(EncodeError::BadExtension { ty: 0x1D })
+    ));
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::InviteRedeemOffered {
+            code_id: [3; 16],
+            code_revision: 1,
+            pairing_id: [4; 16],
+            redeemer_device_id: [5; 32],
+            redeem: redeem(0x50),
+        })
+        .with_max_redeems(1)
+        .try_encode(&mut Vec::new()),
+        Err(EncodeError::BadExtension { ty: 0x12 })
+    ));
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x51)))
+            .with_max_redeems(1)
+            .try_encode(&mut Vec::new()),
+        Err(EncodeError::BadExtension { ty: 0x10 })
+    ));
+    // Decode: undefined flag bits and the empty section are refused.
+    for flags in [0x00u8, 0x04, 0x03 | 0x08, 0xFF] {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&4u32.to_be_bytes());
+        payload.push(flags);
+        if flags & EXT_ENDPOINT_FLAG != 0 {
+            payload.extend_from_slice(&2u16.to_be_bytes());
+            payload.extend_from_slice(&[0xAA, 0xBB]);
+        }
+        if flags & EXT_MAX_REDEEMS_FLAG != 0 {
+            payload.extend_from_slice(&1u32.to_be_bytes());
+        }
+        assert!(
+            matches!(
+                CtrlFrame::decode(&wrap(0x0A, &payload)),
+                Err(DecodeError::BadExtensionFlags(f)) if f == flags
+            ),
+            "flags {flags:#04x} must be refused"
+        );
+    }
+    // Decode: the cap flag is illegal off the claim frame.
+    let request = redeem(0x52);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&request.request_id);
+    payload.extend_from_slice(&request.lookup_digest);
+    payload.extend_from_slice(&request.redeemer_nonce);
+    payload.extend_from_slice(&request.deadline_ms.to_be_bytes());
+    payload.extend_from_slice(&request.request_mac);
+    payload.extend_from_slice(&request.signature);
+    payload.push(EXT_MAX_REDEEMS_FLAG);
+    payload.extend_from_slice(&1u32.to_be_bytes());
+    assert!(matches!(
+        CtrlFrame::decode(&wrap(0x10, &payload)),
+        Err(DecodeError::BadExtension { ty: 0x10 })
+    ));
+    // Leftover bytes inside the section are trailing garbage.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; 16]);
+    payload.extend_from_slice(&[0u8; 32]);
+    payload.extend_from_slice(&4u32.to_be_bytes());
+    payload.push(EXT_ENDPOINT_FLAG);
+    payload.extend_from_slice(&2u16.to_be_bytes());
+    payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+    assert!(matches!(
+        CtrlFrame::decode(&wrap(0x0A, &payload)),
+        Err(DecodeError::Trailing(1))
+    ));
 }

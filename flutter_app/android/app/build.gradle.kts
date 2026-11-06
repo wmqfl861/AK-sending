@@ -27,6 +27,12 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Only the ABIs scripts/build_android_ffi.sh cross-compiles
+        // libak_ffi.so for (arm64 devices + x86_64 emulators). Without
+        // this filter the release APK also packaged Flutter's own
+        // armeabi-v7a libs WITHOUT libak_ffi.so — a 32-bit ARM phone
+        // would install that variant and die at System.loadLibrary.
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
     buildTypes {

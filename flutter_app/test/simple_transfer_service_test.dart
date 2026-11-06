@@ -785,5 +785,242 @@ void main() {
       await expectLater(pending, throwsStateError);
       expect(fake.runtimes[runtimeId], isNotNull); // untouched state
     });
+
+    test('R30-P1-01: a disposed service drainProgress never touches the '
+        'seam (the queued line stays queued)', () {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w31d');
+      fake.emitProgress('cd' * 16);
+      service.drainProgress();
+      expect(service.progressTick('cd' * 16), 1, reason: '存活时照常入账');
+      expect(fake.progressLines, isEmpty, reason: '存活时消费了该行');
+
+      service.dispose();
+      fake.emitProgress('cd' * 16);
+      service.drainProgress(); // the R30-P1-01 entry gate: a no-op
+      expect(service.progressTick('cd' * 16), 1,
+          reason: '释放后不得再入账任何进度');
+      expect(fake.progressLines, hasLength(1),
+          reason: '释放后零 native 调用：排队行必须原封不动');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Wave-31 review fixes (R30): pump-consumed progress renewal
+  // (R30-P2-01), request_closed + late-incoming refusal (R30-P2-03), and
+  // the joiner-side code_id mapping (R30-P2-02).
+  // -------------------------------------------------------------------------
+
+  group('wave-31 R30-P2-01: pump-consumed progress still renews', () {
+    test('with the event pump at the PRODUCTION cadence, progress the '
+        'pump reads FIRST still renews the send stall budget', () async {
+      final fake = FakeAkTaskCalls(autoCompleteOps: false);
+      final receiver = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      receiver.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w31a');
+      final receiverRuntime = fake.runtimes.keys.first;
+      final receiverCodeFuture =
+          receiver.createCode(SimpleTransferRole.receiver);
+      fake.pumpOps(receiverRuntime);
+      final receiverCode = await receiverCodeFuture;
+
+      // The sender keeps BOTH production cadences: the 50 ms event pump
+      // reads every progress line FIRST and the 200 ms send waiter only
+      // ever observes the ticks the pump already credited — the exact
+      // dual-consumer timing a per-poll baseline erased (R30-P2-01).
+      final sender = SimpleTransferService(calls: fake);
+      sender.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w31b');
+      final senderRuntime = fake.runtimes.keys.last;
+      final joinFuture = sender.join(receiverCode.code);
+      fake.pumpOps(senderRuntime);
+      final joined = await joinFuture;
+      sender.pumpEvents();
+
+      final sendFuture = sender.sendFiles(joined.connId, const ['C:/big.bin'],
+          timeout: const Duration(milliseconds: 200));
+      final progress = Timer.periodic(const Duration(milliseconds: 25),
+          (_) => fake.emitProgress(joined.connId));
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      fake.pumpOps(senderRuntime); // the long transfer finally completes
+      final report = await sendFuture;
+      progress.cancel();
+      expect(report['files'], 1,
+          reason: '被事件泵先读走的进度也必须续期（R30-P2-01）');
+      receiver.dispose();
+      sender.dispose();
+    });
+  });
+
+  group('wave-31 R30-P2-02: the joiner learns the pairing code_id', () {
+    test('a JOINER (receiver of a sender-minted code) fills '
+        'codeIdOfConnection from the join result / connected event',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final creator = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      creator.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w31c');
+      final created =
+          await creator.createCode(SimpleTransferRole.sender);
+
+      final joiner = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      joiner.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w31e');
+      final joined = await joiner.join(created.code);
+      expect(joiner.codeIdOfConnection(joined.connId), created.codeId,
+          reason: '加入方也必须知道配对 code_id（join 结果/connected 事件）');
+      joiner.pumpEvents(); // the connected event path fills it too
+      expect(joiner.codeIdOfConnection(joined.connId), created.codeId);
+      creator.dispose();
+      joiner.dispose();
+    });
+  });
+
+  group('wave-31 R30-P2-03: request_closed and late incomings', () {
+    test('request_closed closes a pending banner (the engine fact, no '
+        'connection event needed)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+
+      final requests = <SimpleIncomingRequest>[];
+      final expired = <String>[];
+      final reqSub = service.incomingRequests.listen(requests.add);
+      final expSub = service.expiredIncomingRequests.listen(expired.add);
+      final job = fake.emitIncomingRequest(runtimeId,
+          connId: joined.connId, files: 1, bytes: 10);
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(requests, hasLength(1));
+
+      // The engine resolved the parked offer with the connection's
+      // disconnect (decline_pending_of_conn) — before/without any
+      // `disconnected` event being pumped.
+      fake.closePendingRequest(runtimeId, job, connId: joined.connId);
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(expired, [job],
+          reason: 'request_closed 必须关闭 pending 横幅（R30-P2-03）');
+      expect(await service.consent(job, accept: true), isFalse,
+          reason: '请求已终结：迟到决定为 no-op');
+      await reqSub.cancel();
+      await expSub.cancel();
+      service.dispose();
+    });
+
+    test('terminal-first race: disconnected → request_closed → the LATE '
+        'incoming is dropped — no permanent banner', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+
+      final requests = <SimpleIncomingRequest>[];
+      final expired = <String>[];
+      final reqSub = service.incomingRequests.listen(requests.add);
+      final expSub = service.expiredIncomingRequests.listen(expired.add);
+
+      // The exact native interleave of R30-P2-03: the register_consent
+      // worker inserted the pending entry and released the lock; the
+      // disconnect publishes the data-plane terminal fact, then the
+      // request-closure fact; the worker's synchronous callback finishes
+      // and publishes the LATE incoming announcement.
+      final job = 'ab' * 16;
+      fake.runtimes[runtimeId]!.events
+          .add(<String, dynamic>{'event': 'disconnected', 'conn': joined.connId, 'reason': 'peer'});
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'request_closed',
+        'job': job,
+        'conn': joined.connId,
+        'reason': 'disconnected',
+      });
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'incoming_request',
+        'job': job,
+        'conn': joined.connId,
+        'root': 'x',
+        'files': 1,
+        'bytes': 1,
+        'saveDir': 'D:/x',
+      });
+      service.pumpEvents();
+      await pumpEventQueue();
+
+      expect(requests, isEmpty,
+          reason: '迟到 incoming 不得再开待同意横幅（R30-P2-03）');
+      expect(expired, [job],
+          reason: 'request_closed 关闭了对应请求');
+      await reqSub.cancel();
+      await expSub.cancel();
+      service.dispose();
+    });
+
+    test('a late incoming on an ALREADY-terminal connection is dropped '
+        'even without request_closed', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+
+      final requests = <SimpleIncomingRequest>[];
+      final expired = <String>[];
+      final reqSub = service.incomingRequests.listen(requests.add);
+      final expSub = service.expiredIncomingRequests.listen(expired.add);
+
+      // The connection died with NO pending request yet; the worker's
+      // late announcement follows on the same (now terminal) conn.
+      fake.runtimes[runtimeId]!.events
+          .add(<String, dynamic>{'event': 'disconnected', 'conn': joined.connId, 'reason': 'peer'});
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'disconnected');
+
+      fake.emitIncomingRequest(runtimeId,
+          connId: joined.connId, files: 1, bytes: 10);
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(requests, isEmpty,
+          reason: '其连接已数据面终态的 incoming 必须丢弃');
+      expect(expired, isEmpty,
+          reason: '该请求从未登记，也不应发到期事件');
+      // A HEALTHY connection's incoming still registers (the guard must
+      // not over-block): re-join on a fresh code and offer again.
+      final created2 = await service.createCode(SimpleTransferRole.receiver);
+      final joined2 = await service.join(created2.code);
+      service.pumpEvents();
+      fake.emitIncomingRequest(runtimeId,
+          connId: joined2.connId, files: 1, bytes: 10);
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(requests, hasLength(1),
+          reason: '健康连接上的 incoming 照常登记');
+      await reqSub.cancel();
+      await expSub.cancel();
+      service.dispose();
+    });
   });
 }

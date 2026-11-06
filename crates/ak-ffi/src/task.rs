@@ -32,8 +32,10 @@
 //!   every task runtime) — the join/disconnect bookkeeping both sides of
 //!   a pairing mutate;
 //! * the engine-wide progress queue (`ak_poll_progress`) — send/receive
-//!   progress lines flow into it under the conn/code id as the `job`
-//!   field, exactly like the scheduler executor's per-task lines.
+//!   progress lines flow into it under the CONNECTION id as the `job`
+//!   field (wave-31 R30-P2-02: both directions — the pairing
+//!   transaction's id is the one correlation key both sides hold),
+//!   exactly like the scheduler executor's per-task lines.
 //!
 //! # The registry relay (wave-28 closeout: the ak-session task API)
 //!
@@ -146,6 +148,12 @@
 //!   (a timer task, not a blocked thread), the runtime tears down, or
 //!   the connection disconnects. The peer is told over the wire
 //!   (DECLINED semantics); on a decline nothing is written to disk.
+//!   Wave-31 R30-P2-03: the pending insert and the `incoming_request`
+//!   publication are ONE critical section with the connection's
+//!   liveness re-checked inside it — an offer registered on an
+//!   already-closed connection is refused without any event, so a late
+//!   `incoming_request` after `request_closed` is structurally
+//!   impossible.
 //! * The resident receiver (wave-29 P2-05/P2-06) — ONE endpoint (one
 //!   advertised port) serves a LOOP of connections: unauthorized dials
 //!   are rejected and the loop keeps listening (they never consume the
@@ -154,7 +162,12 @@
 //!   single-transfer task's terminal state (both sides converge their
 //!   connection entries to `disconnected`). The save folder is resolved
 //!   from the runtime's CURRENT setting each time a transfer starts, so
-//!   `ak_task_set_save_dir` applies to every subsequent task.
+//!   `ak_task_set_save_dir` applies to every subsequent task; wave-31
+//!   P2-06 makes that ONE immutable binding per transfer — the
+//!   `incoming_request` event's `saveDir` and the `done` event's
+//!   `saveDir` carry the very directory the engine's `ReceiveSpec`
+//!   writes into (never a second, skewable read of the setting; a change
+//!   during the pending-consent window applies to the NEXT request).
 //! * `ak_task_list` / `ak_task_disconnect` / `ak_task_set_save_dir` /
 //!   `ak_task_consent` — real state, real bilateral `disconnected` events
 //!   (registry revoke + TASK-CLOSE + event pump; a same-engine peer
@@ -775,10 +788,34 @@ impl TaskRt {
 /// connection. The frozen `window` auto-decline runs as its own timer
 /// task; a runtime teardown or a disconnect of the attributed connection
 /// resolves the request by removing the entry.
+///
+/// `save_dir` is the transfer's BOUND target (wave-31 P2-06): the ONE
+/// directory binding the resident receiver resolved when this
+/// connection was accepted — the same value the engine's `ReceiveSpec`
+/// writes into and the `done` event reports. The event never re-reads
+/// the global setting, so the banner, the disk result and the terminal
+/// event can never disagree.
+///
+/// Wave-31 R30-P2-03: the pending INSERT and the `incoming_request`
+/// PUBLICATION are ONE critical section on the pending table, with the
+/// connection's liveness re-checked INSIDE it (lock order: pending →
+/// conns and pending → events, nested nowhere in reverse —
+/// [`TaskRt::decline_pending_of_conn`] and the expiry timer take the
+/// pending lock alone, and [`task_disconnect`] releases the conns lock
+/// before its decline path runs). A disconnect that races the
+/// registration therefore always lands on one side of the section:
+/// either it severed the connection first — the re-check sees
+/// `Disconnected`, the offer is refused on the spot and NO
+/// `incoming_request` ever surfaces for the dead request — or the entry
+/// is already inserted and published, in which case the decline's
+/// `request_closed` (emitted under the SAME lock) can only land AFTER
+/// the `incoming_request`. A late incoming after `request_closed` is
+/// structurally impossible.
 fn register_consent(
     rt: &Arc<TaskRt>,
     code_id: &[u8; 16],
     info: &ConsentInfo,
+    save_dir: &std::path::Path,
     window: Duration,
 ) -> ConsentAnswer {
     if rt.is_stopped() {
@@ -796,6 +833,24 @@ fn register_consent(
         let Ok(mut pending) = rt.pending.lock() else {
             return ConsentAnswer::Now(false);
         };
+        // Liveness re-check INSIDE the critical section (wave-31
+        // R30-P2-03): the attribution above ran without the pending lock,
+        // and a concurrent disconnect may have severed the connection in
+        // that window. An offer on an already-closed connection is
+        // refused here — no pending entry, no event, the parked receive
+        // fails closed on the vanished oneshot.
+        let still_live = rt
+            .conns
+            .lock()
+            .map(|conns| {
+                conns
+                    .get(&conn.conn_id)
+                    .is_some_and(|entry| entry.state != ConnState::Disconnected)
+            })
+            .unwrap_or(false);
+        if !still_live {
+            return ConsentAnswer::Now(false);
+        }
         pending.insert(
             job,
             PendingConsent {
@@ -803,34 +858,31 @@ fn register_consent(
                 sender,
             },
         );
+        // Published while STILL holding the pending lock — the same
+        // ordering discipline `decline_pending_of_conn` uses for
+        // `request_closed`, so the two lines are totally ordered by the
+        // one lock that guards the request's existence.
+        let mut line = String::with_capacity(192);
+        line.push_str(&format!(
+            "{{\"event\":\"incoming_request\",\"job\":\"{}\",\"conn\":\"{}\"",
+            core::hex_encode(&job),
+            core::hex_encode(&conn.conn_id),
+        ));
+        // saveDir (wave-31 P2-06): the transfer's ONE binding — resolved
+        // by the resident receiver when the connection was accepted, the
+        // same directory the engine's ReceiveSpec writes into. Not a
+        // fresh read of the global setting: the banner can only ever
+        // show the target that is actually used.
+        line.push_str(&format!(
+            ",\"root\":{},\"files\":{},\"bytes\":{},\"saveDir\":{}",
+            crate::core::json::quoted(&info.root_name),
+            info.file_count,
+            info.total_bytes,
+            crate::core::json::quoted(&save_dir.to_string_lossy()),
+        ));
+        line.push('}');
+        rt.push_event(line);
     }
-    let mut line = String::with_capacity(192);
-    line.push_str(&format!(
-        "{{\"event\":\"incoming_request\",\"job\":\"{}\",\"conn\":\"{}\"",
-        core::hex_encode(&job),
-        core::hex_encode(&conn.conn_id),
-    ));
-    // saveDir: the snapshot of where THIS request will land (wave-30
-    // P2-06 residual): the UI banner shows the real target — the value
-    // the transfer will actually use when consented (resolved per task
-    // at accept time; the event reflects the snapshot at offer time).
-    line.push_str(&format!(
-        ",\"root\":{},\"files\":{},\"bytes\":{},\"saveDir\":{}",
-        crate::core::json::quoted(&info.root_name),
-        info.file_count,
-        info.total_bytes,
-        {
-            let text = rt
-                .save_dir
-                .lock()
-                .expect("save dir lock")
-                .to_string_lossy()
-                .into_owned();
-            crate::core::json::quoted(&text)
-        }
-    ));
-    line.push('}');
-    rt.push_event(line);
     // The frozen 30 s auto-decline: a timer task, never a blocked thread.
     // Wave-30 P2-11 residual: the expiry is a REQUEST-TERMINAL event, not
     // just a silent resolution — the native source of truth the UI mirror
@@ -1386,8 +1438,12 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
         );
     }
     rt.push_event(format!(
-        "{{\"event\":\"connected\",\"conn\":\"{}\",\"role\":{},\"peer_endpoint\":{endpoint},\"code\":{}}}",
+        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{endpoint},\"code\":{}}}",
         core::hex_encode(&conn_id),
+        // Wave-31 R30-P2-02: both sides of the pairing share the SAME
+        // code id — the joiner (which never saw the create result) fills
+        // its conn→code mapping from this field.
+        core::hex_encode(&code_id),
         quoted(role.as_str()),
         quoted(&display),
     ));
@@ -2664,37 +2720,40 @@ async fn run_resident_receiver(
         Err(_) => return,
     };
     let _ = first_addr.send(bound);
-    // Progress lines ride under the CURRENT code id (the registry id once
-    // the claim/redeem that owns this receiver filled the slot).
+    // Progress lines ride under the CONNECTION id (wave-31 R30-P2-02):
+    // the pairing transaction's id is the ONE correlation key both sides
+    // of a pairing hold — the sender's rows already use it, and a joiner
+    // that typed someone else's code never learns the code id at all, so
+    // the Dart side maps receive progress by conn id alone. The current
+    // code id (the registry id once the claim/redeem that owns this
+    // receiver filled the slot) resolves the connection entry; entries
+    // are never removed, so a started transfer always finds its conn.
     let progress_queue = Arc::clone(&rt.engine_progress);
     let progress_slot = Arc::clone(&code_slot);
+    let progress_rt = Arc::clone(&rt);
     let progress = move |event: Progress| {
         let code_id = progress_slot
             .lock()
             .map(|slot| *slot)
             .unwrap_or_else(|poisoned| *poisoned.into_inner());
+        let job = progress_rt
+            .conn_of_code(&code_id)
+            .map(|conn| core::hex_encode(&conn.conn_id))
+            // Unreachable for a started transfer (consent already
+            // required a fingerprint-matched, live connection entry);
+            // keep a diagnosable code-id row rather than dropping the
+            // event silently.
+            .unwrap_or_else(|| core::hex_encode(&code_id));
         if let Ok(mut queue) = progress_queue.lock() {
             core::push_capped(
                 &mut queue,
                 format!(
                     "{{\"job\":{},\"event\":{}}}",
-                    quoted(&core::hex_encode(&code_id)),
+                    quoted(&job),
                     quoted(core::progress_name(&event)),
                 ),
             );
         }
-    };
-    // The non-blocking consent hook (P2-07): registers + returns pending.
-    let consent: TransferConsent = {
-        let rt = Arc::clone(&rt);
-        let code_slot = Arc::clone(&code_slot);
-        Arc::new(move |info: &ConsentInfo| {
-            let code_id = code_slot
-                .lock()
-                .map(|slot| *slot)
-                .unwrap_or_else(|poisoned| *poisoned.into_inner());
-            register_consent(&rt, &code_id, info, PENDING_CONSENT_WINDOW)
-        })
     };
     loop {
         if rt.is_stopped() {
@@ -2737,16 +2796,26 @@ async fn run_resident_receiver(
                 // fact, never a listener verdict: record the bounded
                 // event and keep serving; the listener only ends with a
                 // task terminal state above or the endpoint's own death.
+                // Wave-31 (R30-P3-01): the field is `code_id` (a 32hex
+                // task-code id STRING, no conn — an unpaired dial has no
+                // attributable connection), matching the frozen
+                // contract shape and the Dart typed parser.
                 rt.push_event(format!(
-                    "{{\"event\":\"handshake_failed\",\"code\":\"{}\",\"reason\":{}}}",
+                    "{{\"event\":\"handshake_failed\",\"code_id\":\"{}\",\"reason\":{}}}",
                     core::hex_encode(&current_code()),
                     quoted(handshake_failure_word(&failure)),
                 ));
                 continue;
             }
         };
-        // P2-06: resolve the save folder NOW (each transfer start), not
-        // at code-creation time.
+        // P2-06 (wave-31): the save folder is resolved ONCE per transfer
+        // start — the moment this connection is accepted — and that ONE
+        // binding is what the engine's ReceiveSpec writes into, what the
+        // consent event shows and what `done` reports. No second read of
+        // the global setting can skew them: a `set_save_dir` during the
+        // pending window applies to the NEXT request, never the
+        // in-flight one (the immutable-binding semantics the wave-28
+        // report blessed for this fix).
         let out_dir = match rt.save_dir.lock() {
             Ok(dir) => dir.clone(),
             Err(_) => return,
@@ -2755,20 +2824,43 @@ async fn run_resident_receiver(
         // (created at start/set time; re-created best-effort here in case
         // it was removed).
         let _ = std::fs::create_dir_all(&out_dir);
-        let mut spec = ReceiveSpec::new(out_dir, identity.clone());
+        let mut spec = ReceiveSpec::new(out_dir.clone(), identity.clone());
         spec.checkpoint_dir = rt.id_dir.join("checkpoints");
         spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
         spec.idle_timeout = TASK_SEND_IDLE;
-        let result = receive_accepted_consent(channel, spec, &progress, Some(Arc::clone(&consent))).await;
+        // The non-blocking consent hook (P2-07): registers + returns
+        // pending. Built PER CONNECTION so the event's saveDir is THIS
+        // transfer's binding (wave-31 P2-06) — the loop serves one
+        // connection at a time, so the capture cannot race a later one.
+        let consent: TransferConsent = {
+            let rt = Arc::clone(&rt);
+            let code_slot = Arc::clone(&code_slot);
+            let bound_dir = out_dir.clone();
+            Arc::new(move |info: &ConsentInfo| {
+                let code_id = code_slot
+                    .lock()
+                    .map(|slot| *slot)
+                    .unwrap_or_else(|poisoned| *poisoned.into_inner());
+                register_consent(&rt, &code_id, info, &bound_dir, PENDING_CONSENT_WINDOW)
+            })
+        };
+        let result = receive_accepted_consent(channel, spec, &progress, Some(consent)).await;
         match result {
             Ok(report) => {
                 // The single-transfer terminal state: report and converge.
                 let conn = rt.conn_of_code(&current_code());
-                let mut line = String::with_capacity(128);
+                let mut line = String::with_capacity(160);
                 line.push_str("{\"event\":\"done\"");
                 if let Some(conn) = &conn {
                     line.push_str(&format!(",\"conn\":\"{}\"", core::hex_encode(&conn.conn_id)));
                 }
+                // saveDir (wave-31 P2-06): the ACTUAL landing directory —
+                // the same binding the consent event showed, so the UI
+                // can display the real result of the finished transfer.
+                line.push_str(&format!(
+                    ",\"saveDir\":{}",
+                    quoted(&out_dir.to_string_lossy()),
+                ));
                 line.push_str(&format!(
                     ",\"files\":{},\"bytes\":{}}}",
                     report.files, report.bytes,
@@ -2940,8 +3032,11 @@ async fn run_join(
         .map(|addr| quoted(&addr.to_string()))
         .unwrap_or_else(|| "null".to_string());
     rt.push_event(format!(
-        "{{\"event\":\"connected\",\"conn\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"code\":{}}}",
+        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"code\":{}}}",
         core::hex_encode(&conn_id),
+        // Wave-31 R30-P2-02: the shared code id rides the joiner's
+        // `connected` event too (same value as the owner's).
+        core::hex_encode(&code_id),
         quoted(my_role.as_str()),
         endpoint,
         quoted(code),
@@ -2954,8 +3049,12 @@ async fn run_join(
     settle_probe_state(rt, &conn_id, &outcome);
     rt.push_event(probe_line);
     Ok(format!(
-        "{{\"op\":\"task_join\",\"conn\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"probe\":\"{verdict}\"}}",
+        "{{\"op\":\"task_join\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"probe\":\"{verdict}\"}}",
         core::hex_encode(&conn_id),
+        // Wave-31 R30-P2-02: the join result carries the redeemed code's
+        // registry id — a joiner that never saw the create result fills
+        // its conn→code (and progress-correlation) mapping from here.
+        core::hex_encode(&code_id),
         quoted(my_role.as_str()),
         endpoint,
     ))
@@ -4225,7 +4324,13 @@ mod task_tests {
         let started = Instant::now();
         // A stopped runtime: immediate decline, nothing registered.
         assert!(matches!(
-            register_consent(&rt, &[0u8; 16], &info, PENDING_CONSENT_WINDOW),
+            register_consent(
+                &rt,
+                &[0u8; 16],
+                &info,
+                std::path::Path::new("D:/unused"),
+                PENDING_CONSENT_WINDOW
+            ),
             ConsentAnswer::Now(false),
         ));
         // A live runtime without the paired connection of that sender:
@@ -4240,7 +4345,13 @@ mod task_tests {
         };
         let mut events = 0;
         assert!(matches!(
-            register_consent(&rt_live, &code_id, &info, PENDING_CONSENT_WINDOW),
+            register_consent(
+                &rt_live,
+                &code_id,
+                &info,
+                std::path::Path::new("D:/unused"),
+                PENDING_CONSENT_WINDOW
+            ),
             ConsentAnswer::Now(false),
         ));
         if let Ok(queue) = rt_live.events.lock() {
@@ -5658,17 +5769,27 @@ mod task_tests {
         };
         let rt_for_close = Arc::clone(&rt);
         let rt_in = Arc::clone(&rt);
+        let bound_dir = dir.path().join("bound-inbox");
+        let bound_save_json = quoted(&bound_dir.to_string_lossy());
         let (expired_declined, closed_declined) = engine.runtime().block_on(async move {
             // Short window: the auto-decline fires while we await.
-            let ConsentAnswer::Pending(expiry_rx) =
-                register_consent(&rt_in, &code_id, &info, Duration::from_millis(300))
-            else {
+            let ConsentAnswer::Pending(expiry_rx) = register_consent(
+                &rt_in,
+                &code_id,
+                &info,
+                &bound_dir,
+                Duration::from_millis(300),
+            ) else {
                 panic!("the attributed offer must register as pending");
             };
             // Long window: only the connection's disconnect resolves it.
-            let ConsentAnswer::Pending(closed_rx) =
-                register_consent(&rt_in, &code_id, &info, Duration::from_secs(60))
-            else {
+            let ConsentAnswer::Pending(closed_rx) = register_consent(
+                &rt_in,
+                &code_id,
+                &info,
+                &bound_dir,
+                Duration::from_secs(60),
+            ) else {
                 panic!("the second offer must register as pending");
             };
             let expired = expiry_rx.await.unwrap_or(false);
@@ -5703,10 +5824,446 @@ mod task_tests {
                 && line.contains(&conn_hex)),
             "the disconnect closes its pending request visibly: {events:?}"
         );
+        // Wave-31 P2-06: the consent event carries the transfer's BOUND
+        // save dir — the one binding, not a fresh read of the setting.
+        assert!(
+            events.iter().any(|line| line.contains("\"event\":\"incoming_request\"")
+                && line.contains(&format!("\"saveDir\":{bound_save_json}"))),
+            "the consent event carries the bound save dir: {events:?}"
+        );
         // Decided requests answer the frozen -4.
         let decided = task_consent(&engine, &runtime, &expired_job, true);
         assert!(decided.is_err(), "the expired request is already decided");
         assert_eq!(decided.err().map(|e| e.code), Some(crate::core::AK_ERR_NOT_FOUND));
+    }
+
+    // -- wave-31 review findings (R30-P2-02, R30-P2-03, P2-06 residual) ----
+
+    /// Poll an OWNED runtime's event queue until one event whose body
+    /// contains `needle` arrives (draining older events like `wait_event`).
+    fn wait_owned_event(rt: &Arc<TaskRt>, needle: &str) -> String {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let popped = rt
+                .events
+                .lock()
+                .ok()
+                .and_then(|mut queue| queue.pop_front());
+            if let Some(line) = popped {
+                if line.contains(needle) {
+                    return line;
+                }
+                continue;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// R30-P2-02: both sides of a pairing share the SAME code id — the
+    /// join result and BOTH `connected` events (the owner's from its
+    /// resident owner loop, the joiner's from its own bookkeeping) carry
+    /// the create result's registry code id, so a joiner that typed the
+    /// code (and never saw the create result) can fill its conn→code
+    /// mapping.
+    #[test]
+    fn connected_events_and_join_result_carry_the_shared_code_id() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let code_id_hex = core::hex_encode(&code_id_of(&json));
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        assert!(
+            join_json.contains(&format!("\"code_id\":\"{code_id_hex}\"")),
+            "the join result carries the redeemed code's id: {join_json}"
+        );
+        let on_owner = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+        assert!(
+            on_owner.contains(&format!("\"code_id\":\"{code_id_hex}\"")),
+            "the owner's connected event carries the shared code id: {on_owner}"
+        );
+        let on_joiner = wait_event(engine_b, &joiner, "\"event\":\"connected\"");
+        assert!(
+            on_joiner.contains(&format!("\"code_id\":\"{code_id_hex}\"")),
+            "the joiner's connected event carries the shared code id: {on_joiner}"
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// R30-P2-02 (the progress-key migration): receive progress rows ride
+    /// under the CONNECTION id — the one correlation key both sides of a
+    /// pairing hold — exactly like the sender's rows; no receive row may
+    /// surface under the code id (the joiner's Dart side maps progress by
+    /// conn id alone and would never see a code-id row).
+    #[test]
+    fn receive_progress_rows_ride_under_the_connection_id() {
+        let registry = TestRegistry::spawn();
+        let engine_a = Arc::new(AkEngine::new().expect("engine a"));
+        let engine_b = Arc::new(AkEngine::new().expect("engine b"));
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = task_start(&engine_a, &registry_spec(&registry, dir_a.path())).expect("rt");
+        let rt_a = task_runtime_of(&engine_a, &owner).expect("task runtime");
+        let joiner = task_start(&engine_b, &registry_spec(&registry, dir_b.path())).expect("rt2");
+        let create_op = task_create_code_start(
+            &engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        )
+        .expect("create accepted");
+        let (ok, json) = wait_op_owned(&engine_a, &owner, &create_op);
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let code_id_hex = core::hex_encode(&code_id_of(&json));
+        let join_op = task_join_start(
+            &engine_b,
+            &joiner,
+            &format!("{{\"spec_version\":1,\"code\":\"{code}\",\"role\":\"sender\"}}"),
+        )
+        .expect("join accepted");
+        let (join_ok, join_json) = wait_op_owned(&engine_b, &joiner, &join_op);
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        // The owner's connection entry (its receiver admission is bound to
+        // it) arrives with the owner-loop completion.
+        let _ = wait_owned_event(&rt_a, "\"event\":\"connected\"");
+
+        let payload = b"progress-key migration payload".repeat(64);
+        std::fs::write(dir_b.path().join("job.bin"), &payload).expect("source file");
+        let send_op = task_send_start(
+            &engine_b,
+            &joiner,
+            &conn,
+            &json_paths(&dir_b.path().join("job.bin")),
+        )
+        .expect("send accepted");
+        let request = wait_owned_event(&rt_a, "incoming_request");
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        task_consent(&engine_a, &owner, &job, true).expect("consent");
+        let (send_ok, send_json) = wait_op_owned(&engine_b, &joiner, &send_op);
+        assert!(send_ok, "the transfer completes: {send_json}");
+        let _ = wait_owned_event(&rt_a, "\"event\":\"done\"");
+
+        // The RECEIVER's progress rows: keyed by the conn id, never the
+        // code id (rows survive completion in the engine-wide queue).
+        let conn_hex = core::hex_encode(&conn);
+        let recv_rows: Vec<String> = rt_a
+            .engine_progress
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            recv_rows.iter().any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))
+                && row.contains("\"event\":\"accepted\"")),
+            "receive progress rides under the connection id: {recv_rows:?}"
+        );
+        assert!(
+            recv_rows.iter().all(|row| !row.contains(&format!("\"job\":\"{code_id_hex}\""))),
+            "no receive row may ride under the code id: {recv_rows:?}"
+        );
+        // The SENDER's rows on its own engine share the SAME key.
+        let rt_b = task_runtime_of(&engine_b, &joiner).expect("joiner runtime");
+        let send_rows: Vec<String> = rt_b
+            .engine_progress
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            send_rows.iter().any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))),
+            "send progress keeps the connection-id key: {send_rows:?}"
+        );
+    }
+
+    /// R30-P2-03 (deterministic half): an offer registered on an
+    /// already-closed connection — the report's interleaving with the
+    /// disconnect's conns flip landed first — is refused inside the
+    /// registration's critical section: NO `incoming_request` surfaces,
+    /// nothing stays pending, and any consent for the never-published
+    /// request answers the frozen `-4`.
+    #[test]
+    fn register_consent_on_a_closed_connection_publishes_nothing() {
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &spec_for(dir.path())).expect("rt");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let code_id = [7u8; 16];
+        let conn_id = [9u8; 16];
+        let sender_fp = DeviceKeyPair::generate().fingerprint();
+        {
+            let mut conns = rt.conns.lock().expect("conn table");
+            conns.insert(
+                conn_id,
+                TaskConn {
+                    conn_id,
+                    role: TaskRole::Receiver,
+                    state: ConnState::Connected,
+                    candidates: Vec::new(),
+                    peer_endpoint: None,
+                    peer_fp: Some(sender_fp),
+                    code_id,
+                    code: "AKI1-TEST".into(),
+                },
+            );
+        }
+        // The disconnect's first half (flip + `disconnected` line) and its
+        // pending decline BOTH complete before the registration runs.
+        rt.push_disconnected_once(&conn_id, "local");
+        rt.decline_pending_of_conn(&conn_id);
+        let info = ConsentInfo {
+            job_id: [0u8; 16],
+            root_name: "late.bin".into(),
+            file_count: 1,
+            total_bytes: 16,
+            sender_fingerprint: sender_fp,
+        };
+        let reg_rt = Arc::clone(&rt);
+        let answer = engine.runtime().block_on(async move {
+            register_consent(
+                &reg_rt,
+                &code_id,
+                &info,
+                std::path::Path::new("D:/unused"),
+                Duration::from_secs(60),
+            )
+        });
+        assert!(
+            matches!(answer, ConsentAnswer::Now(false)),
+            "an offer on a closed connection is refused on the spot"
+        );
+        let events: Vec<String> = rt
+            .events
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            !events.iter().any(|line| line.contains("incoming_request")),
+            "no incoming_request may surface for a dead request: {events:?}"
+        );
+        assert!(
+            rt.pending.lock().map(|pending| pending.is_empty()).unwrap_or(false),
+            "nothing stays pending"
+        );
+        let decided = task_consent(&engine, &runtime, &[1u8; 16], true);
+        assert_eq!(
+            decided.err().map(|error| error.code),
+            Some(crate::core::AK_ERR_NOT_FOUND)
+        );
+    }
+
+    /// R30-P2-03 (race half): a registration racing a disconnect of its
+    /// connection — many real thread interleavings of the exact window
+    /// (pending insert vs. flip + decline) — can never leave a published
+    /// `incoming_request` without its `request_closed` landing LATER in
+    /// the same window, and never leaves a pending entry behind.
+    #[test]
+    fn disconnect_register_race_never_surfaces_a_late_incoming() {
+        let engine = Arc::new(AkEngine::new().expect("engine"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &spec_for(dir.path())).expect("rt");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let code_id = [7u8; 16];
+        let conn_id = [9u8; 16];
+        let sender_fp = DeviceKeyPair::generate().fingerprint();
+        {
+            let mut conns = rt.conns.lock().expect("conn table");
+            conns.insert(
+                conn_id,
+                TaskConn {
+                    conn_id,
+                    role: TaskRole::Receiver,
+                    state: ConnState::Connected,
+                    candidates: Vec::new(),
+                    peer_endpoint: None,
+                    peer_fp: Some(sender_fp),
+                    code_id,
+                    code: "AKI1-TEST".into(),
+                },
+            );
+        }
+        let info = ConsentInfo {
+            job_id: [0u8; 16],
+            root_name: "race.bin".into(),
+            file_count: 1,
+            total_bytes: 16,
+            sender_fingerprint: sender_fp,
+        };
+        for _round in 0..64 {
+            // Re-arm the connection (the previous round severed it).
+            rt.conns
+                .lock()
+                .expect("conn table")
+                .get_mut(&conn_id)
+                .expect("conn entry")
+                .state = ConnState::Connected;
+            let base = rt.events.lock().expect("event queue").len();
+            let reg_rt = Arc::clone(&rt);
+            let reg_engine = Arc::clone(&engine);
+            let reg_info = info.clone();
+            let close_rt = Arc::clone(&rt);
+            let registrar = thread::spawn(move || {
+                reg_engine.runtime().block_on(async move {
+                    matches!(
+                        register_consent(
+                            &reg_rt,
+                            &code_id,
+                            &reg_info,
+                            std::path::Path::new("D:/unused"),
+                            Duration::from_millis(25),
+                        ),
+                        ConsentAnswer::Now(false)
+                    )
+                })
+            });
+            let closer = thread::spawn(move || {
+                // `task_disconnect`'s exact order: flip + `disconnected`
+                // line first, then the pending decline of the connection.
+                close_rt.push_disconnected_once(&conn_id, "local");
+                close_rt.decline_pending_of_conn(&conn_id);
+            });
+            let _refused = registrar.join().expect("registrar answered");
+            closer.join().expect("closer answered");
+            let events: Vec<String> = rt
+                .events
+                .lock()
+                .expect("event queue")
+                .iter()
+                .skip(base)
+                .cloned()
+                .collect();
+            for (index, line) in events.iter().enumerate() {
+                if line.contains("\"event\":\"incoming_request\"") {
+                    let job_hex = line
+                        .split("\"job\":\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .expect("job id");
+                    assert!(
+                        events[index + 1..].iter().any(|later| later
+                            .contains("\"event\":\"request_closed\"")
+                            && later.contains(&format!("\"job\":\"{job_hex}\""))),
+                        "every published request is closed LATER in its window: {events:?}"
+                    );
+                }
+            }
+            assert!(
+                rt.pending.lock().expect("pending table").is_empty(),
+                "no request survives the round"
+            );
+        }
+    }
+
+    /// P2-06 residual (wave-31): the save folder is ONE immutable binding
+    /// per transfer — resolved when the connection is accepted, carried
+    /// identically by the `incoming_request` event, the engine's actual
+    /// writes and the `done` event. Changing the setting DURING the
+    /// pending-consent window cannot skew them: the in-flight transfer
+    /// lands in its bound folder and `done` reports exactly that.
+    #[test]
+    fn save_dir_binding_is_immutable_across_the_consent_window() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let alpha = dir_a.path().join("alpha");
+        let alpha_text = alpha.to_string_lossy().replace('\\', "/");
+        let beta = dir_a.path().join("beta");
+        let beta_text = beta.to_string_lossy().replace('\\', "/");
+        let alpha_path = CString::new(alpha_text.clone()).expect("path CString");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), alpha_path.as_ptr()),
+            0
+        );
+
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+
+        let payload = b"immutable binding payload".repeat(64);
+        std::fs::write(dir_b.path().join("bound.bin"), &payload).expect("source file");
+        let paths = CString::new(json_paths(&dir_b.path().join("bound.bin"))).unwrap();
+        let mut send_op = [0u8; 16];
+        assert_eq!(
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                send_op.as_mut_ptr()
+            ),
+            0
+        );
+        // The banner's saveDir is the transfer's binding (alpha) — not a
+        // fresh read of the setting.
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        assert!(
+            request.contains(&format!("\"saveDir\":\"{alpha_text}\"")),
+            "the consent event shows the bound target: {request}"
+        );
+        // The user changes the setting DURING the pending window.
+        let beta_path = CString::new(beta_text.clone()).expect("path CString");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), beta_path.as_ptr()),
+            0
+        );
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
+        assert!(send_ok, "{send_json}");
+
+        // The in-flight transfer landed in its BOUND folder and `done`
+        // reports exactly that — the actual disk result, not the newer
+        // setting.
+        let delivered =
+            find_file(&alpha, "bound.bin").expect("the file lands in the bound folder");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        assert!(
+            find_file(&beta, "bound.bin").is_none(),
+            "a mid-pending setting change cannot move the in-flight transfer"
+        );
+        let done = wait_event(engine_a, &owner, "\"event\":\"done\"");
+        assert!(
+            done.contains(&format!("\"saveDir\":\"{alpha_text}\"")),
+            "done reports the actual landing dir: {done}"
+        );
+        assert!(
+            !done.contains(&format!("\"saveDir\":\"{beta_text}\"")),
+            "done never reports a dir the transfer did not use: {done}"
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
     }
 
     // -- helpers --------------------------------------------------------------

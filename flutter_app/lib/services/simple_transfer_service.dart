@@ -84,6 +84,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskEvent,
         TaskIncomingRequestEvent,
         TaskProbeResultEvent,
+        TaskRequestClosedEvent,
         TaskRuntimeFfi,
         TaskFfi;
 
@@ -286,10 +287,13 @@ final class SimpleTransferService {
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
 
-  /// Wave-30 P2-04: the code ids this runtime minted, by normalized code
-  /// key — the cancel keys for un-joined codes, and the receive-progress
-  /// job ids of the P2-10 stall budgets (a receive row keys its progress
-  /// by the CODE id, a send row by the connection id).
+  /// Wave-30 P2-04: the code ids this runtime's pairings used, by
+  /// normalized code key — the cancel keys for un-joined codes. Both
+  /// sides of a pairing fill it since wave-31 (R30-P2-02): the creator
+  /// at mint time, the joiner from the join result / `connected` event's
+  /// `code_id` field. (Task-plane progress rows themselves are keyed by
+  /// the CONNECTION id since the wave-31 ffi-v2 §8.4 revision — this
+  /// table stays the pairing correlation, not the progress key.)
   final Map<String, String> _codeIdOfKey = <String, String>{};
 
   /// Wave-30 P2-10: monotonic per-job progress ticks fed by the
@@ -305,6 +309,17 @@ final class SimpleTransferService {
   /// connection; the banner must close, not wait for an event that will
   /// never come).
   final Map<String, String?> _pendingJobs = <String, String?>{};
+
+  /// Wave-31 R30-P2-03: jobs whose request became TERMINAL undecided —
+  /// the bounded record that refuses a LATE `incoming_request` (the
+  /// native register/publish race: the request was closed before its
+  /// announcement could be pumped). FIFO-bounded like every native
+  /// cache; a native job id is minted per registration, so a bounded
+  /// recent record is exact for the race it guards.
+  final Map<String, String?> _closedJobs = <String, String?>{};
+
+  /// The bound of [_closedJobs] (the endpoint-cache pattern).
+  static const int _closedJobsCap = 256;
 
   bool _disposed = false;
 
@@ -444,6 +459,14 @@ final class SimpleTransferService {
         ensureLive: _ensureLive,
       );
       final connId = result['conn'] as String;
+      // Wave-31 R30-P2-02: the join result carries the pairing's
+      // `code_id` (native lands the field in parallel) — a JOINER learns
+      // here the same correlation key the creator minted, so both sides
+      // share one key for the pairing's facts.
+      final joinedCodeId = result['code_id'] as String?;
+      if (joinedCodeId != null && joinedCodeId.isNotEmpty) {
+        _codeIdOfKey[_codeKey(code)] = joinedCodeId;
+      }
       _upsert(
         connId: connId,
         role: result['role'] as String?,
@@ -536,6 +559,14 @@ final class SimpleTransferService {
   /// issued, and the rethrown [TimeoutException] reports HONESTLY: when
   /// the cancel itself fails, the message says the transfer may still be
   /// running in the background instead of claiming it was cancelled.
+  ///
+  /// Wave-31 R30-P2-01: the renewal fact is "did bytes move since THIS
+  /// waiter's previous observation" — the ledger below lives across the
+  /// waiter's polls, so progress lines the 50 ms event pump drained
+  /// between two waiter polls still renew (the waiter and the pump
+  /// credit the SAME monotonic ticks; a per-poll baseline would fold the
+  /// pump-credited ticks into the new normal and report `false`
+  /// forever).
   Future<Map<String, dynamic>> sendFiles(
     String connId,
     List<String> paths, {
@@ -543,13 +574,14 @@ final class SimpleTransferService {
   }) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
+    final lastSeen = <String, int>{}; // THIS waiter's cross-poll ledger
     try {
       return await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
             interval: opPollInterval,
             timeout: timeout,
             delay: _delay,
             ensureLive: _ensureLive,
-            onPoll: () => _progressAdvancedFor(<String>[connId]),
+            onPoll: () => _progressAdvancedSince(lastSeen, <String>[connId]),
           );
     } on TimeoutException {
       final cancelFailure = _tryCancelTaskConnection(runtime, connId);
@@ -626,7 +658,14 @@ final class SimpleTransferService {
   /// `ak_poll_progress` queue into per-job ticks. Safe to call from the
   /// event pump and from the send/receive stall loops alike (each line
   /// is consumed exactly once and credited to its own job id).
+  ///
+  /// Wave-31 R30-P1-01: LIVENESS GATE at the entry — dispose invalidates
+  /// every call channel before the native owner is released, so a stall
+  /// loop's racing tick must never re-poll a freed engine pointer.
   void drainProgress() {
+    if (_disposed) {
+      return;
+    }
     final runtime = _runtime;
     if (runtime == null) {
       return;
@@ -654,22 +693,35 @@ final class SimpleTransferService {
   /// seen). Compare two reads to learn "did bytes move since I looked".
   int progressTick(String job) => _progressTicks[job] ?? 0;
 
-  /// True when any of [jobs] ticked since the caller's last baseline —
-  /// the deadline-renewal fact of the stall budgets. Drains the queue
-  /// first so pump-driven tests and live loops observe fresh lines.
-  bool _progressAdvancedFor(List<String> jobs) {
-    final baseline = <String, int>{
-      for (final job in jobs) job: progressTick(job),
-    };
+  /// True when any of [jobs] advanced since the CALLER's previous
+  /// observation — the deadline-renewal fact of the stall budgets.
+  /// [lastSeen] is the caller's own CROSS-POLL ledger, updated in place:
+  /// progress lines the EVENT PUMP drained between two of the caller's
+  /// polls still count, because the waiter and the pump credit the same
+  /// monotonic ticks (R30-P2-01 — the waiter's own observation is the
+  /// only baseline that may advance; a per-call baseline would see the
+  /// pump-credited ticks as the new normal and never report progress).
+  bool _progressAdvancedSince(Map<String, int> lastSeen, List<String> jobs) {
     drainProgress();
-    return jobs.any((job) => progressTick(job) > (baseline[job] ?? 0));
+    var advanced = false;
+    for (final job in jobs) {
+      final tick = progressTick(job);
+      if (tick > (lastSeen[job] ?? 0)) {
+        advanced = true;
+        lastSeen[job] = tick;
+      }
+    }
+    return advanced;
   }
 
-  /// The receive-side progress job of [connId] (wave-30 P2-10): the CODE
-  /// id the connection was paired through — a receive row keys its
-  /// `ak_poll_progress` lines by it (a send row uses the connection id).
-  /// Null when this runtime never minted the code (it joined someone
-  /// else's code — that side never receives).
+  /// The pairing's code id for [connId] — the correlation key the
+  /// connection was paired through. BOTH sides know it since wave-31
+  /// (R30-P2-02): the creator fills [_codeIdOfKey] at mint time, the
+  /// joiner from the join result / `connected` event's `code_id` field.
+  /// (Task-plane progress rows are keyed by the CONNECTION id since the
+  /// wave-31 ffi-v2 §8.4 revision — the stall budgets no longer read
+  /// this mapping; it stays for pairing correlation and diagnostics.
+  /// Null when neither source taught this runtime the id.)
   String? codeIdOfConnection(String connId) {
     final code = _connections[connId]?.code;
     if (code == null) {
@@ -858,10 +910,34 @@ final class SimpleTransferService {
         .toList();
     for (final job in doomed) {
       _pendingJobs.remove(job);
+      _recordClosedJob(job, connId); // R30-P2-03: refuse a late incoming
       if (!_expiredIncomingController.isClosed) {
         _expiredIncomingController.add(job);
       }
     }
+  }
+
+  /// R30-P2-03: remembers that [job]'s request became TERMINAL
+  /// undecided, bounded FIFO — the record a racing LATE
+  /// `incoming_request` is refused against.
+  void _recordClosedJob(String job, String? conn) {
+    _closedJobs[job] = conn;
+    while (_closedJobs.length > _closedJobsCap) {
+      _closedJobs.remove(_closedJobs.keys.first);
+    }
+  }
+
+  /// R30-P2-03: is this `incoming_request` LATE — its request already
+  /// died before the announcement could be pumped? True when the job is
+  /// in the bounded closure record (a `request_closed`/`consent_expired`
+  /// /connection-terminal fact arrived first) or its connection is
+  /// already data-plane terminal.
+  bool _isLateIncoming(String job, String? conn) {
+    if (_closedJobs.containsKey(job)) {
+      return true;
+    }
+    final state = conn == null ? null : _connections[conn]?.state;
+    return state != null && _stateRank(state) >= 2;
   }
 
   /// One pump tick: drain the runtime's event queue and route by type,
@@ -901,6 +977,13 @@ final class SimpleTransferService {
         code: event.code,
         state: 'probing',
       );
+      final codeId = event.codeId;
+      final code = event.code;
+      if (codeId != null && code != null && code.isNotEmpty) {
+        // R30-P2-02: the `connected` event teaches a JOINER the pairing's
+        // code_id (the creator fills the same table at mint time).
+        _codeIdOfKey[_codeKey(code)] = codeId;
+      }
       return;
     }
     if (event is TaskProbeResultEvent) {
@@ -922,6 +1005,14 @@ final class SimpleTransferService {
       return;
     }
     if (event is TaskIncomingRequestEvent) {
+      // R30-P2-03: a LATE incoming — its request already died terminal
+      // (the connection went data-plane terminal, or the engine's
+      // request-closure fact arrived first) — must NOT re-open a banner.
+      // The native register/publish sequence is not one critical
+      // section, so this exact order is reachable.
+      if (_isLateIncoming(event.job, event.conn)) {
+        return;
+      }
       _pendingJobs[event.job] = event.conn; // undecided until consent
       if (!_incomingController.isClosed) {
         _incomingController.add(SimpleIncomingRequest(
@@ -965,12 +1056,27 @@ final class SimpleTransferService {
       // P2-11: the NATIVE 30 s window auto-declined the request — the
       // banner closes on this engine fact, never on a Dart timer mirror.
       _pendingJobs.remove(event.job);
+      _recordClosedJob(event.job, event.conn); // R30-P2-03
       if (!_expiredIncomingController.isClosed) {
         _expiredIncomingController.add(event.job);
       }
       return;
     }
-    // runtime_ready / op_done / op_failed / code_cancelled / unknown: the
-    // op waiters read their own results; nothing to fold here.
+    if (event is TaskRequestClosedEvent) {
+      // R30-P2-03: the request's own terminal fact (the engine resolved
+      // the parked offer with the connection's disconnect) — close the
+      // banner AND remember the closure so the racing LATE incoming is
+      // refused instead of resurrecting an accept/decline row.
+      _pendingJobs.remove(event.job);
+      _recordClosedJob(event.job, event.conn);
+      if (!_expiredIncomingController.isClosed) {
+        _expiredIncomingController.add(event.job);
+      }
+      return;
+    }
+    // runtime_ready / op_done / op_failed / code_cancelled /
+    // handshake_failed / unknown: the op waiters read their own results;
+    // handshake_failed is a bounded per-dial record (never a task
+    // verdict); nothing to fold here.
   }
 }

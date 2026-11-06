@@ -5,8 +5,9 @@
 library;
 
 import 'dart:async' show Completer, Timer, TimeoutException;
+import 'dart:typed_data' show Uint8List;
 
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show FakeAkTaskCalls;
+import 'package:ak_ffi_dart/ak_ffi_dart.dart' show AkTaskCalls, FakeAkTaskCalls;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ak_sending_app/services/ffi_simple_transfer_service.dart';
@@ -340,9 +341,6 @@ void main() {
     final joined = await service.joinCode(code);
     service.engine.pumpEvents();
     final runtimeId = fake.runtimes.keys.first;
-    // The receive row keys its progress by the pairing CODE id.
-    final codeKey = fake.runtimes[runtimeId]!.codes.first;
-    final codeId = fake.runtimes[runtimeId]!.codeIdOfCode[codeKey]!;
 
     final job = fake.emitIncomingRequest(runtimeId,
         connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
@@ -350,8 +348,10 @@ void main() {
     await pumpEventQueue();
 
     final accepted = service.consent(job, true);
+    // Wave-31 contract (R30-P2-02): receive progress rows key `job` by
+    // the CONNECTION id — the one correlation key both sides hold.
     final progress = Timer.periodic(const Duration(milliseconds: 25),
-        (_) => fake.emitProgress(codeId));
+        (_) => fake.emitProgress(joined.connectionId!));
     await Future<void>.delayed(const Duration(milliseconds: 600));
     fake.emitDone(runtimeId, connId: joined.connectionId); // finally done
     service.engine.pumpEvents();
@@ -437,4 +437,231 @@ void main() {
     await expectLater(unconfigured.start(), throwsStateError);
     unconfigured.dispose();
   });
+
+  // -------------------------------------------------------------------------
+  // Wave-31 review fixes (R30): the receive wait may not outlive dispose
+  // (R30-P1-01), conn-keyed receive renewal for the JOINER direction
+  // (R30-P2-02), and the terminal-first banner race (R30-P2-03).
+  // -------------------------------------------------------------------------
+
+  test('R30-P1-01: disposing mid-receive ends the wait and NO native call '
+      'follows (the fake call count freezes)', () async {
+    final fake = FakeAkTaskCalls();
+    final counting = CountingTaskCalls(fake);
+    final service = FfiSimpleTransferService(
+      calls: counting,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      receiveTimeout: const Duration(seconds: 30),
+      engineOwner: () {}, // the native free follows the borrowers' disposal
+    );
+    await service.start();
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final runtimeId = fake.runtimes.keys.first;
+    final job = fake.emitIncomingRequest(runtimeId,
+        connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    // Accept → the receive is in flight (unsettled) → dispose the whole
+    // service while the wait is parked on its real 50 ms tick.
+    final accepted = service.consent(job, true);
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    expect(counting.snapshot()['pollProgress'] ?? 0, greaterThan(0),
+        reason: '前置：接收等待确实在轮询进度（悬空指针路径）');
+    service.dispose(); // engine channels die FIRST, then the owner frees
+    final frozen = counting.snapshot();
+    final outcome = expectLater(
+        accepted, throwsStateError); // the wait ends, it never hangs
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    expect(counting.snapshot(), frozen,
+        reason: 'dispose 后不得再有任何 native 调用（R30-P1-01）');
+    await outcome;
+  });
+
+  test('R30-P2-02: a JOINER receiver (the sender minted the code on '
+      'another engine) renews on CONN-keyed progress', () async {
+    final fake = FakeAkTaskCalls();
+    // The SENDER device mints the code — a second runtime on the shared
+    // fake stands in for the other engine.
+    final senderService = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/w31-sender',
+      delay: immediate,
+    );
+    senderService.start();
+    final code = await senderService.createCode(TaskRole.send);
+
+    // The device under test JOINS that code as the RECEIVER: this side
+    // never minted the code, so no local code-id mapping exists — the
+    // conn id is the only correlation key it holds.
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/w31-joiner',
+      delay: immediate,
+      receiveTimeout: const Duration(milliseconds: 200),
+    );
+    await service.start();
+    final runtimeId = fake.runtimes.keys.last; // the joiner's runtime
+    final joined = await service.joinCode(code.code, role: TaskRole.receive);
+    service.engine.pumpEvents();
+
+    final job = fake.emitIncomingRequest(runtimeId,
+        connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    final accepted = service.consent(job, true);
+    // The wave-31 contract: receive progress rows are keyed by the CONN id
+    // (the Rust side lands the same key in parallel).
+    final progress = Timer.periodic(const Duration(milliseconds: 25),
+        (_) => fake.emitProgress(joined.connectionId!));
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    fake.emitDone(runtimeId, connId: joined.connectionId); // finally done
+    service.engine.pumpEvents();
+    await accepted; // 600 ms > the 200 ms budget — renewal kept it alive
+    progress.cancel();
+    senderService.dispose();
+    service.dispose();
+  });
+
+  test('R30-P2-03: terminal-first (disconnected → request_closed → LATE '
+      'incoming) never re-opens a banner', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final runtimeId = fake.runtimes.keys.first;
+    final conn = joined.connectionId!;
+
+    final requests = <IncomingRequest>[];
+    final expired = <String>[];
+    final reqSub = service.incomingRequests.listen(requests.add);
+    final expSub = service.expiredIncomingRequests.listen(expired.add);
+
+    final job = 'ab' * 16;
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'disconnected',
+      'conn': conn,
+      'reason': 'peer',
+    });
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'request_closed',
+      'job': job,
+      'conn': conn,
+      'reason': 'disconnected',
+    });
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'incoming_request',
+      'job': job,
+      'conn': conn,
+      'root': 'x',
+      'files': 1,
+      'bytes': 1,
+      'saveDir': 'D:/x',
+    });
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    expect(requests, isEmpty,
+        reason: '迟到 incoming 不得展示待同意横幅（R30-P2-03）');
+    expect(expired, [job], reason: 'request_closed 必须关闭对应请求横幅');
+    await reqSub.cancel();
+    await expSub.cancel();
+    service.dispose();
+  });
+}
+
+/// Counts every seam call that crosses to the wrapped fake (R30-P1-01:
+/// the "zero native calls after dispose" assertion surface).
+class CountingTaskCalls implements AkTaskCalls {
+  CountingTaskCalls(this._inner);
+
+  final AkTaskCalls _inner;
+  final Map<String, int> calls = <String, int>{};
+
+  void _tick(String name) => calls[name] = (calls[name] ?? 0) + 1;
+
+  /// A comparable copy of the counters.
+  Map<String, int> snapshot() => Map<String, int>.of(calls);
+
+  @override
+  String? lastError() => _inner.lastError();
+
+  @override
+  int start(String specJson, Uint8List runtimeIdOut) {
+    _tick('start');
+    return _inner.start(specJson, runtimeIdOut);
+  }
+
+  @override
+  int createCode(Uint8List runtimeId, String specJson, Uint8List opIdOut) {
+    _tick('createCode');
+    return _inner.createCode(runtimeId, specJson, opIdOut);
+  }
+
+  @override
+  int join(Uint8List runtimeId, String specJson, Uint8List opIdOut) {
+    _tick('join');
+    return _inner.join(runtimeId, specJson, opIdOut);
+  }
+
+  @override
+  int send(
+      Uint8List runtimeId, Uint8List connId, String pathsJson, Uint8List opIdOut) {
+    _tick('send');
+    return _inner.send(runtimeId, connId, pathsJson, opIdOut);
+  }
+
+  @override
+  int list(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _tick('list');
+    return _inner.list(runtimeId, buffer, cap);
+  }
+
+  @override
+  int disconnect(Uint8List runtimeId, Uint8List connId) {
+    _tick('disconnect');
+    return _inner.disconnect(runtimeId, connId);
+  }
+
+  @override
+  int setSaveDir(Uint8List runtimeId, String path) {
+    _tick('setSaveDir');
+    return _inner.setSaveDir(runtimeId, path);
+  }
+
+  @override
+  int consent(Uint8List runtimeId, Uint8List jobId, int accept) {
+    _tick('consent');
+    return _inner.consent(runtimeId, jobId, accept);
+  }
+
+  @override
+  int opResult(
+      Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
+    _tick('opResult');
+    return _inner.opResult(runtimeId, opId, buffer, cap);
+  }
+
+  @override
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _tick('pollEvent');
+    return _inner.pollEvent(runtimeId, buffer, cap);
+  }
+
+  @override
+  int pollProgress(Uint8List buffer, int cap) {
+    _tick('pollProgress');
+    return _inner.pollProgress(buffer, cap);
+  }
 }

@@ -272,15 +272,15 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     // the done event of THIS request's connection AND the connection
     // itself going terminal (a mid-transfer disconnect must not hang the
     // wait — P2-10). Wave-30 P2-10: [receiveTimeout] is a STALL budget,
-    // not an overall cap — receive progress lines (keyed by the pairing
-    // code id; the connection id also watched defensively) RENEW the
-    // deadline, so only a true no-progress stall elapses.
+    // not an overall cap — receive progress lines RENEW the deadline, so
+    // only a true no-progress stall elapses.
     final conn = _connOfJob[jobId];
-    final progressJobs = <String>{?conn};
-    final codeId = conn == null ? null : _engine.codeIdOfConnection(conn);
-    if (codeId != null) {
-      progressJobs.add(codeId);
-    }
+    // Wave-31 R30-P2-02: receive progress rows are keyed by the
+    // CONNECTION id (the ffi-v2 §8.4 wave-31 revision; native lands the
+    // job-key change in parallel): the receiver as JOINER has no local
+    // code-id mapping, but every side of a connection knows its conn id
+    // — ONE correlation key for both creation and join directions.
+    final progressJobs = conn == null ? const <String>{} : <String>{conn};
     try {
       await _awaitReceiveSettled(conn, progressJobs);
     } on TimeoutException {
@@ -304,6 +304,14 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   /// throws [TimeoutException] only after [receiveTimeout] WITHOUT any
   /// progress line for [progressJobs] (every observed line renews the
   /// deadline — a long, healthy receive is never cut by total duration).
+  ///
+  /// Wave-31 R30-P1-01: the wait may NOT outlive the service — the
+  /// engine's dispose invalidates every call channel BEFORE the native
+  /// owner releases the engine handle, so (a) both listens treat stream
+  /// closure as settled (only dispose closes those streams), (b) every
+  /// `await` is followed by a liveness gate BEFORE any FFI call, exactly
+  /// like the op waiters' `ensureLive` hook, and (c) [drainProgress]
+  /// itself refuses to poll a disposed engine.
   Future<void> _awaitReceiveSettled(
       String? conn, Set<String> progressJobs) async {
     var settled = false;
@@ -312,7 +320,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
       if (conn == null || event.conn == conn) {
         settled = true;
       }
-    });
+    }, onDone: () => settled = true); // stream closed = settled (dispose)
     final lostSub = conn == null
         ? null
         : _engine.connections.listen((rows) {
@@ -333,7 +341,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
                 return;
               }
             }
-          });
+          }, onDone: () => settled = true); // stream closed = settled
     try {
       var baseline = <String, int>{
         for (final job in progressJobs) job: _engine.progressTick(job),
@@ -344,6 +352,12 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         // must give the event loop room to deliver the stream events it
         // watches and let tests drive the fake synchronously around it.
         await Future<void>.delayed(receivePollInterval);
+        // R30-P1-01 (ensureLive uniformity): validate AFTER every await,
+        // BEFORE any FFI call — a dispose that raced this tick must end
+        // the wait here, never poll the (soon freed) native engine.
+        if (_engine.isDisposed) {
+          throw StateError('接收等待中止：任务服务已释放。');
+        }
         _engine.drainProgress();
         var advanced = false;
         for (final job in progressJobs) {
@@ -359,6 +373,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         if (DateTime.now().isAfter(deadline)) {
           throw TimeoutException('接收无进展超时', receiveTimeout);
         }
+      }
+      // Settled via stream closure (onDone): the engine is disposed —
+      // the wait ends NOW with the same honest verdict as the tick gate.
+      if (_engine.isDisposed) {
+        throw StateError('接收等待中止：任务服务已释放。');
       }
       final error = failure;
       if (error != null) {

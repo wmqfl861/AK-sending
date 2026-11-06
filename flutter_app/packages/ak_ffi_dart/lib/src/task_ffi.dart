@@ -339,9 +339,10 @@ abstract interface class AkTaskCalls {
 
   /// `ak_poll_progress` (the ENGINE-WIDE progress queue — no runtime id):
   /// 1 progress JSON line written, 0 queue empty, -3 too small (the line
-  /// stays queued). Task-plane send rows key their progress by the
-  /// connection id, receive rows by the current code id (ffi-v2 §8.4) —
-  /// the wave-30 P2-10 progress-renewal source.
+  /// stays queued). Task-plane rows — send AND receive alike — key their
+  /// progress by the connection id (ffi-v2 §8.4's wave-31 revision; a
+  /// joiner receiver never knew the code id) — the wave-30 P2-10
+  /// progress-renewal source.
   int pollProgress(Uint8List buffer, int cap);
 
   /// The native error detail of the most recent negative status, or null

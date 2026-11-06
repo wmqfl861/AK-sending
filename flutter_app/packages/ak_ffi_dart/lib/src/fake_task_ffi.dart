@@ -23,7 +23,8 @@
 ///   carry the request's snapshotted `saveDir` (wave-30 P2-06);
 /// * the native 30 s consent window is SCRIPTED via [expireConsent]
 ///   (wave-30 P2-11: the engine emits `consent_expired`, never a local
-///   Dart timer);
+///   Dart timer), and a disconnect-driven pending-request closure via
+///   [closePendingRequest] (wave-31 R30-P2-03: `request_closed`);
 /// * the ENGINE-WIDE progress queue (`ak_poll_progress`, wave-30 P2-10)
 ///   is scripted via [emitProgress] and read through [pollProgress];
 /// * `ak_task_disconnect` covers UN-JOINED code cancellation by
@@ -214,6 +215,11 @@ final class FakeAkTaskCalls implements AkTaskCalls {
           ? roleHint // explicit user intent wins
           : (owner.roleOfCode[normalized] == 'sender' ? 'receiver' : 'sender');
       final conn = _hex(_newId());
+      // Wave-31 R30-P2-02: the join result and BOTH `connected` events
+      // carry the pairing's `code_id` — the joiner learns the same
+      // correlation key the creator minted (native lands the same field
+      // in parallel).
+      final codeId = owner.codeIdOfCode[normalized];
       runtime.connections[conn] = TaskConnState(role, 'probing', '127.0.0.1:45678');
       if (identical(owner, runtime)) {
         // Self-join (one runtime drives both actions, the single-runtime
@@ -225,6 +231,7 @@ final class FakeAkTaskCalls implements AkTaskCalls {
           'role': role,
           'peer_endpoint': '127.0.0.1:45678',
           'code': normalized,
+          if (codeId != null) 'code_id': codeId,
         });
         runtime.events.add(<String, dynamic>{
           'event': 'probe_result',
@@ -242,6 +249,7 @@ final class FakeAkTaskCalls implements AkTaskCalls {
             'role': side.connections[conn]!.role,
             'peer_endpoint': '127.0.0.1:45678',
             'code': normalized,
+            if (codeId != null) 'code_id': codeId,
           });
           // Both sides run their own reachability probe after the
           // `connected` bookkeeping event (the Rust owner_side_completion
@@ -260,6 +268,7 @@ final class FakeAkTaskCalls implements AkTaskCalls {
         'role': role,
         'peer_endpoint': '127.0.0.1:45678',
         'probe': 'verified',
+        if (codeId != null) 'code_id': codeId,
       };
       if (autoCompleteOps) {
         op.result = op.body!();
@@ -556,13 +565,37 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   }
 
   /// Pushes one line onto the ENGINE-WIDE progress queue
-  /// (`ak_poll_progress`, wave-30 P2-10): send rows key `job` by the
-  /// CONNECTION id, receive rows by the CODE id — the same correlation
-  /// the real engine uses (ffi-v2 §8.4).
+  /// (`ak_poll_progress`, wave-30 P2-10): task-plane rows — send AND
+  /// receive alike — key `job` by the CONNECTION id, the wave-31
+  /// correlation revision of ffi-v2 §8.4 (wave-30 keyed receive rows by
+  /// the code id, which a JOINER receiver never knew; the connection id
+  /// is the one key both sides always have).
   void emitProgress(String jobId, {String event = 'chunk_sent'}) {
     progressLines.add(<String, dynamic>{
       'job': jobId,
       'event': event,
+    });
+  }
+
+  /// Simulates the native `decline_pending_of_conn` (wave-31
+  /// R30-P2-03): the connection's disconnect resolves [jobId]'s parked
+  /// offer with a declination — the pending entry is removed (a later
+  /// consent answers `-4`) and the request-TERMINAL `request_closed`
+  /// event is queued. A no-op for unknown/already-decided jobs.
+  void closePendingRequest(String runtimeIdHex, String jobId,
+      {String? connId, String reason = 'disconnected'}) {
+    final runtime = runtimes[runtimeIdHex];
+    if (runtime == null) {
+      throw StateError('fake: 未知运行时 $runtimeIdHex');
+    }
+    if (!runtime.pendingConsents.remove(jobId)) {
+      return;
+    }
+    runtime.events.add(<String, dynamic>{
+      'event': 'request_closed',
+      'job': jobId,
+      if (connId != null) 'conn': connId,
+      'reason': reason,
     });
   }
 

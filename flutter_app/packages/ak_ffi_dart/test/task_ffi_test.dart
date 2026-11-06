@@ -503,6 +503,132 @@ void main() {
       expect((event as TaskIncomingRequestEvent).saveDir, 'D:/offer-time');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Wave-31 (review R30): the corrected handshake_failed shape
+  // (R30-P3-01), the request_closed terminal event (R30-P2-03), and the
+  // pairing code_id announced to JOINERS (R30-P2-02).
+  // -------------------------------------------------------------------------
+
+  group('wave-31: corrected event shapes (R30)', () {
+    test('handshake_failed parses typed — code_id string + fixed reason, '
+        'NO conn; the old conn/int shape is refused (R30-P3-01)', () {
+      final event = TaskEvent.fromJson(<String, Object?>{
+        'event': 'handshake_failed',
+        'code_id': 'ab' * 16,
+        'reason': 'peer certificate rejected',
+      });
+      expect(event, isA<TaskHandshakeFailedEvent>());
+      final failed = event as TaskHandshakeFailedEvent;
+      expect(failed.codeId, 'ab' * 16);
+      expect(failed.reason, 'peer certificate rejected');
+      expect(failed.fields.containsKey('conn'), isFalse,
+          reason: '未配对的失败握手没有可归属连接（R30-P3-01）');
+      expect(failed.fields['code_id'] is String, isTrue,
+          reason: 'code_id 是 32hex 字符串，不是整数错误码');
+
+      expect(
+          () => TaskEvent.fromJson(<String, Object?>{
+                'event': 'handshake_failed',
+                'conn': 'cd' * 16,
+                'code': 7,
+                'reason': 'handshake transport failure',
+              }),
+          throwsA(isA<FormatException>()),
+          reason: '冻结前旧形状（conn + 整数 code）按破损契约拒绝');
+    });
+
+    test('request_closed parses typed (job/conn/reason)', () {
+      final event = TaskEvent.fromJson(<String, Object?>{
+        'event': 'request_closed',
+        'job': 'ef' * 16,
+        'conn': 'cd' * 16,
+        'reason': 'disconnected',
+      });
+      expect(event, isA<TaskRequestClosedEvent>());
+      final closed = event as TaskRequestClosedEvent;
+      expect(closed.job, 'ef' * 16);
+      expect(closed.conn, 'cd' * 16);
+      expect(closed.reason, 'disconnected');
+      expect(
+          () => TaskEvent.fromJson(
+              const <String, Object?>{'event': 'request_closed'}),
+          throwsA(isA<FormatException>()));
+    });
+
+    test('connected carries the pairing code_id (R30-P2-02); absence '
+        'still parses (older engine)', () {
+      final withId = TaskEvent.fromJson(<String, Object?>{
+        'event': 'connected',
+        'conn': 'cd' * 16,
+        'role': 'receiver',
+        'code': 'AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH',
+        'code_id': 'ab' * 16,
+      }) as TaskConnectedEvent;
+      expect(withId.codeId, 'ab' * 16);
+      final bare = TaskEvent.fromJson(<String, Object?>{
+        'event': 'connected',
+        'conn': 'cd' * 16,
+        'role': 'receiver',
+      }) as TaskConnectedEvent;
+      expect(bare.codeId, isNull);
+    });
+
+    test('the fake join teaches the JOINER the pairing code_id (result '
+        'and connected event — R30-P2-02 fake sync)', () async {
+      final fake = FakeAkTaskCalls();
+      final owner = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/w31a'));
+      final joiner = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/w31b'));
+      owner.pollEvent(); // drain runtime_ready
+      joiner.pollEvent();
+      final created = await owner
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender))
+          .wait(delay: immediateDelay);
+      final codeId = created['code_id'] as String;
+
+      final joined = await joiner
+          .join(AkTaskJoinSpec(code: created['code'] as String))
+          .wait(delay: immediateDelay);
+      expect(joined['code_id'], codeId,
+          reason: 'join 结果必须携带配对 code_id（wave-31 契约）');
+
+      TaskConnectedEvent? connected;
+      while (true) {
+        final event = joiner.pollEvent();
+        if (event == null) {
+          break;
+        }
+        if (event is TaskConnectedEvent) {
+          connected = event;
+        }
+      }
+      expect(connected?.codeId, codeId,
+          reason: '加入方的 connected 事件必须带同一 code_id');
+    });
+
+    test('closePendingRequest mirrors decline_pending_of_conn (R30-P2-03)',
+        () {
+      final fake = FakeAkTaskCalls();
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/w31c'));
+      runtime.pollEvent(); // drain runtime_ready
+
+      final job = fake.emitIncomingRequest(runtime.runtimeIdHex,
+          connId: 'cd' * 16, files: 1, bytes: 1);
+      fake.closePendingRequest(runtime.runtimeIdHex, job,
+          connId: 'cd' * 16);
+      final closed =
+          drainUntil(runtime, (event) => event is TaskRequestClosedEvent);
+      expect((closed as TaskRequestClosedEvent).job, job);
+      expect(closed.conn, 'cd' * 16);
+      expect(runtime.consent(job, accept: true), isFalse,
+          reason: '请求已随连接终结：迟到决定为 -4');
+      fake.closePendingRequest(runtime.runtimeIdHex, job); // gone: silent
+      expect(runtime.pollEvent(), isNull);
+    });
+  });
 }
 
 /// A zero-delay `Future.delayed` stand-in (the wait loops become

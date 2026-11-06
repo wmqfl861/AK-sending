@@ -10,13 +10,17 @@
 /// {"event":"op_done","op_id":"<32hex>","op":"task_create_code|task_join|task_send"}
 /// {"event":"op_failed","op_id":"<32hex>","op":"..."}
 /// {"event":"connected","conn":"<32hex>","role":"sender|receiver",
-///  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
+///  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
+///  "code_id":"<32hex>"}
 /// {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":true|false|null}
 /// {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
 ///  "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox"}
 /// {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
 /// {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
-/// {"event":"consent_expired","job":"<32hex>"}
+/// {"event":"handshake_failed","code_id":"<32hex>",
+///  "reason":"peer certificate rejected|handshake transport failure"}
+/// {"event":"consent_expired","job":"<32hex>","conn":"<32hex>"}
+/// {"event":"request_closed","job":"<32hex>","conn":"<32hex>","reason":"disconnected"}
 /// ```
 ///
 /// Wave-30 contract-first notes (the Rust task plane lands the same
@@ -28,6 +32,24 @@
 /// * `consent_expired` (wave-30 P2-11): the native 30 s consent window
 ///   auto-declined the request — the terminal request event that closes
 ///   pending UI banners (no Dart-side timer mirror).
+///
+/// Wave-31 notes (review R30, landed with the same Rust revision):
+/// * `handshake_failed` (shape corrected, R30-P3-01): NO `conn` — an
+///   unpaired failed handshake has no connection to attribute — and the
+///   correlation field is `code_id`, the 32hex task-code id string of
+///   the listener that saw the failure (never an integer error code);
+///   `reason` is the fixed two-word vocabulary. The event is a bounded
+///   per-dial record, never a listener verdict.
+/// * `request_closed` (R30-P2-03): the request-level terminal fact the
+///   engine publishes when a disconnect resolves a still-pending consent
+///   — it closes the UI banner, and a LATE `incoming_request` for the
+///   same job (the native register/publish race) must be refused by
+///   consumers instead of re-opening one.
+/// * `connected.code_id` / the join result's `code_id` (R30-P2-02): the
+///   pairing's code id announced to BOTH sides, so a JOINER learns the
+///   correlation key the creator minted (receive progress rows
+///   themselves are keyed by the CONNECTION id — see ffi-v2 §8.4's
+///   wave-31 revision).
 ///
 /// Wave-29 note on `disconnected` reasons (P2-08, wave-30 P2-05 widened):
 /// `local`, `peer`, `receiver_failed` and `done` are DATA-PLANE terminal
@@ -74,6 +96,7 @@ sealed class TaskEvent {
           role: _string(json, 'role'),
           peerEndpoint: _optionalString(json, 'peer_endpoint'),
           code: _optionalString(json, 'code'),
+          codeId: _optionalString(json, 'code_id'),
         );
       case 'probe_result':
         return TaskProbeResultEvent(
@@ -105,11 +128,24 @@ sealed class TaskEvent {
           conn: _optionalString(json, 'conn'),
           reason: _optionalString(json, 'reason') ?? 'unknown',
         );
+      case 'handshake_failed':
+        return TaskHandshakeFailedEvent(
+          atMs: at,
+          codeId: _string(json, 'code_id'),
+          reason: _string(json, 'reason'),
+        );
       case 'consent_expired':
         return TaskConsentExpiredEvent(
           atMs: at,
           job: _string(json, 'job'),
           conn: _optionalString(json, 'conn'),
+        );
+      case 'request_closed':
+        return TaskRequestClosedEvent(
+          atMs: at,
+          job: _string(json, 'job'),
+          conn: _optionalString(json, 'conn'),
+          reason: _optionalString(json, 'reason') ?? 'disconnected',
         );
       case 'op_done':
       case 'op_failed':
@@ -178,6 +214,7 @@ final class TaskConnectedEvent extends TaskEvent {
     required this.role,
     this.peerEndpoint,
     this.code,
+    this.codeId,
   });
 
   /// Hex connection id (32 chars) — the UI correlation key.
@@ -192,6 +229,12 @@ final class TaskConnectedEvent extends TaskEvent {
   /// The task code that produced the connection, when known.
   final String? code;
 
+  /// The pairing's engine code id (32 hex, wire `code_id`), when the
+  /// engine announces it (wave-31 R30-P2-02): a JOINER learns here the
+  /// same correlation key the creator minted at create time. Null = an
+  /// engine predating the field.
+  final String? codeId;
+
   @override
   String get name => 'connected';
 
@@ -201,6 +244,7 @@ final class TaskConnectedEvent extends TaskEvent {
         'role': role,
         if (peerEndpoint != null) 'peer_endpoint': peerEndpoint,
         if (code != null) 'code': code,
+        if (codeId != null) 'code_id': codeId,
       };
 }
 
@@ -320,6 +364,34 @@ final class TaskDisconnectedEvent extends TaskEvent {
       };
 }
 
+/// ONE inbound handshake attempt failed before pairing could attribute a
+/// connection to it (wave-30 P1-04; shape corrected wave-31 R30-P3-01).
+/// This is a bounded per-dial record, NEVER a listener or task verdict —
+/// the resident receiver keeps serving. There is no `conn`: an unpaired
+/// failed handshake has no connection to blame. [codeId] is the 32hex
+/// task-code id string of the code whose listener saw the failure (NOT
+/// an integer error code), and [reason] is the fixed two-word vocabulary
+/// (`peer certificate rejected` | `handshake transport failure`).
+final class TaskHandshakeFailedEvent extends TaskEvent {
+  const TaskHandshakeFailedEvent({
+    super.atMs,
+    required this.codeId,
+    required this.reason,
+  });
+
+  /// Hex code id (32 chars) of the listening task code.
+  final String codeId;
+
+  /// `peer certificate rejected` | `handshake transport failure`.
+  final String reason;
+
+  @override
+  String get name => 'handshake_failed';
+
+  @override
+  Map<String, Object?> get fields => {'code_id': codeId, 'reason': reason};
+}
+
 /// The native 30 s consent window auto-declined a pending request
 /// (wave-30 P2-11): the request is TERMINAL — a request-level fact from
 /// the engine that times the window, replacing any Dart-side timer
@@ -341,6 +413,44 @@ final class TaskConsentExpiredEvent extends TaskEvent {
   Map<String, Object?> get fields => {
         'job': job,
         if (conn != null) 'conn': conn,
+      };
+}
+
+/// A pending request became TERMINAL undecided because its connection
+/// closed (wave-31 R30-P2-03): the engine's `decline_pending_of_conn`
+/// resolves the parked offer with a declination and publishes this
+/// request-level fact — the banner closes at the moment the request
+/// dies, not when a mirror timer guesses. The native register/publish
+/// sequence is not one critical section, so a LATE
+/// [TaskIncomingRequestEvent] for [job] may still arrive afterwards;
+/// consumers must refuse it instead of re-opening a banner. A later
+/// `ak_task_consent` on [job] answers `-4` (unknown or already decided).
+final class TaskRequestClosedEvent extends TaskEvent {
+  const TaskRequestClosedEvent({
+    super.atMs,
+    required this.job,
+    this.conn,
+    this.reason = 'disconnected',
+  });
+
+  /// The hex pending-request id whose request was closed undecided.
+  final String job;
+
+  /// The request's connection, when the engine could attribute it.
+  final String? conn;
+
+  /// Why the request closed (the frozen vocabulary starts with
+  /// `disconnected`).
+  final String reason;
+
+  @override
+  String get name => 'request_closed';
+
+  @override
+  Map<String, Object?> get fields => {
+        'job': job,
+        if (conn != null) 'conn': conn,
+        'reason': reason,
       };
 }
 

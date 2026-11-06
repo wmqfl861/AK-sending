@@ -29,9 +29,12 @@ enum TaskRole { send, receive }
 class TaskCode {
   const TaskCode({required this.code, required this.role});
 
-  /// The code in canonical display form: 8 characters split by a hyphen
-  /// (e.g. `K3P7-QM2X`), cased as created. Consumed once; invalid after
-  /// the pairing completes or either side disconnects.
+  /// The code in canonical display form: `AKI1-` + eight groups of four
+  /// Crockford Base32 symbols, e.g.
+  /// `AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` (the Rust
+  /// `InviteCode::to_display` shape — 160 bits of entropy; the `AKI1`
+  /// prefix is the format version, not entropy). Consumed once; invalid
+  /// after the pairing completes or either side disconnects.
   final String code;
 
   /// The direction this device declared when creating the code.
@@ -48,6 +51,11 @@ enum TaskConnectionState {
 
   /// Probe passed — transfer-ready ("测试成功").
   connected,
+
+  /// Probe FAILED (wave-29 P2-09): the pairing committed but no data
+  /// path to the peer could be verified. Not terminal-disconnected — the
+  /// user should re-pair (or check the network) rather than retry a send.
+  unreachable,
 
   /// The connection dropped (either end or a network change). Services
   /// remove dropped rows from the `connections` snapshot; this state
@@ -118,14 +126,16 @@ class IncomingRequest {
   final int totalBytes;
 }
 
-/// The wave-28 minimal transfer service (frozen shape).
+/// The wave-28 minimal transfer service (frozen shape + the wave-29
+/// review-fix additions documented per member).
 ///
 /// Lifecycle: `start()` once at app launch; `dispose()` at shutdown.
-/// Streams are broadcast; `connections` replays the current snapshot to
-/// late subscribers, `incomingRequests` does not replay.
+/// Streams are broadcast.
 abstract class SimpleTransferService {
   /// Initializes the service (identity, listeners). Call once before any
-  /// other member.
+  /// other member. A failed start surfaces through the app shell's
+  /// startup-error banner (wave-29 P1-01) — implementations may throw a
+  /// readable reason.
   Future<void> start();
 
   /// Mints a fresh one-time pairing code declaring MY direction [role].
@@ -133,22 +143,37 @@ abstract class SimpleTransferService {
   Future<TaskCode> createCode(TaskRole role);
 
   /// Joins (consumes) a pairing code. Implementations tolerate hyphens,
-  /// spaces and lower case in [code]. On success the new connection
-  /// (state [TaskConnectionState.connecting] — the auto probe follows)
-  /// appears in `connections`.
-  Future<JoinResult> joinCode(String code);
+  /// spaces and lower case in [code]. The optional [role] (wave-29
+  /// P1-05) is the joiner's EXPLICIT direction — the UI user's intent —
+  /// forwarded to the engine so a cross-device join never guesses the
+  /// direction; null keeps the engine's resolution. On success the new
+  /// connection (state [TaskConnectionState.connecting] — the auto probe
+  /// follows) appears in `connections`.
+  Future<JoinResult> joinCode(String code, {TaskRole? role});
 
   /// Live connection snapshots (id/对端名/方向/状态); dropped connections
   /// leave the list.
+  ///
+  /// Replay contract (wave-29 P1-06): EVERY new subscription first
+  /// receives the CURRENT snapshot, then the live change events — a
+  /// detail page opened while another listener is already attached (the
+  /// home page) still sees the live list immediately. Each call of this
+  /// getter returns an independent stream.
   Stream<List<TaskConnection>> get connections;
 
   /// Incoming transfer offers (jobId/文件数/总字节), one event per offer.
   Stream<IncomingRequest> get incomingRequests;
 
+  /// Job ids whose 30 s consent window closed undecided (wave-29 P2-11):
+  /// the engine auto-declined them, so the UI closes their banners. A
+  /// later decline click on such a job resolves normally (idempotent).
+  Stream<String> get expiredIncomingRequests;
+
   /// Answers an [IncomingRequest]. With `accept: true` the returned future
   /// completes when the receive finishes and rejects on failure; the files
   /// land in the default save folder. With `accept: false` the offer is
-  /// declined (nothing is received) and the future completes immediately.
+  /// declined (nothing is received) and the future completes immediately —
+  /// including when the request already expired (wave-29 P2-11).
   Future<void> consent(String jobId, bool accept);
 
   /// Sends [paths] (files and/or one directory) over connection [connId]
@@ -171,22 +196,49 @@ abstract class SimpleTransferService {
   void dispose();
 }
 
-/// Canonical `XXXX-XXXX` display of an 8-char code body; shorter/other
-/// input is uppercased and hyphenated on the 4th character when possible,
-/// otherwise returned as-is (uppercased, hyphens stripped).
+/// Format version prefix of every task code (not entropy). Mirrors the
+/// Rust `InviteCode` presentation (`AKI1`, crates/ak-identity).
+const String taskCodePrefix = 'AKI1';
+
+/// Symbol count after the prefix: 160 bits / 5 bits per symbol.
+const int taskCodeSymbolCount = 32;
+
+/// Groups of four symbols in the canonical display form (wave-29 P1-02).
+const int taskCodeGroupCount = 8;
+
+final RegExp _taskCodeShape = RegExp(r'^AKI1[0-9A-HJKMNP-TV-Z]{32}$');
+
+/// Canonical `AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` display of a
+/// task code; input in ANY tolerant form (lower case, hyphens, spaces,
+/// ungrouped) regroups when it is a valid code, otherwise the normalized
+/// (uppercased, separator-stripped) input is returned as-is so the UI can
+/// show what is wrong.
 String formatTaskCode(String raw) {
-  final body = raw.toUpperCase().replaceAll(RegExp(r'[^0-9A-Z]'), '');
-  if (body.length == 8) {
-    return '${body.substring(0, 4)}-${body.substring(4)}';
+  final normalized = normalizeJoinCode(raw);
+  if (isValidTaskCode(normalized)) {
+    final body = normalized.substring(taskCodePrefix.length);
+    final groups = <String>[
+      for (var i = 0; i < taskCodeGroupCount; i++)
+        body.substring(i * 4, i * 4 + 4),
+    ];
+    return '$taskCodePrefix-${groups.join('-')}';
   }
-  return body;
+  return normalized;
 }
 
 /// Normalizes user-typed join input for `joinCode`: uppercases, strips
-/// hyphens/spaces. Implementations accept both this and the hyphenated
-/// form (连字符容错).
+/// hyphens and whitespace (大小写/连字符/空格容错 — the engine's
+/// `normalize_code_key` accepts the same forms). The result of a valid
+/// input is `AKI1` + 32 Crockford Base32 symbols (36 characters).
 String normalizeJoinCode(String input) =>
-    input.toUpperCase().replaceAll(RegExp(r'[^0-9A-Z]'), '');
+    input.toUpperCase().replaceAll(RegExp(r'[-\s]'), '');
+
+/// Whether [normalized] (a [normalizeJoinCode] result) is a WELL-FORMED
+/// task code: the `AKI1` prefix plus exactly 32 Crockford Base32 symbols
+/// (the alphabet excludes I, L, O and U — undefined symbols are refused,
+/// never guessed, mirroring the Rust `InviteCode::parse`).
+bool isValidTaskCode(String normalized) =>
+    _taskCodeShape.hasMatch(normalized);
 
 /// Human byte size (`12.3 MB`) for banner/detail copy.
 String formatBytes(int bytes) {

@@ -3,6 +3,12 @@
 /// with 接受/拒绝, an indeterminate progress row while receiving, and a
 /// success card carrying the save path. Visible on both tabs (mounted by
 /// the shell above the page content).
+///
+/// Wave-29 P2-11: banners whose 30 s consent window closed undecided are
+/// REMOVED via `expiredIncomingRequests` (the engine auto-declined them),
+/// and every consent answer — accept AND decline — is error-contained: a
+/// click that races the window resolves without an unhandled async
+/// exception.
 library;
 
 import 'dart:async' show StreamSubscription;
@@ -32,6 +38,7 @@ class IncomingRequestsHost extends StatefulWidget {
 
 class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
   StreamSubscription<IncomingRequest>? _sub;
+  StreamSubscription<String>? _expiredSub;
   final List<_BannerState> _banners = [];
 
   @override
@@ -44,11 +51,22 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
       },
       onError: (Object _) {},
     );
+    _expiredSub = widget.service.expiredIncomingRequests.listen(
+      (jobId) {
+        if (!mounted) return;
+        // The engine auto-declined the offer: close its banner instead of
+        // leaving a dead accept/reject pair on screen (P2-11).
+        setState(() => _banners.removeWhere(
+            (banner) => banner.request.jobId == jobId));
+      },
+      onError: (Object _) {},
+    );
   }
 
   @override
   void dispose() {
     _sub?.cancel();
+    _expiredSub?.cancel();
     super.dispose();
   }
 
@@ -56,7 +74,13 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
     if (banner.stage != _Stage.pending) return;
     if (!accept) {
       setState(() => _banners.remove(banner));
-      await widget.service.consent(banner.request.jobId, false);
+      try {
+        await widget.service.consent(banner.request.jobId, false);
+      } on Object {
+        // P2-11: a decline racing the 30 s window (or a disposed engine)
+        // must not surface as an unhandled async exception — nothing was
+        // received either way.
+      }
       return;
     }
     setState(() => banner.stage = _Stage.receiving);

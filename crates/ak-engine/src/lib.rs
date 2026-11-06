@@ -681,15 +681,38 @@ pub struct ConsentInfo {
     pub file_count: u64,
     /// Total payload bytes the offer announces.
     pub total_bytes: u64,
+    /// The sender's VERIFIED TLS fingerprint (wave 29, review P1-04): the
+    /// channel identity the transport established before the Offer was
+    /// read. Consent decisions can be attributed to a specific paired
+    /// device instead of to whatever listener the offer happened to reach.
+    pub sender_fingerprint: Fingerprint,
 }
 
-/// Optional receive-side consent hook (wave 28): invoked once per receive
-/// with the offer summary; `false` refuses the transfer — the peer is told
-/// over the wire with the DECLINED semantics ([`DECLINED_WIRE_CODE`], see
-/// also [`EngineError::ConsentDeclined`]) and the connection closes before
+/// What one [`TransferConsent`] hook answered (wave 29, review P2-07):
+/// either the decision is already known, or the callback registered the
+/// request out-of-band and returned immediately — the receive body then
+/// awaits the pending half WITHOUT blocking the calling worker (a plain
+/// bool callback had to park inside the async body, starving bounded
+/// runtimes while a human decided).
+pub enum ConsentAnswer {
+    /// Decide now: `true` accepts the offer, `false` declines it.
+    Now(bool),
+    /// The decision is pending elsewhere (a UI, a 30 s window, a teardown).
+    /// The receiver end resolves it; a dropped sender half (no decider
+    /// left) fails closed as a declination.
+    Pending(tokio::sync::oneshot::Receiver<bool>),
+}
+
+/// Optional receive-side consent hook (wave 28; shape made non-blocking
+/// wave 29): invoked once per receive with the offer summary; the callback
+/// returns IMMEDIATELY with either the decision or the pending half
+/// ([`ConsentAnswer`]) — it must never block the calling thread. `false`
+/// refuses the transfer — the peer is told over the wire with the DECLINED
+/// semantics ([`DECLINED_WIRE_CODE`], see also
+/// [`EngineError::ConsentDeclined`]) and the connection closes before
 /// anything is written to disk. `None` (every pre-wave-28 entry) keeps the
 /// frozen behavior: the offer is accepted automatically.
-pub type TransferConsent = Arc<dyn Fn(&ConsentInfo) -> bool + Send + Sync>;
+pub type TransferConsent = Arc<dyn Fn(&ConsentInfo) -> ConsentAnswer + Send + Sync>;
 
 /// Wire code of a user declination (wave 28). The closed `ErrorCode` set
 /// (frozen, ak-wire) has no dedicated DECLINED value, so the refusal rides
@@ -2874,6 +2897,43 @@ pub async fn receive_on_channel_consent(
     .await
 }
 
+/// One receive on a channel the CALLER already accepted and authorized
+/// (wave 29, review P1-04/P2-05): the frozen LEGACY single-job body — the
+/// very same one [`receive_with_addr_consent`] runs after its internal
+/// bind+accept — driven on an externally owned [`DirectChannel`].
+///
+/// This is the entry a caller-side accept LOOP needs: it can keep one
+/// endpoint (one advertised port) bound across many connections, reject
+/// unauthorized TLS peers at `accept` without consuming the listener, and
+/// still run each authorized channel through the unmodified receive
+/// protocol with the optional user-consent hook. `receive_on_channel*`
+/// cannot serve that role — its admission decider makes it refuse every
+/// legacy (non-CAP_SCHEDULER) sender by construction.
+///
+/// `spec.bind`/`spec.authorize` are unused here (the channel exists and was
+/// authorized by the caller); the destination, conflict policy,
+/// checkpoints, idle timeout and policy gate all apply exactly as in
+/// [`receive_with_addr`]. The channel closes when this returns.
+pub async fn receive_accepted_consent(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+    consent: Option<TransferConsent>,
+) -> Result<Report, EngineError> {
+    let started = Instant::now();
+    let target = LocalSaveTarget::open(&spec.out_dir)?;
+    receive_job(
+        channel,
+        &target,
+        &JobSpec::of(&spec),
+        started,
+        None,
+        progress,
+        consent.as_ref(),
+    )
+    .await
+}
+
 /// Daemon-side scheduler handshake (wave 27, scheduler.md §2/§6): on an
 /// already-accepted [`DirectChannel`], run the receive head — peer
 /// identity re-check, policy gate, the Hello exchange — and split by the
@@ -3470,22 +3530,31 @@ async fn receive_frozen_body(
         files: file_count,
         bytes: total_bytes,
     });
-    // Receive-side user consent (wave 28): the one decision point between
-    // the validated Offer and the Accept. `None` (every pre-wave-28 entry)
-    // falls straight through — the frames below are byte-identical to the
-    // frozen behavior. A `false` answer tells the peer with the DECLINED
-    // error frame (existing Error-frame semantics; see
-    // [`DECLINED_WIRE_CODE`]), fails locally with
+    // Receive-side user consent (wave 28; non-blocking shape wave 29): the
+    // one decision point between the validated Offer and the Accept. `None`
+    // (every pre-wave-28 entry) falls straight through — the frames below
+    // are byte-identical to the frozen behavior. A `false` answer tells the
+    // peer with the DECLINED error frame (existing Error-frame semantics;
+    // see [`DECLINED_WIRE_CODE`]), fails locally with
     // [`EngineError::ConsentDeclined`] and lets the channel close — no
-    // Accept, no sink, no checkpoint record, nothing on disk.
+    // Accept, no sink, no checkpoint record, nothing on disk. The callback
+    // itself returns immediately ([`ConsentAnswer`]); a pending decision is
+    // awaited here, and a decider that vanishes without answering (dropped
+    // sender half) fails closed as a declination.
     if let Some(consent) = consent {
         let info = ConsentInfo {
             job_id,
             root_name: root_name.clone(),
             file_count,
             total_bytes,
+            sender_fingerprint: *channel.peer_fingerprint(),
         };
-        if !consent(&info) {
+        let decided = match consent(&info) {
+            ConsentAnswer::Now(decided) => decided,
+            // Every decider going away fails closed as a declination.
+            ConsentAnswer::Pending(pending) => pending.await.unwrap_or_default(),
+        };
+        if !decided {
             let _ = tx
                 .send_frame(&Frame {
                     version: ak_wire::VERSION,
@@ -8914,7 +8983,9 @@ mod tests {
     /// checkpoint record).
     #[tokio::test]
     async fn consent_decline_sends_declined_error_and_writes_nothing() {
-        let harness = consent_harness(Some(Arc::new(|_: &ConsentInfo| false)), 2, 4096, true).await;
+        let harness =
+            consent_harness(Some(Arc::new(|_: &ConsentInfo| ConsentAnswer::Now(false))), 2, 4096, true)
+                .await;
 
         // The wire answer, observed by the early reader: exactly one
         // DECLINED error frame and then the connection ends.
@@ -8966,7 +9037,7 @@ mod tests {
         let mut harness = consent_harness(
             Some(Arc::new(move |info: &ConsentInfo| {
                 *sink.lock().unwrap() = Some(info.clone());
-                true
+                ConsentAnswer::Now(true)
             })),
             2,
             12_345,
@@ -8991,6 +9062,55 @@ mod tests {
         assert!(
             !matches!(outcome, Err(EngineError::ConsentDeclined { .. })),
             "accepting consent must not decline: {outcome:?}"
+        );
+    }
+
+    /// The non-blocking shape (wave 29, review P2-07): a
+    /// `ConsentAnswer::Pending` parks the receive at the Offer point while
+    /// the callback itself already returned — the decision arrives through
+    /// the oneshot — and a decider that vanishes (every sender half
+    /// dropped) fails closed as a declination.
+    #[tokio::test]
+    async fn consent_pending_resolves_asynchronously_and_fails_closed() {
+        // Resolved-accept leg: the receiver stays parked at the Offer until
+        // the out-of-band decision arrives.
+        let (decide_tx, decide_rx) = tokio::sync::oneshot::channel::<bool>();
+        let parked = std::sync::Mutex::new(Some(decide_rx));
+        let mut harness = consent_harness(
+            Some(Arc::new(move |_: &ConsentInfo| match parked.lock().unwrap().take() {
+                Some(pending) => ConsentAnswer::Pending(pending),
+                None => ConsentAnswer::Now(false),
+            })),
+            1,
+            10,
+            false,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        decide_tx.send(true).unwrap();
+        match harness.next_frame().await {
+            Message::Accept { job_id } => assert_eq!(job_id, harness.job_id),
+            other => panic!("a resolved-accept pending consent must Accept, got {other:?}"),
+        }
+
+        // Fail-closed leg: every decider drops without answering.
+        let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(gone_tx);
+        let vanished = std::sync::Mutex::new(Some(gone_rx));
+        let harness = consent_harness(
+            Some(Arc::new(move |_: &ConsentInfo| match vanished.lock().unwrap().take() {
+                Some(pending) => ConsentAnswer::Pending(pending),
+                None => ConsentAnswer::Now(false),
+            })),
+            1,
+            10,
+            false,
+        )
+        .await;
+        let outcome = harness.receiver.await.unwrap();
+        assert!(
+            matches!(outcome, Err(EngineError::ConsentDeclined { .. })),
+            "a vanished decider must fail closed as a declination: {outcome:?}"
         );
     }
 
@@ -9059,7 +9179,7 @@ mod tests {
         }
 
         let (plain_frames, plain_report) = one_run(None, &payload, &entry).await;
-        let consent = Some(Arc::new(|_: &ConsentInfo| true) as TransferConsent);
+        let consent = Some(Arc::new(|_: &ConsentInfo| ConsentAnswer::Now(true)) as TransferConsent);
         let (consent_frames, consent_report) = one_run(consent, &payload, &entry).await;
 
         // Every protocol frame after the Hello is identical.

@@ -45,7 +45,10 @@ void main() {
     expect(codeText, findsOneWidget);
     final selectable = tester.widget<SelectableText>(codeText);
     expect(selectable.style?.fontFamily, 'monospace');
-    expect(selectable.data, 'AK01-0001');
+    final shownCode = selectable.data ?? '';
+    expect(shownCode, fake.createdCodes.single.code,
+        reason: '展示的是引擎真实 AKI1 码（P1-02）');
+    expect(shownCode.startsWith('AKI1-'), isTrue);
     expect(find.byKey(const ValueKey('flow_copy_code')), findsOneWidget);
     expect(find.byKey(const ValueKey('flow_waiting')), findsOneWidget);
     expect(fake.createdCodes.single.role, TaskRole.send);
@@ -55,7 +58,8 @@ void main() {
     // the test.
     await tester.tap(find.byKey(const ValueKey('flow_copy_code')));
     await tester.pump();
-    expect(clipboard.text, 'AK01-0001');
+    expect(clipboard.text, fake.createdCodes.single.code,
+        reason: '复制按钮写入选中的完整显示码');
     await tester.pump(const Duration(seconds: 5));
 
     // Peer joins → connection appears, flow moves to 建立连接.
@@ -86,25 +90,37 @@ void main() {
     expect(find.text('我发送 → 对方'), findsOneWidget);
   });
 
-  testWidgets('join flow: hyphen/lowercase tolerance, probe, success; '
-      'joiner direction complements the creator declaration',
+  testWidgets('join flow: full AKI1 code with case/hyphen/space '
+      'tolerance, explicit direction, probe, success',
       (tester) async {
     final fake = await pumpApp(tester);
 
-    // The other device minted a "我要接收" code — we joined it, so OUR
-    // connection direction is send.
-    await fake.createCode(TaskRole.receive);
+    // The other device minted a "我要接收" code — we join it declaring
+    // OUR intent (send), so the connection direction is send.
+    final minted = await fake.createCode(TaskRole.receive);
+    expect(minted.code.startsWith('AKI1-'), isTrue);
 
     await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    // Lowercase + hyphenated input: the formatter uppercases, the
-    // controller strips the hyphen before joinCode.
+    // Lowercase + ungrouped + spaced input of the FULL code: the
+    // formatter uppercases, the controller strips separators.
+    final tolerant = minted.code.toLowerCase().replaceAll('-', ' ');
     await tester.enterText(
-        find.byKey(const ValueKey('join_code_field')), 'ak01-0001');
+        find.byKey(const ValueKey('join_code_field')), tolerant);
     await tester.pump();
-    expect(find.text('8/8 位'), findsOneWidget);
+    expect(find.text('36/36 位'), findsOneWidget);
+
+    // The join direction picker (P1-05): submit stays disabled until the
+    // user declares their intent.
+    final submitDisabled = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submitDisabled.onPressed, isNull);
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('发送文件')));
+    await tester.pump();
 
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -118,21 +134,28 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('flow_done_button')));
     await tester.pump();
     expect(find.text('我发送 → 对方'), findsOneWidget);
-    // One-time code: consumed by the join.
+    // One-time code: consumed by the join; the typed (normalized) form
+    // reached the service with the explicit role.
     expect(fake.pendingCode, isNull);
-    expect(fake.joinRequests.single, 'AK010001');
+    expect(fake.joinRequests.single, normalizeJoinCode(minted.code));
+    expect(fake.joinRoleRequests.single, TaskRole.send);
   });
 
   testWidgets('join flow failure: readable reason, retry reopens the '
       'input panel', (tester) async {
     final fake = await pumpApp(tester);
     fake.nextJoinError = '配对码不存在或已过期';
+    final minted = await fake.createCode(TaskRole.send);
 
     await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(
-        find.byKey(const ValueKey('join_code_field')), 'ZZZZ-9999');
+        find.byKey(const ValueKey('join_code_field')), minted.code);
+    await tester.pump();
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('接收文件')));
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -145,23 +168,63 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('flow_retry_button')));
     await tester.pump();
     expect(find.byKey(const ValueKey('join_code_field')), findsOneWidget);
-    expect(fake.joinRequests.single, 'ZZZZ9999');
+    expect(fake.joinRequests.single, normalizeJoinCode(minted.code));
   });
 
-  testWidgets('join submit stays disabled below 8 chars with a counter '
-      'hint', (tester) async {
+  testWidgets('join submit stays disabled on a malformed AKI1 code with '
+      'a counter hint', (tester) async {
     await pumpApp(tester);
 
     await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
+    // Old 8-char shape and a truncated AKI1 form are both rejected.
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), 'AB-12');
     await tester.pump();
     final submit = tester.widget<FilledButton>(
         find.byKey(const ValueKey('join_submit_button')));
     expect(submit.onPressed, isNull);
-    expect(find.text('4/8 位'), findsOneWidget);
+    expect(find.textContaining('4/36 位'), findsOneWidget);
+
+  });
+
+  testWidgets('join submit stays disabled one symbol short of the real '
+      'AKI1 format', (tester) async {
+    final fake = await pumpApp(tester);
+    final minted = await fake.createCode(TaskRole.send);
+
+    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    // 43 of 44 display characters: one symbol short of the real format.
+    await tester.enterText(
+        find.byKey(const ValueKey('join_code_field')),
+        minted.code.substring(0, minted.code.length - 1));
+    await tester.pump();
+    final shortSubmit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(shortSubmit.onPressed, isNull);
+    expect(find.textContaining('35/36 位'), findsOneWidget);
+  });
+
+  testWidgets('P2-09: a FAILED probe ends the flow with an honest '
+      '不可达 verdict (never "连接成功")', (tester) async {
+    final fake = await pumpApp(tester);
+
+    await chooseRole(tester, const ValueKey('role_send_button'));
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.failProbe(connId);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('flow_error')), findsOneWidget);
+    expect(find.textContaining('连通测试未通过'), findsOneWidget);
+    // The list card carries the honest state chip.
+    expect(find.byKey(const ValueKey('conn_state_unreachable')),
+        findsOneWidget);
+    expect(find.byKey(const ValueKey('flow_success')), findsNothing);
   });
 
   testWidgets('create flow cancel returns to the two actions without a '

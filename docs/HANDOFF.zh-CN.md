@@ -48,6 +48,23 @@
 - 如实边界（更新到二十二次后，2026-11-05）：13 项配对 e2e 为进程内真 TLS（rustls）＋真 SQLite 形态（全流程互录 journal/owner 离线补推/中断恢复/防中间人/同码多兑换/幂等/双 runtime listener 均实测），无跨机器注册服务部署、无真机双端配对验证；B8 FFI 已于第二十二波落地首版——实际 14 导出 vs 冻结契约 18 名称（缺 `ak_pairing_stop_start`/`ak_sched_retry`/`ak_sched_task_result`/`ak_sched_shutdown_start`，契约 `ak_sched_listen_start` 实际命名 `ak_sched_start`），契约对齐列入终审 P1-4；`client_v2` 与 `server_v2` 三处握手常量（ALPN/pin/exporter label）已于第二十二波统一；ghost 反枚举为内存态、owner 握手窗口崩溃不可恢复（见 [SECURITY](SECURITY.zh-CN.md) 邀请码节已知限制）。
 - 当前状态与已知限制（更新到二十五波后，2026-11-05）：FFI 已落地并补齐契约（19 导出，双 ABI 符号验证）、TLS 常量已统一、P1-4 已按"Fake→Real 接线"关闭（边界如实：daemon 真实链路每轮单任务、全零 code_id 匿名组；真实分组的四模式矩阵与双端 wire 准入已于第二十七波实现并有活动区间证据（见 CHANGELOG 与 send_admission_cli itest）——CLI daemon `--same-code/--cross-code` 自第二十四波（`ac6b23b`）起走真实链路（`RealTransport`＋`SessionRuntime`＋`RealTransferExecutor`，全链测试 `wired_enqueue_completes_a_real_transfer_through_the_session`，`crates/ak-cli/src/daemon.rs`）。真机跨设备已验证（第二十五波 `3bc75e0`）：服务器部署于 122.51.121.24（registry 7200 TLS＋signal 7100/7101，systemd 常驻），Windows↔Linux 邀请码配对双向传输 `scripts/cross_device_test.sh` 6/6 PASS（双向 8 MiB SHA256 一致）；多 IP 候选＋LAN 优先回退解决 VPN/真实 IP 双栈问题。FFI 侧如实边界：常驻调度监听器关停（`listener_enabled:false`，`crates/ak-ffi/src/sched_ext.rs`）、FFI wire 准入握手列入后续（`crates/ak-ffi/src/pairing.rs:28-34`）——GUI 发送/接收/邀请码走引擎 FFI 真路径，托管式调度在 CLI daemon。终审 5 项 P1 全列表与逐项修复状态见 [BACKLOG](BACKLOG.zh-CN.md)"终审发现（2026-11-05）"节。
 
+## 第二十八至二十九波：v1 极简配对 UX 与终审修复（2026-11-06，dev/local-parallel）
+
+**第二十八波（提交 `7458e9f`，4 并行代理＋集成者）——v1 极简配对 UX**。用户冻结规格：一个随机任务码＝一次传输任务、恰好双方、任一侧发起；码按需生成（600s TTL、`max_redeems=1`）、携带创建方连接设置（endpoint）、断开即失效；UI 永不显示 IP/端口/指纹。五层交付：
+
+- 协议/服务器：帧层 endpoint 扩展（四个配对消息携带 ≤512B 不透明 blob，防枚举帧形状保持）；`max_redeems` 单次兑换语义（`0x2109 REDEEM_EXHAUSTED`，仅已提交事务消耗额度）；SQLite v1→v2 增量迁移（码表 endpoint 列＋事务快照）。部署服务器 122.51.121.24 已升级 v2 schema（身份 pin 不变）。
+- 会话/引擎：`ak-session::pairing::task`（`TaskPairing` 生命周期：create/join、方向互补、LAN 优先 probe、`TaskDisconnected` Local/Network/ByPeer）；引擎 `TransferConsent` 钩子（Offer 级接受/拒绝，DECLINED＋零用户文件落盘，默认 `None` 字节不变）。
+- FFI/Dart：`ak_task_*` 8 导出（复用 poll_event/op_result）；`crates/ak-ffi/src/task.rs`＋`task_ext.rs`；Dart `task_ffi.dart`＋`FfiSimpleTransferService` 桥（引擎本地码表降级为同引擎缓存）。
+- UI：导航收敛为**连接＋设置**两页（生码选角色/输码自动探测/连接列表/详情页系统选择器/入站横幅接受→进度→保存路径；唯一设置＝默认保存文件夹；旧身份/指纹/配对簿/邀请码页全部移除；390dp 回归测试）。
+- 验证（`7458e9f` 时点）：workspace 1085/0＋clippy 干净＋契约 5/5；dart 128/128、flutter 86/86；升级后 v2 服务器跨设备向后兼容 6/6（W→L 4.3s、L→W 19.4s，SHA256 一致）。
+
+**第二十九波（进行中，修复在未提交工作树）——wave-28 终审修复轮**。终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`；P0×0 / P1×6 / P2×15；结论"不宜按已完成通过终审"，最直接阻断是 GUI 入口 Fake、八位码校验、方向错误、快照缺失）。修复状态（已完成／在途如实区分）：
+
+- 已完成：P1-03 服务器额度竞态（Commit 同事务复查 `max_redeems`，含竞态/cap>1/不消耗额度三类测试）；P2-13 迁移原子性（单一写事务＋可重入）；P2-14 幂等跨版本（默认扩展保持 v1 36B canonical body，旧 journal 升级后重放幂等）；P1-05 会话侧方向前置门禁（`join_task_code` 显式 `my_direction`＋`veto_task_offer` 在 RedeemOffer 阶段否决，Dart 已传显式角色）；P1-01 Dart 真接线（`main()` 构造真实栈，构造失败降级错误卡片，Fake 仅测试注入）；P1-02 真实 AKI1 码格式（UI 接受完整 `AKI1-…` 码）；P1-06 流快照（逐订阅者快照＋后续事件）；P2-08/09/10/11（协调断开与直连状态分离、探测真值归并、终态跟踪替代固定超时、30s 自动拒绝关横幅且过期拒绝幂等）。
+- 在途（无法预知结果）：P1-04 FFI 接收器身份绑定（接收器 `authorize` 绑定配对已验证指纹、`ConsentInfo.sender_fingerprint`、陌生身份不触发合法任务提示——工作树已有实质实现与测试，收口验收进行中）；P2×9：P2-01 request_id 原子受理、P2-02 并发懒初始化、P2-03 空闲断开跨设备通知、P2-04 未加入码取消/TTL、P2-05 接收器终态收敛、P2-06 保存目录变更时点、P2-07 consent 阻塞 worker、P2-12 echo 响应互投、P2-15 endpoint 缓存回收。
+- 验证基线（如实）：dart 129/129、flutter 107/107（wave-29 工作树时点）；workspace 1085/0 为 wave-28 时点（`7458e9f`），wave-29 修复后未复跑全量；契约 5/5；跨设备向后兼容 6/6；服务器 122.51.121.24 已运行 v2 协议。
+- 口径变化：**v1 一次性任务码模型为 GUI 主线路径**；旧 invite/调度多码模型（`invite create/redeem`、`daemon --pairing`、两维并发策略）保留为 **CLI 高级能力**，两条路径并存、CLI 未接 v1 任务码（GUI-only）。
+
 ## 实现与验证边界（如实）
 
 - 已验证范围＝本机环回（L2 形态）＋模拟器↔宿主跨设备（CLI 路线：真实双进程、跨网络栈 NAT 形态、逐字节一致）：QUIC 握手、传输、续传、大文件、CLI 双进程。两台物理机器、跨网段、公网 NAT 穿透、抓包（L3/L4）未执行。
@@ -74,13 +91,13 @@ README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 2026-11-02 方案评审见 [方案评审](REVIEW_2026-11-02.zh-CN.md)；D1/D5/D6 已按所有者指示经 ADR-002 采纳，D2/D3 细节仍待确认。
 第一阶段验证记录见 [Rust 验证记录](../reports/rust-validation-2026-11-02.txt)、[上传验收记录](../reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。
 
-## 下一工程节点（更新到第二十六波，2026-11-06）
+## 下一工程节点（更新到第二十八/二十九波，2026-11-06）
 
-1. **物理双机跨网段实测（P0-01/P0-05/P0-07 依赖环境）**：Windows↔Linux 跨公网双向传输已由 `scripts/cross_device_test.sh` 自动化验证（2026-11-05，部署服务器 122.51.121.24，双向 8 MiB SHA256 一致，6/6 PASS）；Android 模拟器→Windows 宿主路线亦通。剩余＝两台真实物理机（家宽/热点组合）下的公网直连成功率与抓包级证据。
-2. **daemon 真实邀请码两维并发（已完成，第二十七波）**：并发 accept + 每连接 handler；组键来自 wire TaskOpen 与 pairing journal Applied 记录的交叉校验（伪造 code_id 被拒）；同码默认串行/异码默认并行的策略矩阵在生产路径生效（多进程 itest 活动区间证据）；发送端有 Ready 关系即自动走准入（BUSY 不静默降级）；legacy 对端同连接旧协议兼容。
-3. **wave-26 修复收口（2026-11-06）**：Codex 二次终审（`reports/codex-review-2026-11-05-wave25.md`，20 项：P0×1/P1×6/P2×13）的修复进行中——P0-01 FFI 快照 ABI 错配（已裁决：以实际 3 参导出为唯一契约）、P1-01 连接预算含扫描、P1-03 真实任务关闭、P1-04 配对停止竞态、P1-05 Dart dispose 悬空调用、P1-06 enqueue 缺 peer、P2×13；前次已披露仍开放的 2 项 P2（on-channel 准入前扫描、检查点 AKREC2 隔离）见 BACKLOG。
-4. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）。
-5. 视实测结果冻结网络库 ADR（评审 D1 尾项）并重估路线。
-6. Android GUI 模拟器走查（第四轮冷启后 android_real_test 已 4P/1S/0F，2026-11-05；SAF 选择器实机走查、MediaStore 仍待）；Linux Flutter GUI 首次真实构建（CLI 已部署实测，GUI 未构建）。
-历史（第二十二波口径，留档）：上一轮"下一节点"原文见 git 历史；其 FFI 14 导出、Fake executor、未部署服务器等状态均已被第二十四/二十五波推进覆盖。
+1. **wave-29 终审修复收口（当前主线，进行中）**：P1-04 FFI 接收器身份绑定＋P2×9（P2-01/02/03/04/05/06/07/12/15）在途；收口门槛＝workspace 全量复跑（当前 1085/0 为 `7458e9f` 时点）＋clippy＋契约 5/5＋dart/flutter 复跑＋终审报告"后续验证建议"表中实际 GUI 接线、单次额度、身份绑定、生命周期、并发时序、存储长传输六组场景（`reports/codex-review-2026-11-06-wave28.md`）。
+2. **v1 极简模型双端 GUI 验收（主线路径）**：真实 `main()` 启动（wave-29 P1-01 已接线）、双方各生一次真实 AKI1 码、真实码复制/输入（P1-02）、稳定连接进详情发送（P1-06）、同意后字节一致——P1-04 收口后补陌生第三方抢先拨号的负例。Android 侧 v1 极简 UI 走查（System UI ANR 史见下第 6 条）。
+3. **旧 invite/调度多码模型＝CLI 高级能力保留**：不进 v1 GUI 主线；`invite create/redeem`、`daemon --pairing` 两维并发（第二十七波 `5a5dac1`）与配对簿/mDNS 流程按 CLI 高级用法维护，向后兼容由服务器 v2 schema 迁移＋跨设备 6/6 保障。
+4. **物理双机跨网段实测（P0-01/P0-05/P0-07 依赖环境）**：Windows↔Linux 跨公网（`scripts/cross_device_test.sh`，部署服务器 122.51.121.24，6/6 PASS，2026-11-05）与 Android 模拟器↔宿主已通；剩余＝两台真实物理机（家宽/热点）公网直连成功率＋抓包级无中继证据（L3）。
+5. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）；视实测结果冻结网络库 ADR（评审 D1 尾项）。
+6. Linux Flutter GUI 首次真实构建（CLI 已部署实测；v1 极简 UI 已就绪待构建）；Android SAF 选择器实机走查、MediaStore、后台生命周期仍待（P0-06 余项）。
+历史（第二十二波口径，留档）：上一轮"下一节点"原文见 git 历史；其 FFI 14 导出、Fake executor、未部署服务器等状态均已被第二十四/二十五波推进覆盖。第二十六波修复（`de8f6be`，二次终审 20 项全关）与第二十七波 daemon 两维并发（`5a5dac1`）已完成，见 CHANGELOG 对应条目。
 后续开发先读取本文件、AGENTS、ROADMAP 和现有源码；保留已有历史，禁止强推。

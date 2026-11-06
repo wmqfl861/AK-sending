@@ -132,7 +132,7 @@ final class FakeAkTaskCalls implements AkTaskCalls {
       return _fail(AkStatus.errInvalid, 'fake: 字段 "role" 必须是 sender 或 receiver');
     }
     final op = _mintOp(runtime, 'task_create_code', opIdOut);
-    final code = 'AKT1-${_codeGroup()}-${_codeGroup()}-${_codeGroup()}'.toUpperCase();
+    final code = _mintDisplayCode();
     runtime.codes.add(_codeKey(code));
     runtime.roleOfCode[_codeKey(code)] = role as String;
     op.body = () => <String, dynamic>{
@@ -162,6 +162,13 @@ final class FakeAkTaskCalls implements AkTaskCalls {
     if (code is! String || code.trim().isEmpty) {
       return _fail(AkStatus.errInvalid, 'fake: 缺少必填字段 "code"');
     }
+    // Optional explicit joiner role (wave-29 P1-05): the engine's
+    // `role_hint` — validated like `TaskRole::parse` on the Rust side.
+    final roleHint = parsed?['role'];
+    if (roleHint != null && roleHint != 'sender' && roleHint != 'receiver') {
+      return _fail(
+          AkStatus.errInvalid, 'fake: 字段 "role" 必须是 sender 或 receiver');
+    }
     final normalized = _codeKey(code);
     final op = _mintOp(runtime, 'task_join', opIdOut);
     // Resolve against ANY started runtime's codes (the engine-local stand-in
@@ -177,18 +184,27 @@ final class FakeAkTaskCalls implements AkTaskCalls {
       };
     } else {
       final owner = ownerEntry.first.value;
-      final role = owner.roleOfCode[normalized] == 'sender' ? 'receiver' : 'sender';
+      final role = roleHint is String
+          ? roleHint // explicit user intent wins
+          : (owner.roleOfCode[normalized] == 'sender' ? 'receiver' : 'sender');
       final conn = _hex(_newId());
       runtime.connections[conn] = TaskConnState(role, 'probing', '127.0.0.1:45678');
       if (identical(owner, runtime)) {
         // Self-join (one runtime drives both actions, the single-runtime
-        // service-test shape): ONE entry — the joiner's.
+        // service-test shape): ONE entry — the joiner's — with its own
+        // probe pair.
         runtime.events.add(<String, dynamic>{
           'event': 'connected',
           'conn': conn,
           'role': role,
           'peer_endpoint': '127.0.0.1:45678',
           'code': normalized,
+        });
+        runtime.events.add(<String, dynamic>{
+          'event': 'probe_result',
+          'conn': conn,
+          'endpoint': '127.0.0.1:45678',
+          'reachable': true,
         });
       } else {
         owner.connections[conn] =
@@ -201,20 +217,23 @@ final class FakeAkTaskCalls implements AkTaskCalls {
             'peer_endpoint': '127.0.0.1:45678',
             'code': normalized,
           });
+          // Both sides run their own reachability probe after the
+          // `connected` bookkeeping event (the Rust owner_side_completion
+          // / run_join shape).
+          side.events.add(<String, dynamic>{
+            'event': 'probe_result',
+            'conn': conn,
+            'endpoint': '127.0.0.1:45678',
+            'reachable': true,
+          });
         }
       }
-      runtime.events.add(<String, dynamic>{
-        'event': 'probe_result',
-        'conn': conn,
-        'endpoint': '127.0.0.1:45678',
-        'reachable': null,
-      });
       op.body = () => <String, dynamic>{
         'op': 'task_join',
         'conn': conn,
         'role': role,
         'peer_endpoint': '127.0.0.1:45678',
-        'probe': 'unverified',
+        'probe': 'verified',
       };
       if (autoCompleteOps) {
         op.result = op.body!();
@@ -286,7 +305,7 @@ final class FakeAkTaskCalls implements AkTaskCalls {
             'role': entry.value.role,
             'state': entry.value.state,
             'peer_endpoint': entry.value.endpoint,
-            'code': 'AKT1-0000-0000-0000',
+            'code': 'AKI1-0000-0000-0000-0000-0000-0000-0000-0000',
           },
       ],
     });
@@ -570,11 +589,19 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   Uint8List _newId() =>
       Uint8List.fromList(List<int>.generate(16, (_) => _random.nextInt(256)));
 
-  String _codeGroup() {
-    const chars = '0123456789abcdef';
-    return String.fromCharCodes(
-        List<int>.generate(4, (_) => chars.codeUnitAt(_random.nextInt(16))));
+  /// One real-shape display code: `AKI1-` + eight groups of four Crockford
+  /// Base32 symbols (I, L, O, U excluded) — mirrors the Rust
+  /// `InviteCode::to_display` presentation exactly (wave-29 P1-02).
+  String _mintDisplayCode() {
+    final groups = <String>[
+      for (var group = 0; group < 8; group++)
+        String.fromCharCodes(List<int>.generate(
+            4, (_) => _crockford.codeUnitAt(_random.nextInt(32)))),
+    ];
+    return 'AKI1-${groups.join('-')}';
   }
+
+  static const String _crockford = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 }
 
 /// The code-table key: uppercase, separators stripped — mirrors the

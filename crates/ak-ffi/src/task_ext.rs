@@ -412,8 +412,11 @@ pub extern "C" fn ak_task_list(
     }
 }
 
-/// `ak_task_disconnect`: sever one connection (idempotent;
-/// `AK_ERR_NOT_FOUND` for an unknown connection or task runtime).
+/// `ak_task_disconnect`: sever one connection — or cancel a task code that
+/// was generated but never joined (the id then names the create result's
+/// `code_id`; wave-29 P2-04). Idempotent (an already-severed connection
+/// and an already-cancelled code are silent `AK_OK`s);
+/// `AK_ERR_NOT_FOUND` for an id that is neither, or an unknown runtime.
 ///
 /// # Safety
 ///

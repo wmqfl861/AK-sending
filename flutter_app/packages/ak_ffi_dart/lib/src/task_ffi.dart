@@ -208,14 +208,32 @@ class AkTaskCreateCodeSpec {
 /// Builder for the `ak_task_join` spec:
 ///
 /// ```json
-/// {"spec_version":1,"code":"AKT1-XXXX-XXXX-XXXX",
-///  "candidates":["ip:port",...],"request_id":"<32hex>"}
+/// {"spec_version":1,"code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
+///  "role":"sender|receiver"(optional),"candidates":["ip:port",...],
+///  "request_id":"<32hex>"}
 /// ```
+///
+/// The code is the REAL display form the Rust side mints
+/// (`InviteCode::to_display`: `AKI1-` + eight groups of four Crockford
+/// Base32 symbols — the engine's `normalize_code_key` tolerates case,
+/// hyphens and spaces, so any user-typed grouping passes through here).
 class AkTaskJoinSpec {
-  const AkTaskJoinSpec({required this.code, this.candidates = const <String>[], this.requestId});
+  const AkTaskJoinSpec({
+    required this.code,
+    this.role,
+    this.candidates = const <String>[],
+    this.requestId,
+  });
 
-  /// The task code as displayed to the user (`AKT1-…`, case-insensitive).
+  /// The task code as displayed to the user (`AKI1-…`, case-insensitive).
   final String code;
+
+  /// The joiner's EXPLICIT role (`"sender"`/`"receiver"`) — the UI user's
+  /// declared intent for this pairing (wave-29 P1-05 alignment: the hint
+  /// rides the join spec so cross-device joins never guess the direction).
+  /// Null keeps the engine's resolution: same-engine mirror-complement,
+  /// else the v1 receiver default.
+  final AkTaskRole? role;
 
   final List<String> candidates;
 
@@ -235,6 +253,7 @@ class AkTaskJoinSpec {
     return <String, dynamic>{
       'spec_version': 1,
       'code': trimmed.toUpperCase(),
+      if (role != null) 'role': role!.wireName,
       if (candidates.isNotEmpty) 'candidates': candidates,
       if (requestId != null) 'request_id': requestId!.toLowerCase(),
     };

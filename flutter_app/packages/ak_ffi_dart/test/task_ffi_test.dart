@@ -74,10 +74,26 @@ void main() {
           throwsA(isA<AkSpecException>()));
     });
 
-    test('join normalizes the code and validates candidates', () {
+    test('join normalizes the code, renders the optional role and '
+        'validates candidates', () {
       final json =
-          AkTaskJoinSpec(code: ' akt1-abcd-1234-ef56 ').toJson();
-      expect(json['code'], 'AKT1-ABCD-1234-EF56');
+          AkTaskJoinSpec(code: ' aki1-abcd-1234 ').toJson();
+      expect(json['code'], 'AKI1-ABCD-1234');
+      expect(json.containsKey('role'), isFalse, reason: '无 role 提示时省略字段');
+
+      final withRole = AkTaskJoinSpec(
+        code: 'AKI1-ABCD-1234',
+        role: AkTaskRole.sender,
+      ).toJson();
+      expect(withRole['role'], 'sender');
+
+      final receiverRole = AkTaskJoinSpec(
+        code: 'aki1abcd1234',
+        role: AkTaskRole.receiver,
+      ).toJson();
+      expect(receiverRole['role'], 'receiver');
+      expect(receiverRole['code'], 'AKI1ABCD1234');
+
       expect(() => AkTaskJoinSpec(code: '  ', candidates: const ['x']).toJson(),
           throwsA(isA<AkSpecException>()));
     });
@@ -110,7 +126,9 @@ void main() {
           .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender))
           .wait(delay: immediateDelay);
       final code = created['code'] as String;
-      expect(code.startsWith('AKT1-'), isTrue);
+      // Real display shape (P1-02): AKI1- + 8 groups of 4 Crockford symbols.
+      expect(RegExp(r'^AKI1-[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){7}$')
+          .hasMatch(code), isTrue);
       expect(created['role'], 'sender');
 
       final settled = runtime.pollEvent();
@@ -130,7 +148,37 @@ void main() {
       expect(connected.conn, conn);
       expect(connected.role, 'receiver');
       final probe = runtime.pollEvent() as TaskProbeResultEvent;
-      expect(probe.reachable, isNull);
+      expect(probe.reachable, isTrue);
+    });
+
+    test('join role hint: the explicit user intent wins over the mirror '
+        'guess (P1-05 seam)', () async {
+      final fake = FakeAkTaskCalls();
+      final task = TaskFfi(calls: fake);
+      final owner = task.start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/i'));
+      final joiner = task.start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/j'));
+      final created = await owner
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.receiver))
+          .wait(delay: immediateDelay);
+      // The mirror-complement of a receiver code would be "sender"; the
+      // joiner EXPLICITLY declared receiver — the hint must win.
+      final joined = await joiner
+          .join(AkTaskJoinSpec(
+              code: created['code'] as String, role: AkTaskRole.receiver))
+          .wait(delay: immediateDelay);
+      expect(joined['role'], 'receiver');
+      // The wire spec carried the hint verbatim.
+      expect(fake.acceptedSpecs.last, contains('"role":"receiver"'));
+      // Without a hint the mirror complement still applies.
+      final secondCode = await owner
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender))
+          .wait(delay: immediateDelay);
+      final mirrored = await joiner
+          .join(AkTaskJoinSpec(code: secondCode['code'] as String))
+          .wait(delay: immediateDelay);
+      expect(mirrored['role'], 'receiver');
     });
 
     test('list snapshot reflects connections and the save dir', () async {
@@ -272,7 +320,7 @@ void main() {
           'conn': 'cd' * 16,
           'role': 'sender',
           'peer_endpoint': '192.168.1.2:7100',
-          'code': 'AKT1-AAAA-BBBB-CCCC',
+          'code': 'AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH',
         }),
         TaskEvent.fromJson({
           'event': 'probe_result',

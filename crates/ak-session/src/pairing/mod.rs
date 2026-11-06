@@ -61,7 +61,7 @@ pub use client::{ClientConfig, ClientState, RegistryClient};
 pub use error::{ClientError, PairFlowError};
 pub use orchestrator::{
     redeem_request_mac, CommittedPairing, CreatedInvite, OrchestratorConfig, PairingOrchestrator,
-    PersistedCodeSource, TaskRedeem, BOOK_NAME, JOURNAL_SUBDIR,
+    PersistedCodeSource, RedeemOffer, RedeemOfferGate, TaskRedeem, BOOK_NAME, JOURNAL_SUBDIR,
 };
 pub use task::{
     decode_endpoint_blob, encode_endpoint_blob, order_candidates_lan_first, probe_peer,

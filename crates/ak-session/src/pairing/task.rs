@@ -10,7 +10,9 @@
 //!   a second redeem is refused with the dedicated `REDEEM_EXHAUSTED`
 //!   business error);
 //! * the **joiner** types the code into [`TaskPairing::join_task_code`],
-//!   which redeems it carrying the joiner's own endpoint blob;
+//!   which redeems it carrying the joiner's own endpoint blob and an
+//!   explicit `my_direction` (the user's intent, an FFI contract — never
+//!   a local default);
 //! * once the frozen pairing transcript reaches `PairReady`, both sides
 //!   hold the peer's blob and parse it into a [`PeerEndpoint`]
 //!   (`candidates`, `name`, `direction`) — the owner's blob travels in
@@ -61,7 +63,7 @@ use tokio::task::JoinHandle;
 
 use crate::pairing::client::ClientState;
 use crate::pairing::error::PairFlowError;
-use crate::pairing::orchestrator::{CreatedInvite, PairingOrchestrator};
+use crate::pairing::orchestrator::{CreatedInvite, PairingOrchestrator, RedeemOffer};
 
 /// Default lifetime of a task code: 10 minutes (the v1 "short TTL").
 pub const TASK_CODE_TTL_SECS: u32 = 600;
@@ -85,9 +87,15 @@ mod reasons {
 // ---- direction ---------------------------------------------------------------
 
 /// Which side of the paired task this device is on. The direction is fixed
-/// by the initiator's declaration; the joiner declares the complementary
-/// one and a mismatched pair refuses at completion
-/// ([`TaskError::DirectionConflict`]).
+/// by the initiator's declaration; the joiner declares its own explicit
+/// direction (`join_task_code`'s `my_direction` — the user's intent at the
+/// UI, an API contract the FFI caller owns). A mismatched pair is refused
+/// by the initiator's owner loop **before the server commits** (see
+/// [`TaskPairing::spawn_owner_loop`]; the joiner then observes the
+/// server's unified "pairing target unavailable" answer, the code stays
+/// redeemable and nothing is journaled or booked on either side). The
+/// post-completion [`TaskError::DirectionConflict`] remains as defense in
+/// depth against a pre-gate initiator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskDirection {
     /// This device sends the payload.
@@ -799,10 +807,18 @@ impl TaskPairing {
     // ---- joiner ---------------------------------------------------------------
 
     /// Redeem a typed task code carrying this device's candidates and
-    /// direction (the mirror of the initiator's declaration; a mismatched
-    /// pair refuses with [`TaskError::DirectionConflict`]). On `PairReady`
-    /// both sides hold each other's endpoint — this side gets the
-    /// initiator's blob off the relayed `PairCommit`.
+    /// explicit direction (`my_direction` is the user's intent at the UI —
+    /// the caller, not any local guess, declares which side of the task
+    /// this device is on). The direction rule is enforced by the
+    /// initiator's owner loop at the relayed offer, **before the server's
+    /// irreversible commit**: a mismatched (or endpoint-less) declaration
+    /// aborts the pending transaction there, so this call fails with the
+    /// server's unified "pairing target unavailable" flow error while the
+    /// code stays redeemable and neither side journals or books anything.
+    /// [`TaskError::DirectionConflict`] after completion remains only as
+    /// defense in depth against a pre-gate initiator (review 2026-11-06,
+    /// P1-05). On `PairReady` both sides hold each other's endpoint —
+    /// this side gets the initiator's blob off the relayed `PairCommit`.
     pub async fn join_task_code(
         &self,
         code_str: &str,
@@ -917,16 +933,66 @@ impl TaskPairing {
         self.finish_task(code_id, TaskDisconnectReason::Network);
     }
 
+    /// Pre-commit veto over one redeem offer (P1-05, wave 29; installed
+    /// by [`TaskPairing::spawn_owner_loop`] as the orchestrator's
+    /// redeem-offer gate). For a code this `TaskPairing` created, the
+    /// joiner's endpoint blob must be present and decodable and must
+    /// declare the mirror of the code's direction — otherwise the offer
+    /// is refused before the owner flow starts, so the server never
+    /// commits, the aborted redeem does not consume the code's single
+    /// budget, and neither side journals or books the pairing. Codes not
+    /// created here (plain invites, adopted codes) carry no task rule
+    /// and pass through untouched.
+    fn veto_task_offer(&self, offer: &RedeemOffer) -> Result<(), PairFlowError> {
+        let my_direction = self
+            .tasks
+            .lock()
+            .expect("task pairing lock")
+            .get(&offer.code_id)
+            .map(|task| task.direction);
+        let Some(mine) = my_direction else {
+            return Ok(());
+        };
+        let blob = offer.redeemer_endpoint.as_deref().ok_or_else(|| {
+            PairFlowError::Local("task redeem without an endpoint blob".into())
+        })?;
+        let peer = decode_endpoint_blob(blob).map_err(|err| {
+            PairFlowError::Local(format!("task redeem endpoint rejected: {err}"))
+        })?;
+        if peer.direction == mine {
+            return Err(PairFlowError::Local(format!(
+                "task direction conflict: initiator {mine:?} vs joiner {:?}",
+                peer.direction
+            )));
+        }
+        Ok(())
+    }
+
     /// Task-aware owner loop (wave 28): answers redeems of this device's
     /// codes through the frozen owner flow, and on every committed
     /// pairing parses the joiner's endpoint blob and registers the live
     /// task — the direction the code was created with is remembered, so
     /// the complementary-declaration rule is enforced on this side too.
-    /// Codes created by other processes (`adopt_persisted_code`) are not
-    /// task codes; complete those manually through
-    /// [`TaskPairing::complete_owner_pairing`].
+    ///
+    /// Wave 29 (review 2026-11-06, P1-05): the rule is enforced **before
+    /// the owner flow starts**, through the orchestrator's redeem-offer
+    /// gate. The joiner's endpoint blob arrives with the relayed
+    /// `InviteRedeemOffered` — the first frame of the owner side — while
+    /// the initiator's own direction only reaches the joiner inside
+    /// `PairCommit` (the authoritative commit point), so the initiator is
+    /// the only side that can run the complementary check pre-commit.
+    /// A refusing gate aborts the pending transaction server-side:
+    /// nothing is committed (an aborted attempt does not consume the
+    /// single redeem), nothing is journaled or booked on either side, and
+    /// the joiner's still-waiting redeem fails with the unified
+    /// "pairing target unavailable" answer. Codes created by other
+    /// processes (`adopt_persisted_code`) are not task codes; complete
+    /// those manually through [`TaskPairing::complete_owner_pairing`].
     pub fn spawn_owner_loop(&self) -> JoinHandle<()> {
         let pairing = self.clone();
+        let gate = pairing.clone();
+        self.orch
+            .set_redeem_offer_gate(Arc::new(move |offer| gate.veto_task_offer(offer)));
         self.orch.spawn_owner_loop_verified(Some(Arc::new(move |verified| {
             let code_id = verified.record().transcript.code_id;
             let my_direction = pairing

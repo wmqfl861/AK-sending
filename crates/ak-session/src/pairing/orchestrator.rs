@@ -36,6 +36,19 @@
 //! a fresh owner nonce, and drives the same
 //! challenge → proof → prepared → commit → apply → ready sequence.
 //!
+//! Before any of that, an optional **redeem-offer gate**
+//! ([`PairingOrchestrator::set_redeem_offer_gate`], wave 29 / review
+//! 2026-11-06 P1-05) inspects the offer — including the redeemer's
+//! wave-28 endpoint blob, peeked without consuming it. A refusing gate
+//! aborts the transaction instead of answering it: the server never
+//! receives the owner's `PairChallenge`/`PairPrepared`, so it never
+//! commits (it commits exactly when both `PairPrepared` frames have
+//! arrived), the aborted attempt does not consume the code's redeem
+//! budget, the redeemer observes the unified `PAIR_UNAVAILABLE` before
+//! any of its local writes, and neither side journals or books the
+//! pairing. This is the pre-commit point task-level rules (direction
+//! complement, endpoint presence) are enforced at.
+//!
 //! ## Recovery ([`PairingOrchestrator::recover`])
 //!
 //! On startup, `journal.load_all()` surfaces every transaction that did
@@ -184,6 +197,32 @@ pub struct TaskRedeem {
     pub owner_endpoint: Option<Vec<u8>>,
 }
 
+/// One redeem offer presented to the owner loop **before** the owner flow
+/// starts (wave 29, review 2026-11-06 P1-05): what an installed
+/// [`RedeemOfferGate`] sees of the relayed `InviteRedeemOffered`.
+#[derive(Debug, Clone)]
+pub struct RedeemOffer {
+    /// The code being redeemed.
+    pub code_id: [u8; 16],
+    /// Registry revision of the code at offer time.
+    pub code_revision: u64,
+    /// The server-assigned pairing transaction.
+    pub pairing_id: [u8; 16],
+    /// The redeemer's authenticated device key.
+    pub redeemer_device_id: [u8; 32],
+    /// The redeemer's wave-28 endpoint blob as relayed by the offer's
+    /// extension section (`None` when the redeemer predates the
+    /// extension). Peeked, not consumed: a flow that proceeds still
+    /// takes it exactly once.
+    pub redeemer_endpoint: Option<Vec<u8>>,
+}
+
+/// Pre-commit veto over one redeem offer (see [`RedeemOffer`]). `Err`
+/// aborts the pairing server-side before the owner flow (and therefore
+/// before the server's commit) starts.
+pub type RedeemOfferGate =
+    Arc<dyn Fn(&RedeemOffer) -> Result<(), PairFlowError> + Send + Sync>;
+
 /// In-memory invite registry: `secret_ref → code` plus `code_id` metadata.
 #[derive(Debug, Default)]
 struct Secrets {
@@ -227,6 +266,11 @@ pub struct PairingOrchestrator {
     /// answered (or declined) exactly like the wave-21 per-offer store
     /// lookup did.
     persisted_source: Arc<StdMutex<Option<PersistedCodeSource>>>,
+    /// Optional pre-commit veto over redeem offers (wave 29, P1-05):
+    /// consulted by every owner loop BEFORE the owner flow starts; a
+    /// refusal aborts the transaction instead of answering it, so the
+    /// server never commits and neither side journals/books.
+    offer_gate: Arc<StdMutex<Option<RedeemOfferGate>>>,
 }
 
 /// Live lookup of one persisted invite code (see
@@ -254,6 +298,7 @@ impl PairingOrchestrator {
             config,
             secrets: Arc::new(StdMutex::new(Secrets::default())),
             persisted_source: Arc::new(StdMutex::new(None)),
+            offer_gate: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -263,6 +308,16 @@ impl PairingOrchestrator {
             .persisted_source
             .lock()
             .expect("orchestrator lock") = Some(source);
+    }
+
+    /// Install the pre-commit redeem-offer gate (wave 29, review
+    /// 2026-11-06 P1-05). Every owner loop of this orchestrator consults
+    /// the gate before answering an `InviteRedeemOffered`; `Err` aborts
+    /// the pairing server-side (tombstoning the pending transaction)
+    /// instead of driving it to commit. Last writer wins; pass-through
+    /// when never installed.
+    pub fn set_redeem_offer_gate(&self, gate: RedeemOfferGate) {
+        *self.offer_gate.lock().expect("orchestrator lock") = Some(gate);
     }
 
     /// Open with the default tunables.
@@ -720,6 +775,47 @@ impl PairingOrchestrator {
                         .is_none();
                     if !fresh {
                         continue;
+                    }
+                    // Pre-commit gate (wave 29, P1-05): a refusing gate
+                    // vetoes the offer BEFORE the owner flow starts. The
+                    // owner never sends its `PairChallenge`/`PairPrepared`,
+                    // so the server (which commits exactly when both
+                    // `PairPrepared` frames have arrived) never commits;
+                    // the aborted attempt does not consume the code's
+                    // redeem budget, and neither side has journaled or
+                    // booked anything at this point.
+                    let gate = orchestrator
+                        .offer_gate
+                        .lock()
+                        .expect("orchestrator lock")
+                        .clone();
+                    if let Some(gate) = gate {
+                        let offer = RedeemOffer {
+                            code_id,
+                            code_revision,
+                            pairing_id,
+                            redeemer_device_id,
+                            redeemer_endpoint: orchestrator
+                                .client
+                                .peek_endpoint_blob(pairing_id),
+                        };
+                        if let Err(err) = gate(&offer) {
+                            log::warn!(
+                                "redeem offer refused before the owner flow ({}): {err}",
+                                hex(&pairing_id)
+                            );
+                            let client = orchestrator.client.clone();
+                            tokio::spawn(async move {
+                                // Tombstone the pending transaction so the
+                                // server can never commit it; the redeemer
+                                // observes the unified `PAIR_UNAVAILABLE`
+                                // before any of its local writes.
+                                let _ = client
+                                    .pair_abort(pairing_id, AbortReason::Protocol)
+                                    .await;
+                            });
+                            continue;
+                        }
                     }
                     let orchestrator = orchestrator.clone();
                     let on_paired = on_paired.clone();

@@ -57,7 +57,8 @@ use crate::server_v2::config::{
 /// gained `owner_endpoint BLOB NULL` and `redeemer_endpoint BLOB NULL`
 /// (both snapshotted at redeem time). The v1→v2 migration is additive
 /// `ALTER TABLE ... ADD COLUMN` statements — tombstones, uniqueness
-/// records and every pre-existing row survive verbatim.
+/// records and every pre-existing row survive verbatim — and runs as one
+/// atomic, re-entrant transaction (see [`migrate_v1_to_v2`]).
 pub const SCHEMA_VERSION: i64 = 2;
 
 /// Why a store operation failed at the storage layer. Business outcomes
@@ -293,6 +294,11 @@ pub enum PreparedDecision {
     AlreadyFinal(PairingState),
     /// Code revoked/expired (or pairing aborted) — pairing failed.
     Unavailable,
+    /// Wave-28 cap recheck at the commit linearization point (P1-03):
+    /// competing pendings already filled `max_redeems`; this pairing was
+    /// aborted inside the same transaction (aborted never consumes the
+    /// cap) and both participants must get the explicit failure.
+    RedeemExhausted,
     /// Owner hit the pairing-relation storage quota.
     ResourceLimit,
     /// Unknown pairing, wrong sender, or digest mismatch.
@@ -383,7 +389,7 @@ impl RegistryStore {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<RegistryStore, StoreError> {
+    fn init(mut conn: Connection) -> Result<RegistryStore, StoreError> {
         conn.busy_timeout(Duration::from_secs(5))?;
         // Durable commits: the authoritative registry must never report a
         // claim/commit accepted before the write reaches the disk
@@ -391,22 +397,17 @@ impl RegistryStore {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 {
-            conn.execute_batch(&format!(
+            // Fresh database: schema creation and the version stamp commit
+            // atomically (an interrupted first open leaves version 0 and no
+            // tables, and `IF NOT EXISTS` makes a rerun safe anyway).
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(&format!(
                 "{DDL_INVITE_CODES}\n{DDL_PAIRING_TRANSACTIONS}\n{DDL_PAIRING_RELATIONS}\n{DDL_REQUEST_JOURNAL}\n{DDL_INDEXES}"
             ))?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
         } else if version == 1 {
-            // Wave-28 migration (1 → 2): additive columns only — every
-            // tombstone, uniqueness record and pre-existing row survives
-            // verbatim. ADD COLUMN fails loudly if the layout already
-            // matches, so a partially-migrated file cannot pass silently.
-            conn.execute_batch(
-                "ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL;
-                 ALTER TABLE invite_codes ADD COLUMN max_redeems INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE pairing_transactions ADD COLUMN owner_endpoint BLOB NULL;
-                 ALTER TABLE pairing_transactions ADD COLUMN redeemer_endpoint BLOB NULL;",
-            )?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            migrate_v1_to_v2(&mut conn)?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion(version));
         }
@@ -449,7 +450,10 @@ impl RegistryStore {
     /// served to redeemers with `PairCommit`) and a redeem cap (0 =
     /// unlimited legacy semantics). Both are part of the idempotency
     /// body: same `request_id` + same content replays the original
-    /// `InviteClaimed`, different content is `REQUEST_CONFLICT`.
+    /// `InviteClaimed`, different content is `REQUEST_CONFLICT`. With
+    /// both at their defaults the body is byte-identical to the
+    /// pre-wave-28 canonical form, so claims journaled by a v1 server
+    /// still replay after the upgrade (P2-14, see [`claim_body`]).
     #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &self,
@@ -1007,14 +1011,14 @@ impl RegistryStore {
         // Both prepared. Commit recheck in the same transaction: the code
         // must still be active and unexpired (a revoke or expiry that
         // linearized first ⇒ this pairing fails).
-        let code: Option<(String, Option<i64>)> = tx
+        let code: Option<(String, Option<i64>, i64)> = tx
             .query_row(
-                "SELECT state, expires_unix_ms FROM invite_codes WHERE code_id=?1",
+                "SELECT state, expires_unix_ms, max_redeems FROM invite_codes WHERE code_id=?1",
                 params![row.code_id.as_slice()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let alive = matches!(&code, Some((state, expires)) if state == "active"
+        let alive = matches!(&code, Some((state, expires, _)) if state == "active"
             && expires.map(|e| e > now_ms as i64).unwrap_or(true));
         if !alive {
             tx.execute(
@@ -1024,6 +1028,32 @@ impl RegistryStore {
             )?;
             tx.commit()?;
             return Ok(PreparedDecision::Unavailable);
+        }
+        // Wave-28 cap recheck at the commit linearization point (P1-03).
+        // `begin_pairing` counts only committed pairings, so several
+        // pendings may coexist under a capped code; the cap must bind
+        // exactly here, inside the write transaction that would flip this
+        // row to `committed`. The count excludes this pairing (still
+        // pending/prepared), so one of the racers wins and the losers are
+        // aborted — and aborted never consumes the cap, leaving the same
+        // `request_id` replay semantics untouched.
+        let max_redeems = code.as_ref().map(|&(_, _, cap)| cap).unwrap_or(0);
+        if max_redeems > 0 {
+            let committed: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pairing_transactions
+                 WHERE code_id=?1 AND state IN ('committed','applied','ready')",
+                params![row.code_id.as_slice()],
+                |row| row.get(0),
+            )?;
+            if committed >= max_redeems {
+                tx.execute(
+                    "UPDATE pairing_transactions SET state='aborted', updated_unix_ms=?1
+                     WHERE pairing_id=?2",
+                    params![now_ms as i64, pairing_id.as_slice()],
+                )?;
+                tx.commit()?;
+                return Ok(PreparedDecision::RedeemExhausted);
+            }
         }
         let relations: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pairing_relations WHERE owner_device_id=?1",
@@ -1268,6 +1298,58 @@ impl RegistryStore {
 
 // ---- helpers ----------------------------------------------------------------
 
+/// Wave-28 migration (schema 1 → 2), atomic and re-entrant (P2-13).
+///
+/// All four additive `ALTER TABLE` statements and the `user_version`
+/// stamp run inside **one** write transaction: an interrupted migration
+/// (crash, power loss, failed later statement) rolls back completely, so
+/// the file is either pristine v1 or fully migrated v2 — never the
+/// half-migrated layout that used to make every subsequent startup fail
+/// with "duplicate column". A database already half-migrated by the
+/// pre-fix non-atomic code is recognized and *completed* rather than
+/// rejected: each `ADD COLUMN` runs only where its column is missing, so
+/// reruns converge and no tombstone, uniqueness record or pre-existing
+/// row is ever touched.
+fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), StoreError> {
+    const COLUMNS: [(&str, &str, &str); 4] = [
+        (
+            "invite_codes",
+            "owner_endpoint",
+            "ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL",
+        ),
+        (
+            "invite_codes",
+            "max_redeems",
+            "ALTER TABLE invite_codes ADD COLUMN max_redeems INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "pairing_transactions",
+            "owner_endpoint",
+            "ALTER TABLE pairing_transactions ADD COLUMN owner_endpoint BLOB NULL",
+        ),
+        (
+            "pairing_transactions",
+            "redeemer_endpoint",
+            "ALTER TABLE pairing_transactions ADD COLUMN redeemer_endpoint BLOB NULL",
+        ),
+    ];
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Fixed literals only (no user input ever reaches these statements).
+    for (table, column, ddl) in COLUMNS {
+        let present: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{column}'"),
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            tx.execute(ddl, [])?;
+        }
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Internal row shape reused by the prepared/applied paths.
 struct TxRow {
     owner: DeviceId,
@@ -1418,19 +1500,34 @@ fn abort_pending_for_code(
     Ok(aborted)
 }
 
+/// Canonical claim idempotency body, stable across schema versions
+/// (P2-14).
+///
+/// The pre-wave-28 body was exactly `lookup_digest[32] + ttl_secs[4]`
+/// (36 bytes). That layout **is** the canonical body whenever the
+/// wave-28 extensions sit at their defaults (`max_redeems == 0`, no
+/// endpoint blob): a claim journaled by a v1 server must replay the
+/// original `InviteClaimed` after the upgrade, byte-for-byte. Only a
+/// non-default extension appends the unambiguous v2 tail
+/// (`max_redeems[4] + endpoint_presence[1] [+ blob]`); a v2 body is
+/// therefore never 36 bytes and can never collide with a legacy one,
+/// while genuinely different extension content still yields
+/// `REQUEST_CONFLICT`.
 fn claim_body(
     lookup_digest: &Digest32,
     ttl_secs: u32,
     max_redeems: u32,
     owner_endpoint: Option<&[u8]>,
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(44);
+    let mut body = Vec::with_capacity(41);
     body.extend_from_slice(lookup_digest);
     body.extend_from_slice(&ttl_secs.to_be_bytes());
-    body.extend_from_slice(&max_redeems.to_be_bytes());
-    body.push(u8::from(owner_endpoint.is_some()));
-    if let Some(endpoint) = owner_endpoint {
-        body.extend_from_slice(endpoint);
+    if max_redeems > 0 || owner_endpoint.is_some() {
+        body.extend_from_slice(&max_redeems.to_be_bytes());
+        body.push(u8::from(owner_endpoint.is_some()));
+        if let Some(endpoint) = owner_endpoint {
+            body.extend_from_slice(endpoint);
+        }
     }
     body
 }
@@ -2388,84 +2485,455 @@ mod tests {
         ));
     }
 
+    /// Drive one pending pairing through challenge + redeemer proof and
+    /// both Prepared messages; the second Prepared returns the commit
+    /// decision (or the explicit failure the commit recheck produced).
+    fn drive_to_commit_decision(
+        store: &RegistryStore,
+        pairing_id: &PairingId,
+        owner: &DeviceId,
+        redeemer: &DeviceId,
+        now: u64,
+    ) -> PreparedDecision {
+        let transcript = [0x44u8; 256];
+        let digest = crate::server_v2::hello2::transcript_digest(&transcript);
+        assert!(store
+            .store_owner_challenge(
+                pairing_id,
+                owner,
+                &transcript,
+                &digest,
+                &PairProof {
+                    mac: [6; 32],
+                    signature: [7; 64],
+                },
+                now,
+            )
+            .unwrap());
+        assert!(store
+            .store_redeemer_proof(
+                pairing_id,
+                redeemer,
+                &digest,
+                &PairProof {
+                    mac: [8; 32],
+                    signature: [9; 64],
+                },
+                now,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .store_prepared_and_try_commit(pairing_id, owner, &[1; 64], &digest, now)
+                .unwrap(),
+            PreparedDecision::WaitingOther
+        );
+        store
+            .store_prepared_and_try_commit(pairing_id, redeemer, &[2; 64], &digest, now)
+            .unwrap()
+    }
+
+    /// P1-03: two pendings begin under a `max_redeems=1` code (pending
+    /// never consumes the cap), then race to Commit — exactly one wins;
+    /// the loser is aborted with the explicit `RedeemExhausted` decision
+    /// and the cap stays consumed by the single winner.
+    #[test]
+    fn commit_recheck_lets_only_one_of_two_racing_pendings_win() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let ClaimOutcome::Claimed {
+            code_id, revision, ..
+        } = store
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 1, None, now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code = ActiveCode {
+            code_id,
+            owner: owner(1),
+            revision,
+            owner_endpoint: None,
+            max_redeems: 1,
+        };
+        let redeem = |seed: u8, deadline: u64| RedeemRequest {
+            request_id: [seed; 16],
+            lookup_digest: lookup(1),
+            redeemer_nonce: [seed + 1; 32],
+            deadline_ms: deadline,
+            request_mac: [seed + 2; 32],
+            signature: [seed + 3; 64],
+        };
+        // Both pendings are admitted — pending consumes nothing.
+        let pairing_a = [0xDA; 16];
+        let pairing_b = [0xDB; 16];
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        // First racer commits.
+        assert_eq!(
+            drive_to_commit_decision(&store, &pairing_a, &owner(1), &owner(2), now),
+            PreparedDecision::Committed { commit_revision: 1 }
+        );
+        // Second racer: the cap recheck inside the commit transaction
+        // aborts it with the explicit result — not a second Commit.
+        assert_eq!(
+            drive_to_commit_decision(&store, &pairing_b, &owner(1), &owner(3), now),
+            PreparedDecision::RedeemExhausted
+        );
+        assert_eq!(
+            store.pairing_snapshot(&pairing_a).unwrap().unwrap().state,
+            PairingState::Committed
+        );
+        assert_eq!(
+            store.pairing_snapshot(&pairing_b).unwrap().unwrap().state,
+            PairingState::Aborted
+        );
+        // The single committed winner consumed the whole cap: a new
+        // redeemer is refused up front.
+        assert_eq!(
+            store
+                .begin_pairing(&[0xDC; 16], &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::RedeemExhausted
+        );
+        // Prepared replays on the aborted loser map to the unified
+        // unavailable shape (no resurrection).
+        let digest = crate::server_v2::hello2::transcript_digest(&[0x44; 256]);
+        assert_eq!(
+            store
+                .store_prepared_and_try_commit(&pairing_b, &owner(1), &[1; 64], &digest, now)
+                .unwrap(),
+            PreparedDecision::Unavailable
+        );
+    }
+
+    /// P1-03 with `max_redeems > 1`: the cap binds at commit, admitting
+    /// exactly that many committed pairings and refusing the next racer.
+    #[test]
+    fn commit_recheck_binds_caps_above_one() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let ClaimOutcome::Claimed {
+            code_id, revision, ..
+        } = store
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 2, None, now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code = ActiveCode {
+            code_id,
+            owner: owner(1),
+            revision,
+            owner_endpoint: None,
+            max_redeems: 2,
+        };
+        let redeem = |seed: u8| RedeemRequest {
+            request_id: [seed; 16],
+            lookup_digest: lookup(1),
+            redeemer_nonce: [seed + 1; 32],
+            deadline_ms: now + 120_000,
+            request_mac: [seed + 2; 32],
+            signature: [seed + 3; 64],
+        };
+        let pendings = [
+            ([0xE1; 16], owner(2), 2u8),
+            ([0xE2; 16], owner(3), 3u8),
+            ([0xE3; 16], owner(4), 4u8),
+        ];
+        for (pairing, redeemer, seed) in pendings {
+            assert_eq!(
+                store
+                    .begin_pairing(&pairing, &redeemer, &redeem(seed), &code, None, now)
+                    .unwrap(),
+                BeginRedeem::Begun
+            );
+        }
+        assert_eq!(
+            drive_to_commit_decision(&store, &[0xE1; 16], &owner(1), &owner(2), now),
+            PreparedDecision::Committed { commit_revision: 1 }
+        );
+        assert_eq!(
+            drive_to_commit_decision(&store, &[0xE2; 16], &owner(1), &owner(3), now),
+            PreparedDecision::Committed { commit_revision: 1 }
+        );
+        assert_eq!(
+            drive_to_commit_decision(&store, &[0xE3; 16], &owner(1), &owner(4), now),
+            PreparedDecision::RedeemExhausted
+        );
+        assert_eq!(
+            store.pairing_snapshot(&[0xE3; 16]).unwrap().unwrap().state,
+            PairingState::Aborted
+        );
+    }
+
+    /// P1-03 companions: aborted and swept (expired) pendings never
+    /// consume the cap — a later pending still commits within it; and a
+    /// revoke that aborts a pending keeps the commit-vs-revoke ordering
+    /// (revoke first ⇒ commit refuses; the aborted attempt counts
+    /// nothing).
+    #[test]
+    fn aborted_expired_and_revoked_pendings_do_not_consume_the_cap() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let ClaimOutcome::Claimed {
+            code_id, revision, ..
+        } = store
+            .claim(&owner(1), &[1; 16], &lookup(1), 0, 1, None, now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code = ActiveCode {
+            code_id,
+            owner: owner(1),
+            revision,
+            owner_endpoint: None,
+            max_redeems: 1,
+        };
+        let redeem = |seed: u8, deadline: u64| RedeemRequest {
+            request_id: [seed; 16],
+            lookup_digest: lookup(1),
+            redeemer_nonce: [seed + 1; 32],
+            deadline_ms: deadline,
+            request_mac: [seed + 2; 32],
+            signature: [seed + 3; 64],
+        };
+        // A: explicitly aborted; B: swept after its deadline; C: commits.
+        let pairing_a = [0xF1; 16];
+        let pairing_b = [0xF2; 16];
+        let pairing_c = [0xF3; 16];
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 1_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        assert!(matches!(
+            store.abort_pairing(&pairing_a, now).unwrap(),
+            AbortDecision::Aborted(_)
+        ));
+        let report = store.expire_due(now + 1_000).unwrap();
+        assert_eq!(report.aborted.len(), 1);
+        assert_eq!(
+            report.aborted[0].pairing_id, pairing_b,
+            "the swept pending is B, not the aborted A"
+        );
+        // C is admitted: A and B consumed nothing.
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_c, &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        assert_eq!(
+            drive_to_commit_decision(&store, &pairing_c, &owner(1), &owner(4), now),
+            PreparedDecision::Committed { commit_revision: 1 }
+        );
+        // Revoke racing the cap on a fresh capped code: proofs land, the
+        // owner prepares, then the revoke aborts the pending before the
+        // deciding Prepared — the commit attempt must fail the pairing
+        // (the aborted attempt consumed no cap).
+        let ClaimOutcome::Claimed {
+            code_id: code_id2,
+            revision: rev2,
+            ..
+        } = store
+            .claim(&owner(5), &[2; 16], &lookup(5), 0, 1, None, now)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let code2 = ActiveCode {
+            code_id: code_id2,
+            owner: owner(5),
+            revision: rev2,
+            owner_endpoint: None,
+            max_redeems: 1,
+        };
+        let pairing_d = [0xF4; 16];
+        assert_eq!(
+            store
+                .begin_pairing(&pairing_d, &owner(6), &redeem(20, now + 120_000), &code2, None, now)
+                .unwrap(),
+            BeginRedeem::Begun
+        );
+        let transcript = [0x45u8; 256];
+        let digest = crate::server_v2::hello2::transcript_digest(&transcript);
+        assert!(store
+            .store_owner_challenge(
+                &pairing_d,
+                &owner(5),
+                &transcript,
+                &digest,
+                &PairProof {
+                    mac: [6; 32],
+                    signature: [7; 64],
+                },
+                now,
+            )
+            .unwrap());
+        assert!(store
+            .store_redeemer_proof(
+                &pairing_d,
+                &owner(6),
+                &digest,
+                &PairProof {
+                    mac: [8; 32],
+                    signature: [9; 64],
+                },
+                now,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .store_prepared_and_try_commit(&pairing_d, &owner(5), &[1; 64], &digest, now)
+                .unwrap(),
+            PreparedDecision::WaitingOther
+        );
+        assert!(matches!(
+            store.revoke(&owner(5), &[3; 16], &code_id2, 1, now + 1).unwrap(),
+            RevokeOutcome::Revoked { .. }
+        ));
+        assert_eq!(
+            store
+                .store_prepared_and_try_commit(&pairing_d, &owner(6), &[2; 64], &digest, now + 2)
+                .unwrap(),
+            PreparedDecision::Unavailable
+        );
+        assert_eq!(
+            store.pairing_snapshot(&pairing_d).unwrap().unwrap().state,
+            PairingState::Aborted
+        );
+        // The revoked code admits no fresh redeem regardless of cap.
+        assert_eq!(store.find_active_code(&lookup(5), now + 3).unwrap(), None);
+    }
+
+    /// P2-14: the canonical claim body for default extensions is exactly
+    /// the pre-wave-28 36-byte layout; non-default extensions append the
+    /// unambiguous v2 tail.
+    #[test]
+    fn claim_body_is_legacy_bytes_for_default_extensions() {
+        let legacy = claim_body(&lookup(1), 600, 0, None);
+        assert_eq!(legacy.len(), 36);
+        assert_eq!(&legacy[..32], &lookup(1));
+        assert_eq!(&legacy[32..], &600u32.to_be_bytes());
+        // Endpoint presence alone extends the body.
+        let with_endpoint = claim_body(&lookup(1), 600, 0, Some(&[0xAB; 16]));
+        assert_eq!(with_endpoint.len(), 41 + 16);
+        assert_eq!(&with_endpoint[..36], &legacy[..]);
+        // A cap alone extends the body.
+        let with_cap = claim_body(&lookup(1), 600, 2, None);
+        assert_eq!(with_cap.len(), 41);
+        assert_eq!(&with_cap[..36], &legacy[..]);
+        assert_ne!(with_cap, with_endpoint);
+        // Different ttl/cap/endpoint ⇒ different bodies in every mix.
+        assert_ne!(claim_body(&lookup(1), 601, 0, None), legacy);
+        assert_ne!(claim_body(&lookup(2), 600, 0, None), legacy);
+    }
+
+    /// Create a pre-wave-28 (schema v1) database exactly as waves 18-27
+    /// wrote it (no endpoint columns, no cap column) holding one active
+    /// code row, and optionally one legacy request_journal entry.
+    fn create_v1_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invite_codes (
+               lookup_digest       BLOB(32) PRIMARY KEY,
+               code_id             BLOB(16) UNIQUE NOT NULL,
+               owner_device_id     BLOB(32) NOT NULL,
+               created_unix_ms     INTEGER NOT NULL,
+               expires_unix_ms     INTEGER NULL,
+               state               TEXT NOT NULL,
+               revision            INTEGER NOT NULL,
+               create_request_id   BLOB(16) NOT NULL,
+               UNIQUE (owner_device_id, create_request_id)
+             );
+             CREATE TABLE pairing_transactions (
+               pairing_id                  BLOB(16) PRIMARY KEY,
+               request_id                  BLOB(16) NOT NULL,
+               code_id                     BLOB(16) NOT NULL,
+               lookup_digest               BLOB(32) NOT NULL,
+               owner_device_id             BLOB(32) NOT NULL,
+               redeemer_device_id          BLOB(32) NOT NULL,
+               state                       TEXT NOT NULL,
+               transcript                  BLOB(256),
+               transcript_digest           BLOB(32),
+               owner_proof_mac             BLOB(32),
+               owner_proof_signature       BLOB(64),
+               redeemer_proof_mac          BLOB(32),
+               redeemer_proof_signature    BLOB(64),
+               owner_prepared_signature    BLOB(64),
+               redeemer_prepared_signature BLOB(64),
+               commit_revision             INTEGER,
+               owner_applied_signature     BLOB(64),
+               redeemer_applied_signature  BLOB(64),
+               redeemer_nonce              BLOB(32) NOT NULL,
+               request_mac                 BLOB(32) NOT NULL,
+               redeemer_signature          BLOB(64) NOT NULL,
+               deadline_unix_ms            INTEGER NOT NULL,
+               code_revision               INTEGER NOT NULL,
+               created_unix_ms             INTEGER NOT NULL,
+               updated_unix_ms             INTEGER NOT NULL
+             );
+             CREATE TABLE pairing_relations (
+               pairing_id         BLOB(16) PRIMARY KEY,
+               code_id            BLOB(16) NOT NULL,
+               lookup_digest      BLOB(32) NOT NULL,
+               owner_device_id    BLOB(32) NOT NULL,
+               redeemer_device_id BLOB(32) NOT NULL,
+               transcript_digest  BLOB(32) NOT NULL,
+               commit_revision    INTEGER NOT NULL,
+               completed_unix_ms  INTEGER NOT NULL
+             );
+             CREATE TABLE request_journal (
+               owner_device_id BLOB(32) NOT NULL,
+               request_id      BLOB(16) NOT NULL,
+               request_kind    TEXT NOT NULL,
+               request_body    BLOB NOT NULL,
+               response        BLOB NOT NULL,
+               created_unix_ms INTEGER NOT NULL,
+               PRIMARY KEY (owner_device_id, request_id)
+             );
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invite_codes
+             (lookup_digest, code_id, owner_device_id, created_unix_ms, expires_unix_ms,
+              state, revision, create_request_id)
+             VALUES (?1,?2,?3,1000,NULL,'active',1,?4)",
+            params![
+                &lookup(1).as_slice(),
+                &[0x42u8; 16].as_slice(),
+                &owner(1).as_slice(),
+                &[9u8; 16].as_slice()
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn v1_database_migrates_to_v2_preserving_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reg.sqlite");
-        {
-            // A pre-wave-28 (schema v1) database, exactly as wave 18-27
-            // wrote it: no endpoint columns, no cap column.
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE invite_codes (
-                   lookup_digest       BLOB(32) PRIMARY KEY,
-                   code_id             BLOB(16) UNIQUE NOT NULL,
-                   owner_device_id     BLOB(32) NOT NULL,
-                   created_unix_ms     INTEGER NOT NULL,
-                   expires_unix_ms     INTEGER NULL,
-                   state               TEXT NOT NULL,
-                   revision            INTEGER NOT NULL,
-                   create_request_id   BLOB(16) NOT NULL,
-                   UNIQUE (owner_device_id, create_request_id)
-                 );
-                 CREATE TABLE pairing_transactions (
-                   pairing_id                  BLOB(16) PRIMARY KEY,
-                   request_id                  BLOB(16) NOT NULL,
-                   code_id                     BLOB(16) NOT NULL,
-                   lookup_digest               BLOB(32) NOT NULL,
-                   owner_device_id             BLOB(32) NOT NULL,
-                   redeemer_device_id          BLOB(32) NOT NULL,
-                   state                       TEXT NOT NULL,
-                   transcript                  BLOB(256),
-                   transcript_digest           BLOB(32),
-                   owner_proof_mac             BLOB(32),
-                   owner_proof_signature       BLOB(64),
-                   redeemer_proof_mac          BLOB(32),
-                   redeemer_proof_signature    BLOB(64),
-                   owner_prepared_signature    BLOB(64),
-                   redeemer_prepared_signature BLOB(64),
-                   commit_revision             INTEGER,
-                   owner_applied_signature     BLOB(64),
-                   redeemer_applied_signature  BLOB(64),
-                   redeemer_nonce              BLOB(32) NOT NULL,
-                   request_mac                 BLOB(32) NOT NULL,
-                   redeemer_signature          BLOB(64) NOT NULL,
-                   deadline_unix_ms            INTEGER NOT NULL,
-                   code_revision               INTEGER NOT NULL,
-                   created_unix_ms             INTEGER NOT NULL,
-                   updated_unix_ms             INTEGER NOT NULL
-                 );
-                 CREATE TABLE pairing_relations (
-                   pairing_id         BLOB(16) PRIMARY KEY,
-                   code_id            BLOB(16) NOT NULL,
-                   lookup_digest      BLOB(32) NOT NULL,
-                   owner_device_id    BLOB(32) NOT NULL,
-                   redeemer_device_id BLOB(32) NOT NULL,
-                   transcript_digest  BLOB(32) NOT NULL,
-                   commit_revision    INTEGER NOT NULL,
-                   completed_unix_ms  INTEGER NOT NULL
-                 );
-                 CREATE TABLE request_journal (
-                   owner_device_id BLOB(32) NOT NULL,
-                   request_id      BLOB(16) NOT NULL,
-                   request_kind    TEXT NOT NULL,
-                   request_body    BLOB NOT NULL,
-                   response        BLOB NOT NULL,
-                   created_unix_ms INTEGER NOT NULL,
-                   PRIMARY KEY (owner_device_id, request_id)
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO invite_codes
-                 (lookup_digest, code_id, owner_device_id, created_unix_ms, expires_unix_ms,
-                  state, revision, create_request_id)
-                 VALUES (?1,?2,?3,1000,NULL,'active',1,?4)",
-                params![&lookup(1).as_slice(), &[0x42u8; 16].as_slice(), &owner(1).as_slice(), &[9u8; 16].as_slice()],
-            )
-            .unwrap();
-        }
+        create_v1_database(&path);
         // Reopening with the wave-28 build migrates 1 → 2 additively.
         let store = RegistryStore::open(&path).unwrap();
         {
@@ -2488,6 +2956,147 @@ mod tests {
             ClaimOutcome::Claimed { .. }
         ));
     }
+
+    /// P2-13: a migration interrupted mid-flight (as the pre-fix
+    /// non-atomic DDL could leave it — some columns added, user_version
+    /// still 1) must be recognized and completed on the next startup,
+    /// preserving every row. Interruptions under the fixed code roll back
+    /// wholesale, so reruns always converge.
+    #[test]
+    fn interrupted_migration_resumes_and_completes() {
+        let partial_states: [&[&str]; 3] = [
+            // Only the first ALTER landed before the crash.
+            &["ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL"],
+            // First three landed.
+            &[
+                "ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL",
+                "ALTER TABLE invite_codes ADD COLUMN max_redeems INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE pairing_transactions ADD COLUMN owner_endpoint BLOB NULL",
+            ],
+            // All four landed but the version stamp never did.
+            &[
+                "ALTER TABLE invite_codes ADD COLUMN owner_endpoint BLOB NULL",
+                "ALTER TABLE invite_codes ADD COLUMN max_redeems INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE pairing_transactions ADD COLUMN owner_endpoint BLOB NULL",
+                "ALTER TABLE pairing_transactions ADD COLUMN redeemer_endpoint BLOB NULL",
+            ],
+        ];
+        for (index, applied) in partial_states.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reg.sqlite");
+            create_v1_database(&path);
+            {
+                let conn = Connection::open(&path).unwrap();
+                for statement in applied.iter() {
+                    conn.execute_batch(statement).unwrap();
+                }
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, 1, "case {index}: still stamped v1");
+            }
+            // Restart completes the migration instead of failing on the
+            // already-present columns.
+            let store = RegistryStore::open(&path)
+                .unwrap_or_else(|e| panic!("case {index}: reopen must migrate, got {e:?}"));
+            {
+                let conn = store.lock();
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, SCHEMA_VERSION, "case {index}");
+            }
+            // The pre-existing row survived untouched.
+            let code = store.find_active_code(&lookup(1), 2_000).unwrap().unwrap();
+            assert_eq!(code.code_id, [0x42u8; 16], "case {index}");
+            assert_eq!(code.owner_endpoint, None, "case {index}");
+            assert_eq!(code.max_redeems, 0, "case {index}");
+            // The completed layout accepts wave-28 writes.
+            assert!(matches!(
+                store
+                    .claim(&owner(7), &[8; 16], &lookup(8), 0, 1, None, 2_000)
+                    .unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
+        }
+    }
+
+    /// P2-14: a claim journaled by a pre-wave-28 server (36-byte body:
+    /// digest + ttl) whose response never reached the client must replay
+    /// the original `InviteClaimed` after the upgrade — while a genuinely
+    /// different request (other ttl, or newly added extension content)
+    /// still conflicts.
+    #[test]
+    fn upgrade_replays_legacy_claim_journal_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.sqlite");
+        create_v1_database(&path);
+        // The pre-upgrade server journaled this claim with the legacy
+        // canonical body and the encoded InviteClaimed response.
+        let legacy_body = claim_body(&lookup(7), 600, 0, None);
+        assert_eq!(legacy_body.len(), 36);
+        let legacy_response = encode_response(&CtrlMessage::InviteClaimed {
+            request_id: [0x77; 16],
+            code_id: [0x42u8; 16],
+            created_ms: 1000,
+            expires_ms: 1000 + 600_000,
+            revision: 1,
+        })
+        .unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO request_journal
+                 (owner_device_id, request_id, request_kind, request_body, response, created_unix_ms)
+                 VALUES (?1,?2,'claim',?3,?4,1000)",
+                params![
+                    &owner(2).as_slice(),
+                    &[0x77u8; 16].as_slice(),
+                    &legacy_body,
+                    &legacy_response
+                ],
+            )
+            .unwrap();
+        }
+        let store = RegistryStore::open(&path).unwrap();
+        // The same request retried after the upgrade: the exact original
+        // answer, not REQUEST_CONFLICT.
+        match store
+            .claim(&owner(2), &[0x77; 16], &lookup(7), 600, 0, None, 9_000)
+            .unwrap()
+        {
+            ClaimOutcome::Replay(bytes) => assert_eq!(bytes, legacy_response),
+            other => panic!("legacy journal entry must replay, got {other:?}"),
+        }
+        // Genuinely different content under the same id still conflicts.
+        assert_eq!(
+            store
+                .claim(&owner(2), &[0x77; 16], &lookup(7), 900, 0, None, 9_001)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(2), &[0x77; 16], &lookup(8), 600, 0, None, 9_002)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // Newly added extension content under the same id is a change of
+        // content, not a replay.
+        assert_eq!(
+            store
+                .claim(&owner(2), &[0x77; 16], &lookup(7), 600, 1, None, 9_003)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(2), &[0x77; 16], &lookup(7), 600, 0, Some(&[0x0E; 32]), 9_004)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+    }
+
     #[test]
     fn restart_reopen_preserves_codes_and_pending_transactions() {
         let dir = tempfile::tempdir().unwrap();

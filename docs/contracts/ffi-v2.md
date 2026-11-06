@@ -388,7 +388,8 @@ int32_t ak_task_consent(
  "registry":"127.0.0.1:7200","registry_id":"<64hex>",
  "id_dir":"C:/ak/id","device_name":"phone","save_dir":"D:/inbox"}
 
-// ak_task_create_code
+// ak_task_create_code（wave-29：ttl_secs 省略或 0 映射为任务码默认
+// 600 秒——v1 任务码绝不以 registry 的"长期有效"语义滞留）
 {"spec_version":1,"role":"sender|receiver",
  "candidates":["192.168.1.4:7000"],"ttl_secs":0,"request_id":"<32hex>"}
 
@@ -426,21 +427,27 @@ int32_t ak_task_consent(
 {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
  "root":"photos","files":3,"bytes":123456}
 {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
-{"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed"}
+{"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
+{"event":"code_cancelled","code_id":"<32hex>"}
 ```
+
+wave-29 增补：`disconnected` 新增 `done` 理由（单传输任务的完成终态——双端连接条目同时收敛，见 §8.4）；`code_cancelled` 在生码方取消一个未被加入的码（`ak_task_disconnect` 按 `code_id`）时发出。
 
 `ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
 "connections":[{"conn":"<32hex>","role":"sender","state":
 "probing|connected|disconnected","peer_endpoint":"ip:port","code":"AKT1-…"}]}`。
 
-### 8.4 行为语义（冻结）
+### 8.4 行为语义（冻结；wave-29 修订处标注）
 
-- **幂等**：三个异步 op 均按 `request_id` 幂等（同 id 同 spec → 原 op id 与原答案；同 id 异 spec → `-2`；判定先于一切副作用）。
-- **发送**：`ak_task_send` 走既有引擎发送，对端 endpoint 候选按 LAN 优先排序逐个尝试；连接预算沿用 wave-26 P1-01 的 10 秒分拆预算（自引擎 `Connecting` 信号起算，源扫描不计入；连接建立后不再受其约束），候选间短暂停顿后回退；连接后失败不再换址重试。
-- **接收同意**：接收方常驻接收以 ak-engine 的 Offer 级 `TransferConsent` 回调为闸——每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件，挂起直至 `ak_task_consent` 决定或 **30 秒窗口自动拒绝**（绝不自动接受）；拒绝经 DECLINED 线上语义告知对端、零字节落盘。`ak_task_consent` 对未知/已决定请求返回 `-4`。
-- **断开**：`ak_task_disconnect` 幂等；双侧经 `disconnected` 事件得知（本侧 `local`，对侧 `peer`）。
-- **发送/接收进度**：进入引擎级 `ak_poll_progress` 队列（发送行 `job` 为连接 id、接收行为码 id 的 32hex）。
+- **幂等（wave-29 P2-01 修订）**：三个异步 op 均按 `request_id` 幂等——去重判定（查找、冲突拒绝、op id 预留）是**同一临界区内的一次原子受理**，并发同请求得到同一 op id；canonical spec 以 `操作类型|conn_id|spec` 为域，同 id 异操作/异连接/异 spec 一律 `-2`；**已受理请求的重放先返回原 op 与原答案**（即使其连接此后已断开），仅全新请求才做连接存活校验。
+- **接收侧身份准入（wave-29 P1-04 新增）**：接收方常驻接收的 TLS `authorize` 只接受**该码已完成配对的已验证对端公钥指纹**，且仅当该配对连接仍存活；配对完成前一切拨号在 TLS 准入门被拒绝并关闭，**不消耗接收器**（监听继续）。`incoming_request` 归属按 Offer 实际发送方指纹匹配连接（而非仅按监听码查表）；无法归属的 Offer 无提示直接拒绝。
+- **发送**：`ak_task_send` 走既有引擎发送，对端 endpoint 候选按 LAN 优先排序逐个尝试；连接预算沿用 wave-26 P1-01 的 10 秒分拆预算（自引擎 `Connecting` 信号起算，源扫描不计入；连接建立后不再受其约束），候选间短暂停顿后回退；连接后失败不再换址重试。wave-29：整表纯连接级失败（从未建立连接）经短暂停顿后**整体重试**（默认至多 3 轮）——对端配对簿记可能滞后加入方一拍，身份校验不受影响。
+- **接收同意（wave-29 P2-07 修订）**：Offer 级 `TransferConsent` 为**非阻塞形状**（回调登记 pending oneshot 后立即返回，等待由引擎异步 await，绝不阻塞 Tokio worker）；每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件，挂起直至 `ak_task_consent` 决定、**30 秒窗口自动拒绝**（计时器任务，绝不自动接受）、该连接断开或运行时 teardown（后两者同样以拒绝收场）。决定即移除条目：`ak_task_consent` 对未知/已决定请求返回 `-4`。拒绝经 DECLINED 线上语义告知对端、零字节落盘。
+- **常驻接收（wave-29 P2-05/P2-06 修订）**：一个码绑定一个端口、一个**循环服务**多连接——陌生拨号被拒后续继监听；**拒绝不是任务终态**（同码可重试，再次发送产生新的 `incoming_request`）；**完成是单传输任务终态**（`done` 后双端连接条目收敛为 `disconnected`/`done`，接收器停止）。保存夹在**每次传输开始时**从当前设置解析：`ak_task_set_save_dir` 对后续任务生效。
+- **断开（wave-29 P2-03/P2-04 修订）**：`ak_task_disconnect` 幂等，且覆盖**已生成未加入的码**——以 create 结果的 `code_id` 为参数即撤销 registry 注册行、释放接收器/echo 监听并发出 `code_cancelled`（重复取消静默 `AK_OK`；未知 id `-4`）。连接断开时：本侧 `local`，注册中心撤码；**空闲时**（无在传输的 QUIC 连接可供对端感知）额外向已配对对端通告的数据端点发起**认证的 TASK-CLOSE 帧通知**（TLS 钉扎配对指纹、复用既有 Error 帧语义），持有监听的对端立即以 `ByPeer` 收敛为 `disconnected`/`peer`；纯发送侧未绑定数据监听，无法被空闲通知触达，其下次发送连接失败即为诚实结果。同引擎对端另有即时缓存通知。引擎 teardown 对本运行时未撤销的码做**有界尽力撤码**（应用退出不遗留无主 active 行）。
+- **任务码 TTL（wave-29 P2-04）**：`ttl_secs` 省略或 `0` 在 FFI 层映射为库默认 600 秒；不再把 0 原样作为 registry 的"长期有效"语义上送。
+- **发送/接收进度**：进入引擎级 `ak_poll_progress` 队列（发送行 `job` 为连接 id、接收行为**当前**码 id 的 32hex——wave-29 修正：不再是领取码前的本地占位 id）。
 
-### 8.5 诚实边界（wave-28 并行分工）
+### 8.5 实现事实（wave-29 终稿）
 
-ak-session 侧的注册中心中继（`create_task_code`/`join_task_code`/`probe_peer`/`PeerEndpoint`/`TaskDisconnected`，代理 B）落地前：任务码表为**引擎本地共享表**（同引擎内两个运行时可配对，跨引擎/跨设备 join 以 “unknown task code” 诚实失败）；加入方钉扎的公钥取自本地码表条目（中继落地后由 `PeerEndpoint` 携带）；`probe_result` 的 `reachable` 恒为 `null`（join 结果 `probe:"unverified"`）。以上槽位在 `crates/ak-ffi/src/task.rs` 以 `WAVE-28/B-PENDING` 标注，并由 `#[ignore]` 测试锁定契约。接收端 Offer 级同意已接通 ak-engine 落地版 `receive_with_addr_consent`（非占位）。
+wave-28 的并行占位槽位已全部落地为真实路径：任务码经 ak-session `TaskPairing` 在真实注册中心 claim/redeem（`max_redeems=1`，配对 transcript 至 `PairReady` 跨引擎/跨设备成立）；加入方钉扎的公钥来自中继的已验证对端指纹；`probe_result` 由真实 UDP 探测回答（echo responder 带 wave-29 防反射约束：应答携带全零 nonce 且永不回答应答本身，并有每来源应答预算）；接收侧身份准入与同意归属按 §8.4；空闲断开通知与码取消按 §8.4。已知诚实边界：纯发送侧设备空闲时无法被主动通知（无数据监听），其发现时机为其下一次发送失败；探测结论只证明候选端口的 UDP 可达性，不构成身份授权。

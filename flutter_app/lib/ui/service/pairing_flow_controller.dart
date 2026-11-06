@@ -69,6 +69,11 @@ class PairingFlowController extends ChangeNotifier {
   String? error;
   TaskConnection? connection;
 
+  /// The joiner's EXPLICIT direction of the running join flow (wave-29
+  /// P1-05): the user's intent picked alongside the code — forwarded to
+  /// `joinCode` so the engine never guesses the direction.
+  TaskRole? joinRole;
+
   /// The connection id a join flow waits for (from [JoinResult]).
   String? _expectedConnectionId;
 
@@ -86,18 +91,26 @@ class PairingFlowController extends ChangeNotifier {
   }
 
   /// Joins a code typed by the user (加入流). Input is normalized here
-  /// (uppercase, hyphen/space tolerance) before hitting the service.
-  Future<void> startJoin(String input) async {
+  /// (uppercase, hyphen/space tolerance) and validated against the REAL
+  /// task-code format (wave-29 P1-02: `AKI1` + 32 Crockford Base32
+  /// symbols) before hitting the service. [role] is the joiner's declared
+  /// direction; the submit affordance requires one.
+  Future<void> startJoin(String input, {TaskRole? role}) async {
+    joinRole = role;
     final normalized = normalizeJoinCode(input);
-    if (normalized.length != 8) {
+    if (!isValidTaskCode(normalized)) {
       _begin(kind: PairingFlowKind.join, phase: PairingFlowPhase.failed);
-      error = '配对码为 8 位字符（当前 ${normalized.length} 位），请检查后重试。';
+      error = normalized.length != taskCodePrefix.length + taskCodeSymbolCount
+          ? '配对码为 AKI1 开头的 36 位字符（当前 ${normalized.length} 位），'
+              '请输入完整的 AKI1 码后重试。'
+          : '配对码格式不正确：AKI1 后应为 32 位 Crockford Base32 字符'
+              '（不含 I/L/O/U），请检查后重试。';
       notifyListeners();
       return;
     }
     _begin(kind: PairingFlowKind.join, phase: PairingFlowPhase.joining);
     try {
-      final result = await _service.joinCode(normalized);
+      final result = await _service.joinCode(normalized, role: role);
       if (!result.ok) {
         _fail(result.error ?? '配对失败，请重试。');
         return;
@@ -149,6 +162,9 @@ class PairingFlowController extends ChangeNotifier {
     error = null;
     connection = null;
     _expectedConnectionId = null;
+    if (kind != PairingFlowKind.join) {
+      joinRole = null; // a fresh join re-picks the direction
+    }
     notifyListeners();
   }
 
@@ -219,6 +235,10 @@ class PairingFlowController extends ChangeNotifier {
         _set(PairingFlowPhase.probing);
       case TaskConnectionState.connected:
         _set(PairingFlowPhase.success);
+      case TaskConnectionState.unreachable:
+        // Wave-29 P2-09: the probe FAILED — an honest negative verdict
+        // ends the flow with a readable reason (never "success").
+        _fail('连通测试未通过：无法与对端建立数据直连，请检查网络后重新配对。');
       case TaskConnectionState.disconnected:
         _fail('连接已断开（对端离开或网络变化），请重新配对。');
     }

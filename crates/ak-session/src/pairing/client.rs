@@ -150,7 +150,20 @@ struct Dispatch {
     /// is dispatched, so a subscriber that just saw the frame can
     /// [`RegistryClient::take_endpoint_blob`] it exactly once.
     endpoint_blobs: HashMap<PairingId, Vec<u8>>,
+    /// Insertion order of `endpoint_blobs` for FIFO eviction. Wave-29
+    /// (review P2-15): a pairing that never completes never takes its
+    /// blob, so without a bound an idle registry connection relaying
+    /// aborted flows would grow the cache forever. `MAX_ENDPOINT_BLOBS`
+    /// evicts the oldest (they are connection HINTS, not credentials —
+    /// an evicted flow simply re-derives its endpoint from the next
+    /// relay frame or fails the pairing honestly).
+    endpoint_blob_order: std::collections::VecDeque<PairingId>,
 }
+
+/// Cache bound for relayed endpoint blobs (review P2-15). Generous
+/// versus concurrent in-flight pairings (registry limits connections
+/// anyway); the value only matters as a hard ceiling.
+const MAX_ENDPOINT_BLOBS: usize = 256;
 
 impl Dispatch {
     /// Bounded fan-out to one sender list; full inboxes drop and count.
@@ -203,10 +216,37 @@ impl ClientInner {
                 _ => None,
             };
             if let Some(pairing_id) = pairing_id {
-                dispatch
-                    .endpoint_blobs
+                let blobs = &mut dispatch.endpoint_blobs;
+                if blobs
                     .entry(pairing_id)
-                    .or_insert_with(|| blob.clone());
+                    .or_insert_with(|| blob.clone())
+                    .len() == blob.len()
+                    && !dispatch.endpoint_blob_order.contains(&pairing_id)
+                {
+                    dispatch.endpoint_blob_order.push_back(pairing_id);
+                    while dispatch.endpoint_blob_order.len() > MAX_ENDPOINT_BLOBS {
+                        if let Some(oldest) = dispatch.endpoint_blob_order.pop_front() {
+                            dispatch.endpoint_blobs.remove(&oldest);
+                        }
+                    }
+                }
+            }
+        }
+        // Terminal pairing states drop their cached blob (review P2-15):
+        // aborted/failed flows never take it, so recycle eagerly.
+        {
+            let terminal_id = match &message {
+                CtrlMessage::PairError { scope, object_id, .. }
+                    if *scope == ErrorScope::Pairing =>
+                {
+                    Some(*object_id)
+                }
+                _ => None,
+            };
+            if let Some(pairing_id) = terminal_id {
+                if dispatch.endpoint_blobs.remove(&pairing_id).is_some() {
+                    dispatch.endpoint_blob_order.retain(|id| *id != pairing_id);
+                }
             }
         }
         let mut delivered = false;
@@ -304,6 +344,7 @@ impl ClientInner {
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
         dispatch.waiters.clear();
         dispatch.endpoint_blobs.clear();
+        dispatch.endpoint_blob_order.clear();
     }
 
     /// Queue one plain message for the writer (bounded, non-blocking).
@@ -508,12 +549,28 @@ impl RegistryClient {
     /// finds it here; `None` means the peer predates the extension or the
     /// blob was already taken.
     pub fn take_endpoint_blob(&self, pairing_id: PairingId) -> Option<Vec<u8>> {
+        let mut dispatch = self.inner.dispatch.lock().expect("client dispatch lock");
+        let taken = dispatch.endpoint_blobs.remove(&pairing_id);
+        if taken.is_some() {
+            dispatch.endpoint_blob_order.retain(|id| *id != pairing_id);
+        }
+        taken
+    }
+
+    /// Peek (clone, without consuming) the wave-28 endpoint blob a relayed
+    /// frame carried for `pairing_id`. The pre-commit redeem-offer gate
+    /// (review 2026-11-06, P1-05) reads the redeemer's settings this way
+    /// while the pairing flow that later completes still finds the blob
+    /// for its exactly-once [`RegistryClient::take_endpoint_blob`].
+    /// `None` means the peer predates the extension.
+    pub fn peek_endpoint_blob(&self, pairing_id: PairingId) -> Option<Vec<u8>> {
         self.inner
             .dispatch
             .lock()
             .expect("client dispatch lock")
             .endpoint_blobs
-            .remove(&pairing_id)
+            .get(&pairing_id)
+            .cloned()
     }
 
     // ---- request API -------------------------------------------------------

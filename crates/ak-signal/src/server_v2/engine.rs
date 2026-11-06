@@ -1850,6 +1850,23 @@ fn handle_prepared(
             // notified both participants; tell only the sender.
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
+        Ok(PreparedDecision::RedeemExhausted) => {
+            // P1-03: the cap bound at the commit linearization point — a
+            // competing pending won this code's last redeem slot. The
+            // store aborted this pairing without consuming the cap; both
+            // participants get the explicit, code-scoped failure.
+            if let Some(fresh) = shared.store.pairing_snapshot(&pairing_id).ok().flatten() {
+                let error = pair_error(
+                    [0u8; 16],
+                    ErrorScope::Code,
+                    fresh.code_id,
+                    REDEEM_EXHAUSTED,
+                    0,
+                );
+                shared.deliver(&fresh.owner, error.clone());
+                shared.deliver(&fresh.redeemer, error);
+            }
+        }
         Ok(PreparedDecision::ResourceLimit) => {
             if let Some(fresh) = shared.store.pairing_snapshot(&pairing_id).ok().flatten() {
                 let error = pair_error(
@@ -3257,4 +3274,137 @@ mod tests {
         server.stop().await;
     }
 
+    /// P1-03: `max_redeems=1` binds at the commit linearization point,
+    /// not only at redeem begin. Two redeemers both reach pending (pending
+    /// consumes nothing), then race to Commit — exactly one pairing
+    /// commits; the loser's Commit fails with the explicit
+    /// `REDEEM_EXHAUSTED` error to both participants, the code refuses
+    /// every new redeemer, and the loser's same-`request_id` retry still
+    /// replays its original pending answer (idempotency unchanged).
+    #[tokio::test]
+    async fn two_pending_redeems_racing_commit_yield_exactly_one() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let mut owner =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
+        let mut first =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "a").await;
+        let mut second =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "b").await;
+
+        let lookup: Digest32 = [0x7E; 32];
+        let claim_request = random_id16();
+        owner
+            .send_frame(
+                &CtrlFrame::new(CtrlMessage::InviteClaim {
+                    request_id: claim_request,
+                    lookup_digest: lookup,
+                    ttl_secs: 0,
+                })
+                .with_max_redeems(1),
+            )
+            .await;
+        let code_id = match owner.recv_frame().await.message {
+            CtrlMessage::InviteClaimed { code_id, .. } => code_id,
+            other => panic!("expected InviteClaimed, got {other:?}"),
+        };
+
+        // Both redeemers are admitted: pending never consumes the cap.
+        let deadline = now_ms() + 8_000;
+        let redeem_a = signed_redeem(&first.key, &registry_id, lookup, random_id16(), deadline);
+        let request_a = redeem_a.request_id;
+        let nonce_a = redeem_a.redeemer_nonce;
+        first.send(&CtrlMessage::InviteRedeem(redeem_a.clone())).await;
+        let pairing_a = match first.recv().await {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("first redeem must begin, got {other:?}"),
+        };
+        let _offer_a = owner.recv_frame().await; // push to the owner
+
+        let redeem_b = signed_redeem(&second.key, &registry_id, lookup, random_id16(), deadline);
+        second.send(&CtrlMessage::InviteRedeem(redeem_b.clone())).await;
+        let pairing_b = match second.recv().await {
+            CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+            other => panic!("second redeem must begin, got {other:?}"),
+        };
+        assert_ne!(pairing_a, pairing_b);
+        let _offer_b = owner.recv_frame().await;
+
+        // Racer A completes through the authoritative commit.
+        drive_to_commit(
+            &mut owner,
+            &mut first,
+            &registry_id,
+            code_id,
+            lookup,
+            pairing_a,
+            request_a,
+            nonce_a,
+            deadline,
+        )
+        .await;
+        let _ = first.recv_frame().await; // PairCommit to the redeemer
+        let _ = owner.recv_frame().await; // PairCommit to the owner
+
+        // Racer B's Commit is refused inside the same write transaction:
+        // both B and the owner get the explicit, code-scoped failure.
+        drive_to_commit(
+            &mut owner,
+            &mut second,
+            &registry_id,
+            code_id,
+            lookup,
+            pairing_b,
+            redeem_b.request_id,
+            redeem_b.redeemer_nonce,
+            deadline,
+        )
+        .await;
+        for (who, frame) in [("redeemer", second.recv().await), ("owner", owner.recv().await)] {
+            match frame {
+                CtrlMessage::PairError {
+                    scope,
+                    object_id,
+                    code,
+                    ..
+                } => {
+                    assert_eq!(code, REDEEM_EXHAUSTED, "{who}");
+                    assert_eq!(scope, ErrorScope::Code, "{who}");
+                    assert_eq!(object_id, code_id, "{who}");
+                }
+                other => panic!("{who}: expected REDEEM_EXHAUSTED, got {other:?}"),
+            }
+        }
+
+        // The exhausted code refuses every new redeemer immediately.
+        let mut third =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "c").await;
+        let third_redeem = signed_redeem(
+            &third.key,
+            &registry_id,
+            lookup,
+            random_id16(),
+            now_ms() + 8_000,
+        );
+        third.send(&CtrlMessage::InviteRedeem(third_redeem)).await;
+        match third.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, REDEEM_EXHAUSTED),
+            other => panic!("expected REDEEM_EXHAUSTED, got {other:?}"),
+        }
+
+        // The losing redeemer retrying its own request id still replays
+        // the original pending answer — the cap never breaks redeem
+        // idempotency.
+        second
+            .send(&CtrlMessage::InviteRedeem(redeem_b))
+            .await;
+        match second.recv().await {
+            CtrlMessage::InviteRedeemPending {
+                pairing_id: replayed,
+                ..
+            } => assert_eq!(replayed, pairing_b),
+            other => panic!("expected replayed InviteRedeemPending, got {other:?}"),
+        }
+        server.stop().await;
+    }
 }

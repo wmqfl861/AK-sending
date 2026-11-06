@@ -4,6 +4,14 @@
 //! ways, `max_redeems = 1` refuses a second join, and every task end maps
 //! to exactly one `TaskDisconnected` event with its source (Local /
 //! Network / ByPeer).
+//!
+//! Wave 29 (review 2026-11-06, P1-05): the complementary-direction rule
+//! is enforced by the initiator's owner loop at the relayed offer —
+//! BEFORE the server's irreversible commit — so a mismatched, endpoint-
+//! less or malformed join is refused without consuming the single redeem
+//! and without either side journaling or booking anything; the post-commit
+//! `DirectionConflict` remains covered as defense in depth against a
+//! gate-less initiator.
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -54,7 +62,6 @@ async fn spawn_registry() -> TestRegistry {
 
 struct TaskDevice {
     pairing: TaskPairing,
-    #[allow(dead_code)]
     dir: tempfile::TempDir,
 }
 
@@ -204,10 +211,193 @@ async fn max_redeems_one_refuses_the_second_join() {
     }
 }
 
-/// A mismatched direction declaration (both sides claim to send) refuses
-/// at completion — a task is exactly one sender and one receiver.
+/// Local pairing artefacts under one device's identity dir: everything in
+/// the `pairing/` journal directory (`.akpair` entries and `.akdgm`
+/// transcript pins) — empty means the device journaled nothing.
+fn journal_artifacts(dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir.join("pairing")) {
+        for entry in entries.flatten() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Whether the device's transactional trust book exists on disk.
+fn has_trust_book(dir: &std::path::Path) -> bool {
+    dir.join("peers.book").exists()
+}
+
+/// The P1-05 product flow (review 2026-11-06): the RECEIVER generates the
+/// code and a cross-device SENDER joins it. The joiner's explicit
+/// `my_direction` (the user's intent) is complementary, so the initiator's
+/// pre-commit gate lets the pairing through and both sides register the
+/// live task over the real registry.
 #[tokio::test]
-async fn direction_conflict_refuses_the_pairing() {
+async fn receiver_generated_code_paired_by_a_cross_device_sender() {
+    let registry = spawn_registry().await;
+    let owner = task_device(&registry, "alice").await;
+    let joiner = task_device(&registry, "bob").await;
+
+    let owner_candidates = vec![localhost(52001), "192.168.1.9:52002".parse().unwrap()];
+    let code = owner
+        .pairing
+        .create_task_code(TaskDirection::Recv, &owner_candidates)
+        .await
+        .expect("create task code");
+    owner.pairing.spawn_owner_loop();
+
+    // The joiner is the sender: its own declaration, not a local default.
+    let paired = joiner
+        .pairing
+        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .await
+        .expect("the cross-device sender joins the receiver's code");
+    assert_eq!(paired.direction, TaskDirection::Send);
+    assert_eq!(paired.peer.direction, TaskDirection::Recv);
+    assert_eq!(paired.peer.name, "alice");
+    assert_eq!(paired.peer.candidates, owner_candidates);
+
+    // The receiver's owner loop registered its side with the declared
+    // direction intact.
+    let owner_done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let active = owner.pairing.active_tasks();
+            if active.len() == 1 && active[0].pairing.is_some() {
+                break active;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owner completes the task within the bound");
+    assert_eq!(owner_done[0].direction, TaskDirection::Recv);
+    assert_eq!(owner_done[0].code, code.invite.code_id);
+}
+
+/// A same-direction join is refused BEFORE the irreversible commit: the
+/// initiator's pre-commit gate aborts the pending transaction, the joiner
+/// observes the server's unified "pairing target unavailable" answer,
+/// neither side journals or books anything, and — because an aborted
+/// attempt does not consume `max_redeems = 1` — the very same code still
+/// pairs with a correctly-directed join afterwards.
+#[tokio::test]
+async fn same_direction_join_is_refused_before_commit_and_keeps_the_code_usable() {
+    let registry = spawn_registry().await;
+    let owner = task_device(&registry, "alice").await;
+    let wrong = task_device(&registry, "bob").await;
+    let right = task_device(&registry, "carol").await;
+
+    let code = owner
+        .pairing
+        .create_task_code(TaskDirection::Send, &[localhost(52001)])
+        .await
+        .expect("create task code");
+    owner.pairing.spawn_owner_loop();
+
+    // Both sides declare Send: the gate vetoes the offer, the owner flow
+    // (and with it the server's commit) never starts.
+    let refused = wrong
+        .pairing
+        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .await;
+    match &refused {
+        Err(TaskError::Flow(ak_session::pairing::PairFlowError::Unavailable { .. })) => {}
+        other => panic!("pre-commit refusal must be the unified unavailable, got {other:?}"),
+    }
+
+    // Pre-commit means pre-local-writes: no journal entries (and no
+    // transcript pins) and no trust book on EITHER side of the refused
+    // attempt, and no live task registered for it.
+    assert!(
+        journal_artifacts(wrong.dir.path()).is_empty(),
+        "the refused joiner journaled nothing"
+    );
+    assert!(!has_trust_book(wrong.dir.path()), "no trust book on the joiner");
+    assert!(
+        journal_artifacts(owner.dir.path()).is_empty(),
+        "the owner journaled nothing for the aborted attempt"
+    );
+    assert!(!has_trust_book(owner.dir.path()), "no trust book on the owner");
+    assert!(wrong.pairing.active_tasks().is_empty());
+    assert!(
+        owner.pairing.active_tasks()[0].pairing.is_none(),
+        "the owner's task stays unpaired"
+    );
+
+    // The single redeem was NOT consumed: a complementary join of the
+    // very same code succeeds (a consumed code would answer
+    // REDEEM_EXHAUSTED).
+    let paired = right
+        .pairing
+        .join_task_code(&code.invite.display, &[localhost(52021)], TaskDirection::Recv)
+        .await
+        .expect("the code must still pair with the correct direction");
+    assert_eq!(paired.direction, TaskDirection::Recv);
+    let owner_done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let active = owner.pairing.active_tasks();
+            if active.len() == 1 && active[0].pairing.is_some() {
+                break active;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owner completes the task within the bound");
+    assert_eq!(owner_done[0].direction, TaskDirection::Send);
+}
+
+/// A pre-wave-28 joiner (plain redeem, no endpoint blob) cannot pair a
+/// task code: the gate refuses the offer pre-commit for exactly that
+/// reason, and the code remains usable for a wave-29 join.
+#[tokio::test]
+async fn legacy_joiner_without_an_endpoint_blob_is_refused_before_commit() {
+    let registry = spawn_registry().await;
+    let owner = task_device(&registry, "alice").await;
+    let legacy = task_device(&registry, "bob").await;
+    let modern = task_device(&registry, "carol").await;
+
+    let code = owner
+        .pairing
+        .create_task_code(TaskDirection::Send, &[localhost(52001)])
+        .await
+        .expect("create task code");
+    owner.pairing.spawn_owner_loop();
+
+    // The legacy path carries no endpoint extension section at all.
+    let refused = legacy
+        .pairing
+        .orchestrator()
+        .redeem(&code.invite.display)
+        .await;
+    match &refused {
+        Err(ak_session::pairing::PairFlowError::Unavailable { .. }) => {}
+        other => panic!("a blob-less task redeem must be refused, got {other:?}"),
+    }
+    assert!(
+        journal_artifacts(legacy.dir.path()).is_empty(),
+        "the refused legacy joiner journaled nothing"
+    );
+    assert!(!has_trust_book(legacy.dir.path()));
+
+    // The abort did not consume the redeem budget.
+    modern
+        .pairing
+        .join_task_code(&code.invite.display, &[localhost(52021)], TaskDirection::Recv)
+        .await
+        .expect("the code still pairs with a wave-29 joiner");
+}
+
+/// Defense in depth (kept from wave 28): against a gate-LESS initiator —
+/// an owner loop running pre-wave-29 code — a same-direction join still
+/// refuses at completion with the typed `DirectionConflict`, after the
+/// pairing committed. This is the fallback the pre-commit gate makes
+/// unreachable for wave-29 initiators, not the product path.
+#[tokio::test]
+async fn direction_conflict_against_a_gateless_owner_still_refuses_at_completion() {
     let registry = spawn_registry().await;
     let owner = task_device(&registry, "alice").await;
     let joiner = task_device(&registry, "bob").await;
@@ -217,7 +407,8 @@ async fn direction_conflict_refuses_the_pairing() {
         .create_task_code(TaskDirection::Send, &[localhost(52001)])
         .await
         .expect("create task code");
-    owner.pairing.spawn_owner_loop();
+    // The plain orchestrator loop answers without the task-layer gate.
+    owner.pairing.orchestrator().spawn_owner_loop();
     let err = joiner
         .pairing
         .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)

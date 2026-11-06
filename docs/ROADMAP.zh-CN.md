@@ -1,17 +1,19 @@
 # 开发路线与完成定义
 
-## 当前位置（2026-11-05）
+## 当前位置（2026-11-06）
 
-按 [ADR-002](adr/002-protocol-stack-and-order.zh-CN.md) D5 顺序，截至第二十四波（2026-11-02 至 2026-11-05，含两轮外部 Codex 评审及其修复波）：
+按 [ADR-002](adr/002-protocol-stack-and-order.zh-CN.md) D5 顺序，截至第二十八波（完成）＋第二十九波（进行中），2026-11-02 至 2026-11-06，含三轮外部 Codex 评审及其修复波：
 
-- **P0 大部分完成**：P0-02（无 relay 网络候选收敛＋协调/文件通道隔离证明对）、P0-03（身份认证/配对/密钥保管全链）、P0-04（mDNS 发现＋手动配对＋doctor）已关闭；P0-08 的 ADR 侧已冻结。仍开放：**P0-05/P0-07 需外部网络与物理双机**（受限 NAT/跨运营商样本、真机抓包），P0-01 的"可用真机"部分（现有跨设备证据为 Android 模拟器↔Windows 宿主，矩阵文档见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)），P0-06 的模拟器/真机走查余项（SAF 代码已落地；iOS 由所有者排除）。
-- **P1 全部完成**：P1-01 清单/分页/版本检测、P1-02 有界分块＋摘要＋安全提交、P1-03 双检查点后端＋重启恢复、P1-04 Flutter 双端界面（Windows 桌面＋Android；iOS/macOS 由所有者明确排除）均已勾选关闭。
+- **P0 大部分完成**：P0-02（无 relay 网络候选收敛＋协调/文件通道隔离证明对）、P0-03（身份认证/配对/密钥保管全链）、P0-04（mDNS 发现＋手动配对＋doctor）已关闭；P0-08 的 ADR 侧已冻结。仍开放：**P0-05/P0-07 需外部网络与物理双机**（受限 NAT/跨运营商样本、真机抓包），P0-01 的"可用真机"部分（现有跨设备证据为 Android 模拟器↔Windows 宿主与 Windows↔Linux 云主机，矩阵文档见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)），P0-06 的模拟器/真机走查余项（SAF 代码已落地；iOS 由所有者排除）。
+- **P1 全部完成**：P1-01 清单/分页/版本检测、P1-02 有界分块＋摘要＋安全提交、P1-03 双检查点后端＋重启恢复、P1-04 Flutter 双端界面（Windows 桌面＋Android；iOS/macOS 由所有者明确排除）均已勾选关闭。P1-04 的界面形态自第二十八波起收敛为 v1 极简 UI（连接＋设置两页，零 IP/端口/指纹）。
 - **P2 部分完成**：P2-01 代码部分已备（信令＋STUN 协调面、TLS registry 服务器），公网部署另需所有者批准；P2-03 的进程内故障注入形态已备（T07/随机中断套件），端点抓包归 P0-07；P2-02 未开始。
-- **邀请码配对已完成**（原 V2-01 规划项提前实现，第十八至二十三波）：`AKI1-` 160 bit 熵邀请码、TLS registry（claim/redeem/revoke/TTL/防枚举）、配对编排 e2e、CLI `invite` 命令族、FFI 19 个 v2 导出、Flutter 邀请页全链落地。
+- **邀请码配对已完成**（原 V2-01 规划项提前实现，第十八至二十三波）：`AKI1-` 160 bit 熵邀请码、TLS registry（claim/redeem/revoke/TTL/防枚举）、配对编排 e2e、CLI `invite` 命令族、FFI 19 个 v2 导出全链落地（旧邀请页已随 v1 UI 移除，模型保留在 CLI）。
 - 已完成（第二十四波 `ac6b23b`）：CLI daemon Fake→Real 接线（RealTransport+SessionRuntime+RealTransferExecutor）。
-- 已完成（2026-11-06）：wave-26 修复 Codex 二次终审全部 20 项发现；wave-27 daemon 真实邀请码并发（终审 P1-02：真实 code_id 分组、双端 wire 准入、并发 accept，策略矩阵生产路径生效）。
+- 已完成（2026-11-06，第二十六波 `de8f6be`／第二十七波 `5a5dac1`）：wave-26 修复 Codex 二次终审全部 20 项发现；wave-27 daemon 真实邀请码并发（终审 P1-02：真实 code_id 分组、双端 wire 准入、并发 accept，策略矩阵生产路径生效）。
+- **已完成（2026-11-06，第二十八波 `7458e9f`）：v1 极简配对 UX**——用户冻结规格（一次性任务码＝一次任务、恰好双方、任一侧发起；码带连接设置、断开即失效；UI 零 IP/端口/指纹）；五层交付（协议 endpoint 扩展＋服务器 v2 schema 部署 122.51.121.24 / TaskPairing＋TransferConsent / `ak_task_*` 8 FFI 导出 / Dart 桥 / 连接＋设置两页 UI）；验证 workspace 1085/0＋契约 5/5＋dart 128/128＋flutter 86/86＋跨设备向后兼容 6/6。**v1 任务码模型为 GUI 主线路径**；旧 invite/调度多码模型降级为 CLI 高级能力（v1 未接 CLI，GUI-only）。
+- **进行中（2026-11-06，第二十九波，修复在未提交工作树）：wave-28 终审修复**（`reports/codex-review-2026-11-06-wave28.md`，P0×0/P1×6/P2×15）。逐项状态——已完成：P1-03 服务器额度竞态（Commit 同事务复查）、P2-13 迁移原子性、P2-14 幂等跨版本、P1-05 会话侧方向前置门禁、P1-01 Dart 真接线、P1-02 真实 AKI1 码格式、P1-06 流快照、P2-08/09/10/11（Dart 服务侧四项）；**在途**：P1-04 FFI 接收器身份绑定（接收器 authorize 绑定配对已验证指纹，收口验收中）、P2-01/02/03/04/05/06/07/12/15 共 9 项 P2。验证基线：dart 129/129、flutter 107/107（wave-29 工作树）；workspace 1085/0 为 wave-28 时点，收口后全量复跑。
 
-工程形态：13 个 Rust crate＋ak_ffi_dart 纯 Dart 包＋Flutter 桌面/移动应用；测试基线（分波次，见 reports/）：第二十三波 workspace 918/0、第二十四波 955/0（`ac6b23b` 时点）；当前 HEAD 以实际运行为准。Android 模拟器↔Windows 宿主双向真实 QUIC 传输逐字节一致；Windows↔Linux 跨公网双向 8 MiB SHA256 一致（2026-11-05）。验证形态与逐项证据见 [开发验证记录](../reports/dev-validation-2026-11-02.txt) 与 [BACKLOG](BACKLOG.zh-CN.md)；平台支持范围见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)；里程碑时间线见 [CHANGELOG](../CHANGELOG.md)。本地可执行范围已尽，余项需外部网络、物理双机与部署批准等外部资源。
+工程形态：13 个 Rust crate＋ak_ffi_dart 纯 Dart 包＋Flutter 桌面/移动应用；测试基线（分波次，见 reports/）：第二十三波 workspace 918/0、第二十四波 955/0（`ac6b23b` 时点）、第二十八波 1085/0（`7458e9f` 时点）；第二十九波修复后全量待复跑，当前以实际运行为准。Android 模拟器↔Windows 宿主双向真实 QUIC 传输逐字节一致；Windows↔Linux 跨公网双向 8 MiB SHA256 一致（2026-11-05）；v2 升级服务器上旧客户端向后兼容 6/6（2026-11-06，`7458e9f`）。验证形态与逐项证据见 [开发验证记录](../reports/dev-validation-2026-11-02.txt) 与 [BACKLOG](BACKLOG.zh-CN.md)；平台支持范围见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)；里程碑时间线见 [CHANGELOG](../CHANGELOG.md)。本地可执行范围已尽，余项需外部网络、物理双机与部署批准等外部资源。
 
 不将文档齐全或原型代码存在计作 P0 通过；下列工期是 3–4 名全职成员的原始工作量参考，需据实重估，不是自动执行承诺。
 

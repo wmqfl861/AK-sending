@@ -21,22 +21,33 @@
 ///        └── crates/ak-ffi task plane (Rust)
 /// ```
 ///
-/// State machine (frozen): `idle → creating | joining → paired (probing)
-/// → connected`, with `failed(reason)` as the error sink:
+/// State machine (frozen + wave-29 P2-09 merge): `idle → creating |
+/// joining → paired (probing) → connected`, with `failed(reason)` as the
+/// error sink and `unreachable` as the probe-FAILED row verdict:
 ///
 /// ```text
 ///        ┌────────── createCode ──────────┐
 ///        │            join                │
-///      idle ────────► creating/joining ──► paired ──(probe_result or
-///        ▲                │                │  ▲      connected event)──► connected
-///        │                ▼                │  └──── last conn disconnected
+///      idle ────────► creating/joining ──► paired ──(probe reachable=true)──► connected
+///        ▲                │                │  ▲      probe reachable=false → row `unreachable`
+///        │                ▼                │  └──── last conn disconnected (data-plane reason)
 ///        └────────────────┴──── failed(reason) ◄── op/engine failures
 /// ```
 ///
 /// * `createCode`: idle→creating→paired (the creator reaches `connected`
-///   when the peer's join lands as a `connected` event).
-/// * `join`: idle→joining→paired, then `probe_result`/`connected` flips
-///   the connection to `connected`.
+///   when the peer's join lands and the probe passes).
+/// * `join`: idle→joining→paired, then `probe_result` flips the row:
+///   `reachable:true` → connected, `false` → unreachable, `null` keeps
+///   probing (verdict pending).
+/// * Row state merges are MONOTONIC (wave-29 P2-09): `probing < connected
+///   = unreachable < disconnected`. A late `join` result never rebuilds a
+///   row the event pump already advanced (nor revives a disconnected
+///   one), and a late `connected` event never downgrades a row the probe
+///   already settled.
+/// * `disconnected` events only kill a row for the DATA-PLANE reasons
+///   (`local` | `peer` | `receiver_failed`, wave-29 P2-08): a
+///   coordination-plane notice (any other reason, e.g. a registry link
+///   loss) leaves still-healthy direct connections untouched.
 /// * disconnecting the last live connection returns to `idle`;
 ///   `failed(reason)` carries the engine's last-error detail.
 ///
@@ -49,7 +60,8 @@
 /// facade), exactly like `FfiInviteService` borrows the facade's engine.
 library;
 
-import 'dart:async' show StreamController, Timer, TimeoutException;
+import 'dart:async'
+    show StreamController, StreamSubscription, Timer, TimeoutException;
 import 'dart:collection' show UnmodifiableListView;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
@@ -108,22 +120,25 @@ enum SimpleTransferPhase {
 
 /// One connection as the UI renders it (the `ak_task_list` row shape).
 final class SimpleConnection {
-  const SimpleConnection({
-    required this.connId,
-    required this.role,
-    required this.state,
-    this.peerEndpoint,
-    this.code,
-  });
+    const SimpleConnection({
+      required this.connId,
+      required this.role,
+      required this.state,
+      this.peerEndpoint,
+      this.code,
+    });
 
-  /// Hex connection id (32 chars) — the send/disconnect key.
-  final String connId;
+    /// Hex connection id (32 chars) — the send/disconnect key.
+    final String connId;
 
-  /// This device's role: `sender` | `receiver`.
-  final String role;
+    /// This device's role: `sender` | `receiver`.
+    final String role;
 
-  /// `probing` | `connected` | `disconnected`.
-  final String state;
+    /// `probing` | `connected` | `unreachable` | `disconnected`. The two
+    /// probe verdicts (`connected`/`unreachable`) are terminal for the
+    /// probe and rank equally; `disconnected` is the overall terminal
+    /// state (see the state-machine doc for the monotonic merge rules).
+    final String state;
 
   final String? peerEndpoint;
 
@@ -190,6 +205,7 @@ final class SimpleTransferService {
     required this.calls,
     this.eventPollInterval = const Duration(milliseconds: 50),
     this.opPollInterval = const Duration(milliseconds: 200),
+    this.consentWindow = const Duration(seconds: 30),
     Future<void> Function(Duration)? delay,
   })  : _delay = delay ?? Future<void>.delayed;
 
@@ -220,16 +236,30 @@ final class SimpleTransferService {
   String? _failureReason;
 
   Timer? _pump;
-  // Replay semantics (the UI contract's): every new listener first
-  // receives the CURRENT snapshot, then the change events. `late` so the
-  // onListen closure can reference the instance method.
-  late final StreamController<List<SimpleConnection>> _connectionsController =
-      StreamController<List<SimpleConnection>>.broadcast(
-          onListen: _notifyConnections);
+  // The live connection-change fan-out. Per-subscriber SNAPSHOT replay is
+  // implemented by [connections] (wave-29 P1-06): a broadcast controller's
+  // onListen only fires on the 0→1 listener transition, which is why this
+  // controller itself carries NO onListen — every new subscriber gets a
+  // dedicated wrapper stream that first yields the current snapshot and
+  // then forwards this controller's events.
+  final StreamController<List<SimpleConnection>> _connectionsController =
+      StreamController<List<SimpleConnection>>.broadcast();
   final StreamController<SimpleIncomingRequest> _incomingController =
       StreamController<SimpleIncomingRequest>.broadcast();
   final StreamController<TaskDoneEvent> _doneController =
       StreamController<TaskDoneEvent>.broadcast();
+
+  /// Wave-29 P2-11: the 30 s engine auto-decline window, mirrored
+  /// locally per pending request so the UI can close banners the engine
+  /// already auto-declined. A timer fires only when the request is still
+  /// undecided here; [consent] cancels its timer.
+  final Map<String, Timer> _consentTimers = <String, Timer>{};
+  final StreamController<String> _expiredIncomingController =
+      StreamController<String>.broadcast();
+
+  /// Engine-side auto-decline window (tests may shorten construction —
+  /// the fake engine never auto-declines on its own).
+  final Duration consentWindow;
 
   bool _disposed = false;
 
@@ -291,17 +321,25 @@ final class SimpleTransferService {
     // (2) the pump.
     _pump?.cancel();
     _pump = null;
+    // Consent-window timers (P2-11) go with the channels.
+    for (final timer in _consentTimers.values) {
+      timer.cancel();
+    }
+    _consentTimers.clear();
     // (3) streams (listeners get a done event; late pollers throw nothing).
     _connectionsController.close();
     _incomingController.close();
     _doneController.close();
+    _expiredIncomingController.close();
   }
 
   // -- the three actions --------------------------------------------------
 
   /// Action 1 — generate a task code for [role]. Returns the DISPLAY code
-  /// (`AKT1-XXXX-XXXX-XXXX`) once the create op completed (receiver-role
-  /// creations bind the resident receiver first, engine-side).
+  /// (`AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, the Rust
+  /// `InviteCode::to_display` shape) once the create op completed
+  /// (receiver-role creations bind the resident receiver first,
+  /// engine-side).
   Future<String> createCode(
     SimpleTransferRole role, {
     List<String>? candidates,
@@ -329,11 +367,19 @@ final class SimpleTransferService {
     }
   }
 
-  /// Action 2 — join by entering the displayed code. The phase reaches
-  /// `paired`, then flips to `connected` when the probe/connected event of
-  /// the new connection lands (see the state-machine diagram).
+  /// Action 2 — join by entering the displayed code. [role] is the
+  /// joiner's EXPLICIT direction (the UI user's intent, wave-29 P1-05):
+  /// it rides the join spec so cross-device joins never guess the
+  /// direction; null keeps the engine's resolution (same-engine mirror
+  /// complement, else the v1 receiver default).
+  ///
+  /// The result row merges MONOTONICALLY (P2-09): when the event pump
+  /// already advanced the row (probe verdict) or even killed it
+  /// (`disconnected`), the late join result only fills role/endpoint/code
+  /// — it never rebuilds the row to `probing` nor regresses the phase.
   Future<SimpleJoinResult> join(
     String code, {
+    SimpleTransferRole? role,
     List<String>? candidates,
     Duration timeout = const Duration(seconds: 30),
   }) async {
@@ -342,6 +388,7 @@ final class SimpleTransferService {
     try {
       final result = await runtime.join(AkTaskJoinSpec(
         code: code,
+        role: role?._wire,
         candidates: candidates ?? const <String>[],
       )).wait(
         interval: opPollInterval,
@@ -350,15 +397,19 @@ final class SimpleTransferService {
         ensureLive: _ensureLive,
       );
       final connId = result['conn'] as String;
-      _connections[connId] = SimpleConnection(
+      _upsert(
         connId: connId,
-        role: result['role'] as String? ?? '',
-        state: 'probing',
+        role: result['role'] as String?,
         peerEndpoint: result['peer_endpoint'] as String?,
         code: code.trim().toUpperCase(),
+        state: 'probing',
       );
-      _notifyConnections();
-      _setPhase(SimpleTransferPhase.paired);
+      // Only the joining→paired step regresses nothing; if events already
+      // moved the phase (connected) or the pairing died (idle/failed),
+      // the late result keeps the phase as is (P2-09).
+      if (_phase == SimpleTransferPhase.joining) {
+        _setPhase(SimpleTransferPhase.paired);
+      }
       return SimpleJoinResult(
         connId: connId,
         role: result['role'] as String? ?? '',
@@ -371,11 +422,31 @@ final class SimpleTransferService {
     }
   }
 
-  /// Action 3a — the live connection list (a broadcast stream that
-  /// REPLAYS the current snapshot to late subscribers; also readable
-  /// synchronously via [currentConnections]).
-  Stream<List<SimpleConnection>> get connections =>
-      _connectionsController.stream;
+  /// Action 3a — the live connection list. Wave-29 P1-06 semantics: EVERY
+  /// subscription (each call of this getter returns an independent
+  /// stream) first receives the CURRENT snapshot, then the live change
+  /// events — a detail page opened while the home page is already
+  /// listening still sees the live list immediately, with no gap between
+  /// the snapshot and the forwarded events (the live tap is attached
+  /// synchronously before the snapshot is emitted). The same snapshot is
+  /// also readable synchronously via [currentConnections].
+  Stream<List<SimpleConnection>> get connections {
+    final out = StreamController<List<SimpleConnection>>.broadcast();
+    StreamSubscription<List<SimpleConnection>>? live;
+    out.onListen = () {
+      live = _connectionsController.stream.listen(
+        out.add,
+        onError: out.addError,
+        onDone: out.close,
+      );
+      out.add(currentConnections); // the per-subscriber snapshot replay
+    };
+    out.onCancel = () {
+      live?.cancel();
+      live = null;
+    };
+    return out.stream;
+  }
 
   /// Action 3b — sever one connection (idempotent; the peer side learns
   /// engine-side).
@@ -401,6 +472,13 @@ final class SimpleTransferService {
   /// The sender picks files and sends them over [connId]. Resolves with
   /// the engine's report map (`files`/`bytes`/`peer`); the offer waits
   /// receiver-side for the 30 s consent window engine-side.
+  ///
+  /// Wave-29 P2-10: when [timeout] elapses the UI wait does NOT simply
+  /// give up while the native task keeps writing — the only FFI cancel
+  /// path of the v1 one-task model (`ak_task_disconnect` of the task
+  /// connection) is issued best-effort and the rethrown
+  /// [TimeoutException] says so. The disconnect event then folds the row
+  /// to `disconnected` through the normal pump.
   Future<Map<String, dynamic>> sendFiles(
     String connId,
     List<String> paths, {
@@ -408,12 +486,34 @@ final class SimpleTransferService {
   }) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
-    return runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
-          interval: opPollInterval,
-          timeout: timeout,
-          delay: _delay,
-          ensureLive: _ensureLive,
-        );
+    try {
+      return await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
+            interval: opPollInterval,
+            timeout: timeout,
+            delay: _delay,
+            ensureLive: _ensureLive,
+          );
+    } on TimeoutException {
+      await _cancelTaskConnection(runtime, connId);
+      throw TimeoutException(
+        '发送等待超时（${timeout.inSeconds} 秒），已取消原生发送任务并断开该连接。',
+        timeout,
+      );
+    }
+  }
+
+  /// The FFI cancel path (P2-10): disconnect the task connection and fold
+  /// the local row. Best-effort by design — the op may complete on its
+  /// own in the race window, in which case the event pump owns the final
+  /// state and a disconnect error is deliberately swallowed.
+  Future<void> _cancelTaskConnection(TaskRuntimeFfi runtime, String connId) async {
+    try {
+      runtime.disconnect(connId);
+    } on Object {
+      // Raced the op's own completion/teardown — nothing else to do.
+      return;
+    }
+    _markDisconnected(connId);
   }
 
   /// Incoming transfer requests (receiver side) — one event per offer,
@@ -421,15 +521,25 @@ final class SimpleTransferService {
   Stream<SimpleIncomingRequest> get incomingRequests =>
       _incomingController.stream;
 
+  /// Wave-29 P2-11: job ids whose consent window closed undecided — the
+  /// engine auto-declined them, so the UI closes/removes their banners.
+  /// Firing is driven by the local mirror of the 30 s window (started at
+  /// event-pump time, cancelled by [consent]); a decline click that
+  /// races the window resolves as false from [consent] and is handled
+  /// idempotently by the adapter.
+  Stream<String> get expiredIncomingRequests =>
+      _expiredIncomingController.stream;
+
   /// Successful transfer completions (either side) with files/bytes.
   Stream<TaskDoneEvent> get doneEvents => _doneController.stream;
 
   /// Decide one pending [SimpleIncomingRequest]. Returns false when the
   /// request is unknown or already decided (including auto-declined by
-  /// the 30 s window).
+  /// the 30 s window — deciding such a request locally is a no-op).
   Future<bool> consent(String jobId, {required bool accept}) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
+    _consentTimers.remove(jobId)?.cancel();
     return runtime.consent(jobId, accept: accept);
   }
 
@@ -502,6 +612,72 @@ final class SimpleTransferService {
     }
   }
 
+  /// The monotonic state order of the P2-09 merge: probing < the probe
+  /// verdicts (connected = unreachable) < disconnected. A rank-equal
+  /// update overwrites (there is exactly one probe verdict per join).
+  static int _stateRank(String state) => switch (state) {
+        'probing' => 0,
+        'connected' || 'unreachable' => 1,
+        _ => 2, // disconnected and anything unknown stay terminal
+      };
+
+  /// Monotonic row upsert (P2-09): fills the optional fields, never
+  /// downgrades an existing state, notifies on change, and advances the
+  /// global phase to `connected` when a row's probe PASSED.
+  void _upsert({
+    required String connId,
+    required String state,
+    String? role,
+    String? peerEndpoint,
+    String? code,
+  }) {
+    final existing = _connections[connId];
+    if (existing == null) {
+      _connections[connId] = SimpleConnection(
+        connId: connId,
+        role: role ?? '',
+        state: state,
+        peerEndpoint: peerEndpoint,
+        code: code,
+      );
+      _notifyConnections();
+    } else {
+      final merged = _stateRank(state) >= _stateRank(existing.state)
+          ? state
+          : existing.state;
+      if (merged == existing.state &&
+          (role == null || role == existing.role) &&
+          (peerEndpoint == null || peerEndpoint == existing.peerEndpoint) &&
+          (code == null || code == existing.code)) {
+        return; // nothing new — no notification
+      }
+      _connections[connId] = SimpleConnection(
+        connId: connId,
+        role: role ?? existing.role,
+        state: merged,
+        peerEndpoint: peerEndpoint ?? existing.peerEndpoint,
+        code: code ?? existing.code,
+      );
+      _notifyConnections();
+    }
+    if (_connections[connId]?.state == 'connected' &&
+        (_phase == SimpleTransferPhase.paired ||
+            _phase == SimpleTransferPhase.joining)) {
+      _setPhase(SimpleTransferPhase.connected);
+    }
+  }
+
+  /// The `disconnected` reasons that are DATA-PLANE terminal verdicts
+  /// (wave-29 P2-08). Anything else (e.g. a registry/coordinator link
+  /// loss surfaced by the engine) is a coordination-plane notice: the
+  /// authorized direct connection may still be healthy, so the row keeps
+  /// its state until a real data-plane close arrives.
+  static const Set<String> _terminalDisconnectReasons = <String>{
+    'local',
+    'peer',
+    'receiver_failed',
+  };
+
   void _markDisconnected(String connId) {
     final existing = _connections[connId];
     if (existing == null) {
@@ -545,35 +721,33 @@ final class SimpleTransferService {
 
   void _route(TaskEvent event) {
     if (event is TaskConnectedEvent) {
-      final existing = _connections[event.conn];
-      _connections[event.conn] = SimpleConnection(
+      // The engine announces the CONNECTION (pairing bookkeeping) before
+      // probing: a fresh row starts at `probing`; a row the pump already
+      // settled (probe verdict / disconnected) keeps its state (P2-09).
+      _upsert(
         connId: event.conn,
         role: event.role,
-        state: existing?.state == 'probing' ? 'probing' : 'connected',
-        peerEndpoint: event.peerEndpoint ?? existing?.peerEndpoint,
-        code: event.code ?? existing?.code,
+        peerEndpoint: event.peerEndpoint,
+        code: event.code,
+        state: 'probing',
       );
-      _notifyConnections();
-      if (_phase == SimpleTransferPhase.paired) {
-        _setPhase(SimpleTransferPhase.connected);
-      }
       return;
     }
     if (event is TaskProbeResultEvent) {
+      // The probe's TRUTH drives the verdict (P2-09): reachable=true →
+      // connected, false → unreachable (never "success"), null → the
+      // verdict is still pending, keep probing.
       final existing = _connections[event.conn];
       if (existing != null) {
-        _connections[event.conn] = SimpleConnection(
+        _upsert(
           connId: event.conn,
-          role: existing.role,
-          state: 'connected',
-          peerEndpoint: event.endpoint ?? existing.peerEndpoint,
-          code: existing.code,
+          peerEndpoint: event.endpoint,
+          state: switch (event.reachable) {
+            true => 'connected',
+            false => 'unreachable',
+            null => existing.state,
+          },
         );
-        _notifyConnections();
-        if (_phase == SimpleTransferPhase.paired ||
-            _phase == SimpleTransferPhase.connected) {
-          _setPhase(SimpleTransferPhase.connected);
-        }
       }
       return;
     }
@@ -587,6 +761,18 @@ final class SimpleTransferService {
           bytes: event.bytes,
         ));
       }
+      // Mirror the engine's 30 s auto-decline window (P2-11): when it
+      // closes with the request still undecided here, tell the UI so the
+      // banner goes away instead of clicking into a dead request.
+      if (!_expiredIncomingController.isClosed &&
+          !_consentTimers.containsKey(event.job)) {
+        _consentTimers[event.job] = Timer(consentWindow, () {
+          _consentTimers.remove(event.job);
+          if (!_disposed && !_expiredIncomingController.isClosed) {
+            _expiredIncomingController.add(event.job);
+          }
+        });
+      }
       return;
     }
     if (event is TaskDoneEvent) {
@@ -597,9 +783,15 @@ final class SimpleTransferService {
     }
     if (event is TaskDisconnectedEvent) {
       final conn = event.conn;
-      if (conn != null && conn.isNotEmpty) {
-        _markDisconnected(conn);
+      if (conn == null || conn.isEmpty) {
+        return;
       }
+      if (!_terminalDisconnectReasons.contains(event.reason)) {
+        // Coordination-plane notice (P2-08): the data channel is
+        // independent — a still-healthy direct connection stays live.
+        return;
+      }
+      _markDisconnected(conn);
       return;
     }
     // runtime_ready / op_done / op_failed / unknown: the op waiters read

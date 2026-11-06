@@ -84,6 +84,36 @@ void main() {
     expect(find.byKey(const ValueKey('incoming_host')), findsNothing);
   });
 
+  testWidgets('P2-11: the 30 s window closing removes the banner; a '
+      'reject racing the expiry never throws', (tester) async {
+    final fake = await pumpApp(tester);
+
+    fake.emitIncomingRequest(fileCount: 2, totalBytes: 2048);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(
+        find.byKey(const ValueKey('incoming_reject_job-1')), findsOneWidget);
+
+    // The engine auto-declined (window closed): the banner closes.
+    fake.expireIncoming('job-1');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('incoming_host')), findsNothing);
+
+    // Race shape: the user taps reject BEFORE the expiry event reaches
+    // the host — the decline must be contained, no unhandled exception.
+    fake.emitIncomingRequest(jobId: 'late', fileCount: 1, totalBytes: 1);
+    await pumpEvents(tester);
+    await tester.pump();
+    fake.expireIncoming('late');
+    await tester.tap(find.byKey(const ValueKey('incoming_reject_late')));
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('incoming_host')), findsNothing);
+    expect(tester.takeException(), isNull);
+    expect(fake.consentRequests.last, ('late', false));
+  });
+
   testWidgets('two concurrent offers render stacked banners',
       (tester) async {
     final fake = await pumpApp(tester);

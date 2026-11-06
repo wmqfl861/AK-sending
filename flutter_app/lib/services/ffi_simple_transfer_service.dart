@@ -27,33 +27,49 @@
 ///   (tests and operator overrides), then the compiled `--dart-define`
 ///   defaults (the only way a standalone phone install gets a real
 ///   registry), the same precedence as
-///   `FfiTransferService.inviteConfigFromEnvironment`; the identity
-///   directory resolves like `FfiTransferService.defaultIdentityDir`
-///   (`AK_ID_DIR` override, else the user-profile `.ak-sending`).
-/// * **role**: `TaskRole.send`/`receive` ⇄ the engine's sender/receiver.
-/// * **code**: the engine mints `AKT1-XXXX-XXXX-XXXX` (12 hex in three
-///   groups — 2^48 space, no key material inside); joining tolerates
-///   hyphens, spaces and lower case engine-side (the code-table key
-///   strips separators).
+///   `FfiTransferService.inviteConfigFromEnvironment`.
+/// * **identity directory** (wave-29 P1-01): desktop resolves `AK_ID_DIR`,
+///   else the user-profile `.ak-sending` (`FfiTransferService
+///   .defaultIdentityDir`'s pattern); Android has NO usable environment,
+///   so the default resolves asynchronously from path_provider
+///   (`getApplicationSupportDirectory()/.ak-sending`) — [start] (and
+///   [identityDirReady]) gate on that resolve exactly like
+///   `FfiTransferService.identityDirReady`. An explicit [idDir] still
+///   wins over every tier.
+/// * **role**: `TaskRole.send`/`receive` ⇄ the engine's sender/receiver;
+///   [joinCode]'s optional role is the joiner's EXPLICIT direction (the
+///   UI user's intent) riding the join spec (wave-29 P1-05).
+/// * **code**: the engine mints the REAL display form
+///   `AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` (the Rust
+///   `InviteCode::to_display` shape: 160-bit secret in Crockford Base32,
+///   I/L/O/U excluded); joining tolerates case, hyphens and spaces
+///   engine-side (the code-table key strips separators).
 /// * **state**: the engine's `probing` maps to the contract's `testing`
-///   (the auto connectivity probe; `reachable` itself is pending
-///   ak-session `probe_peer`, WAVE-28/B-PENDING); `connecting` is the
-///   contract's transient that this v1 skips (a join lands directly in
-///   probing); dropped rows are filtered out of the `connections`
-///   snapshot per the contract.
+///   (the auto connectivity probe); a FAILED probe maps to the
+///   contract's `unreachable` (wave-29 P2-09 — never to "success");
+///   dropped rows are filtered out of the `connections` snapshot per the
+///   contract.
 /// * **peerName**: the zero-identity v1 model carries no peer name — the
 ///   row shows the task code's short label until registry-relayed device
 ///   names land with agent B.
 /// * **consent**: with `accept: true` the returned future completes when
 ///   the receive finishes (the engine's `done` event for that
-///   connection) and rejects on failure/timeout; declines resolve
-///   immediately.
+///   connection), rejects on failure/disconnect and — past
+///   [receiveTimeout] — cancels the native task through the disconnect
+///   path before rejecting (wave-29 P2-10); declines resolve immediately
+///   and are IDEMPOTENT for an already-expired/decided request
+///   (wave-29 P2-11: the 30 s auto-decline window may have closed first).
 /// * **sendFiles**: resolves with a readable Chinese summary built from
-///   the engine report (`已发送 N 个文件（formatBytes）`).
+///   the engine report (`已发送 N 个文件（formatBytes）`); past
+///   [sendTimeout] the engine service cancels the native op and the
+///   rejection says so (wave-29 P2-10).
 library;
 
 import 'dart:async' show Stream, StreamSubscription, TimeoutException;
 import 'dart:io' show Platform;
+
+import 'package:path_provider/path_provider.dart'
+    show getApplicationSupportDirectory;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show AkFfiException, AkStatus, AkTaskCalls;
@@ -81,13 +97,29 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     String? saveDir,
     Map<String, String> Function()? environment,
     Future<void> Function(Duration)? delay,
+    bool? isAndroid,
+    Future<String> Function()? androidIdentityDir,
+    this.receiveTimeout = const Duration(seconds: 180),
+    this.sendTimeout = const Duration(seconds: 120),
+    this.engineOwner,
   })  : _saveDirOverride = saveDir,
         _environment = environment ?? _platformEnvironment,
+        _isAndroidPlatform = isAndroid ?? Platform.isAndroid,
+        _androidIdentityDir =
+            androidIdentityDir ?? defaultAndroidIdentityDir,
         _engine = task_engine.SimpleTransferService(
           calls: calls,
           delay: delay,
           eventPollInterval: const Duration(milliseconds: 50),
-        );
+        ) {
+    // Wave-29 P1-01: Android resolves the real identity directory from
+    // path_provider; every dir consumer gates on [identityDirReady]
+    // (immediately complete on desktop). Never throws — a provider
+    // failure keeps the desktop-style fallback.
+    identityDirReady = _isAndroidPlatform
+        ? _resolveAndroidIdentityDir(_androidIdentityDir)
+        : Future<void>.value();
+  }
 
   /// Explicit registry endpoint override (tests/operators); null resolves
   /// from the environment/compiled defaults at [start].
@@ -97,15 +129,40 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   final String? registryIdHex;
 
   /// Explicit identity directory override; null resolves `AK_ID_DIR`,
-  /// else the user-profile `.ak-sending`.
+  /// then the Android path_provider tier, else the user-profile
+  /// `.ak-sending`.
   final String? idDir;
 
   /// Explicit default save folder override; null keeps the engine default
   /// (`<id_dir>/downloads`).
   final String? _saveDirOverride;
 
+  /// Wall-clock budget for the receive half of an accepted consent
+  /// (wave-29 P2-10; on expiry the native task is cancelled through the
+  /// disconnect path before the future rejects).
+  final Duration receiveTimeout;
+
+  /// Wall-clock budget handed to the engine's send wait (P2-10).
+  final Duration sendTimeout;
+
+  /// Optional owner of the native engine handle behind [AkTaskCalls] —
+  /// released AFTER the engine service in [dispose] (borrowers-first,
+  /// the P1-05 release order). The app shell passes the facade it opened
+  /// in `main.dart`.
+  final void Function()? engineOwner;
+
   final Map<String, String> Function() _environment;
+  final bool _isAndroidPlatform;
+  final Future<String> Function() _androidIdentityDir;
   final task_engine.SimpleTransferService _engine;
+
+  /// The path_provider-resolved default identity dir once it lands
+  /// (Android only; null until then).
+  String? _platformIdentityDir;
+
+  /// Completes when the Android identity-directory resolve settles
+  /// (immediately on desktop). Never throws.
+  late final Future<void> identityDirReady;
 
   StreamSubscription<task_engine.SimpleIncomingRequest>? _requestSub;
   final Map<String, String?> _connOfJob = <String, String?>{};
@@ -117,6 +174,9 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   @override
   Future<void> start() async {
+    if (_isAndroidPlatform) {
+      await identityDirReady; // the real dir gates the engine's id_dir
+    }
     final env = _environment();
     final address = registry ?? _envOrCompiled(env, 'AK_REGISTRY_ADDR');
     final pin = registryIdHex ?? _envOrCompiled(env, 'AK_REGISTRY_ID');
@@ -143,6 +203,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     _requestSub?.cancel();
     _requestSub = null;
     _engine.dispose();
+    engineOwner?.call(); // the native engine goes LAST (borrowers first)
   }
 
   // -- the three actions --------------------------------------------------
@@ -154,9 +215,9 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   }
 
   @override
-  Future<JoinResult> joinCode(String code) async {
+  Future<JoinResult> joinCode(String code, {TaskRole? role}) async {
     try {
-      final joined = await _engine.join(code);
+      final joined = await _engine.join(code, role: _engineRoleOrNull(role));
       return JoinResult.success(joined.connId);
     } on AkFfiException catch (error) {
       return JoinResult.failure(_readable(error));
@@ -181,30 +242,70 @@ final class FfiSimpleTransferService implements SimpleTransferService {
           ));
 
   @override
+  Stream<String> get expiredIncomingRequests =>
+      _engine.expiredIncomingRequests;
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     final decided = await _engine.consent(jobId, accept: accept);
     if (!decided) {
+      if (!accept) {
+        // Wave-29 P2-11: a decline of an already-expired/auto-declined
+        // request is IDEMPOTENT — the engine declined it (or the 30 s
+        // window did); nothing is received either way.
+        return;
+      }
       throw StateError('该请求已失效（可能已被处理或超过 30 秒自动拒绝）。');
     }
     if (!accept) {
       return; // declined: nothing is received, resolve immediately
     }
     // Accepted: the contract completes when the receive finishes. Watch
-    // the done event of THIS request's connection (any done when the
-    // request carried no connection id).
+    // the done event of THIS request's connection AND the connection
+    // itself going away (a mid-transfer disconnect must not hang the
+    // wait until the timeout — P2-10); past [receiveTimeout] the native
+    // task is cancelled through the disconnect path.
     final conn = _connOfJob[jobId];
     try {
-      await _engine.doneEvents
-          .firstWhere((done) => conn == null || done.conn == conn)
-          .timeout(const Duration(seconds: 180));
+      final done = _engine.doneEvents
+          .firstWhere((event) => conn == null || event.conn == conn)
+          .then<void>((_) {});
+      final lost = conn == null
+          ? null
+          : _engine.connections
+              .firstWhere((rows) => rows.any(
+                  (row) => row.connId == conn && row.state == 'disconnected'))
+              .then<void>((_) => throw StateError('连接已断开，接收已中断。'));
+      await (lost == null ? done : Future.any<void>([done, lost]))
+          .timeout(receiveTimeout);
     } on TimeoutException {
-      throw TimeoutException('接收未在限时内完成。', const Duration(seconds: 180));
+      await _cancelReceiveTask(conn);
+      throw TimeoutException(
+        '接收未在 ${receiveTimeout.inSeconds} 秒内完成，已取消原生接收任务并断开该连接。',
+        receiveTimeout,
+      );
+    }
+  }
+
+  /// P2-10's receive-side cancel: the FFI disconnect path stops the
+  /// native receive; best-effort (the receive may complete in the race
+  /// window, in which case the pump owns the final state).
+  Future<void> _cancelReceiveTask(String? connId) async {
+    final id = connId;
+    if (id == null) {
+      return;
+    }
+    try {
+      await _engine.disconnect(id);
+    } on Object {
+      // raced completion — the event pump owns the state
     }
   }
 
   @override
   Future<String> sendFiles(String connId, List<String> paths) async {
-    final report = await _engine.sendFiles(connId, paths);
+    final report =
+        await _engine.sendFiles(connId, paths, timeout: sendTimeout);
     final files = report['files'] is int ? report['files'] as int : 0;
     final bytes = report['bytes'] is int ? report['bytes'] as int : 0;
     return '已发送 $files 个文件（${formatBytes(bytes)}）';
@@ -240,13 +341,18 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     return trimmed.isEmpty ? null : trimmed;
   }
 
-  /// `AK_ID_DIR` override, else the user-profile `.ak-sending` (the
-  /// `FfiTransferService.defaultIdentityDir` pattern, minus the Android
-  /// path_provider tier which the app shell supplies via [idDir]).
-  static String _resolveIdentityDir(Map<String, String> env) {
+  /// `AK_ID_DIR` override, then the Android path_provider tier (already
+  /// resolved into [_platformIdentityDir] by [identityDirReady]), else
+  /// the user-profile `.ak-sending` (the
+  /// `FfiTransferService.defaultIdentityDir` pattern).
+  String _resolveIdentityDir(Map<String, String> env) {
     final overridden = env['AK_ID_DIR']?.trim();
     if (overridden != null && overridden.isNotEmpty) {
       return overridden;
+    }
+    final platform = _platformIdentityDir;
+    if (platform != null && platform.isNotEmpty) {
+      return platform;
     }
     final home = env['USERPROFILE'] ?? env['HOME'] ?? '';
     if (home.isEmpty) {
@@ -256,10 +362,40 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     return '$home$separator.ak-sending';
   }
 
+  /// Resolves (or runs [resolver], injectable for tests) the Android
+  /// identity directory and anchors [_platformIdentityDir]. Never throws
+  /// — see [identityDirReady].
+  Future<void> _resolveAndroidIdentityDir(
+      Future<String> Function() resolver) async {
+    try {
+      final dir = await resolver();
+      if (dir.isEmpty) {
+        return;
+      }
+      _platformIdentityDir = dir;
+    } on Object {
+      // path_provider unavailable: keep the desktop-style fallback.
+    }
+  }
+
+  /// Android default identity directory: `<app support>/.ak-sending` via
+  /// path_provider (the `FfiTransferService.defaultAndroidIdentityDir`
+  /// pattern — app-private storage, no permission, survives runs).
+  static Future<String> defaultAndroidIdentityDir() async {
+    final support = await getApplicationSupportDirectory();
+    final base = support.path;
+    return base.endsWith('/') || base.endsWith(r'\')
+        ? '$base.ak-sending'
+        : '$base/.ak-sending';
+  }
+
   task_engine.SimpleTransferRole _engineRole(TaskRole role) =>
       role == TaskRole.send
           ? task_engine.SimpleTransferRole.sender
           : task_engine.SimpleTransferRole.receiver;
+
+  task_engine.SimpleTransferRole? _engineRoleOrNull(TaskRole? role) =>
+      role == null ? null : _engineRole(role);
 
   TaskRole _uiRole(String role) =>
       role == 'sender' ? TaskRole.send : TaskRole.receive;
@@ -268,11 +404,15 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     switch (state) {
       case 'connected':
         return TaskConnectionState.connected;
+      case 'unreachable':
+        // The probe FAILED (P2-09): an honest negative verdict, never
+        // "success" and not the terminal `disconnected` either.
+        return TaskConnectionState.unreachable;
       case 'disconnected':
         return TaskConnectionState.disconnected;
       case 'probing':
       default:
-        // The auto connectivity probe (reachability pending B).
+        // The auto connectivity probe (verdict pending).
         return TaskConnectionState.testing;
     }
   }

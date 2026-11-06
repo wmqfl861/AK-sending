@@ -171,7 +171,8 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     final theme = Theme.of(context);
     final connection = _connection;
     final live = connection != null &&
-        connection.state != TaskConnectionState.disconnected;
+        connection.state != TaskConnectionState.disconnected &&
+        connection.state != TaskConnectionState.unreachable;
     final peerName = connection?.peerName ?? '对端';
 
     return Scaffold(
@@ -216,11 +217,18 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                     Padding(
                       padding: const EdgeInsets.only(top: 4),
                       child: Text(
-                        connection.state == TaskConnectionState.testing
-                            ? '正在测试连通性…'
-                            : '正在建立连接…',
-                        style: theme.textTheme.bodySmall
-                            ?.copyWith(color: theme.colorScheme.tertiary),
+                        switch (connection.state) {
+                          TaskConnectionState.testing => '正在测试连通性…',
+                          TaskConnectionState.unreachable =>
+                            '连通测试未通过：无法与对端建立数据直连，请重新配对。',
+                          _ => '正在建立连接…',
+                        },
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: connection.state ==
+                                  TaskConnectionState.unreachable
+                              ? theme.colorScheme.error
+                              : theme.colorScheme.tertiary,
+                        ),
                       ),
                     ),
                 ],

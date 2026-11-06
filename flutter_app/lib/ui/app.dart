@@ -7,10 +7,15 @@
 /// IndexedStack. The incoming-request banner host sits above the page
 /// content on BOTH tabs.
 ///
-/// `lib/main.dart` constructs the [SimpleTransferService] (wave-28 switch
-/// point: fake today, agent C's real implementation when it lands) and
-/// hands it here.
+/// `lib/main.dart` constructs the REAL [SimpleTransferService] (wave-29
+/// P1-01: `FfiSimpleTransferService` over the borrowed engine) and hands
+/// it here; a construction-time failure (missing DLL, old exports)
+/// arrives as [AkSendingApp.startupError] and a failed `start()` is
+/// captured by the shell — both render the visible engine-error card
+/// below instead of a silent local demo.
 library;
+
+import 'dart:async' show unawaited;
 
 import 'package:flutter/material.dart';
 
@@ -26,11 +31,19 @@ class AkSendingApp extends StatelessWidget {
   const AkSendingApp({
     super.key,
     required this.service,
+    this.startupError,
     this.store = const SharedPrefsSaveDirStore(),
     this.picker = const PluginFilePickGateway(),
   });
 
   final SimpleTransferService service;
+
+  /// A CONSTRUCTION-time failure reason from `main.dart` (missing native
+  /// library / unsupported exports): non-null renders the engine-error
+  /// card. The service member still answers (throwing its honest
+  /// StateErrors) so navigation keeps working in the degraded state.
+  final String? startupError;
+
   final SaveDirStore store;
   final FilePickGateway picker;
 
@@ -42,7 +55,12 @@ class AkSendingApp extends StatelessWidget {
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF316A5A)),
       ),
-      home: AppShell(service: service, store: store, picker: picker),
+      home: AppShell(
+        service: service,
+        startupError: startupError,
+        store: store,
+        picker: picker,
+      ),
     );
   }
 }
@@ -52,11 +70,16 @@ class AppShell extends StatefulWidget {
   const AppShell({
     super.key,
     required this.service,
+    this.startupError,
     required this.store,
     required this.picker,
   });
 
   final SimpleTransferService service;
+
+  /// See [AkSendingApp.startupError].
+  final String? startupError;
+
   final SaveDirStore store;
   final FilePickGateway picker;
 
@@ -67,12 +90,21 @@ class AppShell extends StatefulWidget {
 class _AppShellState extends State<AppShell> {
   int _index = 0;
 
+  /// A failed `service.start()` reason (wave-29 P1-01): rendered as the
+  /// visible engine-error card together with [AppShell.startupError].
+  String? _startError;
+
   @override
   void initState() {
     super.initState();
-    // One-shot service init (listeners, identity); failures surface
-    // through the service's own state, not the shell.
-    widget.service.start();
+    // One-shot service init (listeners, identity, task runtime). A
+    // failure (missing registry config, engine start error…) must be
+    // VISIBLE, not swallowed: latch it for the error card (P1-01).
+    unawaited(widget.service.start().catchError((Object error) {
+      if (mounted) {
+        setState(() => _startError = '$error');
+      }
+    }));
     _restoreSaveDir();
   }
 
@@ -98,8 +130,11 @@ class _AppShellState extends State<AppShell> {
       body: LayoutBuilder(
         builder: (context, constraints) {
           final wide = constraints.maxWidth >= 700;
+          final startupError = widget.startupError ?? _startError;
           final content = Column(
             children: [
+              if (startupError != null)
+                _StartupErrorCard(reason: startupError),
               IncomingRequestsHost(service: widget.service),
               Expanded(
                 child: IndexedStack(
@@ -170,6 +205,55 @@ class _AppShellState extends State<AppShell> {
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+/// The visible engine-unavailable state (wave-29 P1-01): construction
+/// failure or failed `start()` — the app stays navigable but honestly
+/// says pairing/transfers cannot run.
+class _StartupErrorCard extends StatelessWidget {
+  const _StartupErrorCard({required this.reason});
+
+  final String reason;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      color: scheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.error_outline, color: scheme.onErrorContainer),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '传输引擎不可用，配对与传输功能暂不能使用。',
+                    key: const ValueKey('app_startup_error'),
+                    style: theme.textTheme.titleSmall
+                        ?.copyWith(color: scheme.onErrorContainer),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    reason,
+                    key: const ValueKey('app_startup_error_detail'),
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: scheme.onErrorContainer),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -10,13 +10,21 @@
 /// {"event":"op_done","op_id":"<32hex>","op":"task_create_code|task_join|task_send"}
 /// {"event":"op_failed","op_id":"<32hex>","op":"..."}
 /// {"event":"connected","conn":"<32hex>","role":"sender|receiver",
-///  "peer_endpoint":"ip:port","code":"AKT1-XXXX-XXXX-XXXX"}
+///  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
 /// {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":true|false|null}
 /// {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
 ///  "root":"photos","files":3,"bytes":123456}
 /// {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
 /// {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed"}
 /// ```
+///
+/// Wave-29 note on `disconnected` reasons (P2-08): `local`, `peer` and
+/// `receiver_failed` are DATA-PLANE terminal verdicts — the task's direct
+/// connection is gone. Any OTHER reason string is a coordination-plane
+/// notice (e.g. a registry/coordinator link loss): the authorized data
+/// channel may still be healthy, so consumers must keep such connections
+/// alive instead of mapping the notice to a terminal state. Only a real
+/// data-plane close drives the terminal state.
 ///
 /// Parsing policy mirrors `pairing_events.dart`: an unknown `"event"` name
 /// decodes to [TaskUnknownEvent] (forward compatibility); a missing or
@@ -261,8 +269,10 @@ final class TaskDoneEvent extends TaskEvent {
       };
 }
 
-/// A connection went away (`local` = this side disconnected,
-/// `peer` = the other side did).
+/// A connection went away. `local`/`peer`/`receiver_failed` are
+/// DATA-PLANE terminal verdicts; any other reason is a coordination-plane
+/// notice that must NOT kill a healthy data connection (see the library
+/// doc, wave-29 P2-08).
 final class TaskDisconnectedEvent extends TaskEvent {
   const TaskDisconnectedEvent({super.atMs, this.conn, required this.reason});
 

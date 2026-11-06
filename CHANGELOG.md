@@ -2,6 +2,40 @@
 
 本文件记录用户可感知的主要里程碑，按时间线组织；逐轮测试证据见 `reports/dev-validation-2026-11-02.txt`，任务级完成状态见 [docs/BACKLOG.zh-CN.md](docs/BACKLOG.zh-CN.md)，平台支持范围见 [docs/SUPPORT_MATRIX.zh-CN.md](docs/SUPPORT_MATRIX.zh-CN.md)。格式参照 Keep a Changelog；版本号语义为预发布（0.x）。
 
+## [未发布] - 2026-11-06：第二十九波（进行中）——wave-28 终审 21 项发现修复轮（P1×6 / P2×15）
+
+Codex 终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`，P0×0 / P1×6 / P2×15）。本波进行中：修复落在未提交工作树，按"已完成 / 在途"如实区分；全量 workspace 测试尚未复跑。
+
+**已完成（工作树，待提交）**：
+
+- **P1-03 服务器额度竞态**：最终 Commit 的同一写事务内复查 `max_redeems`——两个预先 pending 的兑换竞争 Commit 时只有其一成功（新增 store 级测试：竞态 Commit、cap>1 边界、aborted/expired/revoked pending 不消耗额度）；`0x2109 REDEEM_EXHAUSTED` 语义兑现"一码恰好双方"。
+- **P2-13 迁移原子性**：SQLite v1→v2 的四个 `ALTER TABLE` 与 `user_version` 更新合并进单一写事务，中断后可重入，不再产生半迁移库。
+- **P2-14 幂等跨版本**：默认扩展（`max_redeems=0`、无 endpoint）时 claim canonical body 保持 v1 36 字节布局——v1 服务器 journal 的旧 claim 在升级后重放仍返回原答案，不再 REQUEST_CONFLICT。
+- **P1-05 会话方向前置门禁（会话侧）**：`join_task_code` 接受显式 `my_direction`（用户意图，FFI 契约）；`veto_task_offer` 在 RedeemOffer 阶段（不可逆 Commit 之前）拒绝同方向加入；完成后的 `DirectionConflict` 保留为纵深防御。Dart JoinSpec 已传显式角色，跨设备完整验收随波次收口。
+- **P1-01 Dart 真接线**：`main()` 构造真实栈 `AkEngineDartFacade → AkTaskFfiBindings → FfiSimpleTransferService`（Android 身份目录经 path_provider）；构造/启动失败降级为可见错误卡片＋不可用服务，不再崩溃；`LocalSimpleTransferService` 降为测试专用注入，生产路径零引用。
+- **P1-02 真实码格式**：UI 输码入口统一接受 Rust 实际生成的 `AKI1-XXXX-…-XXXX` 完整展示码（废除八位短码校验）；生成、展示、复制、输入、规范化、服务调用同守一份契约。
+- **P1-06 流快照**：真实服务改为逐订阅者当前快照＋后续事件——连接稳定后进入详情页不再误显示"已断开"。
+- **P2-08/09/10/11（Dart 服务侧）**：协调连接断开与数据直连状态分离（registry 短断不再判死健康直连）；探测失败不再映射为成功、迟到的 join 结果不再把状态退回 probing；固定 120/180 秒整体超时改为真实终态跟踪；30 秒自动拒绝现在关闭横幅、过期后拒绝幂等收尾不再抛未处理异常。
+
+**在途（无法预知结果，标注进行中）**：
+
+- **P1-04 FFI 接收器身份绑定**：接收器 TLS `authorize` 绑定本次配对已验证的发送方指纹（`ConsentInfo` 携带 `sender_fingerprint`，提示归属指纹匹配的连接；陌生身份无法抢占接收器或冒用提示）——工作树已有实质实现与测试，收口验收进行中。
+- **P2×9**：P2-01（FFI request_id 原子受理与上下文绑定）、P2-02（任务栈并发懒初始化）、P2-03（空闲断开跨设备通知）、P2-04（未加入码取消与 TTL 回收）、P2-05（接收器一次任务后的终态收敛）、P2-06（保存目录变更生效时点）、P2-07（consent 阻塞 Tokio worker）、P2-12（UDP echo 响应互投）、P2-15（endpoint 缓存总量与回收）。
+
+**验证基线（如实）**：workspace 1085/0 为 wave-28 时点（`7458e9f`，wave-29 修复后未复跑全量）；dart 129/129、flutter 107/107 为 wave-29 工作树时点；契约 5/5；跨设备向后兼容 6/6（升级后 v2 服务器）；服务器已部署 v2 协议（122.51.121.24，schema 迁移完成、身份 pin 不变）。
+
+## [未发布] - 2026-11-06：第二十八波——v1 极简配对 UX（一次性任务码、零配置连接、同意接收）
+
+提交 `7458e9f`（4 并行代理＋集成者）。**用户冻结的 v1 规格**：一个随机任务码＝一次传输任务、恰好双方、任一侧发起；码按需生成、携带创建方连接设置、断开即失效；UI 永不显示 IP/端口/指纹。五层交付：
+
+- **协议/服务器**：帧层 endpoint 扩展（InviteClaim/Redeem/RedeemOffered/PairCommit 携带 ≤512B 不透明 blob，防枚举帧形状保持）；`max_redeems` 单次兑换语义（`0x2109 REDEEM_EXHAUSTED`；仅已提交事务消耗额度，重放幂等保留）；SQLite v1→v2 增量迁移（码表 endpoint 列＋事务 endpoint 快照）。
+- **会话/引擎**：`TaskPairing` 生命周期——`create_task_code`（600s TTL、`max_redeems=1`、endpoint 上传）/`join_task_code`（对端 endpoint 双向交付）、方向互补强制（同角色加入被拒）；LAN 优先 `probe_peer`（双栈 holepunch 复用）；`TaskDisconnected` 事件（Local/Network/ByPeer 原因）；`TransferConsent` 钩子（Offer 级接受/拒绝、DECLINED 帧＋零用户文件落盘；默认 `None` 保持既有冻结行为字节一致）。
+- **FFI**：`ak_task_*` 家族 8 导出（复用既有 poll_event/op_result 通道）；每运行时 TaskPairing 的真实注册中继（跨引擎加入走注册服务器）；真实探测（echo-responder 端口使 UDP 交换真实可确认）；远端断开传播。
+- **Dart**：`SimpleTransferService` UI 契约＋`FfiSimpleTransferService` 桥；引擎本地码表降级为同引擎缓存。
+- **UI**：导航收敛为**连接＋设置**两页；生码（选角色）/输码流程带自动探测与可读失败；连接列表（多条并发）＋详情页（系统文件选择器，多文件或文件夹）；入站请求横幅（接受/拒绝→进度→保存路径）；唯一设置项＝默认保存文件夹；所有 IP/端口/指纹/配对簿页面移除；390dp 窄屏回归测试。
+
+**验证矩阵（`7458e9f` 时点）**：workspace 1085/0＋clippy 干净＋契约 5/5；dart 128/128、flutter 86/86；升级后 v2 服务器上跨设备向后兼容 6/6 PASS（W→L 4.3s、L→W 19.4s，双向 SHA256 一致）；服务器重新部署 122.51.121.24（schema 已迁移，身份 pin 不变）。
+
 ## [未发布] - 2026-11-06：第二十七波——daemon 真实邀请码两维并发（终审 P1-02 关闭）
 
 - 引擎：`channel_scheduler_handshake`（Hello 能力分流 + TaskOpen 读取）与 `receive_on_channel_preadmitted`（预准入接收体）；Legacy 分支带回流（`HelloStream`）+ `receive_after_hello` 同连接延续体；`receive_job` 零复制重构为三阶段共享。

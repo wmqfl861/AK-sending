@@ -113,7 +113,7 @@ class _HomePageState extends State<HomePage> {
           )
         else if (_joinInputOpen)
           _JoinInputPanel(
-            onSubmit: (code) => _flow.startJoin(code),
+            onSubmit: (code, role) => _flow.startJoin(code, role: role),
             onCancel: () => setState(() => _joinInputOpen = false),
           )
         else
@@ -218,11 +218,16 @@ class _RoleSheet extends StatelessWidget {
 }
 
 /// The join-code input form (加入流 first step): auto-uppercase,
-/// hyphen-tolerant, live normalized-length counter.
+/// hyphen/space-tolerant paste of the FULL `AKI1-…` code (wave-29 P1-02),
+/// live normalized-length counter, and the joiner's direction pick — the
+/// user's explicit intent forwarded with the join (P1-05).
 class _JoinInputPanel extends StatefulWidget {
-  const _JoinInputPanel({required this.onSubmit, required this.onCancel});
+  const _JoinInputPanel({
+    required this.onSubmit,
+    required this.onCancel,
+  });
 
-  final ValueChanged<String> onSubmit;
+  final void Function(String code, TaskRole role) onSubmit;
   final VoidCallback onCancel;
 
   @override
@@ -231,6 +236,7 @@ class _JoinInputPanel extends StatefulWidget {
 
 class _JoinInputPanelState extends State<_JoinInputPanel> {
   final TextEditingController _controller = TextEditingController();
+  TaskRole? _role;
 
   static final TextInputFormatter _upperCase = TextInputFormatter.withFunction(
     (oldValue, newValue) => newValue.copyWith(text: newValue.text.toUpperCase()),
@@ -245,7 +251,10 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final normalizedLength = normalizeJoinCode(_controller.text).length;
+    final normalized = normalizeJoinCode(_controller.text);
+    final codeValid = isValidTaskCode(normalized);
+    final role = _role;
+    final ready = codeValid && role != null;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -259,36 +268,63 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
               controller: _controller,
               autofocus: true,
               inputFormatters: [
-                FilteringTextInputFormatter.allow(RegExp('[0-9A-Za-z-]')),
+                FilteringTextInputFormatter.allow(RegExp('[0-9A-Za-z- ]')),
                 _upperCase,
               ],
               textCapitalization: TextCapitalization.characters,
               onChanged: (_) => setState(() {}),
-              onSubmitted: normalizedLength == 8
-                  ? (_) => widget.onSubmit(_controller.text)
+              onSubmitted: ready
+                  ? (_) => widget.onSubmit(_controller.text, role)
                   : null,
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
-                hintText: '例如 K3P7-QM2X',
-                helperText: '大小写、连字符均可，自动识别',
+                hintText: 'AKI1-XXXX-XXXX-XXXX-…（完整复制粘贴即可）',
+                helperText: '大小写、连字符、空格均可，自动识别',
                 counterText: '',
               ),
-              maxLength: 9,
+              // The grouped display form is 44 characters; the slack also
+              // tolerates pasted leading/trailing spaces.
+              maxLength: 64,
               style: const TextStyle(
                 fontFamily: 'monospace',
-                fontSize: 22,
-                letterSpacing: 2,
+                fontSize: 16,
+                letterSpacing: 1,
               ),
             ),
             const SizedBox(height: 4),
-            Text('$normalizedLength/8 位',
-                key: const ValueKey('join_code_counter'),
-                style: theme.textTheme.bodySmall),
+            Text(
+              '${normalized.length}/36 位'
+              '${normalized.isNotEmpty && !codeValid ? '（需 AKI1 开头的 36 位字符）' : ''}',
+              key: const ValueKey('join_code_counter'),
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            Text('这次配对我要：', style: theme.textTheme.bodyMedium),
+            const SizedBox(height: 4),
+            SegmentedButton<TaskRole>(
+              key: const ValueKey('join_role_selector'),
+              segments: const [
+                ButtonSegment(
+                  value: TaskRole.send,
+                  icon: Icon(Icons.upload),
+                  label: Text('发送文件'),
+                ),
+                ButtonSegment(
+                  value: TaskRole.receive,
+                  icon: Icon(Icons.download),
+                  label: Text('接收文件'),
+                ),
+              ],
+              selected: role == null ? const <TaskRole>{} : <TaskRole>{role},
+              emptySelectionAllowed: true,
+              onSelectionChanged: (selection) =>
+                  setState(() => _role = selection.first),
+            ),
             const SizedBox(height: 12),
             FilledButton.icon(
               key: const ValueKey('join_submit_button'),
-              onPressed: normalizedLength == 8
-                  ? () => widget.onSubmit(_controller.text)
+              onPressed: ready
+                  ? () => widget.onSubmit(_controller.text, role)
                   : null,
               icon: const Icon(Icons.link),
               label: const Text('配对'),
@@ -400,20 +436,21 @@ class _CodeShownView extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // FittedBox keeps the 8-char code on screen at 390dp and
-            // under large text scale without ellipsizing.
+            // The full AKI1 display form is 44 characters: wrap over (at
+            // most) two monospace lines instead of shrinking to dust at
+            // 390dp.
             Expanded(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: SelectableText(
-                  code,
-                  key: const ValueKey('flow_pairing_code'),
-                  style: theme.textTheme.displayMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
-                    fontFamily: 'monospace',
-                    letterSpacing: 4,
-                  ),
+              child: SelectableText(
+                code,
+                key: const ValueKey('flow_pairing_code'),
+                maxLines: 2,
+                style: theme.textTheme.headlineMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  fontFamily: 'monospace',
+                  letterSpacing: 1,
+                  height: 1.25,
                 ),
               ),
             ),

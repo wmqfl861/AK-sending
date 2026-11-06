@@ -4,6 +4,8 @@
 
 > **架构已确定：允许服务器参与设备发现、信令和 NAT 穿透协调；绝不允许任何服务器参与文件数据传输，包括加密中继。**
 
+**v1 极简交互（wave-28 起，提交 `7458e9f`）**：一台设备生成一个随机任务码，另一台输入该码，即完成一次配对——**一个码＝一次传输任务、恰好双方、任一侧可发起**；码按需生成、自带创建方连接设置、断开即失效；接收方对每个入站请求**逐一同意**后才落盘。全程**零配置、零 IP、零端口、零指纹**：GUI 只剩"连接＋设置"两页，唯一的设置项是默认保存文件夹。
+
 目标仓库：`wmqfl861/AK-sending`。本包是 v0.1 项目初始化材料，不是五端可用软件。
 
 ## 当前真实状态
@@ -21,6 +23,8 @@
 - 2026-11-03（第六至八轮，同分支）：并发接收（`serve_concurrently` + `receive --jobs N`）、IPv6 双栈端点与 `probe --dual-stack`、长文件名 part 短名回退（NTFS 255 上限真实缺陷修复）、`probe --json` 与 `pair export`/`import`（AKPAIR1，无私钥）、信令对抗加固（TCP 模糊/STUN 洪泛/限频旁路全存活，Hello 设备名控制字符注入修复）、产品全流程 e2e 四幕（配对准入/中断续传/并发接收/信令关停后直传照常）、CLI `completions`/`jobs status`/`--bind`/`--stun-bind`。第八轮后 workspace 417 项测试通过（＋sqlite 特性 26）、clippy 全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第六/七、八轮节。
 - 2026-11-04（第十三轮，安卓移植波，同分支；承接第十至十二轮 ak-ffi/Dart 绑定/Flutter Windows 桌面端）：双 ABI 交叉编译脚本（llvm-nm 符号验证）＋flutter_app 安卓平台（INTERNET 权限/minSdk 24/tier-0 so 加载/身份目录异步/Download 输出链），flutter test 66/66；APK 构建成功（161MB debug、双 ABI so 在包内，装机待验）；Windows GUI 首启截图核验通过；AVD 装机与跨设备传输进行中（系统镜像重装中）。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第十三轮节。
 - 2026-11-04（第十八至二十一波，同分支，邀请码配对）：ADR-004＋五份契约冻结（157 项与 Codex 计划逐字核对）→控制协议 v2（TLS 1.3、30 消息、独立端口 7200 不降级明文）→权威注册服务（rustls＋SQLite，ghost-pending 反枚举）→共享调度层 `ak-session`（两维并发/常驻 runtime/配对编排）→wire 任务准入＋staging→引擎 on-channel 拆分→CLI `invite`/`registry-server`；13 项真 TLS＋SQLite 配对 e2e，workspace 851 项测试通过；FFI/Dart 侧接线属后续波。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 邀请码配对节与 [ADR-004](docs/adr/004-invite-pairing.zh-CN.md)。
+- 2026-11-06（第二十八波，提交 `7458e9f`，v1 极简配对 UX）：用户冻结 v1 规格——一次性任务码（600s TTL、单次兑换）、endpoint 交换、接收同意、GUI 收敛为"连接＋设置"两页（零 IP/端口/指纹）。五层交付：协议/服务器（帧层 endpoint 扩展＋SQLite v1→v2 迁移）、会话/引擎（TaskPairing 生命周期＋TransferConsent）、FFI（`ak_task_*` 8 导出）、Dart（SimpleTransferService 桥）、UI（生码/输码/连接列表/详情页/入站横幅）。验证：workspace 1085/0＋clippy 干净＋契约 5/5；dart 128/128、flutter 86/86；升级后 v2 服务器跨设备向后兼容 6/6（W→L 4.3s、L→W 19.4s，SHA256 一致）。
+- 2026-11-06（第二十九波，进行中，工作树未提交）：wave-28 终审（`reports/codex-review-2026-11-06-wave28.md`，21 项：P1×6/P2×15）修复轮。已完成：P1-03 服务器额度竞态（Commit 时复查）、P2-13 迁移原子性、P2-14 幂等跨版本、P1-05 会话侧方向前置门禁、P1-01 Dart 真接线、P1-02 真实 AKI1 码格式、P1-06 流快照、P2-08/09/10/11（Dart 服务侧）。在途：P1-04 FFI 接收器身份绑定＋P2×9。验证基线：dart 129/129、flutter 107/107（wave-29 工作树）；workspace 1085/0 为 wave-28 时点、修复后未复跑全量。
 - 跨设备实测（2026-11-05）：Windows↔Linux 跨公网邀请码配对双向传输已验证（`scripts/cross_device_test.sh`，部署服务器 122.51.121.24，双向 8 MiB SHA256 一致）；Android 模拟器↔Windows 宿主亦通。仍未完成（如实标注）：家宽/热点物理双机 NAT 穿透成功率、抓包级无中继证明（L3）、Linux Flutter GUI 构建、移动原生适配（mDNS/SAF 实机/后台）、真机验收。
 - 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
@@ -63,7 +67,20 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-命令行原型（局域网，环回或同网段两台机器）：
+## v1 极简交互（GUI 主线路径，wave-28 起）
+
+普通用户的全部操作（Android/Windows GUI，Linux GUI 待构建）：
+
+1. **生成任务码**：连接页点"生成码"并选择本机角色（发送方或接收方）——码按需生成（600 秒有效、仅可兑换一次），显示为 `AKI1-XXXX-…-XXXX` 完整格式，复制给对端；
+2. **输入任务码**：对端在连接页输入该码，双方经部署的注册服务器（122.51.121.24）自动交换连接设置并完成配对——全程无需输入 IP、端口或指纹；任一侧断开，码即失效；
+3. **收发**：配对成功后连接出现在列表中，进入详情用系统文件选择器挑文件或文件夹发送；接收方对每个入站请求先看到横幅，**点"接受"后才开始落盘**（拒绝则零写入）；
+4. **设置**：仅一项——默认保存文件夹。
+
+**注意（如实标注）**：v1 任务码模型目前**只接 GUI**（FFI `ak_task_*` → Dart → Flutter），`ak-cli` 未接任务码命令——CLI 仍走下述高级用法中的旧邀请码/配对簿模型。wave-29（进行中）正在收口终审发现（详见 [CHANGELOG](CHANGELOG.md) 第二十九波条目）。
+
+## 高级 CLI 用法（旧邀请码/配对簿多码模型与运维工具）
+
+以下命令行能力全部保留，适用于自动化、服务器运维与高级场景；其中 `invite`/`daemon --pairing` 属旧"多码调度"模型（与 v1 一次性任务码并存的两条产品路径，CLI 侧未提供 v1 任务码入口）：
 
 ```sh
 cargo run -p ak-cli -- keygen            # 生成本机密钥并显示 device id/指纹/配对码（fingerprint 子命令同输出）

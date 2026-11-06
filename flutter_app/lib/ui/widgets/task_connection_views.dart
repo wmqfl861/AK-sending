@@ -19,14 +19,16 @@ String connectionStateLabel(TaskConnectionState state) => switch (state) {
       TaskConnectionState.connecting => '建立中',
       TaskConnectionState.testing => '测试中',
       TaskConnectionState.connected => '已连接',
+      TaskConnectionState.unreachable => '不可达',
       TaskConnectionState.disconnected => '已断开',
     };
 
 Color _connectionStateColor(
-    TaskConnectionState state, ColorScheme scheme) => switch (state) {
+        TaskConnectionState state, ColorScheme scheme) => switch (state) {
       TaskConnectionState.connecting => scheme.tertiary,
       TaskConnectionState.testing => scheme.secondary,
       TaskConnectionState.connected => Colors.green,
+      TaskConnectionState.unreachable => Colors.orange,
       TaskConnectionState.disconnected => scheme.error,
     };
 

@@ -10,7 +10,11 @@
 //! frozen ffi-v2 §2/§3 one, reused verbatim: validation precedes any side
 //! effect (an op id is only minted for a fully valid request),
 //! `request_id` makes create/join/send idempotent (same id + same spec →
-//! the SAME op id and the SAME answer; same id + different spec → `-2`),
+//! the SAME op id and the SAME answer; same id + different spec → `-2`;
+//! wave-29 P2-01: the check/reserve/launch handoff is one atomic
+//! acceptance under the request registry's lock, the canonical spec is
+//! namespaced by op type + connection id, and an accepted request replays
+//! its ORIGINAL answer even after the connection later disconnected),
 //! `AK_ERR_BUFFER` never consumes (op results re-readable, popped events
 //! pushed back), and results/events cross through the EXISTING
 //! `ak_pairing_op_result` / `ak_pairing_poll_event` channels with the task
@@ -48,20 +52,38 @@
 //!   from `TaskPaired::verified.owner_fingerprint()` (the relayed,
 //!   transcript-verified key), and the owner the redeemer's. The engine
 //!   `send` keeps using it as the TLS pin.
+//! * **Receiver admission binds the pairing (wave-29 P1-04)** — the
+//!   resident receiver's TLS `authorize` accepts ONLY the fingerprint of
+//!   the connection entry the completed pairing registered. Before the
+//!   pairing completes there is no entry, so every dial is refused at
+//!   handshake and the listener keeps waiting; a stranger that somehow
+//!   reaches the port can neither deliver an Offer nor consume the
+//!   receiver. The offer-level consent is additionally ATTRIBUTED by the
+//!   verified sender fingerprint ([`ConsentInfo::sender_fingerprint`]):
+//!   an `incoming_request` belongs to the fingerprint-matching connection
+//!   of that code, never merely to the port's own code id.
 //! * **Probing** — after a pairing both sides run ak-session
 //!   `probe_peer` over the peer's advertised candidates (LAN-first) and
 //!   emit `probe_result`; the join result's `probe` field is the honest
 //!   verdict (`verified` / `all_failed`; `unverified` only when no probe
 //!   could run). Probes are answered by the probe echo responder each
-//!   side binds alongside its endpoint advertisement (below).
+//!   side binds alongside its endpoint advertisement (below); the
+//!   responder is anti-reflection hardened (wave-29 P2-12: replies carry
+//!   the all-zero nonce and are never themselves answered, plus a
+//!   per-source reply budget, so two responders cannot ping-pong).
 //! * **Remote disconnect** — `TaskPairing::disconnect` revokes the code
 //!   at the registry (a pending redeem of a revoked code aborts), and the
 //!   [`TaskEvent`] stream (`TaskPairing::subscribe`) is pumped into the
 //!   task event queue: `TaskDisconnected{ByPeer}` → `disconnected` with
-//!   reason `peer` (the resident receiver reporting the peer's data-plane
-//!   departure, or a send that died with `PeerClosed`), `Network` → the
-//!   frozen `receiver_failed` wording. A `local` line is pushed directly
-//!   by `ak_task_disconnect`, so the pump never repeats it.
+//!   reason `peer`, `Network` → the frozen `receiver_failed` wording. A
+//!   `local` line is pushed directly by `ak_task_disconnect`, so the pump
+//!   never repeats it. While IDLE (no live transfer whose QUIC drop the
+//!   peer would see) the disconnecting side additionally dials the paired
+//!   peer's advertised data endpoint and hands it an authenticated
+//!   TASK-CLOSE Error frame (wave-29 P2-03), so the LISTENING peer
+//!   learns `ByPeer` immediately instead of staying "connected"; a peer
+//!   that never bound a data listener (a pure sender side) still learns
+//!   honestly at its next send, which fails to connect.
 //!
 //! The endpoint blob each side registers carries its dial candidates:
 //! the RECEIVER side's real resident-receiver port first, then — when the
@@ -90,10 +112,12 @@
 //!   and stored (the Dart layer resolves them from environment/dart-define
 //!   exactly like the invite plane's `AK_REGISTRY_ADDR`/`AK_REGISTRY_ID`).
 //! * `ak_task_create_code` — a real registry claim (owner settings blob,
-//!   `max_redeems = 1`, TTL). A RECEIVER-role creation additionally binds
-//!   a REAL `ak-engine` resident receiver (`receive_with_addr_consent`,
-//!   wildcard bind, sequential serve loop) and derives the code's dial
-//!   candidates from the machine's interfaces.
+//!   `max_redeems = 1`, TTL: an absent or `0` `ttl_secs` maps to the
+//!   task-code default [`TASK_CODE_TTL_SECS`], so v1 codes never linger
+//!   as never-expiring registry rows — wave-29 P2-04). A RECEIVER-role
+//!   creation additionally binds a REAL resident receiver (wildcard bind,
+//!   serve loop) and derives the code's dial candidates from the
+//!   machine's interfaces.
 //! * `ak_task_join` — a real registry redeem: the full pairing transcript
 //!   to `PairReady`, bilateral `connected` events (the owner's from its
 //!   resident owner loop), the verified peer key, a real `probe_result`
@@ -105,15 +129,33 @@
 //!   budget starts at the engine's `Connecting` report, never during the
 //!   source scan, and stops applying once connected).
 //! * Offer-level receive consent — the receiver's resident receiver runs
-//!   with the ak-engine `TransferConsent` hook (wave 28): every incoming
-//!   offer mints a pending request id, emits an `incoming_request` event,
-//!   and the transfer is held until `ak_task_consent` decides or the
-//!   frozen 30 s window auto-declines. The peer is told over the wire
+//!   with the ak-engine `TransferConsent` hook in its NON-BLOCKING shape
+//!   (wave-29 P2-07: the callback registers the request and returns a
+//!   pending oneshot immediately — no Tokio worker is ever parked on a
+//!   human decision): every incoming offer mints a pending request id,
+//!   emits an `incoming_request` event attributed to the fingerprint-
+//!   matched connection, and the transfer is held until
+//!   `ak_task_consent` decides, the frozen 30 s window auto-declines
+//!   (a timer task, not a blocked thread), the runtime tears down, or
+//!   the connection disconnects. The peer is told over the wire
 //!   (DECLINED semantics); on a decline nothing is written to disk.
+//! * The resident receiver (wave-29 P2-05/P2-06) — ONE endpoint (one
+//!   advertised port) serves a LOOP of connections: unauthorized dials
+//!   are rejected and the loop keeps listening (they never consume the
+//!   receiver); a DECLINED offer ends only that connection, so the
+//!   sender may retry on the same code; a COMPLETED transfer is the
+//!   single-transfer task's terminal state (both sides converge their
+//!   connection entries to `disconnected`). The save folder is resolved
+//!   from the runtime's CURRENT setting each time a transfer starts, so
+//!   `ak_task_set_save_dir` applies to every subsequent task.
 //! * `ak_task_list` / `ak_task_disconnect` / `ak_task_set_save_dir` /
 //!   `ak_task_consent` — real state, real bilateral `disconnected` events
-//!   (registry revoke + event pump; a same-engine peer additionally gets
-//!   the instant cache notification).
+//!   (registry revoke + TASK-CLOSE + event pump; a same-engine peer
+//!   additionally gets the instant cache notification).
+//!   `ak_task_disconnect` is idempotent and also covers a code that was
+//!   generated but never joined (wave-29 P2-04): disconnecting by the
+//!   create result's `code_id` revokes the registry row, releases the
+//!   receiver/echo listeners and emits `code_cancelled`.
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, VecDeque};
@@ -121,12 +163,13 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use ak_core::error::ErrorCode;
 use ak_engine::{
-    receive_with_addr_consent, send, ConsentInfo, EngineError, Progress, ReceiveSpec, Report,
-    SendSpec, TransferConsent,
+    receive_accepted_consent, send, ConsentAnswer, ConsentInfo, EngineError, Progress,
+    ReceiveSpec, Report, SendSpec, TransferConsent,
 };
 use ak_identity::pairing_txn::{random_id16, VerifiedPairing};
 use ak_identity::tls::make_self_signed;
@@ -136,6 +179,7 @@ use ak_session::pairing::{
     ProbeOptions, ProbeOutcome, RegistryClient, TaskDirection, TaskDisconnectReason, TaskError,
     TaskEvent, TaskPairing, TaskPairingConfig, TaskPaired, TASK_CODE_TTL_SECS,
 };
+use ak_wire::{Frame, Message};
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
@@ -164,6 +208,17 @@ const TASK_SEND_IDLE: Duration = Duration::from_secs(120);
 /// endpoint releases its UDP socket asynchronously; the CLI driver uses
 /// the same 150 ms).
 const ATTEMPT_PAUSE: Duration = Duration::from_millis(150);
+
+/// Whole-list connect passes of `ak_task_send` (wave-29 P1-04 follow-up):
+/// a send may fire the instant its join op returned, while the paired
+/// peer's owner loop is still a beat away from registering the connection
+/// its receiver admission is bound to — its first dial can be REFUSED at
+/// the TLS gate through no fault of the sender. Purely connect-level
+/// failures (nothing ever connected) are retried after a short settle
+/// pause; identity checks are unaffected — the peer still authorizes
+/// exactly the pairing's verified fingerprint.
+const TASK_CONNECT_PASSES: usize = 3;
+const TASK_SETTLE_PAUSE: Duration = Duration::from_millis(300);
 
 /// Bound for the resident receiver's first bind (surfaced as the code's
 /// candidates). Binding a wildcard UDP socket is fast; the bound exists so
@@ -200,6 +255,32 @@ const TASK_PROBE_RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// shrink loop below is a belt-and-braces guard, never the common path).
 const MAX_DIAL_CANDIDATES: usize = 8;
 const MAX_ECHO_CANDIDATES: usize = 4;
+
+/// Wire marker of the task-plane close notification (wave-29 P2-03): a
+/// disconnecting side that has no live transfer (whose QUIC drop the peer
+/// would observe) dials the paired peer's advertised data endpoint — TLS
+/// pinned to the pairing's verified fingerprint — and hands it exactly one
+/// Error frame with `ErrorCode::Cancelled` and this message before
+/// closing. The peer's resident receiver recognizes the marker and ends
+/// its pairing ByPeer (the event pump surfaces `disconnected`/`peer`).
+/// Reusing the existing Error-frame semantics adds no wire vocabulary.
+pub(crate) const TASK_CLOSE_MESSAGE: &str = "TASK-CLOSE: paired device disconnected";
+
+/// Per-candidate and overall budget of the close-notify dial (best effort:
+/// a peer behind a dead path simply is not reachable; the disconnect
+/// itself already succeeded locally).
+const TASK_CLOSE_CONNECT_BUDGET: Duration = Duration::from_secs(3);
+const TASK_CLOSE_TOTAL_BUDGET: Duration = Duration::from_secs(6);
+
+/// Anti-reflection constants of the probe echo responder (wave-29 P2-12):
+/// replies carry the all-zero nonce (a real prober's nonce is
+/// time/counter-derived and never all-zero) and are NEVER themselves
+/// answered, and each source endpoint gets a bounded reply budget per
+/// window so a spoofed flood cannot sustain CPU burn either.
+const ECHO_REPLY_NONCE: [u8; 16] = [0u8; 16];
+const ECHO_REPLY_BUDGET: u32 = 32;
+const ECHO_REPLY_WINDOW: Duration = Duration::from_secs(1);
+const ECHO_SOURCES_MAX: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // State.
@@ -305,17 +386,24 @@ pub(crate) struct TaskConn {
     code: String,
 }
 
-/// One pending receive-consent request (held until decided or the 30 s
-/// window auto-declines). The human-readable summary (`conn`, root, files,
-/// bytes) rides the `incoming_request` event; the held state itself is
-/// just the undecided/decided flag.
-#[derive(Debug, Clone)]
+/// One pending receive-consent request: the fingerprint-attributed
+/// connection (whose disconnect resolves the request, wave-29 P2-07) plus
+/// the deciding half of the oneshot the engine's receive body holds. The
+/// request exists exactly until it is decided: `ak_task_consent`, the
+/// 30 s auto-decline timer, a disconnect of its connection or runtime
+/// teardown REMOVE the entry and resolve the channel (dropping the sender
+/// half unparked would fail closed anyway — removing it keeps
+/// `ak_task_consent` honestly `-4` afterwards).
 struct PendingConsent {
-    decision: Option<bool>,
+    conn: Option<[u8; 16]>,
+    sender: oneshot::Sender<bool>,
 }
 
 /// One accepted op's idempotency record: the minted op id plus the
-/// canonical spec the request was accepted for.
+/// DOMAIN-NAMESPACED canonical spec the request was accepted for
+/// (wave-29 P2-01: `op|conn|canonical-json` — the same request id under a
+/// different op type, a different connection or a different spec is a
+/// conflict, never a false replay hit).
 type TaskRequestRecord = ([u8; 16], String);
 
 /// A popped task event plus the queue it came from (the shim pushes the
@@ -338,6 +426,11 @@ pub(crate) struct TaskCodeEntry {
     joiner: Option<Arc<TaskRt>>,
     /// The connection id once the code was paired (same-engine only).
     conn: Option<[u8; 16]>,
+    /// Flipped when the un-joined code was cancelled through
+    /// `ak_task_disconnect` (wave-29 P2-04): the registry row is revoked
+    /// and the listener resources released; repeat disconnects of the
+    /// same code id stay idempotent `AK_OK`s.
+    cancelled: AtomicBool,
 }
 
 /// The per-runtime ak-session task-pairing stack: one registry client,
@@ -398,9 +491,9 @@ pub(crate) struct TaskRt {
     /// Connections of this runtime (`ak_task_list`).
     pub(crate) conns: StdMutex<HashMap<[u8; 16], TaskConn>>,
     /// Pending receive consents keyed by request id (`ak_task_consent`).
+    /// Each entry owns the deciding oneshot half; the engine's parked
+    /// receive holds the other (wave-29 P2-07: nothing blocks a worker).
     pending: StdMutex<HashMap<[u8; 16], PendingConsent>>,
-    /// Wakes blocked consent gates (paired with [`TaskRt::pending`]).
-    consent_signal: Condvar,
     /// Resident-receiver + probe-echo tasks (aborted by teardown),
     /// keyed by code id (a local placeholder id until the registry
     /// assigns the real one). One code owns SEVERAL tasks — the receiver
@@ -410,8 +503,14 @@ pub(crate) struct TaskRt {
     stopped: StdMutex<bool>,
     /// request_id idempotency: request id → (op id, canonical spec).
     request_ids: StdMutex<HashMap<[u8; 16], TaskRequestRecord>>,
-    /// The lazily built ak-session stack (first create/join op).
+    /// The lazily built ak-session stack (first create/join op). The
+    /// build itself is serialized by [`TaskRt::stack_init`] (wave-29
+    /// P2-02): exactly one registry login ever runs per runtime, so
+    /// concurrent first ops can neither duplicate the client nor strand
+    /// a replaced control connection.
     stack: StdMutex<Option<Arc<TaskStack>>>,
+    /// One-at-a-time gate for the lazy stack build (P2-02).
+    stack_init: tokio::sync::Mutex<()>,
     /// In-flight op ids per connection (a disconnect aborts them).
     conn_ops: StdMutex<HashMap<[u8; 16], Vec<[u8; 16]>>>,
     /// The engine-shared task-code cache (module doc: engine sharing
@@ -422,11 +521,12 @@ pub(crate) struct TaskRt {
 }
 
 impl TaskRt {
-    /// Teardown (engine drop): invalidate waiters FIRST — a consent gate
-    /// blocked on the condvar cannot be interrupted by `abort()`, so every
-    /// pending request gets an explicit decline and a wakeup before any
-    /// task is aborted. Order matters for the same reason the wave-26
-    /// P1-05 Dart sequence does: waiters, then owners.
+    /// Teardown (engine drop): invalidate waiters FIRST — every pending
+    /// consent is resolved with an explicit decline by DROPPING its
+    /// deciding half (the parked engine receive fails closed on the
+    /// vanished oneshot, wave-29 P2-07: no worker is blocked, so there is
+    /// no condvar to wake). Order matters for the same reason the
+    /// wave-26 P1-05 Dart sequence does: waiters, then owners.
     pub(crate) fn teardown(&self, runtime: &tokio::runtime::Runtime) {
         {
             let mut stopped = match self.stopped.lock() {
@@ -436,18 +536,12 @@ impl TaskRt {
             *stopped = true;
         }
         {
-            // Wake every blocked consent gate with an explicit decline.
-            let mut pending = match self.pending.lock() {
-                Ok(slot) => slot,
-                Err(_) => return,
-            };
-            for entry in pending.values_mut() {
-                if entry.decision.is_none() {
-                    entry.decision = Some(false);
-                }
+            // Resolve every pending consent with a declination: dropping
+            // the sender half unparks the receive (fail-closed Err → the
+            // engine declines) and leaves `ak_task_consent` honestly -4.
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.clear();
             }
-            drop(pending);
-            self.consent_signal.notify_all();
         }
         if let Ok(mut spawned) = self.spawned.lock() {
             for (_, tasks) in spawned.drain() {
@@ -468,8 +562,11 @@ impl TaskRt {
         }
         // Take the registry stack down: abort the resident owner loop /
         // watcher / pump first (waiters before owners, same order as
-        // above), then close the control client bounded — an open client
-        // would otherwise hold the TCP connection past the engine drop.
+        // above), then — wave-29 P2-04 — revoke this runtime's own
+        // un-cancelled codes BEST-EFFORT and bounded (an app exit must
+        // not leave active registry rows no local secret can answer for),
+        // then close the control client bounded — an open client would
+        // otherwise hold the TCP connection past the engine drop.
         let stack = self
             .stack
             .lock()
@@ -477,6 +574,29 @@ impl TaskRt {
             .and_then(|mut slot| slot.take());
         if let Some(stack) = stack {
             stack.abort_tasks();
+            let owned: Vec<[u8; 16]> = self
+                .codes
+                .lock()
+                .map(|table| {
+                    table
+                        .values()
+                        .filter(|entry| {
+                            entry.owner.runtime_id == self.runtime_id
+                                && !entry.cancelled.load(Ordering::Acquire)
+                        })
+                        .map(|entry| entry.code_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let pairing = stack.pairing.clone();
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    for code_id in owned {
+                        let _ = pairing.disconnect(code_id).await;
+                    }
+                })
+                .await
+            });
             let client = stack.pairing.orchestrator().client().clone();
             let _ = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(500), client.close()).await
@@ -484,14 +604,14 @@ impl TaskRt {
         }
         // Drop this runtime's cached code registrations: it breaks the
         // table↔runtime Arc cycle AND un-advertises codes whose owner is
-        // going away (the registry rows expire on their own TTL; the
-        // cache only mirrors them for same-engine lookups).
+        // going away (codes not revoked above simply expire on their TTL;
+        // the cache only mirrors them for same-engine lookups).
         if let Ok(mut table) = self.codes.lock() {
             table.retain(|_, entry| entry.owner.runtime_id != self.runtime_id);
         }
-        // Bounded settle window: the woken gates return at their next
-        // instruction; aborted tasks land at their next await point. The
-        // empty future keeps the timeout on the runtime's own clock.
+        // Bounded settle window: aborted tasks land at their next await
+        // point. The empty future keeps the timeout on the runtime's own
+        // clock.
         let _ = runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(500), std::future::ready(())).await
         });
@@ -578,78 +698,108 @@ impl TaskRt {
         }
     }
 
-    /// Register one pending consent, emit `incoming_request`, and hold
-    /// until decided or `window` elapses (then auto-decline). Runs INSIDE
-    /// the engine's receive body — the blocking wait IS the consent gate
-    /// (single-connection v1; the embedded runtime keeps the other worker
-    /// free for the peer's send).
-    fn gate_consent(&self, code_id: &[u8; 16], info: &ConsentInfo, window: Duration) -> bool {
-        if self.is_stopped() {
-            return false;
-        }
-        let job = random_id16();
-        let conn = self.conn_of_code(code_id);
-        {
-            let mut pending = match self.pending.lock() {
-                Ok(slot) => slot,
-                Err(_) => return false,
-            };
-            pending.insert(job, PendingConsent { decision: None });
-        }
-        let mut line = String::with_capacity(160);
-        line.push_str(&format!(
-            "{{\"event\":\"incoming_request\",\"job\":\"{}\"",
-            core::hex_encode(&job),
-        ));
-        if let Some(conn) = &conn {
-            line.push_str(&format!(",\"conn\":\"{}\"", core::hex_encode(&conn.conn_id)));
-        }
-        line.push_str(&format!(
-            ",\"root\":{},\"files\":{},\"bytes\":{}}}",
-            crate::core::json::quoted(&info.root_name),
-            info.file_count,
-            info.total_bytes,
-        ));
-        self.push_event(line);
-        self.await_decision(job, window)
+    /// The connection one offer is attributed to (wave-29 P1-04): the
+    /// entry of THIS code whose verified peer fingerprint equals the
+    /// offer's actual TLS sender and which has not reached a terminal
+    /// state. `None` means the sender is not this task's paired peer —
+    /// the offer is refused without ever surfacing to the user.
+    fn conn_for_sender(
+        &self,
+        code_id: &[u8; 16],
+        sender: &Fingerprint,
+    ) -> Option<TaskConn> {
+        let conns = self.conns.lock().ok()?;
+        conns
+            .values()
+            .find(|conn| {
+                &conn.code_id == code_id
+                    && conn.state != ConnState::Disconnected
+                    && conn.peer_fp == Some(*sender)
+            })
+            .cloned()
     }
 
-    /// Block until `ak_task_consent` decides `job`, the runtime stops, or
-    /// `window` elapses (auto-decline). The entry is always removed.
-    fn await_decision(&self, job: [u8; 16], window: Duration) -> bool {
-        let deadline = std::time::Instant::now() + window;
-        let mut pending = match self.pending.lock() {
-            Ok(slot) => slot,
-            Err(_) => return false,
+    /// Resolve every pending consent of one connection with a
+    /// declination (a disconnect must wake its parked offers — the sender
+    /// learns over the wire, the user's stale banner answers `-4`).
+    fn decline_pending_of_conn(&self, conn_id: &[u8; 16]) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
         };
-        loop {
-            if self.is_stopped() {
-                pending.remove(&job);
-                self.consent_signal.notify_all();
-                return false;
+        let doomed: Vec<[u8; 16]> = pending
+            .iter()
+            .filter(|(_, entry)| entry.conn.as_ref() == Some(conn_id))
+            .map(|(job, _)| *job)
+            .collect();
+        for job in doomed {
+            if let Some(entry) = pending.remove(&job) {
+                let _ = entry.sender.send(false);
             }
-            match pending.get(&job) {
-                Some(entry) => {
-                    if let Some(decision) = entry.decision {
-                        pending.remove(&job);
-                        return decision;
-                    }
-                }
-                None => return false, // removed elsewhere: declined
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                pending.remove(&job);
-                self.consent_signal.notify_all();
-                return false; // the frozen 30 s auto-decline
-            }
-            let (guard, _) = self
-                .consent_signal
-                .wait_timeout(pending, deadline - now)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending = guard;
         }
     }
+}
+
+/// Register one pending receive consent and hand back its pending half
+/// (wave-29 P2-07: this returns IMMEDIATELY — the engine's receive body
+/// awaits the oneshot, so no Tokio worker is ever parked on the user's
+/// decision). The offer is first attributed by VERIFIED SENDER
+/// FINGERPRINT (wave-29 P1-04): an offer that does not match the paired
+/// connection of the listening code is refused on the spot (`Now(false)`)
+/// — no `incoming_request` event, no attribution to an innocent
+/// connection. The frozen `window` auto-decline runs as its own timer
+/// task; a runtime teardown or a disconnect of the attributed connection
+/// resolves the request by removing the entry.
+fn register_consent(
+    rt: &Arc<TaskRt>,
+    code_id: &[u8; 16],
+    info: &ConsentInfo,
+    window: Duration,
+) -> ConsentAnswer {
+    if rt.is_stopped() {
+        return ConsentAnswer::Now(false);
+    }
+    let Some(conn) = rt.conn_for_sender(code_id, &info.sender_fingerprint) else {
+        // Not the paired peer of this code (pre-pairing dial that slipped
+        // past an earlier authorize shape, or a terminal connection):
+        // fail closed, silently — the user is never asked.
+        return ConsentAnswer::Now(false);
+    };
+    let job = random_id16();
+    let (sender, receiver) = oneshot::channel();
+    {
+        let Ok(mut pending) = rt.pending.lock() else {
+            return ConsentAnswer::Now(false);
+        };
+        pending.insert(
+            job,
+            PendingConsent {
+                conn: Some(conn.conn_id),
+                sender,
+            },
+        );
+    }
+    let mut line = String::with_capacity(192);
+    line.push_str(&format!(
+        "{{\"event\":\"incoming_request\",\"job\":\"{}\",\"conn\":\"{}\"",
+        core::hex_encode(&job),
+        core::hex_encode(&conn.conn_id),
+    ));
+    line.push_str(&format!(
+        ",\"root\":{},\"files\":{},\"bytes\":{}}}",
+        crate::core::json::quoted(&info.root_name),
+        info.file_count,
+        info.total_bytes,
+    ));
+    rt.push_event(line);
+    // The frozen 30 s auto-decline: a timer task, never a blocked thread.
+    let timer_rt = Arc::clone(rt);
+    tokio::spawn(async move {
+        tokio::time::sleep(window).await;
+        if let Some(entry) = timer_rt.pending.lock().ok().and_then(|mut m| m.remove(&job)) {
+            let _ = entry.sender.send(false);
+        }
+    });
+    ConsentAnswer::Pending(receiver)
 }
 
 fn quoted(text: &str) -> String {
@@ -835,11 +985,11 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         events: Arc::new(StdMutex::new(VecDeque::new())),
         conns: StdMutex::new(HashMap::new()),
         pending: StdMutex::new(HashMap::new()),
-        consent_signal: Condvar::new(),
         spawned: StdMutex::new(HashMap::new()),
         stopped: StdMutex::new(false),
         request_ids: StdMutex::new(HashMap::new()),
         stack: StdMutex::new(None),
+        stack_init: tokio::sync::Mutex::new(()),
         conn_ops: StdMutex::new(HashMap::new()),
         codes,
         engine_progress,
@@ -942,6 +1092,13 @@ fn parse_candidates(args: &crate::core::json::Json) -> Result<Vec<SocketAddr>, F
 /// on top, and its three resident tasks — the task-aware owner loop, the
 /// network watcher and the event pump. Runs inside op bodies, i.e. on the
 /// engine's embedded runtime (the client's reader tasks spawn there).
+///
+/// The build is serialized by [`TaskRt::stack_init`] (wave-29 P2-02):
+/// concurrent first ops await the gate and then find the finished stack,
+/// so exactly ONE registry login ever runs — no duplicate device login
+/// (the server's "new connection closes the old" would strand the saved
+/// stack), no orphaned replacement client. A failed build leaves the slot
+/// empty, so a later op retries cleanly.
 async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
     if let Some(stack) = rt
         .stack
@@ -950,6 +1107,23 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         .clone()
     {
         return Ok(stack);
+    }
+    if rt.is_stopped() {
+        return Err("task runtime is stopped".to_string());
+    }
+    // One initializer at a time; the gate is released on both success and
+    // failure (a failed login must be retryable by the next op).
+    let init_gate = rt.stack_init.lock().await;
+    if let Some(stack) = rt
+        .stack
+        .lock()
+        .map_err(|_| "task stack lock poisoned".to_string())?
+        .clone()
+    {
+        return Ok(stack);
+    }
+    if rt.is_stopped() {
+        return Err("task runtime is stopped".to_string());
     }
     let connect = RegistryClient::connect_with_config(
         rt.registry_addr,
@@ -1019,10 +1193,16 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         // the task — no `connected` event is the honest surface
         // (ak-session logged the refusal on its own stream).
         if let Ok(paired) = owner_stack.pairing.complete_owner_pairing(&verified, direction) {
+            // The connection entry and `connected` event are inserted
+            // SYNCHRONOUSLY here, before any await: the resident
+            // receiver's P1-04 admission is bound to this entry, and the
+            // peer's join may already be returning on the other device —
+            // its send can dial this endpoint within milliseconds.
+            owner_side_bookkeeping(&owner_rt, code_id, &paired);
             let rt = Arc::clone(&owner_rt);
             let stack = Arc::clone(&owner_stack);
             tokio::spawn(async move {
-                owner_side_completion(&rt, &stack, code_id, paired).await;
+                owner_side_probe(&rt, &stack, paired).await;
             });
         }
     });
@@ -1032,30 +1212,42 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         .spawn_owner_loop_verified(Some(on_paired));
     let watcher = stack.pairing.spawn_network_watcher();
     let pump = spawn_task_event_pump(Arc::clone(rt), &stack);
+    let mut unbuilt: Option<[JoinHandle<()>; 3]> = Some([owner_loop, watcher, pump]);
+    // Install under the stack lock, re-checking `stopped` INSIDE it: either
+    // teardown took the slot first (we see `stopped` and abort what we
+    // built) or we install first (teardown then finds and closes our
+    // stack). No live registry client can slip past a teardown.
     {
         let mut slot = rt
             .stack
             .lock()
             .map_err(|_| "task stack lock poisoned".to_string())?;
-        if let Some(existing) = slot.as_ref() {
-            // A racing op built the stack first: keep theirs, abort ours
-            // (dropping a JoinHandle does NOT stop a tokio task).
-            for task in [owner_loop, watcher, pump] {
-                task.abort();
+        if !rt.is_stopped() {
+            if let Some([owner_loop, watcher, pump]) = unbuilt.take() {
+                if let Ok(mut handle) = stack.owner_loop.lock() {
+                    *handle = Some(owner_loop);
+                }
+                if let Ok(mut handle) = stack.network_watcher.lock() {
+                    *handle = Some(watcher);
+                }
+                if let Ok(mut handle) = stack.event_pump.lock() {
+                    *handle = Some(pump);
+                }
             }
-            return Ok(Arc::clone(existing));
+            *slot = Some(Arc::clone(&stack));
         }
-        if let Ok(mut handle) = stack.owner_loop.lock() {
-            *handle = Some(owner_loop);
-        }
-        if let Ok(mut handle) = stack.network_watcher.lock() {
-            *handle = Some(watcher);
-        }
-        if let Ok(mut handle) = stack.event_pump.lock() {
-            *handle = Some(pump);
-        }
-        *slot = Some(Arc::clone(&stack));
     }
+    if let Some(tasks) = unbuilt {
+        // Teardown ran mid-build: nothing may install a live registry
+        // client past the engine's death — abort what we built.
+        for task in tasks {
+            task.abort();
+        }
+        let client = stack.pairing.orchestrator().client().clone();
+        let _ = tokio::time::timeout(Duration::from_millis(200), client.close()).await;
+        return Err("task runtime is stopped".to_string());
+    }
+    drop(init_gate);
     Ok(stack)
 }
 
@@ -1091,15 +1283,12 @@ fn spawn_task_event_pump(rt: Arc<TaskRt>, stack: &Arc<TaskStack>) -> JoinHandle<
     })
 }
 
-/// The owner side of a completed registry pairing: the connection entry
-/// (conn id = the pairing transaction's id, identical on both sides),
-/// the `connected` event, then the real reachability probe.
-async fn owner_side_completion(
-    rt: &Arc<TaskRt>,
-    stack: &Arc<TaskStack>,
-    code_id: [u8; 16],
-    paired: TaskPaired,
-) {
+/// The owner side of a completed registry pairing, synchronous half: the
+/// connection entry (conn id = the pairing transaction's id, identical on
+/// both sides) and the `connected` event. Runs inside the owner-loop
+/// callback (see `ensure_stack`) so the entry exists before the peer's
+/// returning join op can possibly dial this endpoint.
+fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPaired) {
     if rt.conn_of_code(&code_id).is_some() {
         return; // duplicate completion (Hello catch-up re-push): dedup
     }
@@ -1136,8 +1325,15 @@ async fn owner_side_completion(
         quoted(role.as_str()),
         quoted(&display),
     ));
+}
+
+/// The owner side of a completed registry pairing, asynchronous half: the
+/// real reachability probe over the peer's advertised candidates and the
+/// connection's `probing → connected` settle.
+async fn owner_side_probe(rt: &Arc<TaskRt>, stack: &Arc<TaskStack>, paired: TaskPaired) {
+    let conn_id = paired.pairing_id;
     let endpoint_probe = PeerEndpoint {
-        candidates: candidates.clone(),
+        candidates: paired.peer.candidates.clone(),
         name: paired.peer.name.clone(),
         direction: paired.peer.direction,
     };
@@ -1247,6 +1443,15 @@ fn task_error_message(error: TaskError) -> String {
 /// reachability (the QUIC receiver itself never speaks the probe
 /// exchange). Registered under `key` in the spawned table (teardown /
 /// disconnect abort it).
+///
+/// Anti-reflection (wave-29 review P2-12): replies carry the fixed
+/// all-zero nonce and a reply is NEVER itself answered, so two reachable
+/// responders cannot loop answering each other (a real prober's nonce is
+/// time/counter-derived and never all-zero); each source endpoint
+/// additionally gets [`ECHO_REPLY_BUDGET`] replies per
+/// [`ECHO_REPLY_WINDOW`] (a genuine probe round sends ~7 packets/s), and
+/// the source table is hard-capped, so even a spoofed flood cannot
+/// sustain unbounded reply traffic or memory growth.
 fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, String> {
     let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")
         .map_err(|error| format!("cannot bind the probe responder: {error}"))?;
@@ -1260,14 +1465,46 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
         .map_err(|error| format!("cannot register the probe responder: {error}"))?;
     let task = tokio::spawn(async move {
         let mut buffer = [0u8; 1500];
+        let mut budgets: HashMap<SocketAddr, (std::time::Instant, u32)> = HashMap::new();
         loop {
             match socket.recv_from(&mut buffer).await {
                 Ok((len, source)) => {
-                    if ak_net::holepunch::is_probe_packet(&buffer[..len]) {
-                        // Echo a probe packet back — exactly what the peer
-                        // side of a paired task observes while probing.
+                    if !ak_net::holepunch::is_probe_packet(&buffer[..len]) {
+                        continue;
+                    }
+                    // A reply (all-zero nonce) is never answered again —
+                    // the loop-killer. A genuine probe's nonce is
+                    // time/counter-derived and cannot be all-zero.
+                    if buffer[8..len] == ECHO_REPLY_NONCE {
+                        continue;
+                    }
+                    let now = std::time::Instant::now();
+                    let allowed = match budgets.get_mut(&source) {
+                        Some(entry) => {
+                            if now.duration_since(entry.0) >= ECHO_REPLY_WINDOW {
+                                *entry = (now, 1);
+                                true
+                            } else if entry.1 < ECHO_REPLY_BUDGET {
+                                entry.1 += 1;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => {
+                            if budgets.len() >= ECHO_SOURCES_MAX {
+                                budgets.clear();
+                            }
+                            budgets.insert(source, (now, 1));
+                            true
+                        }
+                    };
+                    if allowed {
                         let _ = socket
-                            .send_to(&ak_net::holepunch::probe_packet(&[0u8; 16]), source)
+                            .send_to(
+                                &ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE),
+                                source,
+                            )
                             .await;
                     }
                 }
@@ -1430,43 +1667,107 @@ fn canonical_spec_json(value: &crate::core::json::Json) -> String {
     out
 }
 
-/// Resolve the request_id idempotency key: `Ok(Some(op_id))` on an exact
-/// replay (the caller returns the ORIGINAL op id, no side effects),
-/// `Err(-2)` on a request-id collision with a different spec, `Ok(None)`
-/// when the key is fresh or absent. Runs BEFORE any side effect.
-fn replay_check(rt: &TaskRt, args: &crate::core::json::Json) -> Result<Option<[u8; 16]>, FfiError> {
+/// The domain-namespaced canonical form of one request (wave-29 P2-01):
+/// op type + connection id (sends) + the sorted-JSON spec. Two requests
+/// collide only when they are the SAME operation for the SAME connection
+/// with the SAME spec; anything else under the same `request_id` is a
+/// conflict, never a false replay hit.
+fn canonical_request(
+    op: &str,
+    conn: Option<[u8; 16]>,
+    args: &crate::core::json::Json,
+) -> String {
+    match conn {
+        Some(conn_id) => format!(
+            "{op}|{}|{}",
+            core::hex_encode(&conn_id),
+            canonical_spec_json(args)
+        ),
+        None => format!("{op}|-|{}", canonical_spec_json(args)),
+    }
+}
+
+/// The outcome of one idempotency gate pass.
+enum RequestGate {
+    /// Exact replay of an already-accepted request: the caller returns
+    /// the ORIGINAL op id and answer — no new side effect, and none of
+    /// the live-state re-validation below applies (a replay answers even
+    /// after its connection later disconnected).
+    Replay([u8; 16]),
+    /// Fresh request; its op id is RESERVED atomically with the check —
+    /// the caller must launch exactly this op id.
+    Fresh([u8; 16]),
+    /// The request carried no `request_id`: nothing to dedupe, the op id
+    /// is minted by the launcher.
+    NoId,
+}
+
+/// The ONE atomic acceptance point of the task plane (wave-29 P2-01):
+/// replay check, conflict rejection, (for sends) the live-connection
+/// rule, and the reservation of the minted op id all happen inside a
+/// single critical section on the request registry, so two racing
+/// identical requests can never both launch. `enforce_live_conn` (sends)
+/// refuses a FRESH request whose connection is already disconnected —
+/// after the replay branch, so an accepted request's answer stays
+/// retrievable forever. Lock order is request_ids → conns; no other path
+/// takes these two together.
+fn gate_request(
+    rt: &TaskRt,
+    op: &str,
+    conn: Option<[u8; 16]>,
+    enforce_live_conn: bool,
+    args: &crate::core::json::Json,
+) -> Result<RequestGate, FfiError> {
     let Some(request_text) = field_str(args, "request_id", false)? else {
-        return Ok(None);
+        if enforce_live_conn {
+            // No dedupe key: still refuse a send on a severed connection
+            // before any op exists.
+            ensure_conn_live(rt, &conn.expect("send gate carries a conn id"))?;
+        }
+        return Ok(RequestGate::NoId);
     };
     let request_id = hex16(&request_text, "field \"request_id\"")?;
-    let canonical = canonical_spec_json(args);
-    let registry = rt
+    let canonical = canonical_request(op, conn, args);
+    let mut registry = rt
         .request_ids
         .lock()
         .map_err(|_| FfiError::internal("task request-id registry lock poisoned"))?;
     match registry.get(&request_id) {
-        Some((op_id, previous)) if *previous == canonical => Ok(Some(*op_id)),
+        Some((op_id, previous)) if *previous == canonical => Ok(RequestGate::Replay(*op_id)),
         Some(_) => Err(FfiError::invalid(format!(
             "request_id {} was already accepted with a different spec",
             core::hex_encode(&request_id),
         ))),
-        None => Ok(None),
+        None => {
+            if enforce_live_conn {
+                // Fresh requests only — replays above keep answering.
+                ensure_conn_live(rt, &conn.expect("send gate carries a conn id"))?;
+            }
+            let op_id = random_id16();
+            registry.insert(request_id, (op_id, canonical));
+            Ok(RequestGate::Fresh(op_id))
+        }
     }
 }
 
-/// Record the idempotency key AFTER the op was accepted (replays answer
-/// the same op id forever).
-fn record_request_id(rt: &TaskRt, args: &crate::core::json::Json, op_id: [u8; 16]) {
-    let Ok(Some(request_text)) = field_str(args, "request_id", false) else {
-        return;
-    };
-    let Ok(request_id) = hex16(&request_text, "field \"request_id\"") else {
-        return;
-    };
-    if let Ok(mut registry) = rt.request_ids.lock() {
-        registry
-            .entry(request_id)
-            .or_insert((op_id, canonical_spec_json(args)));
+/// The live-connection rule of a FRESH send: unknown → `-4`, already
+/// severed → `-2` (nothing was reserved yet — refusal is side-effect
+/// free). Caller holds the request-registry lock (lock order above).
+fn ensure_conn_live(rt: &TaskRt, conn_id: &[u8; 16]) -> Result<(), FfiError> {
+    let conns = rt
+        .conns
+        .lock()
+        .map_err(|_| FfiError::internal("task connection table lock poisoned"))?;
+    match conns.get(conn_id) {
+        None => Err(FfiError::not_found(format!(
+            "unknown connection {} on task runtime {}",
+            core::hex_encode(conn_id),
+            core::hex_encode(&rt.runtime_id),
+        ))),
+        Some(conn) if conn.state == ConnState::Disconnected => Err(FfiError::invalid(
+            "the connection is disconnected".to_string(),
+        )),
+        Some(_) => Ok(()),
     }
 }
 
@@ -1474,15 +1775,17 @@ fn record_request_id(rt: &TaskRt, args: &crate::core::json::Json, op_id: [u8; 16
 /// shape): register the entry, spawn the body on the embedded runtime,
 /// stamp the terminal JSON (kept for lossless repeated reads), announce
 /// `op_done`/`op_failed` in the task event queue. The body owns ONLY
-/// `Arc` clones — never an engine borrow (module doc).
+/// `Arc` clones — never an engine borrow (module doc). `reserved` is the
+/// op id the idempotency gate already recorded (`None` mints a fresh one
+/// for requests without a `request_id`).
 fn launch_task_op(
     engine: &AkEngine,
     rt: &Arc<TaskRt>,
     spec: TaskOpSpec,
-    args_json: &crate::core::json::Json,
+    reserved: Option<[u8; 16]>,
 ) -> Result<[u8; 16], FfiError> {
     let op = spec.op();
-    let op_id = random_id16();
+    let op_id = reserved.unwrap_or_else(random_id16);
     // Sends are abortable by a disconnect of their connection.
     if let TaskOpSpec::Send { conn_id, .. } = &spec {
         rt.track_conn_op(*conn_id, op_id);
@@ -1528,7 +1831,6 @@ fn launch_task_op(
     if let Ok(mut slot) = entry.task.lock() {
         *slot = Some(task);
     }
-    record_request_id(rt, args_json, op_id);
     Ok(op_id)
 }
 
@@ -1540,7 +1842,9 @@ fn launch_task_op(
 /// chosen role (endpoint blob + `max_redeems = 1`; one code pairs once).
 /// A RECEIVER-role creation binds the resident receiver first; the op
 /// completes with the registry's display code only after the bind and the
-/// claim both succeeded.
+/// claim both succeeded. An absent or `0` `ttl_secs` maps to the task-code
+/// default [`TASK_CODE_TTL_SECS`] (wave-29 P2-04: a v1 code never lingers
+/// as a never-expiring registry row).
 pub fn task_create_code_start(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
@@ -1556,18 +1860,27 @@ pub fn task_create_code_start(
     if ttl_secs > u64::from(u32::MAX) {
         return Err(FfiError::invalid("field \"ttl_secs\" is too large"));
     }
-    if let Some(replay) = replay_check(&rt, &args)? {
-        return Ok(replay);
-    }
+    // P2-04: 0/absent = the ten-minute task-code default, never the
+    // registry's "long-lived" semantics.
+    let ttl_secs = if ttl_secs == 0 {
+        TASK_CODE_TTL_SECS
+    } else {
+        ttl_secs as u32
+    };
+    let reserved = match gate_request(&rt, "task_create_code", None, false, &args)? {
+        RequestGate::Replay(op_id) => return Ok(op_id),
+        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::NoId => None,
+    };
     launch_task_op(
         engine,
         &rt,
         TaskOpSpec::CreateCode {
             role,
             candidates,
-            ttl_secs: ttl_secs as u32,
+            ttl_secs,
         },
-        &args,
+        reserved,
     )
 }
 
@@ -1596,9 +1909,11 @@ pub fn task_join_start(
         Some(text) => Some(TaskRole::parse(&text)?),
     };
     let candidates = parse_candidates(&args)?;
-    if let Some(replay) = replay_check(&rt, &args)? {
-        return Ok(replay);
-    }
+    let reserved = match gate_request(&rt, "task_join", None, false, &args)? {
+        RequestGate::Replay(op_id) => return Ok(op_id),
+        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::NoId => None,
+    };
     launch_task_op(
         engine,
         &rt,
@@ -1607,12 +1922,15 @@ pub fn task_join_start(
             candidates,
             role_hint,
         },
-        &args,
+        reserved,
     )
 }
 
 /// `ak_task_send`: run a real engine send over the connection's candidate
 /// endpoints (LAN-first, 10 s split connect budget, automatic fallback).
+/// The idempotency gate runs AFTER the spec validates but BEFORE the
+/// live-connection rule, so an ACCEPTED request's answer stays retrievable
+/// even after the connection later disconnected (wave-29 P2-01).
 pub fn task_send_start(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
@@ -1621,19 +1939,18 @@ pub fn task_send_start(
 ) -> Result<[u8; 16], FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
     {
+        // Unknown connection refuses before anything else (-4, the frozen
+        // validation order: runtime, conn, spec).
         let conns = rt
             .conns
             .lock()
             .map_err(|_| FfiError::internal("task connection table lock poisoned"))?;
-        let conn = conns.get(conn_id).ok_or_else(|| {
-            FfiError::not_found(format!(
+        if !conns.contains_key(conn_id) {
+            return Err(FfiError::not_found(format!(
                 "unknown connection {} on task runtime {}",
                 core::hex_encode(conn_id),
                 core::hex_encode(runtime_id),
-            ))
-        })?;
-        if conn.state == ConnState::Disconnected {
-            return Err(FfiError::invalid("the connection is disconnected"));
+            )));
         }
     }
     let args = crate::core::json::parse(spec).map_err(FfiError::invalid)?;
@@ -1651,9 +1968,13 @@ pub fn task_send_start(
     if paths.iter().any(|path| path.is_empty()) {
         return Err(FfiError::invalid("entries of \"paths\" must be non-empty paths"));
     }
-    if let Some(replay) = replay_check(&rt, &args)? {
-        return Ok(replay);
-    }
+    // Replay answers first; a FRESH send additionally requires a live
+    // connection (inside the gate's atomic acceptance).
+    let reserved = match gate_request(&rt, "task_send", Some(*conn_id), true, &args)? {
+        RequestGate::Replay(op_id) => return Ok(op_id),
+        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::NoId => None,
+    };
     launch_task_op(
         engine,
         &rt,
@@ -1661,7 +1982,7 @@ pub fn task_send_start(
             conn_id: *conn_id,
             paths,
         },
-        &args,
+        reserved,
     )
 }
 
@@ -1714,15 +2035,24 @@ fn render_conn(conn: &TaskConn) -> String {
     )
 }
 
-/// `ak_task_disconnect`: sever one connection. The local side gets its
-/// `disconnected`/`local` line immediately; the code is revoked AT THE
-/// REGISTRY (a pending redeem of it aborts server-side, and the pair's
-/// data-plane drop reaches the peer — its resident receiver reports the
-/// departure, which the event pump surfaces as `disconnected`/`peer`);
-/// a SAME-ENGINE peer additionally gets the instant cache notification.
-/// In-flight send ops of the connection are aborted (their QUIC endpoint
-/// dropping is what carries the close to the peer). Idempotent: an
-/// already-severed connection is a silent `AK_OK`.
+/// `ak_task_disconnect`: sever one connection — or CANCEL a code that was
+/// generated but never joined (wave-29 P2-04: the id argument then names
+/// the create result's `code_id`; the registry row is revoked, the
+/// receiver/echo listeners released, a `code_cancelled` event emitted).
+///
+/// For a connection: the local side gets its `disconnected`/`local` line
+/// immediately; the code is revoked AT THE REGISTRY (a pending redeem of
+/// it aborts server-side); in-flight send ops and the pending consents of
+/// the connection are resolved; and — wave-29 P2-03 — while IDLE (no live
+/// transfer whose QUIC drop the peer would observe) the disconnecting
+/// side additionally dials the paired peer's advertised data endpoint and
+/// hands it one authenticated TASK-CLOSE Error frame, so the LISTENING
+/// peer ends the pairing ByPeer (`disconnected`/`peer`) right away
+/// instead of staying "connected". A peer that never bound a data
+/// listener (a pure sender side) cannot be reached this way and learns
+/// honestly at its next send. A SAME-ENGINE peer additionally gets the
+/// instant cache notification. Idempotent: an already-severed connection
+/// — and an already-cancelled code — are silent `AK_OK`s.
 pub fn task_disconnect(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
@@ -1734,13 +2064,10 @@ pub fn task_disconnect(
             .conns
             .lock()
             .map_err(|_| FfiError::internal("task connection table lock poisoned"))?;
-        let conn = conns.get_mut(conn_id).ok_or_else(|| {
-            FfiError::not_found(format!(
-                "unknown connection {} on task runtime {}",
-                core::hex_encode(conn_id),
-                core::hex_encode(runtime_id),
-            ))
-        })?;
+        let Some(conn) = conns.get_mut(conn_id) else {
+            drop(conns);
+            return cancel_unjoined_code(engine, &rt, conn_id);
+        };
         if conn.state == ConnState::Disconnected {
             return Ok(());
         }
@@ -1751,6 +2078,9 @@ pub fn task_disconnect(
         "{{\"event\":\"disconnected\",\"conn\":\"{}\",\"reason\":\"local\"}}",
         core::hex_encode(conn_id),
     ));
+    // Wake this connection's parked consents (P2-07: a disconnect must
+    // resolve its pending offers, not wait out the 30 s window).
+    rt.decline_pending_of_conn(conn_id);
     // Abort this connection's in-flight ops and resident tasks (the
     // spawned map holds the resident receiver + probe responder of the
     // code; dropping them closes the data plane toward the peer).
@@ -1777,6 +2107,15 @@ pub fn task_disconnect(
             }
         }
     }
+    // The idle close notification (P2-03): tell the paired peer over its
+    // authenticated data channel before the code goes away.
+    let notify_conn = rt.conn_of_code(&code_id);
+    let notify_rt = Arc::clone(&rt);
+    engine.runtime().spawn(async move {
+        if let Some(conn) = notify_conn {
+            close_notify_peer(&notify_rt, &conn).await;
+        }
+    });
     // The registry disconnect: revoke the code server-side (aborting any
     // pending redeem) and end the local task — ak-session emits
     // `TaskDisconnected{Local}`, which the pump skips (the direct line
@@ -1788,6 +2127,135 @@ pub fn task_disconnect(
         });
     }
     Ok(())
+}
+
+/// The P2-04 cancel path of [`task_disconnect`]: `code_id` names one of
+/// THIS runtime's generated codes that has no connection yet (nobody
+/// joined). Revoke the registry row, release the receiver/echo listeners,
+/// emit `code_cancelled`, and mark the cache entry cancelled so repeat
+/// disconnects stay silent `AK_OK`s. A code that was already cancelled is
+/// a silent success; anything else is the frozen `-4`.
+fn cancel_unjoined_code(
+    engine: &AkEngine,
+    rt: &Arc<TaskRt>,
+    code_id: &[u8; 16],
+) -> Result<(), FfiError> {
+    // The code was already joined (a live pairing exists for it): the
+    // disconnect is the CONNECTION's, not the un-joined cancel — delegate
+    // so the pairing's bookkeeping, notification and revoke all run.
+    if let Some(conn) = rt.conn_of_code(code_id) {
+        let runtime_id = rt.runtime_id;
+        return task_disconnect(engine, &runtime_id, &conn.conn_id);
+    }
+    let stack = rt.stack.lock().ok().and_then(|slot| slot.clone());
+    let already = {
+        let Ok(table) = rt.codes.lock() else {
+            return Err(FfiError::internal("task code cache lock poisoned"));
+        };
+        let Some(entry) = table
+            .values()
+            .find(|entry| &entry.code_id == code_id)
+        else {
+            return Err(FfiError::not_found(format!(
+                "unknown connection {} on task runtime {}",
+                core::hex_encode(code_id),
+                core::hex_encode(&rt.runtime_id),
+            )));
+        };
+        if entry.owner.runtime_id != rt.runtime_id {
+            // Another runtime's code: not this caller's to cancel.
+            return Err(FfiError::not_found(format!(
+                "unknown connection {} on task runtime {}",
+                core::hex_encode(code_id),
+                core::hex_encode(&rt.runtime_id),
+            )));
+        }
+        entry.cancelled.load(Ordering::Acquire)
+    };
+    if already {
+        return Ok(()); // idempotent repeat cancel
+    }
+    // Abort the code's resident receiver + echo responder (release the
+    // listeners) and revoke at the registry.
+    if let Ok(mut spawned) = rt.spawned.lock() {
+        if let Some(tasks) = spawned.remove(code_id) {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+    if let Some(stack) = stack {
+        let pairing = stack.pairing.clone();
+        let revoke_id = *code_id;
+        engine.runtime().spawn(async move {
+            let _ = pairing.disconnect(revoke_id).await;
+        });
+    }
+    rt.push_event(format!(
+        "{{\"event\":\"code_cancelled\",\"code_id\":\"{}\"}}",
+        core::hex_encode(code_id),
+    ));
+    // Mark cancelled only after the side effects are armed; the flag is
+    // what makes repeat disconnects idempotent (the event/revoke above
+    // fire exactly once per code).
+    if let Ok(table) = rt.codes.lock() {
+        if let Some(entry) = table.values().find(|entry| &entry.code_id == code_id) {
+            entry.cancelled.store(true, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
+/// The authenticated idle-close notification (wave-29 P2-03): dial the
+/// paired peer's advertised data candidates (LAN-first, family-matched,
+/// TLS pinned to the pairing's verified fingerprint — the peer's receiver
+/// admission accepts exactly that key) and deliver ONE
+/// `ErrorCode::Cancelled` + [`TASK_CLOSE_MESSAGE`] Error frame. The
+/// peer's resident receiver recognizes the marker, ends its pairing
+/// ByPeer and stops; an unreachable peer is an honest miss (its next
+/// send fails to connect), never a failed disconnect.
+async fn close_notify_peer(rt: &Arc<TaskRt>, conn: &TaskConn) {
+    let Some(pinned) = conn.peer_fp else {
+        return;
+    };
+    let identity = make_self_signed(&rt.key);
+    let candidates = order_candidates(conn.candidates.clone());
+    let mut remaining = TASK_CLOSE_TOTAL_BUDGET;
+    for addr in candidates {
+        if remaining.is_zero() {
+            return;
+        }
+        let bind = if addr.is_ipv6() {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+        let Ok(endpoint) = ak_net::DirectEndpoint::bind(bind, &identity).await else {
+            return;
+        };
+        let dial = tokio::time::timeout(
+            TASK_CLOSE_CONNECT_BUDGET.min(remaining),
+            endpoint.connect(addr, &pinned),
+        )
+        .await;
+        remaining = remaining.saturating_sub(TASK_CLOSE_CONNECT_BUDGET);
+        let Ok(Ok(channel)) = dial else {
+            continue; // candidate down: try the next
+        };
+        if let Ok(mut stream) = channel.open_bi().await {
+            let frame = Frame {
+                version: ak_wire::VERSION,
+                message: Message::Error {
+                    code: ErrorCode::Cancelled,
+                    message: TASK_CLOSE_MESSAGE.to_string(),
+                },
+            };
+            let _ = stream.send_frame(&frame).await;
+            let _ = stream.finish_send();
+        }
+        channel.close(0, b"task closed");
+        return; // one delivered notification is enough
+    }
 }
 
 /// `ak_task_set_save_dir`: the ONE default save folder. The directory is
@@ -1814,8 +2282,10 @@ pub fn task_set_save_dir(
 }
 
 /// `ak_task_consent`: decide one pending `incoming_request` (accept or
-/// decline). An unknown or already-decided request is `-4`; the 30 s
-/// window auto-declines on its own.
+/// decline). The decision removes the entry and resolves the parked
+/// receive through its oneshot; an unknown or already-decided request
+/// (the entry is gone the moment it was decided, auto-declined at the 30 s
+/// window, resolved by a disconnect, or removed at teardown) is `-4`.
 pub fn task_consent(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
@@ -1823,28 +2293,22 @@ pub fn task_consent(
     accept: bool,
 ) -> Result<(), FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
-    let mut pending = rt
-        .pending
-        .lock()
-        .map_err(|_| FfiError::internal("pending consent table lock poisoned"))?;
-    let already = pending
-        .get(job_id)
-        .is_some_and(|entry| entry.decision.is_some());
-    if already {
+    let entry = {
+        let mut pending = rt
+            .pending
+            .lock()
+            .map_err(|_| FfiError::internal("pending consent table lock poisoned"))?;
+        pending.remove(job_id)
+    };
+    let Some(entry) = entry else {
         return Err(FfiError::not_found(format!(
-            "consent request {} was already decided",
+            "consent request {} is unknown or already decided",
             core::hex_encode(job_id),
         )));
-    }
-    let entry = pending.get_mut(job_id).ok_or_else(|| {
-        FfiError::not_found(format!(
-            "unknown consent request {}",
-            core::hex_encode(job_id),
-        ))
-    })?;
-    entry.decision = Some(accept);
-    drop(pending);
-    rt.consent_signal.notify_all();
+    };
+    // The parked receive may already be gone (transfer aborted): the send
+    // half fails silently, the request was moot either way.
+    let _ = entry.sender.send(accept);
     Ok(())
 }
 
@@ -1966,6 +2430,7 @@ async fn run_create_code(
                 owner: Arc::clone(rt),
                 joiner: None,
                 conn: None,
+                cancelled: AtomicBool::new(false),
             },
         );
     }
@@ -2021,18 +2486,29 @@ async fn bind_resident_receiver(
     }
 }
 
-/// The resident receiver: bind once (wildcard), serve exactly ONE
-/// connection, then end. Rationale: `receive_with_addr_consent` binds
-/// internally, so a serve loop would rebind a DIFFERENT port per job and
-/// strand the advertised candidates; and in the v1 model one code carries
-/// one connection (the joiner's dial is the first and only completed
-/// handshake — a stray dial cannot complete TLS against this endpoint's
-/// certificate). Every job runs with the offer-level consent gate;
-/// progress flows into the engine-wide queue under the code id, and a
-/// completed job emits a `done` event carrying the connection of the
-/// code (once joined). A DECLINED offer ends the receiver too (the
-/// connection is closed at the Offer point; the sender learns over the
-/// wire — a fresh code is the v1 answer for another attempt).
+/// The resident receiver (wave-29 P1-04/P2-05/P2-06): bind ONE wildcard
+/// endpoint (one advertised port) and serve a LOOP of connections until
+/// the task reaches a terminal state.
+///
+/// * **Admission binds the pairing (P1-04)** — the accept `authorize`
+///   admits ONLY the fingerprint ak-session's completed pairing verified
+///   for this code's connection, and only while that connection is live.
+///   Before the pairing completes there is no entry, so EVERY dial is
+///   refused at the TLS gate and the loop keeps waiting: a stranger can
+///   neither deliver an Offer nor consume the receiver. The consent hook
+///   re-checks the attribution independently (fingerprint, not port).
+/// * **Decline keeps the listener (P2-05)** — a DECLINED offer ends only
+///   that connection; the sender may retry on the same code (a fresh
+///   `incoming_request` fires).
+/// * **Done is the single-transfer terminal state (P2-05)** — a completed
+///   transfer ends the task: both sides converge their connection entries
+///   to `disconnected` (`done`).
+/// * **Per-task save folder (P2-06)** — the out dir is resolved from the
+///   runtime's CURRENT setting each time a transfer starts, so
+///   `ak_task_set_save_dir` applies to every subsequent task.
+/// * **Idle close notification (P2-03)** — a TASK-CLOSE Error frame from
+///   the paired peer ends the pairing ByPeer (the pump surfaces
+///   `disconnected`/`peer`).
 async fn run_resident_receiver(
     rt: Arc<TaskRt>,
     code_slot: ReceiverCodeSlot,
@@ -2046,23 +2522,42 @@ async fn run_resident_receiver(
             .map(|slot| *slot)
             .unwrap_or_else(|poisoned| *poisoned.into_inner())
     };
-    let code_id = current_code();
-    let out_dir = match rt.save_dir.lock() {
-        Ok(dir) => dir.clone(),
+    let identity = make_self_signed(&rt.key);
+    let endpoint = match ak_net::DirectEndpoint::bind(
+        SocketAddr::from(([0, 0, 0, 0], 0)),
+        &identity,
+    )
+    .await
+    {
+        Ok(endpoint) => endpoint,
+        Err(_) => return, // the dropped oneshot fails the create/join op
+    };
+    let bound = match endpoint.local_addr() {
+        Ok(addr) => addr,
         Err(_) => return,
     };
-    // ak-engine's save target requires the directory to exist (created at
-    // start/set time; re-created best-effort here in case it was removed).
-    let _ = std::fs::create_dir_all(&out_dir);
-    let mut spec = ReceiveSpec::new(out_dir, make_self_signed(&rt.key));
-    spec.bind = SocketAddr::from(([0, 0, 0, 0], 0));
-    spec.checkpoint_dir = rt.id_dir.join("checkpoints");
-    spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
-    spec.idle_timeout = TASK_SEND_IDLE;
-    // v1 zero-fingerprint admission: the channel accepts any peer; the
-    // USER-facing gate is the offer-level consent below (the pairing's
-    // verified key is pinned at SEND time, not at admission).
-    spec.authorize = Box::new(|_| true);
+    let _ = first_addr.send(bound);
+    // Progress lines ride under the CURRENT code id (the registry id once
+    // the claim/redeem that owns this receiver filled the slot).
+    let progress_queue = Arc::clone(&rt.engine_progress);
+    let progress_slot = Arc::clone(&code_slot);
+    let progress = move |event: Progress| {
+        let code_id = progress_slot
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or_else(|poisoned| *poisoned.into_inner());
+        if let Ok(mut queue) = progress_queue.lock() {
+            core::push_capped(
+                &mut queue,
+                format!(
+                    "{{\"job\":{},\"event\":{}}}",
+                    quoted(&core::hex_encode(&code_id)),
+                    quoted(core::progress_name(&event)),
+                ),
+            );
+        }
+    };
+    // The non-blocking consent hook (P2-07): registers + returns pending.
     let consent: TransferConsent = {
         let rt = Arc::clone(&rt);
         let code_slot = Arc::clone(&code_slot);
@@ -2071,60 +2566,102 @@ async fn run_resident_receiver(
                 .lock()
                 .map(|slot| *slot)
                 .unwrap_or_else(|poisoned| *poisoned.into_inner());
-            rt.gate_consent(&code_id, info, PENDING_CONSENT_WINDOW)
+            register_consent(&rt, &code_id, info, PENDING_CONSENT_WINDOW)
         })
     };
-    let progress_queue = Arc::clone(&rt.engine_progress);
-    let code_hex = core::hex_encode(&code_id);
-    let progress = move |event: Progress| {
-        if let Ok(mut queue) = progress_queue.lock() {
-            core::push_capped(
-                &mut queue,
-                format!(
-                    "{{\"job\":{},\"event\":{}}}",
-                    quoted(&code_hex),
-                    quoted(core::progress_name(&event)),
-                ),
-            );
+    loop {
+        if rt.is_stopped() {
+            return;
         }
-    };
-    let result = receive_with_addr_consent(spec, &progress, first_addr, Some(consent)).await;
-    match result {
-        Ok(report) => {
-            let conn = rt.conn_of_code(&current_code());
-            let mut line = String::with_capacity(128);
-            line.push_str("{\"event\":\"done\"");
-            if let Some(conn) = &conn {
-                line.push_str(&format!(",\"conn\":\"{}\"", core::hex_encode(&conn.conn_id)));
-            }
-            line.push_str(&format!(
-                ",\"files\":{},\"bytes\":{}}}",
-                report.files, report.bytes,
-            ));
-            rt.push_event(line);
+        let code_id = current_code();
+        // The task already reached a terminal state (done, ByPeer,
+        // receiver_failed, local disconnect): stop listening.
+        if rt
+            .conn_of_code(&code_id)
+            .is_some_and(|conn| conn.state == ConnState::Disconnected)
+        {
+            return;
         }
-        Err(EngineError::ConsentDeclined { .. }) => {
-            // The user (or the 30 s window) declined: the pending entry is
-            // resolved, the peer was told over the wire, nothing landed on
-            // disk. The receiver ends (one code, one connection).
-        }
-        Err(_) => {
-            // Channel-level failure (sender gave up mid-handshake, peer
-            // disconnected mid-transfer, IO error). The receiver ends;
-            // when the pairing had completed, this is the peer going away
-            // — report it so the task ends as ByPeer through the event
-            // pump (the cross-device `disconnected`/`peer` notification).
+        // P1-04 admission: only this pairing's verified peer, and only
+        // while its connection is live. A refused dial closes the
+        // stranger's connection and the loop keeps listening.
+        let authorize = |fp: &Fingerprint| -> bool {
             let code_id = current_code();
-            if rt.conn_of_code(&code_id).is_some() {
-                if let Some(stack) = rt
-                    .stack
-                    .lock()
-                    .ok()
-                    .and_then(|slot| slot.clone())
-                {
-                    stack.pairing.report_peer_disconnect(code_id);
+            rt.conn_of_code(&code_id).is_some_and(|conn| {
+                conn.state != ConnState::Disconnected && conn.peer_fp == Some(*fp)
+            })
+        };
+        let channel = match endpoint.accept(&authorize).await {
+            Ok(channel) => channel,
+            Err(ak_net::ConnectError::Unauthorized) => continue,
+            Err(_) => return, // endpoint closed / transport gone
+        };
+        // P2-06: resolve the save folder NOW (each transfer start), not
+        // at code-creation time.
+        let out_dir = match rt.save_dir.lock() {
+            Ok(dir) => dir.clone(),
+            Err(_) => return,
+        };
+        // ak-engine's save target requires the directory to exist
+        // (created at start/set time; re-created best-effort here in case
+        // it was removed).
+        let _ = std::fs::create_dir_all(&out_dir);
+        let mut spec = ReceiveSpec::new(out_dir, identity.clone());
+        spec.checkpoint_dir = rt.id_dir.join("checkpoints");
+        spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
+        spec.idle_timeout = TASK_SEND_IDLE;
+        let result = receive_accepted_consent(channel, spec, &progress, Some(Arc::clone(&consent))).await;
+        match result {
+            Ok(report) => {
+                // The single-transfer terminal state: report and converge.
+                let conn = rt.conn_of_code(&current_code());
+                let mut line = String::with_capacity(128);
+                line.push_str("{\"event\":\"done\"");
+                if let Some(conn) = &conn {
+                    line.push_str(&format!(",\"conn\":\"{}\"", core::hex_encode(&conn.conn_id)));
                 }
+                line.push_str(&format!(
+                    ",\"files\":{},\"bytes\":{}}}",
+                    report.files, report.bytes,
+                ));
+                rt.push_event(line);
+                if let Some(conn) = conn {
+                    rt.push_disconnected_once(&conn.conn_id, "done");
+                }
+                return;
             }
+            Err(EngineError::ConsentDeclined { .. }) => {
+                // The user (or the 30 s window) declined: the pending
+                // entry is resolved, the peer was told over the wire,
+                // nothing landed on disk. Only THIS connection ended —
+                // keep listening, the sender may retry on the same code.
+                continue;
+            }
+            Err(EngineError::PeerError { message, .. }) if message == TASK_CLOSE_MESSAGE => {
+                // The paired peer's authenticated idle-close (P2-03):
+                // end the pairing ByPeer through the event pump.
+                report_peer_departure(&rt, &current_code());
+                return;
+            }
+            Err(_) => {
+                // Channel-level failure (sender gave up mid-handshake,
+                // peer disconnected mid-transfer, IO error). The task is
+                // over; when the pairing had completed, this is the peer
+                // going away — report ByPeer through the event pump (the
+                // cross-device `disconnected`/`peer` notification).
+                report_peer_departure(&rt, &current_code());
+                return;
+            }
+        }
+    }
+}
+
+/// Report one pairing as ended ByPeer when it had completed (the receiver
+/// observed its peer's data plane depart).
+fn report_peer_departure(rt: &Arc<TaskRt>, code_id: &[u8; 16]) {
+    if rt.conn_of_code(code_id).is_some() {
+        if let Some(stack) = rt.stack.lock().ok().and_then(|slot| slot.clone()) {
+            stack.pairing.report_peer_disconnect(*code_id);
         }
     }
 }
@@ -2272,6 +2809,9 @@ async fn run_join(
 /// One send op: iterate the connection's candidates LAN-first under the
 /// split connect budget; a post-connect failure fails the op (another
 /// address cannot fix it); success emits `done` and completes the op.
+/// Purely connect-level failure of the WHOLE list gets
+/// [`TASK_CONNECT_PASSES`] passes (the just-paired peer's admission
+/// bookkeeping can trail the joiner by a beat — see the constant).
 async fn run_send(
     rt: &Arc<TaskRt>,
     conn_id: [u8; 16],
@@ -2301,34 +2841,58 @@ async fn run_send(
         ));
     }
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
-    for (index, addr) in ordered.iter().enumerate() {
-        if index > 0 {
-            tokio::time::sleep(ATTEMPT_PAUSE).await;
+    for pass in 0..TASK_CONNECT_PASSES {
+        if pass > 0 {
+            // Stop retrying a connection that ended while we waited.
+            let severed = rt
+                .conns
+                .lock()
+                .map(|conns| {
+                    conns
+                        .get(&conn_id)
+                        .is_none_or(|conn| conn.state == ConnState::Disconnected)
+                })
+                .unwrap_or(true);
+            if severed {
+                break;
+            }
+            tokio::time::sleep(TASK_SETTLE_PAUSE).await;
+            failures.clear();
         }
-        match attempt_task_send(rt, &conn, *addr, &paths, pinned).await {
-            AttemptOutcome::Done(report) => {
-                rt.push_event(format!(
-                    "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
-                    core::hex_encode(&conn_id),
-                    report.files,
-                    report.bytes,
-                ));
-                return Ok(format!(
-                    "{{\"op\":\"task_send\",\"conn\":\"{}\",\"files\":{},\"bytes\":{},\"peer\":{}}}",
-                    core::hex_encode(&conn_id),
-                    report.files,
-                    report.bytes,
-                    quoted(&addr.to_string()),
-                ));
+        for (index, addr) in ordered.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(ATTEMPT_PAUSE).await;
             }
-            AttemptOutcome::FailedAfterConnect { reason, peer_gone } => {
-                if peer_gone {
-                    report_peer_gone(rt, &conn);
+            match attempt_task_send(rt, &conn, *addr, &paths, pinned).await {
+                AttemptOutcome::Done(report) => {
+                    rt.push_event(format!(
+                        "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
+                        core::hex_encode(&conn_id),
+                        report.files,
+                        report.bytes,
+                    ));
+                    // The single-transfer task is complete: converge BOTH
+                    // sides' entries (the receiver ends its loop and marks
+                    // the same terminal state; wave-29 P2-05 — the UI never
+                    // keeps offering a dead connection).
+                    rt.push_disconnected_once(&conn_id, "done");
+                    return Ok(format!(
+                        "{{\"op\":\"task_send\",\"conn\":\"{}\",\"files\":{},\"bytes\":{},\"peer\":{}}}",
+                        core::hex_encode(&conn_id),
+                        report.files,
+                        report.bytes,
+                        quoted(&addr.to_string()),
+                    ));
                 }
-                return Err(format!("transfer failed after connecting via {addr}: {reason}"));
-            }
-            AttemptOutcome::ConnectFailed(reason) => {
-                failures.push((*addr, reason));
+                AttemptOutcome::FailedAfterConnect { reason, peer_gone } => {
+                    if peer_gone {
+                        report_peer_gone(rt, &conn);
+                    }
+                    return Err(format!("transfer failed after connecting via {addr}: {reason}"));
+                }
+                AttemptOutcome::ConnectFailed(reason) => {
+                    failures.push((*addr, reason));
+                }
             }
         }
     }
@@ -3479,12 +4043,14 @@ mod task_tests {
         ak_engine_free(engine);
     }
 
-    /// Teardown flips `stopped`: the consent gate declines every later
-    /// offer immediately (the waiter-first teardown of engine drop). Built
-    /// on the safe layer with an OWNED engine value, so no raw pointer is
+    /// Teardown flips `stopped`: the consent registration declines every
+    /// later offer immediately (the waiter-first teardown of engine drop).
+    /// A live runtime without a fingerprint-matching connection declines
+    /// too (P1-04: attribution fails closed, no event surfaces). Built on
+    /// the safe layer with an OWNED engine value, so no raw pointer is
     /// ever dereferenced (this module is `forbid(unsafe_code)`).
     #[test]
-    fn consent_gate_declines_after_teardown() {
+    fn consent_registration_declines_after_teardown_and_for_strangers() {
         let rt = {
             let engine = AkEngine::new().expect("engine");
             let dir = tempfile::tempdir().expect("tempdir");
@@ -3499,10 +4065,34 @@ mod task_tests {
             root_name: "late.bin".to_string(),
             file_count: 1,
             total_bytes: 1,
+            sender_fingerprint: Fingerprint::from_bytes([7u8; 32]),
         };
         let started = Instant::now();
-        let decision = rt.gate_consent(&[0u8; 16], &info, PENDING_CONSENT_WINDOW);
-        assert!(!decision, "a stopped runtime declines every offer");
+        // A stopped runtime: immediate decline, nothing registered.
+        assert!(matches!(
+            register_consent(&rt, &[0u8; 16], &info, PENDING_CONSENT_WINDOW),
+            ConsentAnswer::Now(false),
+        ));
+        // A live runtime without the paired connection of that sender:
+        // also an immediate decline (fail closed — the offer belongs to
+        // no connection of this code, so the user is never asked).
+        let (engine, rt_live, code_id) = {
+            let engine = AkEngine::new().expect("engine");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime_id = task_start(&engine, &spec_for(dir.path())).expect("runtime");
+            let rt = task_runtime_of(&engine, &runtime_id).expect("task runtime");
+            (engine, rt, [0u8; 16])
+        };
+        let mut events = 0;
+        assert!(matches!(
+            register_consent(&rt_live, &code_id, &info, PENDING_CONSENT_WINDOW),
+            ConsentAnswer::Now(false),
+        ));
+        if let Ok(queue) = rt_live.events.lock() {
+            events = queue.len();
+        }
+        assert_eq!(events, 1, "only runtime_ready is queued: {events}");
+        drop(engine);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -3710,6 +4300,773 @@ mod task_tests {
         assert!(text_of(&buf).contains("\"state\":\"disconnected\""));
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
+    }
+
+    // -- wave-29 review findings (P1-04, P2-01..07, P2-12) ------------------
+
+    /// Poll `ak_pairing_poll_event` for `ms` and FAIL if any event whose
+    /// body contains `needle` arrives (the absence assertions of the
+    /// stranger-dial tests: a refused offer must never reach the user).
+    fn assert_no_event_within(engine: *mut AkEngine, runtime_id: &[u8; 16], needle: &str, ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            let mut buf = cbuf(CAP);
+            let code =
+                ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len());
+            if code == 1 {
+                let line = text_of(&buf);
+                assert!(!line.contains(needle), "unexpected event {needle:?}: {line}");
+            } else {
+                assert!(code == 0, "poll_event failed: {code}");
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// The first advertised endpoint of a create result (the receiver's
+    /// real port for a receiver-role code).
+    fn endpoint_of(json: &str) -> SocketAddr {
+        json.split("\"endpoint\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("endpoint in result")
+            .parse()
+            .expect("endpoint is ip:port")
+    }
+
+    fn code_id_of(json: &str) -> [u8; 16] {
+        let hex = json
+            .split("\"code_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("code id in result");
+        hex16_id(hex)
+    }
+
+    /// A REAL engine send from a STRANGER device (wave-29 P1-04): a fresh
+    /// device key that knows both the target endpoint and the owner's
+    /// fingerprint (the worst case — the TLS handshake completes), yet is
+    /// not the paired peer of the task. Returns the failure text; a
+    /// stranger transfer that SUCCEEDS fails the test.
+    fn stranger_send_fails(
+        endpoint: SocketAddr,
+        expect_peer: &Fingerprint,
+        payload: &std::path::Path,
+    ) -> String {
+        let key = DeviceKeyPair::generate();
+        let mut spec = SendSpec::new(
+            payload.to_path_buf(),
+            endpoint,
+            *expect_peer,
+            make_self_signed(&key),
+        );
+        spec.bind = if endpoint.is_ipv6() {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+        spec.idle_timeout = Duration::from_secs(5);
+        let stranger = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("stranger runtime");
+        let attempt = stranger.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), send(spec, &|_| {})).await
+        });
+        match attempt {
+            Ok(Ok(report)) => panic!("the stranger's transfer succeeded: {report:?}"),
+            Ok(Err(error)) => format!("{error}"),
+            Err(_) => "stranger send timed out".to_string(),
+        }
+    }
+
+    /// Safe-layer op wait for the OWNED-engine tests (no raw pointers).
+    fn wait_op_owned(
+        engine: &AkEngine,
+        runtime_id: &[u8; 16],
+        op_id: &[u8; 16],
+    ) -> (bool, String) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let snapshot = crate::task::task_op_result_maybe(engine, runtime_id, op_id)
+                .expect("task op read")
+                .expect("task runtime");
+            if let OpResult::Finished { ok, json } = snapshot {
+                return (ok, json);
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for the owned op");
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Fire one safe-layer `task_create_code_start` from a spawned thread
+    /// (the concurrency tests; the raw C handle is not `Send`, and the
+    /// atomicity under test lives in the safe layer's gate anyway).
+    fn threaded_create(
+        engine: Arc<AkEngine>,
+        runtime_id: [u8; 16],
+        spec: String,
+    ) -> mpsc::Receiver<Result<[u8; 16], FfiError>> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = task_create_code_start(&engine, &runtime_id, &spec);
+            tx.send(result).expect("test channel");
+        });
+        rx
+    }
+
+    /// P1-04: the receiver's admission is bound to the completed pairing's
+    /// verified fingerprint. Before B joins, a stranger's dial (C — a
+    /// fresh device key that knows A's endpoint AND fingerprint, so its
+    /// TLS handshake completes) is refused at the admission gate: no
+    /// `incoming_request`, zero disk writes, and the listener survives.
+    /// After B joins, the SAME stranger is refused again (fingerprint
+    /// mismatch now), and B's legitimate send still succeeds on the very
+    /// same listener — a stranger never consumes the receiver.
+    #[test]
+    fn stranger_dials_never_reach_the_user_or_consume_the_receiver() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let inbox = dir_a.path().join("inbox");
+        let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "receiver-role create (real bind): {json}");
+        let code = code_of(&json);
+        let endpoint = endpoint_of(&json);
+        // The stranger "knows" A's fingerprint: A's device key is on disk.
+        let (owner_key, _) =
+            DeviceKeyPair::load_or_create(&dir_a.path().join("device.key")).expect("A key");
+        let owner_fp = owner_key.fingerprint();
+        std::fs::write(dir_a.path().join("stranger.bin"), b"stranger payload").unwrap();
+
+        // 1) Pre-pairing: C's completed-TLS dial is refused — no consent
+        //    prompt, nothing on disk, receiver not consumed.
+        let failure = stranger_send_fails(endpoint, &owner_fp, &dir_a.path().join("stranger.bin"));
+        assert!(
+            !failure.is_empty(),
+            "the pre-pairing stranger dial must fail: {failure}"
+        );
+        assert_no_event_within(engine_a, &owner, "incoming_request", 1500);
+        assert!(find_file(&inbox, "stranger.bin").is_none());
+
+        // 2) B joins as the sender; A's connection entry arrives with the
+        //    owner-loop completion (synchronous bookkeeping).
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "the legitimate join must succeed: {join_json}");
+        let conn = conn_of(&join_json);
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+
+        // 3) Post-pairing: the same stranger is refused AGAIN — its
+        //    fingerprint is not the pairing's verified peer.
+        let failure_two =
+            stranger_send_fails(endpoint, &owner_fp, &dir_a.path().join("stranger.bin"));
+        assert!(
+            !failure_two.is_empty(),
+            "the post-pairing stranger dial must fail: {failure_two}"
+        );
+        assert_no_event_within(engine_a, &owner, "incoming_request", 1500);
+        assert!(
+            find_file(&inbox, "stranger.bin").is_none(),
+            "a stranger's offer writes nothing to disk"
+        );
+
+        // 4) B's legitimate send on the SAME listener succeeds, and the
+        //    prompt is attributed to B's connection.
+        let payload = b"legitimate bytes after stranger attempts".repeat(32);
+        std::fs::write(dir_b.path().join("legit.bin"), &payload).unwrap();
+        let paths = CString::new(json_paths(&dir_b.path().join("legit.bin"))).unwrap();
+        let mut send_op = [0u8; 16];
+        assert_eq!(
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                send_op.as_mut_ptr()
+            ),
+            0,
+            "B's send accepted: {}",
+            last_error_of(engine_b)
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        assert!(
+            request.contains(&format!("\"conn\":\"{}\"", core::hex_encode(&conn))),
+            "the prompt is attributed to the fingerprint-matched conn: {request}"
+        );
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
+        assert!(send_ok, "B still succeeds after the stranger attempts: {send_json}");
+        let delivered = find_file(&inbox, "legit.bin").expect("B's file landed");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-01: the request gate is one atomic acceptance — two threads
+    /// racing the SAME request get the SAME op id (exactly one code is
+    /// claimed), and the same `request_id` under a DIFFERENT operation is
+    /// a `-2` conflict, never a cross-operation replay hit.
+    #[test]
+    fn request_id_acceptance_is_atomic_and_domain_scoped() {
+        let registry = TestRegistry::spawn();
+        let engine = Arc::new(AkEngine::new().expect("engine"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = task_start(&engine, &registry_spec(&registry, dir.path())).expect("rt");
+        let request_id = "b1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let spec = format!(
+            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}"
+        );
+        let racer_one = threaded_create(Arc::clone(&engine), runtime_id, spec.clone());
+        let racer_two = threaded_create(Arc::clone(&engine), runtime_id, spec.clone());
+        let op_one = racer_one.recv().expect("racer one answered").expect("accepted");
+        let op_two = racer_two.recv().expect("racer two answered").expect("accepted");
+        assert_eq!(
+            op_one, op_two,
+            "both racers must observe the ONE atomically accepted op"
+        );
+        let (ok, json) = wait_op_owned(&engine, &runtime_id, &op_one);
+        assert!(ok, "{json}");
+        assert!(json.contains("\"code\":\"AKI1-"), "exactly one claim: {json}");
+
+        // Cross-operation domain: the same request id under task_join is
+        // a conflict (-2), not a replay of the create's op.
+        let join_spec = format!(
+            "{{\"spec_version\":1,\"code\":\"AKI1-0000-0000-0000-0000-0000-0000-0000-0000\",\
+              \"request_id\":\"{request_id}\"}}"
+        );
+        let error = task_join_start(&engine, &runtime_id, &join_spec).expect_err("conflict");
+        assert_eq!(error.code, crate::core::AK_ERR_INVALID);
+        assert!(error.message.contains("different spec"), "{}", error.message);
+    }
+
+    /// P2-01 (second half): an ACCEPTED send request's answer stays
+    /// retrievable after the connection later disconnected — the replay
+    /// returns the ORIGINAL op id instead of a state rejection.
+    #[test]
+    fn accepted_send_request_replays_its_answer_after_disconnect() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+
+        let payload = b"replayable request".repeat(16);
+        std::fs::write(dir_b.path().join("re.bin"), &payload).unwrap();
+        let spec = CString::new(format!(
+            "{{\"spec_version\":1,\"paths\":[\"{}\"],\
+              \"request_id\":\"c1c2c3d4e5f60718293a4b5c6d7e8f90\"}}",
+            dir_b.path().join("re.bin").to_string_lossy().replace('\\', "/"),
+        ))
+        .unwrap();
+        let mut op_one = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), spec.as_ptr(), op_one.as_mut_ptr()),
+            0
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &op_one);
+        assert!(send_ok, "{send_json}");
+
+        // The connection goes away; the ORIGINAL request still answers.
+        assert_eq!(ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()), 0);
+        let mut op_two = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), spec.as_ptr(), op_two.as_mut_ptr()),
+            0,
+            "the replay is answered, not state-rejected: {}",
+            last_error_of(engine_b)
+        );
+        assert_eq!(op_one, op_two, "the replay returns the ORIGINAL op");
+        let (replay_ok, replay_json) = wait_op(engine_b, &joiner, &op_two);
+        assert!(replay_ok, "{replay_json}");
+        assert_eq!(replay_json, send_json, "the original answer, verbatim");
+        // A FRESH request on the severed connection is still refused.
+        let fresh = CString::new(json_paths(&dir_b.path().join("re.bin"))).unwrap();
+        let mut op_three = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), fresh.as_ptr(), op_three.as_mut_ptr()),
+            -2
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-02: two concurrent FIRST ops on one runtime initialize the
+    /// registry stack exactly once — both succeed and the surviving stack
+    /// keeps serving later ops (no stranded, replaced control client).
+    #[test]
+    fn concurrent_first_ops_initialize_the_stack_once_and_it_stays_usable() {
+        let registry = TestRegistry::spawn();
+        let engine = Arc::new(AkEngine::new().expect("engine"));
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let runtime_id = task_start(&engine, &registry_spec(&registry, dir_a.path())).expect("rt");
+        let spec_one = format!(
+            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{:032x}\"}}",
+            0u32
+        );
+        let spec_two = format!(
+            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{:032x}\"}}",
+            1u32
+        );
+        let racer_one = threaded_create(Arc::clone(&engine), runtime_id, spec_one);
+        let racer_two = threaded_create(Arc::clone(&engine), runtime_id, spec_two);
+        let op_one = racer_one.recv().expect("racer one answered").expect("accepted");
+        let op_two = racer_two.recv().expect("racer two answered").expect("accepted");
+        assert_ne!(op_one, op_two, "distinct requests, distinct ops");
+        let mut codes = Vec::new();
+        for op in [&op_one, &op_two] {
+            let (ok, json) = wait_op_owned(&engine, &runtime_id, op);
+            assert!(ok, "both concurrent first ops must succeed: {json}");
+            codes.push(code_of(&json));
+        }
+        // The stack the race left behind still serves real work: a second
+        // runtime on the same engine joins one of the codes through it.
+        let joiner = task_start(&engine, &registry_spec(&registry, dir_b.path())).expect("rt2");
+        let join_op = task_join_start(
+            &engine,
+            &joiner,
+            &format!("{{\"spec_version\":1,\"code\":\"{}\"}}", codes[0]),
+        )
+        .expect("join accepted");
+        let (join_ok, join_json) = wait_op_owned(&engine, &joiner, &join_op);
+        assert!(join_ok, "the surviving stack is usable: {join_json}");
+    }
+
+    /// P2-03: an IDLE disconnect (no transfer whose QUIC drop the peer
+    /// would observe) still reaches the paired peer: B's disconnect dials
+    /// A's advertised receiver port and hands it the TASK-CLOSE frame; A
+    /// ends the pairing ByPeer (`disconnected`/`peer`).
+    #[test]
+    fn idle_disconnect_reaches_the_paired_peer() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        // A's connection entry arrives with its owner-loop completion.
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+        // IDLE: no send ever happens. B walks away.
+        assert_eq!(ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()), 0);
+        let remote = wait_event(engine_a, &owner, "disconnected");
+        assert!(
+            remote.contains("\"reason\":\"peer\""),
+            "the idle peer must learn the disconnect: {remote}"
+        );
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(text_of(&buf).contains("\"state\":\"disconnected\""));
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-04: a generated-but-never-joined code is cancellable through
+    /// `ak_task_disconnect` by its `code_id`: the registry row revokes
+    /// (a later join answers "unknown task code"), the receiver/echo
+    /// listeners are released, `code_cancelled` is emitted, and repeats
+    /// are idempotent. Runs on an OWNED engine (safe-layer calls only).
+    #[test]
+    fn unjoined_code_is_cancellable_through_disconnect() {
+        let registry = TestRegistry::spawn();
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = registry_spec(&registry, dir.path());
+        let runtime = task_start(&engine, &spec).expect("runtime");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let op = task_create_code_start(
+            &engine,
+            &runtime,
+            "{\"spec_version\":1,\"role\":\"receiver\",\
+              \"request_id\":\"d1d2d3d4e5f60718293a4b5c6d7e8f90\"}",
+        )
+        .expect("create accepted");
+        let (ok, json) = wait_op_owned(&engine, &runtime, &op);
+        assert!(ok, "{json}");
+        let code_id = code_id_of(&json);
+        let code = code_of(&json);
+        assert!(
+            rt.spawned.lock().map(|m| m.contains_key(&code_id)).unwrap_or(false),
+            "the receiver/echo listeners are registered under the code id"
+        );
+
+        // Cancel by code id (the FFI disconnect covers the un-joined state).
+        task_disconnect(&engine, &runtime, &code_id).expect("cancel");
+        let events: Vec<String> = rt
+            .events
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            events.iter().any(|line| line.contains("code_cancelled")
+                && line.contains(&core::hex_encode(&code_id))),
+            "the cancel is observable: {events:?}"
+        );
+        assert!(
+            !rt.spawned.lock().map(|m| m.contains_key(&code_id)).unwrap_or(true),
+            "the listeners are released"
+        );
+        // Idempotent repeat: a silent AK_OK.
+        task_disconnect(&engine, &runtime, &code_id).expect("idempotent cancel");
+
+        // The registry row is gone: a later join answers "unknown task code".
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let spec_b = registry_spec(&registry, dir_b.path());
+        let runtime_b = task_start(&engine, &spec_b).expect("second runtime");
+        let join_op =
+            task_join_start(&engine, &runtime_b, &format!("{{\"spec_version\":1,\"code\":\"{code}\"}}"))
+                .expect("join accepted");
+        let (join_ok, join_json) = wait_op_owned(&engine, &runtime_b, &join_op);
+        assert!(!join_ok, "a cancelled code cannot be joined: {join_json}");
+        assert!(join_json.contains("unknown task code"), "{join_json}");
+
+        // An id that is neither a connection nor one of this runtime's
+        // codes stays the frozen -4.
+        let error = task_disconnect(&engine, &runtime, &[9u8; 16]).expect_err("unknown id");
+        assert_eq!(error.code, crate::core::AK_ERR_NOT_FOUND);
+    }
+
+    /// P2-05: a DECLINED offer keeps the listener alive (the sender may
+    /// retry on the same code), and a COMPLETED transfer converges BOTH
+    /// sides' entries to the terminal `disconnected` — a follow-up send
+    /// on the dead connection is refused up front.
+    #[test]
+    fn declined_offer_keeps_the_listener_and_done_converges_both_sides() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let inbox = dir_a.path().join("inbox");
+        let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+
+        // Attempt 1: declined.
+        let payload = b"retry me".repeat(64);
+        std::fs::write(dir_b.path().join("retry.bin"), &payload).unwrap();
+        let paths = CString::new(json_paths(&dir_b.path().join("retry.bin"))).unwrap();
+        let mut op_one = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_one.as_mut_ptr()),
+            0
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        let job = hex16_id(
+            request.split("\"job\":\"").nth(1).and_then(|r| r.split('"').next()).expect("job"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 0), 0);
+        let (declined_ok, _) = wait_op(engine_b, &joiner, &op_one);
+        assert!(!declined_ok, "the declined attempt fails the op");
+        // The listener (and the connection) survived the decline.
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"connected\""),
+            "a decline is not a task terminal state: {}",
+            text_of(&buf)
+        );
+
+        // Attempt 2 (a fresh op on the SAME connection): accepted, lands.
+        let mut op_two = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_two.as_mut_ptr()),
+            0,
+            "the retry is accepted: {}",
+            last_error_of(engine_b)
+        );
+        let request_two = wait_event(engine_a, &owner, "incoming_request");
+        let job_two = hex16_id(
+            request_two
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .expect("job"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job_two.as_ptr(), 1), 0);
+        let (retry_ok, retry_json) = wait_op(engine_b, &joiner, &op_two);
+        assert!(retry_ok, "the retry after a decline succeeds: {retry_json}");
+        let delivered = find_file(&inbox, "retry.bin").expect("the retry landed");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+
+        // Done is the single-transfer terminal state on BOTH sides.
+        let _ = wait_event(engine_a, &owner, "\"event\":\"done\"");
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"disconnected\""),
+            "the receiver converges: {}",
+            text_of(&buf)
+        );
+        buf.iter_mut().for_each(|slot| *slot = 0);
+        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"disconnected\""),
+            "the sender converges: {}",
+            text_of(&buf)
+        );
+        // A third send on the terminal connection is refused up front.
+        let mut op_three = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_three.as_mut_ptr()),
+            -2
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-06: the save folder is resolved when a transfer STARTS, not when
+    /// the code was generated — a `set_save_dir` after the code (but
+    /// before the offer) applies to the incoming task.
+    #[test]
+    fn save_dir_change_applies_to_the_next_received_task() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        // Create the code FIRST (the receiver captures the DEFAULT dir),
+        // then change the setting — the change must govern the task.
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let inbox = dir_a.path().join("later-inbox");
+        let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        let payload = b"saved in the changed folder".repeat(32);
+        std::fs::write(dir_b.path().join("moved.bin"), &payload).unwrap();
+        let paths = CString::new(json_paths(&dir_b.path().join("moved.bin"))).unwrap();
+        let mut send_op = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            0
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        let job = hex16_id(
+            request.split("\"job\":\"").nth(1).and_then(|r| r.split('"').next()).expect("job"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
+        assert!(send_ok, "{send_json}");
+        let delivered = find_file(&inbox, "moved.bin")
+            .expect("the file lands in the folder current at task start");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        assert!(
+            find_file(&dir_a.path().join("downloads"), "moved.bin").is_none(),
+            "the stale creation-time folder must not receive the task"
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-07: two pending consents on ONE engine (two receivers, two
+    /// paired senders) park nothing on the two Tokio workers — a third
+    /// registry op on the same engine completes while both humans have
+    /// not decided, and both transfers then land once accepted. (Under
+    /// the retired Condvar gate this test starves: both workers block,
+    /// the third op cannot run.)
+    #[test]
+    fn pending_consents_do_not_starve_the_engine_runtime() {
+        let registry = TestRegistry::spawn();
+        let engine = ak_engine_new(); // A1, A2 (receivers) + A3
+        let engine_f = ak_engine_new(); // B1, B2 (senders)
+        let mut receivers = Vec::new();
+        let mut senders = Vec::new();
+        let mut codes = Vec::new();
+        for index in 0..2 {
+            let dir = tempfile::tempdir().expect("receiver tempdir");
+            let inbox = dir.path().join(format!("inbox{index}"));
+            let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+            let runtime = start_task_on(engine, &registry, dir.path());
+            assert_eq!(ak_task_set_save_dir(engine, runtime.as_ptr(), save_path.as_ptr()), 0);
+            let (_, ok, json) =
+                create_code(engine, &runtime, "{\"spec_version\":1,\"role\":\"receiver\"}");
+            assert!(ok, "{json}");
+            codes.push((code_of(&json), dir, inbox));
+            receivers.push(runtime);
+        }
+        for (code, _, _) in &codes {
+            let dir = tempfile::tempdir().expect("sender tempdir");
+            let runtime = start_task_on(engine_f, &registry, dir.path());
+            let (join_ok, join_json) = join_code_as(engine_f, &runtime, code, Some("sender"));
+            assert!(join_ok, "{join_json}");
+            senders.push((runtime, conn_of(&join_json), dir));
+        }
+
+        // Both senders fire; both receivers park at their consent gates.
+        let payload = b"concurrent consent payload".repeat(64);
+        let mut ops = Vec::new();
+        for (runtime, conn, dir) in &senders {
+            std::fs::write(dir.path().join("cc.bin"), &payload).unwrap();
+            let paths = CString::new(json_paths(&dir.path().join("cc.bin"))).unwrap();
+            let mut op = [0u8; 16];
+            assert_eq!(
+                ak_task_send(
+                    engine_f,
+                    runtime.as_ptr(),
+                    conn.as_ptr(),
+                    paths.as_ptr(),
+                    op.as_mut_ptr()
+                ),
+                0
+            );
+            ops.push(op);
+        }
+        // Both receivers park at their consent gates; capture the job ids.
+        let mut jobs = Vec::new();
+        for runtime in &receivers {
+            let request = wait_event(engine, runtime, "incoming_request");
+            jobs.push(hex16_id(
+                request
+                    .split("\"job\":\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .expect("job"),
+            ));
+        }
+
+        // THE P2-07 ASSERTION: with both consents still pending, a third
+        // REAL op on the same two-worker engine completes promptly.
+        let dir3 = tempfile::tempdir().expect("tempdir 3");
+        let third = start_task_on(engine, &registry, dir3.path());
+        let started = Instant::now();
+        let (_, third_ok, third_json) =
+            create_code(engine, &third, "{\"spec_version\":1,\"role\":\"sender\"}");
+        assert!(third_ok, "the runtime is not starved: {third_json}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the third op completed while both consents were pending"
+        );
+
+        // Both pending gates then resolve and both transfers land.
+        for (index, runtime) in receivers.iter().enumerate() {
+            assert_eq!(ak_task_consent(engine, runtime.as_ptr(), jobs[index].as_ptr(), 1), 0);
+            let (send_ok, send_json) = wait_op(engine_f, &senders[index].0, &ops[index]);
+            assert!(send_ok, "transfer {index} lands: {send_json}");
+            assert!(
+                find_file(&codes[index].2, "cc.bin").is_some(),
+                "transfer {index} bytes landed"
+            );
+        }
+        ak_engine_free(engine);
+        ak_engine_free(engine_f);
+    }
+
+    /// P2-12: the probe echo responder answers a genuine probe (with the
+    /// fixed all-zero reply nonce), NEVER answers a reply (its own or
+    /// another responder's — the reflection loop killer), and keeps
+    /// answering fresh probes afterwards.
+    #[test]
+    fn echo_responder_answers_probes_but_never_replies_to_replies() {
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &spec_for(dir.path())).expect("runtime");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        // The responder's wildcard bind reports 0.0.0.0:port on Windows;
+        // dial it through loopback (exactly what local_candidates does).
+        let bound_one = engine
+            .runtime()
+            .block_on(async { spawn_echo_responder(&rt, [1u8; 16]) })
+            .expect("responder one");
+        let addr_one = SocketAddr::from(([127, 0, 0, 1], bound_one.port()));
+        let bound_two = engine
+            .runtime()
+            .block_on(async { spawn_echo_responder(&rt, [2u8; 16]) })
+            .expect("responder two");
+        let addr_two = SocketAddr::from(([127, 0, 0, 1], bound_two.port()));
+        let probe_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe socket");
+        probe_socket
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("read timeout");
+
+        // A genuine probe is answered; the reply carries the zero nonce.
+        let nonce = [0xA5u8; 16];
+        probe_socket
+            .send_to(&ak_net::holepunch::probe_packet(&nonce), addr_one)
+            .expect("probe sent");
+        let mut buffer = [0u8; 1500];
+        let (len, from) = probe_socket.recv_from(&mut buffer).expect("a reply arrives");
+        assert_eq!(len, 24, "the reply is a probe-shaped packet");
+        assert_eq!(&buffer[8..len], &[0u8; 16][..], "the reply nonce is the marker");
+        assert_eq!(from, addr_one);
+        let reply = buffer[..len].to_vec();
+
+        // The responder never answers its OWN reply (a reply is not a probe).
+        probe_socket.send_to(&reply, addr_one).expect("reply sent");
+        assert!(
+            probe_socket.recv_from(&mut buffer).is_err(),
+            "a responder must never answer a reply"
+        );
+
+        // Two responders fed a reply stay silent — no mutual answering loop.
+        probe_socket.send_to(&reply, addr_two).expect("cross reply sent");
+        assert!(
+            probe_socket.recv_from(&mut buffer).is_err(),
+            "a second responder must never answer a reply either"
+        );
+
+        // Fresh probes still work: neither responder was consumed.
+        probe_socket
+            .send_to(&ak_net::holepunch::probe_packet(&[0x5Au8; 16]), addr_two)
+            .expect("fresh probe");
+        let (len, _) = probe_socket.recv_from(&mut buffer).expect("responder two answers");
+        assert_eq!(len, 24);
     }
 
     // -- helpers --------------------------------------------------------------

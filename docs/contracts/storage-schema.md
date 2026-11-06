@@ -37,7 +37,7 @@ invite_codes
 - 撤销、过期后不复用旧码：保留最小 tombstone（至少 lookup、终态及必要版本信息），不允许通过删除记录重新激活旧码。
 - `expires_unix_ms` 为 NULL（或协议层 `expires_ms=0`）表示长期有效。
 
-**wave-28 修订（schema v1→v2，增量迁移）**：`invite_codes` 增 `owner_endpoint BLOB NULL`（发起方连接设置，≤512B 透传 blob，随 claim 扩展段到达）与 `max_redeems INTEGER NOT NULL DEFAULT 0`（0=不限，1=任务码单次兑换；额度只计 committed/applied/ready 事务，pending/aborted 不消耗；耗尽后新 redeemer 得 `0x2109 REDEEM_EXHAUSTED`，同 request_id 重放幂等不变）；`pairing_transactions` 增 `owner_endpoint BLOB NULL`/`redeemer_endpoint BLOB NULL`（兑换时刻快照，双端点交付依据）。endpoint blob 是连接提示而非凭证，不受 transcript 签名覆盖。
+**wave-28 修订（schema v1→v2，增量迁移）**：`invite_codes` 增 `owner_endpoint BLOB NULL`（发起方连接设置，≤512B 透传 blob，随 claim 扩展段到达）与 `max_redeems INTEGER NOT NULL DEFAULT 0`（0=不限，1=任务码单次兑换；额度只计 committed/applied/ready 事务，pending/aborted 不消耗，且在 redeem begin 与最终 Commit 的同一写事务内两处强制——竞争 Commit 的超限事务同事务转 aborted 并返回 `0x2109`；耗尽后新 redeemer 得 `0x2109 REDEEM_EXHAUSTED`，同 request_id 重放幂等不变）；`pairing_transactions` 增 `owner_endpoint BLOB NULL`/`redeemer_endpoint BLOB NULL`（兑换时刻快照，双端点交付依据）。endpoint blob 是连接提示而非凭证，不受 transcript 签名覆盖。
 
 ### 3. `pairing_transactions` 表（冻结）
 
@@ -71,6 +71,8 @@ invite_codes
 - 有界请求幂等记录：支撑“同 owner、同 `request_id`、同请求内容返回原结果；不同内容拒绝 `REQUEST_CONFLICT`”，记录有界并回收。
 - 注册库自带 schema 版本；升级迁移不得破坏 tombstone 与唯一性记录。
 - 不保存文件任务记录、路径、内容或文件进度。
+- **幂等请求体跨版本稳定（wave-29 修订）**：claim 的 canonical 幂等体在扩展段为默认值（无 endpoint、`max_redeems=0`）时与 v1 布局逐字节一致（`lookup_digest[32]+ttl_secs[4]`，36 字节）；仅非默认扩展追加 v2 尾部（`max_redeems[4]+endpoint presence[1]+blob`），两种布局长度不同、不可碰撞。升级前持久化的旧 claim 幂等记录在升级后同请求重放命中原响应；真正改变扩展内容仍是 `REQUEST_CONFLICT`。revoke 等其他请求体的编码不受影响。
+- **迁移原子性与可重入（wave-29 修订）**：schema 迁移（如 v1→v2）的全部 DDL 与 `PRAGMA user_version` 推进必须在**单个写事务**内完成——中断要么整体回滚（库保持迁移前一致状态），要么完整提交；再次启动重入即可完成。对历史非原子代码留下的半迁移布局（部分列已存在而版本号未推进），按列存在性受控识别并补齐缺失列后推进版本，不删除库、tombstone 或唯一性记录。
 
 ### 6. 备份与时钟规则（冻结）
 

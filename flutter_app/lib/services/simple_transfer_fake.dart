@@ -61,6 +61,10 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// Arguments of every [joinCode] call, in order.
   final List<String> joinRequests = [];
 
+  /// Optional role arguments of every [joinCode] call (null = not given),
+  /// in the same order as [joinRequests].
+  final List<TaskRole?> joinRoleRequests = [];
+
   /// `(jobId, accept)` pairs in call order.
   final List<(String, bool)> consentRequests = [];
 
@@ -88,6 +92,18 @@ class LocalSimpleTransferService implements SimpleTransferService {
   final StreamController<IncomingRequest> _incomingController =
       StreamController<IncomingRequest>.broadcast();
 
+  /// Wave-29 P2-11: job ids whose consent window closed (driven
+  /// explicitly by tests via [expireIncoming] — no timers in the fake).
+  final StreamController<String> _expiredIncomingController =
+      StreamController<String>.broadcast();
+
+  /// Job ids the fake reported expired (assertion material).
+  final List<String> expiredJobs = [];
+
+  /// Job ids already decided through [consent] (an expire after a
+  /// decision is ignored, like the engine's window).
+  final Set<String> _decidedJobs = {};
+
   /// Completers of accepted-but-unfinished receives, by jobId.
   final Map<String, Completer<void>> _pendingReceives = {};
 
@@ -113,11 +129,20 @@ class LocalSimpleTransferService implements SimpleTransferService {
   Future<TaskCode> createCode(TaskRole role) async {
     createCodeCalls += 1;
     _codeSeq += 1;
-    final body = 'AK${_codeSeq.toString().padLeft(2, '0')}'
-        '${_codeSeq.toString().padLeft(4, '0')}';
-    // Deterministic 8-char body, e.g. AK01-0001 …
+    // Real display shape (wave-29 P1-02): AKI1- + 8×4 Crockford Base32
+    // symbols (I/L/O/U excluded), deterministic from the counter — the
+    // first two symbols encode it so every minted code is distinct.
+    const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    String symbol(int index) => alphabet[(index + _codeSeq) % 32];
+    final firstGroup = '${alphabet[_codeSeq % 32]}'
+        '${alphabet[(_codeSeq ~/ 32) % 32]}${symbol(2)}${symbol(3)}';
+    final groups = <String>[
+      firstGroup,
+      for (var group = 1; group < 8; group++)
+        [for (var i = 0; i < 4; i++) symbol(group * 4 + i)].join(),
+    ];
     final code = TaskCode(
-      code: '${body.substring(0, 4)}-${body.substring(4, 8)}',
+      code: 'AKI1-${groups.join('-')}',
       role: role,
     );
     _pendingCode = code;
@@ -126,9 +151,10 @@ class LocalSimpleTransferService implements SimpleTransferService {
   }
 
   @override
-  Future<JoinResult> joinCode(String code) async {
+  Future<JoinResult> joinCode(String code, {TaskRole? role}) async {
     joinCodeCalls += 1;
     joinRequests.add(code);
+    joinRoleRequests.add(role);
     final error = _joinError;
     if (error != null) {
       _joinError = null; // one-shot failure injection
@@ -139,11 +165,11 @@ class LocalSimpleTransferService implements SimpleTransferService {
     if (pending == null || normalizeJoinCode(pending.code) != normalized) {
       return JoinResult.failure('配对码不存在或已失效，请向对方确认最新配对码。');
     }
-    // The joiner's direction COMPLEMENTS the creator's declaration (the
+    // The joiner's direction: the user's EXPLICIT intent (wave-29 P1-05)
+    // when given, else the complement of the creator's declaration (the
     // creator of a "我要接收" code receives; we send).
-    final connection =
-        _consumePendingCode(peerName: remotePeerName, role: _opposite(
-            pending.role));
+    final connection = _consumePendingCode(
+        peerName: remotePeerName, role: role ?? _opposite(pending.role));
     return JoinResult.success(connection.id);
   }
 
@@ -161,9 +187,14 @@ class LocalSimpleTransferService implements SimpleTransferService {
   Stream<IncomingRequest> get incomingRequests => _incomingController.stream;
 
   @override
+  Stream<String> get expiredIncomingRequests =>
+      _expiredIncomingController.stream;
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     consentCalls += 1;
     consentRequests.add((jobId, accept));
+    _decidedJobs.add(jobId);
     if (!accept) {
       return;
     }
@@ -204,6 +235,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _connections.clear();
     _connectionsController.close();
     _incomingController.close();
+    _expiredIncomingController.close();
   }
 
   // ---------------------------------------------------------------------
@@ -238,6 +270,12 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _updateState(connId, TaskConnectionState.connected);
   }
 
+  /// Moves connection [connId] into `unreachable` (probe FAILED — the
+  /// wave-29 P2-09 honest negative verdict).
+  void failProbe(String connId) {
+    _updateState(connId, TaskConnectionState.unreachable);
+  }
+
   /// Drops every connection at once (spec: 网络变化自动断开) and kills the
   /// pending code.
   void simulateNetworkChange() {
@@ -263,6 +301,21 @@ class LocalSimpleTransferService implements SimpleTransferService {
       totalBytes: totalBytes,
     ));
     return id;
+  }
+
+  /// Simulates the 30 s window closing on [jobId] undecided (wave-29
+  /// P2-11): emits on [SimpleTransferService.expiredIncomingRequests]
+  /// unless the request was already decided through [consent]. A LATER
+  /// decline of an expired job still completes normally (idempotent —
+  /// nothing was received either way).
+  void expireIncoming(String jobId) {
+    if (_decidedJobs.contains(jobId)) {
+      return;
+    }
+    expiredJobs.add(jobId);
+    if (!_expiredIncomingController.isClosed) {
+      _expiredIncomingController.add(jobId);
+    }
   }
 
   /// Finishes an accepted receive (its `consent` future completes).

@@ -13,8 +13,9 @@
 //! * `active_total` equals the number of live permits and the sum of the
 //!   per-group active counts;
 //! * no queued task is admissible under the current policy (the core pumps
-//!   after every mutation), except while it is being drained or a group is
-//!   blocked by a serial constraint;
+//!   after every mutation), except while it is being drained, a group is
+//!   blocked by a serial constraint, or the cross-code serial batch gate
+//!   defers a next-batch append (contract §8 finite batches);
 //! * the queue never silently drops or reorders tasks (cancellation is the
 //!   only removal).
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use std::collections::HashMap;
 use ak_core::error::ErrorCode;
 
 use crate::scheduler::admission::{self, ActiveGroups, ActiveTasks, AdmissionDecision, DenyReason};
-use crate::scheduler::config::SchedulerPolicy;
+use crate::scheduler::config::{CrossCodeMode, SchedulerPolicy};
 use crate::scheduler::key::{CodeGroupKey, Permit, PermitId, TaskHandle, TaskId};
 use crate::scheduler::queue::{FairQueue, QueueError};
 use crate::scheduler::state::{FinishOutcome, SchedulerEvent, TaskPhase, TaskState};
@@ -76,6 +77,34 @@ pub struct PolicySwitch {
     pub admitted: usize,
 }
 
+/// One cross-code serial batch (contract §8: finite batches).
+///
+/// While cross-code serial mode selects a group, the batch fixes which of
+/// that group's tasks belong to the current turn:
+///
+/// * while `open` (from the group's first admission until its first slot
+///   release — a batch task finishing, being cancelled, paused or yielding
+///   its slot), `cutoff` tracks the enqueue counter, so the tasks filling
+///   the group's parallelism, including appends that pile up behind the
+///   cap, still belong to this batch;
+/// * the first slot release closes the selection by freezing `cutoff`:
+///   tasks of the batch group appended (or requeued) afterwards carry a
+///   higher enqueue sequence and belong to the *next* batch.
+///
+/// A batch lives exactly as long as its group holds at least one active
+/// task. When the last one releases, the batch ends and the ready ring
+/// rotates to the next group — a hot code that keeps appending cannot
+/// occupy the single cross-code serial slot forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrossSerialBatch {
+    /// The group owning this turn.
+    group: CodeGroupKey,
+    /// Highest enqueue sequence still belonging to this batch.
+    cutoff: u64,
+    /// Whether the selection window is still absorbing new appends.
+    open: bool,
+}
+
 /// Contract §9 transition table for runtime-reported phases (anything not
 /// listed is rejected; `CancelRequested` is accepted from every
 /// non-terminal state).
@@ -115,6 +144,10 @@ pub struct SchedulerCore {
     /// (wave-24 `max_pending_admissions` bound; kept exact against
     /// `TaskRecord::state` by grant/release/report_phase).
     pending_admissions: u32,
+    /// The live cross-code serial batch, if any (contract §8 finite
+    /// batches; see [`CrossSerialBatch`]). `None` outside cross-code serial
+    /// mode or between batches.
+    cross_serial_batch: Option<CrossSerialBatch>,
     events: Vec<SchedulerEvent>,
 }
 
@@ -138,6 +171,7 @@ impl SchedulerCore {
             active_total: 0,
             permits: HashMap::new(),
             pending_admissions: 0,
+            cross_serial_batch: None,
             events: Vec::new(),
         }
     }
@@ -285,7 +319,17 @@ impl SchedulerCore {
     /// new task driver beyond the bound (the driver of a held-back task is
     /// simply not dispatched; it is dispatched by the next pump once a
     /// pending handshake completes or is released).
+    ///
+    /// Cross-code serial finite batches (contract §8): while a batch is
+    /// live, an admissible task of the batch group whose enqueue sequence
+    /// exceeds the batch cutoff is denied `WaitingSerialMode` — it belongs
+    /// to the group's next batch. Every denial of the live batch group
+    /// defers that group to the *back* of the ready ring (it already holds
+    /// the turn; waiting groups must stay ahead of it), so when the batch
+    /// ends the next group in rotation is selected instead of the hot
+    /// group's appends.
     pub fn pump(&mut self) -> usize {
+        self.refresh_cross_serial_batch();
         let order = self.queue.ready_order();
         let mut admitted = 0;
         for group in order {
@@ -296,13 +340,20 @@ impl SchedulerCore {
                 {
                     decision = AdmissionDecision::Deny(DenyReason::WaitingCapacity);
                 }
+                if decision.is_admitted() && self.batch_defers(&group, &task) {
+                    decision = AdmissionDecision::Deny(DenyReason::WaitingSerialMode);
+                }
                 match decision {
                     AdmissionDecision::Admit => {
                         self.grant(task, &group);
                         admitted += 1;
                     }
                     AdmissionDecision::Deny(_) => {
-                        self.queue.requeue_front(&group, task);
+                        if self.holds_live_batch(&group) {
+                            self.queue.requeue_defer(&group, task);
+                        } else {
+                            self.queue.requeue_front(&group, task);
+                        }
                         break;
                     }
                 }
@@ -575,6 +626,18 @@ impl SchedulerCore {
 
     /// Grant a permit to `task` for `group`, marking it admitted.
     fn grant(&mut self, task: TaskId, group: &CodeGroupKey) {
+        // Selecting a group under cross-code serial opens its finite batch
+        // (contract §8): everything of this group queued so far joins the
+        // turn; appends arriving after the first slot release are next
+        // batch (see [`CrossSerialBatch`]).
+        if self.policy.cross_code_mode == CrossCodeMode::Serial && self.cross_serial_batch.is_none()
+        {
+            self.cross_serial_batch = Some(CrossSerialBatch {
+                group: *group,
+                cutoff: self.enqueue_seq_counter,
+                open: true,
+            });
+        }
         self.permit_seq += 1;
         let permit_id = PermitId::from_counter(self.permit_seq);
         self.permits
@@ -614,6 +677,14 @@ impl SchedulerCore {
         if rec.state.is_pending_admission() {
             self.pending_admissions = self.pending_admissions.saturating_sub(1);
         }
+        // The first slot release of a batch task closes the cross-code
+        // serial batch's selection window (contract §8 finite batches):
+        // appends arriving from here on belong to the next batch.
+        if let Some(batch) = self.cross_serial_batch.as_mut() {
+            if batch.open && batch.group == group {
+                batch.open = false;
+            }
+        }
         match self.active_per_group.get_mut(&group) {
             Some(count) => {
                 *count -= 1;
@@ -637,6 +708,47 @@ impl SchedulerCore {
             .values()
             .any(|count| *count > limits.max_tasks_per_group)
             || self.active_per_group.len() > limits.max_active_groups as usize
+    }
+
+    /// Reconcile the cross-code serial batch with reality at the top of
+    /// every pump: a batch ends when its group no longer holds an active
+    /// task (or the policy left cross-code serial mode), and an open batch
+    /// keeps its cutoff level with the enqueue counter so appends of the
+    /// batch group still join the turn while the selection window is open.
+    fn refresh_cross_serial_batch(&mut self) {
+        let Some(batch) = self.cross_serial_batch else {
+            return;
+        };
+        let live = self.policy.cross_code_mode == CrossCodeMode::Serial
+            && self.active_per_group.contains_key(&batch.group);
+        if !live {
+            self.cross_serial_batch = None;
+        } else if batch.open && batch.cutoff != self.enqueue_seq_counter {
+            self.cross_serial_batch = Some(CrossSerialBatch {
+                cutoff: self.enqueue_seq_counter,
+                ..batch
+            });
+        }
+    }
+
+    /// Whether `task` of `group` is an admissible task of the live batch
+    /// group whose enqueue sequence places it in the *next* batch (the
+    /// cross-code serial finite-batch gate; `false` in every other case).
+    fn batch_defers(&self, group: &CodeGroupKey, task: &TaskId) -> bool {
+        match self.cross_serial_batch {
+            Some(batch) if batch.group == *group => self
+                .records
+                .get(task)
+                .is_none_or(|rec| rec.enqueue_seq > batch.cutoff),
+            _ => false,
+        }
+    }
+
+    /// Whether `group` is the group of the live cross-code serial batch
+    /// (its denials defer it to the back of the ready ring — see
+    /// [`SchedulerCore::pump`]).
+    fn holds_live_batch(&self, group: &CodeGroupKey) -> bool {
+        self.cross_serial_batch.is_some_and(|batch| batch.group == *group)
     }
 }
 

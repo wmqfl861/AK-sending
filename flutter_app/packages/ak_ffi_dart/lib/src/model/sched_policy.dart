@@ -1,24 +1,31 @@
 /// The two-dimensional scheduler concurrency policy of `ak_sched_set_policy`
-/// (wave-22). The value object carries the full §3 vocabulary of
-/// `docs/contracts/scheduler.md`; the WIRE keys are the subset the wave-22
-/// Rust side actually parses (`crates/ak-ffi/src/pairing.rs`, `parse_policy`
-/// — `same_code`/`cross_code` plus the three caps):
+/// (wave-22). The value object AND the wire JSON carry the FULL §3
+/// vocabulary of `docs/contracts/scheduler.md` — all eight fields
+/// (P2-05: `toJson` used to send only the five keys the wave-22
+/// `parse_policy` read, silently dropping the three newer caps; the wire
+/// now carries everything the contract freezes):
 ///
 /// ```json
 /// {
 ///   "same_code": "serial",
 ///   "cross_code": "parallel",
+///   "max_active_tasks": 8,
 ///   "max_active_tasks_per_code": 4,
 ///   "max_active_code_groups": 4,
-///   "max_queued_tasks": 256
+///   "max_queued_tasks": 256,
+///   "max_queued_tasks_per_code": 64,
+///   "max_pending_admissions": 32
 /// }
 /// ```
 ///
-/// The contract-doc spellings (`same_code_mode`/`cross_code_mode`, the
-/// global `max_active_tasks`, per-code queue and admission caps) are NOT
-/// parsed by the current engine — they stay on the value object (equality,
-/// future engines) but not on the wire. [SchedulerPolicy.fromJson] accepts
-/// BOTH spellings (the snapshot renders `same_code`/`cross_code`).
+/// [SchedulerPolicy.fromJson] accepts BOTH mode spellings
+/// (`same_code`/`cross_code` of the engine snapshot and the contract's
+/// `same_code_mode`/`cross_code_mode`) and is LENIENT about missing caps
+/// ON PURPOSE: snapshots written by engines that predate the three new
+/// fields keep the defaults instead of failing the read — the
+/// snapshot/set-policy ROUND-TRIP alignment is guaranteed by the Rust
+/// side's serialization (it emits every field it parses), not by
+/// rejecting old readers here.
 ///
 /// `toJson` validates the frozen ranges (scheduler.md §3) and throws
 /// [AkSpecException] on violation — the same early-Dart-rejection pattern
@@ -120,8 +127,11 @@ final class SchedulerPolicy {
 
   /// Validates every field against the frozen ranges (including the two
   /// "not above the global cap" cross rules) and returns the WIRE JSON —
-  /// the keys the engine parses (`same_code`/`cross_code` + the three
-  /// caps; see the library doc). Throws [AkSpecException] on violation.
+  /// ALL EIGHT §3 fields (P2-05: the three newer caps
+  /// `max_active_tasks`/`max_queued_tasks_per_code`/
+  /// `max_pending_admissions` ride along too, so an explicit user value is
+  /// no longer silently swapped for an engine default). Throws
+  /// [AkSpecException] on violation.
   Map<String, dynamic> toJson() {
     _check('max_active_tasks', maxActiveTasks);
     _check('max_active_tasks_per_code', maxActiveTasksPerCode);
@@ -140,9 +150,12 @@ final class SchedulerPolicy {
     return <String, dynamic>{
       'same_code': sameCodeMode.wireName,
       'cross_code': crossCodeMode.wireName,
+      'max_active_tasks': maxActiveTasks,
       'max_active_tasks_per_code': maxActiveTasksPerCode,
       'max_active_code_groups': maxActiveCodeGroups,
       'max_queued_tasks': maxQueuedTasks,
+      'max_queued_tasks_per_code': maxQueuedTasksPerCode,
+      'max_pending_admissions': maxPendingAdmissions,
     };
   }
 
@@ -155,9 +168,12 @@ final class SchedulerPolicy {
 
   /// Decodes a policy from an `ak_sched_snapshot` `policy` object (engine
   /// keys `same_code`/`cross_code`) or any future `same_code_mode`/
-  /// `cross_code_mode` spelling. Tolerant: missing optional fields keep
-  /// the defaults; an unknown mode value throws [FormatException] (never
-  /// silently a wrong mode).
+  /// `cross_code_mode` spelling. Tolerant BY DESIGN: caps missing from
+  /// the JSON keep the defaults — snapshots produced before the three §3
+  /// caps joined the wire (P2-05) must still decode; the read side is
+  /// aligned with the writer by the RUST serialization emitting every
+  /// field it parses, not by strict rejection here. An unknown mode value
+  /// throws [FormatException] (never silently a wrong mode).
   factory SchedulerPolicy.fromJson(Map<String, Object?> json) =>
       SchedulerPolicy(
         sameCodeMode: _modeOf(json, 'same_code', 'same_code_mode',

@@ -789,17 +789,36 @@ final class FfiTransferService implements TransferService {
     return true;
   }
 
+  /// P1-05 dispose sequence (frozen order — waiters before owners):
+  ///
+  /// 1. INVALIDATE every waiter/call channel first: the `_disposed` flag
+  ///    gates all entries, the result poller and the core-event
+  ///    subscription stop feeding, and `FfiInviteService.dispose()` flips
+  ///    its own flag so PENDING READINESS/OP WAITERS abort at their next
+  ///    wake-up (post-await guards + the `ensureLive` hook of
+  ///    `PairingOpHandle.wait`) BEFORE issuing another native call.
+  /// 2. THEN release the pairing layer (its pump, stream, runtime).
+  /// 3. The core transfer service follows (it owns a SEPARATE engine
+  ///    instance from the facade).
+  /// 4. The facade/native engine the pairing runtime BORROWED goes LAST —
+  ///    by then no Dart-side waiter can reach the freed handle anymore
+  ///    (a suspended `Future.delayed` continuation re-checks disposed
+  ///    before its next FFI poll and throws instead).
   @override
   void dispose() {
     if (_disposed) {
       return;
     }
+    // (1) invalidate waiters / call channels.
     _disposed = true;
     _resultPoller.cancel();
     _eventsSubscription?.cancel();
+    // (2) release the pairing layer (invalidates its pending waiters).
     _inviteService?.dispose();
     _inviteService = null;
+    // (3) core transfer service (own engine, independent of the facade).
     _core?.dispose();
+    // (4) facade / native engine LAST.
     final facade = _facade;
     if (facade is AkEngineDartFacade) {
       facade.dispose();

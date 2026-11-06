@@ -304,29 +304,39 @@
 //!
 //! `ak_sched_start` spec (binds to the most recent pairing runtime unless
 //! `runtime_id` names one; the runtime must be connected — poll
-//! `runtime_ready` first; one scheduler per engine):
+//! `runtime_ready` first; one scheduler per engine). All eight policy
+//! knobs take effect; a field outside this set is `-2` (never accepted
+//! and then silently run with different values — P2-05):
 //!
 //! ```json
 //! {
 //!   "spec_version": 1,
+//!   "request_id": "<32hex>",             // optional envelope field
 //!   "runtime_id": "<32hex>",             // optional
 //!   "same_code": "serial",               // optional: serial|parallel (default serial)
 //!   "cross_code": "parallel",            // optional: serial|parallel (default parallel)
 //!   "max_active_tasks_per_code": 4,      // optional, contract ranges
 //!   "max_active_code_groups": 4,         // optional
-//!   "max_queued_tasks": 256              // optional
+//!   "max_queued_tasks": 256,             // optional
+//!   "max_active_tasks": 16,              // optional (wave-24 cap, wired since wave 26)
+//!   "max_queued_tasks_per_code": 16,     // optional (wave-24 cap, wired since wave 26)
+//!   "max_pending_admissions": 16         // optional (wave-24 cap, wired since wave 26)
 //! }
 //! ```
 //!
 //! `ak_sched_enqueue` spec — the pairing relation (code group + verified
 //! peer key) resolves from the local pairing journal; the caller cannot
 //! override either (ffi-v2 §4). The data endpoint of the paired peer is
-//! the caller's to reach in this revision:
+//! the caller's to reach in this revision (REQUIRED `peer`; resolving it
+//! from the Ready relation is a future evolution — P1-06):
 //!
 //! ```json
 //! {
 //!   "spec_version": 1,
-//!   "request_id": "<32hex>",
+//!   "request_id": "<32hex>",             // optional idempotency key (P2-07): replay of
+//!                                         // the same request_id + same spec returns the
+//!                                         // ORIGINAL task id without side effects; the
+//!                                         // same request_id with a different spec is -2
 //!   "pairing_id": "<32hex>",             // required: applied pairing in this runtime's journal
 //!   "source_roots": ["C:/send/file.bin"],
 //!   "peer": "127.0.0.1:7100",            // required: the paired peer's data endpoint
@@ -342,11 +352,13 @@
 //! the wire-level `TaskOpen`/`TaskAdmission` handshake of the on-channel
 //! executor is the documented next step (see `src/pairing.rs`).
 //!
-//! `ak_sched_snapshot` (`1` JSON / `-3` buffer / `-4` no scheduler):
+//! `ak_sched_snapshot` (`1` JSON / `-3` buffer / `-4` no scheduler) — the
+//! policy object carries all eight knobs (P2-05):
 //!
 //! ```json
 //! {"policy":{"same_code":"serial","cross_code":"parallel","max_active_tasks_per_code":4,
-//!   "max_active_code_groups":4,"max_queued_tasks":256},
+//!   "max_active_code_groups":4,"max_queued_tasks":256,"max_active_tasks":16,
+//!   "max_queued_tasks_per_code":16,"max_pending_admissions":16},
 //!  "policy_revision":1,"draining":false,"active_tasks":2,"queued_tasks":1,
 //!  "shutting_down":false,"listener":{"enabled":false,"running":false,
 //!   "inbound_submitted":0,"inbound_rejected_queue_full":0},
@@ -390,14 +402,18 @@
 //! silent rebind):
 //!
 //! * `ak_pairing_stop_start(e, runtime_id, op_id_out)` — REAL: stops the
-//!   runtime (op/owner-loop aborts, spawned best-effort client close),
-//!   flips its phase to a terminal "stopped by caller", emits
+//!   runtime — first atomically entering the terminal "stopped" phase
+//!   under the runtime's startup lock, then cancelling/awaiting the
+//!   startup subtasks (background connect included) and the op tasks,
+//!   plus a spawned best-effort client close. Emits
 //!   `{"event":"runtime_stopped","runtime":"<32hex>"}`, clears the
 //!   engine's active-runtime pointer when it named this runtime, and
 //!   records the immediately-finished op
 //!   `{"op":"stop","runtime":"<32hex>"}` (readable via
-//!   `ak_pairing_op_result`; later ops on the runtime fail with
-//!   "stopped by caller").
+//!   `ak_pairing_op_result`; a connect completing after the stop can
+//!   never bring the runtime back online — P1-04; accepted op results
+//!   from before the stop stay readable; later ops fail with "stopped by
+//!   caller").
 //! * `ak_sched_listen_start(e, runtime_id, spec_json, op_id_out)` — REAL
 //!   delegation: the contract's name for the scheduler start. Same policy
 //!   spec as `ak_sched_start`; the caller's `runtime_id` is injected when

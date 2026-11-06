@@ -45,6 +45,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         PairingCompleteEvent,
         PairingEvent,
         PairingFfi,
+        PairingOpHandle,
         PairingRuntimeFfi,
         InvitationRevokedEvent,
         SchedulerPolicy,
@@ -303,6 +304,34 @@ final class FfiInviteService implements InviteService {
   bool _starting = false;
   bool _disposed = false;
 
+  /// P1-05: every async continuation re-checks this BEFORE any native
+  /// call — a disposed service must never reach the (possibly freed)
+  /// borrowed engine pointer with a stale poll.
+  void _throwIfDisposed() {
+    if (_disposed) {
+      throw StateError('FfiInviteService is disposed');
+    }
+  }
+
+  /// A `Future.delayed` whose continuation aborts when the service was
+  /// disposed during the wait (P1-05: the check runs AFTER the await, so
+  /// a dispose between two polls stops the NEXT native call).
+  Future<void> _delayOrDisposed(Duration duration) async {
+    await Future<void>.delayed(duration);
+    _throwIfDisposed();
+  }
+
+  /// Waits one op with the dispose guard injected (P1-05):
+  /// `PairingOpHandle.wait` calls [guard] at the TOP of every loop
+  /// iteration — i.e. after EVERY await, BEFORE each native poll — so a
+  /// dispose mid-wait surfaces as [StateError] here instead of a poll on
+  /// a released engine.
+  Future<Map<String, dynamic>> _waitOp(PairingOpHandle op) =>
+      op.wait(
+          interval: opPollInterval,
+          timeout: opTimeout,
+          ensureLive: _throwIfDisposed);
+
   /// In-memory preference fallback when no identity directory is known.
   SchedulerPreference? _memoryPreference;
 
@@ -328,16 +357,17 @@ final class FfiInviteService implements InviteService {
   /// binds the scheduler — then the event pump runs. Every public call
   /// awaits this; a failure surfaces with the explicit reason (DLL
   /// missing, wave-22 exports missing, engine refusal, registry
-  /// unreachable).
+  /// unreachable). P1-05: EVERY await here is followed by a disposed
+  /// re-check, so a dispose during startup aborts before the next native
+  /// call (`ak_sched_start` included) instead of racing the release of
+  /// the borrowed engine.
   Future<void> _ensureStarted() async {
-    if (_disposed) {
-      throw StateError('FfiInviteService is disposed');
-    }
+    _throwIfDisposed();
     if (_runtime != null) {
       return;
     }
     while (_starting) {
-      await Future<void>.delayed(const Duration(milliseconds: 5));
+      await _delayOrDisposed(const Duration(milliseconds: 5));
       if (_runtime != null) {
         return;
       }
@@ -375,6 +405,9 @@ final class FfiInviteService implements InviteService {
       // the engine reports the READY phase before anything may bind to it
       // (ak_sched_start refuses a not-yet-Ready runtime).
       await _awaitReady(runtime);
+      // P1-05: disposed while waiting for readiness — do NOT hand the
+      // (possibly already released) engine to ak_sched_start.
+      _throwIfDisposed();
       _sched!.start(_lastKnownPreference.toPolicy(),
           runtimeIdHex: runtime.runtimeIdHex);
       _runtime = runtime;
@@ -387,10 +420,13 @@ final class FfiInviteService implements InviteService {
   /// Polls the pairing event queue until `runtime_ready` (the
   /// [ServiceOnlineEvent]) or `runtime_failed`; every event seen on the
   /// way still lands on the stream. Throws the engine's failure reason on
-  /// `runtime_failed` and a timeout error past [readyTimeout].
+  /// `runtime_failed` and a timeout error past [readyTimeout]. P1-05:
+  /// each idle wait re-checks disposed on wake-up, so a dispose during
+  /// the readiness gate stops the next `ak_pairing_poll_event` call.
   Future<void> _awaitReady(PairingRuntimeFfi runtime) async {
     final deadline = DateTime.now().add(readyTimeout);
     while (DateTime.now().isBefore(deadline)) {
+      _throwIfDisposed();
       PairingEvent? event;
       try {
         event = runtime.pollEvent();
@@ -398,7 +434,7 @@ final class FfiInviteService implements InviteService {
         throw StateError('配对运行时启动失败：$error');
       }
       if (event == null) {
-        await Future<void>.delayed(opPollInterval);
+        await _delayOrDisposed(opPollInterval);
         continue;
       }
       _events.add(event);
@@ -443,7 +479,7 @@ final class FfiInviteService implements InviteService {
         stateFilter: includeTerminal
             ? InviteListStateFilter.all
             : InviteListStateFilter.active);
-    final map = await op.wait(interval: opPollInterval, timeout: opTimeout);
+    final map = await _waitOp(op);
     return InviteSummary.listFromJson(map);
   }
 
@@ -452,8 +488,7 @@ final class FfiInviteService implements InviteService {
       {InviteTtlKind ttl = InviteTtlKind.longLived}) async {
     await _ensureStarted();
     final op = _runtime!.createInvite(ttlSecs: ttl.ttlSecs);
-    return InviteCreated.fromJson(
-        await op.wait(interval: opPollInterval, timeout: opTimeout));
+    return InviteCreated.fromJson(await _waitOp(op));
   }
 
   @override
@@ -463,7 +498,8 @@ final class FfiInviteService implements InviteService {
     final normalized = normalizeInviteCode(inviteCode);
     await _ensureStarted();
     final op = _runtime!.redeemInvite(normalized);
-    final map = await op.wait(interval: opPollInterval, timeout: opTimeout);
+    final map = await _waitOp(op);
+    _throwIfDisposed(); // P1-05: no stream writes past dispose
     // No pairing-queue wire event for a finished redeem this wave —
     // synthesize the timeline event from the op result (pairing_id +
     // verified peer are right there).
@@ -482,7 +518,8 @@ final class FfiInviteService implements InviteService {
   Future<void> revokeInvite(String codeId) async {
     await _ensureStarted();
     final op = _runtime!.revokeInvite(codeId);
-    await op.wait(interval: opPollInterval, timeout: opTimeout);
+    await _waitOp(op);
+    _throwIfDisposed(); // P1-05: no stream writes past dispose
     // The op completing IS the server confirm (the engine waits for the
     // registry round-trip); surface the timeline event.
     _events.add(InvitationRevokedEvent(
@@ -566,6 +603,14 @@ final class FfiInviteService implements InviteService {
     await file.writeAsString(jsonEncode(preference.toJson()), flush: true);
   }
 
+  /// Releases the service (P1-05 sequence): the `_disposed` flag goes up
+  /// FIRST — from this instant every pending readiness/op waiter aborts
+  /// at its next wake-up (the post-await guards + the injected
+  /// `ensureLive` of `PairingOpHandle.wait`) BEFORE making another native
+  /// call — then the event pump stops and the stream closes. The CALLER
+  /// (`FfiTransferService.dispose`) releases the pairing runtime's
+  /// borrowed engine only after this, keeping the native engine alive
+  /// until every waiter has been fenced off.
   @override
   void dispose() {
     if (_disposed) {

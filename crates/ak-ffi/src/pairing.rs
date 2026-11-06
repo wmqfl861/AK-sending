@@ -113,6 +113,9 @@ pub(crate) enum RtPhase {
     /// The connect failed permanently; the message is the bounded
     /// diagnostic ops surface.
     Failed(String),
+    /// Terminal: stopped by the caller (`ak_pairing_stop_start`). A late
+    /// connect completion can never move the runtime back online (P1-04).
+    Stopped,
 }
 
 /// The connected halves, installed exactly once by the background task.
@@ -120,6 +123,23 @@ pub(crate) enum RtPhase {
 pub(crate) struct RtLive {
     client: RegistryClient,
     orch: PairingOrchestrator,
+}
+
+/// The runtime's startup ownership: the background connect task, the
+/// resident owner loop, and the live halves, all under ONE lock so that
+/// `ak_pairing_stop_start`'s "atomically enter the terminal state, then
+/// cancel" step and the background connect's "install the live halves"
+/// step are mutually exclusive (P1-04: a stop that returned must never be
+/// followed by the runtime coming back online).
+pub(crate) struct RtStartup {
+    /// JoinHandle of the background connect task spawned by
+    /// `ak_pairing_start` (registered while the lock is held, before the
+    /// spawning call returns, so every later stop observes it).
+    pub(crate) connect: Option<JoinHandle<()>>,
+    /// The resident owner loop handle (abortable teardown).
+    pub(crate) owner_loop: Option<JoinHandle<()>>,
+    /// The live client + orchestrator (`None` until `Ready`).
+    pub(crate) live: Option<RtLive>,
 }
 
 /// One pairing runtime (the `ak_pairing_start` artefact).
@@ -138,22 +158,58 @@ pub(crate) struct PairingRt {
     pub(crate) registry_id: [u8; 32],
     /// Connect phase; `Starting` until the background task settles.
     pub(crate) phase: watch::Sender<RtPhase>,
-    /// The live client + orchestrator (`None` until `Ready`).
-    pub(crate) live: StdMutex<Option<RtLive>>,
-    /// The resident owner loop handle (abortable teardown).
-    pub(crate) owner_loop: StdMutex<Option<JoinHandle<()>>>,
+    /// Startup ownership (see [`RtStartup`]).
+    pub(crate) startup: StdMutex<RtStartup>,
     /// Op table: op id → entry (entries stay readable after completion —
-    /// the same forever-readable semantics as the job table).
+    /// and after a stop — the same forever-readable semantics as the job
+    /// table).
     pub(crate) ops: StdMutex<HashMap<[u8; 16], Arc<OpEntry>>>,
     /// Pairing-plane event lines (schema in the crate header).
     pub(crate) events: Arc<StdMutex<VecDeque<String>>>,
 }
 
 impl PairingRt {
-    /// Best-effort teardown on engine drop: abort the op tasks and the
-    /// owner loop, then ask the client to close (polite close_notify).
+    /// Teardown of one runtime — used by `ak_pairing_stop_start` AND by
+    /// engine drop. Ordering (P1-04, ffi-v2 §2 stop semantics):
+    ///
+    /// 1. while holding the startup lock (the same lock the background
+    ///    connect's install step takes), atomically flip the phase to
+    ///    [`RtPhase::Stopped`] and take the connect task, the owner loop,
+    ///    and the live halves;
+    /// 2. then — outside the lock — cancel the startup subtasks (the
+    ///    connect task is additionally awaited, bounded, so a stop that
+    ///    returned is not racing a still-scheduled installer) and ask a
+    ///    taken client to close (polite close_notify, spawned).
+    ///
+    /// Op tasks are aborted but their entries STAY: accepted results
+    /// remain readable through `ak_pairing_op_result` after the stop
+    /// (sched_ext documents that contract; the old `ops.clear()` was the
+    /// contradiction the wave-25 review flagged).
     pub(crate) fn teardown(&self, runtime: &tokio::runtime::Runtime) {
-        if let Ok(mut ops) = self.ops.lock() {
+        let (connect, owner, live) = {
+            let Ok(mut slot) = self.startup.lock() else {
+                return; // poisoned: nothing sane left to tear down
+            };
+            // The terminal flip happens UNDER the lock: the install step
+            // re-checks the phase while holding it, so a connect settling
+            // concurrently can never install a live client (or emit
+            // runtime_ready) at or after this point.
+            self.phase.send_replace(RtPhase::Stopped);
+            (slot.connect.take(), slot.owner_loop.take(), slot.live.take())
+        };
+        if let Some(connect) = connect {
+            connect.abort();
+            // Bounded reap (same discipline as job_cancel): once this
+            // resolves, the connect future is dropped and its socket with
+            // it; the cap bounds a task wedged in blocking work.
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), connect).await
+            });
+        }
+        if let Some(owner) = owner {
+            owner.abort();
+        }
+        if let Ok(ops) = self.ops.lock() {
             for entry in ops.values() {
                 if let Ok(mut slot) = entry.task.lock() {
                     if let Some(task) = slot.take() {
@@ -161,13 +217,8 @@ impl PairingRt {
                     }
                 }
             }
-            ops.clear();
+            // Entries intentionally kept: results stay readable post-stop.
         }
-        let owner = self.owner_loop.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(owner) = owner {
-            owner.abort();
-        }
-        let live = self.live.lock().ok().and_then(|mut slot| slot.take());
         if let Some(live) = live {
             let client = live.client;
             runtime.spawn(async move {
@@ -189,6 +240,7 @@ impl PairingRt {
             match &*rx.borrow() {
                 RtPhase::Ready => return Ok(()),
                 RtPhase::Failed(message) => return Err(message.clone()),
+                RtPhase::Stopped => return Err("stopped by caller".to_string()),
                 RtPhase::Starting => {}
             }
             if rx.changed().await.is_err() {
@@ -391,8 +443,11 @@ pub fn pairing_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError
         registry_addr,
         registry_id,
         phase,
-        live: StdMutex::new(None),
-        owner_loop: StdMutex::new(None),
+        startup: StdMutex::new(RtStartup {
+            connect: None,
+            owner_loop: None,
+            live: None,
+        }),
         ops: StdMutex::new(HashMap::new()),
         events: Arc::new(StdMutex::new(VecDeque::new())),
     });
@@ -407,58 +462,102 @@ pub fn pairing_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError
 
     // Background connect: no network wait inside this synchronous call
     // (ffi-v2 §2). Ops started meanwhile park on `await_ready`.
-    engine.runtime().spawn(async move {
-        let connect = RegistryClient::connect_with_config(
-            rt.registry_addr,
-            rt.registry_id,
-            &rt.key,
-            &device_name,
-            ClientConfig::default(),
-        );
-        let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(client)) => client,
-            Ok(Err(error)) => return fail_start(&rt, &error.to_string()),
-            Err(_) => return fail_start(&rt, "registry connect timed out"),
-        };
-        let config = OrchestratorConfig {
-            redeem_window_ms,
-            ..OrchestratorConfig::default()
-        };
-        let orch =
-            match PairingOrchestrator::open(client.clone(), rt.key.clone(), &rt.id_dir, config) {
-                Ok(orch) => orch,
-                Err(error) => {
-                    return fail_start(&rt, &format!("cannot open pairing state: {error}"));
-                }
+    //
+    // P1-04: the task's JoinHandle is registered into the runtime's
+    // startup ownership WHILE the startup lock is held, so any later
+    // `ak_pairing_stop_start` sees and cancels it. Holding the lock across
+    // the spawn is safe (the task only needs it at its install step, long
+    // after the connect) and guarantees the handle is visible before this
+    // call returns.
+    {
+        // Lock through a clone so `rt` itself stays free to move into the
+        // spawned task.
+        let startup_owner = Arc::clone(&rt);
+        let mut startup = startup_owner
+            .startup
+            .lock()
+            .map_err(|_| FfiError::internal("startup lock poisoned"))?;
+        startup.connect = Some(engine.runtime().spawn(async move {
+            let connect = RegistryClient::connect_with_config(
+                rt.registry_addr,
+                rt.registry_id,
+                &rt.key,
+                &device_name,
+                ClientConfig::default(),
+            );
+            let client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => return fail_start(&rt, &error.to_string()),
+                Err(_) => return fail_start(&rt, "registry connect timed out"),
             };
-        if owner_loop {
-            let loop_handle = orch.spawn_owner_loop();
-            if let Ok(mut slot) = rt.owner_loop.lock() {
-                *slot = Some(loop_handle);
+            let config = OrchestratorConfig {
+                redeem_window_ms,
+                ..OrchestratorConfig::default()
+            };
+            let orch =
+                match PairingOrchestrator::open(client.clone(), rt.key.clone(), &rt.id_dir, config)
+                {
+                    Ok(orch) => orch,
+                    Err(error) => {
+                        return fail_start(&rt, &format!("cannot open pairing state: {error}"));
+                    }
+                };
+            // P1-04 install step: under the startup lock, re-verify the
+            // runtime is still Starting. A stop that already returned left
+            // the phase terminal (and aborted this task); if the abort
+            // lands only at the NEXT await point, this check is what
+            // keeps a late connect completion from installing the live
+            // client, flipping Ready, and resurrecting a stopped runtime.
+            let mut slot = match rt.startup.lock() {
+                Ok(slot) => slot,
+                Err(_) => return,
+            };
+            if !matches!(&*rt.phase.borrow(), RtPhase::Starting) {
+                drop(slot);
+                // Politely close the freshly connected client; it never
+                // goes live and no runtime_ready event is emitted.
+                tokio::spawn(async move {
+                    client.close().await;
+                });
+                return;
             }
-        }
-        if let Ok(mut slot) = rt.live.lock() {
-            *slot = Some(RtLive {
+            if owner_loop {
+                slot.owner_loop = Some(orch.spawn_owner_loop());
+            }
+            slot.live = Some(RtLive {
                 client,
                 orch: orch.clone(),
             });
-        }
-        rt.phase.send_replace(RtPhase::Ready);
-        rt.push_event(format!(
-            "{{\"event\":\"runtime_ready\",\"runtime\":\"{}\"}}",
-            core::hex_encode(&rt.runtime_id)
-        ));
-    });
+            rt.phase.send_replace(RtPhase::Ready);
+            drop(slot);
+            rt.push_event(format!(
+                "{{\"event\":\"runtime_ready\",\"runtime\":\"{}\"}}",
+                core::hex_encode(&rt.runtime_id)
+            ));
+        }));
+    }
     Ok(runtime_id)
 }
 
+/// Terminal connect failure — only a `Starting` runtime can fail: if the
+/// caller already stopped it (P1-04) or it otherwise settled, the
+/// existing terminal phase and its event stand.
 fn fail_start(rt: &PairingRt, message: &str) {
-    rt.phase.send_replace(RtPhase::Failed(message.to_string()));
-    rt.push_event(format!(
-        "{{\"event\":\"runtime_failed\",\"runtime\":\"{}\",\"error\":{}}}",
-        core::hex_encode(&rt.runtime_id),
-        quoted(message),
-    ));
+    let flipped = rt.phase.send_if_modified(|phase| {
+        if matches!(phase, RtPhase::Starting) {
+            *phase = RtPhase::Failed(message.to_string());
+            true
+        } else {
+            false
+        }
+    });
+    if flipped {
+        rt.push_event(format!(
+            "{{\"event\":\"runtime_failed\",\"runtime\":\"{}\",\"error\":{}}}",
+            core::hex_encode(&rt.runtime_id),
+            quoted(message),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,11 +731,11 @@ async fn run_op(rt: &PairingRt, op_spec: OpSpec) -> Result<String, String> {
         return Err(format!("pairing runtime not connected: {message}"));
     }
     let (client, orch) = {
-        let live = rt
-            .live
+        let startup = rt
+            .startup
             .lock()
             .map_err(|_| "runtime state lock poisoned".to_string())?;
-        let live = live.as_ref().ok_or("runtime is not connected")?;
+        let live = startup.live.as_ref().ok_or("runtime is not connected")?;
         (live.client.clone(), live.orch.clone())
     };
     match op_spec {
@@ -879,6 +978,13 @@ pub fn pairing_cancel_op(
 // Scheduler: ak_sched_*.
 // ---------------------------------------------------------------------------
 
+/// One accepted enqueue's idempotency record (P2-07): the minted task
+/// id plus the canonical spec the request was accepted for.
+pub(crate) type EnqueueRecord = ([u8; 16], String);
+
+/// The enqueue idempotency registry: request_id → acceptance record.
+pub(crate) type EnqueueRegistry = HashMap<[u8; 16], EnqueueRecord>;
+
 /// The single scheduler runtime of one engine (see the module docs).
 pub(crate) struct SchedRt {
     /// The pairing runtime the scheduler shares its client with.
@@ -887,6 +993,13 @@ pub(crate) struct SchedRt {
     pub handle: SessionHandle,
     pub executor: Arc<FfiSendExecutor>,
     pub(crate) events: Arc<StdMutex<VecDeque<String>>>,
+    /// Accepted-enqueue idempotency registry (P2-07, ffi-v2 §2):
+    /// request_id → (task id, canonical spec). A replay of the same
+    /// request with the same spec returns the ORIGINAL task id without
+    /// side effects; the same request_id with a different spec is `-2`.
+    /// Entries live for the runtime's lifetime (bounded by the queue
+    /// itself: each accepted enqueue is one entry).
+    pub(crate) enqueues: StdMutex<EnqueueRegistry>,
     /// Event pump task handle (broadcast → bounded queue).
     pump: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -1188,22 +1301,30 @@ pub fn sched_start(engine: &AkEngine, spec: &str) -> Result<(), FfiError> {
     let rt = runtime_of(engine, &runtime_id)?;
     let policy = parse_policy(&args)?;
 
-    let ready = {
-        let phase = rt.phase.subscribe();
-        let borrowed = phase.borrow();
-        matches!(&*borrowed, RtPhase::Ready)
-    };
-    if !ready {
-        return Err(FfiError::invalid(
-            "the pairing runtime is not connected yet (poll the runtime_ready event first)",
-        ));
-    }
+    // Both the phase check and the client borrow happen under the startup
+    // lock: a stop (or the install step itself) can never interleave
+    // between "Ready" and "take the client".
     let client = {
-        let live = rt
-            .live
+        let startup = rt
+            .startup
             .lock()
             .map_err(|_| FfiError::internal("runtime state lock poisoned"))?;
-        live.as_ref()
+        match &*rt.phase.borrow() {
+            RtPhase::Ready => {}
+            RtPhase::Stopped => {
+                return Err(FfiError::invalid(
+                    "the pairing runtime was stopped by the caller",
+                ));
+            }
+            RtPhase::Failed(_) | RtPhase::Starting => {
+                return Err(FfiError::invalid(
+                    "the pairing runtime is not connected yet (poll the runtime_ready event first)",
+                ));
+            }
+        }
+        startup
+            .live
+            .as_ref()
             .map(|live| live.client.clone())
             .ok_or_else(|| FfiError::invalid("the pairing runtime is not connected"))?
     };
@@ -1273,6 +1394,7 @@ pub fn sched_start(engine: &AkEngine, spec: &str) -> Result<(), FfiError> {
             handle,
             executor,
             events,
+            enqueues: StdMutex::new(EnqueueRegistry::new()),
             pump: StdMutex::new(Some(pump)),
         })
     })?;
@@ -1290,9 +1412,44 @@ pub fn sched_start(engine: &AkEngine, spec: &str) -> Result<(), FfiError> {
     Ok(())
 }
 
+/// The policy knobs the FFI accepts (ffi-v2 §4). The FFI spellings of
+/// the contract's `same_code_mode`/`cross_code_mode` are the shorter
+/// `same_code`/`cross_code` the shipped Dart bindings emit.
+const POLICY_FIELDS: &[&str] = &[
+    "same_code",
+    "cross_code",
+    "max_active_tasks_per_code",
+    "max_active_code_groups",
+    "max_queued_tasks",
+    // Wave-24 caps, wired through the FFI since wave 26 (P2-05).
+    "max_active_tasks",
+    "max_queued_tasks_per_code",
+    "max_pending_admissions",
+];
+
+/// Envelope fields that ride along in an `ak_sched_start` /
+/// `ak_sched_listen_start` spec around the policy block above.
+const POLICY_ENVELOPE_FIELDS: &[&str] = &["spec_version", "request_id", "runtime_id"];
+
 /// Parse a [`SchedulerPolicy`] from the shared field set (used by
 /// `ak_sched_start` and `ak_sched_set_policy`).
+///
+/// P2-05: all eight frozen knobs parse and take effect (the three wave-24
+/// caps included), and any field outside the frozen set is REJECTED with
+/// `-2` — a policy document is never accepted only to run with different
+/// values than the caller wrote.
 fn parse_policy(args: &crate::core::json::Json) -> Result<SchedulerPolicy, FfiError> {
+    for (key, _) in args.members() {
+        if !POLICY_FIELDS.contains(&key.as_str())
+            && !POLICY_ENVELOPE_FIELDS.contains(&key.as_str())
+        {
+            return Err(FfiError::invalid(format!(
+                "unknown policy field \"{key}\" (supported: same_code, cross_code, \
+                 max_active_tasks_per_code, max_active_code_groups, max_queued_tasks, \
+                 max_active_tasks, max_queued_tasks_per_code, max_pending_admissions)"
+            )));
+        }
+    }
     let same = match field_str(args, "same_code", false)?.as_deref() {
         None | Some("serial") => SameCodeMode::Serial,
         Some("parallel") => SameCodeMode::Parallel,
@@ -1311,6 +1468,7 @@ fn parse_policy(args: &crate::core::json::Json) -> Result<SchedulerPolicy, FfiEr
             )));
         }
     };
+    // Frozen ranges (scheduler.md §3); defaults follow SchedulerPolicy.
     let defaults = SchedulerPolicy::default();
     let per_code = field_u64(args, "max_active_tasks_per_code")?
         .unwrap_or(u64::from(defaults.max_active_tasks_per_code));
@@ -1318,14 +1476,57 @@ fn parse_policy(args: &crate::core::json::Json) -> Result<SchedulerPolicy, FfiEr
         .unwrap_or(u64::from(defaults.max_active_code_connections));
     let queued =
         field_u64(args, "max_queued_tasks")?.unwrap_or(u64::from(defaults.max_queued_tasks));
-    if per_code > u64::from(u16::MAX)
-        || groups > u64::from(u16::MAX)
-        || queued > u64::from(u16::MAX)
+    let active =
+        field_u64(args, "max_active_tasks")?.unwrap_or(defaults.max_active_tasks as u64);
+    let mut queued_per_code = field_u64(args, "max_queued_tasks_per_code")?
+        .unwrap_or(defaults.max_queued_tasks_per_code as u64);
+    let pending = field_u64(args, "max_pending_admissions")?
+        .unwrap_or(defaults.max_pending_admissions as u64);
+    let explicit_per_code = args.get("max_queued_tasks_per_code").is_some_and(|value| {
+        !matches!(value, crate::core::json::Json::Null)
+    });
+    if per_code == 0
+        || per_code > 16
+        || groups == 0
+        || groups > 16
+        || queued == 0
+        || queued > 4096
+        || active == 0
+        || active > 64
+        || queued_per_code == 0
+        || queued_per_code > 512
+        || pending == 0
+        || pending > 64
     {
-        return Err(FfiError::invalid("scheduler policy limits are too large"));
+        return Err(FfiError::invalid(
+            "scheduler policy limit out of the frozen range (scheduler.md §3)",
+        ));
     }
-    SchedulerPolicy::new(same, cross, per_code as u32, groups as u32, queued as u32)
-        .map_err(|error| FfiError::invalid(format!("invalid scheduler policy: {error}")))
+    // Contract §3 coupling, order-independent (mirrors
+    // SchedulerPolicy::from_json): an explicit per-code queue bound above
+    // the global bound is rejected; a defaulted one is clamped down.
+    if queued_per_code > queued {
+        if explicit_per_code {
+            return Err(FfiError::invalid(
+                "field \"max_queued_tasks_per_code\" must not exceed \"max_queued_tasks\"",
+            ));
+        }
+        queued_per_code = queued;
+    }
+    // The new-policy construction path config.rs documents for
+    // programmatic callers: the wave-19 five-knob constructor, then the
+    // wave-24 caps via struct update, then a full re-validation.
+    let policy = SchedulerPolicy {
+        max_active_tasks: active as usize,
+        max_queued_tasks_per_code: queued_per_code as usize,
+        max_pending_admissions: pending as usize,
+        ..SchedulerPolicy::new(same, cross, per_code as u32, groups as u32, queued as u32)
+            .map_err(|error| FfiError::invalid(format!("invalid scheduler policy: {error}")))?
+    };
+    policy
+        .validate()
+        .map_err(|error| FfiError::invalid(format!("invalid scheduler policy: {error}")))?;
+    Ok(policy)
 }
 
 fn sched_of(engine: &AkEngine) -> Result<Arc<SchedRt>, FfiError> {
@@ -1338,8 +1539,61 @@ fn sched_of(engine: &AkEngine) -> Result<Arc<SchedRt>, FfiError> {
         .ok_or_else(|| FfiError::not_found("no scheduler runtime: call ak_sched_start first"))
 }
 
+/// Canonical rendering of a parsed spec: JSON with object members sorted
+/// by key (recursively), so two documents that differ only in member
+/// order compare equal — the digest form of the enqueue idempotency
+/// registry (P2-07).
+fn canonical_spec_json(value: &crate::core::json::Json) -> String {
+    use crate::core::json::Json;
+    fn render_into(out: &mut String, value: &Json) {
+        match value {
+            Json::Null => out.push_str("null"),
+            Json::Bool(true) => out.push_str("true"),
+            Json::Bool(false) => out.push_str("false"),
+            Json::Num(token) => out.push_str(token),
+            Json::Str(text) => {
+                let quoted = crate::core::json::quoted(text);
+                out.push_str(&quoted);
+            }
+            Json::Arr(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    render_into(out, item);
+                }
+                out.push(']');
+            }
+            Json::Obj(members) => {
+                let mut sorted: Vec<&(String, Json)> = members.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                out.push('{');
+                for (index, (key, item)) in sorted.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    let quoted_key = crate::core::json::quoted(key);
+                    out.push_str(&quoted_key);
+                    out.push(':');
+                    render_into(out, item);
+                }
+                out.push('}');
+            }
+        }
+    }
+    let mut out = String::new();
+    render_into(&mut out, value);
+    out
+}
+
 /// `ak_sched_enqueue`: resolve the pairing relation locally, register the
 /// engine send spec, submit the task. Returns the task id.
+///
+/// P2-07 (ffi-v2 §2 idempotency): a spec carrying `request_id` (32 hex,
+/// optional) is deduplicated BEFORE any side effect — replaying the same
+/// request returns the original task id; the same request_id with a
+/// different spec is `-2`. A spec without `request_id` is never deduped.
 pub fn sched_enqueue(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
     let sched = sched_of(engine)?;
     let rt = runtime_of(engine, &sched.runtime_id)?;
@@ -1372,6 +1626,34 @@ pub fn sched_enqueue(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError
             "field \"peer\" is not an ip:port address: {peer_text:?}"
         ))
     })?;
+    // The whole spec is validated by now; resolve the optional
+    // idempotency key and run the dedup check BEFORE any side effect
+    // (journal read, spec registration, scheduler submission).
+    let request_id = match field_str(&args, "request_id", false)? {
+        Some(text) => Some(hex16(&text, "field \"request_id\"")?),
+        None => None,
+    };
+    let canonical = request_id.map(|_| canonical_spec_json(&args));
+    if let Some(request_id) = request_id {
+        let canonical = canonical
+            .as_deref()
+            .expect("canonical is computed exactly when request_id is present");
+        let registry = sched
+            .enqueues
+            .lock()
+            .map_err(|_| FfiError::internal("enqueue registry lock poisoned"))?;
+        if let Some((task_id, previous)) = registry.get(&request_id) {
+            if previous == canonical {
+                // Exact replay: the original acceptance stands, no new
+                // task, no side effects (ffi-v2 §2).
+                return Ok(*task_id);
+            }
+            return Err(FfiError::invalid(format!(
+                "request_id {} was already accepted with a different spec",
+                core::hex_encode(&request_id)
+            )));
+        }
+    }
 
     // Resolve the pairing relation from this runtime's journal: the code
     // group and the verified peer key. The UI cannot override either
@@ -1456,10 +1738,21 @@ pub fn sched_enqueue(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError
     match submitted {
         Ok(id) => {
             debug_assert_eq!(*id.as_bytes(), task_id);
+            // Accepted: record the idempotency key so replays of this
+            // request answer the same task id (P2-07).
+            if let Some(request_id) = request_id {
+                let canonical = canonical.expect("canonical accompanies request_id");
+                if let Ok(mut registry) = sched.enqueues.lock() {
+                    registry.entry(request_id).or_insert((task_id, canonical));
+                }
+            }
             Ok(task_id)
         }
         Err(error) => {
-            // Nothing was admitted: forget the registered spec too.
+            // Nothing was admitted: forget the registered spec too, and
+            // leave the idempotency registry untouched — a caller retry
+            // (same request_id) re-attempts rather than being pinned to
+            // the failed acceptance.
             if let Ok(mut specs) = sched.executor.specs.lock() {
                 specs.remove(&task_id);
             }
@@ -1554,13 +1847,18 @@ fn map_session_error(error: ak_session::runtime::SessionError) -> FfiError {
 
 fn render_snapshot(snapshot: &ak_session::runtime::SessionSnapshot) -> Result<String, FfiError> {
     let mut out = String::with_capacity(256);
+    // All eight policy knobs render (P2-05): what was configured is what
+    // the caller reads back — the wave-24 caps included.
     out.push_str(&format!(
-        "{{\"policy\":{{\"same_code\":{},\"cross_code\":{},\"max_active_tasks_per_code\":{},\"max_active_code_groups\":{},\"max_queued_tasks\":{}}}",
+        "{{\"policy\":{{\"same_code\":{},\"cross_code\":{},\"max_active_tasks_per_code\":{},\"max_active_code_groups\":{},\"max_queued_tasks\":{},\"max_active_tasks\":{},\"max_queued_tasks_per_code\":{},\"max_pending_admissions\":{}}}",
         quoted(snapshot.policy.same_code_mode.as_str()),
         quoted(snapshot.policy.cross_code_mode.as_str()),
         snapshot.policy.max_active_tasks_per_code,
         snapshot.policy.max_active_code_connections,
         snapshot.policy.max_queued_tasks,
+        snapshot.policy.max_active_tasks,
+        snapshot.policy.max_queued_tasks_per_code,
+        snapshot.policy.max_pending_admissions,
     ));
     out.push_str(&format!(
         ",\"policy_revision\":{},\"draining\":{},\"active_tasks\":{},\"queued_tasks\":{},\"shutting_down\":{}",

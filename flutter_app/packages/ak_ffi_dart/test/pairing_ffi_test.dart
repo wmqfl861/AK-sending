@@ -187,10 +187,24 @@ void main() {
         {
           'same_code': 'serial',
           'cross_code': 'parallel',
+          'max_active_tasks': 8,
           'max_active_tasks_per_code': 4,
           'max_active_code_groups': 4,
           'max_queued_tasks': 256,
+          'max_queued_tasks_per_code': 64,
+          'max_pending_admissions': 32,
         },
+        reason: 'P2-05：toJson 输出 §3 全部 8 字段，新三限额不再被静默丢弃',
+      );
+      expect(
+        SchedulerPolicy(maxActiveTasks: 6, maxQueuedTasksPerCode: 2,
+                maxPendingAdmissions: 3)
+            .toJson(),
+        allOf(
+            containsPair('max_active_tasks', 6),
+            containsPair('max_queued_tasks_per_code', 2),
+            containsPair('max_pending_admissions', 3)),
+        reason: 'P2-05：显式新限额值原样上线，不会被默认值替换',
       );
       expect(
         SchedulerPolicy().withModes(
@@ -235,6 +249,30 @@ void main() {
         'parallel × serial',
         reason: '快照/事件两种拼法都容忍',
       );
+      // P2-05：旧快照缺新三字段时宽容读默认值（对齐由 Rust 序列化保证），
+      // 新字段存在时原样读回。
+      final legacy = SchedulerPolicy.fromJson({
+        'same_code': 'serial',
+        'cross_code': 'parallel',
+        'max_active_tasks_per_code': 4,
+        'max_active_code_groups': 4,
+        'max_queued_tasks': 256,
+      });
+      expect(legacy, const SchedulerPolicy(),
+          reason: '缺新字段的旧快照按默认值读回');
+      final full = SchedulerPolicy.fromJson({
+        'same_code': 'serial',
+        'cross_code': 'parallel',
+        'max_active_tasks': 1,
+        'max_active_tasks_per_code': 4,
+        'max_active_code_groups': 4,
+        'max_queued_tasks': 256,
+        'max_queued_tasks_per_code': 2,
+        'max_pending_admissions': 3,
+      });
+      expect(full.maxActiveTasks, 1);
+      expect(full.maxQueuedTasksPerCode, 2);
+      expect(full.maxPendingAdmissions, 3);
       expect(
           () => SchedulerPolicy.fromJson({'same_code': 'turbo'}),
           throwsFormatException);
@@ -246,10 +284,11 @@ void main() {
       // const regId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
     const pid = 'fedcba0987654321fedcba0987654321';
 
-    test('enqueue 规格逐字段匹配 ffi-v2.md §4 冻结示例', () {
+    test('enqueue 规格逐字段匹配引擎解析字段（含必填 peer，P1-06）', () {
       final spec = AkSchedEnqueueSpec(
         requestId: rid,
         pairingId: pid,
+        peer: '192.168.1.20:7300',
         sourceRoots: [r'D:\photos', r'E:\docs'],
       );
       expect(
@@ -258,6 +297,7 @@ void main() {
           'spec_version': 1,
           'request_id': rid,
           'pairing_id': pid,
+          'peer': '192.168.1.20:7300',
           'source_roots': [r'D:\photos', r'E:\docs'],
           'conflict': 'fail',
           'multistream': false,
@@ -267,14 +307,82 @@ void main() {
       );
       expect(
           () => AkSchedEnqueueSpec(
-                  requestId: rid, pairingId: pid, sourceRoots: [])
+                  requestId: rid,
+                  pairingId: pid,
+                  peer: '192.168.1.20:7300',
+                  sourceRoots: [])
               .toJson(),
           throwsA(isA<AkSpecException>()));
       expect(
           () => AkSchedEnqueueSpec(
-                  requestId: rid, pairingId: 'zz', sourceRoots: ['a'])
+                  requestId: rid,
+                  pairingId: 'zz',
+                  peer: '192.168.1.20:7300',
+                  sourceRoots: ['a'])
               .toJson(),
           throwsA(isA<AkSpecException>()));
+    });
+
+    test('enqueue 的 peer 必填且必须是 ip:port 形状（P1-06）', () {
+      // 括号 IPv6 字面量可用（与 registry 的 SocketAddr 镜像一致）。
+      expect(
+        AkSchedEnqueueSpec(
+                requestId: rid,
+                pairingId: pid,
+                peer: '[2001:db8::1]:7300',
+                sourceRoots: ['a'])
+            .toJson()['peer'],
+        '[2001:db8::1]:7300',
+      );
+      expect(
+        AkSchedEnqueueSpec(
+                requestId: rid, pairingId: pid, peer: '127.0.0.1:0',
+                sourceRoots: ['a'])
+            .toJson()['peer'],
+        '127.0.0.1:0',
+      );
+      // 主机名、空串、占位符、越界端口都到达 FFI 前拒绝——引擎对缺 peer
+      // 的规格只会回 AK_ERR_INVALID，公共 API 无法表达合法输入。
+      expect(
+          () => AkSchedEnqueueSpec(
+                  requestId: rid,
+                  pairingId: pid,
+                  peer: 'ak.example.com:7300',
+                  sourceRoots: ['a'])
+              .toJson(),
+          throwsA(isA<AkSpecException>()),
+          reason: '主机名不是 ip:port');
+      expect(
+          () => AkSchedEnqueueSpec(
+                  requestId: rid, pairingId: pid, peer: '', sourceRoots: ['a'])
+              .toJson(),
+          throwsA(isA<AkSpecException>()));
+      expect(
+          () => AkSchedEnqueueSpec(
+                  requestId: rid,
+                  pairingId: pid,
+                  peer: 'ip:port',
+                  sourceRoots: ['a'])
+              .toJson(),
+          throwsA(isA<AkSpecException>()));
+      expect(
+          () => AkSchedEnqueueSpec(
+                  requestId: rid,
+                  pairingId: pid,
+                  peer: '127.0.0.1:99999',
+                  sourceRoots: ['a'])
+              .toJson(),
+          throwsA(isA<AkSpecException>()),
+          reason: '端口越界');
+      expect(
+          () => AkSchedEnqueueSpec(
+                  requestId: rid,
+                  pairingId: pid,
+                  peer: '127.0.0.1',
+                  sourceRoots: ['a'])
+              .toJson(),
+          throwsA(isA<AkSpecException>()),
+          reason: '缺端口');
     });
 
     test('start spec 携带 runtime_id 与初始策略 wire 键', () {
@@ -286,9 +394,12 @@ void main() {
           'runtime_id': 'ab' * 16,
           'same_code': 'serial',
           'cross_code': 'parallel',
+          'max_active_tasks': 8,
           'max_active_tasks_per_code': 4,
           'max_active_code_groups': 4,
           'max_queued_tasks': 256,
+          'max_queued_tasks_per_code': 64,
+          'max_pending_admissions': 32,
         },
       );
       expect(
@@ -494,6 +605,44 @@ void main() {
       );
     });
 
+    test('负返回码后的原生错误详情进入异常消息（P2-08）', () {
+      // Fake 同时表达状态码与文本——真实绑定层在失败调用后立即读取
+      // ak_engine_last_error（engine.dart 的既有模式）。
+      final fake = FakePairingCalls()
+        ..startCode = AkStatus.errInvalid
+        ..lastErrorText = 'cannot create the identity directory';
+      expect(
+        () => PairingFfi(calls: fake).start(_startSpec()),
+        throwsA(isA<AkFfiException>()
+            .having((e) => e.code, 'code', AkStatus.errInvalid)
+            .having(
+                (e) => e.message,
+                'message',
+                allOf(contains('ak_pairing_start'),
+                    contains('AK_ERR_INVALID'),
+                    contains('identity directory')))),
+        reason: '同一状态码覆盖多种引擎失败：文案必须携带原生根因',
+      );
+
+      final rejected = FakePairingCalls()
+        ..rejectStartsWithCode = AkStatus.errNotFound
+        ..lastErrorText = 'runtime not in this engine';
+      final runtime = PairingFfi(calls: rejected).start(_startSpec());
+      expect(
+        () => runtime.listInvites(),
+        throwsA(isA<AkFfiException>().having(
+            (e) => e.message, 'message', contains('runtime not in this engine'))),
+      );
+
+      // 无详情时仍是"固定文案 + 状态名"的明确错误。
+      final bare = FakePairingCalls()..startCode = AkStatus.errInvalid;
+      expect(
+        () => PairingFfi(calls: bare).start(_startSpec()),
+        throwsA(isA<AkFfiException>()
+            .having((e) => e.message, 'message', contains('AK_ERR_INVALID'))),
+      );
+    });
+
     test('create/redeem/list/revoke 受理后返回 op 轮询句柄且 spec 逐字到达',
         () {
       final fake = FakePairingCalls();
@@ -628,6 +777,38 @@ void main() {
       );
     });
 
+    test('wait 的 ensureLive 在每个 await 之后拦截（P1-05：dispose 后不再 native 轮询）',
+        () async {
+      final fake = FakePairingCalls();
+      final runtime = PairingFfi(calls: fake).start(_startSpec());
+      final op = runtime.createInvite();
+      // 永远 pending 的结果：没有生命周期护栏会一直轮询下去。
+      fake.opResults[op.opIdHex] = FakeOpScript(
+        code: AkStatus.done,
+        json: '{"op":"create"}',
+        pendingPolls: 1000,
+      );
+      var ticks = 0;
+      await expectLater(
+        op.wait(
+          delay: (_) async {
+            ticks += 1;
+          },
+          // 模拟第一个等待间隔内发生了 dispose：下一次循环顶（即 await 之后、
+          // native poll 之前）必须抛出。
+          ensureLive: () {
+            if (ticks >= 1) {
+              throw StateError('FfiInviteService is disposed');
+            }
+          },
+        ),
+        throwsA(isA<StateError>()),
+      );
+      expect(fake.opResultCalls[op.opIdHex], 1,
+          reason: '受理后恰好一次结果轮询；dispose 之后不再发生 native 调用');
+      expect(ticks, 1, reason: '护栏在第一次 delay 后立刻中止了循环');
+    });
+
     test('pollEvent：空队列返回 null；-3 扩容不丢事件；事件按序类型化', () {
       final fake = FakePairingCalls();
       final runtime = PairingFfi(calls: fake).start(_startSpec());
@@ -693,10 +874,15 @@ void main() {
       final taskId = runtime.enqueue(AkSchedEnqueueSpec(
         requestId: '0123456789abcdef0123456789abcdef',
         pairingId: 'fedcba0987654321fedcba0987654321',
+        peer: '192.168.1.20:7300',
         sourceRoots: [r'D:\photos'],
       ));
       expect(akIdToHex(taskId), hasLength(32));
       expect(fake.enqueueSpecs, hasLength(1));
+      expect(
+          (jsonDecode(fake.enqueueSpecs.single) as Map<String, dynamic>)['peer'],
+          '192.168.1.20:7300',
+          reason: 'P1-06：peer 进入 enqueue JSON');
     });
 
     test('setPolicy 发送冻结策略线键；cancel 对未知任务是 -4', () {
@@ -717,9 +903,40 @@ void main() {
       final taskId = runtime.enqueue(AkSchedEnqueueSpec(
         requestId: '0123456789abcdef0123456789abcdef',
         pairingId: 'fedcba0987654321fedcba0987654321',
+        peer: '192.168.1.20:7300',
         sourceRoots: ['a'],
       ));
       runtime.cancelTask(taskId); // 已受理任务：ok
+    });
+
+    test('snapshot 冻结三参：仅接受默认查询 "{}"（P0-01）', () {
+      final fake = FakeSchedCalls();
+      final runtime = SchedRuntimeFfi(calls: fake);
+      expect(runtime.snapshot(), isNotNull, reason: '默认 "{}" 查询可用');
+      expect(
+        () => runtime.snapshot(queryJson: '{"code_id":"ab" * 16}'),
+        throwsArgumentError,
+        reason: '查询过滤是 v3 扩展：冻结 ABI 没有 query 参数',
+      );
+      expect(
+        fake.snapshotCalls,
+        contains('{}'),
+        reason: '只有默认查询到达调用缝',
+      );
+    });
+
+    test('负返回码后的原生错误详情进入异常消息（P2-08）', () {
+      final fake = FakeSchedCalls()
+        ..setPolicyCode = AkStatus.errInvalid
+        ..lastErrorText = 'scheduler policy limits are too large';
+      final runtime = SchedRuntimeFfi(calls: fake);
+      expect(
+        () => runtime.setPolicy(const SchedulerPolicy()),
+        throwsA(isA<AkFfiException>()
+            .having((e) => e.code, 'code', AkStatus.errInvalid)
+            .having((e) => e.message, 'message',
+                allOf(contains('AK_ERR_INVALID'), contains('too large')))),
+      );
     });
 
     test('snapshot 与 pollEvent：JSON 解码、-3 扩容、事件类型化', () {
@@ -729,9 +946,12 @@ void main() {
         'policy': {
           'same_code': 'serial',
           'cross_code': 'parallel',
+          'max_active_tasks': 8,
           'max_active_tasks_per_code': 4,
           'max_active_code_groups': 4,
           'max_queued_tasks': 256,
+          'max_queued_tasks_per_code': 64,
+          'max_pending_admissions': 32,
         },
         'policy_revision': 1,
         'draining': false,
@@ -744,9 +964,9 @@ void main() {
       });
       final snapshot = runtime.snapshot();
       expect(
-          SchedulerPolicy.fromJson(snapshot!['policy'] as Map<String, dynamic>)
-              .modeLabel,
-          'serial × parallel');
+          SchedulerPolicy.fromJson(snapshot!['policy'] as Map<String, dynamic>),
+          const SchedulerPolicy(),
+          reason: 'P2-05：快照携带 8 字段策略并完整往返');
       expect((snapshot['tasks'] as List).single['state'], 'Transferring');
       expect(fake.sawCaps, containsAll(<int>[1024, 2048]));
 
@@ -788,7 +1008,9 @@ final class FakeOpScript {
 
 /// Deterministic [AkPairingCalls]: captures every spec JSON, hands out
 /// sequential op ids, and honors the frozen buffer contract (`-3` writes
-/// and consumes nothing).
+/// and consumes nothing). [lastErrorText] scripts the native detail the
+/// real bindings capture after a negative code (P2-08: status AND text on
+/// one seam).
 final class FakePairingCalls implements AkPairingCalls {
   final List<(String, String)> invocations = [];
   final Map<String, int> opResultCalls = {};
@@ -806,10 +1028,17 @@ final class FakePairingCalls implements AkPairingCalls {
   /// When set, `*_start` calls answer this code instead of accepting.
   int? rejectStartsWithCode;
 
+  /// The native error detail surfaced by [lastError] (the text the real
+  /// bindings read from `ak_engine_last_error` right after a failure).
+  String? lastErrorText;
+
   int _nextOp = 1;
 
   late final String startRuntimeIdHex = '10' * 16;
   late final Uint8List _startRuntimeId = akIdFromHex(startRuntimeIdHex);
+
+  @override
+  String? lastError() => lastErrorText;
 
   @override
   int start(String specJson, Uint8List runtimeIdOut) {
@@ -916,11 +1145,14 @@ final class FakePairingCalls implements AkPairingCalls {
   }
 }
 
-/// Deterministic [AkSchedCalls] (the six shipped engine calls).
+/// Deterministic [AkSchedCalls] (the six shipped engine calls); mirrors
+/// the P0-01 ruling (only the default snapshot query crosses the seam)
+/// and the P2-08 status+text error surface.
 final class FakeSchedCalls implements AkSchedCalls {
   final List<String> startSpecs = [];
   final List<String> enqueueSpecs = [];
   final List<String> policySpecs = [];
+  final List<String> snapshotCalls = [];
   final Map<String, FakeOpScript> taskResults = {};
   final List<Map<String, Object?>> eventQueue = [];
   final List<int> sawCaps = [];
@@ -930,12 +1162,21 @@ final class FakeSchedCalls implements AkSchedCalls {
 
   int minBufferCap = 0;
   int snapshotCode = AkStatus.event;
+  int startCode = AkStatus.ok;
+  int setPolicyCode = AkStatus.ok;
+
+  /// The native error detail surfaced by [lastError] (status AND text).
+  String? lastErrorText;
+
   int _nextId = 1;
+
+  @override
+  String? lastError() => lastErrorText;
 
   @override
   int start(String specJson) {
     startSpecs.add(specJson);
-    return AkStatus.ok;
+    return startCode;
   }
 
   @override
@@ -952,7 +1193,7 @@ final class FakeSchedCalls implements AkSchedCalls {
   @override
   int setPolicy(String policyJson) {
     policySpecs.add(policyJson);
-    return AkStatus.ok;
+    return setPolicyCode;
   }
 
   @override
@@ -962,6 +1203,10 @@ final class FakeSchedCalls implements AkSchedCalls {
 
   @override
   int snapshot(String queryJson, Uint8List buffer, int cap) {
+    // P0-01 mirror: the shipped export takes NO query — only the default
+    // '{}' is expressible on the seam.
+    checkSchedSnapshotQuery(queryJson);
+    snapshotCalls.add(queryJson);
     sawCaps.add(cap);
     if (snapshotCode == AkStatus.pending) {
       return AkStatus.pending;

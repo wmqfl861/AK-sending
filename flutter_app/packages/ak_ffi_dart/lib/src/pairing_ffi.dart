@@ -49,7 +49,7 @@ import 'dart:typed_data' show Uint8List;
 import 'bindings.dart'
     show AkEngine, AkFfiException, AkStatus, processAllocator;
 import 'ffi_json.dart'
-    show AkSpecException, decodeFfiJson, toNativeUtf8;
+    show AkSpecException, decodeFfiJson, fromNativeUtf8, toNativeUtf8;
 import 'model/invite.dart';
 import 'model/pairing_events.dart';
 
@@ -58,6 +58,62 @@ const int akPairingIdLength = 16;
 
 /// Defensive ceiling for the automatic `-3` grow-retry loops.
 const int _maxBufferBytes = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Shared native-detail plumbing (P2-08): the seam carries the thread-local
+// `ak_engine_last_error` text of the most recent failing call.
+// ---------------------------------------------------------------------------
+
+/// `ak_engine_last_error(engine, buf, cap)` — the shared detail export
+/// every family (engine/pairing/sched) reads after a failing call.
+typedef EngineLastErrorC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, IntPtr);
+
+/// Dart side of [EngineLastErrorC].
+typedef EngineLastErrorDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, int);
+
+/// Reads the NUL-terminated `ak_engine_last_error` message through a
+/// resolved binding function with the shared lossless `-3` grow loop —
+/// the pattern of `engine.dart`'s `_exceptionFor`. The engine handle is
+/// never dereferenced (thread-local storage), and '' means "no detail".
+String readEngineLastError(
+    int Function(Pointer<AkEngine>, Pointer<Uint8>, int) lastError,
+    Pointer<AkEngine> engine) {
+  var capacity = 256;
+  while (capacity <= _maxBufferBytes) {
+    final buf = processAllocator.allocate<Uint8>(capacity);
+    try {
+      final code = lastError(engine, buf, capacity);
+      if (code >= 0) {
+        return fromNativeUtf8(buf);
+      }
+      if (code == AkStatus.errBuffer) {
+        capacity *= 2; // stored message untouched; retry losslessly
+        continue;
+      }
+      return ''; // unreadable detail (e.g. -1): no text to add
+    } finally {
+      processAllocator.free(buf);
+    }
+  }
+  return '';
+}
+
+/// Builds the [AkFfiException] for one negative seam status: the fixed
+/// `what（状态名）` text plus the native detail captured by the seam right
+/// after the failing call (`AkPairingCalls.lastError` /
+/// `AkSchedCalls.lastError`) when one exists (P2-08 — a status code alone
+/// covers several distinct engine failures).
+AkFfiException akCallFailure(
+    int code, String what, String? Function() lastError) {
+  final detail = lastError();
+  return AkFfiException(
+      code,
+      detail == null || detail.isEmpty
+          ? '$what（${AkStatus.name(code)}）'
+          : '$what（${AkStatus.name(code)}）：$detail');
+}
 
 // ---------------------------------------------------------------------------
 // Id helpers (16-byte ids ⇄ 32 hex chars; request ids are the hex form).
@@ -102,6 +158,42 @@ String newRequestId([Random? random]) {
 // ---------------------------------------------------------------------------
 
 final RegExp _hex32 = RegExp(r'^[0-9a-fA-F]{32}$');
+
+final RegExp _ipv4Octet =
+    RegExp(r'^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$');
+final RegExp _digits = RegExp(r'^[0-9]+$');
+final RegExp _v6Body = RegExp(r'^[0-9A-Fa-f:.%]+$');
+
+/// Mirror of the engine's `SocketAddr` parse (the `registry` field here and
+/// the sched `peer` field of `AkSchedEnqueueSpec`): IPv4 dotted quad or a
+/// bracketed IPv6 literal with a 1..=65535 port, hostname-free (mirrors
+/// `ffi_json.dart`).
+bool isIpPortAddress(String text) {
+  bool portOk(String port) {
+    if (port.isEmpty || port.length > 5 || !_digits.hasMatch(port)) {
+      return false;
+    }
+    return int.parse(port) <= 65535;
+  }
+
+  if (text.startsWith('[')) {
+    final close = text.indexOf(']');
+    if (close < 2 || close + 1 >= text.length || text[close + 1] != ':') {
+      return false;
+    }
+    final host = text.substring(1, close);
+    return _v6Body.hasMatch(host) && portOk(text.substring(close + 2));
+  }
+  final colon = text.lastIndexOf(':');
+  if (colon <= 0) {
+    return false;
+  }
+  final octets = text.substring(0, colon).split('.');
+  if (octets.length != 4 || !octets.every(_ipv4Octet.hasMatch)) {
+    return false;
+  }
+  return portOk(text.substring(colon + 1));
+}
 
 void _checkRequestId(String requestId) {
   if (!_hex32.hasMatch(requestId)) {
@@ -157,7 +249,7 @@ class AkPairingStartSpec {
     if (registry.isEmpty || registry == 'ip:port') {
       throw const AkSpecException('字段 "registry" 必须是 ip:port 地址');
     }
-    if (!_isIpPort(registry)) {
+    if (!isIpPortAddress(registry)) {
       throw AkSpecException('字段 "registry" 不是 ip:port 地址："$registry"');
     }
     // Registry pin is the raw 32-byte Ed25519 public key = 64 hex chars
@@ -188,40 +280,6 @@ class AkPairingStartSpec {
 
   /// Compact spec JSON for `ak_pairing_start`.
   String toJsonString() => jsonEncode(toJson());
-
-  static final RegExp _ipv4Octet =
-      RegExp(r'^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$');
-  static final RegExp _digits = RegExp(r'^[0-9]+$');
-  static final RegExp _v6Body = RegExp(r'^[0-9A-Fa-f:.%]+$');
-
-  /// Mirror of the engine's `SocketAddr` parse: IPv4 dotted quad or a
-  /// bracketed IPv6 literal, hostname-free (mirrors `ffi_json.dart`).
-  static bool _isIpPort(String text) {
-    bool portOk(String port) {
-      if (port.isEmpty || port.length > 5 || !_digits.hasMatch(port)) {
-        return false;
-      }
-      return int.parse(port) <= 65535;
-    }
-
-    if (text.startsWith('[')) {
-      final close = text.indexOf(']');
-      if (close < 2 || close + 1 >= text.length || text[close + 1] != ':') {
-        return false;
-      }
-      final host = text.substring(1, close);
-      return _v6Body.hasMatch(host) && portOk(text.substring(close + 2));
-    }
-    final colon = text.lastIndexOf(':');
-    if (colon <= 0) {
-      return false;
-    }
-    final octets = text.substring(0, colon).split('.');
-    if (octets.length != 4 || !octets.every(_ipv4Octet.hasMatch)) {
-      return false;
-    }
-    return portOk(text.substring(colon + 1));
-  }
 }
 
 /// Builder for the `ak_pairing_create_start` spec (engine shape):
@@ -412,6 +470,14 @@ abstract interface class AkPairingCalls {
 
   /// `ak_pairing_stop_start`: 0 accepted (op id written).
   int stopStart(Uint8List runtimeId, Uint8List opIdOut);
+
+  /// The native error detail of the most recent negative status, or null
+  /// (P2-08): the BINDINGS layer reads the thread-local
+  /// `ak_engine_last_error` IMMEDIATELY after the failing call — before
+  /// any later native call can overwrite it — and hands the text back
+  /// here so the friendly layer can build honest error messages. Fakes
+  /// return their scripted detail (status code AND text on one seam).
+  String? lastError();
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +565,10 @@ final class AkPairingFfiBindings implements AkPairingCalls {
     // resolved opportunistically so the class stays usable against the
     // current DLL.
     _stopStart = _tryStopStart();
+    // P2-08: the shared last-error read used right after every failing
+    // call (never dereferences the engine — thread-local storage).
+    _engineLastError = _library.lookupFunction<EngineLastErrorC,
+        EngineLastErrorDart>('ak_engine_last_error');
   }
 
   final Pointer<AkEngine> _engine;
@@ -512,7 +582,26 @@ final class AkPairingFfiBindings implements AkPairingCalls {
   late final _IdBufDart _opResult;
   late final _EventBufDart _pollEvent;
   late final _TwoIdsDart _cancelOp;
+  late final EngineLastErrorDart _engineLastError;
   _IdInOutDart? _stopStart;
+
+  /// The native detail captured right after the most recent failing call
+  /// (null when the last call did not fail or carried no text).
+  String? _lastErrorDetail;
+
+  /// Captures the thread-local `ak_engine_last_error` IMMEDIATELY after a
+  /// negative return — before any later native call can overwrite it
+  /// (P2-08). `-3` is excluded: the lossless grow loop retries, it is not
+  /// a surfaced failure.
+  int _note(int code) {
+    if (code < 0 && code != AkStatus.errBuffer) {
+      _lastErrorDetail = readEngineLastError(_engineLastError, _engine);
+    }
+    return code;
+  }
+
+  @override
+  String? lastError() => _lastErrorDetail;
 
   _IdInOutDart? _tryStopStart() {
     try {
@@ -546,7 +635,7 @@ final class AkPairingFfiBindings implements AkPairingCalls {
     final spec = toNativeUtf8(specJson);
     final idOut = processAllocator.allocate<Uint8>(akPairingIdLength);
     try {
-      final code = _start(_engine, spec, idOut);
+      final code = _note(_start(_engine, spec, idOut));
       if (code == AkStatus.ok) {
         runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
       }
@@ -583,7 +672,7 @@ final class AkPairingFfiBindings implements AkPairingCalls {
     final spec = toNativeUtf8(specJson);
     final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
     try {
-      final code = invoke(_engine, id, spec, opOut);
+      final code = _note(invoke(_engine, id, spec, opOut));
       if (code == AkStatus.ok) {
         opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
       }
@@ -629,7 +718,7 @@ final class AkPairingFfiBindings implements AkPairingCalls {
     final runtime = _idIn(runtimeId);
     final op = _idIn(opId);
     try {
-      return _cancelOp(_engine, runtime, op);
+      return _note(_cancelOp(_engine, runtime, op));
     } finally {
       processAllocator.free(op);
       processAllocator.free(runtime);
@@ -647,7 +736,7 @@ final class AkPairingFfiBindings implements AkPairingCalls {
     final runtime = _idIn(runtimeId);
     final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
     try {
-      final code = invoke(_engine, runtime, opOut);
+      final code = _note(invoke(_engine, runtime, opOut));
       if (code == AkStatus.ok) {
         opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
       }
@@ -677,7 +766,7 @@ final class AkPairingFfiBindings implements AkPairingCalls {
       int cap) {
     final buf = processAllocator.allocate<Uint8>(cap);
     try {
-      final code = invoke(buf, cap);
+      final code = _note(invoke(buf, cap));
       if (code > 0) {
         var length = 0;
         while (length < cap && buf[length] != 0) {
@@ -754,7 +843,7 @@ final class PairingOpHandle {
   /// One poll: `AK_PENDING` → pending, `AK_DONE/AK_EVENT` → decoded JSON,
   /// `AK_FAILED` → failed JSON, `-3` grows the buffer and retries
   /// (nothing was consumed), other negatives throw [AkFfiException]
-  /// carrying the last error.
+  /// carrying the native last-error detail (P2-08).
   PairingOpResult poll() {
     var capacity = 256;
     while (capacity <= _maxBufferBytes) {
@@ -773,8 +862,7 @@ final class PairingOpHandle {
           capacity *= 2; // nothing consumed; retry losslessly
           continue;
         default:
-          throw AkFfiException(
-              code, '$symbol 结果轮询失败（${AkStatus.name(code)}）');
+          throw akCallFailure(code, '$symbol 结果轮询失败', _calls.lastError);
       }
     }
     throw StateError('$symbol 结果超过 $_maxBufferBytes 字节');
@@ -783,14 +871,23 @@ final class PairingOpHandle {
   /// Polls until the op settles and returns the done JSON map; a failed op
   /// throws [AkFfiException] carrying the engine error. [delay] is
   /// injectable so tests drive the loop without real timers.
+  ///
+  /// [ensureLive] is the P1-05 lifecycle hook: it runs at the TOP of every
+  /// loop iteration — i.e. after EVERY await — BEFORE the next native
+  /// poll. A caller that owns the engine's lifetime (e.g. the Flutter
+  /// service during dispose) passes a closure that throws once the owner
+  /// is released, so a dispose between two polls can never reach the
+  /// engine with a stale handle.
   Future<Map<String, dynamic>> wait({
     Duration interval = const Duration(milliseconds: 200),
     Duration timeout = const Duration(seconds: 30),
     Future<void> Function(Duration)? delay,
+    void Function()? ensureLive,
   }) async {
     final wait = delay ?? Future<void>.delayed;
     final deadline = DateTime.now().add(timeout);
     while (true) {
+      ensureLive?.call(); // disposed owner: abort BEFORE any native call
       final result = poll();
       if (result.isDone) {
         return result.map!;
@@ -823,8 +920,7 @@ final class PairingFfi {
     final runtimeId = Uint8List(akPairingIdLength);
     final code = _calls.start(spec.toJsonString(), runtimeId);
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_pairing_start 未受理（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_pairing_start 未受理', _calls.lastError);
     }
     return PairingRuntimeFfi._(_calls, runtimeId);
   }
@@ -893,8 +989,7 @@ final class PairingRuntimeFfi {
   void cancelOp(PairingOpHandle op) {
     final code = _calls.cancelOp(runtimeId, op.opId);
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_pairing_cancel_op 失败（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_pairing_cancel_op 失败', _calls.lastError);
     }
   }
 
@@ -908,8 +1003,7 @@ final class PairingRuntimeFfi {
     final opOut = Uint8List(akPairingIdLength);
     final code = invoke(opOut);
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, '$symbol 未受理（${AkStatus.name(code)}）');
+      throw akCallFailure(code, '$symbol 未受理', _calls.lastError);
     }
     return PairingOpHandle._(_calls, runtimeId, opOut, kind, symbol);
   }
@@ -932,7 +1026,7 @@ final class PairingRuntimeFfi {
         capacity *= 2; // event stays queued; retry losslessly
         continue;
       }
-      throw AkFfiException(code, '$symbol 失败（${AkStatus.name(code)}）');
+      throw akCallFailure(code, '$symbol 失败', _calls.lastError);
     }
     throw StateError('$symbol 事件超过 $_maxBufferBytes 字节');
   }

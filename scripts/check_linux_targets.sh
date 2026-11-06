@@ -38,7 +38,9 @@ PURE_PACKAGES="-p ak-core -p ak-wire"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # cargo/rustup live in ~/.cargo/bin; prepend it when present (idempotent).
-if [ -d "$USERPROFILE/.cargo/bin" ]; then
+# USERPROFILE is Windows-only — plain Linux hosts don't define it, and
+# reading it bare under `set -u` would abort the script before it starts.
+if [ -n "${USERPROFILE:-}" ] && [ -d "$USERPROFILE/.cargo/bin" ]; then
   case ":$PATH:" in
     *":$USERPROFILE/.cargo/bin:"*) ;;
     *) export PATH="$USERPROFILE/.cargo/bin:$PATH" ;;
@@ -74,11 +76,17 @@ else
   elif grep -q "failed to run custom build command" "$log"; then
     status="BLOCKED"
     note="host env: $(first_error_line "$log")"
-    # Corroborate: the C-free pure-Rust subset should still check.
+    # Corroborate: the C-free pure-Rust subset should still check. A
+    # FAILURE here is a REAL code error (ak-core/ak-wire compile without
+    # any C toolchain), so it must ESCALATE the whole run to FAIL — the
+    # BLOCKED status only covers environment problems, and reporting
+    # "blocked, non-failure" while the script itself observed rustc
+    # errors would hide them (P2-12).
     if cargo check $PURE_PACKAGES --target "$TARGET" \
         >"$LOGDIR/check-$TARGET-pure.ffi.log" 2>&1; then
       note="$note; pure subset {ak-core,ak-wire} PASS"
     else
+      status="FAIL"
       note="$note; pure subset {ak-core,ak-wire} FAIL: $(first_error_line "$LOGDIR/check-$TARGET-pure.ffi.log")"
     fi
   else

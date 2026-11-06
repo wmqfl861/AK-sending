@@ -30,9 +30,9 @@ use ak_ffi::{
     ak_pairing_poll_event, ak_pairing_redeem_start, ak_pairing_revoke_start, ak_pairing_start,
     ak_pairing_stop_start, ak_poll_progress, ak_receive_start, ak_sched_cancel, ak_sched_enqueue,
     ak_sched_listen_start, ak_sched_poll_event, ak_sched_retry, ak_sched_set_policy,
-    ak_sched_shutdown_start, ak_sched_snapshot, ak_sched_start, ak_sched_task_result, AkEngine,
-    AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND, AK_ERR_NULL, AK_EVENT, AK_FAILED,
-    AK_OK, AK_PENDING,
+    ak_sched_shutdown_start, ak_sched_snapshot, ak_sched_start, ak_sched_task_result,
+    ak_send_start, ak_version, AkEngine, AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NOT_FOUND,
+    AK_ERR_NULL, AK_EVENT, AK_FAILED, AK_OK, AK_PENDING,
 };
 
 // ---------------------------------------------------------------------------
@@ -1517,4 +1517,382 @@ fn sched_shutdown_and_pairing_stop_lifecycle() {
         ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
         AK_OK
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 26: P1-04 stop-race, P2-05 policy caps, P2-07 enqueue idempotency,
+// P2-08 sync error propagation.
+// ---------------------------------------------------------------------------
+
+/// A one-shot TCP proxy in front of the real registry whose first
+/// connection is held back until `release` fires: the pairing TLS
+/// handshake cannot complete while the gate is closed, so a runtime
+/// started through the proxy stays in `Starting` for exactly as long as
+/// the test wants (the P1-04 window).
+struct GatedRegistryProxy {
+    addr: std::net::SocketAddr,
+    release: mpsc::Sender<()>,
+}
+
+fn gated_registry_proxy(real: std::net::SocketAddr) -> GatedRegistryProxy {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+    let addr = listener.local_addr().expect("proxy addr");
+    let (release, gate) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(client) = stream else { break };
+            let Ok(upstream) = std::net::TcpStream::connect(real) else {
+                continue;
+            };
+            // Hold EVERYTHING back until the gate opens.
+            if gate.recv().is_err() {
+                break;
+            }
+            let Ok(mut up_read) = upstream.try_clone() else { break };
+            let Ok(mut client_read) = client.try_clone() else { break };
+            let Ok(mut client_write) = client.try_clone() else { break };
+            let Ok(mut up_write) = upstream.try_clone() else { break };
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut client_read, &mut up_write);
+            });
+            let _ = std::io::copy(&mut up_read, &mut client_write);
+        }
+    });
+    GatedRegistryProxy { addr, release }
+}
+
+/// P1-04: stopping a pairing runtime WHILE its background connect is
+/// still in flight must be final — the delayed connection completing
+/// afterwards can neither install the live client nor flip the phase to
+/// Ready nor emit `runtime_ready`. With the pre-fix code the connect task
+/// was unregistered (unabortable) and installed unconditionally, so the
+/// runtime came back online after a successful stop.
+#[test]
+fn pairing_stop_during_starting_prevents_late_connect_resurrection() {
+    let registry = TestRegistry::spawn();
+    let proxy = gated_registry_proxy(registry.addr);
+    let engine = ak_engine_new();
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let spec = CString::new(format!(
+        "{{\"registry\":\"{}\",\"registry_id\":{},\"id_dir\":{},\"device_name\":\"ffi-device\"}}",
+        proxy.addr,
+        jstr(&registry.id_hex()),
+        path_jstr(&dir),
+    ))
+    .unwrap();
+    let mut runtime_id = [0u8; 16];
+    assert_eq!(
+        ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+        AK_OK
+    );
+
+    // The connect is gated, so the runtime is Starting: stop it NOW,
+    // before the TLS handshake ever completes.
+    let mut stop_op = [0u8; 16];
+    assert_eq!(
+        ak_pairing_stop_start(engine, runtime_id.as_ptr(), stop_op.as_mut_ptr()),
+        AK_OK
+    );
+    let (code, stopped) = wait_op_result(engine, &runtime_id, &stop_op);
+    assert_eq!(code, AK_DONE, "{stopped}");
+    assert!(stopped.starts_with("{\"op\":\"stop\""), "{stopped}");
+    assert!(
+        wait_event(engine, &runtime_id, "runtime_stopped", 5).contains("runtime_stopped")
+    );
+
+    // NOW the delayed connect completes on the wire. The resurrection
+    // window is open: give it real time to misbehave in.
+    proxy.release.send(()).expect("gate opens");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let mut buf = [0 as c_char; 512];
+        let code = ak_pairing_poll_event(
+            engine,
+            runtime_id.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        );
+        assert!(code == AK_EVENT || code == AK_PENDING, "poll code {code}");
+        if code == AK_EVENT {
+            let line = cbuf_to_string(&buf);
+            assert!(
+                !line.contains("runtime_ready"),
+                "a stopped runtime came back online: {line}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // New ops fail fast with the frozen stop reason.
+    let (code, json) = run_op(
+        engine,
+        &runtime_id,
+        Op::Create("{\"spec_version\":1,\"ttl_secs\":0}"),
+    );
+    assert_eq!(code, AK_FAILED, "{json}");
+    assert!(json.contains("stopped by caller"), "{json}");
+
+    // A second stop stays accepted and idempotent.
+    let mut again = [0u8; 16];
+    assert_eq!(
+        ak_pairing_stop_start(engine, runtime_id.as_ptr(), again.as_mut_ptr()),
+        AK_OK
+    );
+    ak_engine_free(engine);
+}
+
+/// P1-04 (doc-contradiction half): accepted op results stay readable
+/// after the runtime was stopped — `sched_ext` documents exactly that;
+/// the old teardown wiped the op table (`ops.clear()`), answering `-4`.
+#[test]
+fn pairing_stop_keeps_finished_op_results_readable() {
+    let pair = paired_fixture();
+    let spec = CString::new("{\"spec_version\":1,\"ttl_secs\":0}").unwrap();
+    let mut op_id = [0u8; 16];
+    assert_eq!(
+        ak_pairing_create_start(
+            pair.engine,
+            pair.b.as_ptr(),
+            spec.as_ptr(),
+            op_id.as_mut_ptr(),
+        ),
+        AK_OK
+    );
+    let (code, before) = wait_op_result(pair.engine, &pair.b, &op_id);
+    assert_eq!(code, AK_DONE, "{before}");
+    let code_text = field_str(&before, "code");
+
+    let mut stop_op = [0u8; 16];
+    assert_eq!(
+        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        AK_OK
+    );
+    let (code, stopped) = wait_op_result(pair.engine, &pair.b, &stop_op);
+    assert_eq!(code, AK_DONE, "{stopped}");
+
+    let mut buf = [0 as c_char; 8192];
+    assert_eq!(
+        ak_pairing_op_result(
+            pair.engine,
+            pair.b.as_ptr(),
+            op_id.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        ),
+        AK_DONE,
+        "a finished op must survive the stop of its runtime"
+    );
+    let after = cbuf_to_string(&buf);
+    assert!(after.contains(&code_text), "{after}");
+}
+
+/// P2-05: the three wave-24 caps (max_active_tasks,
+/// max_queued_tasks_per_code, max_pending_admissions) flow through the
+/// FFI into the live policy and back out of the snapshot; a field outside
+/// the frozen set is `-2` (never accepted-then-ignored); range and
+/// coupling violations are `-2`.
+#[test]
+fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
+    let pair = paired_fixture();
+    let spec = CString::new(format!(
+        "{{\"runtime_id\":\"{}\",\"same_code\":\"parallel\",\"cross_code\":\"parallel\",\
+         \"max_active_tasks_per_code\":2,\"max_active_code_groups\":3,\"max_queued_tasks\":40,\
+         \"max_active_tasks\":5,\"max_queued_tasks_per_code\":6,\"max_pending_admissions\":7}}",
+        hex16(&pair.a),
+    ))
+    .unwrap();
+    assert_eq!(ak_sched_start(pair.engine, spec.as_ptr()), AK_OK);
+
+    let (code, json) = snapshot_text(pair.engine);
+    assert_eq!(code, AK_DONE, "{json}");
+    assert_eq!(field_u64(&json, "max_active_tasks"), 5, "{json}");
+    assert_eq!(field_u64(&json, "max_queued_tasks_per_code"), 6, "{json}");
+    assert_eq!(field_u64(&json, "max_pending_admissions"), 7, "{json}");
+    assert_eq!(field_u64(&json, "max_active_tasks_per_code"), 2, "{json}");
+    assert_eq!(field_u64(&json, "max_active_code_groups"), 3, "{json}");
+    assert_eq!(field_u64(&json, "max_queued_tasks"), 40, "{json}");
+
+    // Dynamic switch of the wave-24 caps takes effect.
+    let policy = CString::new(
+        "{\"max_active_tasks\":1,\"max_queued_tasks_per_code\":2,\"max_pending_admissions\":3}",
+    )
+    .unwrap();
+    assert_eq!(ak_sched_set_policy(pair.engine, policy.as_ptr()), AK_OK);
+    let json = snapshot_until(pair.engine, |json| field_u64(json, "max_active_tasks") == 1, 10);
+    assert_eq!(field_u64(&json, "max_queued_tasks_per_code"), 2, "{json}");
+    assert_eq!(field_u64(&json, "max_pending_admissions"), 3, "{json}");
+
+    // Unknown field: explicit -2 with a naming message (P2-05's "不能成功
+    // 后按另一套值执行"), and nothing changed.
+    let unknown = CString::new("{\"max_tasks\":1}").unwrap();
+    assert_eq!(
+        ak_sched_set_policy(pair.engine, unknown.as_ptr()),
+        AK_ERR_INVALID
+    );
+    let last = last_error_text(pair.engine);
+    assert!(last.contains("unknown policy field"), "{last}");
+    let (_, json) = snapshot_text(pair.engine);
+    assert_eq!(field_u64(&json, "max_active_tasks"), 1, "{json}");
+
+    // Out of the frozen range: -2.
+    let big = CString::new("{\"max_active_tasks\":65}").unwrap();
+    assert_eq!(
+        ak_sched_set_policy(pair.engine, big.as_ptr()),
+        AK_ERR_INVALID
+    );
+
+    // Contract §3 coupling: an EXPLICIT per-code queue bound above the
+    // global bound is rejected.
+    let coupled = CString::new("{\"max_queued_tasks\":8,\"max_queued_tasks_per_code\":9}").unwrap();
+    assert_eq!(
+        ak_sched_set_policy(pair.engine, coupled.as_ptr()),
+        AK_ERR_INVALID
+    );
+
+    // A DEFAULTED per-code bound above a shrunk global bound clamps down.
+    let clamp = CString::new("{\"max_queued_tasks\":8}").unwrap();
+    assert_eq!(ak_sched_set_policy(pair.engine, clamp.as_ptr()), AK_OK);
+    let json = snapshot_until(pair.engine, |json| field_u64(json, "max_queued_tasks") == 8, 10);
+    assert_eq!(field_u64(&json, "max_queued_tasks_per_code"), 8, "{json}");
+}
+
+/// P2-07: `ak_sched_enqueue` honors the ffi-v2 §2 `request_id`
+/// idempotency — a replay of the same request returns the ORIGINAL task
+/// id (no second task, dedup before any side effect); the same
+/// request_id with a different spec is `-2`; without a request_id every
+/// call accepts a fresh task.
+#[test]
+fn sched_enqueue_request_id_is_idempotent() {
+    let mut pair = paired_fixture();
+    let sched_spec =
+        CString::new(format!("{{\"runtime_id\":\"{}\",\"same_code\":\"serial\"}}", hex16(&pair.a)))
+            .unwrap();
+    assert_eq!(ak_sched_start(pair.engine, sched_spec.as_ptr()), AK_OK);
+    create_invite_on(&mut pair);
+    let (code, json) = run_op(
+        pair.engine,
+        &pair.a,
+        Op::Redeem(&format!(
+            "{{\"spec_version\":1,\"invite_code\":{}}}",
+            jstr(&pair.invite_code)
+        )),
+    );
+    assert_eq!(code, AK_DONE, "redeem: {json}");
+    let pairing_id = field_str(&json, "pairing_id");
+
+    let src = tempfile::tempdir().expect("src tempdir").keep();
+    let file_a = src.join("a.bin");
+    let file_b = src.join("b.bin");
+    fs::write(&file_a, b"payload-a").expect("write a");
+    fs::write(&file_b, b"payload-b").expect("write b");
+    let request_id = "0123456789abcdef0123456789abcdef";
+
+    let spec_a = format!(
+        "{{\"spec_version\":1,\"request_id\":\"{request_id}\",\"pairing_id\":\"{pairing_id}\",\
+         \"source_roots\":[{}],\"peer\":\"127.0.0.1:1\"}}",
+        path_jstr(&file_a),
+    );
+    // The SAME request with members in a different order — the canonical
+    // form must treat it as identical.
+    let spec_a_reordered = format!(
+        "{{\"peer\":\"127.0.0.1:1\",\"source_roots\":[{}],\
+         \"pairing_id\":\"{pairing_id}\",\"request_id\":\"{request_id}\",\"spec_version\":1}}",
+        path_jstr(&file_a),
+    );
+
+    let mut first = [0u8; 16];
+    let spec = CString::new(spec_a).unwrap();
+    assert_eq!(
+        ak_sched_enqueue(pair.engine, spec.as_ptr(), first.as_mut_ptr()),
+        AK_OK
+    );
+    let mut replay = [0u8; 16];
+    let spec = CString::new(spec_a_reordered).unwrap();
+    assert_eq!(
+        ak_sched_enqueue(pair.engine, spec.as_ptr(), replay.as_mut_ptr()),
+        AK_OK
+    );
+    assert_eq!(
+        first, replay,
+        "the same request_id must replay the original task id"
+    );
+
+    // Same request_id, DIFFERENT spec: -2, named reason, no new task.
+    let spec_conflict = CString::new(format!(
+        "{{\"spec_version\":1,\"request_id\":\"{request_id}\",\"pairing_id\":\"{pairing_id}\",\
+         \"source_roots\":[{}],\"peer\":\"127.0.0.1:1\"}}",
+        path_jstr(&file_b),
+    ))
+    .unwrap();
+    let mut conflict = [0u8; 16];
+    assert_eq!(
+        ak_sched_enqueue(pair.engine, spec_conflict.as_ptr(), conflict.as_mut_ptr()),
+        AK_ERR_INVALID
+    );
+    let last = last_error_text(pair.engine);
+    assert!(last.contains("different spec"), "{last}");
+
+    // Without a request_id no dedup happens: a fresh, distinct task.
+    let spec_fresh = CString::new(format!(
+        "{{\"spec_version\":1,\"pairing_id\":\"{pairing_id}\",\"source_roots\":[{}],\
+         \"peer\":\"127.0.0.1:1\"}}",
+        path_jstr(&file_a),
+    ))
+    .unwrap();
+    let mut fresh = [0u8; 16];
+    assert_eq!(
+        ak_sched_enqueue(pair.engine, spec_fresh.as_ptr(), fresh.as_mut_ptr()),
+        AK_OK
+    );
+    assert_ne!(first, fresh, "an unkeyed enqueue is a new task");
+
+    // Exactly two tasks exist: the replay created nothing.
+    let json = snapshot_until(
+        pair.engine,
+        |json| json.matches("\"state\":\"").count() == 2,
+        15,
+    );
+    assert!(json.contains(&hex16(&first)), "{json}");
+    assert!(json.contains(&hex16(&fresh)), "{json}");
+}
+
+/// P2-08 (Rust side): every synchronous failure path records a
+/// thread-local last-error message — the status code alone is never the
+/// whole answer. Representative -1/-2/-3/-4 paths.
+#[test]
+fn synchronous_failure_paths_leave_last_error_messages() {
+    let engine = ak_engine_new();
+
+    // -1: null output pointer (argument validation).
+    let spec = CString::new("{}").unwrap();
+    assert_eq!(
+        ak_sched_enqueue(engine, spec.as_ptr(), std::ptr::null_mut()),
+        AK_ERR_NULL
+    );
+    assert!(!last_error_text(engine).is_empty(), "-1 needs a message");
+
+    // -2: malformed spec JSON.
+    let bad = CString::new("{not json").unwrap();
+    let mut job = [0u8; 16];
+    assert_eq!(
+        ak_send_start(engine, bad.as_ptr(), job.as_mut_ptr()),
+        AK_ERR_INVALID
+    );
+    assert!(!last_error_text(engine).is_empty(), "-2 needs a message");
+
+    // -3: caller buffer too small names the needed size.
+    let mut tiny = [0 as c_char; 2];
+    assert_eq!(ak_version(tiny.as_mut_ptr(), tiny.len()), AK_ERR_BUFFER);
+    let last = last_error_text(engine);
+    assert!(last.contains("need"), "the -3 message names the size: {last}");
+
+    // -4: no scheduler runtime on this engine.
+    let mut buf = [0 as c_char; 256];
+    assert_eq!(
+        ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()),
+        AK_ERR_NOT_FOUND
+    );
+    assert!(!last_error_text(engine).is_empty(), "-4 needs a message");
+
+    ak_engine_free(engine);
 }

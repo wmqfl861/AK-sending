@@ -34,26 +34,46 @@
 //! `Finished { Failed { code } }` with a stable
 //! [`ErrorCode`](ak_core::error::ErrorCode) classification.
 //!
-//! Cancellation: the engine kernel has no cooperative cancel handle, so
-//! `cancel` aborts the spawned engine task (part files and checkpoints
-//! stay behind, resumable exactly like a peer drop) and reports
-//! `Failed { CANCELLED }` on its behalf.
+//! Cancellation (P1-03): the engine kernel has no cooperative cancel
+//! handle, so the spawned work task races the kernel future against a
+//! cancel flag. On cancellation it drops the kernel future — releasing
+//! the bound port and stopping staged writes — and only then records and
+//! reports `Failed { CANCELLED }` (part files and checkpoints stay
+//! behind, resumable exactly like a peer drop). A cancellation that races
+//! the final commit loses against the persisted state: when the engine
+//! already saved its terminal `completed` checkpoint (observed as the
+//! `FinalAck { verified: true }` progress, which the kernel emits strictly
+//! after that save and before its bounded FinalAck tail-hold), the work
+//! task lets the kernel finish and reports `Completed`. The work task's
+//! `JoinHandle` stays joinable through [`TransferExecutor::take_work`] so
+//! shutdown can prove the engine exited before answering.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ak_core::error::ErrorCode;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use crate::runtime::error::EngineStartError;
-use crate::runtime::executor::{ProgressSink, TransferExecutor};
+use crate::runtime::executor::{ExecutorWork, ProgressSink, TransferExecutor};
 use crate::runtime::types::{TransferDirection, TransferSpec};
 use crate::scheduler::key::{TaskHandle, TaskId};
 use crate::scheduler::state::{FinishOutcome, TaskPhase};
 
 /// How many finished outcomes stay queryable (per task id, latest wins).
 const MAX_REMEMBERED_OUTCOMES: usize = 8;
+
+/// Grace given to the engine kernel when a cancellation races the final
+/// commit (P1-03). Between the terminal `completed` checkpoint save and
+/// the `FinalAck { verified: true }` progress event the kernel is a few
+/// quick frame writes away from a fully persisted completion; 250 ms lets
+/// that finish (and report `Completed`) while keeping an ordinary
+/// mid-transfer cancel prompt — the drop itself is what stops the port
+/// and the writes, so the bound only delays the synthesized report.
+const FINAL_COMMIT_GRACE: Duration = Duration::from_millis(250);
 
 /// The classified failure of one real transfer attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +101,14 @@ pub enum RealOutcome {
     Failed(RealFailure),
 }
 
-/// Running per-task bookkeeping (for `cancel`).
+/// Running per-task bookkeeping (for `cancel` and `take_work`).
 struct RunningTask {
-    sink: ProgressSink,
-    abort: AbortHandle,
+    /// Cooperative cancellation flag (set by `cancel`).
+    cancel: watch::Sender<bool>,
+    /// The joinable engine-work task (P1-03: cancelable AND awaitable —
+    /// handed to the runtime by `take_work` so shutdown can join the real
+    /// engine before it answers).
+    join: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -237,29 +261,45 @@ impl TransferExecutor for RealTransferExecutor {
             .unwrap_or_else(|| oneshot::channel::<SocketAddr>().0);
 
         // Phase events cross from the engine's synchronous progress
-        // callback into the driver task through an unbounded channel; the
+        // callback into the work task through an unbounded channel; the
         // only event forwarded today is `Transferring` (on `Connected`),
         // so the channel cannot grow without bound.
         let (phase_tx, mut phase_rx) = mpsc::unbounded_channel::<TaskPhase>();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // "The completion is persisted": ak-engine saves the terminal
+        // `completed` checkpoint strictly before emitting
+        // `FinalAck { verified: true }` and before its bounded FinalAck
+        // tail-hold, so this flag is exactly the signal a cancellation
+        // must lose against (P1-03).
+        let final_ack = Arc::new(AtomicBool::new(false));
         let observer = self.observer.clone();
+        let progress_final_ack = Arc::clone(&final_ack);
         let progress = move |progress: ak_engine::Progress| {
             if let Some(observer) = observer.as_ref() {
                 observer(progress.clone());
             }
-            if matches!(progress, ak_engine::Progress::Connected { .. }) {
-                let _ = phase_tx.send(TaskPhase::Transferring);
+            match progress {
+                ak_engine::Progress::Connected { .. } => {
+                    let _ = phase_tx.send(TaskPhase::Transferring);
+                }
+                ak_engine::Progress::FinalAck { verified: true } => {
+                    progress_final_ack.store(true, Ordering::Release);
+                }
+                _ => {}
             }
         };
 
         let task_sink = sink.clone();
         let shared_state = Arc::clone(&self.state);
         let engine_task = tokio::spawn(async move {
+            let mut cancel_rx = cancel_rx;
             task_sink.phase(task, TaskPhase::Scanning).await;
-            let engine_fut = ak_engine::receive_with_addr(engine_spec, &progress, addr_tx);
-            tokio::pin!(engine_fut);
+            let mut engine_fut =
+                Box::pin(ak_engine::receive_with_addr(engine_spec, &progress, addr_tx));
             let mut transferring_reported = false;
             let result = loop {
                 tokio::select! {
+                    biased;
                     phase = phase_rx.recv() => {
                         if let Some(phase) = phase {
                             if phase == TaskPhase::Transferring {
@@ -268,21 +308,45 @@ impl TransferExecutor for RealTransferExecutor {
                             task_sink.phase(task, phase).await;
                         }
                     }
-                    outcome = &mut engine_fut => break outcome,
+                    outcome = &mut engine_fut => break Some(outcome),
+                    _ = cancel_rx.changed() => {
+                        if !*cancel_rx.borrow_and_update() {
+                            continue;
+                        }
+                        if final_ack.load(Ordering::Acquire) {
+                            // Persisted completion: let the kernel finish
+                            // (its FinalAck tail-hold is bounded by the
+                            // engine itself) and report the real outcome —
+                            // never Cancelled (P1-03).
+                            break Some((&mut engine_fut).await);
+                        }
+                        // Final-commit race grace: the completion may be
+                        // a few frame writes from persisting; give it a
+                        // short bounded chance before dropping the kernel.
+                        match tokio::time::timeout(FINAL_COMMIT_GRACE, &mut engine_fut).await {
+                            Ok(outcome) => break Some(outcome),
+                            Err(_grace_elapsed) => break None,
+                        }
+                    }
                 }
             };
+            // Drop the kernel BEFORE recording and reporting (P1-03): the
+            // bound port is released and staged writes stop here, so by
+            // the time the runtime can observe this task's outcome the
+            // real engine work is already off the wire. Part files and
+            // checkpoints stay behind, resumable exactly like a peer drop.
+            drop(engine_fut);
             // Record the outcome in a lexically-scoped block: a std
             // MutexGuard must never sit across an await point, and the
             // block boundary makes that provable for the Send check.
             let failure_code = {
                 let mut state = shared_state.lock().expect("real executor lock");
-                state.running.remove(&id);
                 match result {
-                    Ok(report) => {
+                    Some(Ok(report)) => {
                         Self::record_outcome(&mut state, id, RealOutcome::Completed { report });
                         None
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         let (code, io_kind) = stable_code(&err);
                         Self::record_outcome(
                             &mut state,
@@ -294,6 +358,21 @@ impl TransferExecutor for RealTransferExecutor {
                             }),
                         );
                         Some(code)
+                    }
+                    None => {
+                        // Dropped on cancellation: the work task reports
+                        // the synthesized cancellation on the kernel's
+                        // behalf, strictly after the kernel exited.
+                        Self::record_outcome(
+                            &mut state,
+                            id,
+                            RealOutcome::Failed(RealFailure {
+                                code: ErrorCode::Cancelled,
+                                io_kind: None,
+                                message: "cancelled: the engine kernel was dropped".to_owned(),
+                            }),
+                        );
+                        Some(ErrorCode::Cancelled)
                     }
                 }
             };
@@ -315,42 +394,46 @@ impl TransferExecutor for RealTransferExecutor {
                         .await;
                 }
             }
+            // Self-deregister last (P1-03): `take_work` may hand out the
+            // join handle up to this point; after the removal the work is
+            // done by definition.
+            shared_state
+                .lock()
+                .expect("real executor lock")
+                .running
+                .remove(&id);
         });
 
-        let abort = engine_task.abort_handle();
         self.state
             .lock()
             .expect("real executor lock")
             .running
-            .insert(id, RunningTask { sink, abort });
+            .insert(id, RunningTask {
+                cancel: cancel_tx,
+                join: engine_task,
+            });
         Ok(())
     }
 
     fn cancel(&self, task: &TaskHandle) {
-        let id = task.task_id();
-        let entry = self
-            .state
+        // Cooperative stop (P1-03): the work task observes the flag at its
+        // current await point, drops the engine kernel (releasing the
+        // bound port, stopping writes) and only then records and reports
+        // its outcome. An already-persisted completion is adopted by the
+        // work task itself — never overwritten with Cancelled.
+        let state = self.state.lock().expect("real executor lock");
+        if let Some(running) = state.running.get(&task.task_id()) {
+            let _ = running.cancel.send(true);
+        }
+    }
+
+    fn take_work(&self, task: &TaskHandle) -> Option<ExecutorWork> {
+        self.state
             .lock()
             .expect("real executor lock")
             .running
-            .remove(&id);
-        let Some(entry) = entry else {
-            return;
-        };
-        // Abort the engine kernel (part files/checkpoints stay resumable,
-        // exactly like a peer drop) and report the cancellation on its
-        // behalf — the aborted task can no longer report itself.
-        entry.abort.abort();
-        let sink = entry.sink;
-        tokio::spawn(async move {
-            sink.finished(
-                TaskHandle::new(id),
-                FinishOutcome::Failed {
-                    error: ErrorCode::Cancelled,
-                },
-            )
-            .await;
-        });
+            .remove(&task.task_id())
+            .map(|running| ExecutorWork::new(running.join))
     }
 }
 
@@ -360,11 +443,335 @@ mod tests {
     use crate::runtime::actor::{test_command_channel, Command};
     use crate::runtime::executor::ExecutorReport;
     use crate::runtime::types::PairingPlan;
+    use crate::runtime::{
+        FakePairingTransport, FakeTransferExecutor, PairingTransport, RealClock, RuntimeClock,
+        RuntimeConfig, SessionRuntime, ShutdownMode, SnapshotQuery, TaskState,
+    };
+    use crate::scheduler::config::SchedulerPolicy;
     use crate::scheduler::key::{CodeGroupKey, CodeId, RegistryId};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn group() -> CodeGroupKey {
         CodeGroupKey::new(RegistryId::from_bytes([7; 32]), CodeId::from_bytes([9; 16]))
+    }
+
+    /// A real receive spec bound to an auto-assigned loopback port with a
+    /// generous idle budget (the tests cancel/shutdown on purpose).
+    fn loopback_spec(out: &std::path::Path) -> ak_engine::ReceiveSpec {
+        let key_b = ak_identity::DeviceKeyPair::generate();
+        let identity_b = ak_identity::tls::make_self_signed(&key_b);
+        let mut spec = ak_engine::ReceiveSpec::new(out.to_owned(), identity_b);
+        spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        spec.idle_timeout = Duration::from_secs(20);
+        spec.authorize = Box::new(|_| true);
+        spec
+    }
+
+    /// A runtime with the real clock and a real receive executor armed for
+    /// `PairingPlan::Local` (the daemon's resident receive shape), plus
+    /// the port it bound and the task id it runs under.
+    async fn real_receive_runtime(
+        out: &std::path::Path,
+        shutdown_timeout_ms: u64,
+    ) -> (
+        crate::runtime::SessionHandle,
+        Arc<RealTransferExecutor>,
+        crate::runtime::TransferId,
+        SocketAddr,
+    ) {
+        let (addr_tx, addr_rx) = oneshot::channel();
+        let executor = Arc::new(RealTransferExecutor::receive(
+            loopback_spec(out),
+            Some(addr_tx),
+            None,
+        ));
+        let clock = RealClock::shared();
+        let mut config = RuntimeConfig::new(
+            SchedulerPolicy::default(),
+            Arc::clone(&clock) as Arc<dyn RuntimeClock>,
+            Arc::new(FakePairingTransport::new(true)) as Arc<dyn PairingTransport>,
+            Arc::new(FakeTransferExecutor::new(clock)) as Arc<dyn TransferExecutor>,
+            RegistryId::from_bytes([0x11; 32]),
+        );
+        config.listener_enabled = false;
+        config.shutdown_timeout_ms = shutdown_timeout_ms;
+        let handle = SessionRuntime::start(config).expect("runtime starts");
+        let task = handle
+            .enqueue(TransferSpec {
+                group_key: group(),
+                pairing: PairingPlan::Local,
+                executor: executor.clone() as Arc<dyn TransferExecutor>,
+                direction: TransferDirection::Receive,
+                label: "real-accept".to_owned(),
+                task_id: None,
+            })
+            .await
+            .expect("real receive task submitted");
+        let bound = tokio::time::timeout(Duration::from_secs(10), addr_rx)
+            .await
+            .expect("the engine binds its address")
+            .expect("addr delivered");
+        (handle, executor, task, bound)
+    }
+
+    /// P1-03: a Drain shutdown whose deadline expires while the real
+    /// engine sits in `accept` must stop AND join that engine before the
+    /// summary is answered — when `shutdown` returns, the UDP port is
+    /// already free (a fresh bind succeeds) and the task carries a real
+    /// recorded cancellation outcome, not a synthesized-after-the-fact
+    /// state on a still-running engine.
+    #[tokio::test]
+    async fn drain_timeout_releases_the_real_bound_port_before_answering() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (handle, executor, task, bound) =
+            real_receive_runtime(&out, 400).await;
+
+        let summary = tokio::time::timeout(
+            Duration::from_secs(15),
+            handle.shutdown(ShutdownMode::Drain),
+        )
+        .await
+        .expect("shutdown answers once the engine joined")
+        .expect("shutdown succeeds");
+        assert!(summary.timed_out, "the accept never finishes on its own");
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(summary.completed, 0);
+
+        // The engine kernel exited before the summary: rebinding the
+        // exact bound address must succeed immediately (no sleep, no
+        // retry — the join in the actor's shutdown path is the guarantee).
+        std::net::UdpSocket::bind(bound)
+            .expect("the real engine released its bound port before the summary");
+        assert!(
+            executor.is_settled(&task),
+            "the engine work recorded its outcome"
+        );
+        match executor.outcome(&task) {
+            Some(RealOutcome::Failed(failure)) => {
+                assert_eq!(failure.code, ErrorCode::Cancelled);
+            }
+            other => panic!("expected a cancelled outcome, got {other:?}"),
+        }
+    }
+
+    /// P1-03: cancelling a running real receive joins the engine work.
+    /// The work handle is taken right after the (cooperative) cancel and
+    /// joined: it resolves only after the kernel dropped (port free) and
+    /// the outcome was recorded — and only then does the work task send
+    /// its synthesized cancellation report.
+    #[tokio::test]
+    async fn cancel_running_real_task_joins_work_and_releases_the_port() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (addr_tx, addr_rx) = oneshot::channel();
+        let executor = Arc::new(RealTransferExecutor::receive(
+            loopback_spec(&out),
+            Some(addr_tx),
+            None,
+        ));
+        let (cmd_tx, mut cmd_rx) = test_command_channel();
+        let handle = TaskHandle::new(TaskId::from_counter(31));
+        executor
+            .enqueue(
+                handle,
+                TransferSpec {
+                    group_key: group(),
+                    pairing: PairingPlan::Local,
+                    executor: executor.clone() as Arc<dyn TransferExecutor>,
+                    direction: TransferDirection::Receive,
+                    label: "cancel-join".to_owned(),
+                    task_id: None,
+                },
+                ProgressSink::new(cmd_tx),
+            )
+            .expect("enqueue starts the engine task");
+        let bound = tokio::time::timeout(Duration::from_secs(10), addr_rx)
+            .await
+            .expect("bound in time")
+            .expect("addr delivered");
+
+        // Stop and take the work handle in one synchronous stretch (no
+        // await between the calls, so the engine cannot have exited).
+        executor.cancel(&handle);
+        let work = executor
+            .take_work(&handle)
+            .expect("the running engine work is joinable");
+        work.join_within(Duration::from_secs(5), Duration::from_secs(5))
+            .await;
+
+        // Joined ⇒ the kernel dropped (port free) and the outcome is
+        // recorded; the report follows strictly after the exit.
+        assert!(executor.is_settled(&handle.task_id()));
+        match executor.outcome(&handle.task_id()) {
+            Some(RealOutcome::Failed(failure)) => {
+                assert_eq!(failure.code, ErrorCode::Cancelled);
+            }
+            other => panic!("expected a cancelled outcome, got {other:?}"),
+        }
+        std::net::UdpSocket::bind(bound)
+            .expect("the real engine released its bound port on cancel");
+        let mut cancelled_report = None;
+        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let Command::Report(ExecutorReport::Finished { outcome, .. }) = cmd {
+                    cancelled_report = Some(outcome);
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(reported.is_ok(), "the work task reported its cancellation");
+        assert_eq!(
+            cancelled_report,
+            Some(FinishOutcome::Failed {
+                error: ErrorCode::Cancelled
+            })
+        );
+    }
+
+    /// P1-03 (runtime path): a user cancel of a running real receive
+    /// finalizes to `Cancelled` strictly from the executor's report —
+    /// which the engine task sends only after dropping the kernel. When
+    /// the snapshot says `Cancelled`, the port is already free.
+    #[tokio::test]
+    async fn runtime_cancel_of_real_receive_finalizes_cancelled_and_frees_the_port() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (handle, executor, task, bound) = real_receive_runtime(&out, 10_000).await;
+
+        let receipt = handle.cancel(task).await.expect("cancel the task");
+        assert_eq!(receipt, crate::runtime::CancelReceipt::RunningCancellationRequested);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = handle
+                .snapshot(SnapshotQuery::one(task))
+                .await
+                .expect("snapshot");
+            if snap
+                .tasks
+                .iter()
+                .any(|view| view.state == TaskState::Cancelled)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "task never reached Cancelled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Cancelled is only reachable via the executor's report, sent
+        // strictly after the kernel dropped: the port must rebind now.
+        std::net::UdpSocket::bind(bound)
+            .expect("the real engine released its bound port before Cancelled");
+        match executor.outcome(&task) {
+            Some(RealOutcome::Failed(failure)) => {
+                assert_eq!(failure.code, ErrorCode::Cancelled);
+            }
+            other => panic!("expected a cancelled outcome, got {other:?}"),
+        }
+        let _ = handle.shutdown(ShutdownMode::Drain).await;
+    }
+
+    /// P1-03: a cancellation racing the final commit must not override a
+    /// persisted completion. The observer fires `cancel` exactly when the
+    /// engine emits `FinalAck { verified: true }` — strictly after the
+    /// terminal `completed` checkpoint was saved, while the kernel is
+    /// still finishing its FinalAck tail. The task must end `Completed`
+    /// with the real report, never `Cancelled`.
+    #[tokio::test]
+    async fn cancel_racing_the_final_commit_keeps_the_persisted_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 199) as u8).collect();
+        std::fs::write(src.join("payload.bin"), &payload).unwrap();
+
+        // The observer needs the executor before it exists; bridge the
+        // cancel through a slot filled right after construction.
+        type CancelSlot = Arc<Mutex<Option<(Arc<RealTransferExecutor>, TaskHandle)>>>;
+        let cancel_slot: CancelSlot = Arc::new(Mutex::new(None));
+        let observer = {
+            let cancel_slot = Arc::clone(&cancel_slot);
+            Arc::new(move |progress: ak_engine::Progress| {
+                if matches!(progress, ak_engine::Progress::FinalAck { verified: true }) {
+                    if let Some((executor, handle)) = cancel_slot.lock().unwrap().as_ref() {
+                        executor.cancel(handle);
+                    }
+                }
+            }) as Arc<dyn Fn(ak_engine::Progress) + Send + Sync>
+        };
+        let (addr_tx, addr_rx) = oneshot::channel();
+        let spec = loopback_spec(&out);
+        let pinned = spec.identity.fingerprint;
+        let executor = Arc::new(RealTransferExecutor::receive(
+            spec,
+            Some(addr_tx),
+            Some(observer),
+        ));
+        let (cmd_tx, mut cmd_rx) = test_command_channel();
+        let sink = ProgressSink::new(cmd_tx);
+        let handle = TaskHandle::new(TaskId::from_counter(21));
+        *cancel_slot.lock().unwrap() = Some((executor.clone(), handle));
+        executor
+            .enqueue(
+                handle,
+                TransferSpec {
+                    group_key: group(),
+                    pairing: PairingPlan::Local,
+                    executor: executor.clone() as Arc<dyn TransferExecutor>,
+                    direction: TransferDirection::Receive,
+                    label: "race".to_owned(),
+                    task_id: None,
+                },
+                sink,
+            )
+            .expect("enqueue starts the engine task");
+
+        let bound = tokio::time::timeout(Duration::from_secs(10), addr_rx)
+            .await
+            .expect("bound in time")
+            .expect("addr delivered");
+        let key_a = ak_identity::DeviceKeyPair::generate();
+        let identity_a = ak_identity::tls::make_self_signed(&key_a);
+        let mut send_spec = ak_engine::SendSpec::new(src, bound, pinned, identity_a);
+        send_spec.idle_timeout = Duration::from_secs(20);
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            ak_engine::send(send_spec, &|_| {}),
+        )
+        .await
+        .expect("send finishes")
+        .expect("send succeeds");
+        assert_eq!(report.files, 1);
+
+        // The cancellation fired mid-completion; the persisted completion
+        // must win: terminal `Completed`, never `Failed { Cancelled }`.
+        let mut finished = None;
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let Command::Report(ExecutorReport::Finished { outcome, .. }) = cmd {
+                    finished = Some(outcome);
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(observed.is_ok(), "the executor reported its finish");
+        assert_eq!(finished, Some(FinishOutcome::Completed));
+        match executor.outcome(&handle.task_id()) {
+            Some(RealOutcome::Completed { report }) => assert_eq!(report.files, 1),
+            other => panic!("expected the persisted completion, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(out.join("payload.bin")).unwrap(),
+            payload,
+            "the committed bytes are identical"
+        );
     }
 
     /// End-to-end on one machine: a real executor (the real engine

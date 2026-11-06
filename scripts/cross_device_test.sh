@@ -22,7 +22,11 @@
 #   --server-port <n>      registry TLS port (default 7200)
 #   --registry-id <64hex>  registry identity pin (`registry-server` prints it)
 #   --ssh-user <name>      SSH login user on the remote Linux box
-#   --ssh-host <ip>        SSH host (= where the registry + ak-cli live)
+#   --ssh-host <ip>        SSH host (= where the registry + ak-cli live).
+#                          host:remote-port is ALWAYS appended last to the
+#                          remote candidate list as the known public entry;
+#                          this assumes the SSH host IS the receiving box --
+#                          when it is only a jump host, use --remote-data-addr
 #   --ssh-port <n>         SSH TCP port (default 22)
 #   --ssh-pass <secret>    SSH password (kept only in a chmod-600 temp file;
 #                          detected backend: sshpass, or python+paramiko)
@@ -35,6 +39,11 @@
 #   --local-addr <ip:port> address the remote should dial for the reverse
 #                          transfer (default: daemon candidates, then the IP
 #                          this machine's SSH connection appears to come from)
+#   --remote-data-addr <a:p> data-plane address of the remote receiver, for
+#                          when --ssh-host is only a jump host AND the
+#                          daemon-advertised candidates are all unreachable;
+#                          appended last (after the ssh-host candidate);
+#                          IPv6 literals must be bracketed ([2001:db8::a]:7300)
 #   --size-mb <n>          payload size per direction in MiB (default 5)
 #   --timeout <secs>       per-attempt send idle budget (default 60)
 #   --binary <path>        local ak-cli (default <repo>/target/release/ak-cli.exe,
@@ -76,6 +85,7 @@ REMOTE_SERVER=""
 REMOTE_PORT=7300
 LOCAL_PORT=7301
 LOCAL_ADDR=""
+REMOTE_DATA_ADDR=""
 SIZE_MB=5
 SEND_TIMEOUT=60
 KEEP=0
@@ -109,6 +119,8 @@ while [ $# -gt 0 ]; do
                    LOCAL_PORT=$2; shift 2 ;;
     --local-addr)  [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
                    LOCAL_ADDR=$2; shift 2 ;;
+    --remote-data-addr) [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
+                   REMOTE_DATA_ADDR=$2; shift 2 ;;
     --size-mb)     [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
                    SIZE_MB=$2; shift 2 ;;
     --timeout)     [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
@@ -154,6 +166,18 @@ if [ -n "$LOCAL_ADDR" ]; then
     0) echo "--local-addr port must be the local daemon's real UDP port (got 0; default is 7301, override with --local-port)" >&2; exit 2 ;;
   esac
 fi
+if [ -n "$REMOTE_DATA_ADDR" ]; then
+  # Same dial-target shape rules as --local-addr: full endpoint, non-zero
+  # port, IPv6 literals bracketed (bare "::1:7300" would mis-split).
+  case "$REMOTE_DATA_ADDR" in
+    \[*\]:[0-9]*) : ;;
+    *:*) : ;;
+    *) echo "--remote-data-addr must look like ip:port (IPv6 as [v6]:port)" >&2; exit 2 ;;
+  esac
+  case "${REMOTE_DATA_ADDR##*:}" in
+    0|'') echo "--remote-data-addr port must be non-zero" >&2; exit 2 ;;
+  esac
+fi
 if [ "$SELF_TEST" -eq 0 ]; then
   missing=""
   [ -n "$SERVER_HOST" ]  || missing="$missing --server-host"
@@ -167,7 +191,19 @@ if [ "$SELF_TEST" -eq 0 ]; then
   fi
 fi
 [ -n "$REMOTE_SERVER" ] || REMOTE_SERVER="127.0.0.1:$SERVER_PORT"
-REGISTRY_ADDR="$SERVER_HOST:$SERVER_PORT"
+# P2-11 fix: single endpoint formatter — a bare IPv6 literal must be
+# bracketed before ":port" is appended or Rust's SocketAddr parser (and
+# every sed/awk consumer) misreads it. All host:port joins go through
+# this helper; inputs already in "[v6]:port" form pass through.
+fmt_endpoint() { # host port -> "host:port" (IPv6 literal bracketed)
+  local host=$1 port=$2
+  case "$host" in
+    \[*\]) printf '%s:%s' "$host" "$port" ;;
+    *:*)   printf '[%s]:%s' "$host" "$port" ;;
+    *)     printf '%s:%s' "$host" "$port" ;;
+  esac
+}
+REGISTRY_ADDR=$(fmt_endpoint "$SERVER_HOST" "$SERVER_PORT")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,6 +242,14 @@ kill_bg() {
 }
 
 cleanup() {
+  # P2-09 fix: decide retention from the ORIGINAL EXIT STATUS captured as
+  # the first statement of the trap. The ERR trap does not inherit into
+  # functions without `set -o errtrace`, so under `set -e` a failing
+  # command inside a function (keygen, invite create, ...) used to exit
+  # with FAILED still 0 and the failure scene was deleted as if the run
+  # had succeeded. Any non-zero exit — command failure, `fail`, or an
+  # interrupt — now keeps every artifact for debugging.
+  local rc=$?
   trap - ERR
   kill_bg "$LOCALD_PID"
   # Remote cleanup FIRST: every remote_run needs $PASSFILE, which is
@@ -213,8 +257,8 @@ cleanup() {
   if [ -n "$RWORK" ]; then
     if [ -n "$SSH_BACKEND" ] && [ "$SSH_BACKEND" != none ]; then
       [ -n "$RPID" ] && remote_run "kill '$RPID' 2>/dev/null; pkill -f '$RWORK' 2>/dev/null" >/dev/null 2>&1 || true
-      if [ "$FAILED" -eq 1 ] || [ "$KEEP" -eq 1 ]; then
-        printf '[cross-device] remote work dir kept: %s\n' "$RWORK" >&2
+      if [ "$rc" -ne 0 ] || [ "$FAILED" -eq 1 ] || [ "$KEEP" -eq 1 ]; then
+        printf '[cross-device] remote work dir kept (exit %s): %s\n' "$rc" "$RWORK" >&2
       else
         remote_run "rm -rf '$RWORK'" >/dev/null 2>&1 || true
       fi
@@ -222,9 +266,9 @@ cleanup() {
   fi
   rm -f "$PASSFILE" 2>/dev/null || true
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
-    if [ "$FAILED" -eq 1 ]; then
+    if [ "$rc" -ne 0 ] || [ "$FAILED" -eq 1 ]; then
       printf '[cross-device] logs kept for inspection: %s\n' "$LOGS" >&2
-      printf '[cross-device] workspace kept: %s\n' "$WORK" >&2
+      printf '[cross-device] workspace kept (exit %s): %s\n' "$rc" "$WORK" >&2
     elif [ "$KEEP" -eq 1 ]; then
       printf '[cross-device] workspace kept (--keep): %s\n' "$WORK"
     else
@@ -233,7 +277,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-trap 'printf "[cross-device] interrupted\n" >&2; exit 130' INT TERM
+# P2-09 fix: an interrupt must also keep the failure scene — mark FAILED
+# before exiting non-zero so both retention signals agree.
+trap 'FAILED=1; printf "[cross-device] interrupted (scene kept)\n" >&2; exit 130' INT TERM
 
 # ---------------------------------------------------------------------------
 # Local binary
@@ -412,12 +458,19 @@ PYEOF
       return 0
     fi
   fi
-  # 1b) No python: sed fallback for the same array (IPv4-shaped candidates).
+  # 1b) No python: sed fallback for the same array. P2-11 fix: the
+  #     `[^]]*` match stops at the FIRST ']' — an IPv6 candidate like
+  #     "[2001:db8::a]:7300" would truncate to "[2001:db8::a" and friends.
+  #     Instead of trusting "non-empty", every parsed line must pass the
+  #     same endpoint-shape check as the python path; anything malformed
+  #     is DROPPED, and an all-invalid parse returns failure (caller
+  #     falls through to the human block) — never truncated addresses.
   if grep -q '"candidates":\[' "$file" 2>/dev/null; then
     local legacy
     legacy=$(grep -o '"candidates":\[[^]]*\]' "$file" | head -1 \
       | sed -e 's/^"candidates":\[//' -e 's/\]$//' \
-      | tr ',' '\n' | tr -d '" ' | grep -v '^$' || true)
+      | tr ',' '\n' | tr -d '" ' \
+      | grep -E '^\[?[0-9A-Fa-f:.]+\]?:[0-9]+$' || true)
     if [ -n "$legacy" ]; then
       printf '%s\n' "$legacy"
       return 0
@@ -489,7 +542,7 @@ make_workspace() {
 self_test() {
   local sub
 
-  step "s1/6 argument parsing + validation"
+  step "s1/7 argument parsing + validation"
   sub=0; bash "$0" --self-test --definitely-not-an-option >/dev/null 2>&1 || sub=$?
   [ "$sub" -eq 2 ] || fail "unknown option should exit 2, got $sub"
   sub=0; bash "$0" --self-test --size-mb abc >/dev/null 2>&1 || sub=$?
@@ -502,12 +555,12 @@ self_test() {
   [ "$sub" -eq 0 ] || fail "--help should exit 0, got $sub"
   note "5 validation sub-cases behaved (bad option / bad size / short registry id / missing required / --help)"
 
-  step "s2/6 locate ak-cli + version"
+  step "s2/7 locate ak-cli + version"
   locate_binary
   note "binary: $AK_BIN"
   note "version: $("$AK_BIN" --version 2>&1)"
 
-  step "s3/6 identity generation + fingerprint parse"
+  step "s3/7 identity generation + fingerprint parse"
   mkdir -p "$WORK/id"
   "$AK_BIN" --id-dir "$WORK/id" keygen > "$LOGS/keygen.log" 2>&1
   local fp
@@ -515,7 +568,7 @@ self_test() {
   [ ${#fp} -eq 64 ] || fail "keygen fingerprint missing (see $LOGS/keygen.log)"
   note "fingerprint parsed: ${fp:0:16}... (64 hex ok)"
 
-  step "s4/6 payload file creation + sha256"
+  step "s4/7 payload file creation + sha256"
   local bytes=$((SIZE_MB * 1024 * 1024)) digest
   head -c "$bytes" /dev/urandom > "$WORK/payload.bin"
   [ "$(wc -c < "$WORK/payload.bin" | tr -d ' ')" -eq "$bytes" ] \
@@ -532,7 +585,7 @@ self_test() {
   [ "${code:0:5}" = "AKI1-" ] || fail "invite code fixture parse failed: '$code'"
   note "invite code fixture parsed: $code"
 
-  step "s5/6 candidate-address parsing fixtures"
+  step "s5/7 candidate-address parsing fixtures"
   # Fixture A: wave-25 NDJSON listening event with a candidates array
   # (byte-for-byte the shape daemon.rs renders, including an IPv6 entry).
   printf '%s\n' \
@@ -573,8 +626,32 @@ self_test() {
   rfp=$(sed -n 's/^paired with redeemer \([0-9a-f]\{64\}\)$/\1/p' "$LOGS/fix-redeemer.log" | head -1)
   [ ${#rfp} -eq 64 ] || fail "redeemer fingerprint fixture parse failed"
   note "paired-with-redeemer line: 64-hex fingerprint parsed"
+  # Fixture E: fmt_endpoint brackets bare IPv6 literals and passes valid
+  # forms through unchanged (P2-11).
+  [ "$(fmt_endpoint 1.2.3.4 7300)" = "1.2.3.4:7300" ] \
+    || fail "fmt_endpoint mangled an IPv4 endpoint"
+  [ "$(fmt_endpoint 2001:db8::a 7300)" = "[2001:db8::a]:7300" ] \
+    || fail "fmt_endpoint did not bracket a bare IPv6 literal"
+  [ "$(fmt_endpoint '[2001:db8::a]' 7300)" = "[2001:db8::a]:7300" ] \
+    || fail "fmt_endpoint double-bracketed an already-bracketed literal"
+  note "fmt_endpoint: IPv4 passthrough / IPv6 bracket / pre-bracketed passthrough"
+  # Fixture F: the no-python sed fallback must DROP truncated entries (the
+  # [^]]* match cannot span an IPv6 ']' — P2-11) and keep only valid lines;
+  # it must never emit a truncated address as if it parsed fine.
+  local py_save="$PYTHON" sed_cands
+  PYTHON=""
+  sed_cands=$(parse_candidates "$LOGS/fix-ndjson.log" | dedup_lines)
+  [ "$(count_lines "$sed_cands")" -eq 2 ] \
+    || fail "sed fallback should keep 2 valid IPv4 candidates, got: $(printf '%s' "$sed_cands" | tr '\n' ' ')"
+  printf '%s\n' "$sed_cands" | grep -qx '103.236.80.135:53112' \
+    || fail "sed fallback lost a valid IPv4 candidate"
+  if printf '%s\n' "$sed_cands" | grep -q '2001:db8::a'; then
+    fail "sed fallback emitted a truncated IPv6 entry instead of dropping it"
+  fi
+  PYTHON="$py_save"
+  note "sed fallback (no python): truncated IPv6 dropped, 2/2 IPv4 kept"
 
-  step "s6/6 ssh backend detection + helper compile"
+  step "s6/7 ssh backend detection + helper compile"
   detect_ssh_backend
   case "$SSH_BACKEND" in
     sshpass)   note "ssh backend: sshpass + ssh" ;;
@@ -589,6 +666,18 @@ self_test() {
       printf '[cross-device]   install with: pip install paramiko   (or install sshpass)\n' >&2
       ;;
   esac
+
+  step "s7/7 failure-scene retention (P2-09)"
+  # A run that dies mid-flight (here: locate_binary rejects --binary) must
+  # exit non-zero AND keep its workspace — the EXIT trap decides from the
+  # original exit code, not from the ERR trap that never fires inside
+  # functions under `set -e` without errtrace.
+  local sub_rc=0 sub_out
+  sub_out=$(bash "$0" --self-test --binary /nonexistent/ak-cli 2>&1) || sub_rc=$?
+  [ "$sub_rc" -ne 0 ] || fail "bad --binary should exit non-zero"
+  printf '%s' "$sub_out" | grep -q 'workspace kept' \
+    || fail "non-zero exit must keep the workspace (P2-09); tail: $(printf '%s' "$sub_out" | tail -2 | tr '\n' ' ')"
+  note "nested failing run (exit $sub_rc): workspace kept as required"
 
   note "PASS: self-test (no server contacted, no SSH, no transfer)"
   note "workspace (kept only with --keep): $WORK"
@@ -697,10 +786,24 @@ real_run() {
   remote_run_quiet "cat '$RLOG'" > "$LOGS/remote-daemon.log" 2>/dev/null || true
   remote_run_quiet "cat '$RERR'" > "$LOGS/remote-daemon.err" 2>/dev/null || true
   REMOTE_CANDS=$(parse_candidates "$LOGS/remote-daemon.log" | dedup_lines || true)
-  if [ -z "$REMOTE_CANDS" ]; then
-    REMOTE_CANDS="$SSH_HOST:$REMOTE_PORT"
-    note "no advertised candidates (older binary): falling back to $REMOTE_CANDS"
+  [ -n "$REMOTE_CANDS" ] || note "no advertised candidates (older binary)"
+  # P2-10 fix: the ssh-host entry point is appended LAST *unconditionally*,
+  # not only when advertised candidates are empty — behind a 1:1 NAT the
+  # daemon publishes only private IPs and the public ssh entry is then the
+  # sole reachable address, which the old empty-only fallback missed.
+  # Assumes the ssh host IS the receiving box; when it is only a jump host,
+  # pass --remote-data-addr with the receiver's data-plane address.
+  local ssh_entry
+  ssh_entry=$(fmt_endpoint "$SSH_HOST" "$REMOTE_PORT")
+  if [ -n "$REMOTE_DATA_ADDR" ]; then
+    REMOTE_CANDS="${REMOTE_CANDS:+$REMOTE_CANDS
+}$ssh_entry
+$REMOTE_DATA_ADDR"
+  else
+    REMOTE_CANDS="${REMOTE_CANDS:+$REMOTE_CANDS
+}$ssh_entry"
   fi
+  REMOTE_CANDS=$(printf '%s\n' "$REMOTE_CANDS" | dedup_lines)
   note "remote candidates (tried in order):"
   printf '%s\n' "$REMOTE_CANDS" | sed 's/^/    /'
   # Local side: daemon candidates, then the address this SSH connection
@@ -715,7 +818,7 @@ $LOCAL_CANDS"
   fi
   if [ -n "$client_ip" ]; then
     LOCAL_CANDS="${LOCAL_CANDS:+$LOCAL_CANDS
-}$client_ip:$LOCAL_PORT"
+}$(fmt_endpoint "$client_ip" "$LOCAL_PORT")"
   fi
   LOCAL_CANDS=$(printf '%s\n' "$LOCAL_CANDS" | dedup_lines)
   [ -n "$LOCAL_CANDS" ] \

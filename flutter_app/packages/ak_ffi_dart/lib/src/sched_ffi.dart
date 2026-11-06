@@ -14,10 +14,17 @@
 ///                          uint8_t task_id_out[16]);                 // 0 ok
 /// int32_t ak_sched_set_policy(AkEngine*, const char *policy_json);   // 0 ok
 /// int32_t ak_sched_cancel(AkEngine*, const uint8_t task_id[16]);     // 0 ok
-/// int32_t ak_sched_snapshot(AkEngine*, const char *query_json,
-///                          char *buf, size_t cap);                   // 1 json
+/// int32_t ak_sched_snapshot(AkEngine*, char *buf, size_t cap);       // 1 json
 /// int32_t ak_sched_poll_event(AkEngine*, char *buf, size_t cap);     // 1 json
 /// ```
+///
+/// `ak_sched_snapshot` is FROZEN as the THREE-argument
+/// `(engine, buf, cap)` form — no query parameter crosses the ABI (P0-01
+/// ruling: the integrator's frozen contract; the five-argument
+/// runtime-scoped draft of ffi-v2.md §1 never shipped). The Dart seam
+/// keeps a `queryJson` parameter for shape compatibility, but ONLY the
+/// default `'{}'` is accepted — anything else is an [ArgumentError]
+/// (query filtering is a v3 extension).
 ///
 /// Scheduling and the resident receiver share ONE runtime: the sched
 /// state is bound engine-side to the pairing runtime (`ak_sched_start`
@@ -35,13 +42,20 @@ import 'dart:convert' show jsonEncode;
 import 'dart:ffi';
 import 'dart:typed_data' show Uint8List;
 
-import 'bindings.dart'
-    show AkEngine, AkFfiException, AkStatus, processAllocator;
+import 'bindings.dart' show AkEngine, AkStatus, processAllocator;
 import 'ffi_json.dart' show AkSpecException, decodeFfiJson, toNativeUtf8;
 import 'model/sched_events.dart';
 import 'model/sched_policy.dart';
 import 'pairing_ffi.dart'
-    show akPairingIdLength, fromNativeUtf8Text, newRequestId;
+    show
+        EngineLastErrorC,
+        EngineLastErrorDart,
+        akCallFailure,
+        akPairingIdLength,
+        fromNativeUtf8Text,
+        isIpPortAddress,
+        newRequestId,
+        readEngineLastError;
 
 /// Defensive ceiling for the automatic `-3` grow-retry loops.
 const int _maxBufferBytes = 16 * 1024 * 1024;
@@ -98,11 +112,16 @@ class AkSchedStartSpec {
 
 /// Builder for the `ak_sched_enqueue` spec — one multi-root send task
 /// through a Ready pairing relation (the frozen send shape of
-/// ffi-v2.md §4; `code_id` and the real peer resolve engine-side from
-/// the saved `pairing_id` — the UI must never overwrite them):
+/// ffi-v2.md §4; `code_id` and the verified peer IDENTITY resolve
+/// engine-side from the saved `pairing_id` — the UI must never overwrite
+/// them; P1-06: the engine ALSO requires an explicit `peer` endpoint
+/// `ip:port` — the transport address of the paired receiver, a REQUIRED
+/// field without which `ak_sched_enqueue` answers `AK_ERR_INVALID`
+/// before anything is submitted):
 ///
 /// ```json
 /// {"spec_version":1,"request_id":"<32hex>","pairing_id":"<32hex>",
+///  "peer":"192.168.1.20:7300",
 ///  "source_roots":["<本地路径>"],"conflict":"fail","multistream":false,
 ///  "no_internet":false,"timeout_secs":30}
 /// ```
@@ -110,6 +129,7 @@ class AkSchedEnqueueSpec {
   AkSchedEnqueueSpec({
     required this.requestId,
     required this.pairingId,
+    required this.peer,
     required List<String> sourceRoots,
     this.conflict = 'fail',
     this.multistream = false,
@@ -121,6 +141,14 @@ class AkSchedEnqueueSpec {
 
   /// The Ready pairing relation this task flows through, 32 hex chars.
   final String pairingId;
+
+  /// REQUIRED (P1-06): the paired receiver's transport endpoint as a
+  /// literal `ip:port` (IPv4 dotted quad or bracketed IPv6) — parsed
+  /// engine-side by `SocketAddr` (`crates/ak-ffi/src/pairing.rs`,
+  /// `sched_enqueue` rejects the spec without it). The pairing FINGERPRINT
+  /// and code group still resolve from `pairing_id`; this is only the
+  /// network address.
+  final String peer;
 
   /// At least one local path (one task = one multi-root manifest; two
   /// independent tasks need two enqueues).
@@ -144,12 +172,18 @@ class AkSchedEnqueueSpec {
     if (!_hex32.hasMatch(pairingId)) {
       throw const AkSpecException('字段 "pairing_id" 必须是 32 个十六进制字符');
     }
+    if (peer.isEmpty || peer == 'ip:port') {
+      throw const AkSpecException('字段 "peer" 必须是 ip:port 地址');
+    }
+    if (!isIpPortAddress(peer)) {
+      throw AkSpecException('字段 "peer" 不是 ip:port 地址："$peer"');
+    }
     if (sourceRoots.isEmpty) {
       throw const AkSpecException('字段 "source_roots" 至少需要一个路径');
     }
     for (final root in sourceRoots) {
       if (root.isEmpty) {
-        throw const AkSpecException('"source_roots" 的条目不能为空路径');
+        throw const AkSpecException('"source_roots" 的条目不能是空路径');
       }
     }
     if (conflict != 'fail' && conflict != 'rename') {
@@ -162,6 +196,7 @@ class AkSchedEnqueueSpec {
       'spec_version': 1,
       'request_id': requestId.toLowerCase(),
       'pairing_id': pairingId.toLowerCase(),
+      'peer': peer,
       'source_roots': sourceRoots,
       'conflict': conflict,
       'multistream': multistream,
@@ -176,6 +211,23 @@ class AkSchedEnqueueSpec {
 // ---------------------------------------------------------------------------
 // The pointer-free call seam (fake-drivable).
 // ---------------------------------------------------------------------------
+
+/// Enforces the FROZEN snapshot-query contract of the [AkSchedCalls]
+/// seam (P0-01 ruling): the shipped export is the THREE-argument
+/// `ak_sched_snapshot(engine, buf, cap)` — the query JSON never crosses
+/// the ABI, so only the default `'{}'` is expressible. Anything else is an
+/// [ArgumentError]; query filtering is a v3 EXTENSION, not part of the
+/// frozen wave-22/25 contract. Both the real bindings and every fake call
+/// this, so the rule is uniform across the seam.
+void checkSchedSnapshotQuery(String queryJson) {
+  if (queryJson != '{}') {
+    throw ArgumentError.value(
+        queryJson,
+        'queryJson',
+        'ak_sched_snapshot 冻结为 (engine, buf, cap) 三参形态：查询过滤是 v3 扩展，'
+        '当前仅接受 "{}"');
+  }
+}
 
 /// One `ak_sched_*` call site without pointers (the six shipped exports);
 /// raw `int32` status back ([AkStatus]). Buffer forms model `buf`/`cap`;
@@ -196,13 +248,22 @@ abstract interface class AkSchedCalls {
   /// `ak_sched_cancel(engine, task_id)`: 0 ok, -4 unknown/terminal task.
   int cancel(Uint8List taskId);
 
-  /// `ak_sched_snapshot(engine, query_json, buf, cap)`: 1 snapshot JSON
-  /// written, 0 empty, -3 too small (retry losslessly).
+  /// `ak_sched_snapshot(engine, buf, cap)` — the frozen THREE-argument
+  /// form (P0-01): 1 snapshot JSON written, 0 empty, -3 too small (retry
+  /// losslessly). The Dart-side [queryJson] parameter is shape-compat
+  /// ONLY: the engine takes no query, so implementations must accept
+  /// exactly `'{}'` ([checkSchedSnapshotQuery] throws otherwise).
   int snapshot(String queryJson, Uint8List buffer, int cap);
 
   /// `ak_sched_poll_event(engine, buf, cap)`: 1 event JSON written, 0
   /// queue empty, -3 too small (event stays queued).
   int pollEvent(Uint8List buffer, int cap);
+
+  /// The native error detail of the most recent negative status, or null
+  /// (P2-08 — same contract as `AkPairingCalls.lastError`; the bindings
+  /// layer reads the thread-local `ak_engine_last_error` immediately
+  /// after the failing call, fakes return their scripted detail).
+  String? lastError();
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +281,8 @@ typedef _SpecIdOutDart = int Function(
 typedef _IdOnlyC = Int32 Function(Pointer<AkEngine>, Pointer<Uint8>);
 typedef _IdOnlyDart = int Function(Pointer<AkEngine>, Pointer<Uint8>);
 
-typedef _QueryBufC = Int32 Function(
-    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, IntPtr);
-typedef _QueryBufDart = int Function(
-    Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
-
+// P0-01: `ak_sched_snapshot` shares the (engine, buf, cap) shape of
+// `ak_sched_poll_event` — the four-argument query form never shipped.
 typedef _EventBufC = Int32 Function(Pointer<AkEngine>, Pointer<Uint8>, IntPtr);
 typedef _EventBufDart = int Function(Pointer<AkEngine>, Pointer<Uint8>, int);
 
@@ -253,10 +311,15 @@ final class AkSchedFfiBindings implements AkSchedCalls {
         .lookupFunction<_SpecOnlyC, _SpecOnlyDart>('ak_sched_set_policy');
     _cancel =
         _library.lookupFunction<_IdOnlyC, _IdOnlyDart>('ak_sched_cancel');
+    // P0-01: the frozen THREE-argument (engine, buf, cap) snapshot export —
+    // the four-argument query form of the ffi-v2.md §1 draft never shipped
+    // (binding it made Rust treat the query pointer as the output buffer).
     _snapshot = _library
-        .lookupFunction<_QueryBufC, _QueryBufDart>('ak_sched_snapshot');
+        .lookupFunction<_EventBufC, _EventBufDart>('ak_sched_snapshot');
     _pollEvent = _library
         .lookupFunction<_EventBufC, _EventBufDart>('ak_sched_poll_event');
+    _engineLastError = _library.lookupFunction<EngineLastErrorC,
+        EngineLastErrorDart>('ak_engine_last_error');
   }
 
   final Pointer<AkEngine> _engine;
@@ -266,8 +329,26 @@ final class AkSchedFfiBindings implements AkSchedCalls {
   late final _SpecIdOutDart _enqueue;
   late final _SpecOnlyDart _setPolicy;
   late final _IdOnlyDart _cancel;
-  late final _QueryBufDart _snapshot;
+  late final _EventBufDart _snapshot;
   late final _EventBufDart _pollEvent;
+  late final EngineLastErrorDart _engineLastError;
+
+  /// The native detail captured right after the most recent failing call
+  /// (null when the last call did not fail or carried no text).
+  String? _lastErrorDetail;
+
+  /// Captures the thread-local `ak_engine_last_error` IMMEDIATELY after a
+  /// negative return — before any later native call can overwrite it
+  /// (P2-08). `-3` is excluded: the lossless grow loop retries.
+  int _note(int code) {
+    if (code < 0 && code != AkStatus.errBuffer) {
+      _lastErrorDetail = readEngineLastError(_engineLastError, _engine);
+    }
+    return code;
+  }
+
+  @override
+  String? lastError() => _lastErrorDetail;
 
   /// Missing `ak_sched_*` symbol names of [library] (empty = supported).
   static List<String> missingSchedExports(DynamicLibrary library) => [
@@ -293,7 +374,7 @@ final class AkSchedFfiBindings implements AkSchedCalls {
   int _withString(String json, int Function(Pointer<AkEngine>, Pointer<Uint8>) invoke) {
     final text = toNativeUtf8(json);
     try {
-      return invoke(_engine, text);
+      return _note(invoke(_engine, text));
     } finally {
       processAllocator.free(text);
     }
@@ -304,7 +385,7 @@ final class AkSchedFfiBindings implements AkSchedCalls {
     final spec = toNativeUtf8(specJson);
     final out = processAllocator.allocate<Uint8>(akPairingIdLength);
     try {
-      final code = _enqueue(_engine, spec, out);
+      final code = _note(_enqueue(_engine, spec, out));
       if (code == AkStatus.ok) {
         taskIdOut.setAll(0, out.asTypedList(akPairingIdLength));
       }
@@ -319,7 +400,7 @@ final class AkSchedFfiBindings implements AkSchedCalls {
   int cancel(Uint8List taskId) {
     final task = _idIn(taskId);
     try {
-      return _cancel(_engine, task);
+      return _note(_cancel(_engine, task));
     } finally {
       processAllocator.free(task);
     }
@@ -327,15 +408,11 @@ final class AkSchedFfiBindings implements AkSchedCalls {
 
   @override
   int snapshot(String queryJson, Uint8List buffer, int cap) {
-    final query = toNativeUtf8(queryJson);
-    try {
-      return _bufCall(
-          (buf, capacity) => _snapshot(_engine, query, buf, capacity),
-          buffer,
-          cap);
-    } finally {
-      processAllocator.free(query);
-    }
+    // P0-01: the frozen ABI takes NO query — only the default '{}' is
+    // expressible; the argument stays for Dart-side shape compatibility.
+    checkSchedSnapshotQuery(queryJson);
+    return _bufCall(
+        (buf, capacity) => _snapshot(_engine, buf, capacity), buffer, cap);
   }
 
   @override
@@ -358,7 +435,7 @@ final class AkSchedFfiBindings implements AkSchedCalls {
       int cap) {
     final buf = processAllocator.allocate<Uint8>(cap);
     try {
-      final code = invoke(buf, cap);
+      final code = _note(invoke(buf, cap));
       if (code > 0) {
         var length = 0;
         while (length < cap && buf[length] != 0) {
@@ -398,8 +475,7 @@ final class SchedRuntimeFfi {
     );
     final code = _calls.start(spec.toJsonString());
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_sched_start 未受理（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_sched_start 未受理', _calls.lastError);
     }
   }
 
@@ -410,8 +486,7 @@ final class SchedRuntimeFfi {
     final taskIdOut = Uint8List(akPairingIdLength);
     final code = _calls.enqueue(spec.toJsonString(), taskIdOut);
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_sched_enqueue 未受理（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_sched_enqueue 未受理', _calls.lastError);
     }
     return taskIdOut;
   }
@@ -422,8 +497,7 @@ final class SchedRuntimeFfi {
   void setPolicy(SchedulerPolicy policy) {
     final code = _calls.setPolicy(jsonEncode(policy.toJson()));
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_sched_set_policy 失败（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_sched_set_policy 失败', _calls.lastError);
     }
   }
 
@@ -431,20 +505,24 @@ final class SchedRuntimeFfi {
   void cancelTask(Uint8List taskId) {
     final code = _calls.cancel(taskId);
     if (code != AkStatus.ok) {
-      throw AkFfiException(
-          code, 'ak_sched_cancel 失败（${AkStatus.name(code)}）');
+      throw akCallFailure(code, 'ak_sched_cancel 失败', _calls.lastError);
     }
   }
 
-  /// `ak_sched_snapshot`: decoded snapshot JSON —
+  /// `ak_sched_snapshot` — the frozen THREE-argument export (P0-01): the
+  /// engine takes NO query, so only the default `'{}'` of [queryJson] is
+  /// accepted (anything else throws [ArgumentError]; query filtering is a
+  /// v3 extension). Returns the decoded snapshot JSON —
   /// `{"policy":{"same_code":...,"cross_code":...,...},
   /// "policy_revision":N,"draining":B,"active_tasks":N,"queued_tasks":N,
   /// "shutting_down":B,"tasks":[...]}` — or null when the engine answers
   /// empty. `-3` grows the buffer losslessly.
-  Map<String, dynamic>? snapshot({String queryJson = '{}'}) =>
-      _pollJson('ak_sched_snapshot',
-          (buffer, cap) => _calls.snapshot(queryJson, buffer, cap),
-          initialCapacity: 1024);
+  Map<String, dynamic>? snapshot({String queryJson = '{}'}) {
+    checkSchedSnapshotQuery(queryJson);
+    return _pollJson('ak_sched_snapshot',
+        (buffer, cap) => _calls.snapshot(queryJson, buffer, cap),
+        initialCapacity: 1024);
+  }
 
   /// `ak_sched_poll_event`: oldest pending scheduler event, typed (null
   /// when empty); a SEPARATE queue from both progress and pairing events.
@@ -470,7 +548,7 @@ final class SchedRuntimeFfi {
         capacity *= 2; // nothing consumed; retry losslessly
         continue;
       }
-      throw AkFfiException(code, '$symbol 失败（${AkStatus.name(code)}）');
+      throw akCallFailure(code, '$symbol 失败', _calls.lastError);
     }
     throw StateError('$symbol 超过 $_maxBufferBytes 字节');
   }

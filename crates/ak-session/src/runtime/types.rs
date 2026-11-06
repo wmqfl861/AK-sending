@@ -16,6 +16,21 @@ use crate::scheduler::state::{SchedulerEvent, TaskState};
 /// receiver observes a `Lagged` warning).
 pub const EVENT_CAPACITY: usize = 1024;
 
+/// How many terminal task records the runtime keeps resident (P2-06).
+///
+/// A resident daemon (one receive loop iteration per executor) used to
+/// retain every task's working spec — executor handle included — forever,
+/// so memory and the snapshot scan grew with the number of finished,
+/// refused, timed-out or errored receives. Terminal tasks now release
+/// their working spec/executor immediately and keep only a small slim
+/// record (terminal state, error summary, timestamps, identity and a
+/// bounded label — a few hundred bytes each). 256 keeps a full page of
+/// recent history for snapshot/UI recall at well under a megabyte while
+/// bounding the resident set; anything older is dropped, because durable
+/// history belongs to persistence, not to memory. Retryable tasks are
+/// never terminal and always keep their full working spec.
+pub const MAX_TERMINAL_HISTORY: usize = 256;
+
 /// Stable task instance identity (contract §11 `transfer_id`).
 pub type TransferId = TaskId;
 
@@ -318,6 +333,10 @@ pub struct TaskView {
     pub cancel_requested: bool,
     /// Why the task is parked, when it is.
     pub parked: Option<ParkReason>,
+    /// When the task reached its terminal state (runtime clock, `None`
+    /// while it can still run). Kept by the bounded terminal history
+    /// (P2-06) so recent finished tasks stay time-addressable.
+    pub finished_at_ms: Option<u64>,
 }
 
 /// Resident-listener counters.

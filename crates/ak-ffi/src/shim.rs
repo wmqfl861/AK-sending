@@ -1415,3 +1415,80 @@ pub extern "C" fn ak_sched_poll_event(engine: *mut AkEngine, buf: *mut c_char, c
         }
     }
 }
+
+#[cfg(test)]
+mod abi_shape_tests {
+    //! P0-01 guard (2026-11-05 wave-26 ABI ruling): the frozen ffi-v2.md
+    //! §1 contract is the ACTUAL published export shapes — 19 v2 symbols,
+    //! with the wave-22 legacy alias `ak_sched_start` and the contract
+    //! name `ak_sched_listen_start` coexisting. Every binding below pins
+    //! an export's name AND its full call shape (arity plus parameter
+    //! types); any drift — an added or removed parameter, a changed
+    //! pointer type — fails COMPILATION here instead of resurfacing as a
+    //! cross-language memory-safety bug like the wave-25 snapshot
+    //! mismatch. `scripts/check_contracts.py` check 2 compares the symbol
+    //! SET against the doc; this test is the parameter-shape half of the
+    //! same guarantee.
+
+    use super::*;
+    use crate::sched_ext::{
+        ak_pairing_stop_start, ak_sched_listen_start, ak_sched_retry, ak_sched_shutdown_start,
+        ak_sched_task_result,
+    };
+
+    #[test]
+    fn frozen_v2_abi_shapes_are_pinned() {
+        // ---- pairing plane: 9 exports, runtime-keyed ----
+        let _: unsafe extern "C" fn(*mut AkEngine, *const c_char, *mut u8) -> i32 =
+            ak_pairing_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_pairing_create_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_pairing_redeem_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_pairing_list_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_pairing_revoke_start;
+        let _: unsafe extern "C" fn(
+            *mut AkEngine,
+            *const u8,
+            *const u8,
+            *mut c_char,
+            usize,
+        ) -> i32 = ak_pairing_op_result;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *mut c_char, usize) -> i32 =
+            ak_pairing_poll_event;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const u8) -> i32 =
+            ak_pairing_cancel_op;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *mut u8) -> i32 =
+            ak_pairing_stop_start;
+
+        // ---- scheduler plane, engine-scoped (NO runtime_id): 6 exports.
+        // ak_sched_snapshot is exactly (engine, buf, cap) — three params,
+        // no query — the shape the wave-26 ruling froze. ----
+        let _: unsafe extern "C" fn(*mut AkEngine, *const c_char) -> i32 = ak_sched_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const c_char, *mut u8) -> i32 =
+            ak_sched_enqueue;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const c_char) -> i32 = ak_sched_set_policy;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8) -> i32 = ak_sched_cancel;
+        let _: unsafe extern "C" fn(*mut AkEngine, *mut c_char, usize) -> i32 = ak_sched_snapshot;
+        let _: unsafe extern "C" fn(*mut AkEngine, *mut c_char, usize) -> i32 =
+            ak_sched_poll_event;
+
+        // ---- scheduler plane, wave-23 entries carrying runtime_id: 4
+        // exports (the id must name the bound pairing runtime, else -4).
+        // ----
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_sched_listen_start;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const u8) -> i32 = ak_sched_retry;
+        let _: unsafe extern "C" fn(
+            *mut AkEngine,
+            *const u8,
+            *const u8,
+            *mut c_char,
+            usize,
+        ) -> i32 = ak_sched_task_result;
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const c_char, *mut u8) -> i32 =
+            ak_sched_shutdown_start;
+    }
+}

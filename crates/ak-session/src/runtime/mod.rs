@@ -51,7 +51,8 @@ pub mod types;
 pub use clock::{FakeClock, RealClock, RuntimeClock};
 pub use error::{EngineStartError, SessionError};
 pub use executor::{
-    ExecutorReport, FakeScript, FakeTransferExecutor, ProgressSink, TaskInterval, TransferExecutor,
+    ExecutorReport, ExecutorWork, FakeScript, FakeTransferExecutor, ProgressSink, TaskInterval,
+    TransferExecutor,
 };
 pub use handle::{SessionHandle, SessionRuntime};
 pub use listener::{ListenerStats, RuntimeListener};
@@ -64,7 +65,7 @@ pub use transport::{
 pub use types::{
     CancelReceipt, ListenerView, PairingPlan, ParkReason, RetryPolicy, RuntimeConfig, SessionEvent,
     SessionSnapshot, ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferDirection,
-    TransferId, TransferSpec, EVENT_CAPACITY,
+    TransferId, TransferSpec, EVENT_CAPACITY, MAX_TERMINAL_HISTORY,
 };
 
 // Re-export the scheduler-domain vocabulary runtime callers need, so the

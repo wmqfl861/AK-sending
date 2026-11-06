@@ -118,7 +118,23 @@ async fn slow_consumer_lags_without_blocking_the_actor() {
         .snapshot(SnapshotQuery::all())
         .await
         .expect("snapshot after lag");
-    assert!(snap.tasks.len() >= 300);
+    // P2-06: the resident set is bounded — the runtime saturated its
+    // capped terminal history (it tracked every task; only the oldest
+    // finished records were evicted) and still lists the fresh task.
+    assert!(
+        snap.tasks.len() >= ak_session::runtime::MAX_TERMINAL_HISTORY,
+        "the bounded history is saturated and the actor kept working, got {} entries",
+        snap.tasks.len()
+    );
+    let fresh = ak_session::scheduler::TaskId::from_counter(999);
+    assert!(
+        snap.tasks.iter().any(|view| view.task == fresh),
+        "the post-lag submission is listed: {:?}",
+        snap.tasks
+            .iter()
+            .map(|view| view.task)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A fast subscriber observes the scheduler lifecycle events in order.

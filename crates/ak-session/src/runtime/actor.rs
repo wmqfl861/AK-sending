@@ -15,7 +15,7 @@
 //! (suppressed once a shutdown began — "stop new admissions"), requeue
 //! tasks parked by a queue-full retry, and check shutdown convergence.
 use ak_core::error::ErrorCode;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -23,16 +23,17 @@ use tokio::task::JoinHandle;
 
 use crate::runtime::clock::RuntimeClock;
 use crate::runtime::error::SessionError;
-use crate::runtime::executor::{ExecutorReport, ProgressSink};
+use crate::runtime::executor::{ExecutorReport, ExecutorWork, ProgressSink};
 use crate::runtime::listener::ListenerStats;
 use crate::runtime::transport::{PairingConfirmation, PairingTransport};
 use crate::runtime::types::{
     CancelReceipt, PairingPlan, ParkReason, RetryPolicy, SessionEvent, SessionSnapshot,
-    ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferId, TransferSpec,
+    ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferDirection, TransferId,
+    TransferSpec, MAX_TERMINAL_HISTORY,
 };
 use crate::scheduler::config::SchedulerPolicy;
-use crate::scheduler::core::{FinishResult, PolicySwitch, SchedulerCore};
-use crate::scheduler::key::{TaskHandle, TaskId};
+use crate::scheduler::core::{CancelOutcome, FinishResult, PolicySwitch, SchedulerCore};
+use crate::scheduler::key::{CodeGroupKey, TaskHandle, TaskId};
 use crate::scheduler::queue::QueueError;
 use crate::scheduler::state::{FinishOutcome, SchedulerEvent, TaskPhase, TaskState};
 
@@ -97,13 +98,41 @@ pub(crate) enum Command {
     ShutdownDeadlineReached,
 }
 
-/// Runtime bookkeeping for one submitted task.
-struct TaskEntry {
-    spec: TransferSpec,
+/// Runtime bookkeeping for one submitted task (P2-06).
+///
+/// A terminal task's working spec — executor handle included — is
+/// released immediately; only a small bounded record stays for
+/// snapshot/history recall. Non-terminal tasks (queued, active, backed
+/// off, parked, retryable) always keep their full working spec: drivers,
+/// retries and executor cancellation need it.
+enum TaskEntry {
+    /// Working state: the task may still run. The spec is boxed: the
+    /// variant must stay comparable in size to the slim `Finished`
+    /// record (clippy::large_enum_variant), and one heap allocation per
+    /// live task is nothing against the executor work it describes.
+    Active {
+        /// The submitted spec (drives retries and carries the executor).
+        spec: Box<TransferSpec>,
+        attempts: u32,
+        cancel_requested: bool,
+        parked: Option<ParkReason>,
+        last_error: Option<ErrorCode>,
+    },
+    /// Bounded terminal record; see [`MAX_TERMINAL_HISTORY`].
+    Finished(FinishedTask),
+}
+
+/// The slim record kept for a terminal task (P2-06): identity and display
+/// fields for snapshot recall, the last stable error, and when it ended.
+/// No executor, no engine spec, no progress state.
+struct FinishedTask {
+    group: CodeGroupKey,
+    direction: TransferDirection,
+    label: String,
     attempts: u32,
-    cancel_requested: bool,
-    parked: Option<ParkReason>,
     last_error: Option<ErrorCode>,
+    cancelled: bool,
+    finished_at_ms: u64,
 }
 
 /// In-progress shutdown.
@@ -118,6 +147,17 @@ struct ShutdownProgress {
 /// giving up on it (abort takes effect at the next `await` point, so this
 /// is a generous safety bound, not the expected duration).
 const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Graceful bound for joining one executor's engine work during shutdown
+/// (P1-03). 12 s deliberately exceeds ak-engine's 10 s FinalAck
+/// tail-hold (a finished receive holds its channel up to 10 s so the
+/// sender can observe the final ack): a task whose completion is already
+/// persisted is allowed to finish that hold rather than be aborted
+/// mid-commit. Only after this may the shutdown summary go out.
+const ENGINE_WORK_GRACE: Duration = Duration::from_secs(12);
+/// Hard bound for the abort escalation after [`ENGINE_WORK_GRACE`]
+/// expires (an aborted task unwinds at its next `await` point).
+const ENGINE_WORK_HARD: Duration = Duration::from_secs(2);
 
 /// Build a real actor command channel for in-crate tests (the same
 /// bounded kind the runtime owns), so executors can be driven through a
@@ -138,6 +178,14 @@ pub(crate) struct SchedulerActor {
     listener_stats: Arc<ListenerStats>,
     listener_enabled: bool,
     entries: HashMap<TaskId, TaskEntry>,
+    /// Termination order of the bounded terminal history (P2-06), for
+    /// oldest-first eviction beyond [`MAX_TERMINAL_HISTORY`].
+    finished_order: VecDeque<TaskId>,
+    /// Cumulative terminal transitions (P2-06): terminal entries may be
+    /// trimmed from `entries`, so shutdown summaries count transitions
+    /// instead of rescanning history.
+    completed_total: u64,
+    cancelled_total: u64,
     /// Tasks with a spawned driver that has not reported a finish yet.
     inflight: HashSet<TaskId>,
     /// Join handles of the spawned task drivers. Kept so shutdown can
@@ -145,6 +193,11 @@ pub(crate) struct SchedulerActor {
     /// (P1-3: previously the handle was dropped on spawn and a driver
     /// stuck in pairing/session I/O outlived the runtime).
     drivers: HashMap<TaskId, JoinHandle<()>>,
+    /// Engine work handles taken from executors during finalize (P1-03):
+    /// joined in [`SchedulerActor::run`] before the shutdown reply, so no
+    /// summary claims the runtime stopped while a real engine still held
+    /// its port or wrote files.
+    pending_engine_work: Vec<ExecutorWork>,
     /// Tasks holding their permit while waiting out a retry backoff.
     backoff_waiters: HashSet<TaskId>,
     shutdown: Option<ShutdownProgress>,
@@ -180,8 +233,12 @@ impl SchedulerActor {
             listener_stats,
             listener_enabled,
             entries: HashMap::new(),
+            finished_order: VecDeque::new(),
+            completed_total: 0,
+            cancelled_total: 0,
             inflight: HashSet::new(),
             drivers: HashMap::new(),
+            pending_engine_work: Vec::new(),
             backoff_waiters: HashSet::new(),
             shutdown: None,
             finalized: false,
@@ -200,12 +257,28 @@ impl SchedulerActor {
             }
         }
         let _ = self.listener_stop.send(true);
+        // P1-03: join the still-running real engine work BEFORE the
+        // shutdown caller is answered. `finalize_shutdown` already asked
+        // every executor to stop; a cancelled engine reports its outcome
+        // on its way out (strictly after dropping the kernel), so the
+        // join below proves the ports are released and the writes stopped
+        // before any summary can claim the runtime is down.
+        self.join_engine_work().await;
         // P1-3: abort and join every remaining driver BEFORE the shutdown
         // caller is answered, so a summary is a statement about a runtime
-        // whose engine work has actually stopped (the executor `cancel`
-        // calls were already issued in `on_shutdown`/`finalize_shutdown`
-        // and had their chance to wind tasks down cooperatively).
+        // whose engine work has actually stopped.
         self.abort_and_join_drivers().await;
+        // Reports that arrived while joining (a cancelled engine task
+        // sends its terminal report right before exiting) are processed
+        // here — with the persisted outcome winning over the requested
+        // cancellation, exactly as in the live loop.
+        while let Ok(cmd) = rx.try_recv() {
+            self.handle(cmd);
+        }
+        // Defensive close-out (P1-03): anything whose engine died without
+        // delivering its report still goes terminal here, so no permit or
+        // slot survives the runtime.
+        self.terminalize_unreported();
         self.flush_events();
         if let Some(mut progress) = self.shutdown.take() {
             if !progress.replied {
@@ -282,8 +355,8 @@ impl SchedulerActor {
             Ok(()) => {
                 self.entries.insert(
                     task_id,
-                    TaskEntry {
-                        spec,
+                    TaskEntry::Active {
+                        spec: Box::new(spec),
                         attempts: 0,
                         cancel_requested: false,
                         parked: None,
@@ -318,28 +391,55 @@ impl SchedulerActor {
         if state.is_terminal() {
             return Err(SessionError::NotActive);
         }
-        let Some(entry) = self.entries.get_mut(task) else {
+        if !matches!(self.entries.get(task), Some(TaskEntry::Active { .. })) {
             return Err(SessionError::TaskNotFound);
-        };
+        }
         let holds_permit = self.core.permit_of(&handle).is_some();
         if holds_permit {
             // Running (or admitted / in backoff): request the stop, let
             // the executor's finish report finalize the terminal state.
-            entry.cancel_requested = true;
-            let _ = self.core.report_phase(&handle, TaskPhase::CancelRequested);
             if self.backoff_waiters.contains(task) {
                 // No executor attempt is running; finalize immediately.
+                if let Some(TaskEntry::Active {
+                    cancel_requested, ..
+                }) = self.entries.get_mut(task)
+                {
+                    *cancel_requested = true;
+                }
+                let _ = self.core.report_phase(&handle, TaskPhase::CancelRequested);
                 self.backoff_waiters.remove(task);
-                let _ = self.core.cancel(&handle);
+                self.cancel_terminal(&handle);
             } else {
-                entry.spec.executor.cancel(&handle);
+                self.request_running_cancel(task);
             }
             Ok(CancelReceipt::RunningCancellationRequested)
         } else {
             // Queued, paused or parked: removed without ever connecting.
-            let _ = self.core.cancel(&handle);
+            self.cancel_terminal(&handle);
             Ok(CancelReceipt::RemovedQueued)
         }
+    }
+
+    /// Hand a running (permit-holding) task's stop to its executor
+    /// (P1-03): flag the intent, publish `CancelRequested`, then let the
+    /// executor wind the real engine down — its finish report, sent
+    /// strictly after the engine work exited, finalizes the terminal
+    /// state (a persisted completion wins over the request).
+    fn request_running_cancel(&mut self, task: &TaskId) {
+        let handle = TaskHandle::new(*task);
+        let executor = match self.entries.get_mut(task) {
+            Some(TaskEntry::Active {
+                cancel_requested,
+                spec,
+                ..
+            }) => {
+                *cancel_requested = true;
+                let _ = self.core.report_phase(&handle, TaskPhase::CancelRequested);
+                Arc::clone(&spec.executor)
+            }
+            _ => return,
+        };
+        executor.cancel(&handle);
     }
 
     fn on_set_policy(
@@ -366,14 +466,28 @@ impl SchedulerActor {
             let _ = reply.send(Err(SessionError::TaskNotFound));
             return;
         };
-        if entry.parked.is_none() {
+        let TaskEntry::Active {
+            attempts,
+            parked,
+            cancel_requested,
+            last_error,
+            ..
+        } = entry
+        else {
+            // Terminal record (P2-06): nothing to restart. Anything
+            // already evicted from the bounded history answered
+            // `TaskNotFound` above.
+            let _ = reply.send(Err(SessionError::NotActive));
+            return;
+        };
+        if parked.is_none() {
             let _ = reply.send(Err(SessionError::NotActive));
             return;
         }
-        entry.attempts = 0;
-        entry.parked = None;
-        entry.cancel_requested = false;
-        entry.last_error = None;
+        *attempts = 0;
+        *parked = None;
+        *cancel_requested = false;
+        *last_error = None;
         let result = match self.core.requeue(&handle) {
             Ok(true) => Ok(()),
             Ok(false) => Err(SessionError::NotActive),
@@ -404,7 +518,8 @@ impl SchedulerActor {
         let _ = self.listener_stop.send(true);
         if mode == ShutdownMode::Cancel {
             // Stop everything we can right now; in-flight tasks finalize
-            // through their executor's finish reports.
+            // through their executor's finish reports (sent strictly after
+            // the real engine work exited — P1-03).
             let tasks: Vec<TaskId> = self.entries.keys().copied().collect();
             for task in tasks {
                 let handle = TaskHandle::new(task);
@@ -415,14 +530,10 @@ impl SchedulerActor {
                     continue;
                 }
                 if self.inflight.contains(&task) {
-                    if let Some(entry) = self.entries.get_mut(&task) {
-                        entry.cancel_requested = true;
-                        let _ = self.core.report_phase(&handle, TaskPhase::CancelRequested);
-                        entry.spec.executor.cancel(&handle);
-                    }
+                    self.request_running_cancel(&task);
                 } else {
                     self.backoff_waiters.remove(&task);
-                    let _ = self.core.cancel(&handle);
+                    self.cancel_terminal(&handle);
                 }
             }
         }
@@ -461,43 +572,60 @@ impl SchedulerActor {
         // its join handle is no longer interesting (aborting it later
         // would be a no-op).
         self.drivers.remove(&id);
-        let Some(entry) = self.entries.get_mut(&id) else {
+        if matches!(self.entries.get(&id), Some(TaskEntry::Finished(_))) {
+            // Terminal (or duplicate) report: the first persisted outcome
+            // wins (P1-03 — never rewrite a terminal state).
             return;
-        };
+        }
         match outcome {
             FinishOutcome::Completed => {
                 // From `CancelRequested` this still wins (contract §9/§10:
                 // the persisted final commit takes precedence).
-                let _ = self.core.finish(task, FinishOutcome::Completed);
+                self.complete_terminal(task);
             }
             FinishOutcome::Failed { error } => {
-                entry.last_error = Some(error);
-                if entry.cancel_requested
-                    || self.core.task_state(task) == Some(TaskState::CancelRequested)
-                {
-                    let _ = self.core.cancel(task);
+                let cancel_requested = {
+                    let Some(TaskEntry::Active {
+                        cancel_requested,
+                        last_error,
+                        ..
+                    }) = self.entries.get_mut(&id)
+                    else {
+                        return;
+                    };
+                    *last_error = Some(error);
+                    *cancel_requested
+                } || self.core.task_state(task) == Some(TaskState::CancelRequested);
+                if cancel_requested {
+                    self.cancel_terminal(task);
                     return;
                 }
-                entry.attempts += 1;
+                let attempts = {
+                    let Some(TaskEntry::Active { attempts, .. }) = self.entries.get_mut(&id)
+                    else {
+                        return;
+                    };
+                    *attempts += 1;
+                    *attempts
+                };
                 if self.shutdown.is_some() {
                     // No point backing off; record and let finalize clean
                     // up (the core requeue keeps it queryable meanwhile).
                     let _ = self.core.finish(task, FinishOutcome::Failed { error });
                     return;
                 }
-                if entry.attempts < self.retry.max_attempts {
+                if attempts < self.retry.max_attempts {
                     // Backoff-first: hold the report until the timer
                     // fires, then finish-as-failed requeues for the next
                     // attempt (B0: backoff timing is the runtime's call).
-                    let attempt = entry.attempts;
                     let deadline = self
                         .clock
                         .now_ms()
-                        .saturating_add(self.retry.backoff_ms(attempt));
+                        .saturating_add(self.retry.backoff_ms(attempts));
                     self.backoff_waiters.insert(id);
                     self.broadcast(SessionEvent::BackoffScheduled {
                         task: id,
-                        attempt,
+                        attempt: attempts,
                         until_ms: deadline,
                     });
                     let clock = Arc::clone(&self.clock);
@@ -510,7 +638,9 @@ impl SchedulerActor {
                     // Retry budget exhausted: park the task (permit
                     // released, checkpoint kept) until a user retry.
                     let _ = self.core.pause(task);
-                    entry.parked = Some(ParkReason::RetryExhausted);
+                    if let Some(TaskEntry::Active { parked, .. }) = self.entries.get_mut(&id) {
+                        *parked = Some(ParkReason::RetryExhausted);
+                    }
                     self.broadcast(SessionEvent::TaskParked {
                         task: id,
                         reason: ParkReason::RetryExhausted,
@@ -529,20 +659,29 @@ impl SchedulerActor {
         if state.is_terminal() {
             return;
         }
-        let Some(entry) = self.entries.get_mut(&task) else {
+        let Some(TaskEntry::Active {
+            attempts,
+            cancel_requested,
+            last_error,
+            ..
+        }) = self.entries.get_mut(&task)
+        else {
             return;
         };
-        if entry.cancel_requested || self.shutdown.is_some() {
-            let _ = self.core.cancel(&handle);
+        let cancel_requested = *cancel_requested;
+        let error = (*last_error).unwrap_or(ErrorCode::Internal);
+        let attempt = *attempts + 1;
+        if cancel_requested || self.shutdown.is_some() {
+            self.cancel_terminal(&handle);
             self.after_mutation();
             return;
         }
-        let error = entry.last_error.unwrap_or(ErrorCode::Internal);
-        let attempt = entry.attempts + 1;
         let result = self.core.finish(&handle, FinishOutcome::Failed { error });
         let mut parked_event = None;
         if let Some(FinishResult::FailedParkedQueueFull) = result {
-            entry.parked = Some(ParkReason::QueueFull);
+            if let Some(TaskEntry::Active { parked, .. }) = self.entries.get_mut(&task) {
+                *parked = Some(ParkReason::QueueFull);
+            }
             parked_event = Some(SessionEvent::TaskParked {
                 task,
                 reason: ParkReason::QueueFull,
@@ -587,8 +726,12 @@ impl SchedulerActor {
             return;
         }
         loop {
-            let candidate = self.entries.iter().find_map(|(id, entry)| {
-                (entry.parked == Some(ParkReason::QueueFull)).then_some(*id)
+            let candidate = self.entries.iter().find_map(|(id, entry)| match entry {
+                TaskEntry::Active {
+                    parked: Some(ParkReason::QueueFull),
+                    ..
+                } => Some(*id),
+                _ => None,
             });
             let Some(task) = candidate else {
                 return;
@@ -596,8 +739,8 @@ impl SchedulerActor {
             let handle = TaskHandle::new(task);
             match self.core.requeue(&handle) {
                 Ok(true) => {
-                    if let Some(entry) = self.entries.get_mut(&task) {
-                        entry.parked = None;
+                    if let Some(TaskEntry::Active { parked, .. }) = self.entries.get_mut(&task) {
+                        *parked = None;
                     }
                 }
                 // Still full (or no longer eligible) — retry on the next
@@ -617,10 +760,16 @@ impl SchedulerActor {
         self.finalize_shutdown();
     }
 
-    /// Cancel every non-terminal task and mark the runtime finalized. The
-    /// shutdown reply (and the `ShutdownComplete` event) is sent from
-    /// [`SchedulerActor::run`] after the remaining drivers are aborted and
-    /// joined — never while engine work may still be in flight.
+    /// Stop every non-terminal task and mark the runtime finalized
+    /// (P1-03).
+    ///
+    /// Tasks without running engine work (queued, parked, backed off) go
+    /// terminal right here. Running tasks are stopped through their
+    /// executor and their joinable work handles are collected; the actual
+    /// terminal transition — and with it the permit release — happens
+    /// only after that work joined and its persisted outcome was
+    /// processed in [`SchedulerActor::run`]. The shutdown reply is never
+    /// sent while a real engine may still hold its port or write files.
     fn finalize_shutdown(&mut self) {
         if self.finalized {
             return;
@@ -628,15 +777,66 @@ impl SchedulerActor {
         let tasks: Vec<TaskId> = self.entries.keys().copied().collect();
         for task in tasks {
             let handle = TaskHandle::new(task);
-            if let Some(state) = self.core.task_state(&handle) {
-                if !state.is_terminal() {
-                    let _ = self.core.cancel(&handle);
+            let Some(state) = self.core.task_state(&handle) else {
+                continue;
+            };
+            if state.is_terminal() {
+                continue;
+            }
+            if self.inflight.contains(&task) {
+                self.request_running_cancel(&task);
+                // Take the joinable work handle: `run` joins it before
+                // the shutdown reply (P1-03).
+                if let Some(TaskEntry::Active { spec, .. }) = self.entries.get(&task) {
+                    if let Some(work) = spec.executor.take_work(&handle) {
+                        self.pending_engine_work.push(work);
+                    }
                 }
+            } else {
+                self.backoff_waiters.remove(&task);
+                self.cancel_terminal(&handle);
             }
         }
         self.backoff_waiters.clear();
         self.flush_events();
         self.finalized = true;
+    }
+
+    /// Join every executor work handle taken during finalize (P1-03),
+    /// concurrently and bounded: the graceful bound deliberately exceeds
+    /// the engine's 10 s FinalAck tail-hold so a receive whose completion
+    /// is already persisted can deliver its final ack instead of being
+    /// aborted mid-commit. `ShutdownComplete` is only sent after this.
+    async fn join_engine_work(&mut self) {
+        let joins: Vec<JoinHandle<()>> = std::mem::take(&mut self.pending_engine_work)
+            .into_iter()
+            .map(|work| {
+                tokio::spawn(async move {
+                    work.join_within(ENGINE_WORK_GRACE, ENGINE_WORK_HARD).await;
+                })
+            })
+            .collect();
+        let overall = ENGINE_WORK_GRACE + ENGINE_WORK_HARD + DRIVER_JOIN_TIMEOUT;
+        for mut join in joins {
+            let _ = tokio::time::timeout(overall, &mut join).await;
+        }
+    }
+
+    /// Defensive close-out (P1-03): after the engine joins and the report
+    /// drain, force any task that never delivered its terminal report
+    /// into `Cancelled`, so no permit or slot survives the runtime.
+    fn terminalize_unreported(&mut self) {
+        let tasks: Vec<TaskId> = self.entries.keys().copied().collect();
+        for task in tasks {
+            let handle = TaskHandle::new(task);
+            if let Some(state) = self.core.task_state(&handle) {
+                if !state.is_terminal() {
+                    self.cancel_terminal(&handle);
+                }
+            }
+        }
+        self.backoff_waiters.clear();
+        self.flush_events();
     }
 
     /// Abort every still-tracked driver task and join it (bounded per
@@ -652,16 +852,81 @@ impl SchedulerActor {
         }
     }
 
+    // ---- Terminal transitions (P2-06) ----------------------------------
+
+    /// Record terminal success through the core (a final commit that won
+    /// the race against a requested cancellation still wins, contract
+    /// §9/§10) and keep the bounded terminal record.
+    fn complete_terminal(&mut self, handle: &TaskHandle) {
+        if matches!(
+            self.core.finish(handle, FinishOutcome::Completed),
+            Some(FinishResult::Completed)
+        ) {
+            self.completed_total += 1;
+            self.retain_finished(handle.task_id(), false);
+        }
+    }
+
+    /// Cancel through the core; when the task actually terminal-cancels,
+    /// keep the bounded terminal record and bump the cumulative counter
+    /// so shutdown summaries stay faithful although terminal entries get
+    /// trimmed (P2-06).
+    fn cancel_terminal(&mut self, handle: &TaskHandle) -> CancelOutcome {
+        let outcome = self.core.cancel(handle);
+        if !matches!(outcome, CancelOutcome::NotActive) {
+            self.cancelled_total += 1;
+            self.retain_finished(handle.task_id(), true);
+        }
+        outcome
+    }
+
+    /// Convert an active entry into its bounded slim terminal record and
+    /// evict the oldest history beyond [`MAX_TERMINAL_HISTORY`] (P2-06).
+    /// The working spec — and with it the executor handle — is released
+    /// here; already-finished entries are left as they are.
+    fn retain_finished(&mut self, task: TaskId, cancelled: bool) {
+        let Some(entry) = self.entries.get_mut(&task) else {
+            return;
+        };
+        let TaskEntry::Active {
+            spec,
+            attempts,
+            last_error,
+            ..
+        } = entry
+        else {
+            return;
+        };
+        let finished = FinishedTask {
+            group: spec.group_key,
+            direction: spec.direction,
+            label: std::mem::take(&mut spec.label),
+            attempts: *attempts,
+            last_error: *last_error,
+            cancelled,
+            finished_at_ms: self.clock.now_ms(),
+        };
+        *entry = TaskEntry::Finished(finished);
+        self.finished_order.push_back(task);
+        while self.finished_order.len() > MAX_TERMINAL_HISTORY {
+            let evict = self
+                .finished_order
+                .pop_front()
+                .expect("history nonempty while over the cap");
+            self.entries.remove(&evict);
+        }
+    }
+
     // ---- Task driver ---------------------------------------------------
 
     /// Drive one admitted task through pairing resolution and into its
     /// executor. Runs outside the actor loop; every observation flows back
     /// through the command channel.
     fn spawn_driver(&mut self, task: TaskId) {
-        let Some(entry) = self.entries.get(&task) else {
+        let Some(TaskEntry::Active { spec, .. }) = self.entries.get(&task) else {
             return;
         };
-        let spec = entry.spec.clone();
+        let spec = (**spec).clone();
         self.inflight.insert(task);
         let transport = Arc::clone(&self.transport);
         let sink = ProgressSink::new(self.cmd_tx.clone());
@@ -761,21 +1026,21 @@ impl SchedulerActor {
     }
 
     fn build_summary(&self, mode: ShutdownMode, timed_out: bool) -> ShutdownSummary {
-        let mut completed = 0;
-        let mut cancelled = 0;
+        // Terminal tasks may already be evicted from the bounded history
+        // (P2-06), so the summary counts cumulative terminal transitions
+        // instead of rescanning entries; parked/queued leftovers are by
+        // definition non-terminal and therefore still resident.
         let mut parked = 0;
-        for task in self.entries.keys() {
-            match self.core.task_state(&TaskHandle::new(*task)) {
-                Some(TaskState::Completed) => completed += 1,
-                Some(TaskState::Cancelled) => cancelled += 1,
+        for id in self.entries.keys() {
+            match self.core.task_state(&TaskHandle::new(*id)) {
                 Some(TaskState::Paused) | Some(TaskState::Queued) => parked += 1,
                 _ => {}
             }
         }
         ShutdownSummary {
             mode,
-            completed,
-            cancelled,
+            completed: self.completed_total,
+            cancelled: self.cancelled_total,
             parked,
             timed_out,
             listener_stopped: true,
@@ -783,13 +1048,54 @@ impl SchedulerActor {
     }
 
     fn build_snapshot(&self, query: &SnapshotQuery) -> SessionSnapshot {
+        // P2-06: the scan is bounded by live tasks plus the capped
+        // terminal history — a long-running runtime no longer walks every
+        // task it ever ran.
         let mut tasks: Vec<TaskView> = self
             .entries
             .iter()
             .filter_map(|(id, entry)| {
-                let handle = TaskHandle::new(*id);
-                let state = self.core.task_state(&handle)?;
-                if !query.include_terminal && state.is_terminal() {
+                let view = match entry {
+                    TaskEntry::Active {
+                        spec,
+                        attempts,
+                        cancel_requested,
+                        parked,
+                        last_error,
+                    } => {
+                        let handle = TaskHandle::new(*id);
+                        let state = self.core.task_state(&handle)?;
+                        TaskView {
+                            task: *id,
+                            group: spec.group_key,
+                            state,
+                            direction: spec.direction,
+                            label: spec.label.clone(),
+                            attempts: *attempts,
+                            last_error: self.core.last_error(&handle).or(*last_error),
+                            cancel_requested: *cancel_requested,
+                            parked: *parked,
+                            finished_at_ms: None,
+                        }
+                    }
+                    TaskEntry::Finished(finished) => TaskView {
+                        task: *id,
+                        group: finished.group,
+                        state: if finished.cancelled {
+                            TaskState::Cancelled
+                        } else {
+                            TaskState::Completed
+                        },
+                        direction: finished.direction,
+                        label: finished.label.clone(),
+                        attempts: finished.attempts,
+                        last_error: finished.last_error,
+                        cancel_requested: false,
+                        parked: None,
+                        finished_at_ms: Some(finished.finished_at_ms),
+                    },
+                };
+                if !query.include_terminal && view.state.is_terminal() {
                     return None;
                 }
                 if let Some(wanted) = query.task {
@@ -797,17 +1103,7 @@ impl SchedulerActor {
                         return None;
                     }
                 }
-                Some(TaskView {
-                    task: *id,
-                    group: entry.spec.group_key,
-                    state,
-                    direction: entry.spec.direction,
-                    label: entry.spec.label.clone(),
-                    attempts: entry.attempts,
-                    last_error: self.core.last_error(&handle).or(entry.last_error),
-                    cancel_requested: entry.cancel_requested,
-                    parked: entry.parked,
-                })
+                Some(view)
             })
             .collect();
         tasks.sort_by_key(|view| view.task);
@@ -842,7 +1138,9 @@ mod tests {
         PairingFuture, PairingId, PairingReadyInfo, RedeemAccepted, RedeemPayload,
     };
     use crate::runtime::types::{PairingPlan, RuntimeConfig, ShutdownMode, TransferDirection};
-    use crate::runtime::{RegistryId, SessionHandle, SessionRuntime, TransferExecutor};
+    use crate::runtime::{
+        RegistryId, RuntimeClock, SessionHandle, SessionRuntime, TransferExecutor,
+    };
     use crate::scheduler::key::CodeGroupKey;
     use std::future::Future;
     use std::pin::Pin;
@@ -1016,5 +1314,92 @@ mod tests {
                 .expect("shutdown succeeds");
         assert!(!summary.timed_out);
         assert_eq!(summary.completed, 1);
+    }
+
+    /// P2-06: a terminal task releases its working spec — and with it the
+    /// executor handle. A Drop-counting executor proves the runtime lets
+    /// go once the task is terminal (only the slim bounded record stays).
+    struct DroppingExecutor {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl TransferExecutor for DroppingExecutor {
+        fn enqueue(
+            &self,
+            task: TaskHandle,
+            _spec: TransferSpec,
+            sink: crate::runtime::executor::ProgressSink,
+        ) -> Result<(), crate::runtime::error::EngineStartError> {
+            tokio::spawn(async move {
+                sink.phase(task, TaskPhase::Scanning).await;
+                sink.phase(task, TaskPhase::Transferring).await;
+                sink.phase(task, TaskPhase::Verifying).await;
+                sink.phase(task, TaskPhase::Committing).await;
+                sink.finished(task, FinishOutcome::Completed).await;
+            });
+            Ok(())
+        }
+
+        fn cancel(&self, _task: &TaskHandle) {}
+    }
+
+    impl Drop for DroppingExecutor {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_task_releases_its_executor() {
+        let clock = RealClock::shared();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut config = RuntimeConfig::new(
+            SchedulerPolicy::default(),
+            Arc::clone(&clock) as Arc<dyn RuntimeClock>,
+            Arc::new(crate::runtime::transport::FakePairingTransport::new(true))
+                as Arc<dyn PairingTransport>,
+            // The default executor is unrelated (listener off); only the
+            // task spec below owns the DroppingExecutor.
+            Arc::new(FakeTransferExecutor::new(Arc::clone(&clock)))
+                as Arc<dyn TransferExecutor>,
+            RegistryId::from_bytes([0x11; 32]),
+        );
+        config.listener_enabled = false;
+        let handle = SessionRuntime::start(config).expect("runtime starts");
+
+        let group = CodeGroupKey::new(
+            RegistryId::from_bytes([0x11; 32]),
+            crate::scheduler::key::CodeId::from_bytes([0x55; 16]),
+        );
+        let spec = TransferSpec {
+            group_key: group,
+            pairing: PairingPlan::Local,
+            executor: Arc::new(DroppingExecutor {
+                dropped: Arc::clone(&dropped),
+            }) as Arc<dyn TransferExecutor>,
+            direction: TransferDirection::Send,
+            label: "drop-me".to_owned(),
+            task_id: None,
+        };
+        let task = handle.enqueue(spec).await.expect("task submitted");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = handle
+                .snapshot(crate::runtime::SnapshotQuery::one(task))
+                .await
+                .expect("snapshot");
+            if snap.tasks.iter().any(|view| view.state.is_terminal()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task never completed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The runtime and every driver have let go of the executor: the
+        // only Arc was the spec's, released with the terminal transition.
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the terminal task's executor was released"
+        );
+        let _ = handle.shutdown(ShutdownMode::Drain).await;
     }
 }

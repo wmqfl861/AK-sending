@@ -11,7 +11,9 @@
 use ak_core::error::ErrorCode;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::runtime::actor::Command;
 use crate::runtime::clock::RuntimeClock;
@@ -80,6 +82,45 @@ impl std::fmt::Debug for ProgressSink {
     }
 }
 
+/// A cancelable and awaitable handle to one executor's running engine
+/// work (P1-03).
+///
+/// Executors that spawn a real engine task hand this handle to the
+/// runtime through [`TransferExecutor::take_work`]. The runtime stops the
+/// work cooperatively via [`TransferExecutor::cancel`] first and then
+/// joins through this handle — escalating to a hard abort only when the
+/// graceful join misses its bound. Dropping the handle does not stop the
+/// work.
+pub struct ExecutorWork {
+    join: JoinHandle<()>,
+}
+
+impl ExecutorWork {
+    /// Wrap the spawned engine-work task.
+    pub fn new(join: JoinHandle<()>) -> Self {
+        ExecutorWork { join }
+    }
+
+    /// Hard-stop the work at its next await point. The cooperative
+    /// [`TransferExecutor::cancel`] is preferred; this is the escalation
+    /// when a join missed its bound.
+    pub fn abort(&self) {
+        self.join.abort();
+    }
+
+    /// Wait for the work task to exit: up to `grace` cooperatively, then
+    /// abort and up to `hard` more. A graceful bound that exceeds the
+    /// engine's own shutdown holds lets a persisted completion finish
+    /// instead of being cut mid-commit.
+    pub async fn join_within(self, grace: Duration, hard: Duration) {
+        let mut join = self.join;
+        if tokio::time::timeout(grace, &mut join).await.is_err() {
+            join.abort();
+            let _ = tokio::time::timeout(hard, &mut join).await;
+        }
+    }
+}
+
 /// Injected engine dependency (wave 20: fake; wave 21: the `ak-engine`
 /// on-channel executor adapter).
 ///
@@ -87,7 +128,8 @@ impl std::fmt::Debug for ProgressSink {
 /// through `sink`; it must not block on I/O. `cancel` asks a previously
 /// enqueued task to stop; the task then reports
 /// `Finished { Failed { CANCELLED } }` — unless the final commit already
-/// won the race (contract §10).
+/// won the race (contract §10, P1-03: a persisted completion is adopted,
+/// never overwritten with `Cancelled`).
 pub trait TransferExecutor: Send + Sync {
     /// Begin executing one admitted task.
     fn enqueue(
@@ -99,6 +141,21 @@ pub trait TransferExecutor: Send + Sync {
 
     /// Request cancellation of a started task (no-op for unknown tasks).
     fn cancel(&self, task: &TaskHandle);
+
+    /// Take the joinable work handle of a started task (P1-03), removing
+    /// it from the executor. `None` when the task has no joinable work —
+    /// unknown id, work already exited, or an executor whose engine work
+    /// is not a trackable spawned task (the default).
+    ///
+    /// The runtime calls `cancel` first; the returned
+    /// [`ExecutorWork::join_within`] resolves once the task's engine work
+    /// has fully exited. Shutdown needs exactly that before it may answer
+    /// `ShutdownComplete`: no executor may report the runtime stopped
+    /// while its engine still holds a port or writes files.
+    fn take_work(&self, task: &TaskHandle) -> Option<ExecutorWork> {
+        let _ = task;
+        None
+    }
 }
 
 /// Script describing how the fake executes one task.
@@ -219,6 +276,9 @@ struct FakeState {
     starts: usize,
     cancel_calls: Vec<TaskId>,
     ctls: HashMap<TaskId, Arc<TaskCtl>>,
+    /// Joinable work per started attempt (P1-03 `take_work`); an attempt
+    /// deregisters itself at its very end, after its final report.
+    work: HashMap<TaskId, JoinHandle<()>>,
 }
 
 struct FakeShared {
@@ -360,47 +420,64 @@ impl TransferExecutor for FakeTransferExecutor {
                 (start_ms, shaped.0, shaped.1, shaped.2)
             };
         let shared = Arc::clone(&self.shared);
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             let mut cancelled = cancelled;
-            sink.phase(task, TaskPhase::Scanning).await;
-            if !sleep_cancellable(&shared.clock, &mut cancelled, start_ms + scan_ms).await {
-                record_end(&shared, id);
-                sink.finished(
-                    task,
-                    FinishOutcome::Failed {
-                        error: ErrorCode::Cancelled,
-                    },
+            'attempt: {
+                sink.phase(task, TaskPhase::Scanning).await;
+                if !sleep_cancellable(&shared.clock, &mut cancelled, start_ms + scan_ms).await {
+                    record_end(&shared, id);
+                    sink.finished(
+                        task,
+                        FinishOutcome::Failed {
+                            error: ErrorCode::Cancelled,
+                        },
+                    )
+                    .await;
+                    break 'attempt;
+                }
+                sink.phase(task, TaskPhase::Transferring).await;
+                if !sleep_cancellable(
+                    &shared.clock,
+                    &mut cancelled,
+                    start_ms + scan_ms + transfer_ms,
                 )
-                .await;
-                return;
-            }
-            sink.phase(task, TaskPhase::Transferring).await;
-            if !sleep_cancellable(
-                &shared.clock,
-                &mut cancelled,
-                start_ms + scan_ms + transfer_ms,
-            )
-            .await
-            {
+                .await
+                {
+                    record_end(&shared, id);
+                    sink.finished(
+                        task,
+                        FinishOutcome::Failed {
+                            error: ErrorCode::Cancelled,
+                        },
+                    )
+                    .await;
+                    break 'attempt;
+                }
+                sink.phase(task, TaskPhase::Verifying).await;
+                sink.phase(task, TaskPhase::Committing).await;
                 record_end(&shared, id);
-                sink.finished(
-                    task,
-                    FinishOutcome::Failed {
-                        error: ErrorCode::Cancelled,
-                    },
-                )
-                .await;
-                return;
+                let outcome = match failure {
+                    Some(error) => FinishOutcome::Failed { error },
+                    None => FinishOutcome::Completed,
+                };
+                sink.finished(task, outcome).await;
             }
-            sink.phase(task, TaskPhase::Verifying).await;
-            sink.phase(task, TaskPhase::Committing).await;
-            record_end(&shared, id);
-            let outcome = match failure {
-                Some(error) => FinishOutcome::Failed { error },
-                None => FinishOutcome::Completed,
-            };
-            sink.finished(task, outcome).await;
+            // Self-deregister the work handle last (P1-03): `take_work`
+            // may hand out the join up to this point; after the removal
+            // the attempt is done by definition.
+            shared
+                .state
+                .lock()
+                .expect("fake executor lock")
+                .work
+                .remove(&id);
         });
+        self.shared
+            .state
+            .lock()
+            .expect("fake executor lock")
+            .work
+            .insert(id, join);
         Ok(())
     }
 
@@ -410,5 +487,15 @@ impl TransferExecutor for FakeTransferExecutor {
         if let Some(ctl) = state.ctls.get(&task.task_id()) {
             ctl.cancel();
         }
+    }
+
+    fn take_work(&self, task: &TaskHandle) -> Option<ExecutorWork> {
+        self.shared
+            .state
+            .lock()
+            .expect("fake executor lock")
+            .work
+            .remove(&task.task_id())
+            .map(ExecutorWork::new)
     }
 }

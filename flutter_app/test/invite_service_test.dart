@@ -18,7 +18,8 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         SchedulerPolicy,
         ServiceOnlineEvent,
         akIdFromHex,
-        akIdToHex;
+        akIdToHex,
+        checkSchedSnapshotQuery;
 
 import 'package:ak_sending_app/services/invite_service.dart'
     show FfiInviteService, InviteTtlKind, PairingStartConfig,
@@ -216,6 +217,64 @@ void main() {
       expect((pumped.last as RedeemPendingEvent).peer, 'cd' * 32,
           reason: 'redeem_offered 解码为 RedeemPendingEvent（peer 保留）');
     });
+
+    test('P1-05：readiness 等待期间 dispose——之后不再发生 native 调用', () async {
+      // 不发 runtime_ready：启动卡在就绪门里轮询（真实注册表连接中的形态）。
+      final fake = FakePairingCalls()..emitReadiness = false;
+      final sched = FakeSchedCalls();
+      final service = FfiInviteService(
+        pairingCalls: fake,
+        schedCalls: sched,
+        identityDirProvider: () => newTempIdDir(),
+      );
+      final pending = service.listInvites();
+      final outcome = expectLater(
+          pending, throwsA(isA<StateError>()));
+      // 让 _ensureStarted 进入就绪等待（首个 100ms 间隔的 delay 中）。
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      service.dispose(); // 同步 dispose：相当于立刻释放 native owner
+      await Future<void>.delayed(
+          const Duration(milliseconds: 250)); // 在途 delay 醒来 → 抛 StateError
+      await outcome;
+      expect(sched.startSpecs, isEmpty,
+          reason: '就绪未达成：dispose 后绝不能落 ak_sched_start');
+      // 关键断言：dispose 之后 native 调用计数完全静止。
+      final callsAfterDispose = fake.nativeCalls;
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(fake.nativeCalls, callsAfterDispose,
+          reason: 'dispose 后不再有任何 ak_pairing_* 调用（悬空指针防护）');
+    });
+
+    test('P1-05：pending op 等待期间 dispose——之后不再发生 native 调用', () async {
+      final fake = FakePairingCalls();
+      final sched = FakeSchedCalls();
+      final service = FfiInviteService(
+        pairingCalls: fake,
+        schedCalls: sched,
+        identityDirProvider: () => newTempIdDir(),
+      );
+      // 结果长期 pending：op.wait 每 100ms 轮询一次（模拟慢注册表）。
+      fake.queueOp(
+          json: '{"op":"create","code":"x","code_id":"ab" * 16,'
+              '"expires_ms":0,"revision":1}',
+          pendingPolls: 10000);
+      final pending = service.createInvite();
+      final outcome = expectLater(
+          pending, throwsA(isA<StateError>()));
+      // 走完启动 + 就绪 + create 受理，进入 op 轮询循环。
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      final callsBeforeDispose = fake.nativeCalls;
+      expect(callsBeforeDispose, greaterThan(0),
+          reason: 'dispose 前确实发生了受理/轮询调用');
+      service.dispose();
+      await Future<void>.delayed(
+          const Duration(milliseconds: 250)); // 在途轮询 delay 醒来 → 抛 StateError
+      await outcome;
+      final callsAfterDispose = fake.nativeCalls;
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(fake.nativeCalls, callsAfterDispose,
+          reason: 'dispose 后 op 轮询立即停止：ensureLive 在每次 await 后拦截');
+    });
   });
 
   group('调度策略与偏好持久化', () {
@@ -349,7 +408,11 @@ final class FakeOp {
 /// Deterministic [AkPairingCalls]: sequential op ids, per-symbol spec
 /// capture, lossless `-3` buffers. [queueOp] scripts the NEXT accepted
 /// `*_start` op's result; [failReadinessWith] makes the readiness gate
-/// see `runtime_failed` instead of `runtime_ready`.
+/// see `runtime_failed` instead of `runtime_ready`; [emitReadiness]
+/// leaves the queue empty so readiness stays pending (P1-05 dispose
+/// tests); [nativeCalls] counts EVERY seam call so tests can prove no
+/// native call happens after dispose; [lastErrorText] scripts the P2-08
+/// native error detail.
 final class FakePairingCalls implements AkPairingCalls {
   final Map<String, List<String>> specsBySymbol = {};
   final Map<String, FakeOp> opResults = {};
@@ -358,9 +421,14 @@ final class FakePairingCalls implements AkPairingCalls {
 
   int minBufferCap = 0;
   int startCalls = 0;
+  int nativeCalls = 0;
   String? startSpecJson;
   String? failReadinessWith;
+  bool emitReadiness = true;
   int readinessEventsDrained = 0;
+
+  /// The native error detail surfaced by [lastError] (P2-08).
+  String? lastErrorText;
 
   late final String startRuntimeIdHex = '10' * 16;
   late final Uint8List runtimeId = akIdFromHex(startRuntimeIdHex);
@@ -372,19 +440,25 @@ final class FakePairingCalls implements AkPairingCalls {
   }
 
   @override
+  String? lastError() => lastErrorText;
+
+  @override
   int start(String specJson, Uint8List runtimeIdOut) {
+    nativeCalls += 1;
     startCalls += 1;
     startSpecJson = specJson;
     runtimeIdOut.setAll(0, runtimeId);
     // The engine connects in the background; the readiness phase becomes
     // observable on the event queue.
-    eventQueue.add(failReadinessWith == null
-        ? {'event': 'runtime_ready', 'runtime': startRuntimeIdHex}
-        : {
-            'event': 'runtime_failed',
-            'runtime': startRuntimeIdHex,
-            'error': failReadinessWith,
-          });
+    if (emitReadiness || failReadinessWith != null) {
+      eventQueue.add(failReadinessWith == null
+          ? {'event': 'runtime_ready', 'runtime': startRuntimeIdHex}
+          : {
+              'event': 'runtime_failed',
+              'runtime': startRuntimeIdHex,
+              'error': failReadinessWith,
+            });
+    }
     return AkStatus.ok;
   }
 
@@ -412,6 +486,7 @@ final class FakePairingCalls implements AkPairingCalls {
       _accept('ak_pairing_stop_start', '{"spec_version":1}', opIdOut);
 
   int _accept(String symbol, String specJson, Uint8List opIdOut) {
+    nativeCalls += 1;
     (specsBySymbol[symbol] ??= []).add(specJson);
     final hex = (_seq++).toRadixString(16).padLeft(32, '0');
     opIdOut.setAll(0, akIdFromHex(hex));
@@ -424,6 +499,7 @@ final class FakePairingCalls implements AkPairingCalls {
   @override
   int opResult(
       Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
+    nativeCalls += 1;
     final op = opResults[akIdToHex(opId)];
     if (op == null) {
       return AkStatus.errNotFound;
@@ -442,6 +518,7 @@ final class FakePairingCalls implements AkPairingCalls {
 
   @override
   int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
+    nativeCalls += 1;
     if (eventQueue.isEmpty) {
       return AkStatus.pending;
     }
@@ -460,7 +537,10 @@ final class FakePairingCalls implements AkPairingCalls {
   }
 
   @override
-  int cancelOp(Uint8List runtimeId, Uint8List opId) => AkStatus.ok;
+  int cancelOp(Uint8List runtimeId, Uint8List opId) {
+    nativeCalls += 1;
+    return AkStatus.ok;
+  }
 
   void _write(Uint8List buffer, String payload) {
     final bytes = utf8.encode(payload);
@@ -471,7 +551,8 @@ final class FakePairingCalls implements AkPairingCalls {
   }
 }
 
-/// Deterministic [AkSchedCalls] (the six shipped engine calls).
+/// Deterministic [AkSchedCalls] (the six shipped engine calls; the
+/// snapshot seam mirrors the P0-01 ruling — only the default '{}' query).
 final class FakeSchedCalls implements AkSchedCalls {
   final List<String> startSpecs = [];
   final List<String> enqueueSpecs = [];
@@ -480,6 +561,12 @@ final class FakeSchedCalls implements AkSchedCalls {
       <Map<String, Object?>>[];
 
   String snapshotJson = '{}';
+
+  /// The native error detail surfaced by [lastError] (P2-08).
+  String? lastErrorText;
+
+  @override
+  String? lastError() => lastErrorText;
 
   @override
   int start(String specJson) {
@@ -505,6 +592,7 @@ final class FakeSchedCalls implements AkSchedCalls {
 
   @override
   int snapshot(String queryJson, Uint8List buffer, int cap) {
+    checkSchedSnapshotQuery(queryJson);
     _write(buffer, snapshotJson);
     return AkStatus.event;
   }

@@ -19,6 +19,7 @@ mod doctor;
 mod errors;
 mod invite;
 
+use std::future::Future;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
@@ -2234,59 +2235,133 @@ pub(crate) fn expect_policy_lines(policy: &ExpectPolicy) -> Vec<String> {
 // Address candidates (wave 25): what a sender can dial on this host
 // ---------------------------------------------------------------------------
 
-/// One address a sender can try on this host: an IPv4 interface address
-/// (public or LAN) carrying the listen port, plus its classification label.
+/// One address a sender can try on this host: a dialable interface address
+/// (or the exact bound endpoint itself) carrying the listen port, plus its
+/// classification label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AddressCandidate {
     pub(crate) addr: SocketAddr,
-    /// "lan" (RFC1918 private) or "public"; display-only.
+    /// "lan" (RFC1918 private / IPv6 unique-local), "public", or
+    /// "loopback" (an explicit loopback bind); display-only.
     pub(crate) label: &'static str,
 }
 
-/// Filter local interface networks down to dialable IPv4 candidates for
-/// `port`: IPv4 only (the mDNS path already advertises v6), no loopback
-/// (127.x -- `local_nets` drops loopback interfaces, this is the defensive
-/// second lock), no link-local (169.254.x), deduped by address, interface
-/// order preserved. Pure over `nets` so the filtering itself is testable
-/// without interfaces.
-pub(crate) fn candidates_from_nets(
-    nets: &[ak_net::classify::Net],
-    port: u16,
-) -> Vec<AddressCandidate> {
-    let mut out: Vec<AddressCandidate> = Vec::new();
-    for net in nets {
-        let IpAddr::V4(v4) = net.addr else {
-            continue; // IPv6 stays out of the printed candidate list
-        };
-        if v4.is_loopback() || v4.is_link_local() {
-            continue;
-        }
-        if out
-            .iter()
-            .any(|candidate| candidate.addr.ip() == IpAddr::V4(v4))
-        {
-            continue;
-        }
-        let label = if ak_net::classify::is_ipv4_private(v4) {
-            "lan"
-        } else {
-            "public"
-        };
-        out.push(AddressCandidate {
-            addr: SocketAddr::new(IpAddr::V4(v4), port),
-            label,
-        });
+/// Display label for one IPv4 interface address.
+fn ipv4_label(v4: std::net::Ipv4Addr) -> &'static str {
+    if v4.is_loopback() {
+        "loopback"
+    } else if ak_net::classify::is_ipv4_private(v4) {
+        "lan"
+    } else {
+        "public"
     }
-    out
 }
 
-/// Live version of [`candidates_from_nets`] over the real interfaces.
-/// Enumeration failure (or no IPv4 interface) yields an empty list: the
-/// candidates block is a hint, the bound listen address is always printed.
-pub(crate) fn address_candidates(port: u16) -> Vec<AddressCandidate> {
+/// True for IPv6 unique-local addresses (`fc00::/7`), the v6 counterpart of
+/// RFC1918 private space.
+fn is_ipv6_ula(v6: &std::net::Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xfe00 == 0xfc00
+}
+
+/// Display label for one IPv6 interface address.
+fn ipv6_label(v6: &std::net::Ipv6Addr) -> &'static str {
+    if v6.is_loopback() {
+        "loopback"
+    } else if is_ipv6_ula(v6) {
+        "lan"
+    } else {
+        "public"
+    }
+}
+
+/// The dialable candidates for `listen` — the receiver's actual bound
+/// endpoint — given the local interface networks (review P2-02: the list
+/// must reflect what is really listening, not just the port):
+///
+/// * **IPv4 wildcard** (`0.0.0.0:port`): every dialable IPv4 interface
+///   address carrying the port (no loopback — `local_nets` drops loopback
+///   interfaces, this is the defensive second lock — no link-local
+///   `169.254.x`), deduped, interface order preserved;
+/// * **IPv6 wildcard** (`[::]:port`): the IPv6 interface addresses (no
+///   loopback, no link-local `fe80::` — those need a zone id to dial). A
+///   plain `[::]` bind is v6-only on most hosts (`IPV6_V6ONLY` is not
+///   portably queryable), so no unverified v4 compatibility is claimed;
+/// * **any specific bind** (a concrete IP of either family, loopback
+///   included): exactly that endpoint and nothing else — publishing other
+///   interfaces' addresses would advertise endpoints nobody listens on.
+///
+/// Pure over `nets` so the filtering itself is testable without interfaces.
+pub(crate) fn candidates_from_nets(
+    nets: &[ak_net::classify::Net],
+    listen: SocketAddr,
+) -> Vec<AddressCandidate> {
+    let port = listen.port();
+    match listen.ip() {
+        IpAddr::V4(wildcard) if wildcard.is_unspecified() => {
+            let mut out: Vec<AddressCandidate> = Vec::new();
+            for net in nets {
+                let IpAddr::V4(v4) = net.addr else {
+                    continue; // IPv6 is not dialable through a v4 wildcard
+                };
+                if v4.is_loopback() || v4.is_link_local() {
+                    continue;
+                }
+                if out.iter().any(|candidate| candidate.addr.ip() == IpAddr::V4(v4)) {
+                    continue;
+                }
+                out.push(AddressCandidate {
+                    addr: SocketAddr::new(IpAddr::V4(v4), port),
+                    label: ipv4_label(v4),
+                });
+            }
+            out
+        }
+        IpAddr::V4(v4) => vec![AddressCandidate {
+            addr: listen,
+            label: ipv4_label(v4),
+        }],
+        IpAddr::V6(wildcard) if wildcard.is_unspecified() => {
+            let mut out: Vec<AddressCandidate> = Vec::new();
+            for net in nets {
+                let IpAddr::V6(v6) = net.addr else {
+                    continue; // IPv4 is not claimed for a v6 wildcard bind
+                };
+                if v6.is_loopback() || ak_net::classify::is_ipv6_link_local(v6) {
+                    continue;
+                }
+                if out.iter().any(|candidate| candidate.addr.ip() == IpAddr::V6(v6)) {
+                    continue;
+                }
+                out.push(AddressCandidate {
+                    addr: SocketAddr::new(IpAddr::V6(v6), port),
+                    label: ipv6_label(&v6),
+                });
+            }
+            out
+        }
+        IpAddr::V6(v6) => vec![AddressCandidate {
+            addr: listen,
+            label: ipv6_label(&v6),
+        }],
+    }
+}
+
+/// Live version of [`candidates_from_nets`] over the real interfaces and the
+/// receiver's actual bound endpoint: what a sender can truly dial given
+/// that bind. Enumeration failure (or no compatible interface) yields an
+/// empty list: the candidates block is a hint, the bound listen address is
+/// always printed.
+pub(crate) fn address_candidates_for(listen: SocketAddr) -> Vec<AddressCandidate> {
     ak_net::classify::local_nets()
-        .map(|nets| candidates_from_nets(&nets, port))
+        .map(|nets| candidates_from_nets(&nets, listen))
         .unwrap_or_default()
+}
+
+/// The daemon's fixed `0.0.0.0:port` bind form of [`address_candidates_for`]
+/// (the daemon binds the IPv4 wildcard, so the port alone identifies the
+/// bind; kept as its own entry so daemon.rs needs no endpoint plumbing).
+pub(crate) fn address_candidates(port: u16) -> Vec<AddressCandidate> {
+    address_candidates_for(SocketAddr::from(([0, 0, 0, 0], port)))
 }
 
 /// The human candidates block ("address candidates (try these):" plus one
@@ -2404,9 +2479,11 @@ async fn receive_command(
             println!("receiving into {}", out.display());
             println!("address: {addr}");
             // Wave 25: 0.0.0.0:PORT is useless to a sender on a multi-NIC
-            // host (VPN + real NIC) -- also list every interface address the
-            // peer can dial, labeled lan/public.
-            for line in address_candidates_lines(&address_candidates(addr.port())) {
+            // host (VPN + real NIC) -- also list what the peer can dial
+            // given the actual bind (every compatible interface address for
+            // a wildcard bind, the bound endpoint itself for a specific
+            // one), labeled lan/public.
+            for line in address_candidates_lines(&address_candidates_for(addr)) {
                 println!("{line}");
             }
             println!("{}", fingerprint_lines("fingerprint", &fp));
@@ -2489,11 +2566,21 @@ fn duplicate_roots_error(err: &EngineError) -> Option<&std::io::Error> {
 // send: multi-address candidates with automatic fallback (wave 25)
 // ---------------------------------------------------------------------------
 
-/// Per-address connect deadline of the send fallback: an address that has
-/// not completed the QUIC+TLS handshake within this budget is abandoned for
-/// the next candidate. Transfers that already connected are NOT bound by it
-/// (see [`attempt_send_to`]).
-const SEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default per-address connect deadline of the send fallback (seconds):
+/// an address whose bind/connect/handshake phase has not completed within
+/// this budget is abandoned for the next candidate. The budget starts when
+/// the engine reports `Progress::Connecting` — i.e. after the synchronous
+/// source scan — and no longer applies once the transfer is connected (see
+/// [`attempt_send_to`] and [`drive_with_connect_budget`]).
+///
+/// 10s (was 3s): the QUIC+TLS handshake needs several round trips, and a
+/// real cross-continent run through a VPN exit measured over 3s on a slow
+/// day — BOTH wave-25 (3s around the whole future) and the split-budget
+/// wave-26 driver failed W→L at exactly 3s while the reverse direction
+/// (China→local, fewer RTTs through the direct path) kept working. LAN
+/// candidates still connect in milliseconds, so a larger budget costs
+/// nothing on fast paths; `--connect-timeout` tunes it per environment.
+const SEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Brief pause between address attempts: the failed attempt's QUIC endpoint
 /// releases its UDP socket asynchronously after drop, so an immediate rebind
@@ -2512,17 +2599,37 @@ fn send_target_prefers_lan(addr: &SocketAddr) -> bool {
     }
 }
 
-/// Dedupe the --to list, then stably sort it LAN-first. Stable: the user's
+/// Dedupe the --to list, normalize v4-mapped candidates to plain IPv4
+/// (`[::ffff:1.2.3.4]:port` dials as `1.2.3.4:port` — `ak_net`'s connect
+/// bridges families for dual-stack sockets, but the engine's send-path
+/// family fast-fail compares raw families, so the dialable plain form is
+/// the canonical one), then stably sort LAN-first. Stable: the user's
 /// order survives within the LAN group and within the public group.
 pub(crate) fn order_send_targets(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let mut ordered: Vec<SocketAddr> = Vec::with_capacity(targets.len());
     for addr in targets {
+        let addr = ak_net::classify::expand_mapped(addr);
         if !ordered.contains(&addr) {
             ordered.push(addr);
         }
     }
     ordered.sort_by_key(|addr| !send_target_prefers_lan(addr));
     ordered
+}
+
+/// Local wildcard bind matching the candidate's address family (review
+/// P2-01): the engine rejects a local/peer family mismatch before dialing,
+/// so an IPv6 candidate must bind `[::]:port` (same-family wildcard), not
+/// `0.0.0.0:port`. The explicit `--port` semantics survive unchanged —
+/// same port, family-matched wildcard — and the per-attempt pause
+/// ([`SEND_ATTEMPT_PAUSE`]) still gives the previous attempt's socket time
+/// to release the port.
+pub(crate) fn send_bind_for(addr: SocketAddr, port: u16) -> SocketAddr {
+    if addr.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port)
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], port))
+    }
 }
 
 /// Why one address attempt failed (wave 25 fallback bookkeeping).
@@ -2570,41 +2677,141 @@ fn one_line_reason(err: &EngineError) -> String {
     clip_line(first, 120).to_owned()
 }
 
-/// One full engine send against a single address, bounded by
-/// [`SEND_CONNECT_TIMEOUT`] for the connect phase only: the engine future
-/// is raced against the deadline until it reports `Progress::Connected`;
-/// a connected transfer then runs to completion unbounded (a real transfer
-/// legitimately outlives 3 seconds). The connected flag is set from the
-/// progress callback, which the engine invokes synchronously inside the
-/// polled future, so there is no cross-task race.
+/// Connect-phase bookkeeping for one send attempt (review P1-01). The
+/// engine invokes its progress callback synchronously inside the polled
+/// future, so every mark below is set while the driver task is inside
+/// `send.poll()` itself — there is no cross-task race, and the recorded
+/// instant is exactly when the engine moved from preparation to binding.
+struct ConnectPhaseMarks {
+    /// When `Progress::Connecting` fired: `prepare_send` (the synchronous
+    /// full-source scan: open every source, whole + chunk digests, sender
+    /// checkpoint) is done and bind/connect/handshake start now.
+    connecting_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Wakes [`drive_with_connect_budget`] when the connect phase starts.
+    /// `Notify` stores a permit when there is no waiter yet, so the signal
+    /// survives whichever order poll and callback run in.
+    connecting: tokio::sync::Notify,
+    /// Set on `Progress::Connected`: the handshake completed and the
+    /// transfer is running under its own idle budget.
+    connected: std::sync::atomic::AtomicBool,
+}
+
+impl ConnectPhaseMarks {
+    fn new() -> Self {
+        Self {
+            connecting_at: std::sync::Mutex::new(None),
+            connecting: tokio::sync::Notify::new(),
+            connected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Progress-callback side: record the phase transitions the budget
+    /// driver needs. `Connecting` marks the scan/connect boundary *before*
+    /// waking the driver, so the recorded instant is always available.
+    fn mark(&self, progress: &Progress) {
+        match progress {
+            Progress::Connecting => {
+                *self.connecting_at.lock().unwrap() = Some(tokio::time::Instant::now());
+                self.connecting.notify_one();
+            }
+            Progress::Connected { .. } => {
+                self.connected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Drive one send attempt under split budgets (review P1-01: the 3-second
+/// wave-25 deadline used to wrap the whole engine future, so a large or
+/// slow-storage scan exhausted it before the first handshake byte):
+///
+/// * **before the connect-phase signal** there is no deadline at all — the
+///   engine's synchronous source scan (`prepare_send`) must not burn the
+///   connect budget, whatever the directory size or storage speed;
+/// * **from the connect-phase signal** (bind/connect/QUIC+TLS handshake)
+///   the attempt gets `budget`, starting exactly at the engine's
+///   `Connecting` report;
+/// * **once connected** the deadline no longer applies: the transfer is
+///   governed by the engine's own idle budget and legitimately outlives
+///   the connect budget.
+///
+/// `Err(())` means the connect phase exceeded its budget without a
+/// handshake; the caller renders the "no QUIC handshake" failure. The
+/// budget is a parameter (production passes [`SEND_CONNECT_TIMEOUT`]) so
+/// the split itself is testable with synthetic futures and small delays
+/// instead of real multi-second scans. Generic over the driven future for
+/// the same reason.
+async fn drive_with_connect_budget<S>(
+    marks: &ConnectPhaseMarks,
+    mut send: std::pin::Pin<&mut S>,
+    budget: Duration,
+) -> Result<<S as Future>::Output, ()>
+where
+    S: Future + ?Sized,
+{
+    // Phase 1 — preparation: no deadline. The engine signals the boundary
+    // from inside its own poll (see ConnectPhaseMarks); an attempt that
+    // finishes or fails before ever connecting (invalid spec, duplicate
+    // roots, bind failure) completes through the second branch untouched.
+    let connect_started = tokio::select! {
+        _ = marks.connecting.notified() => {
+            marks
+                .connecting_at
+                .lock()
+                .unwrap()
+                .expect("Connecting instant is recorded before notify")
+        }
+        done = send.as_mut() => return Ok(done),
+    };
+    // Phase 2 — bind/connect/handshake: the budget counted from the
+    // engine's own Connecting report, so scan time cannot leak in.
+    match tokio::time::timeout_at(connect_started + budget, send.as_mut()).await {
+        Ok(done) => Ok(done),
+        Err(_deadline_elapsed) => {
+            if marks
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Connected inside the deadline; from here the transfer is
+                // governed by its own idle budget, not the connect deadline.
+                Ok(send.await)
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+/// One full engine send against a single address, split-timed by
+/// [`drive_with_connect_budget`]: the synchronous source scan is unbudgeted,
+/// bind/connect/handshake gets [`SEND_CONNECT_TIMEOUT`], and a connected
+/// transfer runs to completion unbounded (a real transfer legitimately
+/// outlives 3 seconds). Phase marks are set from the progress callback,
+/// which the engine invokes synchronously inside the polled future, so
+/// there is no cross-task race.
 async fn attempt_send_to(
     spec: SendSpec,
     printer: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Report, AttemptFailure> {
     let addr = spec.peer;
-    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = connected.clone();
+    let marks = Arc::new(ConnectPhaseMarks::new());
+    let phase_marks = marks.clone();
     let wrapped = move |progress: Progress| {
-        if matches!(progress, Progress::Connected { .. }) {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        phase_marks.mark(&progress);
         printer(progress);
     };
     let send = ak_engine::send(spec, &wrapped);
     tokio::pin!(send);
-    let result = match tokio::time::timeout(SEND_CONNECT_TIMEOUT, send.as_mut()).await {
+    let result = match drive_with_connect_budget(&marks, send.as_mut(), SEND_CONNECT_TIMEOUT).await
+    {
         Ok(result) => result,
-        Err(_deadline_elapsed) => {
-            if connected.load(std::sync::atomic::Ordering::Relaxed) {
-                // Connected inside the deadline; from here the transfer is
-                // governed by its own idle budget, not the connect deadline.
-                send.await
-            } else {
-                return Err(AttemptFailure::connect_timeout(addr));
-            }
-        }
+        Err(()) => return Err(AttemptFailure::connect_timeout(addr)),
     };
-    let after_connect = connected.load(std::sync::atomic::Ordering::Relaxed);
+    let after_connect = marks
+        .connected
+        .load(std::sync::atomic::Ordering::Relaxed);
     result.map_err(|err| AttemptFailure {
         addr,
         reason: one_line_reason(&err),
@@ -2762,8 +2969,14 @@ async fn send_command(
     let printer = progress_printer("send");
     let _ = key;
     // One engine send per address; the spec is rebuilt per attempt because
-    // SendSpec carries the peer address. The shared pieces are borrowed (not
-    // moved) so the closure stays FnMut across attempts.
+    // SendSpec carries the peer address (and the engine consumes the spec).
+    // The shared pieces are borrowed (not moved) so the closure stays FnMut
+    // across attempts, and every attempt clones its own spec inputs — no
+    // spec state survives one attempt to pollute the next. The engine's
+    // prepared scan, however, is private to one `ak_engine::send` call and
+    // cannot be shared across candidates from the CLI (see the P1-01 note
+    // in reports/codex-review-2026-11-05-wave25.md: fixing that repetition
+    // needs an ak-engine entry change, out of scope here).
     let (root, extras, bundle, checkpoints, device_name) =
         (&root, &extras, &bundle, &checkpoints, &device_name);
     let printer = printer.as_ref();
@@ -2772,7 +2985,11 @@ async fn send_command(
         for extra in extras.iter() {
             spec.add_root(extra.clone());
         }
-        spec.bind = SocketAddr::from(([0, 0, 0, 0], port));
+        // Family-matched wildcard per candidate (review P2-01): an IPv6
+        // candidate binds [::]:port, an IPv4 candidate 0.0.0.0:port — the
+        // engine's family fast-fail would otherwise kill every IPv6
+        // candidate before the handshake.
+        spec.bind = send_bind_for(addr, port);
         spec.conflict = conflict;
         spec.checkpoint_dir = checkpoints.clone();
         spec.device_name = device_name.clone();
@@ -4321,6 +4538,56 @@ mod tests {
     }
 
     #[test]
+    fn order_send_targets_normalizes_v4_mapped_candidates() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        // v4-mapped v6 candidates dial as plain IPv4 (the engine's send-path
+        // family fast-fail compares raw families), and the normalization
+        // also makes the dedup family-aware.
+        let ordered = order_send_targets(vec![
+            addr("[::ffff:127.0.0.1]:7000"),
+            addr("127.0.0.1:7000"), // duplicate after normalization
+            addr("[::ffff:192.168.1.5]:7000"),
+        ]);
+        assert_eq!(
+            ordered,
+            vec![
+                addr("127.0.0.1:7000"),
+                addr("192.168.1.5:7000"), // LAN tier keeps it after loopback
+            ]
+        );
+        // Native v6 addresses are left alone.
+        assert_eq!(
+            order_send_targets(vec![addr("[2001:db8::1]:7000")]),
+            vec![addr("[2001:db8::1]:7000")]
+        );
+    }
+
+    #[test]
+    fn send_bind_for_matches_candidate_family_and_keeps_port() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        // IPv4 candidates keep the classic wildcard; the explicit --port
+        // survives on both families.
+        assert_eq!(
+            send_bind_for(addr("192.168.1.5:7000"), 7300),
+            addr("0.0.0.0:7300")
+        );
+        assert_eq!(
+            send_bind_for(addr("127.0.0.1:7000"), 0),
+            addr("0.0.0.0:0")
+        );
+        // IPv6 candidates get the same-family [::] wildcard (review P2-01:
+        // 0.0.0.0 made every v6 candidate fail the family fast-fail).
+        assert_eq!(
+            send_bind_for(addr("[::1]:7000"), 7300),
+            addr("[::]:7300")
+        );
+        assert_eq!(
+            send_bind_for(addr("[2001:db8::1]:7000"), 0),
+            addr("[::]:0")
+        );
+    }
+
+    #[test]
     fn candidates_from_nets_filters_and_labels_ipv4() {
         let net = |ip: &str| ak_net::classify::Net {
             addr: ip.parse().unwrap(),
@@ -4336,7 +4603,9 @@ mod tests {
             net("192.168.1.100"),  // duplicate interface address
             net("10.8.0.2"),       // LAN (VPN-typical private range)
         ];
-        let candidates = candidates_from_nets(&nets, 57210);
+        // Wildcard IPv4 bind: the wave-25 expansion over every dialable v4
+        // interface (the daemon's fixed 0.0.0.0 bind is exactly this form).
+        let candidates = candidates_from_nets(&nets, "0.0.0.0:57210".parse().unwrap());
         let rendered: Vec<String> = candidates
             .iter()
             .map(|candidate| format!("{} ({})", candidate.addr, candidate.label))
@@ -4357,6 +4626,91 @@ mod tests {
                 "103.236.80.135:57210".to_owned(),
                 "10.8.0.2:57210".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn candidates_from_nets_specific_bind_publishes_only_that_endpoint() {
+        let net = |ip: &str| ak_net::classify::Net {
+            addr: ip.parse().unwrap(),
+            prefix_len: 24,
+        };
+        let nets = vec![
+            net("192.168.1.100"),  // LAN interface
+            net("10.8.0.2"),       // another interface
+            net("103.236.80.135"), // public interface
+        ];
+        // A bind to one concrete interface listens ONLY there (review
+        // P2-02): advertising the other interfaces' ports would send peers
+        // to endpoints nobody answers on.
+        let candidates = candidates_from_nets(&nets, "192.168.1.5:57210".parse().unwrap());
+        assert_eq!(
+            candidates,
+            vec![AddressCandidate {
+                addr: "192.168.1.5:57210".parse().unwrap(),
+                label: "lan",
+            }]
+        );
+        // An explicit loopback bind is published as the loopback endpoint.
+        assert_eq!(
+            candidates_from_nets(&nets, "127.0.0.1:57210".parse().unwrap()),
+            vec![AddressCandidate {
+                addr: "127.0.0.1:57210".parse().unwrap(),
+                label: "loopback",
+            }]
+        );
+        // So is a concrete public bind, and a concrete IPv6 bind (ULA
+        // labels "lan", global labels "public").
+        assert_eq!(
+            candidates_from_nets(&nets, "103.236.80.135:57210".parse().unwrap()),
+            vec![AddressCandidate {
+                addr: "103.236.80.135:57210".parse().unwrap(),
+                label: "public",
+            }]
+        );
+        assert_eq!(
+            candidates_from_nets(&nets, "[fd00::9]:57210".parse().unwrap()),
+            vec![AddressCandidate {
+                addr: "[fd00::9]:57210".parse().unwrap(),
+                label: "lan",
+            }]
+        );
+        assert_eq!(
+            candidates_from_nets(&nets, "[::1]:57210".parse().unwrap()),
+            vec![AddressCandidate {
+                addr: "[::1]:57210".parse().unwrap(),
+                label: "loopback",
+            }]
+        );
+    }
+
+    #[test]
+    fn candidates_from_nets_v6_wildcard_lists_v6_interfaces_only() {
+        let net = |ip: &str| ak_net::classify::Net {
+            addr: ip.parse().unwrap(),
+            prefix_len: 64,
+        };
+        let nets = vec![
+            net("192.168.1.100"), // v4 interfaces are NOT claimed for a v6
+            net("10.8.0.2"),      // wildcard bind (v6only is the safe read)
+            net("fe80::1"),       // v6 link-local: needs a zone id, not dialable
+            net("::1"),           // v6 loopback
+            net("fd00::10"),      // unique-local (lan)
+            net("2001:db8::2"),   // global (public)
+            net("fd00::10"),      // duplicate interface address
+        ];
+        let candidates = candidates_from_nets(&nets, "[::]:57210".parse().unwrap());
+        let rendered: Vec<String> = candidates
+            .iter()
+            .map(|candidate| format!("{} ({})", candidate.addr, candidate.label))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "[fd00::10]:57210 (lan)".to_owned(),
+                "[2001:db8::2]:57210 (public)".to_owned(),
+            ],
+            "v6 interfaces only, loopback/link-local filtered, deduped: {rendered:?}"
         );
     }
 
@@ -4436,9 +4790,9 @@ mod tests {
             .expect_err("all dead");
         assert_eq!(failures.iter().map(|f| f.addr).collect::<Vec<_>>(), targets);
         assert!(
-            failures
-                .iter()
-                .all(|f| f.reason.starts_with("timeout after 3s")),
+            failures.iter().all(|f| f
+                .reason
+                .starts_with(&format!("timeout after {}s", SEND_CONNECT_TIMEOUT.as_secs()))),
             "every reason names the deadline: {failures:?}"
         );
     }
@@ -4531,7 +4885,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("192.168.1.100:7000: timeout after 3s"),
+            text.contains(&format!(
+                "192.168.1.100:7000: timeout after {}s",
+                SEND_CONNECT_TIMEOUT.as_secs()
+            )),
             "{text}"
         );
         assert!(
@@ -4606,12 +4963,292 @@ mod tests {
         // fallback moved on.
         assert!(
             started.elapsed() >= SEND_CONNECT_TIMEOUT,
-            "the dead address must burn the 3s connect deadline"
+            "the dead address must burn the full connect deadline"
         );
         assert_eq!(
             std::fs::read(out.join("fallback.bin")).unwrap(),
             payload,
             "byte-identical delivery through the fallback path"
+        );
+        let recv_report = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("receiver joins")
+            .expect("receiver task ok")
+            .expect("receive ok");
+        assert_eq!(recv_report.bytes, payload.len() as u64);
+    }
+
+    // -- split connect budgets (review P1-01) -----------------------------
+    //
+    // Synthetic futures stand in for the engine: the wrapper cannot tell a
+    // slow `prepare_send` from any other pre-Connecting delay — that is the
+    // point of the split — so the budget semantics are pinned with cheap
+    // delays and a shrunken budget instead of real multi-second scans.
+
+    /// A future that behaves like `ak_engine::send`: delays before the
+    /// Connecting mark (the synchronous source scan), then the connect
+    /// phase, then the connected transfer, driven by `script`.
+    async fn scripted_send(
+        marks: Arc<ConnectPhaseMarks>,
+        scan: Duration,
+        connect: Duration,
+        transfer: Duration,
+    ) -> Result<Report, EngineError> {
+        tokio::time::sleep(scan).await;
+        marks.mark(&Progress::Connecting);
+        tokio::time::sleep(connect).await;
+        marks.mark(&Progress::Connected {
+            peer: "peer".to_owned(),
+        });
+        tokio::time::sleep(transfer).await;
+        Ok(fake_report(7))
+    }
+
+    #[tokio::test]
+    async fn connect_budget_ignores_slow_source_scan() {
+        // A scan (800ms) far longer than the connect budget (200ms) must
+        // not consume it: the attempt still succeeds once the connect phase
+        // itself is quick. The pre-fix wrapper (one deadline around the
+        // whole future) abandoned this attempt at 200ms.
+        let marks = Arc::new(ConnectPhaseMarks::new());
+        let send = scripted_send(
+            marks.clone(),
+            Duration::from_millis(800),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        );
+        tokio::pin!(send);
+        let outcome =
+            drive_with_connect_budget(&marks, send.as_mut(), Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, Ok(Ok(ref report)) if report.bytes == 7),
+            "slow scan must not burn the connect budget: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_budget_fires_on_stalled_handshake() {
+        // The scan finishes fast, but the handshake never completes: the
+        // budget (200ms) fires well before the would-be 5s "engine"
+        // timeout, and only because the scan did not eat into it.
+        let marks = Arc::new(ConnectPhaseMarks::new());
+        let send = scripted_send(
+            marks.clone(),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        tokio::pin!(send);
+        let started = Instant::now();
+        let outcome =
+            drive_with_connect_budget(&marks, send.as_mut(), Duration::from_millis(200)).await;
+        assert!(outcome.is_err(), "stalled handshake must hit the budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "budget fired near 200ms, not at the 5s inner timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_transfer_outlives_connect_budget() {
+        // Connected inside the budget, then a transfer (800ms) longer than
+        // the budget (200ms): the deadline no longer applies and the
+        // transfer runs to completion under its own idle budget.
+        let marks = Arc::new(ConnectPhaseMarks::new());
+        let send = scripted_send(
+            marks.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+            Duration::from_millis(800),
+        );
+        tokio::pin!(send);
+        let outcome =
+            drive_with_connect_budget(&marks, send.as_mut(), Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, Ok(Ok(ref report)) if report.bytes == 7),
+            "connected transfers are governed by the idle budget: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_before_connecting_keeps_engine_error() {
+        // An attempt that fails during preparation (duplicate roots, bind
+        // error, ...) never reaches the connect phase: the engine error
+        // surfaces untouched, not a connect-budget timeout, so the classic
+        // single-address wording still applies.
+        let marks = Arc::new(ConnectPhaseMarks::new());
+        let send = async { Err::<Report, EngineError>(EngineError::PeerClosed) };
+        tokio::pin!(send);
+        let outcome =
+            drive_with_connect_budget(&marks, send.as_mut(), Duration::from_millis(200)).await;
+        match outcome {
+            Ok(Err(EngineError::PeerClosed)) => {}
+            other => panic!("engine error must pass through: {other:?}"),
+        }
+        assert!(!marks.connected.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // -- IPv6 candidates vs the local bind (review P2-01) -----------------
+
+    /// Real-engine IPv6 loopback send: with the family-matched `[::]` bind
+    /// the candidate connects and delivers; with the old fixed `0.0.0.0`
+    /// bind the engine's family fast-fail rejects it before the handshake.
+    /// Skips (passes with a notice) on hosts without IPv6 loopback.
+    #[tokio::test]
+    async fn ipv6_loopback_candidate_needs_family_matched_bind() {
+        let dir = TempDir::new("send-ipv6-loopback");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_fp = receiver_key.fingerprint();
+        let mut recv_spec = ReceiveSpec::new(
+            out.clone(),
+            ak_identity::tls::make_self_signed(&receiver_key),
+        );
+        recv_spec.bind = "[::1]:0".parse().unwrap();
+        recv_spec.idle_timeout = Duration::from_secs(20);
+        recv_spec.authorize = Box::new(|_| true);
+        recv_spec.checkpoint_dir = dir.path().join("recv-checkpoints");
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(async move {
+            ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await
+        });
+        let live = match addr_rx.await {
+            Ok(addr) => addr,
+            Err(_) => {
+                eprintln!("skipping: [::1] bind unavailable on this host");
+                return;
+            }
+        };
+        assert!(live.is_ipv6(), "receiver really bound v6: {live}");
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 249) as u8).collect();
+        std::fs::write(src.join("v6.bin"), &payload).unwrap();
+
+        let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+        let checkpoints = dir.path().join("send-checkpoints");
+        let printer: &(dyn Fn(Progress) + Send + Sync) = &|_| {};
+        let spec_for = |bind: SocketAddr| {
+            let mut spec =
+                SendSpec::new(src.clone(), live, receiver_fp, sender_bundle.clone());
+            spec.bind = bind;
+            spec.idle_timeout = Duration::from_secs(20);
+            spec.checkpoint_dir = checkpoints.clone();
+            spec
+        };
+
+        // The old fixed v4 bind is rejected by the engine's family
+        // fast-fail before any handshake (fast, no 3s burn).
+        let mismatch = attempt_send_to(spec_for("0.0.0.0:0".parse().unwrap()), printer)
+            .await
+            .expect_err("v4 socket cannot dial a native v6 peer");
+        assert!(
+            mismatch.reason.contains("address family mismatch"),
+            "engine fast-fail reason: {}",
+            mismatch.reason
+        );
+        assert!(!mismatch.after_connect);
+
+        // The family-matched [::] bind (send_bind_for's choice for v6
+        // candidates) connects and delivers byte-identical content.
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            attempt_send_to(spec_for(send_bind_for(live, 0)), printer),
+        )
+        .await
+        .expect("bounded run")
+        .expect("the v6 loopback candidate delivers");
+        assert_eq!(report.bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(out.join("v6.bin")).unwrap(), payload);
+        let recv_report = tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("receiver joins")
+            .expect("receiver task ok")
+            .expect("receive ok");
+        assert_eq!(recv_report.bytes, payload.len() as u64);
+    }
+
+    /// Real-engine fallback across families (review P2-01): an IPv4 black
+    /// hole burns its 3s connect budget, the fallback moves to the IPv6
+    /// loopback receiver and delivers. Both targets are loopback tier, so
+    /// the dead-first order survives the LAN sort.
+    #[tokio::test]
+    async fn send_fallback_moves_from_dead_ipv4_to_live_ipv6() {
+        let dir = TempDir::new("send-fallback-v6");
+        let blackhole = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+            Ok(socket) => socket,
+            Err(err) => {
+                eprintln!("skipping: blackhole bind failed ({err})");
+                return;
+            }
+        };
+        let dead = blackhole.local_addr().expect("black hole addr");
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_fp = receiver_key.fingerprint();
+        let mut recv_spec = ReceiveSpec::new(
+            out.clone(),
+            ak_identity::tls::make_self_signed(&receiver_key),
+        );
+        recv_spec.bind = "[::1]:0".parse().unwrap();
+        recv_spec.idle_timeout = Duration::from_secs(20);
+        recv_spec.authorize = Box::new(|_| true);
+        recv_spec.checkpoint_dir = dir.path().join("recv-checkpoints");
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(async move {
+            ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await
+        });
+        let live = match addr_rx.await {
+            Ok(addr) => addr,
+            Err(_) => {
+                eprintln!("skipping: [::1] bind unavailable on this host");
+                return;
+            }
+        };
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("fallback-v6.bin"), &payload).unwrap();
+
+        let targets = order_send_targets(vec![dead, live]);
+        assert_eq!(targets, vec![dead, live], "loopback tier keeps order");
+
+        let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+        let (root, checkpoints, sender_bundle) = (
+            &src,
+            &dir.path().join("send-checkpoints"),
+            &sender_bundle,
+        );
+        let printer: &(dyn Fn(Progress) + Send + Sync) = &|_| {};
+        let started = Instant::now();
+        let attempt = |addr: SocketAddr| async move {
+            let mut spec = SendSpec::new(root.clone(), addr, receiver_fp, sender_bundle.clone());
+            spec.bind = send_bind_for(addr, 0); // per-candidate family (P2-01)
+            spec.idle_timeout = Duration::from_secs(20);
+            spec.checkpoint_dir = checkpoints.clone();
+            attempt_send_to(spec, printer).await
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_send_fallback(&targets, attempt),
+        )
+        .await
+        .expect("bounded run")
+        .expect("the IPv6 address delivers after the IPv4 failure");
+        assert_eq!(report.bytes, payload.len() as u64);
+        assert!(
+            started.elapsed() >= SEND_CONNECT_TIMEOUT,
+            "the dead IPv4 address burned its full connect budget first"
+        );
+        assert_eq!(
+            std::fs::read(out.join("fallback-v6.bin")).unwrap(),
+            payload,
+            "byte-identical delivery over the v6 fallback path"
         );
         let recv_report = tokio::time::timeout(Duration::from_secs(10), receiver)
             .await

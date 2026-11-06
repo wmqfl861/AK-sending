@@ -6,9 +6,9 @@
 //! just by final success).
 use ak_core::error::ErrorCode;
 use ak_session::scheduler::{
-    CancelOutcome, CodeGroupKey, CodeId, CrossCodeMode, FinishOutcome, FinishResult, RegistryId,
-    SameCodeMode, SchedulerCore, SchedulerEvent, SchedulerPolicy, TaskHandle, TaskId, TaskPhase,
-    TaskState,
+    CancelOutcome, CodeGroupKey, CodeId, CrossCodeMode, FinishOutcome, FinishResult, QueueError,
+    RegistryId, SameCodeMode, SchedulerCore, SchedulerEvent, SchedulerPolicy, TaskHandle, TaskId,
+    TaskPhase, TaskState,
 };
 
 fn group(n: u8) -> CodeGroupKey {
@@ -604,5 +604,355 @@ fn churn_proves_serial_per_code_and_overlap_across_codes_with_intervals() {
         let mut sorted = order.clone();
         sorted.sort();
         assert_eq!(order, sorted, "per-group completion must follow FIFO");
+    }
+}
+
+/// P2-03: shrinking a queue limit through `set_policy` keeps the live
+/// backlog queued (contract §7: no automatic dropping), refuses new
+/// enqueues while the backlog sits at or above the target, and — once the
+/// backlog has drained — enforces the *requested* smaller limit instead of
+/// staying silently inflated to the old backlog size. Both dimensions are
+/// covered: the global `max_queued_tasks` and the per-code
+/// `max_queued_tasks_per_code`.
+#[test]
+fn queue_limit_shrink_keeps_backlog_then_converges_to_the_new_limits() {
+    // ---- global `max_queued_tasks` path --------------------------------
+    let mut core = SchedulerCore::new(policy(
+        SameCodeMode::Serial,
+        CrossCodeMode::Parallel,
+        4,
+        4,
+        8,
+    ));
+    let a = group(1);
+    for n in 1..=4u64 {
+        core.enqueue(task(n), a).unwrap(); // task 1 runs, tasks 2..=4 queued
+    }
+    assert_eq!(core.queued_len(), 3);
+    core.set_policy(policy(
+        SameCodeMode::Serial,
+        CrossCodeMode::Parallel,
+        4,
+        4,
+        2,
+    ));
+    assert_eq!(core.queued_len(), 3, "the shrink keeps the backlog");
+    assert_eq!(
+        core.enqueue(task(5), a),
+        Err(QueueError::QueueFull),
+        "new enqueues refused while len(3) >= target(2)"
+    );
+    // Drain everything: each finish admits the next queued task.
+    for n in 1..=4u64 {
+        assert_eq!(
+            core.finish(&task(n), FinishOutcome::Completed),
+            Some(FinishResult::Completed)
+        );
+    }
+    assert_eq!(core.queued_len(), 0);
+    // The new global bound (2) now binds: two queue, the third is refused
+    // even though the old capacity was 8.
+    core.enqueue(task(6), a).unwrap(); // admitted, not queued
+    core.enqueue(task(7), a).unwrap(); // queued (len 1)
+    core.enqueue(task(8), a).unwrap(); // queued (len 2)
+    assert_eq!(core.enqueue(task(9), a), Err(QueueError::QueueFull));
+
+    // ---- per-code `max_queued_tasks_per_code` path ---------------------
+    let base = SchedulerPolicy {
+        max_queued_tasks: 32,
+        max_queued_tasks_per_code: 4,
+        ..SchedulerPolicy::default() // serial/parallel
+    };
+    let mut core = SchedulerCore::new(base);
+    for n in 11..=14u64 {
+        core.enqueue(task(n), a).unwrap(); // task 11 runs, 12..=14 queued
+    }
+    assert_eq!(core.queued_len(), 3);
+    let shrunk = SchedulerPolicy {
+        max_queued_tasks_per_code: 2,
+        ..base
+    };
+    core.set_policy(shrunk);
+    assert_eq!(core.queued_len(), 3, "the shrink keeps the backlog");
+    assert_eq!(
+        core.enqueue(task(15), a),
+        Err(QueueError::QueueFull),
+        "group a is above the target: its new enqueues are refused"
+    );
+    // Another group queues unharmed (contract §7: a per-code bound never
+    // blocks other codes).
+    core.enqueue(task(21), group(2)).unwrap();
+    // Drain group a completely.
+    for n in 11..=14u64 {
+        assert_eq!(
+            core.finish(&task(n), FinishOutcome::Completed),
+            Some(FinishResult::Completed)
+        );
+    }
+    // The new per-code bound (2) now binds: task 16 admits (not queued),
+    // tasks 17 and 18 queue (group length 2), the fourth submission of
+    // group a is refused even though the old bound was 4.
+    core.enqueue(task(16), a).unwrap(); // admitted
+    core.enqueue(task(17), a).unwrap(); // queued (group len 1)
+    core.enqueue(task(18), a).unwrap(); // queued (group len 2)
+    assert_eq!(
+        core.enqueue(task(19), a),
+        Err(QueueError::QueueFull),
+        "the shrunk per-code limit converges after the drain"
+    );
+}
+
+/// P2-04: cross-code serial finite batches (contract §8) in the affected
+/// mode — `same_code = parallel × cross_code = serial`. While group A
+/// holds the turn, appends that arrive after the batch's selection window
+/// closes (its first slot release) are deferred to A's *next* batch, and
+/// when the batch ends the turn rotates to the waiting group B instead of
+/// A's post-window appends.
+#[test]
+fn cross_serial_batch_defers_post_selection_appends_to_the_next_batch() {
+    let p = SchedulerPolicy {
+        same_code_mode: SameCodeMode::Parallel,
+        cross_code_mode: CrossCodeMode::Serial,
+        max_active_tasks_per_code: 3,
+        ..SchedulerPolicy::default()
+    };
+    let mut core = SchedulerCore::new(p);
+    let a = group(1);
+    let b = group(2);
+
+    // The batch fills the group's parallelism (A1..A3); B queues.
+    for n in 1..=3u64 {
+        core.enqueue(task(n), a).unwrap();
+    }
+    core.enqueue(task(8), b).unwrap();
+    assert_eq!(core.active_in_group(&a), 3);
+    assert_eq!(core.task_state(&task(8)), Some(TaskState::Queued));
+
+    // An append while the selection window is still open (no batch task
+    // has released its slot yet) joins the batch and backfills a freed
+    // slot within the turn.
+    core.enqueue(task(4), a).unwrap();
+    assert_eq!(core.task_state(&task(4)), Some(TaskState::Queued));
+    core.finish(&task(1), FinishOutcome::Completed).unwrap();
+    assert_eq!(
+        core.task_state(&task(4)),
+        Some(TaskState::WaitingPairing),
+        "an in-window append backfills within the batch"
+    );
+
+    // Appends after the window closed belong to the next batch: A5 stays
+    // queued even though a same-group slot is free (cap 3, two active).
+    core.enqueue(task(5), a).unwrap();
+    core.finish(&task(2), FinishOutcome::Completed).unwrap();
+    assert_eq!(core.active_in_group(&a), 2, "A3 and A4 are active");
+    assert_eq!(
+        core.task_state(&task(5)),
+        Some(TaskState::Queued),
+        "a next-batch append must not extend the current batch"
+    );
+    assert_eq!(core.task_state(&task(8)), Some(TaskState::Queued));
+
+    // Batch end: once A holds no active task, the turn rotates to B — not
+    // to A's next-batch append.
+    core.finish(&task(3), FinishOutcome::Completed).unwrap();
+    core.finish(&task(4), FinishOutcome::Completed).unwrap();
+    assert_eq!(
+        core.task_state(&task(8)),
+        Some(TaskState::WaitingPairing),
+        "the cold group takes the turn at the batch boundary"
+    );
+    assert_eq!(
+        core.task_state(&task(5)),
+        Some(TaskState::Queued),
+        "A's next-batch append waits out B's batch"
+    );
+    // Sanity: finishing B's task opens A's next batch (no deadlock).
+    core.finish(&task(8), FinishOutcome::Completed).unwrap();
+    assert_eq!(
+        core.task_state(&task(5)),
+        Some(TaskState::WaitingPairing),
+        "the deferred append runs in the following batch"
+    );
+}
+
+/// P2-04 shared plumbing for the interval scenarios below.
+mod cross_serial_intervals {
+    use super::*;
+
+    /// One recorded activity interval: (task counter, group, start, end).
+    type Span = (u64, CodeGroupKey, u64, u64);
+
+    /// parallel/serial with the given same-code parallelism cap.
+    fn parallel_serial(per_code: u32) -> SchedulerPolicy {
+        SchedulerPolicy {
+            same_code_mode: SameCodeMode::Parallel,
+            cross_code_mode: CrossCodeMode::Serial,
+            max_active_tasks_per_code: per_code,
+            ..SchedulerPolicy::default()
+        }
+    }
+
+    /// Task counter of a handle built by `task(n)` (big-endian low bytes).
+    fn counter_of(handle: &TaskHandle) -> u64 {
+        let id = handle.task_id();
+        let bytes = id.as_bytes();
+        u64::from_be_bytes(bytes[8..16].try_into().unwrap())
+    }
+
+    /// Deterministic tick simulation: the hot code A starts two tasks
+    /// (`a1_duration`, `a2_duration`), the cold task B (`b_duration`) is
+    /// queued from tick 0, and A appends one new task (`append_duration`)
+    /// per tick for `append_ticks` ticks. Every task runs for its duration
+    /// once admitted. Returns the activity spans `(counter, group, start,
+    /// end)` (contract §12 interval evidence) and each task's enqueue
+    /// tick. The batch selection window closes at tick
+    /// `min(a1_duration, a2_duration)` — the first release of an initial
+    /// batch task (both are admitted at tick 0).
+    fn simulate_hot_appends(
+        a1_duration: u64,
+        a2_duration: u64,
+        b_duration: u64,
+        append_duration: u64,
+        append_ticks: u64,
+    ) -> (Vec<Span>, std::collections::HashMap<u64, u64>) {
+        let a = group(1);
+        let b = group(2);
+        let mut core = SchedulerCore::new(parallel_serial(2));
+        let mut durations = std::collections::HashMap::new();
+        durations.insert(1u64, a1_duration);
+        durations.insert(2u64, a2_duration);
+        durations.insert(9u64, b_duration);
+        let mut enqueue_tick = std::collections::HashMap::new();
+        enqueue_tick.insert(1u64, 0u64);
+        enqueue_tick.insert(2u64, 0u64);
+        enqueue_tick.insert(9u64, 0u64);
+
+        core.enqueue(task(1), a).unwrap();
+        core.enqueue(task(2), a).unwrap();
+        core.enqueue(task(9), b).unwrap();
+
+        let total = 3 + append_ticks;
+        let mut spans: Vec<Span> = Vec::new();
+        let mut open: Vec<(TaskHandle, u64, u64)> = Vec::new();
+        let mut finished = 0usize;
+        let mut next_append = 100u64;
+
+        for clock in 0..500u64 {
+            for event in core.take_events() {
+                match event {
+                    SchedulerEvent::TaskAdmitted { task, .. } => {
+                        let dur = durations[&counter_of(&task)];
+                        open.push((task, clock, dur));
+                    }
+                    SchedulerEvent::TaskFinished { task, group, .. } => {
+                        let index = open.iter().position(|(t, _, _)| *t == task).unwrap();
+                        let (_, start, _) = open.remove(index);
+                        spans.push((counter_of(&task), group, start, clock));
+                        finished += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if finished == total as usize {
+                break;
+            }
+            // The hot code keeps appending: one new task per tick.
+            if clock < append_ticks {
+                core.enqueue(task(next_append), a).unwrap();
+                durations.insert(next_append, append_duration);
+                enqueue_tick.insert(next_append, clock);
+                next_append += 1;
+            }
+            // Every admitted task finishes after running for its duration.
+            let running: Vec<(TaskHandle, u64, u64)> = open.clone();
+            for (t, start, dur) in running {
+                if clock - start >= dur {
+                    core.finish(&t, FinishOutcome::Completed).unwrap();
+                }
+            }
+        }
+        assert_eq!(finished, total as usize, "every simulated task finished");
+        assert_eq!(core.active_total(), 0);
+        assert_eq!(core.live_permits(), 0);
+        assert_eq!(core.queued_len(), 0);
+        (spans, enqueue_tick)
+    }
+
+    /// Assert the finite-batch properties on a simulation run whose batch
+    /// selection window closed at `close_tick`:
+    ///
+    /// * every hot-code task enqueued before the close ran *before* B
+    ///   (B waited out exactly one finite batch, not the whole backlog);
+    /// * every hot-code append enqueued after the close ran *after* B
+    ///   finished (it was deferred to the next batch);
+    /// * no hot-code interval overlaps B's interval (cross-code serial
+    ///   exclusivity);
+    /// * at least one append really was deferred (B did not simply run
+    ///   last behind an unbounded batch).
+    fn assert_finite_batches(
+        spans: &[Span],
+        enqueue_tick: &std::collections::HashMap<u64, u64>,
+        close_tick: u64,
+        label: &str,
+    ) {
+        let a = group(1);
+        let (_, _, b_start, b_end) = spans
+            .iter()
+            .find(|(counter, _, _, _)| *counter == 9)
+            .expect("cold task ran");
+        for (counter, g, start, end) in spans {
+            if *g != a || *counter == 9 {
+                continue;
+            }
+            let tick = enqueue_tick[counter];
+            if tick <= close_tick {
+                assert!(
+                    end <= b_start,
+                    "{label}: in-batch hot task {counter} (enqueue @{tick}) ended @{end} \
+                     after B started @{b_start}"
+                );
+            } else {
+                assert!(
+                    *start >= *b_end,
+                    "{label}: next-batch hot append {counter} (enqueue @{tick}) started \
+                     @{start} before B ended @{b_end}"
+                );
+            }
+        }
+        // Cross-code serial exclusivity, as intervals.
+        let hot: Vec<&Span> = spans.iter().filter(|(_, g, _, _)| *g == a).collect();
+        for (_, _, start, end) in &hot {
+            assert!(
+                *end <= *b_start || *start >= *b_end,
+                "{label}: hot interval [{start},{end}) overlaps B [{b_start},{b_end})"
+            );
+        }
+        // A next batch really existed: at least one post-window append ran
+        // strictly after B — under the starvation bug B would only run
+        // after the unbounded append stream drained.
+        assert!(
+            hot.iter().any(|(counter, _, start, _)| {
+                *start >= *b_end && enqueue_tick[counter] > close_tick
+            }),
+            "{label}: no hot append was deferred to a batch after B"
+        );
+    }
+
+    /// Scenario 1 — staggered hot durations (A1 short, A2 long): the
+    /// selection window closes at A1's release (tick 3); appends from
+    /// tick 4 on are next batch and must not start before B finished.
+    #[test]
+    fn hot_appends_with_short_long_durations_cannot_starve_the_cold_code() {
+        let (spans, enqueue_tick) = simulate_hot_appends(3, 5, 1, 2, 12);
+        assert_finite_batches(&spans, &enqueue_tick, 3, "short/long");
+    }
+
+    /// Scenario 2 — the mirrored staggering (A1 long, A2 short): the
+    /// window closes early at A2's release (tick 2), so even more appends
+    /// defer and B is served after the smaller first batch.
+    #[test]
+    fn hot_appends_with_long_short_durations_cannot_starve_the_cold_code() {
+        let (spans, enqueue_tick) = simulate_hot_appends(8, 2, 1, 2, 12);
+        assert_finite_batches(&spans, &enqueue_tick, 2, "long/short");
     }
 }

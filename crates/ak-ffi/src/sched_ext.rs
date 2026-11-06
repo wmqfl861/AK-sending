@@ -1,7 +1,10 @@
 //! B8 (wave 23): the five remaining `ffi-v2.md` §1 exports —
 //! `ak_pairing_stop_start`, `ak_sched_listen_start`, `ak_sched_retry`,
 //! `ak_sched_task_result`, `ak_sched_shutdown_start` — completing the frozen
-//! 18-symbol v2 surface (`ak_pairing_*` 9 + `ak_sched_*` 9).
+//! 18-signature v2 table (`ak_pairing_*` 9 + `ak_sched_*` 9). Together with
+//! the wave-22 legacy alias `ak_sched_start` (shim.rs) the actual export
+//! count is 19, the form the 2026-11-05 wave-26 ABI ruling froze
+//! (`ak_sched_start` and `ak_sched_listen_start` coexist).
 //!
 //! # Why a second shim file
 //!
@@ -82,7 +85,7 @@ use ak_session::scheduler::key::TaskId;
 use crate::core::{
     self, guarded, AkEngine, FfiError, AK_DONE, AK_ERR_BUFFER, AK_ERR_INVALID, AK_ERR_NULL, AK_OK,
 };
-use crate::pairing::{OpEntry, OpOutcome, PairingRt, RtPhase, SchedRt};
+use crate::pairing::{OpEntry, OpOutcome, PairingRt, SchedRt};
 
 /// Byte length of every id crossing the boundary (runtime/op/task ids).
 const ID_LEN: usize = 16;
@@ -218,21 +221,26 @@ fn sched_roundtrip<T>(
 // ak_pairing_stop_start (safe body).
 // ---------------------------------------------------------------------------
 
-/// Stop one pairing runtime: abort its ops and owner loop, close the
-/// control client, and freeze the runtime in a terminal "stopped" phase.
-/// The runtime entry STAYS registered so the returned op id (and any op
-/// started earlier) remains readable via `ak_pairing_op_result`; every
-/// later op on this runtime fails fast with "stopped by caller".
+/// Stop one pairing runtime: atomically enter the terminal "stopped"
+/// phase (under the runtime's startup lock), then cancel/await the
+/// startup subtasks — the background connect included — abort the op
+/// tasks, and close the control client. The runtime entry STAYS
+/// registered and accepted op results (this stop op included, and any op
+/// that finished before the stop) remain readable via
+/// `ak_pairing_op_result`; every later op on this runtime fails fast
+/// with "stopped by caller". A connect that settles after the stop
+/// returns can never install its live halves or emit `runtime_ready`
+/// (P1-04; ffi-v2 §2 stop semantics).
 pub fn pairing_stop(
     engine: &AkEngine,
     runtime_id: &[u8; ID_LEN],
 ) -> Result<[u8; ID_LEN], FfiError> {
     let rt = runtime_of(engine, runtime_id)?;
-    // Local teardown only: task aborts plus a spawned best-effort
-    // close_notify — no network wait inside the synchronous call.
+    // Teardown enters the terminal phase FIRST (inside, under the startup
+    // lock), then cancels/awaits the startup subtasks. Local work only —
+    // task aborts plus a spawned best-effort close_notify; no network
+    // wait inside the synchronous call.
     rt.teardown(engine.runtime());
-    rt.phase
-        .send_replace(RtPhase::Failed("stopped by caller".to_string()));
     push_rt_event(
         &rt,
         format!(

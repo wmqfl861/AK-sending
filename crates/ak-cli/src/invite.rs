@@ -5,37 +5,30 @@
 //! list, redeem-to-ready with the transactional `peers.book` commit) go
 //! through `ak_session::pairing::PairingOrchestrator` — the shared
 //! orchestration layer. One piece is CLI-local by necessity: the
-//! **cross-process owner answer** (`daemon --pairing`). The orchestrator
-//! keeps invite secrets in process memory (populated by `create_invite`),
-//! so a daemon in a second process cannot answer redeems of a code the
-//! `invite create` process created; until ak-session grows a public
-//! "remember persisted code" seam, [`owner_pairing_loop`] composes the
-//! same frozen transcript from `RegistryClient`'s public frame APIs plus
-//! `ak-identity` proofs and this CLI's own persisted invite store
-//! (`<id-dir>/invites.store`, the same bearer-secret discipline as
-//! `device.key`).
+//! **cross-process owner answer** (`daemon --pairing`, wave 27): the
+//! daemon runs the ORCHESTRATOR's owner loop (`PairingOrchestrator::
+//! spawn_owner_loop_notifying`) and adopts every live code from this
+//! CLI's persisted invite store (`<id-dir>/invites.store`, the same
+//! bearer-secret discipline as `device.key`) through the public
+//! `adopt_persisted_code` seam — the answer drives the frozen transcript
+//! AND writes the pairing journal the wave-27 admission validator reads.
+//! The wave-21 hand-rolled loop this replaced lived here; git history
+//! keeps it.
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
 use ak_identity::invite::InviteCode;
-use ak_identity::pairing_txn::{random_nonce32, PairTranscript, PairingRecord, VerifyExpectations};
-use ak_identity::peer_store::PeerBookStore;
-use ak_identity::{DeviceKeyPair, Fingerprint, PeerRecord};
+use ak_identity::DeviceKeyPair;
 use ak_session::pairing::{CreatedInvite, PairingOrchestrator, RegistryClient};
-use ak_signal::protocol_v2::{
-    AbortReason, CodeId, CtrlMessage, StateFilter, CURSOR_END, CURSOR_START,
-};
-use ak_signal::server_v2::hello2;
+use ak_signal::protocol_v2::{StateFilter, CURSOR_END, CURSOR_START};
 
-use crate::{now_unix_ms, whoami};
+use crate::whoami;
 
 /// File holding the registry endpoint pin under the identity directory:
 /// `AKREG1 <server-addr> <registry-id-64hex>`.
@@ -46,10 +39,6 @@ pub(crate) const REGISTRY_PIN_FILE: &str = "registry.pin";
 /// <display-code>` line per code. Bearer secrets: same protection level
 /// as `device.key`, never printed by `invite list`.
 pub(crate) const INVITE_STORE_FILE: &str = "invites.store";
-
-/// How long the owner answer waits for each peer step before aborting the
-/// transaction (the orchestrator uses the same order of magnitude).
-const OWNER_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The registry endpoint a device talks to (server address + the registry
 /// identity pin its TLS certificate must match).
@@ -547,311 +536,10 @@ pub(crate) async fn redeem_and_pair(
         .context("invite redeem / pairing failed")
 }
 
-// ---------------------------------------------------------------------------
-// Cross-process owner answer (`daemon --pairing`)
-// ---------------------------------------------------------------------------
-
-/// Wire proof → identity proof.
-fn wire_proof(proof: ak_signal::protocol_v2::PairProof) -> ak_identity::pairing_txn::PairProofData {
-    ak_identity::pairing_txn::PairProofData {
-        mac: proof.mac,
-        signature: proof.signature,
-    }
-}
-
-/// Wait for the next pairing-plane frame of `pairing_id` accepted by
-/// `want` within [`OWNER_STEP_TIMEOUT`]. Frames of other transactions and
-/// unrelated pushes are skipped; `PairCommit` carries no pairing id, so
-/// its correlation happens inside `want` (the transcript match).
-async fn wait_frame<T>(
-    plane: &mut tokio::sync::mpsc::Receiver<CtrlMessage>,
-    pairing_id: &[u8; 16],
-    mut want: impl FnMut(CtrlMessage) -> Option<T>,
-) -> Result<T> {
-    let deadline = tokio::time::Instant::now() + OWNER_STEP_TIMEOUT;
-    loop {
-        let frame = tokio::time::timeout_at(deadline, plane.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("pairing step timed out"))?
-            .ok_or_else(|| anyhow::anyhow!("registry pairing plane closed"))?;
-        let ours = match &frame {
-            CtrlMessage::PairProof { pairing_id: id, .. } => id == pairing_id,
-            CtrlMessage::PairCommit { .. } => true, // matched by transcript in `want`
-            CtrlMessage::PairReady { pairing_id: id, .. } => id == pairing_id,
-            _ => false,
-        };
-        if !ours {
-            continue;
-        }
-        if let Some(matched) = want(frame) {
-            return Ok(matched);
-        }
-    }
-}
-
-/// Answer one redeem offer as the code owner, driving the frozen
-/// transcript to `PairReady` and committing the redeemer into
-/// `peers.book`. Returns the redeemer's fingerprint.
-///
-/// The record is built with a throwaway key in the redeemer half
-/// (`ak-identity`'s only public constructor signs both halves; the real
-/// redeemer proof arrives over the wire and the whole record is verified
-/// with `PairingRecord::verify_transcript` before anything is committed).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn answer_offer_as_owner(
-    client: &RegistryClient,
-    key: &DeviceKeyPair,
-    code: &InviteCode,
-    book_path: &Path,
-    code_id: CodeId,
-    code_revision: u64,
-    pairing_id: [u8; 16],
-    redeemer_device_id: [u8; 32],
-    redeem: ak_signal::protocol_v2::RedeemRequest,
-) -> Result<Fingerprint> {
-    let mut plane = client.subscribe_plane();
-    let transcript = PairTranscript {
-        registry_id: client.registry_id(),
-        code_id,
-        code_revision,
-        pairing_id,
-        request_id: redeem.request_id,
-        lookup_digest: code.lookup_digest(),
-        owner_device_id: key.public_key(),
-        redeemer_device_id,
-        owner_nonce: random_nonce32(),
-        redeemer_nonce: redeem.redeemer_nonce,
-        deadline_ms: redeem.deadline_ms,
-    };
-    let auth_key = code.auth_key();
-    let throwaway = DeviceKeyPair::generate();
-    let mut record = PairingRecord::build(transcript, &auth_key, key, &throwaway);
-    let owner_proof = record.owner_proof;
-    client
-        .send_pair_challenge(
-            transcript.to_bytes(),
-            ak_signal::protocol_v2::PairProof {
-                mac: owner_proof.mac,
-                signature: owner_proof.signature,
-            },
-        )
-        .await
-        .context("sending the pairing challenge failed")?;
-    let digest = transcript.transcript_digest();
-
-    // Redeemer proof.
-    record.redeemer_proof = wire_proof(
-        wait_frame(&mut plane, &pairing_id, |frame| match frame {
-            CtrlMessage::PairProof {
-                pairing_id: id,
-                transcript_digest,
-                redeemer_proof,
-            } if id == pairing_id && transcript_digest == digest => Some(redeemer_proof),
-            _ => None,
-        })
-        .await
-        .context("the redeemer's PairProof never arrived")?,
-    );
-
-    // Verify the whole record under the invite auth key before anything
-    // is trusted (both MACs, both signatures, both nonces, the deadline).
-    let verified = record
-        .verify_transcript(&VerifyExpectations {
-            auth_key: &auth_key,
-            expected_owner_nonce: &transcript.owner_nonce,
-            expected_redeemer_nonce: &transcript.redeemer_nonce,
-            now_unix_ms: now_unix_ms(),
-        })
-        .context("the redeemer's pairing proof failed verification")?;
-
-    // Prepared (the frozen server commits once BOTH sides sent theirs).
-    let prepared_signature = key.sign(&hello2::prepared_message(&pairing_id, &digest));
-    client
-        .send_pair_prepared(pairing_id, digest, prepared_signature)
-        .await
-        .context("sending PairPrepared failed")?;
-
-    // Commit: the authoritative record must be byte-identical to ours.
-    let commit = wait_frame(&mut plane, &pairing_id, |frame| match frame {
-        CtrlMessage::PairCommit {
-            transcript,
-            commit_revision,
-            ..
-        } if transcript == verified.record().transcript.to_bytes() => Some(commit_revision),
-        _ => None,
-    })
-    .await
-    .context("PairCommit never matched the verified transcript")?;
-
-    // Local trust-book apply, then the server-side confirmation.
-    let peer_fingerprint = Fingerprint::from_public_key(&redeemer_device_id);
-    PeerBookStore::new()
-        .commit_paired_peer(
-            book_path,
-            PeerRecord {
-                fingerprint: peer_fingerprint,
-                name: String::new(),
-                paired_unix_ms: now_unix_ms(),
-            },
-            &pairing_id,
-        )
-        .context("trust book commit failed")?;
-    let applied_signature = key.sign(&hello2::applied_message(&pairing_id, &digest, commit));
-    client
-        .send_pair_applied(pairing_id, digest, commit, applied_signature)
-        .await
-        .context("sending PairApplied failed")?;
-    wait_frame(&mut plane, &pairing_id, |frame| match frame {
-        CtrlMessage::PairReady { pairing_id: id, .. } if id == pairing_id => Some(()),
-        _ => None,
-    })
-    .await
-    .context("PairReady never arrived")?;
-    Ok(peer_fingerprint)
-}
-
-/// The resident owner loop of `daemon --pairing`: consumes the pairing
-/// plane and answers every redeem offer for a live code in the local
-/// store. Unknown codes are ignored (the server holds the redeem pending
-/// until its deadline — a code this daemon does not hold is not ours to
-/// answer).
-///
-/// The registry keeps ONE session per device: any other process of this
-/// identity connecting (e.g. a later `ak-cli invite create`) replaces this
-/// connection. The plane channel itself survives that (its sender lives in
-/// the shared dispatch state), so the loss is observed on the
-/// connection-state watcher; the loop then reconnects with a bounded
-/// backoff — the server re-pushes pending redeem offers on the new Hello,
-/// and the per-pairing dedup set (kept across reconnects) skips
-/// already-handled transactions.
-pub(crate) async fn owner_pairing_loop(
-    client: RegistryClient,
-    key: DeviceKeyPair,
-    id_dir: PathBuf,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-    on_paired: std::sync::Arc<dyn Fn(Fingerprint) + Send + Sync>,
-) {
-    use ak_session::pairing::ClientState;
-
-    /// One step of the owner loop's inner select.
-    #[allow(clippy::large_enum_variant)]
-    enum Step {
-        Frame(CtrlMessage),
-        Dropped,
-        Disconnected,
-        Stop,
-    }
-
-    let book_path = crate::peer_book_path(&id_dir);
-    let mut seen: HashSet<[u8; 16]> = HashSet::new();
-    'session: loop {
-        let mut plane = client.subscribe_plane();
-        let mut state = client.state_watcher();
-        loop {
-            let step = tokio::select! {
-                _ = shutdown.changed() => Step::Stop,
-                frame = plane.recv() => match frame {
-                    Some(frame) => Step::Frame(frame),
-                    None => Step::Dropped,
-                },
-                _ = state.changed() => {
-                    if matches!(*state.borrow_and_update(), ClientState::Disconnected) {
-                        Step::Disconnected
-                    } else {
-                        continue
-                    }
-                }
-            };
-            let frame = match step {
-                Step::Stop => return,
-                // The plane sender is never dropped on a connection loss
-                // (see the loop docs), so both loss paths reconnect.
-                Step::Dropped | Step::Disconnected => break,
-                Step::Frame(frame) => frame,
-            };
-            if let CtrlMessage::InviteRedeemOffered {
-                code_id,
-                code_revision,
-                pairing_id,
-                redeemer_device_id,
-                redeem,
-            } = frame
-            {
-                if !seen.insert(pairing_id) {
-                    continue; // Hello catch-up re-push of a handled flow.
-                }
-                let Ok(Some(held)) = InviteStore::open(&id_dir).find(&code_id) else {
-                    log::warn!(
-                        "redeem offer for unknown code {} — not answering",
-                        hex_16(&code_id)
-                    );
-                    continue;
-                };
-                if !held.live(now_unix_ms()) {
-                    log::warn!(
-                        "redeem offer for expired code {} — not answering",
-                        hex_16(&code_id)
-                    );
-                    continue;
-                }
-                let Ok(code) = held.code() else {
-                    continue;
-                };
-                let client = client.clone();
-                let key = key.clone();
-                let book_path = book_path.clone();
-                let on_paired = std::sync::Arc::clone(&on_paired);
-                tokio::spawn(async move {
-                    match answer_offer_as_owner(
-                        &client,
-                        &key,
-                        &code,
-                        &book_path,
-                        code_id,
-                        code_revision,
-                        pairing_id,
-                        redeemer_device_id,
-                        redeem,
-                    )
-                    .await
-                    {
-                        Ok(peer) => on_paired(peer),
-                        Err(err) => {
-                            log::warn!("owner pairing flow failed: {err}");
-                            let _ = client.pair_abort(pairing_id, AbortReason::Protocol).await;
-                        }
-                    }
-                });
-            }
-        }
-        // The connection is gone (replacement or network). Reconnect with
-        // a bounded backoff until shutdown fires.
-        let mut backoff = Duration::from_millis(200);
-        loop {
-            if *shutdown.borrow() {
-                return;
-            }
-            match client.reconnect().await {
-                Ok(()) => {
-                    log::info!("pairing service reconnected");
-                    continue 'session;
-                }
-                Err(err) => {
-                    log::warn!("pairing service reconnect failed: {err}");
-                }
-            }
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(backoff) => {},
-            }
-            backoff = (backoff * 2).min(Duration::from_secs(10));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::now_unix_ms;
 
     fn temp_id(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -147,7 +147,13 @@ impl std::fmt::Debug for RealTransferExecutor {
 }
 
 /// Classify an engine failure onto the stable scheduler error code.
-fn stable_code(err: &ak_engine::EngineError) -> (ErrorCode, Option<std::io::ErrorKind>) {
+///
+/// `pub(crate)` since wave 27: the on-channel receive executor
+/// (`channel_executor`) classifies the same engine error taxonomy for
+/// already-accepted direct channels.
+pub(crate) fn stable_code(
+    err: &ak_engine::EngineError,
+) -> (ErrorCode, Option<std::io::ErrorKind>) {
     use ak_engine::EngineError;
     match err {
         EngineError::Connect(ak_net::ConnectError::Unauthorized) => (ErrorCode::AuthFailed, None),

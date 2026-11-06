@@ -20,6 +20,9 @@ ak-signal = { workspace = true, features = ["server-persistence"] }
 # `daemon --same-code/--cross-code` (SessionHandle::set_policy). Path dep:
 # ak-session is not (yet) a workspace.dependencies entry.
 ak-session = { path = "../ak-session" }
+# Wave 27 (P1-02): `send` reads the Ready pairing relations of the pairing
+# journal (`.akpair` records) to build the scheduler admission context.
+ak-store = { workspace = true }
 ak-storage = { workspace = true }
 ak-wire = { workspace = true }
 anyhow = { workspace = true }
@@ -37,6 +40,4 @@ name = "ak-cli"
 path = "src/main.rs"
 
 [dev-dependencies]
-# Test-only: builds real AKJOB1 checkpoint fixtures that the jobs parser reads.
-ak-store = { workspace = true }
 tempfile = "3"

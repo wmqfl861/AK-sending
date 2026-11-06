@@ -39,6 +39,8 @@
 //! No networking, no file I/O, no wall clock — everything observable is
 //! driven through the injected ports.
 pub mod actor;
+pub mod admission;
+pub mod channel_executor;
 pub mod clock;
 pub mod error;
 pub mod executor;
@@ -48,6 +50,10 @@ pub mod real_executor;
 pub mod transport;
 pub mod types;
 
+pub use admission::{
+    code_group_wire_form, AdmissionReject, AdmissionValidator, ResolvedAdmission, TaskOpenClaim,
+};
+pub use channel_executor::ChannelReceiveExecutor;
 pub use clock::{FakeClock, RealClock, RuntimeClock};
 pub use error::{EngineStartError, SessionError};
 pub use executor::{

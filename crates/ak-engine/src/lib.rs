@@ -419,6 +419,178 @@ pub enum AdmissionDecision {
 /// [`AdmissionDecision`].
 pub type AdmissionDecider<'a> = &'a (dyn Fn(&AdmissionRequest) -> AdmissionDecision + Send + Sync);
 
+/// Outcome of [`channel_scheduler_handshake`] (wave 27): what a daemon
+/// learned about an accepted channel's peer before any admission decision
+/// is made.
+///
+/// * [`SchedulerHandshake::Scheduler`] — the peer advertises
+///   `CAP_SCHEDULER` and its `TaskOpen` has been read off the wire (the
+///   retained fields are in the [`TaskOpenAdmission`] value). The upper
+///   layer validates the pairing relation, resolves the two-dimensional
+///   code group and, once its scheduler grants the permit, completes the
+///   task with [`receive_on_channel_preadmitted`].
+/// * [`SchedulerHandshake::Legacy`] — the peer's Hello carried no
+///   `CAP_SCHEDULER`; a legacy sender never sends a `TaskOpen`. The
+///   Hello-exchanged protocol stream is handed back in
+///   [`HelloStream`] so [`receive_after_hello`] can resume the frozen
+///   receive body on the SAME connection (wave 27 integrator fix: the
+///   stream halves used to drop here, forcing the daemon to kill the
+///   legacy peer's connection right after its Hello).
+#[derive(Debug)]
+pub enum SchedulerHandshake {
+    /// Peer without `CAP_SCHEDULER`: legacy protocol; the upper layer
+    /// serves it with [`receive_after_hello`].
+    Legacy {
+        /// The peer's Hello capability bits, verbatim (e.g. to inspect
+        /// `CAP_RESUME`/`CAP_MULTISTREAM` before choosing the legacy path).
+        peer_capabilities: u16,
+        /// The live protocol stream with the Hello exchange already done;
+        /// feed it to [`receive_after_hello`] to run the frozen receive
+        /// body (unstaged, no admission) on this same connection.
+        stream: HelloStream,
+    },
+    /// Peer advertises `CAP_SCHEDULER` and has sent its `TaskOpen` (the
+    /// reply is pending — see [`TaskOpenAdmission`]).
+    Scheduler {
+        /// The read-and-retained admission fields plus the live protocol
+        /// stream; feed the same value back into
+        /// [`receive_on_channel_preadmitted`] once the scheduler grants.
+        open: TaskOpenAdmission,
+    },
+}
+
+/// The Hello-exchanged protocol stream of a legacy peer, handed back by
+/// [`SchedulerHandshake::Legacy`] (wave 27). Opaque to callers: the only
+/// thing the upper layer can do with it is feed it back into
+/// [`receive_after_hello`], which resumes the frozen unstaged receive body
+/// on the same stream. Fields are private by design, mirroring
+/// [`TaskOpenAdmission`]'s retention pattern.
+pub struct HelloStream {
+    pub(crate) tx: DirectSendStream,
+    pub(crate) rx: DirectRecvStream,
+}
+
+impl std::fmt::Debug for HelloStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The stream halves carry no meaningful debug payload; name the
+        // state instead of leaking quinn internals (same reasoning as
+        // TaskOpenAdmission's hand-written Debug).
+        f.debug_struct("HelloStream")
+            .field("state", &"hello-exchanged")
+            .finish()
+    }
+}
+
+/// The admission fields of one wire-read `TaskOpen`, retained for the
+/// pre-admitted receive entry (wave 27, scheduler.md §6). Produced ONLY by
+/// [`channel_scheduler_handshake`]; the fields are private and readable
+/// through the accessors, so the upper layer (ak-session) can bind the
+/// task to its code group before the scheduler has granted a permit.
+///
+/// Besides the frozen admission field set (`job_id`/`permit_id`/`group`/
+/// `group_registry`/`pairing_id`/`direction`) the value privately retains
+/// the accepted protocol stream with its Hello exchange already complete
+/// and the peer's capabilities: the daemon-side protocol is single-stream
+/// (one bidi stream carries Hello, admission and the whole file body), so
+/// the only way [`receive_on_channel_preadmitted`] can answer the pending
+/// `Admission` in place is to find the exact stream state here. Dropping
+/// the value drops that stream.
+///
+/// The wire-level fail-closed rules already applied by the handshake:
+/// `job_id`, `pairing_id` and `group_registry` are non-zero (the same
+/// sentinel refusal the combined [`receive_on_channel`] path performs
+/// before its decider). `direction` is retained verbatim and is checked
+/// by [`receive_on_channel_preadmitted`].
+pub struct TaskOpenAdmission {
+    /// `TaskOpen.job_id` — the scheduler task identity; on the receiving
+    /// side this keys the per-task staging tree.
+    job_id: [u8; 16],
+    /// `TaskOpen.permit_id` — the permit the sender's runtime minted.
+    permit_id: [u8; 16],
+    /// `TaskOpen.group` — the code group (the pairing `code_id`, 32-byte
+    /// form).
+    group: [u8; 32],
+    /// `TaskOpen.group_registry` — the registry owning the group.
+    group_registry: [u8; 32],
+    /// `TaskOpen.pairing_id` — the pairing relation that selected us.
+    pairing_id: [u8; 16],
+    /// `TaskOpen.direction` — verbatim wire tag (0 = the peer sends,
+    /// 1 = the peer receives). The pre-admitted entry requires the
+    /// sending direction.
+    direction: u8,
+    /// Retained wire state (not part of the frozen admission field set):
+    /// the accepted stream halves after the Hello exchange, and the peer
+    /// capabilities read from its Hello (the frozen body needs them for
+    /// the multistream decision).
+    peer_caps: u16,
+    tx: DirectSendStream,
+    rx: DirectRecvStream,
+}
+
+impl TaskOpenAdmission {
+    /// `TaskOpen.job_id`: the scheduler task identity that keys the
+    /// per-task staging tree on the receiving side.
+    pub fn job_id(&self) -> [u8; 16] {
+        self.job_id
+    }
+
+    /// `TaskOpen.permit_id`: the permit id the sender's runtime minted.
+    pub fn permit_id(&self) -> [u8; 16] {
+        self.permit_id
+    }
+
+    /// `TaskOpen.group`: the code group (the pairing `code_id`, 32-byte
+    /// form).
+    pub fn group(&self) -> [u8; 32] {
+        self.group
+    }
+
+    /// `TaskOpen.group_registry`: the registry identity owning the group.
+    pub fn group_registry(&self) -> [u8; 32] {
+        self.group_registry
+    }
+
+    /// `TaskOpen.pairing_id`: the pairing relation that selected this
+    /// device.
+    pub fn pairing_id(&self) -> [u8; 16] {
+        self.pairing_id
+    }
+
+    /// `TaskOpen.direction` verbatim (0 = the peer sends, 1 = the peer
+    /// receives). [`receive_on_channel_preadmitted`] requires the sending
+    /// direction.
+    pub fn direction(&self) -> u8 {
+        self.direction
+    }
+
+    /// The admission fields in the exact shape the combined
+    /// [`receive_on_channel`] hands its decider ([`AdmissionRequest`]) —
+    /// convenient for the upper layer's pairing/group validation.
+    pub fn admission_request(&self) -> AdmissionRequest {
+        AdmissionRequest {
+            group: self.group,
+            group_registry: self.group_registry,
+            pairing_id: self.pairing_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for TaskOpenAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The retained stream halves are not Debug; the admission fields
+        // are the identity that matters.
+        f.debug_struct("TaskOpenAdmission")
+            .field("job_id", &self.job_id)
+            .field("permit_id", &self.permit_id)
+            .field("group", &self.group)
+            .field("group_registry", &self.group_registry)
+            .field("pairing_id", &self.pairing_id)
+            .field("direction", &self.direction)
+            .field("peer_caps", &self.peer_caps)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Progress events, distinct per direction so the CLI can render honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -975,12 +1147,94 @@ async fn admission_handshake_sender(
     }
 }
 
+/// One wire-read `TaskOpen`, destructured into the fields the receive-side
+/// admission paths consume (wave 27 split of `admission_handshake_receiver`
+/// into "read + validate" and "answer"; see [`recv_task_open`]).
+struct TaskOpenWire {
+    task_id: [u8; 16],
+    permit_id: [u8; 16],
+    request: AdmissionRequest,
+    direction: u8,
+}
+
+/// Read one `TaskOpen` frame off the wire (header-budgeted through
+/// [`recv_admission_frame`]) and destructure its fields. No validation
+/// here — callers pick the fail-closed set via [`validate_task_open`]
+/// (sentinels only, e.g. the handshake entry retains `direction`
+/// verbatim) or the full set including the direction tag.
+async fn recv_task_open(
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+) -> Result<TaskOpenWire, EngineError> {
+    match recv_admission_frame(rx, limits, idle).await? {
+        Frame {
+            message:
+                Message::TaskOpen {
+                    job_id,
+                    permit_id,
+                    group,
+                    group_registry,
+                    pairing_id,
+                    direction,
+                },
+            ..
+        } => Ok(TaskOpenWire {
+            task_id: job_id,
+            permit_id,
+            request: AdmissionRequest {
+                group,
+                group_registry,
+                pairing_id,
+            },
+            direction,
+        }),
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => Err(EngineError::PeerError { code, message }),
+        other => Err(unexpected(other.message)),
+    }
+}
+
+/// The wire-level fail-closed rules in front of every receive-side
+/// admission consumer (wave 23, unchanged semantics): the all-zero task
+/// id is the reserved staging sentinel (it can never own a staging tree),
+/// and neither the pairing nor the registry identity can be the all-zero
+/// sentinel of a real Ready relation (mirroring what `AdmissionCtx::new`
+/// enforces on the sending side). With `require_send_direction`, a
+/// TaskOpen must be opened by the sending side by definition.
+fn validate_task_open(
+    open: &TaskOpenWire,
+    require_send_direction: bool,
+) -> Result<(), EngineError> {
+    if open.task_id == [0u8; 16] {
+        return Err(protocol_error("task id must not be the all-zero sentinel"));
+    }
+    if open.request.pairing_id == [0u8; 16] {
+        return Err(protocol_error(
+            "pairing id must not be the all-zero sentinel",
+        ));
+    }
+    if open.request.group_registry == [0u8; 32] {
+        return Err(protocol_error(
+            "group registry must not be the all-zero sentinel",
+        ));
+    }
+    if require_send_direction && open.direction != DIRECTION_SEND {
+        return Err(protocol_error(
+            "TaskOpen must be opened by the sending side",
+        ));
+    }
+    Ok(())
+}
+
 /// Receiver side of the scheduler admission handshake (wave 21, hardened
 /// wave 23): read TaskOpen, refuse the wire-level sentinels and direction
 /// violations, hand the *complete* admission context ([`AdmissionRequest`]:
 /// code group + registry + pairing relation) to the caller's decider,
 /// answer `Admission` (a grant carries the bounded [`ADMISSION_LEASE_MS`]
-/// lease), and — only on grant — wait for `AdmissionAck` before the frozen
+/// lease), and — only on grant — wait for AdmissionAck before the frozen
 /// receive body runs. Returns the task id that keys the receiver's per-task
 /// staging tree. A denial is answered on the wire and fails the call
 /// locally with the same reason; no Offer is ever read afterwards.
@@ -991,60 +1245,14 @@ async fn admission_handshake_receiver(
     idle: Duration,
     decider: AdmissionDecider<'_>,
 ) -> Result<[u8; 16], EngineError> {
-    let (task_id, permit_id, request, direction) =
-        match recv_admission_frame(rx, limits, idle).await? {
-            Frame {
-                message:
-                    Message::TaskOpen {
-                        job_id,
-                        permit_id,
-                        group,
-                        group_registry,
-                        pairing_id,
-                        direction,
-                    },
-                ..
-            } => (
-                job_id,
-                permit_id,
-                AdmissionRequest {
-                    group,
-                    group_registry,
-                    pairing_id,
-                },
-                direction,
-            ),
-            Frame {
-                message: Message::Error { code, message },
-                ..
-            } => return Err(EngineError::PeerError { code, message }),
-            other => return Err(unexpected(other.message)),
-        };
-    // The all-zero task id is the reserved sentinel (it can never own a
-    // staging tree), so it is a protocol violation here, not a decider
-    // question. Wave 23 extends the same fail-closed rule to the pairing
-    // and registry identities — neither can be the all-zero sentinel of a
-    // real Ready relation (mirroring what AdmissionCtx::new enforces on
-    // the sending side) — and to the direction tag: a TaskOpen is opened
-    // by the sending side by definition.
-    if task_id == [0u8; 16] {
-        return Err(protocol_error("task id must not be the all-zero sentinel"));
-    }
-    if request.pairing_id == [0u8; 16] {
-        return Err(protocol_error(
-            "pairing id must not be the all-zero sentinel",
-        ));
-    }
-    if request.group_registry == [0u8; 32] {
-        return Err(protocol_error(
-            "group registry must not be the all-zero sentinel",
-        ));
-    }
-    if direction != DIRECTION_SEND {
-        return Err(protocol_error(
-            "TaskOpen must be opened by the sending side",
-        ));
-    }
+    let opened = recv_task_open(rx, limits, idle).await?;
+    validate_task_open(&opened, true)?;
+    let TaskOpenWire {
+        task_id,
+        permit_id,
+        request,
+        ..
+    } = opened;
     let (granted, reason) = match decider(&request) {
         AdmissionDecision::Admit => (true, AdmissionReason::Ok),
         AdmissionDecision::Deny(reason) => (false, reason),
@@ -2580,6 +2788,269 @@ pub async fn receive_on_channel(
     .await
 }
 
+/// Daemon-side scheduler handshake (wave 27, scheduler.md §2/§6): on an
+/// already-accepted [`DirectChannel`], run the receive head — peer
+/// identity re-check, policy gate, the Hello exchange — and split by the
+/// peer's capabilities, so the upper layer (ak-session) can read the
+/// sender's `TaskOpen`, bind it to its two-dimensional code group and
+/// ask its scheduler for a permit BEFORE the engine answers `Admission`.
+///
+/// Identity semantics, frozen to the receive path's: `spec.authorize` is
+/// the same callback type `DirectEndpoint::accept` and
+/// [`ReceiveSpec::authorize`] use, re-run here against the channel's
+/// verified TLS fingerprint — a refusal closes the connection with the
+/// accept path's code and surfaces
+/// `EngineError::Connect(ConnectError::Unauthorized)`, exactly what
+/// `receive_with_addr` returns for an unauthorized accept. Hello version
+/// mismatches fail with the same `PROTOCOL_UNSUPPORTED` peer error
+/// [`receive_on_channel`] produces ([`expect_hello`]).
+///
+/// Wire behavior: our Hello always advertises `CAP_SCHEDULER` (this entry
+/// exists for the scheduler path), so the split is decided purely by the
+/// peer's bits —
+///
+/// * peer WITH `CAP_SCHEDULER`: its `TaskOpen` is read (the fail-closed
+///   sentinel rules of the combined path apply — the all-zero task id,
+///   pairing id and registry are protocol violations, never handed
+///   upward) and returned retained in
+///   [`SchedulerHandshake::Scheduler`] together with the live protocol
+///   stream. The `Admission` answer is deliberately NOT sent here; it is
+///   [`receive_on_channel_preadmitted`]'s first protocol byte.
+/// * peer WITHOUT `CAP_SCHEDULER`: [`SchedulerHandshake::Legacy`] with
+///   the peer's capability bits. No `TaskOpen` is read (a legacy sender
+///   never sends one). The accepted protocol stream — whose Hello
+///   exchange already happened — closes when this function returns; the
+///   channel itself stays open and caller-owned. Such peers are served
+///   by the daemon's legacy receive path, not by this entry pair.
+///
+/// No `Progress` events are emitted (this is the pre-decision phase; the
+/// transfer entry emits from `Connected` onward).
+pub async fn channel_scheduler_handshake(
+    channel: &mut DirectChannel,
+    spec: &ReceiveSpec,
+) -> Result<SchedulerHandshake, EngineError> {
+    // Peer identity re-check with the accept path's authorize shape and
+    // refusal semantics (see the method docs): the same condition
+    // `DirectEndpoint::accept` enforces at TLS time, re-derived here
+    // because this entry receives the channel after the fact.
+    if !(spec.authorize)(channel.peer_fingerprint()) {
+        channel.close(1, b"unauthorized");
+        return Err(EngineError::Connect(ak_net::ConnectError::Unauthorized));
+    }
+    let job = JobSpec::of(spec);
+    let (tx, mut rx, peer_caps) = receive_hello_exchange(channel, &job, true, &|_| {}).await?;
+    if peer_caps & CAP_SCHEDULER == 0 {
+        // Legacy peer: no TaskOpen will ever arrive. Hand the
+        // Hello-exchanged stream back so the caller can resume the frozen
+        // unstaged body via `receive_after_hello` on this SAME connection
+        // (wave 27 integrator fix: dropping the halves here killed the
+        // legacy peer's connection right after its Hello).
+        return Ok(SchedulerHandshake::Legacy {
+            peer_capabilities: peer_caps,
+            stream: HelloStream { tx, rx },
+        });
+    }
+    let opened = recv_task_open(&mut rx, &engine_limits(), job.idle_timeout).await?;
+    // Sentinel fail-closed set (direction deliberately retained verbatim:
+    // it is the pre-admitted entry's frozen validation).
+    validate_task_open(&opened, false)?;
+    Ok(SchedulerHandshake::Scheduler {
+        open: TaskOpenAdmission {
+            job_id: opened.task_id,
+            permit_id: opened.permit_id,
+            group: opened.request.group,
+            group_registry: opened.request.group_registry,
+            pairing_id: opened.request.pairing_id,
+            direction: opened.direction,
+            peer_caps,
+            tx,
+            rx,
+        },
+    })
+}
+
+/// Pre-admitted on-channel receive (wave 27): the daemon already read the
+/// sender's `TaskOpen` through [`channel_scheduler_handshake`], validated
+/// the pairing relation against its store and obtained its scheduler's
+/// permit — this entry performs the wire half: answer the granted
+/// `Admission` (with the bounded [`ADMISSION_LEASE_MS`] lease), wait for
+/// the sender's `AdmissionAck`, then run the exact frozen receive body of
+/// [`receive_on_channel`] (per-task staging tree keyed by the wire task
+/// id included).
+///
+/// Checks re-run here, per the "engine entries keep their defenses"
+/// rule (scheduler.md §4): `spec.authorize` against the channel's peer
+/// fingerprint (refusal semantics of the accept path), the policy gate
+/// before the first protocol byte this entry writes, and the wire-level
+/// fail-closed rules on the retained `open` — in particular
+/// `open.direction` must equal the sending direction (the peer is the
+/// sender of this task); anything else is the same
+/// `PROTOCOL_UNSUPPORTED` protocol violation the combined path produces,
+/// and no `Admission` is ever answered.
+///
+/// The `AdmissionAck` must name the same task and permit as the retained
+/// `open`; a mismatch is a protocol violation. From the granted ack on,
+/// the caller's wire position is identical to a task admitted through
+/// [`receive_on_channel`].
+pub async fn receive_on_channel_preadmitted(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    open: TaskOpenAdmission,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let started = Instant::now();
+    let target = LocalSaveTarget::open(&spec.out_dir)?;
+    let job = JobSpec::of(&spec);
+    // Defense in depth (the handshake already checked both on the same
+    // channel): identity first, policy gate before the first byte this
+    // entry writes.
+    if !(spec.authorize)(channel.peer_fingerprint()) {
+        channel.close(1, b"unauthorized");
+        return Err(EngineError::Connect(ak_net::ConnectError::Unauthorized));
+    }
+    gate_channel(&job.policy, &channel)?;
+    progress(Progress::Connected {
+        peer: channel.peer_fingerprint().to_hex(),
+    });
+
+    let TaskOpenAdmission {
+        job_id: task_id,
+        permit_id,
+        group,
+        group_registry,
+        pairing_id,
+        direction,
+        peer_caps,
+        tx,
+        rx,
+    } = open;
+    // Full fail-closed set on the retained fields, including the frozen
+    // direction contract of this entry (sentinels are re-checked as
+    // defense: nothing between the two calls can weaken the handshake's
+    // validation, but the check is cheap and this entry keys staging by
+    // the task id).
+    let opened = TaskOpenWire {
+        task_id,
+        permit_id,
+        request: AdmissionRequest {
+            group,
+            group_registry,
+            pairing_id,
+        },
+        direction,
+    };
+    validate_task_open(&opened, true)?;
+
+    let limits = engine_limits();
+    let mut tx = tx;
+    let mut rx = rx;
+    // The granted answer, mirroring `admission_handshake_receiver`'s
+    // grant arm byte for byte (bounded lease, reason ok).
+    tx.send_frame(&Frame {
+        version: ak_wire::VERSION,
+        message: Message::Admission {
+            job_id: task_id,
+            permit_id,
+            granted: true,
+            reason: AdmissionReason::Ok,
+            lease_ms: ADMISSION_LEASE_MS,
+        },
+    })
+    .await?;
+    // Final handshake step: the sender confirms it acts on the granted
+    // permit; the ids must be the ones this task was opened with.
+    match recv_admission_frame(&mut rx, &limits, job.idle_timeout).await? {
+        Frame {
+            message:
+                Message::AdmissionAck {
+                    job_id: acked_job,
+                    permit_id: acked_permit,
+                },
+            ..
+        } => {
+            if acked_job != task_id || acked_permit != permit_id {
+                return Err(protocol_error(
+                    "admission ack names a different task or permit",
+                ));
+            }
+        }
+        Frame {
+            message: Message::Error { code, message },
+            ..
+        } => return Err(EngineError::PeerError { code, message }),
+        other => return Err(unexpected(other.message)),
+    }
+    let store = FileCheckpointStore::open(&job.checkpoint_dir).map_err(EngineError::Checkpoint)?;
+    receive_frozen_body(
+        channel,
+        tx,
+        rx,
+        peer_caps,
+        Some(task_id),
+        &target,
+        &job,
+        started,
+        &store,
+        progress,
+    )
+    .await
+}
+
+/// Legacy continuation (wave 27): run the frozen UNSTAGED receive body on
+/// a connection whose Hello exchange already happened inside
+/// [`channel_scheduler_handshake`] and whose peer turned out to have no
+/// `CAP_SCHEDULER` (a legacy sender). The [`HelloStream`] handed back by
+/// the handshake's `Legacy` arm is fed straight in — this entry resumes
+/// exactly where the handshake stopped, so the daemon's wired mode can
+/// serve legacy peers on the SAME connection instead of dropping it after
+/// their Hello.
+///
+/// Defenses re-run here per the "engine entries keep their defenses" rule
+/// (scheduler.md §4): `spec.authorize` against the channel's peer
+/// fingerprint (refusal semantics of the accept path) and the policy gate
+/// before the first protocol byte. The `Connected` progress event is
+/// emitted here (the handshake deliberately emits nothing — it passed a
+/// no-op sink — so callers keying `job_started` off `Connected` see
+/// exactly one event per task, same as every other receive entry).
+///
+/// No admission stage exists on this path by construction (the peer never
+/// sends a `TaskOpen`); staging is the frozen unstaged behavior of the
+/// legacy `receive_with_addr` kernel.
+pub async fn receive_after_hello(
+    channel: DirectChannel,
+    spec: ReceiveSpec,
+    hello: HelloStream,
+    peer_capabilities: u16,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    if !(spec.authorize)(channel.peer_fingerprint()) {
+        channel.close(1, b"unauthorized");
+        return Err(EngineError::Connect(ak_net::ConnectError::Unauthorized));
+    }
+    let job = JobSpec::of(&spec);
+    gate_channel(&job.policy, &channel)?;
+    progress(Progress::Connected {
+        peer: channel.peer_fingerprint().to_hex(),
+    });
+    let started = Instant::now();
+    let target = LocalSaveTarget::open(&spec.out_dir)?;
+    let store = FileCheckpointStore::open(&job.checkpoint_dir).map_err(EngineError::Checkpoint)?;
+    let HelloStream { tx, rx } = hello;
+    receive_frozen_body(
+        channel,
+        tx,
+        rx,
+        peer_capabilities,
+        None,
+        &target,
+        &job,
+        started,
+        &store,
+        progress,
+    )
+    .await
+}
+
 /// The per-connection subset of [`ReceiveSpec`] the single-job protocol body
 /// ([`receive_job`]) needs. [`ReceiveSpec`] is not `Clone` (its `authorize`
 /// callback belongs to the accept side only), so the concurrent receiver
@@ -2667,6 +3138,13 @@ fn committed_file_matches(root: &Path, entry: &ak_core::manifest::FileEntry) -> 
 /// per-task staging tree. `None` (the legacy entries) keeps the frozen v1
 /// behavior byte for byte.
 ///
+/// Wave 27 split: the head (policy gate, Hello exchange, admission stage)
+/// and the frozen transfer body live in [`receive_hello_exchange`],
+/// [`receive_admission_stage`] and [`receive_frozen_body`], shared with
+/// the daemon-side entries ([`channel_scheduler_handshake`] /
+/// [`receive_on_channel_preadmitted`]) so no copy of the frozen body
+/// exists. Behavior is byte for byte what the single function did.
+///
 /// Concurrency isolation when several of these run at once (see module
 /// docs): the checkpoint store is opened per call, and distinct job ids
 /// mean distinct `<job>.akjob` files written atomically by exactly one
@@ -2685,21 +3163,47 @@ async fn receive_job(
 ) -> Result<Report, EngineError> {
     let limits = engine_limits();
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
+    let (mut tx, mut rx, peer_caps) =
+        receive_hello_exchange(&channel, spec, admission.is_some(), progress).await?;
+    let staged_task =
+        receive_admission_stage(&mut tx, &mut rx, &limits, spec.idle_timeout, admission, peer_caps)
+            .await?;
+    receive_frozen_body(
+        channel,
+        tx,
+        rx,
+        peer_caps,
+        staged_task,
+        target,
+        spec,
+        started,
+        &store,
+        progress,
+    )
+    .await
+}
 
-    // Policy gate (protocol step 0): a refused path closes the connection
-    // before any stream is accepted or frame moves.
-    gate_channel(&spec.policy, &channel)?;
+/// Shared receive head (wave 27): the policy gate (protocol step 0 — a
+/// refused path closes the connection before any stream is accepted or
+/// frame moves), the Connected progress event, the accepted bidi stream,
+/// our Hello and the peer's. `advertise_scheduler` adds `CAP_SCHEDULER`
+/// to our capabilities (the daemon handshake always does; the legacy
+/// entries never do). Returns the split stream halves plus the peer's
+/// capability bits.
+async fn receive_hello_exchange(
+    channel: &DirectChannel,
+    spec: &JobSpec,
+    advertise_scheduler: bool,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<(DirectSendStream, DirectRecvStream, u16), EngineError> {
+    let limits = engine_limits();
+    gate_channel(&spec.policy, channel)?;
     progress(Progress::Connected {
         peer: channel.peer_fingerprint().to_hex(),
     });
     let stream = channel.accept_bi().await?;
     let (mut tx, mut rx) = stream.split();
-
-    let capabilities = if admission.is_some() {
-        RECV_CAPABILITIES | CAP_SCHEDULER
-    } else {
-        RECV_CAPABILITIES
-    };
+    let capabilities = scheduler_recv_caps(advertise_scheduler);
     tx.send_frame(&hello_frame(
         &spec.device_name,
         &spec.identity,
@@ -2707,36 +3211,94 @@ async fn receive_job(
     ))
     .await?;
     let peer_caps = expect_hello(&mut rx, &limits, spec.idle_timeout).await?;
-    // Scheduled admission (wave 21): only when BOTH Hellos carry the bit.
-    // Wave 23 (review P1-4) closes the downgrade hole: when this call
-    // carries a decider (i.e. it is `receive_on_channel`, which exists
-    // precisely for scheduled tasks), a sender without CAP_SCHEDULER is
-    // refused with PROTOCOL_UNSUPPORTED and the channel closes — the
-    // frozen unstaged body is reserved for the legacy entries, whose
-    // `admission` is None.
-    let staged_task: Option<[u8; 16]> = if scheduler_frames_allowed(capabilities, peer_caps) {
+    Ok((tx, rx, peer_caps))
+}
+
+/// Our receiver-side capability bits, with or without the scheduler
+/// admission bit (wave 27 helper shared by every receive head).
+fn scheduler_recv_caps(advertise_scheduler: bool) -> u16 {
+    if advertise_scheduler {
+        RECV_CAPABILITIES | CAP_SCHEDULER
+    } else {
+        RECV_CAPABILITIES
+    }
+}
+
+/// Shared admission stage (wave 27): after both Hellos, either run the
+/// combined TaskOpen→Admission→AdmissionAck handshake (whose task id keys
+/// the per-task staging tree) or keep the frozen unstaged path.
+///
+/// Scheduled admission (wave 21): only when BOTH Hellos carry the bit.
+/// Wave 23 (review P1-4) closes the downgrade hole: when this call
+/// carries a decider (i.e. it is `receive_on_channel`, which exists
+/// precisely for scheduled tasks), a sender without CAP_SCHEDULER is
+/// refused with PROTOCOL_UNSUPPORTED and the channel closes — the
+/// frozen unstaged body is reserved for the legacy entries, whose
+/// `admission` is None.
+async fn receive_admission_stage(
+    tx: &mut DirectSendStream,
+    rx: &mut DirectRecvStream,
+    limits: &Limits,
+    idle: Duration,
+    admission: Option<AdmissionDecider<'_>>,
+    peer_caps: u16,
+) -> Result<Option<[u8; 16]>, EngineError> {
+    let capabilities = scheduler_recv_caps(admission.is_some());
+    if scheduler_frames_allowed(capabilities, peer_caps) {
         let decider = admission.expect("CAP_SCHEDULER is advertised only with a decider");
-        Some(
-            admission_handshake_receiver(&mut tx, &mut rx, &limits, spec.idle_timeout, decider)
-                .await?,
-        )
+        Ok(Some(
+            admission_handshake_receiver(tx, rx, limits, idle, decider).await?,
+        ))
     } else if admission.is_some() {
-        return Err(EngineError::PeerError {
+        Err(EngineError::PeerError {
             code: ErrorCode::ProtocolUnsupported,
             message: "peer does not advertise CAP_SCHEDULER; \
                       scheduled task admission cannot run"
                 .into(),
-        });
+        })
     } else {
-        None
-    };
+        Ok(None)
+    }
+}
+
+/// The frozen receive body (wave 27 split out of `receive_job` verbatim):
+/// everything from Offer/Accept through manifest pages, resume answer,
+/// chunk phase (single-stream or multistream), verify, commit, FinalAck
+/// and the terminal-state staging cleanup. `staged_task` is the per-task
+/// staging key under scheduled admission (`None` = legacy `.akpart`
+/// beside the final name).
+#[allow(clippy::too_many_arguments)]
+async fn receive_frozen_body(
+    channel: DirectChannel,
+    mut tx: DirectSendStream,
+    mut rx: DirectRecvStream,
+    peer_caps: u16,
+    staged_task: Option<[u8; 16]>,
+    target: &LocalSaveTarget,
+    spec: &JobSpec,
+    started: Instant,
+    store: &FileCheckpointStore,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    let limits = engine_limits();
     let multistream = (peer_caps & CAP_MULTISTREAM) != 0;
 
     // Offer -> consent -> Accept. Channel-level consent already happened via
     // the authorize callback; the offer is accepted per current product copy.
+    //
+    // A connection LOSS while awaiting the FIRST frame is normalized to
+    // [`EngineError::PeerClosed`] (wave 27): the peer hung up before
+    // offering a job — the canonical case is a wave-27 sender aborting its
+    // scheduler-admission attempt against this legacy endpoint (its Hello
+    // carried no `CAP_SCHEDULER`) and retrying on a fresh connection. Such
+    // a connection is NOT a transfer, and one-shot receivers
+    // (`receive --once`, `invite redeem --once`) use exactly this signal
+    // to keep waiting instead of consuming their single accept. Wire
+    // rejections (oversized headers, budget violations) still surface
+    // verbatim — only `Connection` losses are a hang-up.
     let (job_id, file_count, total_bytes, offered_chunk_size) =
-        match recv_within(&mut rx, &limits, spec.idle_timeout).await? {
-            Frame {
+        match recv_within(&mut rx, &limits, spec.idle_timeout).await {
+            Ok(Frame {
                 message:
                     Message::Offer {
                         job_id,
@@ -2746,12 +3308,16 @@ async fn receive_job(
                         ..
                     },
                 ..
-            } => (job_id, file_count, total_bytes, chunk_size),
-            Frame {
+            }) => (job_id, file_count, total_bytes, chunk_size),
+            Ok(Frame {
                 message: Message::Error { code, message },
                 ..
-            } => return Err(EngineError::PeerError { code, message }),
-            other => return Err(unexpected(other.message)),
+            }) => return Err(EngineError::PeerError { code, message }),
+            Ok(other) => return Err(unexpected(other.message)),
+            Err(EngineError::Stream(ak_net::StreamError::Connection(_))) => {
+                return Err(EngineError::PeerClosed)
+            }
+            Err(other) => return Err(other),
         };
     // P1-1 defense in depth (review round 17): validate the offered chunk
     // size against the engine's own limits BEFORE consenting. The wire
@@ -2986,7 +3552,7 @@ async fn receive_job(
                     &job.manifest,
                     &mut sinks,
                     &mut record,
-                    &store,
+                    store,
                     spec.idle_timeout,
                     progress,
                 )
@@ -3002,7 +3568,7 @@ async fn receive_job(
                     &job.manifest,
                     &mut sinks,
                     &mut record,
-                    &store,
+                    store,
                     spec.idle_timeout,
                     progress,
                 )
@@ -8034,5 +8600,540 @@ mod tests {
             !ak_storage::staging_path(dst.path(), task_id).exists(),
             "terminal state discards the task's staging tree"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 27: daemon scheduler handshake + pre-admitted receive
+    // ------------------------------------------------------------------
+
+    /// Spawn the daemon head for the wave-27 tests: accept one connection
+    /// and run `channel_scheduler_handshake`, yielding the (still
+    /// caller-owned) channel next to the handshake result.
+    fn spawn_daemon_handshake(
+        endpoint: DirectEndpoint,
+        spec: ReceiveSpec,
+    ) -> tokio::task::JoinHandle<
+        Result<(SchedulerHandshake, DirectChannel), EngineError>,
+    > {
+        tokio::spawn(async move {
+            let mut channel = endpoint.accept(&|_| true).await.unwrap();
+            let handshake = channel_scheduler_handshake(&mut channel, &spec).await?;
+            Ok((handshake, channel))
+        })
+    }
+
+    /// A CAP_SCHEDULER peer's TaskOpen comes back through
+    /// `SchedulerHandshake::Scheduler` with every admission field byte
+    /// for byte what the peer put on the wire (wave 27: the daemon gets
+    /// the raw fields to bind the code group BEFORE admission answers).
+    #[tokio::test]
+    async fn scheduler_handshake_reads_a_scheduler_peers_task_open_byte_exact() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+
+        let daemon = spawn_daemon_handshake(endpoint, spec);
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        let task_id: [u8; 16] = [0x42; 16];
+        let permit: [u8; 16] = [0x5C; 16];
+        let group: [u8; 32] = [0x77; 32];
+        let registry: [u8; 32] = [0x91; 32];
+        let pairing: [u8; 16] = [0xB3; 16];
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: permit,
+                group,
+                group_registry: registry,
+                pairing_id: pairing,
+                direction: ak_wire::DIRECTION_SEND,
+            }))
+            .await
+            .unwrap();
+
+        let (handshake, _channel) = daemon.await.unwrap().expect("handshake completes");
+        match handshake {
+            SchedulerHandshake::Scheduler { open } => {
+                assert_eq!(open.job_id(), task_id, "job_id byte exact");
+                assert_eq!(open.permit_id(), permit, "permit_id byte exact");
+                assert_eq!(open.group(), group, "group byte exact");
+                assert_eq!(open.group_registry(), registry, "group_registry byte exact");
+                assert_eq!(open.pairing_id(), pairing, "pairing_id byte exact");
+                assert_eq!(open.direction(), ak_wire::DIRECTION_SEND);
+                // The convenience view carries the same pairing fields.
+                assert_eq!(
+                    open.admission_request(),
+                    AdmissionRequest {
+                        group,
+                        group_registry: registry,
+                        pairing_id: pairing,
+                    }
+                );
+            }
+            SchedulerHandshake::Legacy { .. } => {
+                panic!("a CAP_SCHEDULER peer must take the Scheduler arm")
+            }
+        }
+        // The handshake did NOT answer admission: nothing of the
+        // Admission/Ack exchange may have moved yet.
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_millis(200)),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => panic!("handshake must stay silent, saw {:?}", frame.message),
+            _ => {}
+        }
+    }
+
+    /// A peer whose Hello lacks CAP_SCHEDULER takes the Legacy arm with
+    /// the peer's capability bits — and no TaskOpen is ever read or
+    /// expected from it.
+    #[tokio::test]
+    async fn scheduler_handshake_returns_legacy_for_a_legacy_peer() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+
+        let daemon = spawn_daemon_handshake(endpoint, spec);
+        // Legacy sender: no CAP_SCHEDULER bit, no TaskOpen — it would
+        // proceed straight to its Offer.
+        let mut fake = fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME).await;
+
+        let (handshake, _channel) = daemon.await.unwrap().expect("handshake completes");
+        match handshake {
+            SchedulerHandshake::Legacy {
+                peer_capabilities,
+                stream,
+            } => {
+                assert_eq!(peer_capabilities, CAP_RESUME);
+                // The Hello-exchanged stream rides along (wave 27
+                // integrator fix): dropping it here is exactly what the
+                // daemon must NOT do — receive_after_hello consumes it.
+                drop(stream);
+            }
+            SchedulerHandshake::Scheduler { .. } => {
+                panic!("a legacy peer must take the Legacy arm")
+            }
+        }
+        // Nothing of the admission exchange may have been answered and no
+        // file protocol ran on this channel from the engine side.
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_millis(200)),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => panic!("legacy arm must stay silent, saw {:?}", frame.message),
+            _ => {}
+        }
+    }
+
+    /// The handshake re-runs the receive path's authorize check: a
+    /// channel whose fingerprint the callback refuses fails with the
+    /// accept path's `ConnectError::Unauthorized` semantics.
+    #[tokio::test]
+    async fn scheduler_handshake_refuses_an_unauthorized_peer() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        spec.authorize = Box::new(|_| false);
+
+        let daemon = spawn_daemon_handshake(endpoint, spec);
+        // The peer dials and connects; the refusal happens on the entry's
+        // identity re-check — before any stream or Hello, so the dial
+        // itself succeeds and no Hello exchange is attempted (the
+        // connection is closed under the peer right after).
+        let sender_key = DeviceKeyPair::generate();
+        let sender_identity = ak_identity::tls::make_self_signed(&sender_key);
+        let dialer =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_identity)
+                .await
+                .unwrap();
+        let _channel = dialer
+            .connect(addr, &receiver_key.fingerprint())
+            .await
+            .unwrap();
+
+        let err = match daemon.await.unwrap() {
+            // DirectChannel is not Debug, so no expect_err here.
+            Err(error) => error,
+            Ok(_) => panic!("the refused fingerprint must fail the handshake"),
+        };
+        assert!(
+            matches!(
+                err,
+                EngineError::Connect(ak_net::ConnectError::Unauthorized)
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// Full daemon round trip (wave 27): accept → handshake → upper-layer
+    /// group binding → pre-admitted receive, against a real
+    /// `send_on_channel` sender. An 8 KiB file moves, the granted
+    /// Admission + AdmissionAck exchange completes, the bytes land
+    /// identical and the per-task staging tree is discarded at the
+    /// terminal state.
+    #[tokio::test]
+    async fn preadmitted_round_trip_completes_an_8kib_transfer() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 241) as u8).collect();
+        write(&src.path().join("round.bin"), &payload);
+
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let pinned = receiver_key.fingerprint();
+        let recv_spec = on_channel_recv_spec(dst.path(), receiver_identity);
+        let seen: Arc<std::sync::Mutex<Vec<Progress>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = Arc::clone(&seen);
+
+        let receiver = tokio::spawn(async move {
+            let mut channel = endpoint.accept(&|_| true).await.unwrap();
+            let open = match channel_scheduler_handshake(&mut channel, &recv_spec).await.unwrap()
+            {
+                SchedulerHandshake::Scheduler { open } => open,
+                SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
+            };
+            // Upper-layer analog (ak-session): bind the retained fields
+            // to the code group before admitting.
+            assert_eq!(
+                open.admission_request(),
+                AdmissionRequest {
+                    group: [0x77; 32],
+                    group_registry: [0x91; 32],
+                    pairing_id: [0xB3; 16],
+                }
+            );
+            let progress = move |event: Progress| events.lock().unwrap().push(event);
+            receive_on_channel_preadmitted(channel, recv_spec, open, &progress).await
+        });
+
+        let task_id: [u8; 16] = [0xD1; 16];
+        let sender =
+            spawn_on_channel_sender(src.path().to_path_buf(), addr, pinned, task_id);
+
+        let recv_report = receiver.await.unwrap().expect("preadmitted receive completes");
+        let send_report = sender.await.unwrap().expect("send completes");
+        assert_eq!(send_report.files, 1);
+        assert_eq!(send_report.bytes, payload.len() as u64);
+        assert_eq!(recv_report.bytes, payload.len() as u64);
+        assert_eq!(fs::read(dst.path().join("round.bin")).unwrap(), payload);
+        assert!(
+            !ak_storage::staging_path(dst.path(), task_id).exists(),
+            "terminal state discards the task's staging tree"
+        );
+        // The transfer entry reported the connection phase (Connected
+        // names the peer the channel verified — the sender device).
+        let events = seen.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Progress::Connected { .. })),
+            "the pre-admitted entry reports Connected: {events:?}"
+        );
+        assert!(events.contains(&Progress::Done));
+    }
+
+    /// Per-task staging isolation across the daemon path: a task whose
+    /// receive fails mid-transfer keeps its verified part in ITS staging
+    /// tree (keyed by its own job_id), and a second task admitted right
+    /// after — through the same handshake/preadmitted pair — completes,
+    /// cleans up only its own tree and leaves the first task's staged
+    /// prefix untouched.
+    #[tokio::test]
+    async fn preadmitted_stages_isolate_by_job_id_and_cleanup_is_per_task() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let pinned = receiver_key.fingerprint();
+
+        const CHUNK: usize = 4096;
+        let payload: Vec<u8> = (0..(CHUNK * 2) as u32).map(|i| (i % 251) as u8).collect();
+        let (a, b) = payload.split_at(CHUNK);
+        let digest = |bytes: &[u8]| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(blake3::hash(bytes).as_bytes());
+            out
+        };
+        let whole = digest(&payload);
+        let chunk_digests = vec![digest(a), digest(b)];
+        let limits = engine_limits();
+
+        // ---- task A (hand-driven): admitted through the daemon pair,
+        // first chunk verifies, second digest is poisoned → the receive
+        // fails with the verified prefix left in A's staging tree.
+        let task_a: [u8; 16] = [0xC1; 16];
+        let mut spec_a = on_channel_recv_spec(dst.path(), receiver_identity.clone());
+        spec_a.idle_timeout = Duration::from_secs(5);
+        let receiver_a = tokio::spawn(async move {
+            let mut channel = endpoint
+                .accept(&|_| true)
+                .await
+                .expect("task A connects");
+            let open = match channel_scheduler_handshake(&mut channel, &spec_a).await.unwrap() {
+                SchedulerHandshake::Scheduler { open } => open,
+                SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
+            };
+            receive_on_channel_preadmitted(channel, spec_a, open, &noop).await
+        });
+        let mut fake_a =
+            fake_sender_side(addr, pinned, CAP_RESUME | CAP_SCHEDULER).await;
+        fake_a
+            .tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_a,
+                permit_id: [2; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_SEND,
+            }))
+            .await
+            .unwrap();
+        // The pre-admitted entry answers the granted admission (bounded
+        // lease) and waits for the ack — the daemon flow, split in two.
+        let (granted_job, granted_permit, granted, reason, lease_ms) =
+            read_admission(&mut fake_a).await;
+        assert_eq!(granted_job, task_a);
+        assert_eq!(granted_permit, [2; 16]);
+        assert!(granted);
+        assert_eq!(reason, AdmissionReason::Ok);
+        assert_eq!(lease_ms, ADMISSION_LEASE_MS, "grant carries the bounded lease");
+        fake_a
+            .tx
+            .send_frame(&wire(Message::AdmissionAck {
+                job_id: task_a,
+                permit_id: [2; 16],
+            }))
+            .await
+            .unwrap();
+
+        // Frozen receive body, hand-written: poisoned chunk-1 digest.
+        let wire_job: JobId = [0xCE; 16];
+        fake_a
+            .tx
+            .send_frame(&wire(Message::Offer {
+                job_id: wire_job,
+                root_name: "iso-a".into(),
+                file_count: 1,
+                total_bytes: payload.len() as u64,
+                chunk_size: CHUNK as u32,
+            }))
+            .await
+            .unwrap();
+        match fake_a.rx.recv_frame(&limits).await.unwrap().message {
+            Message::Accept { job_id: acked } => assert_eq!(acked, wire_job),
+            other => panic!("expected Accept, got {other:?}"),
+        }
+        let entry = ak_core::manifest::FileEntry::with_digest_alg(
+            "iso-a.bin",
+            payload.len() as u64,
+            1_700_000_000_000,
+            ak_core::manifest::DIGEST_ALG_BLAKE3,
+            whole,
+            chunk_digests,
+        )
+        .unwrap();
+        let mut wire_entry = WireEntry::from(&entry);
+        wire_entry.chunk_digests[1] = [0xEE; 32]; // poisoned
+        fake_a
+            .tx
+            .send_frame(&wire(Message::ManifestPage {
+                job_id: wire_job,
+                page_index: 0,
+                last_page: true,
+                entries: vec![wire_entry],
+            }))
+            .await
+            .unwrap();
+        match fake_a.rx.recv_frame(&limits).await.unwrap().message {
+            Message::ResumeRequest { files, more, .. } => {
+                assert!(!more);
+                assert_eq!(files[0].verified_prefix_chunks, 0, "fresh task");
+            }
+            other => panic!("expected ResumeRequest, got {other:?}"),
+        }
+        for (index, data) in [(0u64, a), (1u64, b)] {
+            fake_a
+                .tx
+                .send_frame(&wire(Message::Chunk {
+                    job_id: wire_job,
+                    file_index: 0,
+                    chunk_index: index,
+                    data: data.to_vec(),
+                }))
+                .await
+                .unwrap();
+        }
+        let err_a = receiver_a
+            .await
+            .unwrap()
+            .expect_err("task A's poisoned digest must fail the receive");
+        assert!(
+            !matches!(err_a, EngineError::AdmissionDenied { .. }),
+            "admission itself succeeded: {err_a:?}"
+        );
+        // Task A's verified prefix lives in ITS staging tree.
+        let staged_a = ak_storage::staging_path(dst.path(), task_a).join("iso-a.bin.akpart");
+        assert!(staged_a.exists(), "A's part must live in A's staging tree");
+        assert_eq!(
+            fs::metadata(&staged_a).unwrap().len(),
+            CHUNK as u64,
+            "exactly A's verified prefix survived"
+        );
+
+        // ---- task B (real sender): completes through the same daemon
+        // pair into the same destination directory. Task A's endpoint
+        // moved into its spawn, so B listens on a fresh endpoint bound
+        // to the same identity (same trick as the staged-resume test's
+        // run 2 — the destination dir is what carries the staged state).
+        let src_b = tempfile::tempdir().unwrap();
+        let payload_b: Vec<u8> = (0..5000u32).map(|i| (i % 199) as u8).collect();
+        write(&src_b.path().join("iso-b.bin"), &payload_b);
+        let task_b: [u8; 16] = [0xC2; 16];
+        let endpoint_b =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr_b = endpoint_b.local_addr().unwrap();
+        let sender_b = spawn_on_channel_sender(src_b.path().to_path_buf(), addr_b, pinned, task_b);
+        let spec_b = on_channel_recv_spec(dst.path(), receiver_identity);
+        let receiver_b = tokio::spawn(async move {
+            let mut channel = endpoint_b
+                .accept(&|_| true)
+                .await
+                .expect("task B connects");
+            let open = match channel_scheduler_handshake(&mut channel, &spec_b).await.unwrap() {
+                SchedulerHandshake::Scheduler { open } => open,
+                SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
+            };
+            assert_eq!(open.job_id(), task_b, "B's TaskOpen names B's task");
+            receive_on_channel_preadmitted(channel, spec_b, open, &noop).await
+        });
+
+        let report_b = receiver_b.await.unwrap().expect("task B completes");
+        sender_b.await.unwrap().expect("task B's send completes");
+        assert_eq!(report_b.bytes, payload_b.len() as u64);
+        assert_eq!(fs::read(dst.path().join("iso-b.bin")).unwrap(), payload_b);
+        // B's terminal state discarded only B's tree...
+        assert!(
+            !ak_storage::staging_path(dst.path(), task_b).exists(),
+            "B's staging tree is discarded at completion"
+        );
+        // ...while A's staged prefix survives untouched (per-task
+        // isolation: B never swept, resumed or collided with A's parts).
+        assert!(
+            staged_a.exists(),
+            "A's staged prefix must survive B's terminal cleanup"
+        );
+        assert_eq!(fs::metadata(&staged_a).unwrap().len(), CHUNK as u64);
+    }
+
+    /// The pre-admitted entry refuses a retained TaskOpen whose direction
+    /// tag says the peer is receiving (it must be the sender): the same
+    /// PROTOCOL_UNSUPPORTED violation the combined path produces, no
+    /// Admission is ever answered and nothing lands.
+    #[tokio::test]
+    async fn preadmitted_refuses_a_recv_direction_task_open() {
+        let dst = tempfile::tempdir().unwrap();
+        let receiver_key = DeviceKeyPair::generate();
+        let receiver_identity = ak_identity::tls::make_self_signed(&receiver_key);
+        let endpoint =
+            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &receiver_identity)
+                .await
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let spec = on_channel_recv_spec(dst.path(), receiver_identity);
+
+        let receiver = tokio::spawn(async move {
+            let mut channel = endpoint.accept(&|_| true).await.unwrap();
+            let open = match channel_scheduler_handshake(&mut channel, &spec).await.unwrap() {
+                SchedulerHandshake::Scheduler { open } => open,
+                SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
+            };
+            receive_on_channel_preadmitted(channel, spec, open, &noop).await
+        });
+
+        let mut fake =
+            fake_sender_side(addr, receiver_key.fingerprint(), CAP_RESUME | CAP_SCHEDULER).await;
+        let task_id: [u8; 16] = [0xEE; 16];
+        fake.tx
+            .send_frame(&wire(Message::TaskOpen {
+                job_id: task_id,
+                permit_id: [7; 16],
+                group: [0x77; 32],
+                group_registry: [0x91; 32],
+                pairing_id: [0xB3; 16],
+                direction: ak_wire::DIRECTION_RECV,
+            }))
+            .await
+            .unwrap();
+
+        let err = receiver
+            .await
+            .unwrap()
+            .expect_err("a recv-direction TaskOpen must be refused");
+        assert!(
+            matches!(
+                &err,
+                EngineError::PeerError {
+                    code: ErrorCode::ProtocolUnsupported,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+        assert!(
+            !ak_storage::staging_path(dst.path(), task_id).exists(),
+            "no staging may appear for a refused direction"
+        );
+        assert_eq!(
+            fs::read_dir(dst.path()).unwrap().count(),
+            0,
+            "no file may land from a refused task"
+        );
+        // No Admission was answered: the fake sees the closed connection,
+        // never a granted frame.
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            recv_admission_frame(&mut fake.rx, &engine_limits(), Duration::from_secs(1)),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => panic!("no Admission may be answered, saw {:?}", frame.message),
+            _ => {}
+        }
     }
 }

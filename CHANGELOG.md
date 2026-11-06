@@ -2,6 +2,15 @@
 
 本文件记录用户可感知的主要里程碑，按时间线组织；逐轮测试证据见 `reports/dev-validation-2026-11-02.txt`，任务级完成状态见 [docs/BACKLOG.zh-CN.md](docs/BACKLOG.zh-CN.md)，平台支持范围见 [docs/SUPPORT_MATRIX.zh-CN.md](docs/SUPPORT_MATRIX.zh-CN.md)。格式参照 Keep a Changelog；版本号语义为预发布（0.x）。
 
+## [未发布] - 2026-11-06：第二十七波——daemon 真实邀请码两维并发（终审 P1-02 关闭）
+
+- 引擎：`channel_scheduler_handshake`（Hello 能力分流 + TaskOpen 读取）与 `receive_on_channel_preadmitted`（预准入接收体）；Legacy 分支带回流（`HelloStream`）+ `receive_after_hello` 同连接延续体；`receive_job` 零复制重构为三阶段共享。
+- 会话层：`ChannelReceiveExecutor`（准入接收执行器）与 `AdmissionValidator`（事实源 = pairing journal Applied 记录；组键只从关系重建，claim 字节仅比对——伪造 code_id 换队列被拒）。
+- daemon：单次 bind + 并发 accept + 每连接 handler；Scheduler 对端按真实组键入队（同码/跨码策略矩阵在生产路径生效），legacy 对端同连接旧协议；关停 Drain 语义保持。
+- 发送端：CLI send 在 id-dir 有匹配 Ready 关系且对端支持时自动走 TaskOpen 准入（拒绝报 BUSY 不静默降级；旧接收端显式回退）。
+- 集成修复（联调暴露）：daemon 全程共享一条注册连接（v2 每设备单连接，双连接互踢曾致 redeem offer 推给无人读的连接）；orchestrator 新增 `adopt_persisted_code`（跨进程持久码回填）；生产 `--pairing` 切换到 orchestrator owner 环（写 journal，准入校验的事实源）；老 owner 循环死代码清理。
+- 证据：同码两 redeemer 并发→接收区间不重叠；异码并发→重叠；双端策略交集（一端 serial 即串行）；准入拒绝→恰 1 个 TaskOpen、零落盘、无静默重试；6/6 多进程真链 itest 全绿。
+
 ## [未发布] - 2026-11-06：第二十六波——二次终审 20 项发现修复（P0×1 / P1×6 / P2×13）
 
 - P0-01 FFI 快照 ABI 错配（真实 GUI 可触发原生堆越界写）：ABI 裁决冻结为实际发布形态（snapshot 三参无 runtime_id/query），契约重写 + Rust fn 指针形状测试锁定 19 导出 + Dart 绑定修正——两侧再漂移即编译失败。

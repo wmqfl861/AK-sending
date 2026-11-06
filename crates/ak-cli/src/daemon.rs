@@ -4,26 +4,44 @@
 //! with `receive` via [`crate::ReceiveLoopConfig`], so admission semantics
 //! can never drift between the two verbs), an mDNS advertisement with the
 //! fingerprint TXT record (the same record `discover` reads), and the
-//! sequential receive loop (the `receive` kernel: bind, accept one job,
-//! run it to completion, rebind). Unlike `receive`, a failed or timed-out
-//! job does not end the daemon -- the failure is reported and the loop
-//! keeps listening until Ctrl-C, which withdraws the mDNS announcement and
-//! exits 0.
+//! receive loop. Unlike `receive`, a failed or timed-out job does not end
+//! the daemon -- the failure is reported and the loop keeps listening
+//! until Ctrl-C, which withdraws the mDNS announcement and exits 0.
+//!
+//! Two receive shapes (wave 27):
+//!
+//! * **wired** (any of `--same-code`/`--cross-code`/`--invite-code`/
+//!   `--registry-fp`): the session-runtime path. The endpoint binds ONCE
+//!   and accepts connections concurrently; every accepted connection
+//!   becomes a handler task that runs the scheduler handshake split. A
+//!   scheduler-capable sender is validated against the local Ready
+//!   pairing relations ([`AdmissionValidator`]) and enters the scheduler
+//!   under the REAL code group of that relation (`PairingPlan::Ready`),
+//!   so `same_code_mode`/`cross_code_mode` govern real groups. A legacy
+//!   peer (no `CAP_SCHEDULER`, e.g. the previous `send --fp`) keeps the
+//!   frozen single-job protocol on the same channel under the anonymous
+//!   legacy group (`PairingPlan::Local`), so its concurrency stays policy
+//!   visible too.
+//! * **direct** (no scheduler flags): the engine loop exactly as it always
+//!   ran -- bind, accept one job at a time, rebind (compatibility gate).
 //!
 //! `--json-lines` turns stdout into an NDJSON event stream
 //! ([`DaemonEvent`]) for GUI/script consumers; human notes move to stderr
 //! so stdout stays parseable line by line.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use ak_engine::{EngineError, Progress, Report};
+use ak_engine::{EngineError, Progress, ReceiveSpec, Report};
+use ak_session::runtime::RealOutcome;
 
 use crate::{ProgressLine, ReceiveLoopConfig, FIREWALL_NOTE};
 
@@ -152,7 +170,10 @@ fn emit_line(text: &str) {
 
 /// Output routing shared by every daemon print: with `--json-lines`
 /// stdout carries ONLY NDJSON events, human notes move to stderr; in text
-/// mode everything is human copy on stdout.
+/// mode everything is human copy on stdout. `Copy`: every concurrent
+/// connection handler owns one (printing is line-atomic through
+/// `println!`'s stdout lock).
+#[derive(Clone, Copy)]
 struct DaemonOut {
     json_lines: bool,
 }
@@ -300,7 +321,7 @@ struct WiredRuntime {
 /// Start the wired runtime (see [`WiredRuntime`]). `default_executor` is
 /// the never-used listener slot (the listener is disabled).
 async fn start_wired_runtime(
-    id: &Path,
+    client: ak_session::pairing::RegistryClient,
     settings: &crate::invite::RegistrySettings,
     policy: ak_session::runtime::SchedulerPolicy,
     default_executor: Arc<ak_session::runtime::RealTransferExecutor>,
@@ -308,8 +329,11 @@ async fn start_wired_runtime(
     use ak_session::runtime::{
         RealClock, RetryPolicy, RuntimeClock, RuntimeConfig, SessionRuntime, TransferExecutor,
     };
-    let (key, _) = crate::load_identity(id)?;
-    let client = crate::invite::connect_registry(settings, &key).await?;
+    // Wave 27: the caller hands in THE daemon's one shared registry client.
+    // The v2 registry keeps exactly ONE live connection per device (a new
+    // Hello kicks the previous), so a second connection here used to kick
+    // the pairing service's connection off — every redeem offer then went
+    // to a plane nobody read (the silent no-pairing failure).
     let transport = ak_session::pairing::RealTransport::new(client);
     let clock: Arc<dyn RuntimeClock> = Arc::new(RealClock::new());
     let mut config = RuntimeConfig::new(
@@ -336,89 +360,34 @@ async fn start_wired_runtime(
     })
 }
 
-/// Best-effort session shutdown at daemon exit: cancel in-flight work,
-/// join the actor (bounded by the handle's own join timeout, plus an
-/// outer bound so a wedged engine abort cannot delay the exit beyond a
-/// second here).
+/// Best-effort session shutdown at daemon exit (wave 27): DRAIN in-flight
+/// work first — the actor waits (bounded by its own `shutdown_timeout_ms`)
+/// for the running receives to finish naturally, force-cancels residuals
+/// and JOINS every real engine work task before answering (wave-26 P1-03
+/// join semantics), so when this returns no engine still holds a port or
+/// writes files. The outer bound keeps a wedged engine abort from delaying
+/// the exit beyond two seconds here.
 async fn stop_wired_runtime(handle: &ak_session::runtime::SessionHandle) {
     use ak_session::runtime::ShutdownMode;
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
-        handle.shutdown(ShutdownMode::Cancel),
+        handle.shutdown(ShutdownMode::Drain),
     )
     .await;
 }
 
-/// How one receive iteration failed (mirrors the direct loop's error
-/// matching so both paths share the response arms).
+/// How one receive task failed (mirrors the direct loop's error matching
+/// so both paths share the response arms).
 enum JobFailure {
     /// A peer outside the accept policy was rejected.
     Unauthorized,
-    /// The bind lost a port race (the loop retries with backoff).
+    /// The bind lost a port race (the direct loop retries with backoff).
     AddrInUse,
+    /// The task was cancelled (daemon shutdown): no NDJSON event — the
+    /// `stopped` event is the closing line.
+    Cancelled,
     /// Anything else; `message` is bounded sanitized text.
     Other { message: String },
-}
-
-/// One iteration of the wired receive loop: enqueue a fresh real receive
-/// task into the session runtime and watch its lifecycle on the event
-/// stream. Returns the submit result (the task id) plus the armed
-/// executor to read the outcome from once the task settles.
-async fn enqueue_wired_receive(
-    wired: &WiredRuntime,
-    spec: ak_engine::ReceiveSpec,
-    printer: Arc<dyn Fn(ak_engine::Progress) + Send + Sync>,
-    addr_tx: tokio::sync::oneshot::Sender<SocketAddr>,
-) -> (
-    Result<ak_session::runtime::TransferId, String>,
-    Arc<ak_session::runtime::RealTransferExecutor>,
-) {
-    use ak_session::runtime::real_executor::RealTransferExecutor;
-    use ak_session::runtime::{
-        CodeGroupKey, CodeId, PairingPlan, RegistryId, TransferDirection, TransferExecutor,
-        TransferSpec,
-    };
-    let executor = Arc::new(RealTransferExecutor::receive(
-        spec,
-        Some(addr_tx),
-        Some(printer),
-    ));
-    // The resident listener's anonymous group: every iteration shares the
-    // pinned registry identity; the all-zero code id is the local sentinel
-    // for "the loop's own group" (it never reaches the wire on the Local
-    // plan, and it keeps every iteration inside one code group so the
-    // same-code policy governs the whole loop as one code).
-    let group = CodeGroupKey::new(
-        RegistryId::from_bytes(wired.registry_id),
-        CodeId::from_bytes([0u8; 16]),
-    );
-    let submit = wired.handle.enqueue(TransferSpec {
-        group_key: group,
-        pairing: PairingPlan::Local,
-        executor: executor.clone() as Arc<dyn TransferExecutor>,
-        direction: TransferDirection::Receive,
-        label: "daemon-receive".to_owned(),
-        task_id: None,
-    });
-    let submitted = submit
-        .await
-        .map_err(|err| format!("cannot enqueue the receive task: {err}"));
-    (submitted, executor)
-}
-
-/// Classify a settled wired receive from the executor's outcome record.
-fn classify_wired_outcome(
-    executor: &ak_session::runtime::RealTransferExecutor,
-    task: &ak_session::runtime::TransferId,
-) -> Result<ak_engine::Report, JobFailure> {
-    use ak_session::runtime::real_executor::RealOutcome;
-    match executor.outcome(task) {
-        Some(RealOutcome::Completed { report }) => Ok(report),
-        Some(RealOutcome::Failed(failure)) => Err(classify_real_failure(&failure)),
-        None => Err(JobFailure::Other {
-            message: "the receive task ended without an engine outcome".to_owned(),
-        }),
-    }
 }
 
 /// Map the executor's stable failure classification onto the loop's
@@ -428,6 +397,7 @@ fn classify_real_failure(failure: &ak_session::runtime::RealFailure) -> JobFailu
     use ak_core::error::ErrorCode;
     match failure.code {
         ErrorCode::AuthFailed => JobFailure::Unauthorized,
+        ErrorCode::Cancelled => JobFailure::Cancelled,
         ErrorCode::StorageError if failure.io_kind == Some(std::io::ErrorKind::AddrInUse) => {
             JobFailure::AddrInUse
         }
@@ -439,11 +409,13 @@ fn classify_real_failure(failure: &ak_session::runtime::RealFailure) -> JobFailu
 
 /// Watch the runtime event stream until `task` reaches a terminal-for-
 /// the-loop scheduler event (finished, parked — retries are disabled so
-/// the single allowed failure parks — or cancelled), then classify.
+/// the single allowed failure parks — or cancelled), then classify the
+/// outcome through `outcome_of` (each wiring passes its executor's
+/// query).
 async fn watch_wired_task(
     events: &mut tokio::sync::broadcast::Receiver<ak_session::runtime::SessionEvent>,
-    executor: &ak_session::runtime::RealTransferExecutor,
     task: ak_session::runtime::TransferId,
+    outcome_of: impl FnOnce(&ak_session::runtime::TransferId) -> Option<RealOutcome>,
 ) -> Result<ak_engine::Report, JobFailure> {
     use ak_session::runtime::SessionEvent;
     use ak_session::scheduler::SchedulerEvent;
@@ -468,7 +440,13 @@ async fn watch_wired_task(
             break;
         }
     }
-    classify_wired_outcome(executor, &task)
+    match outcome_of(&task) {
+        Some(RealOutcome::Completed { report }) => Ok(report),
+        Some(RealOutcome::Failed(failure)) => Err(classify_real_failure(&failure)),
+        None => Err(JobFailure::Other {
+            message: "the receive task ended without an engine outcome".to_owned(),
+        }),
+    }
 }
 
 /// `ak-cli daemon`: resident receive mode (mDNS advertise + receive loop +
@@ -483,6 +461,831 @@ pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()>
         let _ = shutdown_tx.send(true);
     });
     daemon_core(id, opts, shutdown_rx).await
+}
+
+// ===========================================================================
+// Wave-27 parallel-agent API (final review P1-02) — ONE integration surface.
+//
+// The entries below are owned by the parallel engine/session agents and
+// land in the same wave; every reference in this file goes through the
+// wrappers in this block, so reconciling the final shapes is a handful of
+// lines here instead of a diff across the file:
+//
+//   ak-engine (landed)
+//     channel_scheduler_handshake(&mut ch, &ReceiveSpec)
+//         -> Result<SchedulerHandshake, EngineError>
+//       SchedulerHandshake::Legacy { peer_capabilities: u16 }
+//       SchedulerHandshake::Scheduler { open: TaskOpenAdmission }
+//   ak-session (landed)
+//     ChannelReceiveExecutor::new(ch, ReceiveSpec, open, observer)
+//       + claim()/peer_fingerprint()/outcome() accessors
+//     runtime::admission::AdmissionValidator::open(id_dir, registry_id)
+//       + resolve(peer, &TaskOpenClaim) -> Result<ResolvedAdmission, ..>
+//
+//   STILL-LANDING (compile fails here until the engine agent exposes it —
+//   expected per the wave brief): the LEGACY continuation
+//     receive_job(ch, ReceiveSpec, peer_capabilities, progress)
+//   — the frozen single-job body from Offer to FinalAck on the
+//   Hello-exchanged stream. This requires the engine's Legacy arm to hand
+//   the Hello-exchanged stream back (today `channel_scheduler_handshake`
+//   drops it, which would strand a legacy peer); the wrapper below is the
+//   single call site to reconcile.
+// ===========================================================================
+
+/// The handshake split outcome in daemon terms (see the block comment
+/// above): a legacy peer, or a scheduler-capable sender whose `TaskOpen`
+/// admission context the engine already decoded.
+enum WiredHandshake {
+    /// Peer without `CAP_SCHEDULER`: keep the frozen single-job protocol
+    /// on the handed-back Hello-exchanged stream.
+    Legacy {
+        peer_capabilities: u16,
+        stream: ak_engine::HelloStream,
+    },
+    /// Scheduler-capable sender: `open` is its `TaskOpen` admission
+    /// context (claimed group + registry + pairing relation) with the
+    /// live Hello-exchanged protocol stream retained inside.
+    Scheduler {
+        open: ak_engine::TaskOpenAdmission,
+    },
+}
+
+/// Run the scheduler handshake split on one accepted channel (wave-27
+/// engine API): identity re-check (`spec.authorize`), policy gate, the
+/// Hello exchange, and — for a scheduler-capable peer — its `TaskOpen`.
+async fn wired_handshake(
+    channel: &mut ak_net::DirectChannel,
+    spec: &ReceiveSpec,
+) -> Result<WiredHandshake, EngineError> {
+    match ak_engine::channel_scheduler_handshake(channel, spec).await {
+        Ok(ak_engine::SchedulerHandshake::Legacy {
+            peer_capabilities,
+            stream,
+        }) => Ok(WiredHandshake::Legacy {
+            peer_capabilities,
+            stream,
+        }),
+        Ok(ak_engine::SchedulerHandshake::Scheduler { open }) => {
+            Ok(WiredHandshake::Scheduler { open })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Continue one legacy (no `CAP_SCHEDULER`) receive on the already
+/// handshook channel: the frozen single-job body from Offer to FinalAck
+/// on the SAME Hello-exchanged stream (the integrator-side engine entry
+/// landed as `receive_after_hello`; it re-runs the authorize/policy
+/// defenses and emits exactly one `Connected`, which the daemon printer
+/// turns into the `job_started` event).
+async fn wired_legacy_body(
+    channel: ak_net::DirectChannel,
+    spec: ReceiveSpec,
+    hello: ak_engine::HelloStream,
+    peer_capabilities: u16,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Report, EngineError> {
+    ak_engine::receive_after_hello(channel, spec, hello, peer_capabilities, progress).await
+}
+
+/// The anonymous legacy code group (wave 24 sentinel kept verbatim): all
+/// legacy connections of one daemon share it, so the same-code policy
+/// governs them as one code — policy stays visible on the compatibility
+/// path. It never reaches the wire (the Local plan carries no TaskOpen).
+fn legacy_group(registry_id: [u8; 32]) -> ak_session::runtime::CodeGroupKey {
+    ak_session::runtime::CodeGroupKey::new(
+        ak_session::runtime::RegistryId::from_bytes(registry_id),
+        ak_session::runtime::CodeId::from_bytes([0u8; 16]),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Legacy channel executor
+// ---------------------------------------------------------------------------
+
+/// Grace given to the engine kernel when a cancellation races the final
+/// commit (mirrors the runtime's real-executor bound, P1-03): between the
+/// terminal `completed` checkpoint save and the `FinalAck { verified:
+/// true }` progress event the kernel is a few frame writes from a fully
+/// persisted completion; 250 ms lets that finish (reporting `Completed`)
+/// while an ordinary mid-transfer cancel stays prompt.
+const LEGACY_FINAL_COMMIT_GRACE: Duration = Duration::from_millis(250);
+
+/// Classify an engine failure onto the stable scheduler error code (the
+/// same mapping `ak-session`'s real executor applies; duplicated here
+/// because the engine taxonomy is public only through this file's use).
+fn legacy_error_code(err: &EngineError) -> (ak_core::error::ErrorCode, Option<std::io::ErrorKind>) {
+    use ak_core::error::ErrorCode;
+    match err {
+        EngineError::Connect(ak_net::ConnectError::Unauthorized) => (ErrorCode::AuthFailed, None),
+        EngineError::Connect(_) => (ErrorCode::DirectUnavailable, None),
+        EngineError::Stream(_) | EngineError::PeerClosed | EngineError::IdleTimeout(_) => {
+            (ErrorCode::DirectUnavailable, None)
+        }
+        EngineError::Rejected(code) | EngineError::PeerError { code, .. } => (*code, None),
+        EngineError::SourceChanged => (ErrorCode::SourceChanged, None),
+        EngineError::Storage(_) | EngineError::Checkpoint(_) => (ErrorCode::StorageError, None),
+        EngineError::StorageFull { .. } => (ErrorCode::StorageFull, None),
+        EngineError::Io(io) => (ErrorCode::StorageError, Some(io.kind())),
+        EngineError::VerificationFailed => (ErrorCode::HashMismatch, None),
+        EngineError::Cancelled => (ErrorCode::Cancelled, None),
+        EngineError::RouteForbidden(_) => (ErrorCode::RouteForbidden, None),
+        EngineError::AdmissionDenied { .. } => (ErrorCode::ProtocolUnsupported, None),
+        EngineError::InvalidAdmissionCtx { .. } | EngineError::PeerMismatch { .. } => {
+            (ErrorCode::PeerMismatch, None)
+        }
+    }
+}
+
+/// One running legacy task (cancel flag + joinable work, P1-03 shape).
+struct LegacyRunning {
+    cancel: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct LegacyState {
+    running: HashMap<ak_session::runtime::TransferId, LegacyRunning>,
+    outcomes: HashMap<ak_session::runtime::TransferId, RealOutcome>,
+}
+
+/// One-shot legacy receive executor (wave 27): runs the frozen single-job
+/// receive body on an ALREADY-ACCEPTED, ALREADY-HANDSHOOK channel — the
+/// daemon's compatibility path for peers without `CAP_SCHEDULER` (e.g.
+/// the previous `send --fp`). Same contract surface as the runtime's
+/// `RealTransferExecutor`: one channel per instance, cooperative cancel
+/// that drops the engine kernel (closing the channel and stopping every
+/// staged write) before reporting, persisted-completion adoption when a
+/// cancel races the final commit, joinable work for shutdown, and a
+/// queryable outcome.
+struct LegacyChannelExecutor {
+    channel: Mutex<Option<ak_net::DirectChannel>>,
+    hello: Mutex<Option<ak_engine::HelloStream>>,
+    peer_capabilities: u16,
+    spec: Mutex<Option<ReceiveSpec>>,
+    observer: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+    state: Arc<Mutex<LegacyState>>,
+}
+
+impl LegacyChannelExecutor {
+    /// Arm the executor with the accepted channel, its Hello-exchanged
+    /// stream (handed back by the handshake's Legacy arm), the
+    /// capabilities the handshake observed, the connection's engine spec
+    /// and an optional progress observer (the daemon printer rides here).
+    fn new(
+        channel: ak_net::DirectChannel,
+        hello: ak_engine::HelloStream,
+        peer_capabilities: u16,
+        spec: ReceiveSpec,
+        observer: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+    ) -> Self {
+        LegacyChannelExecutor {
+            channel: Mutex::new(Some(channel)),
+            hello: Mutex::new(Some(hello)),
+            peer_capabilities,
+            spec: Mutex::new(Some(spec)),
+            observer,
+            state: Arc::new(Mutex::new(LegacyState::default())),
+        }
+    }
+
+    /// The outcome of the task's attempt once it settled (`None` while
+    /// running).
+    fn outcome(&self, task: &ak_session::runtime::TransferId) -> Option<RealOutcome> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .outcomes
+            .get(task)
+            .cloned()
+    }
+}
+
+impl ak_session::runtime::TransferExecutor for LegacyChannelExecutor {
+    fn enqueue(
+        &self,
+        task: ak_session::scheduler::key::TaskHandle,
+        spec: ak_session::runtime::TransferSpec,
+        sink: ak_session::runtime::ProgressSink,
+    ) -> Result<(), ak_session::runtime::EngineStartError> {
+        use ak_session::runtime::{EngineStartError, TransferDirection};
+        if spec.direction != TransferDirection::Receive {
+            return Err(EngineStartError::new(
+                ak_core::error::ErrorCode::Internal,
+                "the legacy channel executor is receive-only",
+            ));
+        }
+        let id = task.task_id();
+        let channel = self
+            .channel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| {
+                EngineStartError::new(
+                    ak_core::error::ErrorCode::Internal,
+                    "this legacy executor already ran its one channel",
+                )
+            })?;
+        let hello = self
+            .hello
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the Hello stream is consumed together with the channel");
+        let engine_spec = self
+            .spec
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the spec is consumed together with the channel");
+
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        // "The completion is persisted": the engine saves the terminal
+        // `completed` checkpoint strictly before emitting
+        // `FinalAck { verified: true }` — the flag a cancellation must
+        // lose against (P1-03).
+        let final_ack = Arc::new(AtomicBool::new(false));
+        let observer = self.observer.clone();
+        let progress_final_ack = Arc::clone(&final_ack);
+        let progress = move |progress: Progress| {
+            if let Some(observer) = observer.as_ref() {
+                observer(progress.clone());
+            }
+            match progress {
+                Progress::Connected { .. } => {
+                    let _ = phase_tx.send(ak_session::scheduler::state::TaskPhase::Transferring);
+                }
+                Progress::FinalAck { verified: true } => {
+                    progress_final_ack.store(true, Ordering::Release);
+                }
+                _ => {}
+            }
+        };
+
+        let peer_caps = self.peer_capabilities;
+        let task_sink = sink.clone();
+        let shared_state = Arc::clone(&self.state);
+        let work = tokio::spawn(async move {
+            use ak_session::scheduler::state::{FinishOutcome, TaskPhase};
+            task_sink.phase(task, TaskPhase::Scanning).await;
+            let mut engine_fut =
+                Box::pin(wired_legacy_body(channel, engine_spec, hello, peer_caps, &progress));
+            let mut transferring_reported = false;
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    phase = phase_rx.recv() => {
+                        if let Some(phase) = phase {
+                            if phase == TaskPhase::Transferring {
+                                transferring_reported = true;
+                            }
+                            task_sink.phase(task, phase).await;
+                        }
+                    }
+                    outcome = &mut engine_fut => break Some(outcome),
+                    _ = cancel_rx.changed() => {
+                        if !*cancel_rx.borrow_and_update() {
+                            continue;
+                        }
+                        if final_ack.load(Ordering::Acquire) {
+                            // Persisted completion: let the kernel finish.
+                            break Some((&mut engine_fut).await);
+                        }
+                        match tokio::time::timeout(
+                            LEGACY_FINAL_COMMIT_GRACE,
+                            &mut engine_fut,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => break Some(outcome),
+                            Err(_grace_elapsed) => break None,
+                        }
+                    }
+                }
+            };
+            // Drop the kernel BEFORE recording and reporting (P1-03): the
+            // channel closes and staged writes stop here.
+            drop(engine_fut);
+            let failure_code = {
+                let mut state = shared_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match result {
+                    Some(Ok(report)) => {
+                        state.outcomes.insert(id, RealOutcome::Completed { report });
+                        None
+                    }
+                    Some(Err(err)) => {
+                        let (code, io_kind) = legacy_error_code(&err);
+                        state.outcomes.insert(
+                            id,
+                            RealOutcome::Failed(ak_session::runtime::RealFailure {
+                                code,
+                                io_kind,
+                                message: err.to_string().chars().take(160).collect(),
+                            }),
+                        );
+                        Some(code)
+                    }
+                    None => {
+                        state.outcomes.insert(
+                            id,
+                            RealOutcome::Failed(ak_session::runtime::RealFailure {
+                                code: ak_core::error::ErrorCode::Cancelled,
+                                io_kind: None,
+                                message: "cancelled: the engine kernel was dropped".to_owned(),
+                            }),
+                        );
+                        Some(ak_core::error::ErrorCode::Cancelled)
+                    }
+                }
+            };
+            match failure_code {
+                None => {
+                    if !transferring_reported {
+                        task_sink.phase(task, TaskPhase::Transferring).await;
+                    }
+                    task_sink.phase(task, TaskPhase::Verifying).await;
+                    task_sink.phase(task, TaskPhase::Committing).await;
+                    task_sink.finished(task, FinishOutcome::Completed).await;
+                }
+                Some(code) => {
+                    task_sink
+                        .finished(task, FinishOutcome::Failed { error: code })
+                        .await;
+                }
+            }
+            shared_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .running
+                .remove(&id);
+        });
+
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+            .insert(
+                id,
+                LegacyRunning {
+                    cancel: cancel_tx,
+                    join: work,
+                },
+            );
+        Ok(())
+    }
+
+    fn cancel(&self, task: &ak_session::scheduler::key::TaskHandle) {
+        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(running) = state.running.get(&task.task_id()) {
+            let _ = running.cancel.send(true);
+        }
+    }
+
+    fn take_work(
+        &self,
+        task: &ak_session::scheduler::key::TaskHandle,
+    ) -> Option<ak_session::runtime::ExecutorWork> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+            .remove(&task.task_id())
+            .map(|running| ak_session::runtime::ExecutorWork::new(running.join))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wired accept loop (wave 27)
+// ---------------------------------------------------------------------------
+
+/// The receive-loop kernel's rebind retry budget: the previous process's
+/// QUIC endpoint releases its UDP socket asynchronously after drop, so a
+/// fresh bind may lose a short port race (the wired path needs this only
+/// for its ONE initial bind; the direct loop rebinds per iteration).
+const MAX_REBIND_RETRIES: u32 = 50;
+
+/// The per-connection slice of [`ReceiveLoopConfig`] the wired handlers
+/// need (everything but `bind`, which the resident endpoint already
+/// consumed). `Clone`: every accepted connection builds one fresh engine
+/// spec from it — including a fresh `authorize` closure, so the engine's
+/// per-entry identity re-check re-reads peers.book exactly like the
+/// accept loop's own check.
+#[derive(Clone)]
+struct WiredJobTemplate {
+    out_dir: PathBuf,
+    identity: ak_identity::tls::TlsBundle,
+    device_name: String,
+    conflict: ak_core::handle::ConflictPolicy,
+    checkpoint_dir: PathBuf,
+    idle_timeout: Duration,
+    allow_internet: bool,
+    policy: crate::ExpectPolicy,
+}
+
+impl WiredJobTemplate {
+    fn of(config: &ReceiveLoopConfig) -> Self {
+        WiredJobTemplate {
+            out_dir: config.out.clone(),
+            identity: config.bundle.clone(),
+            device_name: config.device_name.clone(),
+            conflict: config.conflict,
+            checkpoint_dir: config.checkpoints.clone(),
+            idle_timeout: config.idle,
+            allow_internet: config.allow_internet,
+            policy: config.policy.clone(),
+        }
+    }
+
+    /// One connection's engine receive spec. `bind` is unused on the
+    /// channel path (the channel exists); `authorize` is re-armed from
+    /// the accept policy because both wave-27 engine entries re-run the
+    /// identity check themselves (defense in depth); the destination,
+    /// conflict policy, checkpoints, idle budget, name and route gate all
+    /// apply exactly as in `receive_with_addr`.
+    fn spec(&self) -> ReceiveSpec {
+        let mut spec = ReceiveSpec::new(self.out_dir.clone(), self.identity.clone());
+        spec.conflict = self.conflict;
+        spec.checkpoint_dir = self.checkpoint_dir.clone();
+        spec.device_name = self.device_name.clone();
+        spec.idle_timeout = self.idle_timeout;
+        spec.policy.allow_internet = self.allow_internet;
+        spec.authorize = self.policy.authorize();
+        spec
+    }
+}
+
+/// The executor of one wired connection, whichever branch the handshake
+/// split took. Both variants expose the same outcome query the task
+/// watcher needs.
+enum WiredExecutor {
+    /// Legacy peer: the daemon's channel executor (this file).
+    Legacy(Arc<LegacyChannelExecutor>),
+    /// Scheduler peer: the session channel executor (wave-27 session API).
+    Channel(Arc<ak_session::runtime::ChannelReceiveExecutor>),
+}
+
+impl WiredExecutor {
+    fn transfer(&self) -> Arc<dyn ak_session::runtime::TransferExecutor> {
+        match self {
+            WiredExecutor::Legacy(executor) => Arc::clone(executor) as Arc<_>,
+            WiredExecutor::Channel(executor) => Arc::clone(executor) as Arc<_>,
+        }
+    }
+
+    fn outcome(&self, task: &ak_session::runtime::TransferId) -> Option<RealOutcome> {
+        match self {
+            WiredExecutor::Legacy(executor) => executor.outcome(task),
+            // Same queryable-outcome contract as the runtime's real
+            // executor (wave-27 session API).
+            WiredExecutor::Channel(executor) => executor.outcome(task),
+        }
+    }
+}
+
+/// Everything one accepted connection's handler owns.
+struct WiredConnection {
+    handle: ak_session::runtime::SessionHandle,
+    validator: Arc<ak_session::runtime::admission::AdmissionValidator>,
+    template: WiredJobTemplate,
+    out: DaemonOut,
+    registry_id: [u8; 32],
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    channel: ak_net::DirectChannel,
+}
+
+/// Serve exactly one accepted connection (spawned per connection by the
+/// wired accept loop): run the scheduler handshake split, then either the
+/// legacy compatibility receive or the validated scheduler receive — both
+/// inside the session runtime, so the policy flags govern real groups —
+/// and emit the per-task NDJSON events (`job_started` comes from the
+/// engine's `Connected` progress through the daemon printer; `job_done`
+/// or `error` from the settled outcome).
+async fn wired_connection_handler(connection: WiredConnection) {
+    let WiredConnection {
+        handle,
+        validator,
+        template,
+        out,
+        registry_id,
+        mut shutdown,
+        mut channel,
+    } = connection;
+    let peer = channel.peer_fingerprint().to_hex();
+    let connected_at = Arc::new(Mutex::new(None::<Instant>));
+    let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
+    let spec = template.spec();
+
+    // Handshake split. Shutdown only races this phase: once a task is
+    // enqueued the runtime's drain/cancel settles it (and joins the
+    // engine work) before the daemon exits, so the watch below needs no
+    // shutdown arm.
+    let split = tokio::select! {
+        split = wired_handshake(&mut channel, &spec) => split,
+        _ = shutdown.changed() => {
+            channel.close(0, b"daemon stopping");
+            return;
+        }
+    };
+    let (executor, group, pairing, label) = match split {
+        Err(error) => {
+            out.event(&DaemonEvent::Error {
+                message: &error.to_string(),
+            });
+            out.text(&format!(
+                "job failed: {error}; still listening (Ctrl-C stops)"
+            ));
+            return;
+        }
+        Ok(WiredHandshake::Legacy {
+            peer_capabilities,
+            stream,
+        }) => {
+            // Compatibility path: the frozen single-job protocol on this
+            // channel (resumed on the handed-back Hello stream), inside
+            // the anonymous legacy group so the same-code policy keeps
+            // governing legacy concurrency.
+            (
+                WiredExecutor::Legacy(Arc::new(LegacyChannelExecutor::new(
+                    channel,
+                    stream,
+                    peer_capabilities,
+                    spec,
+                    Some(printer),
+                ))),
+                legacy_group(registry_id),
+                ak_session::runtime::PairingPlan::Local,
+                "daemon-legacy-receive".to_owned(),
+            )
+        }
+        Ok(WiredHandshake::Scheduler { open }) => {
+            // The channel executor owns the channel + the wire TaskOpen;
+            // its accessors feed the relation check (wave-27 session API:
+            // the group key may only come from a validated Ready
+            // relation, never from the claim bytes).
+            let channel_executor = ak_session::runtime::ChannelReceiveExecutor::new(
+                channel,
+                spec,
+                open,
+                Some(printer),
+            );
+            let (claim, channel_peer) = match (channel_executor.claim(), channel_executor.peer_fingerprint()) {
+                (Some(claim), Some(channel_peer)) => (claim, channel_peer),
+                _ => {
+                    // Cannot happen for a freshly built executor; fail
+                    // closed anyway.
+                    let message = "scheduler admission lost its channel before validation";
+                    out.event(&DaemonEvent::Error { message });
+                    out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+                    return;
+                }
+            };
+            match validator.resolve(&channel_peer, &claim) {
+                Ok(resolved) => (
+                    WiredExecutor::Channel(Arc::new(channel_executor)),
+                    resolved.group,
+                    // Local, not Ready: the actor's Ready path opens a
+                    // SIGNALING session toward the peer before the
+                    // executor — meaningful for outbound sends, wrong for
+                    // an inbound channel that already exists. `Local`
+                    // goes straight from admission to the executor; the
+                    // REAL validated group key above is what the policy
+                    // governs (the plan carries no grouping). The pairing
+                    // id rides the label for snapshot visibility.
+                    ak_session::runtime::PairingPlan::Local,
+                    format!("daemon-receive p{}", &resolved.pairing_id.to_hex()[..16]),
+                ),
+                Err(reject) => {
+                    // Wire semantics: the refused admission closes the
+                    // channel (dropping the executor drops it); the
+                    // reason is reported, the daemon lives on.
+                    drop(channel_executor);
+                    let message =
+                        format!("rejected a scheduler admission from peer {peer}: {reject}");
+                    out.event(&DaemonEvent::Error { message: &message });
+                    out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+                    return;
+                }
+            }
+        }
+    };
+
+    // Subscribe BEFORE the submit: a broadcast receiver only sees messages
+    // sent after it existed, and a lightning-fast task must not be able to
+    // finish before the watcher is armed.
+    let mut events = handle.subscribe();
+    let task = match handle
+        .enqueue(ak_session::runtime::TransferSpec {
+            group_key: group,
+            pairing,
+            executor: executor.transfer(),
+            direction: ak_session::runtime::TransferDirection::Receive,
+            label,
+            task_id: None,
+        })
+        .await
+    {
+        Ok(task) => task,
+        Err(ak_session::runtime::SessionError::QueueFull) => {
+            // Contract §7: the local queue is full — refuse THIS
+            // connection (capacity), never block or disturb others.
+            let message = "queue full: connection refused (capacity)".to_owned();
+            out.event(&DaemonEvent::Error { message: &message });
+            out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+            return;
+        }
+        Err(err) => {
+            let message = format!("cannot enqueue the receive task: {err}");
+            out.event(&DaemonEvent::Error { message: &message });
+            out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+            return;
+        }
+    };
+    let outcome = watch_wired_task(&mut events, task, |task| executor.outcome(task)).await;
+    match outcome {
+        Ok(report) => {
+            emit_job_done(&out, &connected_at, &report);
+            out.text("waiting for next sender (Ctrl-C stops)...");
+        }
+        Err(JobFailure::Unauthorized) => {
+            out.event(&DaemonEvent::Error {
+                message: "rejected a peer outside the accept policy",
+            });
+            out.text("rejected a peer outside the accept policy; still listening (Ctrl-C stops)");
+        }
+        Err(JobFailure::Cancelled) => {
+            // Shutdown cancellation: the closing `stopped` event is the
+            // report; no per-task error line on the event stream.
+            out.text("task cancelled (daemon stopping)");
+        }
+        Err(JobFailure::AddrInUse) => {
+            let message =
+                "bind failed: address already in use (retry budget exhausted)".to_owned();
+            out.event(&DaemonEvent::Error { message: &message });
+            out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+        }
+        Err(JobFailure::Other { message }) => {
+            out.event(&DaemonEvent::Error { message: &message });
+            out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+        }
+    }
+}
+
+/// The wired daemon's resident state (wave 27): one bound endpoint, the
+/// session runtime, the admission validator over this identity's pairing
+/// journal, and the output/mDNS wiring the shutdown path must close.
+struct WiredDaemon {
+    wired: WiredRuntime,
+    id_dir: PathBuf,
+    config: ReceiveLoopConfig,
+    out: DaemonOut,
+    fingerprint: ak_identity::Fingerprint,
+    name: String,
+    mdns: Option<ak_discovery::MdnsDiscovery>,
+    mdns_ok: bool,
+    candidates_json: Vec<String>,
+    candidate_addrs: Vec<crate::AddressCandidate>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+impl WiredDaemon {
+    /// The wired receive path: bind once (rebind backoff only on the
+    /// initial bind), announce, then accept connections concurrently —
+    /// one handler task each — until shutdown; on shutdown drain/cancel
+    /// the runtime, join every handler, then emit the closing event.
+    async fn run(mut self) -> Result<()> {
+        let endpoint = self.bind_once().await?;
+        let addr = endpoint
+            .local_addr()
+            .with_context(|| format!("cannot read the bound address of {}", self.config.listen))?;
+        self.announce(addr);
+        let validator = Arc::new(
+            ak_session::runtime::admission::AdmissionValidator::open(
+                &self.id_dir,
+                ak_session::runtime::RegistryId::from_bytes(self.wired.registry_id),
+            )
+            .context("cannot open the pairing journal for admission validation")?,
+        );
+        let template = WiredJobTemplate::of(&self.config);
+
+        let mut handlers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        loop {
+            // A fresh spec per accept: the authorize callback re-reads
+            // peers.book, so `pair add` takes effect without a restart
+            // (the same rule the direct loop applies per iteration).
+            let accept_spec = self.config.iteration_spec();
+            tokio::select! {
+                accepted = endpoint.accept(&accept_spec.authorize) => {
+                    match accepted {
+                        Ok(channel) => {
+                            handlers.push(tokio::spawn(wired_connection_handler(
+                                WiredConnection {
+                                    handle: self.wired.handle.clone(),
+                                    validator: Arc::clone(&validator),
+                                    template: template.clone(),
+                                    out: self.out,
+                                    registry_id: self.wired.registry_id,
+                                    shutdown: self.shutdown.clone(),
+                                    channel,
+                                },
+                            )));
+                            // Reap exited handlers so the join set stays
+                            // bounded on a long-lived daemon.
+                            handlers.retain(|task| !task.is_finished());
+                        }
+                        Err(ak_net::ConnectError::Unauthorized) => {
+                            self.out.event(&DaemonEvent::Error {
+                                message: "rejected a peer outside the accept policy",
+                            });
+                            self.out.text(
+                                "rejected a peer outside the accept policy; still waiting (Ctrl-C stops)",
+                            );
+                        }
+                        Err(err) => {
+                            // The endpoint itself is gone (or the accept
+                            // machinery failed): the resident listener
+                            // cannot continue.
+                            let message = format!("accept failed: {err}");
+                            self.out.event(&DaemonEvent::Error { message: &message });
+                            self.out.text(&format!("{message}; stopping the listener"));
+                            break;
+                        }
+                    }
+                }
+                _ = self.shutdown.changed() => break,
+            }
+        }
+
+        // Shutdown (contract §10): stop accepting, withdraw the mDNS
+        // announcement, drain-or-cancel every in-flight task (the runtime
+        // joins all real engine work before answering), let the handlers
+        // report their settled outcomes, and only then close the event
+        // stream — `stopped` remains the last NDJSON line.
+        if let Some(discovery) = self.mdns.as_mut() {
+            discovery.stop_advertise();
+        }
+        stop_wired_runtime(&self.wired.handle).await;
+        for task in handlers.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        }
+        self.out.event(&DaemonEvent::Stopped { reason: "shutdown" });
+        self.out.text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
+        Ok(())
+    }
+
+    /// Bind the one wired endpoint. The wave-24 rebind backoff survives
+    /// HERE (and only here): the previous process's endpoint releases its
+    /// UDP socket asynchronously, so the first bind may lose a short port
+    /// race. Once bound, the endpoint serves every connection for the
+    /// daemon's whole life — the per-iteration rebind is gone.
+    async fn bind_once(&self) -> Result<ak_net::DirectEndpoint> {
+        let mut retries = 0u32;
+        loop {
+            match ak_net::DirectEndpoint::bind(self.config.listen, &self.config.bundle).await {
+                Ok(endpoint) => return Ok(endpoint),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrInUse
+                        && retries < MAX_REBIND_RETRIES =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(err) => {
+                    bail!("daemon cannot bind {}: {err}", self.config.listen)
+                }
+            }
+        }
+    }
+
+    /// The once-per-run listening announcement (event + human block),
+    /// identical in shape to the direct loop's first iteration.
+    fn announce(&self, addr: SocketAddr) {
+        self.out.event(&DaemonEvent::Listening {
+            addr: &addr.to_string(),
+            port: addr.port(),
+            fingerprint: &self.fingerprint.to_hex(),
+            name: &self.name,
+            mdns: self.mdns_ok,
+            candidates: &self.candidates_json,
+        });
+        self.out.text(&format!(
+            "daemon listening on {addr} into {} (name {})",
+            self.config.out.display(),
+            self.name
+        ));
+        for line in crate::address_candidates_lines(&self.candidate_addrs) {
+            self.out.text(&line);
+        }
+        self.out.text(&crate::fingerprint_lines("fingerprint", &self.fingerprint));
+        self.out.text(&format!(
+            "pairing code: {}",
+            ak_identity::pairing_code(&self.fingerprint)
+        ));
+        self.out.text("waiting for sender (Ctrl-C stops)...");
+    }
 }
 
 /// The daemon body, shutdown-driven (the command wrapper only wires
@@ -516,15 +1319,49 @@ pub(crate) async fn daemon_core(
         None
     };
 
-    // Wave 21: owner-side pairing service (`--pairing`). Resident: spawned,
-    // stopped by the shared shutdown flag.
-    if opts.pairing {
-        let settings = match registry {
-            Some(settings) => settings,
+    // Wave 21: `--invite-code`: redeem at startup, pair with the owner,
+    // then keep receiving (the owner lands in peers.book, so the book
+    // policy below admits it). MUST run BEFORE the shared client below
+    // connects: the redeem opens its own short-lived same-device
+    // connection, and under the registry's one-connection-per-device rule
+    // the two connections would kick each other for as long as the redeem
+    // flow runs (the wave-27 keeper reconnects the shared client, which
+    // kills the in-flight redeem — the connection war the smoke test
+    // caught). Redeem first, close, then connect the shared client once.
+    if let Some(code) = &opts.invite_code {
+        let settings = registry
+            .as_ref()
+            .expect("invite-code implies the wired registry settings");
+        let verified = crate::invite::redeem_and_pair(id, code, settings).await?;
+        let peer = verified.owner_fingerprint(); // the code owner is the peer
+        out.note("paired with the code owner:");
+        out.note(&crate::fingerprint_lines("owner", &peer));
+    }
+
+    // Wave 27: THE daemon's one registry connection, shared by everything
+    // resident (the --pairing orchestrator's owner loop AND the wired
+    // runtime's RealTransport). The v2 registry keeps exactly one live
+    // connection per device — a second connect used to kick the first,
+    // silently rerouting every redeem offer to a plane nobody read.
+    let shared_registry = if wired_mode || opts.pairing {
+        let settings = match registry.as_ref() {
+            Some(settings) => *settings,
             None => crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?,
         };
         let (key, _) = crate::load_identity(id)?;
         let client = crate::invite::connect_registry(&settings, &key).await?;
+        Some((settings, key, client))
+    } else {
+        None
+    };
+
+    // Wave 21: owner-side pairing service (`--pairing`). Resident: spawned,
+    // stopped by the shared shutdown flag.
+    if opts.pairing {
+        let (settings, key, client) = shared_registry
+            .as_ref()
+            .expect("--pairing implies the shared registry connection");
+        let (key, client) = (key.clone(), client.clone());
         out.note(&format!(
             "pairing service: answering redeems for codes in {} (registry {})",
             id.join(crate::invite::INVITE_STORE_FILE).display(),
@@ -543,27 +1380,90 @@ pub(crate) async fn daemon_core(
                 );
             }
         });
-        tokio::spawn(crate::invite::owner_pairing_loop(
+        // Wave 27: the owner answers through the ORCHESTRATOR's owner loop
+        // (the wave-21 `invite::owner_pairing_loop` only wrote peers.book,
+        // never the pairing journal — so wave-27's admission validator,
+        // whose fact source is the journal's Applied records, would reject
+        // every scheduler-capable sender this daemon paired with). Codes
+        // created in earlier runs live in `<id-dir>/invites.store`; the
+        // orchestrator's secret slots open empty, so every LIVE persisted
+        // code is adopted back before the loop starts answering.
+        let orchestrator = ak_session::pairing::PairingOrchestrator::with_defaults(
             client,
-            key,
-            id_dir,
-            shutdown.clone(),
-            on_paired,
-        ));
+            key.clone(),
+            &id_dir,
+        )?;
+        let now_ms = crate::now_unix_ms();
+        for held in crate::invite::InviteStore::open(&id_dir).load()? {
+            if !held.live(now_ms) {
+                continue; // expired codes are not answered (same rule the
+                          // old loop applied per offer)
+            }
+            let code = held.code()?;
+            orchestrator.adopt_persisted_code(
+                &code,
+                held.code_id,
+                held.revision,
+                held.expires_ms,
+            );
+        }
+        // Codes created (or revoked) by OTHER processes while this daemon
+        // runs: a LIVE per-offer backfill over the persisted store — the
+        // same freshness semantics the wave-21 loop had. `invite create`
+        // in a second process is the normal flow (the cross-device script
+        // starts the owner daemon before creating its code).
+        {
+            let store_dir = id_dir.clone();
+            let source: ak_session::pairing::PersistedCodeSource =
+                std::sync::Arc::new(move |code_id: &[u8; 16]| {
+                    let held = crate::invite::InviteStore::open(&store_dir)
+                        .find(code_id)
+                        .ok()
+                        .flatten()?;
+                    if !held.live(crate::now_unix_ms()) {
+                        return None; // expired: not answered
+                    }
+                    let code = held.code().ok()?;
+                    Some((code, held.revision, held.expires_ms))
+                });
+            orchestrator.set_persisted_code_source(source);
+        }
+        orchestrator.spawn_owner_loop_notifying(Some(on_paired));
     }
 
-    // Wave 21: `--invite-code`: redeem at startup, pair with the owner,
-    // then keep receiving (the owner lands in peers.book, so the book
-    // policy below admits it). In wired mode the registry settings were
-    // resolved once above.
-    if let Some(code) = &opts.invite_code {
-        let settings = registry
-            .as_ref()
-            .expect("invite-code implies the wired registry settings");
-        let verified = crate::invite::redeem_and_pair(id, code, settings).await?;
-        let peer = verified.owner_fingerprint(); // the code owner is the peer
-        out.note("paired with the code owner:");
-        out.note(&crate::fingerprint_lines("owner", &peer));
+    // Wave 27: connection keeper for the SHARED registry client. The v2
+    // registry keeps one live connection per device, so any same-device
+    // process (`invite create`, a second daemon, a probe) KICKS this
+    // connection; the client surfaces Disconnected but never re-establishes
+    // on its own, which used to leave the owner loop deaf (its plane
+    // received nothing until a restart). The keeper reconnects with the
+    // client's built-in backoff; the server's Hello catch-up then re-pushes
+    // pending redeem offers onto the still-live plane subscription.
+    if let Some((_settings, _key, client)) = shared_registry.as_ref() {
+        let client = client.clone();
+        let mut shutdown_keeper = shutdown.clone();
+        tokio::spawn(async move {
+            let mut state = client.state_watcher();
+            loop {
+                tokio::select! {
+                    _ = shutdown_keeper.changed() => break,
+                    _ = state.changed() => {
+                        if matches!(
+                            *state.borrow_and_update(),
+                            ak_session::pairing::ClientState::Disconnected
+                        ) {
+                            if let Err(err) = client.reconnect().await {
+                                log::warn!("registry reconnect failed: {err}");
+                                // The watcher fires again on the next
+                                // state change; a hard failure also sets
+                                // Disconnected, so this retries with the
+                                // built-in backoff rather than spinning.
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     let port = if opts.port == 0 {
@@ -613,7 +1513,13 @@ pub(crate) async fn daemon_core(
             None,
             None,
         ));
-        let wired = start_wired_runtime(id, settings, policy, default_executor).await?;
+        let shared_client = shared_registry
+            .as_ref()
+            .expect("wired mode implies the shared registry connection")
+            .2
+            .clone();
+        let wired =
+            start_wired_runtime(shared_client, settings, policy, default_executor).await?;
         let switch = wired
             .handle
             .set_policy(policy)
@@ -672,9 +1578,32 @@ pub(crate) async fn daemon_core(
         )),
     }
 
-    // The receive kernel's rebind retry budget (the previous iteration's
-    // QUIC endpoint releases its UDP socket asynchronously after drop).
-    const MAX_REBIND_RETRIES: u32 = 50;
+    // Wave 27 wired branch: hand everything to the resident wired daemon
+    // — one bind, a concurrent accept loop (one handler per connection,
+    // real code-group scheduling, legacy compatibility) and the drain+
+    // join shutdown. This returns only at shutdown.
+    if let Some(wired) = wired_runtime {
+        let daemon = WiredDaemon {
+            wired,
+            id_dir: id.to_path_buf(),
+            config,
+            out,
+            fingerprint: fp,
+            name,
+            mdns,
+            mdns_ok,
+            candidates_json,
+            candidate_addrs,
+            shutdown,
+        };
+        return daemon.run().await;
+    }
+
+    // Direct branch (no registry/scheduler flags): the engine loop as it
+    // always ran — bind, accept ONE job at a time, run it to completion,
+    // rebind (the compatibility gate). The rebind budget covers the
+    // previous iteration's endpoint releasing its UDP socket
+    // asynchronously after drop.
     let mut rebind_retries = 0u32;
     let mut first = true;
     loop {
@@ -685,103 +1614,6 @@ pub(crate) async fn daemon_core(
         let connected_at = Arc::new(Mutex::new(None::<Instant>));
         let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-
-        // Wave 24 wired branch: the iteration runs inside the session
-        // runtime (enqueue → admission → real executor → engine).
-        if let Some(wired) = wired_runtime.as_ref() {
-            // Subscribe BEFORE the submit: a broadcast receiver only sees
-            // messages sent after it existed, and a lightning-fast task
-            // must not be able to finish before the watcher is armed.
-            let mut events = wired.handle.subscribe();
-            let (submitted, executor) = enqueue_wired_receive(wired, spec, printer, addr_tx).await;
-            let task = match submitted {
-                Ok(task) => task,
-                Err(message) => {
-                    out.event(&DaemonEvent::Error { message: &message });
-                    out.text(&format!("{message}; still listening (Ctrl-C stops)"));
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-            };
-            if first {
-                let addr = addr_rx.await.context("receiver failed to bind")?;
-                out.event(&DaemonEvent::Listening {
-                    addr: &addr.to_string(),
-                    port: addr.port(),
-                    fingerprint: &fp.to_hex(),
-                    name: &name,
-                    mdns: mdns_ok,
-                    candidates: &candidates_json,
-                });
-                out.text(&format!(
-                    "daemon listening on {addr} into {} (name {name})",
-                    config.out.display()
-                ));
-                for line in crate::address_candidates_lines(&candidate_addrs) {
-                    out.text(&line);
-                }
-                out.text(&crate::fingerprint_lines("fingerprint", &fp));
-                out.text(&format!("pairing code: {}", ak_identity::pairing_code(&fp)));
-                out.text("waiting for sender (Ctrl-C stops)...");
-                first = false;
-            } else {
-                let _ = addr_rx.await;
-            }
-            let watcher = watch_wired_task(&mut events, &executor, task);
-            tokio::pin!(watcher);
-            let outcome = tokio::select! {
-                result = &mut watcher => result,
-                _ = shutdown.changed() => {
-                    if let Some(discovery) = mdns.as_mut() {
-                        discovery.stop_advertise();
-                    }
-                    out.event(&DaemonEvent::Stopped { reason: "shutdown" });
-                    out.text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
-                    stop_wired_runtime(&wired.handle).await;
-                    return Ok(());
-                }
-            };
-            match outcome {
-                Ok(report) => {
-                    rebind_retries = 0;
-                    emit_job_done(&out, &connected_at, &report);
-                    out.text("waiting for next sender (Ctrl-C stops)...");
-                }
-                Err(JobFailure::Unauthorized) => {
-                    out.event(&DaemonEvent::Error {
-                        message: "rejected a peer outside the accept policy",
-                    });
-                    out.text(
-                        "rejected a peer outside the accept policy; still waiting (Ctrl-C stops)",
-                    );
-                }
-                Err(JobFailure::AddrInUse) if rebind_retries < MAX_REBIND_RETRIES => {
-                    rebind_retries += 1;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Err(failure) => {
-                    let message = match &failure {
-                        JobFailure::AddrInUse => {
-                            "bind failed: address already in use (retry budget exhausted)"
-                                .to_owned()
-                        }
-                        JobFailure::Other { message } => message.clone(),
-                        JobFailure::Unauthorized => {
-                            "rejected a peer outside the accept policy".to_owned()
-                        }
-                    };
-                    out.event(&DaemonEvent::Error { message: &message });
-                    out.text(&format!(
-                        "job failed: {message}; still listening (Ctrl-C stops)"
-                    ));
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-            continue;
-        }
-
-        // Direct branch (no registry/scheduler flags): the engine loop as
-        // it always ran.
         let receiver =
             tokio::spawn(
                 async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
@@ -856,16 +1688,13 @@ pub(crate) async fn daemon_core(
             Err(join) => bail!("receiver task failed: {join}"),
         }
     }
-    if let Some(wired) = &wired_runtime {
-        stop_wired_runtime(&wired.handle).await;
-    }
     Ok(())
 }
 
-/// Emit the job-done NDJSON event / text summary shared by both loop
-/// branches. Duration spans `job_started` (handshake) to completion; if
-/// no `Connected` event was seen, the engine's own report duration is
-/// used.
+/// Emit the job-done NDJSON event / text summary shared by both receive
+/// paths (the wired connection handlers and the direct loop). Duration
+/// spans `job_started` (handshake) to completion; if no `Connected` event
+/// was seen, the engine's own report duration is used.
 fn emit_job_done(out: &DaemonOut, connected_at: &Arc<Mutex<Option<Instant>>>, report: &Report) {
     if out.json_lines {
         let started = connected_at
@@ -1344,8 +2173,12 @@ mod tests {
             None,
             None,
         );
+        let (key, _) = crate::load_identity(&dir).unwrap();
+        let client = crate::invite::connect_registry(&registry.settings, &key)
+            .await
+            .unwrap();
         let wired = start_wired_runtime(
-            &dir,
+            client,
             &registry.settings,
             scheduler_policy_from_flags(Some("parallel"), Some("serial")).unwrap(),
             Arc::new(default_executor),
@@ -1391,8 +2224,12 @@ mod tests {
             None,
             None,
         );
+        let (key, _) = crate::load_identity(&dir).unwrap();
+        let client = crate::invite::connect_registry(&registry.settings, &key)
+            .await
+            .unwrap();
         let wired = start_wired_runtime(
-            &dir,
+            client,
             &registry.settings,
             scheduler_policy_from_flags(Some("parallel"), None).unwrap(),
             Arc::new(default_executor),
@@ -1474,6 +2311,690 @@ mod tests {
 
         stop_wired_runtime(&wired.handle).await;
         registry.stop().await;
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 27: concurrent wired receive — real code groups, real policy
+    // (final-review P1-02). The fixtures below drive the REAL wired
+    // machinery: a real v2 registry, the daemon identity as the code
+    // owner (its `owner_pairing_loop` answers every redeem, so the
+    // daemon's pairing journal holds the Ready relations the senders'
+    // `TaskOpen`s claim), the real wired session runtime with the policy
+    // under test, the real admission validator, and the real per-
+    // connection handler on a loopback `DirectEndpoint`. Senders are real
+    // `send_on_channel` scheduler senders; concurrency is proven by task
+    // activity intervals (contract §12), observed on the sender as
+    // `Offered` (fires strictly after the receiver granted admission —
+    // the TaskOpen handshake blocks until then) to `Done` (final ack).
+    // ------------------------------------------------------------------
+
+    /// The sender-side activity window of one scheduler task.
+    #[derive(Clone, Copy, Debug)]
+    struct SenderInterval {
+        offered: Instant,
+        done: Instant,
+    }
+
+    /// Shared slots a spawned sender's progress callback fills.
+    #[derive(Clone, Default)]
+    struct IntervalWatch {
+        offered: Arc<Mutex<Option<Instant>>>,
+        done: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl IntervalWatch {
+        /// Block until the sender's `Offered` arrives (it was admitted).
+        async fn wait_offered(&self, deadline: Instant) -> Instant {
+            loop {
+                if let Some(at) = *self.offered.lock().unwrap() {
+                    return at;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the sender was never admitted (no Offered progress)"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// The completed interval (both ends observed).
+        fn interval(&self) -> SenderInterval {
+            SenderInterval {
+                offered: self.offered.lock().unwrap().expect("offered observed"),
+                done: self.done.lock().unwrap().expect("done observed"),
+            }
+        }
+    }
+
+    /// Everything one wired-concurrency test needs, on real planes.
+    struct WiredScaffold {
+        tmp: tempfile::TempDir,
+        registry: TestRegistry,
+        daemon_fp: ak_identity::Fingerprint,
+        daemon_bundle: ak_identity::tls::TlsBundle,
+        out_dir: PathBuf,
+        handle: ak_session::runtime::SessionHandle,
+        registry_id: [u8; 32],
+        validator: Arc<ak_session::runtime::admission::AdmissionValidator>,
+        template: WiredJobTemplate,
+    }
+
+    impl WiredScaffold {
+        /// Deterministic teardown of every resident piece.
+        async fn teardown(self) {
+            stop_wired_runtime(&self.handle).await;
+            self.registry.stop().await;
+        }
+    }
+
+    /// The pairing phase of a wired test: the registry, the daemon
+    /// identity and the daemon-owned codes, with the ORCHESTRATOR owner
+    /// loop answering redeems (the journal-writing path — the daemon's
+    /// pairing journal is exactly what `AdmissionValidator::resolve`
+    /// checks, and `crate::invite::owner_pairing_loop` only writes
+    /// `peers.book`).
+    ///
+    /// Phase discipline (the v2 registry keeps ONE live connection per
+    /// device — a newer Hello replaces the previous): this phase owns the
+    /// daemon's single registry connection; [`WiredPairing::start_runtime`]
+    /// releases it and only then starts the wired runtime.
+    struct WiredPairing {
+        tmp: tempfile::TempDir,
+        registry: TestRegistry,
+        daemon_dir: PathBuf,
+        daemon_bundle: ak_identity::tls::TlsBundle,
+        daemon_fp: ak_identity::Fingerprint,
+        out_dir: PathBuf,
+        codes: Vec<([u8; 16], String)>,
+        _orchestrator: ak_session::pairing::PairingOrchestrator,
+        _client: ak_session::pairing::RegistryClient,
+        owner_loop: tokio::task::JoinHandle<()>,
+    }
+
+    /// Registry + daemon identity + `codes` fresh codes + the owner loop
+    /// answering (phase 1).
+    async fn wired_pairing_setup(codes: usize) -> WiredPairing {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .is_test(true)
+            .try_init();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = tmp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let registry = TestRegistry::start(tmp.path()).await;
+
+        let (daemon_key, daemon_bundle) = crate::load_identity(&daemon_dir).unwrap();
+        let daemon_fp = daemon_key.fingerprint();
+        let client = crate::invite::connect_registry(&registry.settings, &daemon_key)
+            .await
+            .expect("daemon registry client");
+        let orchestrator = ak_session::pairing::PairingOrchestrator::with_defaults(
+            client.clone(),
+            daemon_key.clone(),
+            &daemon_dir,
+        )
+        .expect("the owner orchestrator opens");
+        let mut created = Vec::new();
+        for _ in 0..codes {
+            let invite = orchestrator
+                .create_invite(600)
+                .await
+                .expect("invite create");
+            created.push((invite.code_id, invite.display.clone()));
+        }
+        let owner_loop = orchestrator.spawn_owner_loop();
+        WiredPairing {
+            tmp,
+            registry,
+            daemon_dir,
+            daemon_bundle,
+            daemon_fp,
+            out_dir,
+            codes: created,
+            _orchestrator: orchestrator,
+            _client: client,
+            owner_loop,
+        }
+    }
+
+    impl WiredPairing {
+        /// Phase 2: the pairings are done — stop the owner loop, release
+        /// the daemon's registry connection and start the wired runtime
+        /// (its transport takes the device's single connection slot), the
+        /// admission validator and the per-connection job template.
+        async fn start_runtime(
+            self,
+            policy: ak_session::runtime::SchedulerPolicy,
+        ) -> WiredScaffold {
+            self.owner_loop.abort();
+            let default_executor = ak_session::runtime::RealTransferExecutor::receive(
+                loopback_receive_spec(&self.tmp.path().join("unused-out"), throwaway_identity()),
+                None,
+                None,
+            );
+            let (key, _) = crate::load_identity(&self.daemon_dir).unwrap();
+            let client = crate::invite::connect_registry(&self.registry.settings, &key)
+                .await
+                .unwrap();
+            let wired = start_wired_runtime(
+                client,
+                &self.registry.settings,
+                policy,
+                Arc::new(default_executor),
+            )
+            .await
+            .expect("wired runtime starts");
+            let validator = Arc::new(
+                ak_session::runtime::admission::AdmissionValidator::open(
+                    &self.daemon_dir,
+                    ak_session::runtime::RegistryId::from_bytes(self.registry.settings.registry_id),
+                )
+                .expect("validator opens over the daemon journal"),
+            );
+            let template = WiredJobTemplate::of(&ReceiveLoopConfig::resolve(
+                &self.daemon_dir,
+                self.out_dir.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                Some("any"),
+                "error",
+                false,
+                30,
+                "wired-test".to_owned(),
+            )
+            .expect("template config resolves"));
+            WiredScaffold {
+                registry_id: wired.registry_id,
+                handle: wired.handle,
+                tmp: self.tmp,
+                registry: self.registry,
+                daemon_fp: self.daemon_fp,
+                daemon_bundle: self.daemon_bundle,
+                out_dir: self.out_dir,
+                validator,
+                template,
+            }
+        }
+    }
+
+    /// One payload directory with a single deterministic file of `size`
+    /// bytes (the engine sends directories).
+    fn payload_dir(root: &Path, name: &str, size: usize) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join(format!("{name}.bin")), &payload).unwrap();
+        dir
+    }
+
+    /// Redeem one invite code from a fresh sender identity, returning the
+    /// sender's directory and the pairing id of its Ready relation.
+    async fn redeem_sender(
+        root: &Path,
+        settings: &crate::invite::RegistrySettings,
+        name: &str,
+        code_display: &str,
+    ) -> (PathBuf, [u8; 16]) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let verified = crate::invite::redeem_and_pair(&dir, code_display, settings)
+            .await
+            .expect("sender redeems the code");
+        (dir, verified.pairing_id())
+    }
+
+    /// The wired accept loop in miniature: accept `connections`
+    /// connections, one real handler task each (the same
+    /// `wired_connection_handler` the daemon spawns).
+    fn spawn_wired_acceptor(
+        endpoint: ak_net::DirectEndpoint,
+        handle: ak_session::runtime::SessionHandle,
+        validator: Arc<ak_session::runtime::admission::AdmissionValidator>,
+        template: WiredJobTemplate,
+        registry_id: [u8; 32],
+        connections: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // The shutdown flag lives as long as the acceptor; every
+            // handler holds a receiver clone.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            for _ in 0..connections {
+                if let Ok(channel) = endpoint
+                    .accept(&|_: &ak_identity::Fingerprint| true)
+                    .await
+                {
+                    tokio::spawn(wired_connection_handler(WiredConnection {
+                        handle: handle.clone(),
+                        validator: Arc::clone(&validator),
+                        template: template.clone(),
+                        out: DaemonOut::new(false),
+                        registry_id,
+                        shutdown: shutdown_rx.clone(),
+                        channel,
+                    }));
+                }
+            }
+            // The endpoint and the shutdown flag must outlive every
+            // accepted connection (the real daemon keeps both for its
+            // whole life — dropping the watch sender would fire every
+            // handler's shutdown arm and close its channel): park until
+            // the test runtime goes away.
+            let _keep_alive = (shutdown_tx, endpoint);
+            std::future::pending::<()>().await;
+        })
+    }
+
+    /// A real scheduler sender: fresh identity, connect, `TaskOpen`
+    /// carrying the relation's code group (frozen 32-byte wire form) and
+    /// pairing id, then the real on-channel send. `Offered`/`Done`
+    /// progress lands in the returned watch (the admitted interval).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_scheduler_sender(
+        settings: &crate::invite::RegistrySettings,
+        daemon_addr: SocketAddr,
+        daemon_fp: &ak_identity::Fingerprint,
+        sender_dir: &Path,
+        src: &Path,
+        code_id: [u8; 16],
+        pairing_id: [u8; 16],
+    ) -> (
+        tokio::task::JoinHandle<Result<ak_engine::Report, ak_engine::EngineError>>,
+        IntervalWatch,
+    ) {
+        let watch = IntervalWatch::default();
+        let progress_watch = watch.clone();
+        let settings = *settings;
+        let daemon_fp = *daemon_fp;
+        let sender_dir = sender_dir.to_path_buf();
+        let src = src.to_path_buf();
+        let join = tokio::spawn(async move {
+            let (key, _) = crate::load_identity(&sender_dir).unwrap();
+            let identity = ak_identity::tls::make_self_signed(&key);
+            let endpoint = ak_net::DirectEndpoint::bind(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                &identity,
+            )
+            .await
+            .unwrap();
+            let channel = endpoint
+                .connect(daemon_addr, &daemon_fp)
+                .await
+                .expect("the scheduler sender connects");
+            // Distinct non-zero task/permit ids derived from the relation
+            // (two senders of one code must not collide on the wire ids).
+            let mut job_id = pairing_id;
+            job_id[0] ^= 0x5a;
+            let mut permit_id = pairing_id;
+            permit_id[1] ^= 0xa5;
+            let ctx = ak_engine::AdmissionCtx::new(
+                job_id,
+                permit_id,
+                ak_session::runtime::admission::code_group_wire_form(&code_id),
+                settings.registry_id,
+                pairing_id,
+            )
+            .expect("a structurally valid admission context");
+            let mut spec = ak_engine::SendSpec::new(src, daemon_addr, daemon_fp, identity);
+            spec.idle_timeout = Duration::from_secs(30);
+            ak_engine::send_on_channel(channel, spec, ctx, &move |progress| {
+                match progress {
+                    ak_engine::Progress::Offered { .. } => {
+                        *progress_watch.offered.lock().unwrap() = Some(Instant::now());
+                    }
+                    ak_engine::Progress::Done => {
+                        *progress_watch.done.lock().unwrap() = Some(Instant::now());
+                    }
+                    _ => {}
+                }
+            })
+            .await
+        });
+        (join, watch)
+    }
+
+    /// Bind the scaffold's daemon endpoint and start the acceptor for
+    /// `connections` handlers; returns the dialable address.
+    async fn wired_listener(
+        scaffold: &WiredScaffold,
+        connections: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let endpoint = ak_net::DirectEndpoint::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            &scaffold.daemon_bundle,
+        )
+        .await
+        .expect("the daemon endpoint binds");
+        let addr = endpoint.local_addr().unwrap();
+        let acceptor = spawn_wired_acceptor(
+            endpoint,
+            scaffold.handle.clone(),
+            Arc::clone(&scaffold.validator),
+            scaffold.template.clone(),
+            scaffold.registry_id,
+            connections,
+        );
+        (addr, acceptor)
+    }
+
+    /// Await one spawned sender to a successful report (bounded).
+    async fn await_sender(
+        join: tokio::task::JoinHandle<Result<ak_engine::Report, ak_engine::EngineError>>,
+        label: &str,
+    ) -> ak_engine::Report {
+        tokio::time::timeout(Duration::from_secs(60), join)
+            .await
+            .expect("the send finishes")
+            .expect("the sender task joins")
+            .unwrap_or_else(|err| panic!("{label} send failed: {err:?}"))
+    }
+
+    /// Default policy (same-code serial, cross-code parallel): two
+    /// scheduler senders of ONE code; the second is only admitted after
+    /// the first finished — their admitted intervals never overlap
+    /// (contract §2/§12, the P1-02 core case).
+    #[tokio::test]
+    async fn wired_same_code_tasks_never_overlap_by_default() {
+        let pairing = wired_pairing_setup(1).await;
+        let (code_id, code_display) = pairing.codes[0].clone();
+        let (dir_a, pair_a) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-a",
+            &code_display,
+        )
+        .await;
+        let (dir_b, pair_b) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-b",
+            &code_display,
+        )
+        .await;
+        let scaffold = pairing
+            .start_runtime(scheduler_policy_from_flags(None, None).unwrap())
+            .await;
+
+        let (addr, _acceptor) = wired_listener(&scaffold, 2).await;
+        let src_a = payload_dir(scaffold.tmp.path(), "src-a", 6 * 1024 * 1024);
+        let src_b = payload_dir(scaffold.tmp.path(), "src-b", 1024 * 1024);
+        let (join_a, watch_a) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_a,
+            &src_a,
+            code_id,
+            pair_a,
+        );
+        // The first task is admitted and transferring before the second
+        // even connects (contract §12: the interval evidence must come
+        // from real sequencing, not accidental starts).
+        watch_a
+            .wait_offered(Instant::now() + Duration::from_secs(30))
+            .await;
+        let (join_b, watch_b) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_b,
+            &src_b,
+            code_id,
+            pair_b,
+        );
+        let report_a = await_sender(join_a, "first").await;
+        let report_b = await_sender(join_b, "second").await;
+        assert_eq!(report_a.files, 1);
+        assert_eq!(report_b.files, 1);
+
+        let first = watch_a.interval();
+        let second = watch_b.interval();
+        assert!(
+            second.offered >= first.done,
+            "same-code tasks overlapped under the default serial policy: \
+             first {first:?}, second {second:?}"
+        );
+        assert!(
+            scaffold.out_dir.join("src-a.bin").exists()
+                && scaffold.out_dir.join("src-b.bin").exists(),
+            "both payloads must land"
+        );
+        scaffold.teardown().await;
+    }
+
+    /// Default policy: two senders of TWO DIFFERENT codes run
+    /// concurrently — the second is admitted while the first still
+    /// transfers (overlapping intervals).
+    #[tokio::test]
+    async fn wired_cross_code_tasks_overlap_by_default() {
+        let pairing = wired_pairing_setup(2).await;
+        let (code_a, display_a) = pairing.codes[0].clone();
+        let (code_b, display_b) = pairing.codes[1].clone();
+        let (dir_a, pair_a) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-a",
+            &display_a,
+        )
+        .await;
+        let (dir_b, pair_b) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-b",
+            &display_b,
+        )
+        .await;
+        let scaffold = pairing
+            .start_runtime(scheduler_policy_from_flags(None, None).unwrap())
+            .await;
+
+        let (addr, _acceptor) = wired_listener(&scaffold, 2).await;
+        let src_a = payload_dir(scaffold.tmp.path(), "src-a", 16 * 1024 * 1024);
+        let src_b = payload_dir(scaffold.tmp.path(), "src-b", 256 * 1024);
+        let (join_a, watch_a) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_a,
+            &src_a,
+            code_a,
+            pair_a,
+        );
+        watch_a
+            .wait_offered(Instant::now() + Duration::from_secs(30))
+            .await;
+        let (join_b, watch_b) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_b,
+            &src_b,
+            code_b,
+            pair_b,
+        );
+        let report_a = await_sender(join_a, "first-code").await;
+        let report_b = await_sender(join_b, "second-code").await;
+        assert_eq!(report_a.files, 1);
+        assert_eq!(report_b.files, 1);
+
+        let first = watch_a.interval();
+        let second = watch_b.interval();
+        assert!(
+            second.offered < first.done,
+            "cross-code tasks did not overlap under the default parallel \
+             policy: first {first:?}, second {second:?}"
+        );
+        assert!(
+            scaffold.out_dir.join("src-a.bin").exists()
+                && scaffold.out_dir.join("src-b.bin").exists(),
+            "both payloads must land"
+        );
+        scaffold.teardown().await;
+    }
+
+    /// The `--same-code parallel` flag reaches the REAL group keys: the
+    /// same one-code setup as the serial test, but the policy admits both
+    /// at once (overlapping intervals) — the four-mode matrix on the real
+    /// path, not just in the scheduler model.
+    #[tokio::test]
+    async fn wired_same_code_parallel_flag_overlaps_real_groups() {
+        let pairing = wired_pairing_setup(1).await;
+        let (code_id, code_display) = pairing.codes[0].clone();
+        let (dir_a, pair_a) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-a",
+            &code_display,
+        )
+        .await;
+        let (dir_b, pair_b) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-b",
+            &code_display,
+        )
+        .await;
+        let scaffold = pairing
+            .start_runtime(scheduler_policy_from_flags(Some("parallel"), None).unwrap())
+            .await;
+
+        let (addr, _acceptor) = wired_listener(&scaffold, 2).await;
+        let src_a = payload_dir(scaffold.tmp.path(), "src-a", 16 * 1024 * 1024);
+        let src_b = payload_dir(scaffold.tmp.path(), "src-b", 256 * 1024);
+        let (join_a, watch_a) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_a,
+            &src_a,
+            code_id,
+            pair_a,
+        );
+        watch_a
+            .wait_offered(Instant::now() + Duration::from_secs(30))
+            .await;
+        let (join_b, watch_b) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &dir_b,
+            &src_b,
+            code_id,
+            pair_b,
+        );
+        let report_a = await_sender(join_a, "parallel-first").await;
+        let report_b = await_sender(join_b, "parallel-second").await;
+        assert_eq!(report_a.files, 1);
+        assert_eq!(report_b.files, 1);
+
+        let first = watch_a.interval();
+        let second = watch_b.interval();
+        assert!(
+            second.offered < first.done,
+            "--same-code parallel did not overlap the real code group: \
+             first {first:?}, second {second:?}"
+        );
+        scaffold.teardown().await;
+    }
+
+    /// A scheduler sender whose `TaskOpen` claims a relation the daemon
+    /// never stored is refused (contract §6: no self-reported `code_id`
+    /// into a queue): its connection dies, and the daemon machinery
+    /// serves the very next (legitimate) sender unchanged.
+    #[tokio::test]
+    async fn wired_admission_rejection_closes_the_connection_and_daemon_survives() {
+        let pairing = wired_pairing_setup(1).await;
+        let (code_id, code_display) = pairing.codes[0].clone();
+        let (good_dir, good_pair) = redeem_sender(
+            pairing.tmp.path(),
+            &pairing.registry.settings,
+            "sender-good",
+            &code_display,
+        )
+        .await;
+        let scaffold = pairing
+            .start_runtime(scheduler_policy_from_flags(None, None).unwrap())
+            .await;
+
+        let (addr, _acceptor) = wired_listener(&scaffold, 2).await;
+        // The attacker: a well-formed TaskOpen of the SAME code group but
+        // a pairing id no local relation backs.
+        let bad_dir = scaffold.tmp.path().join("sender-bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let src_bad = payload_dir(scaffold.tmp.path(), "src-bad", 64 * 1024);
+        let (bad_join, _bad_watch) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &bad_dir,
+            &src_bad,
+            code_id,
+            [0x99; 16],
+        );
+        let bad = tokio::time::timeout(Duration::from_secs(30), bad_join)
+            .await
+            .expect("the refused sender settles")
+            .expect("join")
+            .expect_err("the unbacked claim must be refused");
+        assert!(
+            !scaffold.out_dir.join("src-bad.bin").exists(),
+            "nothing may land from the refused task (error {bad:?})"
+        );
+
+        // The daemon lives: the legitimate relation completes through the
+        // same handler machinery.
+        let src_good = payload_dir(scaffold.tmp.path(), "src-good", 256 * 1024);
+        let (good_join, _good_watch) = spawn_scheduler_sender(
+            &scaffold.registry.settings,
+            addr,
+            &scaffold.daemon_fp,
+            &good_dir,
+            &src_good,
+            code_id,
+            good_pair,
+        );
+        let report = await_sender(good_join, "good-after-reject").await;
+        assert_eq!(report.files, 1);
+        assert!(
+            scaffold.out_dir.join("src-good.bin").exists(),
+            "the legitimate payload lands after the rejection"
+        );
+        scaffold.teardown().await;
+    }
+
+    /// A pure LEGACY peer (no `CAP_SCHEDULER`, no `TaskOpen` — the frozen
+    /// `send` kernel, i.e. the pre-wave-27 `send --fp`) completes one
+    /// receive through the wired daemon's compatibility path (the
+    /// anonymous legacy group + the frozen single-job body on the same
+    /// channel).
+    #[tokio::test]
+    async fn wired_legacy_peer_still_completes_one_receive() {
+        let pairing = wired_pairing_setup(0).await;
+        let scaffold = pairing
+            .start_runtime(scheduler_policy_from_flags(None, None).unwrap())
+            .await;
+        let (addr, _acceptor) = wired_listener(&scaffold, 1).await;
+
+        let sender_dir = scaffold.tmp.path().join("legacy-sender");
+        std::fs::create_dir_all(&sender_dir).unwrap();
+        let (_, identity) = crate::load_identity(&sender_dir).unwrap();
+        let src = payload_dir(scaffold.tmp.path(), "src-legacy", 512 * 1024);
+        let mut spec = ak_engine::SendSpec::new(src, addr, scaffold.daemon_fp, identity);
+        spec.idle_timeout = Duration::from_secs(30);
+        let report = tokio::time::timeout(
+            Duration::from_secs(60),
+            ak_engine::send(spec, &|_| {}),
+        )
+        .await
+        .expect("the legacy send settles")
+        .expect("the legacy send succeeds");
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, 512 * 1024_u64);
+        assert!(
+            scaffold.out_dir.join("src-legacy.bin").exists(),
+            "the legacy payload lands through the wired compatibility path"
+        );
+        scaffold.teardown().await;
     }
 
     /// A real v2 test registry (TLS + SQLite) shared by the wired tests.
@@ -1572,40 +3093,62 @@ mod tests {
             registry_id: registry_key.public_key(),
         };
 
-        // 2. `invite create` on the owner side.
-        let first =
-            crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
-                .await
-                .expect("invite create");
-        assert!(first.display.starts_with("AKI1-"), "{}", first.display);
-        assert_eq!(
-            crate::invite::InviteStore::open(&dir_a)
-                .load()
-                .unwrap()
-                .len(),
-            1,
-            "the bearer secret persists for the owner loop"
-        );
-
-        // 3. Owner pairing answer online (`daemon --pairing` core).
+        // 2. `invite create` on the owner side — both codes of this
+        //    journey up front, created through the ORCHESTRATOR (wave 27):
+        //    its resident owner loop answers redeems through the
+        //    journal-writing path, so the owner side ends up holding the
+        //    Ready pairing relation the later scheduler send claims (the
+        //    `invite.rs` answer loop only writes peers.book). The bearer
+        //    secrets persist exactly like the CLI wrapper does.
+        let registry_fp_hex: String = registry_key
+            .public_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let (key_a, _) = crate::load_identity(&dir_a).unwrap();
         let client_a = crate::invite::connect_registry(&settings, &key_a)
             .await
             .expect("owner registry client");
-        let (owner_stop, owner_stop_rx) = tokio::sync::watch::channel(false);
-        let paired: Arc<Mutex<Vec<ak_identity::Fingerprint>>> = Arc::new(Mutex::new(Vec::new()));
-        let paired_seen = Arc::clone(&paired);
-        let on_paired = std::sync::Arc::new(move |peer: ak_identity::Fingerprint| {
-            paired_seen.lock().unwrap().push(peer);
-        });
-        let owner_dir = dir_a.clone();
-        let owner_loop = tokio::spawn(crate::invite::owner_pairing_loop(
-            client_a,
+        let orchestrator_a = ak_session::pairing::PairingOrchestrator::with_defaults(
+            client_a.clone(),
             key_a.clone(),
-            owner_dir,
-            owner_stop_rx,
-            on_paired,
-        ));
+            &dir_a,
+        )
+        .expect("the owner orchestrator opens");
+        let invite_store = crate::invite::InviteStore::open(&dir_a);
+        let mut invites = Vec::new();
+        for _ in 0..2 {
+            let created = orchestrator_a
+                .create_invite(600)
+                .await
+                .expect("invite create");
+            invite_store
+                .add(&crate::invite::StoredInvite {
+                    code_id: created.code_id,
+                    expires_ms: created.expires_ms,
+                    revision: created.revision,
+                    display: created.display.clone(),
+                })
+                .expect("the bearer secret persists");
+            invites.push(created);
+        }
+        let first = &invites[0];
+        let second = &invites[1];
+        assert!(first.display.starts_with("AKI1-"), "{}", first.display);
+        assert_eq!(
+            invite_store.load().unwrap().len(),
+            2,
+            "the bearer secrets persist for the owner loop"
+        );
+
+        // 3. Owner pairing answer online (the orchestrator's resident
+        // owner loop; the registry keeps one live connection per device,
+        // so this client is the owner's single connection).
+        let owner_loop = orchestrator_a.spawn_owner_loop();
+        // The owner's registry pin (what the scheduler send's admission
+        // context reads its `group_registry` from).
+        crate::invite::resolve_registry(&dir_a, Some(registry_addr), Some(registry_fp_hex.clone()))
+            .expect("persist the owner's registry pin");
 
         // 4. Redeem on the other side: peers.book records both directions.
         let verified = crate::invite::redeem_and_pair(&dir_b, &first.display, &settings)
@@ -1625,26 +3168,19 @@ mod tests {
             book_b.contains(&fp_a.to_hex()),
             "redeemer book records owner: {book_b}"
         );
+        let first_relation = crate::ready_relation_for(&dir_a, &fp_b)
+            .expect("relation lookup")
+            .expect("the owner observed the pairing (journal Applied)");
         assert_eq!(
-            *paired.lock().unwrap(),
-            vec![fp_b],
-            "owner observed the pairing"
+            first_relation.code_id, first.code_id,
+            "the first relation belongs to the first code"
         );
 
         // 5. `daemon --invite-code` on a SECOND code of the same owner:
         // redeem at startup, then resident receive.
-        let second =
-            crate::invite::invite_create(&dir_a, crate::invite::TtlChoice::Secs(600), &settings)
-                .await
-                .expect("second invite");
         let out_b = tmp.path().join("out-b");
         std::fs::create_dir_all(&out_b).unwrap();
         let daemon_port = pick_free_port().unwrap();
-        let registry_fp_hex: String = registry_key
-            .public_key()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
         let daemon_opts = DaemonOptions {
             out: out_b.clone(),
             port: daemon_port,
@@ -1658,7 +3194,7 @@ mod tests {
             same_code: Some("parallel".into()),
             cross_code: Some("serial".into()),
             server: Some(registry_addr),
-            registry_fp: Some(registry_fp_hex),
+            registry_fp: Some(registry_fp_hex.clone()),
         };
         let (daemon_stop, daemon_stop_rx) = tokio::sync::watch::channel(false);
         let daemon_dir = dir_b.clone();
@@ -1667,38 +3203,53 @@ mod tests {
                 async move { daemon_core(&daemon_dir, daemon_opts, daemon_stop_rx).await },
             );
 
-        // 6. Wait for the second pairing (owner side observes it), then
-        // send one real file into the daemon's listener.
+        // 6. Wait for the second pairing (the owner's journal reaches
+        // Applied for the second code), then send one real file into the
+        // daemon's listener.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while paired.lock().unwrap().len() < 2 {
+        let relation = loop {
+            if let Ok(Some(relation)) = crate::ready_relation_for(&dir_a, &fp_b) {
+                if relation.code_id == second.code_id {
+                    break relation;
+                }
+            }
             assert!(
                 Instant::now() < deadline,
                 "second pairing never completed (daemon finished early: {})",
                 daemon.is_finished()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        };
         tokio::time::sleep(Duration::from_millis(500)).await; // bind settles
+
+        // Wave 27: the send rides the SCHEDULER admission path (the
+        // equivalent migration of the legacy one-shot send): the owner
+        // side holds a Ready relation for the daemon from the second
+        // redeem, so the real `send_on_channel` TaskOpen reaches the
+        // daemon's new accept loop, gets validated against the daemon's
+        // journal and runs under the real code group.
 
         let src = tmp.path().join("smoke-src");
         std::fs::create_dir_all(&src).unwrap();
         let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i % 253) as u8).collect();
         std::fs::write(src.join("journey.bin"), &payload).unwrap();
-        let identity_a =
-            ak_identity::tls::make_self_signed(&crate::load_identity(&dir_a).unwrap().0);
-        let mut send_spec = ak_engine::SendSpec::new(
-            src.clone(),
-            SocketAddr::from(([127, 0, 0, 1], daemon_port)),
-            fp_b,
-            identity_a,
-        );
-        send_spec.checkpoint_dir = tmp.path().join("checkpoints-a");
-        send_spec.idle_timeout = Duration::from_secs(10);
 
         let report = loop {
-            match ak_engine::send(send_spec.clone(), &|_| {}).await {
-                Ok(report) => break report,
-                Err(ak_engine::EngineError::Connect(_)) => {
+            let (join, _watch) = spawn_scheduler_sender(
+                &settings,
+                SocketAddr::from(([127, 0, 0, 1], daemon_port)),
+                &fp_b,
+                &dir_a,
+                &src,
+                relation.code_id,
+                relation.pairing_id,
+            );
+            match tokio::time::timeout(Duration::from_secs(30), join)
+                .await
+                .expect("the sender joins")
+            {
+                Ok(Ok(report)) => break report,
+                Ok(Err(ak_engine::EngineError::Connect(_))) => {
                     // The daemon is still redeeming/binding; retry briefly.
                     assert!(
                         Instant::now() < deadline,
@@ -1706,7 +3257,8 @@ mod tests {
                     );
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
-                Err(other) => panic!("send failed: {other:?}"),
+                Ok(Err(other)) => panic!("scheduler send failed: {other:?}"),
+                Err(join) => panic!("sender task failed: {join}"),
             }
         };
         assert_eq!(report.files, 1);
@@ -1720,7 +3272,6 @@ mod tests {
         // 7. Deterministic shutdown of every resident piece.
         let _ = daemon_stop.send(true);
         daemon.await.unwrap().expect("daemon exits cleanly");
-        let _ = owner_stop.send(true);
         owner_loop.abort();
         let _ = registry_stop.send(true);
     }

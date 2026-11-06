@@ -2643,6 +2643,12 @@ struct AttemptFailure {
     /// True when the engine had already reported `Connected`: a
     /// transfer-phase failure another address cannot fix.
     after_connect: bool,
+    /// Send-path hint that overrides [`errors::friendly_send_hint`] for
+    /// this failure (wave 27: the scheduler-admission BUSY copy). `None`
+    /// everywhere except an admission denial. Boxed to keep the struct
+    /// under the `result_large_err` budget (the hint exists on exactly
+    /// one failure shape; the indirection is free where it is absent).
+    hint: Option<Box<str>>,
 }
 
 impl AttemptFailure {
@@ -2656,6 +2662,7 @@ impl AttemptFailure {
             ),
             err: EngineError::IdleTimeout(SEND_CONNECT_TIMEOUT),
             after_connect: false,
+            hint: None,
         }
     }
 
@@ -2791,6 +2798,14 @@ where
 /// outlives 3 seconds). Phase marks are set from the progress callback,
 /// which the engine invokes synchronously inside the polled future, so
 /// there is no cross-task race.
+///
+/// `AttemptFailure` carries the original `EngineError` (and, since wave
+/// 27, the admission BUSY hint) so the aggregate error keeps the full
+/// chain; at 128 bytes it sits exactly on clippy's `result_large_err`
+/// budget. Boxing the error would hide the concrete variant behind a
+/// deref at every match site, so the shape is kept and the lint allowed
+/// here (single site; the struct never nests).
+#[allow(clippy::result_large_err)]
 async fn attempt_send_to(
     spec: SendSpec,
     printer: &(dyn Fn(Progress) + Send + Sync),
@@ -2817,6 +2832,7 @@ async fn attempt_send_to(
         reason: one_line_reason(&err),
         err,
         after_connect,
+        hint: None,
     })
 }
 
@@ -2890,7 +2906,13 @@ fn send_failures_error(failures: Vec<AttemptFailure>, targets: &[SocketAddr]) ->
     let last = failures
         .pop()
         .expect("run_send_fallback returns at least one failure");
-    let hint = errors::friendly_send_hint(&last.err);
+    // Wave 27: an admission-denial failure carries its own BUSY/retry copy
+    // (scheduler.md §7); every other failure keeps the generic mapping.
+    let hint = last
+        .hint
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| errors::friendly_send_hint(&last.err));
     let base = anyhow::Error::from(last.err);
     if targets.len() == 1 {
         // Single address: byte-for-byte the classic error path.
@@ -2926,6 +2948,289 @@ fn send_failures_error(failures: Vec<AttemptFailure>, targets: &[SocketAddr]) ->
         message.push_str(&format!("\n{hint}"));
     }
     base.context(message)
+}
+
+// ---------------------------------------------------------------------------
+// send: scheduler admission over a Ready pairing relation (wave 27, P1-02)
+// ---------------------------------------------------------------------------
+
+/// One Ready pairing relation of this identity directory that matches the
+/// pinned send target — the facts the scheduler admission context needs
+/// (scheduler.md §6): which code group the task runs under and which
+/// pairing relation selected the peer.
+///
+/// Source of truth (read-only, CLI side):
+///
+/// * the relation itself — the `ak-store` pairing journal
+///   (`<id-dir>/pairing/<pairing hex>.akpair`, written by the wave-21/22
+///   pairing flows): `phase applied` marks the relation whose `PairReady`
+///   completed and whose entry landed in `peers.book` (the journal's
+///   `applied` IS the local Ready mark — see
+///   [`ak_session::pairing::PairingOrchestrator::finish_committed`]);
+///   the record's `peer_public_key` is the peer device's Ed25519 key,
+///   whose `Fingerprint::from_public_key` equals the TLS fingerprint the
+///   send pins;
+/// * the registry half — `<id-dir>/registry.pin` (`AKREG1 <addr> <64hex>`):
+///   the pinned registry id is exactly `TaskOpen.group_registry` (the
+///   registry certificate key IS the registry id, see
+///   `ak_session::pairing::client`).
+///
+/// A relation without a usable registry pin cannot form a valid
+/// `AdmissionCtx` (`group_registry` must name the real registry), so the
+/// lookup returns `None` and the send keeps the legacy protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadyRelation {
+    /// `TaskOpen.pairing_id`: the pairing transaction that produced the
+    /// relation (one code may be redeemed by several devices — the task
+    /// must name which relation it runs on, scheduler.md §2).
+    pairing_id: [u8; 16],
+    /// The invite code identity of the relation (`code_id[16]`); travels
+    /// as `TaskOpen.group` through the frozen 32-byte wire form
+    /// [`ak_session::runtime::code_group_wire_form`] (BLAKE3 of the 16
+    /// code bytes — the wave-27 convention shared with the receiving
+    /// daemon's [`ak_session::runtime::AdmissionValidator`]).
+    code_id: [u8; 16],
+    /// `TaskOpen.group_registry`: the pinned registry identity.
+    registry_id: [u8; 32],
+}
+
+/// The registry identity pinned under `id` (`registry.pin`), when one
+/// exists. Absent file → `None` (this device never talked to a registry,
+/// so no admission context is possible). A present-but-corrupt pin is an
+/// error, never silently ignored (the fail-closed discipline of
+/// [`invite::RegistrySettings::parse`]).
+fn pinned_registry_id(id: &Path) -> Result<Option<[u8; 32]>> {
+    let pin_path = id.join(invite::REGISTRY_PIN_FILE);
+    match std::fs::read_to_string(&pin_path) {
+        Ok(text) => Ok(Some(
+            invite::RegistrySettings::parse(&text)
+                .with_context(|| format!("corrupt {}", pin_path.display()))?
+                .registry_id,
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err).context(format!("cannot read {}", pin_path.display()))),
+    }
+}
+
+/// Owner-side revocation knowledge (best effort, pure local files): a code
+/// this device itself created is revoked when `invite revoke` removed its
+/// line from `<id-dir>/invites.store` — a store that exists but no longer
+/// lists the code means the operator killed it. A redeemer has no local
+/// revocation state (the store is owner-side only), so a missing store
+/// never disqualifies a relation; the receiving owner's admission decider
+/// remains the authority on whether the code still stands.
+fn code_revoked_locally(id: &Path, code_id: &[u8; 16]) -> bool {
+    let Ok(text) = std::fs::read_to_string(id.join(invite::INVITE_STORE_FILE)) else {
+        return false;
+    };
+    let prefix = format!("AKINV1 {}", hex_of(code_id));
+    !text.lines().any(|line| line.trim_start().starts_with(&prefix))
+}
+
+/// Find the Ready pairing relation of this identity directory that matches
+/// `pinned` (wave 27, scheduler.md §6). Read-only: nothing is created,
+/// nothing is written. Facts and selection rule:
+///
+/// * candidates are journal records with `phase applied` whose
+///   `peer_public_key` derives exactly the pinned fingerprint;
+/// * among several relations for the same peer (a re-pair, or several
+///   codes redeemed with the same device) the most recently updated
+///   applied record wins — its code group is the freshest pairing state;
+///   ties break on `pairing_id` bytes so the choice is deterministic;
+/// * owner-revoked codes (see [`code_revoked_locally`]) are skipped;
+/// * a corrupt journal fails closed (the ak-store contract: a journal that
+///   lies is worse than one that refuses) — the operator fixes the state
+///   instead of the send silently dropping to the unadmitted path;
+/// * no registry pin → `Ok(None)` (legacy protocol; see
+///   [`ReadyRelation`]).
+fn ready_relation_for(id: &Path, pinned: &Fingerprint) -> Result<Option<ReadyRelation>> {
+    let journal_dir = id.join(ak_session::pairing::JOURNAL_SUBDIR);
+    if !journal_dir.exists() {
+        // Fresh identity directory: no pairing has ever run here. Do not
+        // even open the journal (PairingJournal::open would create it).
+        return Ok(None);
+    }
+    let Some(registry_id) = pinned_registry_id(id)? else {
+        return Ok(None);
+    };
+    let journal = ak_store::PairingJournal::open(&journal_dir)
+        .with_context(|| format!("cannot open the pairing journal at {}", journal_dir.display()))?;
+    let records = journal
+        .load_all()
+        .context("the pairing journal is corrupt; fix it before sending (fail closed)")?;
+    let mut candidates: Vec<&ak_store::PairingRecord> = records
+        .iter()
+        .filter(|record| record.phase == ak_store::PairingPhase::Applied)
+        .filter(|record| {
+            record
+                .peer_public_key
+                .is_some_and(|key| Fingerprint::from_public_key(&key) == *pinned)
+        })
+        .filter(|record| !code_revoked_locally(id, &record.code_id))
+        .collect();
+    // Most recent Ready first; pairing-id bytes break exact ties so two
+    // records updated within the same millisecond still choose stably.
+    candidates.sort_by(|a, b| {
+        b.updated_unix_ms
+            .cmp(&a.updated_unix_ms)
+            .then_with(|| a.pairing_id.cmp(&b.pairing_id))
+    });
+    Ok(candidates.first().map(|record| ReadyRelation {
+        pairing_id: record.pairing_id,
+        code_id: record.code_id,
+        registry_id,
+    }))
+}
+
+/// Bounded BUSY copy for an admission denial (scheduler.md §7: "远端准入
+/// 队列满：返回有界 BUSY/retry hint"). The one-shot CLI keeps no local
+/// queue item, so the honest advice is: nothing was sent, retry the same
+/// command after the stated condition clears.
+fn admission_denied_hint(reason: ak_wire::AdmissionReason) -> String {
+    use ak_wire::AdmissionReason;
+    match reason {
+        AdmissionReason::SerialWait => "对端忙（BUSY）：同一邀请码下已有任务在传输（serial_wait）。\
+            本次未发送任何数据；请等对端当前任务结束后重跑同一命令重试"
+            .to_owned(),
+        AdmissionReason::Capacity => "对端忙（BUSY）：对端的准入队列或并发上限已满（capacity）。\
+            本次未发送任何数据；请稍后重跑同一命令重试"
+            .to_owned(),
+        AdmissionReason::StalePermit => "对端忙（BUSY）：准入许可反复过期（stale_permit，已按有界预算重试）。\
+            本次未发送任何数据；请稍后重跑同一命令重试"
+            .to_owned(),
+        AdmissionReason::Ok => "对端忙（BUSY）：准入被拒。本次未发送任何数据；请稍后重跑同一命令重试"
+            .to_owned(),
+    }
+}
+
+/// Outcome of one admission-capable send attempt against one address.
+#[derive(Debug)]
+enum AdmissionAttempt {
+    /// The admission handshake ran and the whole transfer completed.
+    Completed(Report),
+    /// The connected peer's Hello did not carry `CAP_SCHEDULER` (a legacy
+    /// receiver): the engine refused the scheduled task with
+    /// `PROTOCOL_UNSUPPORTED` before any TaskOpen byte moved (the error
+    /// itself is carried for the caller's diagnostics line). The caller
+    /// may retry the same address on the legacy protocol — the frozen v1
+    /// wire both ends still share (scheduler.md §6: old ends keep the old
+    /// protocol; the refusal itself is what proves no silent downgrade of
+    /// a scheduler-capable peer happened).
+    LegacyPeer(EngineError),
+    /// Any other failure: connect-phase errors (next address may help)
+    /// and post-connect failures (another address cannot fix them).
+    Failed(AttemptFailure),
+}
+
+/// One scheduler-admission send attempt against a single address (wave
+/// 27): bind + connect under the same [`SEND_CONNECT_TIMEOUT`] budget the
+/// legacy per-address attempt uses (the budget covers exactly the
+/// bind/QUIC+TLS handshake phase — admission runs after the connection is
+/// established, so the budget semantics of wave 26 are unchanged), then
+/// hand the connected channel to [`ak_engine::send_on_channel`] with the
+/// [`AdmissionCtx`] built from the Ready relation.
+///
+/// Error discipline (scheduler.md §6):
+///
+/// * an admission denial (capacity/serial_wait, or a stale-permit budget
+///   exhausted) is a terminal BUSY failure — `after_connect = true`, so
+///   the fallback driver stops: the same peer would deny on every
+///   address, and there is no fallback to the unadmitted path;
+/// * `PROTOCOL_UNSUPPORTED` from the on-channel entry means exactly "the
+///   peer Hello lacked CAP_SCHEDULER" (the engine checks the capability
+///   locally, before any TaskOpen) — surfaced as [`AdmissionAttempt::LegacyPeer`];
+/// * everything else from `send_on_channel` happened after the connection
+///   was established, so it is `after_connect = true` like the legacy
+///   attempt's post-connect failures.
+async fn attempt_send_admission_to(
+    spec: SendSpec,
+    relation: &ReadyRelation,
+    printer: &(dyn Fn(Progress) + Send + Sync),
+) -> AdmissionAttempt {
+    let addr = spec.peer;
+    // AdmissionCtx identities: task and permit ids are minted fresh per
+    // invocation (scheduler.md §11: a user submission is a new task
+    // instance with a random persistent id; the file-protocol wire job id
+    // is content-derived inside the engine and not derivable before the
+    // handshake without duplicating the engine's private source scan).
+    // The all-zero sentinel cannot occur from `random_id16`; the
+    // validating constructor is still the only way the ctx is built.
+    let ctx = match ak_engine::AdmissionCtx::new(
+        ak_identity::pairing_txn::random_id16(),
+        ak_identity::pairing_txn::random_id16(),
+        ak_session::runtime::code_group_wire_form(&relation.code_id),
+        relation.registry_id,
+        relation.pairing_id,
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return AdmissionAttempt::Failed(AttemptFailure {
+                addr,
+                reason: one_line_reason(&err),
+                err,
+                after_connect: false,
+                hint: None,
+            })
+        }
+    };
+    // Bind + connect (QUIC + pinned TLS handshake) under the wave-26
+    // connect budget. The source scan runs inside send_on_channel after
+    // the channel exists, so unlike the legacy path it cannot eat into
+    // this budget at all.
+    let connect = async {
+        let endpoint = ak_net::DirectEndpoint::bind(spec.bind, &spec.identity).await?;
+        endpoint.connect(spec.peer, &spec.pinned).await
+    };
+    let channel = match tokio::time::timeout(SEND_CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(err)) => {
+            let err = EngineError::Connect(err);
+            return AdmissionAttempt::Failed(AttemptFailure {
+                addr,
+                reason: one_line_reason(&err),
+                err,
+                after_connect: false,
+                hint: None,
+            });
+        }
+        Err(_deadline_elapsed) => {
+            return AdmissionAttempt::Failed(AttemptFailure::connect_timeout(addr))
+        }
+    };
+    match ak_engine::send_on_channel(channel, spec, ctx, printer).await {
+        Ok(report) => AdmissionAttempt::Completed(report),
+        Err(EngineError::AdmissionDenied { reason }) => {
+            let hint = admission_denied_hint(reason);
+            AdmissionAttempt::Failed(AttemptFailure {
+                addr,
+                reason: format!(
+                    "remote admission denied ({:?}); nothing was sent",
+                    reason
+                ),
+                err: EngineError::AdmissionDenied { reason },
+                after_connect: true,
+                hint: Some(Box::from(hint)),
+            })
+        }
+        Err(
+            err @ EngineError::PeerError {
+                code: ak_core::error::ErrorCode::ProtocolUnsupported,
+                ..
+            },
+        ) => {
+            // Exactly "peer does not advertise CAP_SCHEDULER": a legacy
+            // receiver. No scheduler frames were sent; the frozen v1
+            // protocol is the shared language for this pair.
+            AdmissionAttempt::LegacyPeer(err)
+        }
+        Err(err) => AdmissionAttempt::Failed(AttemptFailure {
+            addr,
+            reason: one_line_reason(&err),
+            err,
+            after_connect: true,
+            hint: None,
+        }),
+    }
 }
 
 // Options arrive flat from clap; grouping them into a struct here would only
@@ -2968,6 +3273,21 @@ async fn send_command(
     let device_name = whoami();
     let printer = progress_printer("send");
     let _ = key;
+    // Wave 27 (scheduler.md §6): when this identity directory holds a
+    // Ready pairing relation matching the pinned peer, each address
+    // attempt first asks the peer for scheduler admission
+    // (TaskOpen → Admission → AdmissionAck) and only then transfers. The
+    // lookup is read-only; without a relation (an explicit manual
+    // fingerprint transfer) the send keeps the legacy protocol unchanged.
+    let relation = ready_relation_for(id, &pinned)?;
+    if let Some(relation) = &relation {
+        println!(
+            "[send] ready pairing relation {} (code {}): requesting scheduler admission",
+            &hex_of(&relation.pairing_id)[..8],
+            &hex_of(&relation.code_id)[..8]
+        );
+    }
+    let admission = relation.as_ref();
     // One engine send per address; the spec is rebuilt per attempt because
     // SendSpec carries the peer address (and the engine consumes the spec).
     // The shared pieces are borrowed (not moved) so the closure stays FnMut
@@ -2996,6 +3316,26 @@ async fn send_command(
         spec.idle_timeout = idle;
         spec.multistream = multistream;
         spec.policy.allow_internet = !no_internet;
+        if let Some(relation) = admission {
+            match attempt_send_admission_to(spec.clone(), relation, printer).await {
+                AdmissionAttempt::Completed(report) => return Ok(report),
+                AdmissionAttempt::LegacyPeer(err) => {
+                    // Legacy receiver (no CAP_SCHEDULER in its Hello): the
+                    // engine refused the scheduled task before any TaskOpen
+                    // byte moved. Explicit, observable retry on the frozen
+                    // v1 protocol both ends share — never a silent path
+                    // choice.
+                    println!("[send] {addr}: {}", one_line_reason(&err));
+                    println!("[send] retrying {addr} on the legacy transfer protocol");
+                    tokio::time::sleep(SEND_ATTEMPT_PAUSE).await;
+                }
+                // An admission denial (BUSY) or any other post-connect
+                // failure: terminal for this run — the same peer would
+                // answer the same way on every address, and there is no
+                // fallback to the unadmitted path.
+                AdmissionAttempt::Failed(failure) => return Err(failure),
+            }
+        }
         attempt_send_to(spec, printer).await
     };
     let report = match run_send_fallback(&targets, attempt).await {
@@ -3230,7 +3570,7 @@ async fn receive_one_after_pairing(
     let spec = config.iteration_spec();
     let printer = progress_printer("recv");
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-    let receiver =
+    let mut receiver =
         tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
     let addr = addr_rx.await.context("receiver failed to bind")?;
     println!(
@@ -3238,7 +3578,58 @@ async fn receive_one_after_pairing(
         out.display()
     );
     println!("fingerprint (full): {}", config.fingerprint.to_hex());
-    let report = receiver.await.context("receiver task failed")??;
+    // A connection that closes before offering a job is not a transfer
+    // (wave 27: a scheduler-capable sender's first attempt against this
+    // legacy endpoint ends exactly that way, and it retries on a fresh
+    // connection). Keep waiting on the SAME port until one real job, an
+    // error worth surfacing, or the overall `--timeout` budget elapses.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout.max(1));
+    let report = loop {
+        match receiver.await.context("receiver task failed")? {
+            Ok(report) => break report,
+            Err(ak_engine::EngineError::PeerClosed) if std::time::Instant::now() < deadline => {
+                // Rebind on the port the sender was told about; the
+                // ephemeral first bind must not change underneath a
+                // retrying peer. The previous endpoint releases its UDP
+                // socket asynchronously after drop, so an immediate rebind
+                // can hit AddrInUse — bounded backoff, same reasoning as
+                // the receive loop's rebind retries.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let mut attempt = 0u32;
+                loop {
+                    let retry = ReceiveLoopConfig::resolve(
+                        id,
+                        out.clone(),
+                        addr,
+                        None,
+                        conflict,
+                        false,
+                        timeout,
+                        whoami(),
+                    )?;
+                    let spec = retry.iteration_spec();
+                    let printer = progress_printer("recv");
+                    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+                    let task = tokio::spawn(async move {
+                        ak_engine::receive_with_addr(spec, &*printer, addr_tx).await
+                    });
+                    if addr_rx.await.is_ok() {
+                        receiver = task;
+                        break;
+                    }
+                    // Bind failed: settle the task, back off, retry.
+                    let _ = task.await;
+                    attempt += 1;
+                    if attempt >= 8 || std::time::Instant::now() >= deadline {
+                        bail!("cannot rebind the receive port {addr} after a pre-offer close");
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                }
+                continue;
+            }
+            Err(other) => return Err(other.into()),
+        }
+    };
     report_summary(&report);
     Ok(())
 }
@@ -4074,6 +4465,245 @@ mod tests {
         DeviceKeyPair::generate().fingerprint()
     }
 
+    // ---- wave 27: scheduler admission over a Ready relation -------------
+
+    /// Render one `.akpair` journal record exactly like
+    /// `ak_store::pairing_journal` (frozen AKPAIR1 format) and write it
+    /// under `<id>/pairing/<pairing hex>.akpair`.
+    fn write_akpair(
+        id: &Path,
+        pairing_id: &[u8; 16],
+        code_id: &[u8; 16],
+        peer_public_key: &[u8; 32],
+        phase: &str,
+        updated_ms: u64,
+    ) {
+        let dir = id.join(ak_session::pairing::JOURNAL_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        let text = format!(
+            "AKPAIR1\npairing {}\ncode {}\nlookup {}\nsecret {}\npeer {}\nphase {}\ncreated 1\nupdated {updated_ms}\n",
+            hex_of(pairing_id),
+            hex_of(code_id),
+            hex_of(&[0x44u8; 32]),
+            hex_of(&[0x55u8; 16]),
+            hex_of(peer_public_key),
+            phase,
+        );
+        std::fs::write(dir.join(format!("{}.akpair", hex_of(pairing_id))), text)
+            .expect("write akpair record");
+    }
+
+    fn write_registry_pin(id: &Path, registry_id: &[u8; 32]) {
+        std::fs::write(
+            id.join(invite::REGISTRY_PIN_FILE),
+            format!("AKREG1 127.0.0.1:1 {}\n", hex_of(registry_id)),
+        )
+        .expect("write registry pin");
+    }
+
+    fn relation_fixture(id: &Path, peer: &DeviceKeyPair) -> ([u8; 16], [u8; 16], [u8; 32]) {
+        // One applied Ready relation for `peer` plus the registry pin.
+        let pairing_id = [0xA1u8; 16];
+        let code_id = [0xC3u8; 16];
+        let registry_id = [0x91u8; 32];
+        write_akpair(
+            id,
+            &pairing_id,
+            &code_id,
+            &peer.public_key(),
+            "applied",
+            5_000,
+        );
+        write_registry_pin(id, &registry_id);
+        (pairing_id, code_id, registry_id)
+    }
+
+    #[test]
+    fn task_open_group_uses_the_shared_wire_form_convention() {
+        // The send path feeds AdmissionCtx::group from the wave-27 shared
+        // helper (BLAKE3 of the 16 code bytes) — the exact form the
+        // receiving daemon's AdmissionValidator accepts. Pin both the
+        // derivation and the all-nonzero shape so a divergence on either
+        // side fails here, not on the wire.
+        let code_id = [0x0Du8; 16];
+        let group = ak_session::runtime::code_group_wire_form(&code_id);
+        assert_eq!(group, *blake3::hash(&code_id).as_bytes());
+        assert_ne!(group, [0u8; 32], "a real code group is never the sentinel");
+    }
+
+    #[test]
+    fn ready_relation_resolves_the_applied_relation_and_registry_pin() {
+        let dir = TempDir::new("ready-relation");
+        let peer = DeviceKeyPair::generate();
+        let (pairing_id, code_id, registry_id) = relation_fixture(dir.path(), &peer);
+
+        let relation = ready_relation_for(dir.path(), &peer.fingerprint())
+            .expect("lookup succeeds")
+            .expect("the applied relation matches");
+        assert_eq!(relation.pairing_id, pairing_id);
+        assert_eq!(relation.code_id, code_id);
+        assert_eq!(relation.registry_id, registry_id);
+    }
+
+    #[test]
+    fn ready_relation_skips_pending_other_peers_and_revoked_codes() {
+        let dir = TempDir::new("ready-skips");
+        let peer = DeviceKeyPair::generate();
+        let pinned = peer.fingerprint();
+        let registry_id = [0x91u8; 32];
+        write_registry_pin(dir.path(), &registry_id);
+
+        // Pending transaction for the right peer: not Ready yet.
+        write_akpair(
+            dir.path(),
+            &[0x01u8; 16],
+            &[0x0Au8; 16],
+            &peer.public_key(),
+            "pending",
+            9_000,
+        );
+        // Applied, but for a different peer.
+        let other = DeviceKeyPair::generate();
+        write_akpair(
+            dir.path(),
+            &[0x02u8; 16],
+            &[0x0Bu8; 16],
+            &other.public_key(),
+            "applied",
+            9_000,
+        );
+        // Applied for the right peer, but the owner revoked this code
+        // locally (the store exists and no longer lists it).
+        std::fs::write(
+            dir.path().join(invite::INVITE_STORE_FILE),
+            "AKINV1 0102030405060708090a0b0c0d0e0f10 0 1 AKI1-XXXX\n",
+        )
+        .expect("invite store");
+        write_akpair(
+            dir.path(),
+            &[0x03u8; 16],
+            &[0xCCu8; 16],
+            &peer.public_key(),
+            "applied",
+            9_000,
+        );
+        assert!(
+            code_revoked_locally(dir.path(), &[0xCCu8; 16]),
+            "the store exists without the code: revoked"
+        );
+        assert!(
+            ready_relation_for(dir.path(), &pinned)
+                .expect("lookup succeeds")
+                .is_none(),
+            "pending / foreign / revoked relations never match"
+        );
+
+        // A fresh applied relation for a still-held code resolves and the
+        // most recently updated one wins over an older relation.
+        write_akpair(
+            dir.path(),
+            &[0x04u8; 16],
+            &[0x0Du8; 16],
+            &peer.public_key(),
+            "applied",
+            7_000,
+        );
+        write_akpair(
+            dir.path(),
+            &[0x05u8; 16],
+            &[0x0Eu8; 16],
+            &peer.public_key(),
+            "applied",
+            8_000,
+        );
+        // The store still lists the older code, so both stay eligible;
+        // recency picks the 0x05 relation.
+        std::fs::write(
+            dir.path().join(invite::INVITE_STORE_FILE),
+            format!(
+                "AKINV1 {} 0 1 AKI1-XXXX\nAKINV1 {} 0 1 AKI1-YYYY\n",
+                hex_of(&[0x0Du8; 16]),
+                hex_of(&[0x0Eu8; 16])
+            ),
+        )
+        .expect("invite store");
+        let relation = ready_relation_for(dir.path(), &pinned)
+            .expect("lookup succeeds")
+            .expect("an eligible relation exists");
+        assert_eq!(relation.pairing_id, [0x05u8; 16]);
+        assert_eq!(relation.code_id, [0x0Eu8; 16]);
+        assert_eq!(relation.registry_id, registry_id);
+    }
+
+    #[test]
+    fn ready_relation_without_journal_or_pin_keeps_legacy_none() {
+        // Fresh identity dir: nothing exists at all.
+        let fresh = TempDir::new("ready-fresh");
+        assert!(
+            ready_relation_for(fresh.path(), &random_fp())
+                .expect("lookup succeeds")
+                .is_none()
+        );
+        assert!(!fresh.path().join(ak_session::pairing::JOURNAL_SUBDIR).exists());
+
+        // Journal with a Ready relation but no registry pin: no valid
+        // AdmissionCtx is possible (group_registry must name the real
+        // registry), so the send keeps the legacy protocol.
+        let dir = TempDir::new("ready-nopin");
+        let peer = DeviceKeyPair::generate();
+        write_akpair(
+            dir.path(),
+            &[0x21u8; 16],
+            &[0x22u8; 16],
+            &peer.public_key(),
+            "applied",
+            1_000,
+        );
+        assert!(
+            ready_relation_for(dir.path(), &peer.fingerprint())
+                .expect("lookup succeeds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ready_relation_fails_closed_on_corrupt_journal() {
+        let dir = TempDir::new("ready-corrupt");
+        let peer = DeviceKeyPair::generate();
+        relation_fixture(dir.path(), &peer);
+        let journal_dir = dir.path().join(ak_session::pairing::JOURNAL_SUBDIR);
+        std::fs::write(journal_dir.join("deadbeef.akpair"), "garbage\n").expect("corrupt record");
+        let err = ready_relation_for(dir.path(), &peer.fingerprint())
+            .expect_err("a corrupt journal must fail the send, not downgrade it");
+        assert!(
+            err.to_string().contains("corrupt"),
+            "error names the journal problem: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_denied_hint_carries_busy_and_retry_copy() {
+        use ak_wire::AdmissionReason;
+        for reason in [
+            AdmissionReason::SerialWait,
+            AdmissionReason::Capacity,
+            AdmissionReason::StalePermit,
+        ] {
+            let hint = admission_denied_hint(reason);
+            assert!(hint.contains("BUSY"), "{reason:?}: {hint}");
+            assert!(hint.contains("重跑同一命令"), "{reason:?}: {hint}");
+            assert!(hint.contains("未发送任何数据"), "{reason:?}: {hint}");
+        }
+        assert!(
+            admission_denied_hint(AdmissionReason::SerialWait).contains("serial_wait"),
+            "serial_wait names the same-code constraint"
+        );
+        assert!(
+            admission_denied_hint(AdmissionReason::Capacity).contains("capacity"),
+            "capacity names the queue/limit condition"
+        );
+    }
+
     #[test]
     fn hex_helpers_round_trip() {
         assert_eq!(hex_to_bytes("00ff10").unwrap(), vec![0, 255, 16]);
@@ -4811,6 +5441,7 @@ mod tests {
                     reason: "peer vanished mid-transfer".to_owned(),
                     err: EngineError::PeerClosed,
                     after_connect: true,
+                    hint: None,
                 })
             } else {
                 panic!("the second address must not be tried after connect");
@@ -4837,6 +5468,7 @@ mod tests {
                 reason: "connect failed: io error: timed out".to_owned(),
                 err: EngineError::Connect(ak_net::ConnectError::Timeout(SEND_CONNECT_TIMEOUT)),
                 after_connect: false,
+                hint: None,
             }],
             &[addr],
         );
@@ -4853,6 +5485,7 @@ mod tests {
                 reason: "idle timeout".to_owned(),
                 err: EngineError::IdleTimeout(SEND_CONNECT_TIMEOUT),
                 after_connect: false,
+                hint: None,
             }],
             &[addr],
         );
@@ -4875,6 +5508,7 @@ mod tests {
                         "connection refused",
                     ))),
                     after_connect: false,
+                    hint: None,
                 },
             ],
             &[lan, public],

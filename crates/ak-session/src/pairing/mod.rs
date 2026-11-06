@@ -60,6 +60,6 @@ pub use client::{ClientConfig, ClientState, RegistryClient};
 pub use error::{ClientError, PairFlowError};
 pub use orchestrator::{
     redeem_request_mac, CommittedPairing, CreatedInvite, OrchestratorConfig, PairingOrchestrator,
-    BOOK_NAME, JOURNAL_SUBDIR,
+    PersistedCodeSource, BOOK_NAME, JOURNAL_SUBDIR,
 };
 pub use transport::RealTransport;

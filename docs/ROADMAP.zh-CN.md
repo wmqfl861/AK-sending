@@ -9,7 +9,7 @@
 - **P2 部分完成**：P2-01 代码部分已备（信令＋STUN 协调面、TLS registry 服务器），公网部署另需所有者批准；P2-03 的进程内故障注入形态已备（T07/随机中断套件），端点抓包归 P0-07；P2-02 未开始。
 - **邀请码配对已完成**（原 V2-01 规划项提前实现，第十八至二十三波）：`AKI1-` 160 bit 熵邀请码、TLS registry（claim/redeem/revoke/TTL/防枚举）、配对编排 e2e、CLI `invite` 命令族、FFI 19 个 v2 导出、Flutter 邀请页全链落地。
 - 已完成（第二十四波 `ac6b23b`）：CLI daemon Fake→Real 接线（RealTransport+SessionRuntime+RealTransferExecutor）。
-- 进行中：daemon 真实邀请码并发（终审 P1-02：真实 code_id 分组四模式矩阵与双端 wire 准入，wave-27 专项）；wave-26 修复 Codex 二次终审 20 项发现（`reports/codex-review-2026-11-05-wave25.md`）。
+- 已完成（2026-11-06）：wave-26 修复 Codex 二次终审全部 20 项发现；wave-27 daemon 真实邀请码并发（终审 P1-02：真实 code_id 分组、双端 wire 准入、并发 accept，策略矩阵生产路径生效）。
 
 工程形态：13 个 Rust crate＋ak_ffi_dart 纯 Dart 包＋Flutter 桌面/移动应用；测试基线（分波次，见 reports/）：第二十三波 workspace 918/0、第二十四波 955/0（`ac6b23b` 时点）；当前 HEAD 以实际运行为准。Android 模拟器↔Windows 宿主双向真实 QUIC 传输逐字节一致；Windows↔Linux 跨公网双向 8 MiB SHA256 一致（2026-11-05）。验证形态与逐项证据见 [开发验证记录](../reports/dev-validation-2026-11-02.txt) 与 [BACKLOG](BACKLOG.zh-CN.md)；平台支持范围见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)；里程碑时间线见 [CHANGELOG](../CHANGELOG.md)。本地可执行范围已尽，余项需外部网络、物理双机与部署批准等外部资源。
 

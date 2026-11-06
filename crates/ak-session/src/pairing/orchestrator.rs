@@ -209,7 +209,20 @@ pub struct PairingOrchestrator {
     peer_store: PeerBookStore,
     config: OrchestratorConfig,
     secrets: Arc<StdMutex<Secrets>>,
+    /// Live backfill for codes this process did not create (wave 27):
+    /// consulted when an offer names a code missing from `secrets`. The
+    /// production daemon points this at `<id-dir>/invites.store`, so a
+    /// code another process created (or revoked — the line removed) is
+    /// answered (or declined) exactly like the wave-21 per-offer store
+    /// lookup did.
+    persisted_source: Arc<StdMutex<Option<PersistedCodeSource>>>,
 }
+
+/// Live lookup of one persisted invite code (see
+/// [`PairingOrchestrator::persisted_source`]): `None` = not held (never
+/// created here, expired, or revoked).
+pub type PersistedCodeSource =
+    Arc<dyn Fn(&[u8; 16]) -> Option<(InviteCode, u64, u64)> + Send + Sync>;
 
 impl PairingOrchestrator {
     /// Open (creating) the journal directory and trust book under `id_dir`.
@@ -229,7 +242,16 @@ impl PairingOrchestrator {
             peer_store: PeerBookStore::new(),
             config,
             secrets: Arc::new(StdMutex::new(Secrets::default())),
+            persisted_source: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// Install the live persisted-code source (see [`Self::persisted_source`]).
+    pub fn set_persisted_code_source(&self, source: PersistedCodeSource) {
+        *self
+            .persisted_source
+            .lock()
+            .expect("orchestrator lock") = Some(source);
     }
 
     /// Open with the default tunables.
@@ -526,10 +548,58 @@ impl PairingOrchestrator {
 
     // ---- owner path ----------------------------------------------------------
 
+    /// Adopt a code this device created in an EARLIER process run (wave 27,
+    /// integrator: production `daemon --pairing`). `Secrets` is in-memory
+    /// and opens empty — codes registered through the persisted
+    /// `<id-dir>/invites.store` (the CLI `invite create` flow) must be fed
+    /// back before [`Self::spawn_owner_loop`] can answer their redeems.
+    /// The revision/expiry metadata comes from the persisted record; the
+    /// registry remains authoritative on both at answer time.
+    pub fn adopt_persisted_code(
+        &self,
+        code: &InviteCode,
+        code_id: [u8; 16],
+        revision: u64,
+        expires_ms: u64,
+    ) {
+        let mut secrets = self.secrets.lock().expect("orchestrator lock");
+        // Same dedup as remember_code: a re-adoption of the identical
+        // secret (store reload, daemon restart) is idempotent.
+        let secret_ref = 'found: {
+            for (secret_ref, held) in &secrets.slots {
+                if held.lookup_digest() == code.lookup_digest() {
+                    break 'found *secret_ref;
+                }
+            }
+            let secret_ref = random_id16();
+            secrets.slots.insert(secret_ref, code.clone());
+            secret_ref
+        };
+        secrets.codes.insert(
+            code_id,
+            CodeSlotMeta {
+                secret_ref,
+                revision,
+                expires_ms,
+            },
+        );
+    }
+
     /// Spawn the resident owner loop: consumes the pairing plane, answers
     /// every `InviteRedeemOffered` for a code this device holds. Duplicate
     /// offers (Hello catch-up re-pushes) are deduplicated per pairing id.
     pub fn spawn_owner_loop(&self) -> JoinHandle<()> {
+        self.spawn_owner_loop_notifying(None)
+    }
+
+    /// [`Self::spawn_owner_loop`] with an optional success callback: the
+    /// redeemer's fingerprint is reported once its pairing committed (the
+    /// production daemon prints its `paired with redeemer …` line here;
+    /// the cross-device script's pairing barrier waits on that text).
+    pub fn spawn_owner_loop_notifying(
+        &self,
+        on_paired: Option<std::sync::Arc<dyn Fn(Fingerprint) + Send + Sync>>,
+    ) -> JoinHandle<()> {
         let orchestrator = self.clone();
         // Subscribe synchronously: an offer pushed between `spawn` and the
         // task's first poll would otherwise be dropped with no subscriber.
@@ -558,8 +628,9 @@ impl PairingOrchestrator {
                         continue;
                     }
                     let orchestrator = orchestrator.clone();
+                    let on_paired = on_paired.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = orchestrator
+                        match orchestrator
                             .owner_answer_offer(
                                 code_id,
                                 code_revision,
@@ -569,11 +640,23 @@ impl PairingOrchestrator {
                             )
                             .await
                         {
-                            log::warn!("owner pairing flow failed ({}): {err}", hex(&pairing_id));
-                            let _ = orchestrator
-                                .client
-                                .pair_abort(pairing_id, AbortReason::Protocol)
-                                .await;
+                            Ok(verified) => {
+                                if let Some(on_paired) = on_paired.as_ref() {
+                                    // The redeemer is this daemon's peer
+                                    // (the owner loop runs on the owner).
+                                    on_paired(verified.redeemer_fingerprint());
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "owner pairing flow failed ({}): {err}",
+                                    hex(&pairing_id)
+                                );
+                                let _ = orchestrator
+                                    .client
+                                    .pair_abort(pairing_id, AbortReason::Protocol)
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -593,7 +676,35 @@ impl PairingOrchestrator {
     ) -> Result<VerifiedPairing, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
         let (auth_key, secret_ref, lookup_digest) = {
-            let secrets = self.secrets.lock().expect("orchestrator lock");
+            let mut secrets = self.secrets.lock().expect("orchestrator lock");
+            // Miss in the in-memory slots: codes created by ANOTHER process
+            // (e.g. `ak-cli invite create` while this daemon runs) land in
+            // the persisted store only — consult the backfill source before
+            // declaring the code unknown (wave 27). The source reads the
+            // store LIVE, so a revoked code (line removed) resolves to
+            // None here and is declined exactly like the old per-offer
+            // store lookup did.
+            if !secrets.codes.contains_key(&code_id) {
+                let persisted = self
+                    .persisted_source
+                    .lock()
+                    .expect("orchestrator lock")
+                    .clone();
+                if let Some((code, revision, expires_ms)) =
+                    persisted.as_ref().and_then(|source| source(&code_id))
+                {
+                    let secret_ref = random_id16();
+                    secrets.slots.insert(secret_ref, code.clone());
+                    secrets.codes.insert(
+                        code_id,
+                        CodeSlotMeta {
+                            secret_ref,
+                            revision,
+                            expires_ms,
+                        },
+                    );
+                }
+            }
             let meta = secrets
                 .codes
                 .get(&code_id)

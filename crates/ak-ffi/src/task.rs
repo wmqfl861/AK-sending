@@ -6156,11 +6156,18 @@ mod task_tests {
                         .nth(1)
                         .and_then(|rest| rest.split('"').next())
                         .expect("job id");
+                    // R31-P3-02: EITHER terminal is legal — the
+                    // disconnect-driven request_closed OR the 25 ms
+                    // consent window's consent_expired (the race may let
+                    // the expiry task win before the closer thread gets
+                    // scheduled; both are correct request terminals that
+                    // can only appear AFTER the incoming was published).
                     assert!(
-                        events[index + 1..].iter().any(|later| later
-                            .contains("\"event\":\"request_closed\"")
+                        events[index + 1..].iter().any(|later|
+                            (later.contains("\"event\":\"request_closed\"")
+                                || later.contains("\"event\":\"consent_expired\""))
                             && later.contains(&format!("\"job\":\"{job_hex}\""))),
-                        "every published request is closed LATER in its window: {events:?}"
+                        "every published request reaches a terminal (closed or expired) LATER: {events:?}"
                     );
                 }
             }

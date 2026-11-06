@@ -121,6 +121,9 @@ sealed class TaskEvent {
           conn: _optionalString(json, 'conn'),
           files: _int(json, 'files'),
           bytes: _int(json, 'bytes'),
+          // Receive-side only: the actual landing directory of this
+          // transfer (R31-P3-01); a sender's done carries no saveDir.
+          saveDir: _optionalString(json, 'saveDir'),
         );
       case 'disconnected':
         return TaskDisconnectedEvent(
@@ -323,13 +326,24 @@ final class TaskIncomingRequestEvent extends TaskEvent {
 
 /// A transfer finished successfully (either side).
 final class TaskDoneEvent extends TaskEvent {
-  const TaskDoneEvent({super.atMs, this.conn, this.files = 0, this.bytes = 0});
+  const TaskDoneEvent({
+    super.atMs,
+    this.conn,
+    this.files = 0,
+    this.bytes = 0,
+    this.saveDir,
+  });
 
   final String? conn;
 
   final int files;
 
   final int bytes;
+
+  /// The actual landing directory of this receive (wave-31 R31-P3-01):
+  /// provided by the RECEIVING side only — a sender's done event has no
+  /// such field (it never knows the peer's local path).
+  final String? saveDir;
 
   @override
   String get name => 'done';
@@ -339,6 +353,7 @@ final class TaskDoneEvent extends TaskEvent {
         if (conn != null) 'conn': conn,
         'files': files,
         'bytes': bytes,
+        if (saveDir != null) 'saveDir': saveDir,
       };
 }
 

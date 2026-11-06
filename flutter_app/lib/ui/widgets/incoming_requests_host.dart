@@ -173,6 +173,27 @@ class _IncomingBannerCard extends StatelessWidget {
             ),
             if (banner.stage == _Stage.pending) ...[
               const SizedBox(height: 8),
+              // Wave-30 P2-06: the request's REAL target — the engine
+              // snapshotted the folder at offer time and the receive
+              // lands there even if the settings change before the user
+              // answers, so the banner follows the event's field (the
+              // live setting only stands in when the engine predates it).
+              Row(
+                children: [
+                  Icon(Icons.folder_outlined,
+                      size: 16, color: scheme.outline),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '将保存到：${request.saveDir ?? saveDir}',
+                      key: ValueKey('incoming_target_$jobId'),
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
               Row(
                 children: [
                   Expanded(
@@ -210,7 +231,7 @@ class _IncomingBannerCard extends StatelessWidget {
                   Expanded(
                     child: Text(
                       '已接收 ${request.fileCount} 个文件，'
-                      '保存在：$saveDir',
+                      '保存在：${request.saveDir ?? saveDir}',
                       key: ValueKey('incoming_success_$jobId'),
                       style: theme.textTheme.bodyMedium
                           ?.copyWith(color: Colors.green.shade800),

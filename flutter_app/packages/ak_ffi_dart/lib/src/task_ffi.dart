@@ -337,6 +337,13 @@ abstract interface class AkTaskCalls {
   /// written, 0 queue empty, -3 too small (event stays queued).
   int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap);
 
+  /// `ak_poll_progress` (the ENGINE-WIDE progress queue — no runtime id):
+  /// 1 progress JSON line written, 0 queue empty, -3 too small (the line
+  /// stays queued). Task-plane send rows key their progress by the
+  /// connection id, receive rows by the current code id (ffi-v2 §8.4) —
+  /// the wave-30 P2-10 progress-renewal source.
+  int pollProgress(Uint8List buffer, int cap);
+
   /// The native error detail of the most recent negative status, or null
   /// (read from `ak_engine_last_error` right after the failing call).
   String? lastError();
@@ -393,6 +400,13 @@ typedef _EventBufC = Int32 Function(
 typedef _EventBufDart = int Function(
     Pointer<AkEngine>, Pointer<Uint8>, Pointer<Uint8>, int);
 
+/// `ak_poll_progress(engine, buf, cap)` — the engine-wide progress queue
+/// (no runtime id; wave-30 P2-10 progress renewal reads it).
+typedef _ProgressBufC = Int32 Function(
+    Pointer<AkEngine>, Pointer<Uint8>, IntPtr);
+typedef _ProgressBufDart = int Function(
+    Pointer<AkEngine>, Pointer<Uint8>, int);
+
 /// The eight `ak_task_*` exports plus the two shared-channel exports the
 /// task plane reads (probe set of [AkTaskFfiBindings.missingTaskExports]).
 const List<String> akTaskExportNames = <String>[
@@ -436,6 +450,8 @@ final class AkTaskFfiBindings implements AkTaskCalls {
         .lookupFunction<_OpBufC, _OpBufDart>('ak_pairing_op_result');
     _pollEvent = _library
         .lookupFunction<_EventBufC, _EventBufDart>('ak_pairing_poll_event');
+    _pollProgress =
+        _library.lookupFunction<_ProgressBufC, _ProgressBufDart>('ak_poll_progress');
     _engineLastError = _library.lookupFunction<EngineLastErrorC,
         EngineLastErrorDart>('ak_engine_last_error');
   }
@@ -453,6 +469,7 @@ final class AkTaskFfiBindings implements AkTaskCalls {
   late final _ConsentDart _consent;
   late final _OpBufDart _opResult;
   late final _EventBufDart _pollEvent;
+  late final _ProgressBufDart _pollProgress;
   late final EngineLastErrorDart _engineLastError;
 
   /// The native detail captured right after the most recent failing call
@@ -626,6 +643,10 @@ final class AkTaskFfiBindings implements AkTaskCalls {
     }
   }
 
+  @override
+  int pollProgress(Uint8List buffer, int cap) =>
+      _bufCall((buf, capacity) => _pollProgress(_engine, buf, capacity), buffer, cap);
+
   Pointer<Uint8> _idIn(Uint8List id) {
     if (id.length != akPairingIdLength) {
       throw ArgumentError.value(id.length, 'id.length',
@@ -741,14 +762,22 @@ final class TaskOpHandle {
   /// Polls until the op settles and returns the done JSON map; a failed op
   /// throws [AkFfiException]. [ensureLive] is the P1-05 lifecycle hook: it
   /// runs at the TOP of every loop iteration, BEFORE the next native call.
+  ///
+  /// [onPoll] (wave-30 P2-10) turns [timeout] into a STALL budget instead
+  /// of an overall wall-clock cap: it runs after every pending poll, and
+  /// when it reports progress (`true`) the deadline is REFRESHED to
+  /// `now + timeout`. Only a true no-progress stall of [timeout] elapses
+  /// into the [TimeoutException] — a long transfer that keeps making
+  /// progress is never cut off by the total duration.
   Future<Map<String, dynamic>> wait({
     Duration interval = const Duration(milliseconds: 200),
     Duration timeout = const Duration(seconds: 30),
     Future<void> Function(Duration)? delay,
     void Function()? ensureLive,
+    bool Function()? onPoll,
   }) async {
     final wait = delay ?? Future<void>.delayed;
-    final deadline = DateTime.now().add(timeout);
+    var deadline = DateTime.now().add(timeout);
     while (true) {
       ensureLive?.call(); // disposed owner: abort BEFORE any native call
       final result = poll();
@@ -759,8 +788,11 @@ final class TaskOpHandle {
         throw AkFfiException(
             AkStatus.failed, result.error ?? '$symbol 操作失败');
       }
+      if (onPoll != null && onPoll()) {
+        deadline = DateTime.now().add(timeout); // progress renews the budget
+      }
       if (DateTime.now().isAfter(deadline)) {
-        throw TimeoutException('$symbol 等待结果超时', timeout);
+        throw TimeoutException('$symbol 等待结果超时（无进展停滞）', timeout);
       }
       await wait(interval);
     }
@@ -940,6 +972,33 @@ final class TaskRuntimeFfi {
       throw akCallFailure(code, '任务事件轮询失败', _calls.lastError);
     }
     throw StateError('任务事件超过 $_maxBufferBytes 字节');
+  }
+
+  /// Pops the oldest ENGINE-WIDE progress line (no runtime scoping — the
+  /// `ak_poll_progress` queue is one per engine; correlate by the line's
+  /// `job` field: the connection id for sends, the code id for receives,
+  /// ffi-v2 §8.4). Returns the raw JSON line string, or null when the
+  /// queue is empty. The `-3` grow loop is lossless like every other
+  /// buffer call. (Wave-30 P2-10: the progress-renewal source for
+  /// stall-based timeouts.)
+  String? pollProgressLine() {
+    var capacity = 256;
+    while (capacity <= _maxBufferBytes) {
+      final buffer = Uint8List(capacity);
+      final code = _calls.pollProgress(buffer, capacity);
+      if (code == AkStatus.pending) {
+        return null;
+      }
+      if (code == AkStatus.event) {
+        return fromNativeUtf8Text(buffer);
+      }
+      if (code == AkStatus.errBuffer) {
+        capacity *= 2; // line stays queued; retry losslessly
+        continue;
+      }
+      throw akCallFailure(code, '进度事件轮询失败', _calls.lastError);
+    }
+    throw StateError('进度事件超过 $_maxBufferBytes 字节');
   }
 
   TaskOpHandle _startOp(

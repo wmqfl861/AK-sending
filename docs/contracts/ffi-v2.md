@@ -393,8 +393,9 @@ int32_t ak_task_consent(
 {"spec_version":1,"role":"sender|receiver",
  "candidates":["192.168.1.4:7000"],"ttl_secs":0,"request_id":"<32hex>"}
 
-// ak_task_join
-{"spec_version":1,"code":"AKT1-XXXX-XXXX-XXXX",
+// ak_task_join（code 为真实 AKI1 展示形状：AKI1 前缀 + 32 个
+// Crockford Base32 符号，去分隔符规范化后共 36 字符）
+{"spec_version":1,"code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
  "candidates":[],"request_id":"<32hex>"}
 
 // ak_task_send（paths 为本地路径数组）
@@ -406,8 +407,8 @@ int32_t ak_task_consent(
 ### 8.2 op 结果 JSON（经 ak_pairing_op_result）
 
 ```json
-{"op":"task_create_code","code":"AKT1-XXXX-XXXX-XXXX","role":"receiver",
- "code_id":"<32hex>","expires_ms":0,"endpoint":"192.168.1.4:53112"}
+{"op":"task_create_code","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
+ "role":"receiver","code_id":"<32hex>","expires_ms":0,"endpoint":"192.168.1.4:53112"}
 {"op":"task_join","conn":"<32hex>","role":"sender",
  "peer_endpoint":"192.168.1.4:53112","probe":"unverified"}
 {"op":"task_send","conn":"<32hex>","files":2,"bytes":123456,
@@ -422,20 +423,26 @@ int32_t ak_task_consent(
 {"event":"op_done","op_id":"<32hex>","op":"task_create_code|task_join|task_send"}
 {"event":"op_failed","op_id":"<32hex>","op":"…"}
 {"event":"connected","conn":"<32hex>","role":"sender|receiver",
- "peer_endpoint":"ip:port","code":"AKT1-…"}
+ "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
 {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":null}
 {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
- "root":"photos","files":3,"bytes":123456}
+ "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox"}
 {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
 {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
 {"event":"code_cancelled","code_id":"<32hex>"}
+{"event":"handshake_failed","conn":"<32hex>","code":"<int>","reason":"peer certificate rejected|handshake transport failure"}
+{"event":"consent_expired","job":"<32hex>","conn":"<32hex>"}
+{"event":"request_closed","job":"<32hex>","conn":"<32hex>","reason":"disconnected"}
 ```
 
 wave-29 增补：`disconnected` 新增 `done` 理由（单传输任务的完成终态——双端连接条目同时收敛，见 §8.4）；`code_cancelled` 在生码方取消一个未被加入的码（`ak_task_disconnect` 按 `code_id`）时发出。
 
+wave-30 增补（复审 R29 修复）：`incoming_request` 携带 `saveDir`（该请求将落盘的真实目标快照，UI 横幅显示用）；`consent_expired` 是同意窗口 30 秒到期的**请求终态事件**（native 为期限事实源，UI 本地计时仅兜底）；`request_closed` 是连接断开驱动 pending 请求终结的终态事件；`handshake_failed` 是单次对端握手失败的有界记录（固定词表，**不代表监听器终结**——接收循环继续）。
+
 `ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
 "connections":[{"conn":"<32hex>","role":"sender","state":
-"probing|connected|disconnected","peer_endpoint":"ip:port","code":"AKT1-…"}]}`。
+"probing|connected|unreachable|disconnected","peer_endpoint":"ip:port",
+"code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}]}`。
 
 ### 8.4 行为语义（冻结；wave-29 修订处标注）
 
@@ -445,6 +452,7 @@ wave-29 增补：`disconnected` 新增 `done` 理由（单传输任务的完成�
 - **接收同意（wave-29 P2-07 修订）**：Offer 级 `TransferConsent` 为**非阻塞形状**（回调登记 pending oneshot 后立即返回，等待由引擎异步 await，绝不阻塞 Tokio worker）；每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件，挂起直至 `ak_task_consent` 决定、**30 秒窗口自动拒绝**（计时器任务，绝不自动接受）、该连接断开或运行时 teardown（后两者同样以拒绝收场）。决定即移除条目：`ak_task_consent` 对未知/已决定请求返回 `-4`。拒绝经 DECLINED 线上语义告知对端、零字节落盘。
 - **常驻接收（wave-29 P2-05/P2-06 修订）**：一个码绑定一个端口、一个**循环服务**多连接——陌生拨号被拒后续继监听；**拒绝不是任务终态**（同码可重试，再次发送产生新的 `incoming_request`）；**完成是单传输任务终态**（`done` 后双端连接条目收敛为 `disconnected`/`done`，接收器停止）。保存夹在**每次传输开始时**从当前设置解析：`ak_task_set_save_dir` 对后续任务生效。
 - **断开（wave-29 P2-03/P2-04 修订）**：`ak_task_disconnect` 幂等，且覆盖**已生成未加入的码**——以 create 结果的 `code_id` 为参数即撤销 registry 注册行、释放接收器/echo 监听并发出 `code_cancelled`（重复取消静默 `AK_OK`；未知 id `-4`）。连接断开时：本侧 `local`，注册中心撤码；**空闲时**（无在传输的 QUIC 连接可供对端感知）额外向已配对对端通告的数据端点发起**认证的 TASK-CLOSE 帧通知**（TLS 钉扎配对指纹、复用既有 Error 帧语义），持有监听的对端立即以 `ByPeer` 收敛为 `disconnected`/`peer`；纯发送侧未绑定数据监听，无法被空闲通知触达，其下次发送连接失败即为诚实结果。同引擎对端另有即时缓存通知。引擎 teardown 对本运行时未撤销的码做**有界尽力撤码**（应用退出不遗留无主 active 行）。
+- **断开原因域（wave-30 修订）**：`disconnected` 的四个理由（`local|peer|receiver_failed|done`）均为**数据面终态**；注册/协调连接断开不产生任何任务终结事件（任务只在数据面链路丢失、对端动作或本地断开时终结），`receiver_failed` 仅由真实数据面链路丢失触发。`ak_task_list` 的 `unreachable`（wave-30 P2-09）= 探测全部失败的如实状态（不再无条件跃迁 connected），终态不被探测结果覆盖。
 - **任务码 TTL（wave-29 P2-04）**：`ttl_secs` 省略或 `0` 在 FFI 层映射为库默认 600 秒；不再把 0 原样作为 registry 的"长期有效"语义上送。
 - **发送/接收进度**：进入引擎级 `ak_poll_progress` 队列（发送行 `job` 为连接 id、接收行为**当前**码 id 的 32hex——wave-29 修正：不再是领取码前的本地占位 id）。
 

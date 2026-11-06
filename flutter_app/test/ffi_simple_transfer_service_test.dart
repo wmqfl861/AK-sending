@@ -4,14 +4,19 @@
 /// consent completion semantics, registry config resolution).
 library;
 
-import 'dart:async' show Completer, TimeoutException;
+import 'dart:async' show Completer, Timer, TimeoutException;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart' show FakeAkTaskCalls;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ak_sending_app/services/ffi_simple_transfer_service.dart';
 import 'package:ak_sending_app/ui/service/simple_transfer_service.dart'
-    show JoinResult, TaskConnection, TaskConnectionState, TaskRole;
+    show
+        IncomingRequest,
+        JoinResult,
+        TaskConnection,
+        TaskConnectionState,
+        TaskRole;
 
 const String regId =
     '1111111111111111111111111111111111111111111111111111111111111111';
@@ -42,6 +47,17 @@ void main() {
         RegExp(r'^AKI1-[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){7}$')
             .hasMatch(code.code),
         isTrue);
+    service.dispose();
+  });
+
+  test('P2-04: createCode hands up the engine code_id (the cancel key)',
+      () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = await service.createCode(TaskRole.receive);
+    expect(code.codeId, isNotNull,
+        reason: 'TaskCode 必须携带引擎 code_id（P2-04 撤码入口）');
+    expect(fake.disconnectCalls, isEmpty); // minting alone never revokes
     service.dispose();
   });
 
@@ -262,6 +278,114 @@ void main() {
       accepted,
       throwsA(isA<StateError>()
           .having((e) => e.message, 'message', contains('连接已断开'))),
+    );
+    service.dispose();
+  });
+
+  test('P2-05: a done transfer converges the row — the live snapshot no '
+      'longer offers a send entry', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.send)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final before = await service.connections.first;
+    expect(before, hasLength(1));
+
+    fake.emitDone(fake.runtimes.keys.first, connId: joined.connectionId);
+    service.engine.pumpEvents();
+    final after = await service.connections.first;
+    expect(after, isEmpty,
+        reason: 'done 后行必须收敛离开活动列表（不再给发送入口）');
+    service.dispose();
+  });
+
+  test('P2-06: the incoming request carries its offer-time saveDir through '
+      'the adapter', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    await service.setSaveDir('D:/changed-later');
+
+    final requests = <IncomingRequest>[];
+    final sub = service.incomingRequests.listen(requests.add);
+    fake.emitIncomingRequest(fake.runtimes.keys.first,
+        connId: joined.connectionId, files: 1, bytes: 1,
+        saveDir: 'D:/offer-time');
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+    expect(requests, hasLength(1));
+    expect(requests.first.saveDir, 'D:/offer-time',
+        reason: '横幅显示的目标必须跟随事件字段（P2-06）');
+    await sub.cancel();
+    service.dispose();
+  });
+
+  test('P2-10: an accepted receive with CONTINUOUS progress outlives '
+      'receiveTimeout; a stalled one is cut', () async {
+    final fake = FakeAkTaskCalls();
+    // REAL delay (no immediate stand-in): the stall loop must yield so
+    // the progress timer feeds the queue while the wait is in flight.
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      receiveTimeout: const Duration(milliseconds: 200),
+    );
+    await service.start();
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final runtimeId = fake.runtimes.keys.first;
+    // The receive row keys its progress by the pairing CODE id.
+    final codeKey = fake.runtimes[runtimeId]!.codes.first;
+    final codeId = fake.runtimes[runtimeId]!.codeIdOfCode[codeKey]!;
+
+    final job = fake.emitIncomingRequest(runtimeId,
+        connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    final accepted = service.consent(job, true);
+    final progress = Timer.periodic(const Duration(milliseconds: 25),
+        (_) => fake.emitProgress(codeId));
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    fake.emitDone(runtimeId, connId: joined.connectionId); // finally done
+    service.engine.pumpEvents();
+    await accepted; // 600 ms > the 200 ms budget — renewal kept it alive
+    progress.cancel();
+    service.dispose();
+  });
+
+  test('P2-10: a stalled receive (no progress) hits the stall budget and '
+      'a FAILED cancel is reported honestly (never 已取消)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      receiveTimeout: Duration.zero,
+    );
+    await service.start();
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final runtimeId = fake.runtimes.keys.first;
+    final job = fake.emitIncomingRequest(runtimeId,
+        connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    fake.nextDisconnectFails = 'engine busy';
+    await expectLater(
+      service.consent(job, true),
+      throwsA(isA<TimeoutException>().having((e) => e.message, 'message',
+          allOf(contains('取消原生任务失败'), contains('engine busy')))),
     );
     service.dispose();
   });

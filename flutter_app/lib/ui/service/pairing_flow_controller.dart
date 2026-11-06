@@ -149,6 +149,32 @@ class PairingFlowController extends ChangeNotifier {
     _begin(kind: null, phase: null);
   }
 
+  /// Wave-30 P2-04: the 取消等待 of a shown code — cancels the flow AND
+  /// revokes the unconsumed code engine-side (`disconnect(codeId)`: the
+  /// registry row is revoked, the code can never be redeemed). Flows
+  /// without a cancel key (already joined, a code without codeId, or the
+  /// join flow) just reset. A FAILED revoke is reported honestly — the
+  /// flow lands in `failed` with the readable reason instead of silently
+  /// leaving a live code behind.
+  Future<void> cancelWaiting() async {
+    final codeId = code?.codeId;
+    final cancellable = kind == PairingFlowKind.create &&
+        phase == PairingFlowPhase.awaitingPeer &&
+        connection == null && // the peer never landed: the code is unconsumed
+        codeId != null &&
+        codeId.isNotEmpty;
+    if (!cancellable) {
+      reset();
+      return;
+    }
+    try {
+      await _service.disconnect(codeId);
+      reset();
+    } on Object catch (e) {
+      _fail('取消配对失败：$e（配对码可能仍然有效，请重试取消）');
+    }
+  }
+
   @override
   void dispose() {
     _subscription.cancel();

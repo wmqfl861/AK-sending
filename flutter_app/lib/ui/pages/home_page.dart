@@ -316,9 +316,15 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
                 ),
               ],
               selected: role == null ? const <TaskRole>{} : <TaskRole>{role},
+              // `emptySelectionAllowed` is required for the INITIAL
+              // nothing-picked state (SegmentedButton asserts non-empty
+              // otherwise). R29-P2-04: an empty selection still can never
+              // reach the join — the callback guards the empty set (a
+              // null role keeps the submit DISABLED), so a re-tap that
+              // deselects is honest, not a StateError crash.
               emptySelectionAllowed: true,
-              onSelectionChanged: (selection) =>
-                  setState(() => _role = selection.first),
+              onSelectionChanged: (selection) => setState(
+                  () => _role = selection.isEmpty ? null : selection.first),
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
@@ -405,6 +411,14 @@ class _CodeShownView extends StatelessWidget {
 
   final PairingFlowController controller;
 
+  Future<void> _cancel(PairingFlowController flow) async {
+    // Wave-30 P2-04: cancelling the wait also REVOKES the unconsumed code
+    // engine-side (disconnect(code_id)) — the code dies with the flow
+    // instead of lingering redeemable until its TTL. A failed revoke
+    // surfaces in the flow's failed state (honest, never silent).
+    await flow.cancelWaiting();
+  }
+
   Future<void> _copy(BuildContext context, String code) async {
     await Clipboard.setData(ClipboardData(text: code));
     if (context.mounted) {
@@ -486,7 +500,7 @@ class _CodeShownView extends StatelessWidget {
           alignment: Alignment.centerLeft,
           child: TextButton(
             key: const ValueKey('flow_cancel_button'),
-            onPressed: controller.reset,
+            onPressed: () => _cancel(controller),
             child: const Text('取消配对'),
           ),
         ),

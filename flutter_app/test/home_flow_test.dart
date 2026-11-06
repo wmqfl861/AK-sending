@@ -241,6 +241,68 @@ void main() {
     expect(find.byKey(const ValueKey('flow_pairing_code')), findsNothing);
   });
 
+  testWidgets('P2-04: cancelling the wait REVOKES the unconsumed code '
+      'engine-side (disconnect by code_id)', (tester) async {
+    final fake = await pumpApp(tester);
+
+    await chooseRole(tester, const ValueKey('role_receive_button'));
+    final code = fake.createdCodes.single;
+    expect(code.codeId, isNotNull, reason: 'fake 也上交 code_id（契约先行）');
+
+    await tester.tap(find.byKey(const ValueKey('flow_cancel_button')));
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(fake.disconnectRequests, contains(code.codeId),
+        reason: '取消等待必须触发原生撤码调用（disconnect(code_id)）');
+    expect(fake.pendingCode, isNull, reason: '被撤销的码不得再可兑换');
+    expect(find.byKey(const ValueKey('home_create_code_button')),
+        findsOneWidget);
+  });
+
+  testWidgets('R29-P2-04: re-tapping the selected role deselects cleanly '
+      '(no empty-set crash) and the submit disables until re-picked',
+      (tester) async {
+    final fake = await pumpApp(tester);
+    final minted = await fake.createCode(TaskRole.send);
+
+    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(
+        find.byKey(const ValueKey('join_code_field')), minted.code);
+    await tester.pump();
+
+    final segment = find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('发送文件'));
+    await tester.tap(segment);
+    await tester.pump();
+    var submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull, reason: '选定角色后提交可用');
+
+    // Re-tap the SAME segment: the empty selection must resolve to a null
+    // role (never `selection.first` on an empty set), and the submit
+    // disables — an empty selection can never enter the join.
+    await tester.tap(segment);
+    await tester.pump();
+    expect(tester.takeException(), isNull,
+        reason: '再次点击已选角色不得抛出空集合异常（R29-P2-04）');
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNull,
+        reason: '取消选择后提交必须禁用（空选择不得进入配对）');
+    expect(fake.joinCodeCalls, 0, reason: '空选择绝不应发起 join');
+
+    // Re-picking restores the submit.
+    await tester.tap(segment);
+    await tester.pump();
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull, reason: '重新选定后提交恢复可用');
+  });
+
   testWidgets('network change drops connections: the list follows',
       (tester) async {
     final fake = await pumpApp(tester);

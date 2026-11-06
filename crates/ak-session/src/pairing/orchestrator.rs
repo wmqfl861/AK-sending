@@ -535,7 +535,7 @@ impl PairingOrchestrator {
             .send_pair_applied(pairing_id, digest, committed.commit_revision, signature)
             .await
             .map_err(map_client)?;
-        wait_ready(plane, pairing_id, digest, self.config.ready_wait_ms).await?;
+        wait_ready(&self.client, plane, pairing_id, digest, self.config.ready_wait_ms).await?;
         self.journal.mark_applied(&pairing_id)?;
         Ok(committed.verified)
     }
@@ -589,7 +589,7 @@ impl PairingOrchestrator {
 
         // ← PairChallenge (relayed owner transcript + owner proof).
         let (transcript, owner_proof) =
-            match wait_frame(plane, pairing_id, deadline.saturating_add(5_000), |frame| {
+            match wait_frame(&self.client, plane, pairing_id, deadline.saturating_add(5_000), |frame| {
                 pairing_challenge_of(frame, pairing_id)
             })
             .await?
@@ -652,6 +652,7 @@ impl PairingOrchestrator {
 
         // ← PairCommit (authoritative).
         let commit = match wait_frame(
+            &self.client,
             plane,
             pairing_id,
             deadline.saturating_add(10_000),
@@ -976,6 +977,7 @@ impl PairingOrchestrator {
 
         // ← PairProof (redeemer's half).
         let redeemer_proof = match wait_frame(
+            &self.client,
             &mut plane,
             pairing_id,
             redeem.deadline_ms.saturating_add(5_000),
@@ -1003,6 +1005,7 @@ impl PairingOrchestrator {
             .await
             .map_err(map_client)?;
         let commit = match wait_frame(
+            &self.client,
             &mut plane,
             pairing_id,
             redeem.deadline_ms.saturating_add(10_000),
@@ -1078,7 +1081,7 @@ impl PairingOrchestrator {
                     {
                         return Err(recover_unverifiable());
                     }
-                    if wait_ready(&mut plane, pairing_id, [0u8; 32], 10_000)
+                    if wait_ready(&self.client, &mut plane, pairing_id, [0u8; 32], 10_000)
                         .await
                         .is_ok()
                     {
@@ -1090,6 +1093,7 @@ impl PairingOrchestrator {
                     // The server re-sends the fixed PairCommit right after
                     // the status reply.
                     let commit = match wait_frame(
+                        &self.client,
                         &mut plane,
                         pairing_id,
                         now_unix_ms().saturating_add(10_000),
@@ -1135,9 +1139,15 @@ impl PairingOrchestrator {
                         .send_pair_applied(pairing_id, digest, commit.commit_revision, signature)
                         .await
                         .map_err(map_client)?;
-                    if wait_ready(&mut plane, pairing_id, digest, self.config.ready_wait_ms)
-                        .await
-                        .is_ok()
+                    if wait_ready(
+                        &self.client,
+                        &mut plane,
+                        pairing_id,
+                        digest,
+                        self.config.ready_wait_ms,
+                    )
+                    .await
+                    .is_ok()
                     {
                         self.journal.mark_applied(&pairing_id)?;
                         applied.push(pairing_id);
@@ -1548,7 +1558,18 @@ fn hex(id: &[u8; 16]) -> String {
 /// `Ok(None)` = timeout. Pairing-scoped `PairError` frames (deadline
 /// ghosts, revoke/sweep aborts — including the all-zero object id the
 /// ghost path uses) surface as unified flow errors.
+///
+/// Wave 30 (review 2026-11-07, R29-P2-01): the commit-time
+/// `REDEEM_EXHAUSTED` refusal is CODE-scoped — it names the code, not
+/// the losing pairing, and carries the all-zero request id — so it
+/// cannot be matched the way pairing-scoped errors are. It is attributed
+/// by asking the registry about OUR pairing: the server aborted the
+/// losing transaction when it refused the commit, so a pairing that no
+/// longer exists server-side was ours (fail promptly with the exhausted
+/// refusal instead of waiting out the commit deadline); a pairing that
+/// is still alive belongs to another flow and this one keeps waiting.
 async fn wait_frame<T, F>(
+    client: &RegistryClient,
     plane: &mut mpsc::Receiver<CtrlMessage>,
     pairing_id: [u8; 16],
     until_ms: u64,
@@ -1566,13 +1587,21 @@ where
             Ok(None) => return Err(PairFlowError::Client(ClientError::ConnectionLost)),
         };
         if let CtrlMessage::PairError {
-            scope: ak_signal::protocol_v2::ErrorScope::Pairing,
+            scope,
             object_id,
             code,
             ..
         } = &frame
         {
-            if *object_id == pairing_id || *object_id == [0u8; 16] {
+            if *scope == ak_signal::protocol_v2::ErrorScope::Pairing
+                && (*object_id == pairing_id || *object_id == [0u8; 16])
+            {
+                return Err(PairFlowError::from_pair_code(*code));
+            }
+            if *scope == ak_signal::protocol_v2::ErrorScope::Code
+                && *code == ak_signal::protocol_v2::message::REDEEM_EXHAUSTED
+                && code_scoped_refusal_is_ours(client, pairing_id).await
+            {
                 return Err(PairFlowError::from_pair_code(*code));
             }
         }
@@ -1580,6 +1609,20 @@ where
             return Ok(Some(value));
         }
     }
+}
+
+/// Attribute one code-scoped `REDEEM_EXHAUSTED` refusal (R29-P2-01):
+/// `true` when OUR pairing no longer exists server-side (the server
+/// aborted it at the commit linearization point — the refusal was for
+/// us); `false` when the transaction is still alive (the refusal
+/// belonged to another flow of the same device) or the status round trip
+/// itself failed for transport reasons (then the ordinary wait — and its
+/// deadline — still bounds the flow).
+async fn code_scoped_refusal_is_ours(client: &RegistryClient, pairing_id: [u8; 16]) -> bool {
+    matches!(
+        client.pair_status_query(pairing_id).await,
+        Err(ClientError::Pair { .. })
+    )
 }
 
 fn pairing_challenge_of(
@@ -1632,13 +1675,14 @@ fn pair_commit_of(frame: &CtrlMessage, pairing_id: [u8; 16]) -> Option<CommitVie
 
 /// Wait for `PairReady` of one pairing (digest `[0;32]` accepts any).
 async fn wait_ready(
+    client: &RegistryClient,
     plane: &mut mpsc::Receiver<CtrlMessage>,
     pairing_id: [u8; 16],
     digest: [u8; 32],
     wait_ms: u64,
 ) -> Result<(), PairFlowError> {
     let until = now_unix_ms().saturating_add(wait_ms);
-    match wait_frame(plane, pairing_id, until, |frame| match frame {
+    match wait_frame(client, plane, pairing_id, until, |frame| match frame {
         CtrlMessage::PairReady {
             pairing_id: pid,
             transcript_digest,

@@ -2,9 +2,14 @@
 /// and event sequences, driven end to end by [FakeAkTaskCalls] (the same
 /// shipped fake — no DLL, no sockets; the Rust side covers the real
 /// bytes).
+///
+/// Wave-30 additions: per-LISTEN snapshot replay (P1-06 completion),
+/// code-id cancel (P2-04), the `done` terminal semantics (P2-05/P2-08),
+/// the request's saveDir snapshot (P2-06), progress-renewed stall
+/// timeouts (P2-10) and native consent expiry (P2-11).
 library;
 
-import 'dart:async' show TimeoutException;
+import 'dart:async' show Timer, TimeoutException;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show AkFfiException, FakeAkTaskCalls, TaskDoneEvent;
@@ -60,8 +65,8 @@ void main() {
         () async {
       final fake = FakeAkTaskCalls();
       final creator = booted(fake);
-      final code = await creator.createCode(SimpleTransferRole.receiver);
-      expect(code.startsWith('AKI1-'), isTrue);
+      final created = await creator.createCode(SimpleTransferRole.receiver);
+      expect(created.code.startsWith('AKI1-'), isTrue);
       expect(creator.phase, SimpleTransferPhase.paired);
 
       // The peer joins (second runtime on the same fake = same engine).
@@ -72,7 +77,7 @@ void main() {
       );
       joiner.start(
           registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/joiner');
-      await joiner.join(code);
+      await joiner.join(created.code);
       expect(joiner.phase, SimpleTransferPhase.paired);
 
       creator.pumpEvents();
@@ -88,8 +93,8 @@ void main() {
     test('joiner connection list reflects probing → connected', () async {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
-      final code = await service.createCode(SimpleTransferRole.sender);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
       expect(joined.role, 'receiver');
       expect(joined.probe, 'verified');
       expect(service.currentConnections, hasLength(1));
@@ -113,8 +118,8 @@ void main() {
       expect(service.phase, SimpleTransferPhase.failed);
       expect(service.failureReason, contains('registry relay down'));
       // A retry leaves the failure sink.
-      final code = await service.createCode(SimpleTransferRole.sender);
-      expect(code.startsWith('AKI1-'), isTrue);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      expect(created.code.startsWith('AKI1-'), isTrue);
       expect(service.phase, SimpleTransferPhase.paired);
       service.dispose();
     });
@@ -123,8 +128,8 @@ void main() {
         () async {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
-      final code = await service.createCode(SimpleTransferRole.sender);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
       service.pumpEvents();
       expect(service.phase, SimpleTransferPhase.connected);
 
@@ -146,8 +151,8 @@ void main() {
     test('incoming_request → consent → done', () async {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
-      final code = await service.createCode(SimpleTransferRole.receiver);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      final joined = await service.join(created.code);
       service.pumpEvents();
 
       final requests = <SimpleIncomingRequest>[];
@@ -201,11 +206,16 @@ void main() {
       senderService.start(
           registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/s2');
       final receiverCode = await service.createCode(SimpleTransferRole.receiver);
-      final joined = await senderService.join(receiverCode);
+      final joined = await senderService.join(receiverCode.code);
       expect(joined.role, 'sender');
       await senderService.sendFiles(joined.connId, const ['C:/pics/a.jpg']);
       senderService.pumpEvents();
-      expect(senderService.phase, SimpleTransferPhase.connected);
+      // Wave-30 P2-05: the one-task transfer COMPLETED — the fake emits
+      // the `done` event with the op announcement and the row converges
+      // to the completed terminal state (phase back to idle).
+      expect(senderService.currentConnections.first.state, 'done',
+          reason: '发送完成后行收敛为完成态');
+      expect(senderService.phase, SimpleTransferPhase.idle);
       service.dispose();
       senderService.dispose();
     });
@@ -225,17 +235,17 @@ void main() {
 
   // -------------------------------------------------------------------------
   // Wave-29 review fixes: snapshot replay (P1-06), state merging
-  // (P2-08/P2-09), timeout cancels (P2-10), consent expiry (P2-11).
+  // (P2-08/P2-09), timeout cancels (P2-10).
   // -------------------------------------------------------------------------
 
-  group('wave-29 P1-06: connections replay per subscriber', () {
+  group('P1-06: connections replay per LISTEN', () {
     test('a LATE subscriber (the detail-page shape) receives the current '
         'list while an earlier listener stays attached and no event follows',
         () async {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
-      final code = await service.createCode(SimpleTransferRole.sender);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
       service.pumpEvents(); // connected + probe flip the row; no further events
       expect(service.currentConnections.first.state, 'connected');
 
@@ -264,6 +274,43 @@ void main() {
       await late.cancel();
       service.dispose();
     });
+
+    test('wave-30 residual: TWO listens of the SAME saved stream object '
+        'each receive the snapshot first (broadcast onListen only fired '
+        'once — this is the exact residual shape)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'connected');
+
+      // The consumer HOLDS the stream object and subscribes twice.
+      final stream = service.connections;
+      final firstSightings = <List<SimpleConnection>>[];
+      final secondSightings = <List<SimpleConnection>>[];
+      final first = stream.listen(firstSightings.add);
+      final second = stream.listen(secondSightings.add);
+      await pumpEventQueue();
+
+      expect(firstSightings, isNotEmpty,
+          reason: '同一流对象的第一订阅必须拿到快照');
+      expect(secondSightings, isNotEmpty,
+          reason: '同一流对象的第二订阅也必须拿到快照（P1-06 残项）');
+      expect(firstSightings.first.first.connId, joined.connId);
+      expect(secondSightings.first.first.connId, joined.connId);
+      expect(secondSightings.first.first.state, 'connected');
+
+      // Cancelling ONE listener keeps the other live (per-listen taps).
+      await first.cancel();
+      await service.disconnect(joined.connId);
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(secondSightings.last.first.state, 'disconnected',
+          reason: '取消一个订阅后，其余订阅仍收到 live 事件');
+      await second.cancel();
+      service.dispose();
+    });
   });
 
   group('wave-29 P2-09: monotonic state merging', () {
@@ -272,8 +319,8 @@ void main() {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
       final runtimeId = fake.runtimes.keys.first;
-      final code = await service.createCode(SimpleTransferRole.sender);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
       // Overwrite the fake's queued probe event with a FAILED verdict.
       final runtime = fake.runtimes[runtimeId]!;
       runtime.events.removeWhere((e) => e['event'] == 'probe_result');
@@ -299,9 +346,9 @@ void main() {
       // PENDING: the join future keeps polling while we drive events.
       final codeFuture = service.createCode(SimpleTransferRole.sender);
       fake.pumpOps(runtimeId);
-      final code = await codeFuture;
+      final created = await codeFuture;
 
-      final joinFuture = service.join(code);
+      final joinFuture = service.join(created.code);
       // The fake queued connected + probe_result at the join call: pump
       // them through the event path BEFORE the op result resolves.
       service.pumpEvents();
@@ -324,9 +371,9 @@ void main() {
       final runtimeId = fake.runtimes.keys.first;
       final codeFuture = service.createCode(SimpleTransferRole.sender);
       fake.pumpOps(runtimeId);
-      final code = await codeFuture;
+      final created = await codeFuture;
 
-      final joinFuture = service.join(code);
+      final joinFuture = service.join(created.code);
       service.pumpEvents(); // connected + probe
       final connId = service.currentConnections.first.connId;
       // The data plane dies BEFORE the join result arrives.
@@ -346,14 +393,14 @@ void main() {
     });
   });
 
-  group('wave-29 P2-08: disconnect reasons are source-separated', () {
+  group('P2-05/P2-08: terminal semantics are source-separated', () {
     test('a coordination-plane notice keeps a healthy data connection '
         'alive; a data-plane reason kills the row', () async {
       final fake = FakeAkTaskCalls();
       final service = booted(fake);
       final runtimeId = fake.runtimes.keys.first;
-      final code = await service.createCode(SimpleTransferRole.sender);
-      final joined = await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
       service.pumpEvents();
       final runtime = fake.runtimes[runtimeId]!;
       final before = service.currentConnections.first.state;
@@ -382,13 +429,172 @@ void main() {
       expect(service.phase, SimpleTransferPhase.idle);
       service.dispose();
     });
+
+    test('wave-30 P2-05: the done EVENT converges the row to the '
+        'completed terminal state — no send entry is offered afterwards',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'connected');
+
+      fake.emitDone(runtimeId, connId: joined.connId, files: 2, bytes: 42);
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'done',
+          reason: 'done 事件必须把行收敛为完成态（P2-05）');
+      expect(service.phase, SimpleTransferPhase.idle,
+          reason: '完成态与断开同样终结核阶段');
+      // The completed row is terminal: a late probe/connected event must
+      // not revive it (monotonic rank).
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'probe_result',
+        'conn': joined.connId,
+        'endpoint': null,
+        'reachable': true,
+      });
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'done',
+          reason: 'done 后行不得被复活');
+      service.dispose();
+    });
+
+    test('wave-30 P2-05: the done DISCONNECT REASON converges the row '
+        'the same way (registry still never does)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.sender);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'disconnected',
+        'conn': joined.connId,
+        'reason': 'done',
+      });
+      service.pumpEvents();
+      expect(service.currentConnections.first.state, 'done');
+      expect(service.phase, SimpleTransferPhase.idle);
+      service.dispose();
+    });
   });
 
-  group('wave-29 P2-10: send timeout cancels the native task', () {
-    test('a timed-out send disconnects the connection (the FFI cancel '
-        'path) and throws a message that says so', () async {
+  group('wave-30 P2-04: code-id cancel of an un-joined code', () {
+    test('createCode hands up the engine code_id; disconnect(codeId) '
+        'reaches the native revoke and the code dies', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      expect(created.codeId, isNotNull,
+          reason: 'create 结果必须上交 code_id（P2-04）');
+      expect(created.codeId, isNot(created.code));
+
+      await service.disconnect(created.codeId!);
+      expect(fake.disconnectCalls, contains(created.codeId),
+          reason: '取消必须走原生撤码调用（disconnect by code_id）');
+      // The registry row is revoked: a later join of the cancelled code
+      // fails (the fake's code table dropped it) — the code is dead.
+      final joiner = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      joiner.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/c1');
+      await expectLater(joiner.join(created.code), throwsA(isA<AkFfiException>()));
+      service.dispose();
+      joiner.dispose();
+      expect(fake.runtimes[runtimeId], isNotNull);
+    });
+  });
+
+  group('wave-30 P2-06: the incoming request carries its saveDir', () {
+    test('the event field flows to the request untouched (the offer-time '
+        'snapshot, not the live setting)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      await service.join(created.code);
+      service.pumpEvents();
+      await service.setSaveDir('D:/new-setting');
+
+      final requests = <SimpleIncomingRequest>[];
+      final sub = service.incomingRequests.listen(requests.add);
+      fake.emitIncomingRequest(runtimeId,
+          files: 1, bytes: 10, saveDir: 'D:/offer-time-folder');
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(requests, hasLength(1));
+      expect(requests.first.saveDir, 'D:/offer-time-folder',
+          reason: '请求必须带 native 侧快照目录（事件字段为准）');
+      await sub.cancel();
+      service.dispose();
+    });
+  });
+
+  group('wave-30 P2-10: progress-renewed stall timeouts', () {
+    test('a send with CONTINUOUS progress outlives the nominal timeout; '
+        'only a true stall is cut', () async {
       final fake = FakeAkTaskCalls(autoCompleteOps: false);
-      final receiver = booted(fake);
+      final receiver = SimpleTransferService(
+        calls: fake,
+        eventPollInterval: const Duration(days: 1), // real delay below
+      );
+      receiver.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30a');
+      final receiverRuntime = fake.runtimes.keys.first;
+      final receiverCodeFuture =
+          receiver.createCode(SimpleTransferRole.receiver);
+      fake.pumpOps(receiverRuntime);
+      final receiverCode = await receiverCodeFuture;
+
+      final sender = SimpleTransferService(
+        calls: fake,
+        eventPollInterval: const Duration(days: 1),
+        opPollInterval: const Duration(milliseconds: 20),
+      );
+      sender.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30b');
+      final senderRuntime = fake.runtimes.keys.last;
+      final joinFuture = sender.join(receiverCode.code);
+      fake.pumpOps(senderRuntime);
+      final joined = await joinFuture;
+      sender.pumpEvents();
+
+      // The op never completes on its own; the send is IN FLIGHT while
+      // progress lines keep arriving (the send row keys them by the
+      // CONNECTION id). 200 ms stall budget with 600 ms of progress —
+      // the old overall cap would have cut at 200 ms; the stall budget
+      // must not.
+      final sendFuture = sender.sendFiles(joined.connId, const ['C:/big.bin'],
+          timeout: const Duration(milliseconds: 200));
+      final progress = Timer.periodic(const Duration(milliseconds: 25),
+          (_) => fake.emitProgress(joined.connId));
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      fake.pumpOps(senderRuntime); // the long transfer finally completes
+      final report = await sendFuture;
+      progress.cancel();
+      expect(report['files'], 1,
+          reason: '持续进度的长传输不得被停滞预算误杀（P2-10）');
+      receiver.dispose();
+      sender.dispose();
+    });
+
+    test('a stalled send (no progress line) is cut by the stall budget '
+        'and the cancel path disconnects the native connection', () async {
+      final fake = FakeAkTaskCalls(autoCompleteOps: false);
+      final receiver = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      receiver.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30c');
       final receiverRuntime = fake.runtimes.keys.first;
       final receiverCodeFuture =
           receiver.createCode(SimpleTransferRole.receiver);
@@ -400,80 +606,103 @@ void main() {
         eventPollInterval: const Duration(days: 1),
       );
       sender.start(
-          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w29');
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30d');
       final senderRuntime = fake.runtimes.keys.last;
-      final codeFuture = sender.join(receiverCode);
+      final codeFuture = sender.join(receiverCode.code);
       fake.pumpOps(senderRuntime);
       final joined = await codeFuture;
       sender.pumpEvents();
 
-      // The send op never completes; a zero timeout trips immediately.
+      // No progress ever: the stall budget trips.
       await expectLater(
         sender.sendFiles(joined.connId, const ['C:/big.bin'],
             timeout: Duration.zero),
         throwsA(isA<TimeoutException>()
             .having((e) => e.message, 'message', contains('已取消原生发送任务'))),
       );
-      // The cancel path ran: the fake's connection is disconnected and
-      // the local row folded.
       expect(
         fake.runtimes[senderRuntime]!.connections[joined.connId]!.state,
         'disconnected',
-        reason: '超时后必须走 FFI 断开取消原生任务',
+        reason: '停滞超时后必须走 FFI 断开取消原生任务',
       );
       expect(sender.currentConnections.first.state, 'disconnected');
       receiver.dispose();
       sender.dispose();
     });
-  });
 
-  group('wave-29 P2-11: the 30 s consent window is observable', () {
-    test('an undecided request expires onto expiredIncomingRequests and '
-        'a later consent answers false', () async {
-      final fake = FakeAkTaskCalls();
-      final service = SimpleTransferService(
+    test('a FAILED cancel never claims 已取消 — the error surfaces '
+        'honestly', () async {
+      final fake = FakeAkTaskCalls(autoCompleteOps: false);
+      final receiver = SimpleTransferService(
         calls: fake,
         delay: immediate,
         eventPollInterval: const Duration(days: 1),
-        consentWindow: const Duration(milliseconds: 30),
       );
-      service.start(
-          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/p29');
+      receiver.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30e');
+      final receiverRuntime = fake.runtimes.keys.first;
+      final receiverCodeFuture =
+          receiver.createCode(SimpleTransferRole.receiver);
+      fake.pumpOps(receiverRuntime);
+      final receiverCode = await receiverCodeFuture;
+      final sender = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      sender.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/w30f');
+      final senderRuntime = fake.runtimes.keys.last;
+      final codeFuture = sender.join(receiverCode.code);
+      fake.pumpOps(senderRuntime);
+      final joined = await codeFuture;
+      sender.pumpEvents();
+
+      fake.nextDisconnectFails = 'engine busy';
+      await expectLater(
+        sender.sendFiles(joined.connId, const ['C:/big.bin'],
+            timeout: Duration.zero),
+        throwsA(isA<TimeoutException>().having((e) => e.message, 'message',
+            allOf(contains('取消原生任务失败'), contains('engine busy')))),
+      );
+      receiver.dispose();
+      sender.dispose();
+    });
+  });
+
+  group('wave-30 P2-11: consent expiry is a native event, not a timer', () {
+    test('the consent_expired event fires expiredIncomingRequests and a '
+        'later consent answers false', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
       final runtimeId = fake.runtimes.keys.first;
-      final code = await service.createCode(SimpleTransferRole.receiver);
-      await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      await service.join(created.code);
       service.pumpEvents();
 
       final expired = <String>[];
       final sub = service.expiredIncomingRequests.listen(expired.add);
       final job = fake.emitIncomingRequest(runtimeId, files: 1, bytes: 10);
       service.pumpEvents();
-      expect(expired, isEmpty, reason: '窗口内不应到期');
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      expect(expired, [job], reason: '30 秒窗口（测试中缩短）后必须通知 UI');
+      expect(expired, isEmpty, reason: '事件到来前不应到期');
 
-      // The engine already auto-declined (the fake has no timer of its
-      // own — drop the pending entry to model that engine-side state):
-      // a late decision answers false.
-      fake.runtimes[runtimeId]!.pendingConsents.remove(job);
-      expect(await service.consent(job, accept: true), isFalse);
+      fake.expireConsent(runtimeId, job); // the native 30 s window closed
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(expired, [job],
+          reason: '原生 consent_expired 事件必须驱动横幅关闭（P2-11）');
+      expect(await service.consent(job, accept: true), isFalse,
+          reason: '引擎已自动拒绝：迟到决定为 no-op');
       await sub.cancel();
       service.dispose();
     });
 
     test('a decided request never expires', () async {
       final fake = FakeAkTaskCalls();
-      final service = SimpleTransferService(
-        calls: fake,
-        delay: immediate,
-        eventPollInterval: const Duration(days: 1),
-        consentWindow: const Duration(milliseconds: 30),
-      );
-      service.start(
-          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/p30');
+      final service = booted(fake);
       final runtimeId = fake.runtimes.keys.first;
-      final code = await service.createCode(SimpleTransferRole.receiver);
-      await service.join(code);
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      await service.join(created.code);
       service.pumpEvents();
 
       final expired = <String>[];
@@ -481,8 +710,40 @@ void main() {
       final job = fake.emitIncomingRequest(runtimeId, files: 1, bytes: 10);
       service.pumpEvents();
       expect(await service.consent(job, accept: false), isTrue);
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      expect(expired, isEmpty, reason: 'consent 取消到期定时器');
+      fake.expireConsent(runtimeId, job); // decided: the engine stays quiet
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(expired, isEmpty, reason: '已决定的请求不再发出到期事件');
+      await sub.cancel();
+      service.dispose();
+    });
+
+    test('a data-plane terminal connection closes its pending banners '
+        '(the engine rejects pending offers with the connection)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.keys.first;
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      final joined = await service.join(created.code);
+      service.pumpEvents();
+
+      final expired = <String>[];
+      final sub = service.expiredIncomingRequests.listen(expired.add);
+      final job = fake.emitIncomingRequest(runtimeId,
+          connId: joined.connId, files: 1, bytes: 10);
+      service.pumpEvents();
+      expect(expired, isEmpty);
+
+      // The connection dies before the user answers.
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'disconnected',
+        'conn': joined.connId,
+        'reason': 'peer',
+      });
+      service.pumpEvents();
+      await pumpEventQueue();
+      expect(expired, [job],
+          reason: '连接断开必须关闭其 pending 横幅（P2-11）');
       await sub.cancel();
       service.dispose();
     });

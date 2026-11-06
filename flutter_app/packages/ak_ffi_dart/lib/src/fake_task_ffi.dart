@@ -19,7 +19,17 @@
 /// * the event queue is FIFO and `runtime_ready` / `op_done` / `op_failed`
 ///   mirror the engine's announcement order;
 /// * `incoming_request` events are SCRIPTED by the test
-///   ([emitIncomingRequest]) — the fake has no real network peer.
+///   ([emitIncomingRequest]) — the fake has no real network peer — and
+///   carry the request's snapshotted `saveDir` (wave-30 P2-06);
+/// * the native 30 s consent window is SCRIPTED via [expireConsent]
+///   (wave-30 P2-11: the engine emits `consent_expired`, never a local
+///   Dart timer);
+/// * the ENGINE-WIDE progress queue (`ak_poll_progress`, wave-30 P2-10)
+///   is scripted via [emitProgress] and read through [pollProgress];
+/// * `ak_task_disconnect` covers UN-JOINED code cancellation by
+///   `code_id` (wave-30 P2-04): the code is revoked (later joins fail)
+///   and a `code_cancelled` event is emitted; every disconnect call is
+///   recorded in [disconnectCalls] for assertions.
 ///
 /// What it deliberately does NOT model: real sockets, real bytes, the
 /// 30 s consent timer (decide via [consent] or leave it — no auto-decline
@@ -82,6 +92,18 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   /// Every spec JSON the fake accepted, newest last (assertion material).
   final List<String> acceptedSpecs = <String>[];
 
+  /// Hex ids of EVERY `ak_task_disconnect` call, in order (connections
+  /// AND un-joined code ids — the wave-30 P2-04 cancel assertion hook).
+  final List<String> disconnectCalls = <String>[];
+
+  /// When set, the NEXT disconnect call fails with this detail (the
+  /// honest-cancel-failure rehearsal of wave-30 P2-10).
+  String? nextDisconnectFails;
+
+  /// The ENGINE-WIDE progress queue (`ak_poll_progress`) — FIFO lines
+  /// pushed by [emitProgress] and drained by [pollProgress].
+  final List<Map<String, dynamic>> progressLines = <Map<String, dynamic>>[];
+
   // -- seam ------------------------------------------------------------
 
   @override
@@ -133,13 +155,17 @@ final class FakeAkTaskCalls implements AkTaskCalls {
     }
     final op = _mintOp(runtime, 'task_create_code', opIdOut);
     final code = _mintDisplayCode();
+    final codeId = _hex(_newId());
     runtime.codes.add(_codeKey(code));
     runtime.roleOfCode[_codeKey(code)] = role as String;
+    // The code_id is minted ONCE and registered for the fake's cancel
+    // path (wave-30 P2-04: ak_task_disconnect by code_id revokes it).
+    runtime.codeIdOfCode[_codeKey(code)] = codeId;
     op.body = () => <String, dynamic>{
       'op': 'task_create_code',
       'code': code,
       'role': role,
-      'code_id': _hex(_newId()),
+      'code_id': codeId,
       'expires_ms': 0,
       'endpoint': '127.0.0.1:45${(400 + runtime.codes.length * 7) % 100}',
     };
@@ -319,26 +345,58 @@ final class FakeAkTaskCalls implements AkTaskCalls {
     if (runtime == null) {
       return _fail(AkStatus.errNotFound, 'fake: 未知任务运行时');
     }
-    final conn = runtime.connections[_hex(connId)];
+    final id = _hex(connId);
+    disconnectCalls.add(id);
+    final scripted = nextDisconnectFails;
+    if (scripted != null) {
+      nextDisconnectFails = null;
+      return _fail(AkStatus.errInternal, scripted);
+    }
+    final conn = runtime.connections[id];
     if (conn == null) {
-      return _fail(AkStatus.errNotFound, 'fake: 未知连接 ${_hex(connId)}');
+      // Wave-30 P2-04: cancelling an UN-JOINED code by its code_id
+      // revokes the registry row (later joins fail) and emits
+      // `code_cancelled`; repeated cancels stay silently OK; unknown
+      // ids keep the engine's `-4`.
+      if (runtime.cancelledCodeIds.contains(id)) {
+        return _ok(); // already revoked — silent AK_OK
+      }
+      final keyOf = runtime.codeIdOfCode.entries
+          .where((entry) => entry.value == id)
+          .map((entry) => entry.key)
+          .toList();
+      if (keyOf.isEmpty) {
+        return _fail(AkStatus.errNotFound, 'fake: 未知连接 $id');
+      }
+      for (final key in keyOf) {
+        runtime.codes.remove(key);
+        runtime.roleOfCode.remove(key);
+        runtime.codeIdOfCode.remove(key);
+      }
+      if (runtime.cancelledCodeIds.add(id)) {
+        runtime.events.add(<String, dynamic>{
+          'event': 'code_cancelled',
+          'code_id': id,
+        });
+      }
+      return _ok();
     }
     if (conn.state != 'disconnected') {
       conn.state = 'disconnected';
       runtime.events.add(<String, dynamic>{
         'event': 'disconnected',
-        'conn': _hex(connId),
+        'conn': id,
         'reason': 'local',
       });
       // Bilateral: the peer runtime hears `peer`.
       for (final other in runtimes.values) {
         if (identical(other, runtime)) continue;
-        final peerConn = other.connections[_hex(connId)];
+        final peerConn = other.connections[id];
         if (peerConn != null && peerConn.state != 'disconnected') {
           peerConn.state = 'disconnected';
           other.events.add(<String, dynamic>{
             'event': 'disconnected',
-            'conn': _hex(connId),
+            'conn': id,
             'reason': 'peer',
           });
         }
@@ -424,17 +482,36 @@ final class FakeAkTaskCalls implements AkTaskCalls {
     return wrote; // -3: nothing consumed
   }
 
+  @override
+  int pollProgress(Uint8List buffer, int cap) {
+    // The ENGINE-WIDE queue (no runtime scoping — one fake == one engine).
+    if (progressLines.isEmpty) {
+      _lastErrorDetail = null;
+      return AkStatus.pending;
+    }
+    final payload = jsonEncode(progressLines.first);
+    final wrote = _writePayload(payload, buffer, cap);
+    if (wrote > 0) {
+      progressLines.removeAt(0);
+      return 1;
+    }
+    return wrote; // -3: nothing consumed
+  }
+
   // -- scripting -------------------------------------------------------
 
   /// Emits one `incoming_request` on [runtimeIdHex]'s queue and registers
   /// the job for a later [consent] (the pending-request id is returned as
-  /// hex).
+  /// hex). The event carries the request's snapshotted `saveDir`
+  /// (wave-30 P2-06) — the runtime's save dir at OFFER time unless the
+  /// test scripts an explicit target.
   String emitIncomingRequest(
     String runtimeIdHex, {
     String? connId,
     String rootName = 'photos',
     int files = 1,
     int bytes = 4096,
+    String? saveDir,
   }) {
     final runtime = runtimes[runtimeIdHex];
     if (runtime == null) {
@@ -442,6 +519,9 @@ final class FakeAkTaskCalls implements AkTaskCalls {
     }
     final job = _hex(_newId());
     runtime.pendingConsents.add(job);
+    if (connId != null) {
+      runtime.jobConn[job] = connId;
+    }
     runtime.events.add(<String, dynamic>{
       'event': 'incoming_request',
       'job': job,
@@ -449,8 +529,41 @@ final class FakeAkTaskCalls implements AkTaskCalls {
       'root': rootName,
       'files': files,
       'bytes': bytes,
+      'saveDir': saveDir ?? runtime.saveDir,
     });
     return job;
+  }
+
+  /// Simulates the native 30 s consent window closing on [jobId]
+  /// undecided (wave-30 P2-11): the pending entry is removed (a later
+  /// consent answers `-4`) and the terminal `consent_expired` event is
+  /// queued. A no-op for unknown/already-decided jobs (the engine never
+  /// emits the event for them).
+  void expireConsent(String runtimeIdHex, String jobId) {
+    final runtime = runtimes[runtimeIdHex];
+    if (runtime == null) {
+      throw StateError('fake: 未知运行时 $runtimeIdHex');
+    }
+    if (!runtime.pendingConsents.remove(jobId)) {
+      return;
+    }
+    runtime.events.add(<String, dynamic>{
+      'event': 'consent_expired',
+      'job': jobId,
+      for (final entry in runtime.jobConn.entries)
+        if (entry.key == jobId) 'conn': entry.value,
+    });
+  }
+
+  /// Pushes one line onto the ENGINE-WIDE progress queue
+  /// (`ak_poll_progress`, wave-30 P2-10): send rows key `job` by the
+  /// CONNECTION id, receive rows by the CODE id — the same correlation
+  /// the real engine uses (ffi-v2 §8.4).
+  void emitProgress(String jobId, {String event = 'chunk_sent'}) {
+    progressLines.add(<String, dynamic>{
+      'job': jobId,
+      'event': event,
+    });
   }
 
   /// Emits one `done` event on [runtimeIdHex]'s queue.
@@ -627,9 +740,20 @@ final class FakeTaskRuntime {
   final List<Map<String, dynamic>> events = <Map<String, dynamic>>[];
   final List<String> codes = <String>[];
   final Map<String, String> roleOfCode = <String, String>{};
+
+  /// Normalized code key → the minted code_id (wave-30 P2-04: the
+  /// `ak_task_disconnect` cancel key for un-joined codes).
+  final Map<String, String> codeIdOfCode = <String, String>{};
+
+  /// Code ids whose `code_cancelled` event already went out (repeated
+  /// cancels stay silently OK).
+  final Set<String> cancelledCodeIds = <String>{};
   final Map<String, TaskConnState> connections = <String, TaskConnState>{};
   final Set<String> pendingConsents = <String>{};
   final Map<String, bool> decisions = <String, bool>{};
+
+  /// Pending-request id → its connection (consent_expired attribution).
+  final Map<String, String> jobConn = <String, String>{};
   final Set<String> opIds = <String>{};
   String saveDir = 'C:/ak/downloads';
   String? nextOpFails;

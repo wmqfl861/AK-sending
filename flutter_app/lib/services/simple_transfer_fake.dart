@@ -144,6 +144,9 @@ class LocalSimpleTransferService implements SimpleTransferService {
     final code = TaskCode(
       code: 'AKI1-${groups.join('-')}',
       role: role,
+      // Wave-30 P2-04: the engine's cancel key. Deterministic from the
+      // same counter (the real engine mints a random 32-hex id).
+      codeId: 'codeid-$_codeSeq',
     );
     _pendingCode = code;
     createdCodes.add(code);
@@ -216,6 +219,13 @@ class LocalSimpleTransferService implements SimpleTransferService {
   Future<void> disconnect(String connId) async {
     disconnectCalls += 1;
     disconnectRequests.add(connId);
+    // Wave-30 P2-04: disconnecting an unconsumed code's codeId REVOKE it
+    // (the pending code dies — a later join fails) instead of dropping a
+    // connection row.
+    if (_pendingCode != null && _pendingCode!.codeId == connId) {
+      _pendingCode = null;
+      return;
+    }
     _dropConnection(connId);
   }
 
@@ -288,17 +298,22 @@ class LocalSimpleTransferService implements SimpleTransferService {
   // Test knobs — receive flow.
   // ---------------------------------------------------------------------
 
-  /// Emits an incoming transfer offer. Returns the jobId.
+  /// Emits an incoming transfer offer. Returns the jobId. The offer
+  /// carries its saveDir snapshot (wave-30 P2-06): the current save dir
+  /// at OFFER time unless scripted — the receive lands there even if the
+  /// settings change before the user answers.
   String emitIncomingRequest({
     String? jobId,
     required int fileCount,
     required int totalBytes,
+    String? saveDir,
   }) {
     final id = jobId ?? 'job-${_jobSeq += 1}';
     _incomingController.add(IncomingRequest(
       jobId: id,
       fileCount: fileCount,
       totalBytes: totalBytes,
+      saveDir: saveDir ?? _saveDir,
     ));
     return id;
   }

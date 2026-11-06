@@ -5,6 +5,8 @@
 /// `pairing_ffi_test.dart`).
 library;
 
+import 'dart:async' show Timer, TimeoutException;
+
 import 'package:ak_ffi_dart/ak_ffi_dart.dart';
 import 'package:test/test.dart';
 
@@ -335,20 +337,27 @@ void main() {
           'root': 'photos',
           'files': 2,
           'bytes': 99,
+          'saveDir': 'D:/inbox',
         }),
         TaskEvent.fromJson({'event': 'done', 'conn': 'cd' * 16, 'files': 2, 'bytes': 99}),
         TaskEvent.fromJson({'event': 'disconnected', 'conn': 'cd' * 16, 'reason': 'peer'}),
+        TaskEvent.fromJson({'event': 'disconnected', 'conn': 'cd' * 16, 'reason': 'done'}),
         TaskEvent.fromJson(
             {'event': 'op_failed', 'op_id': '12' * 16, 'op': 'task_join'}),
+        TaskEvent.fromJson({'event': 'consent_expired', 'job': 'ef' * 16}),
       ];
       expect(events[0], isA<TaskRuntimeReadyEvent>());
       expect(events[1], isA<TaskConnectedEvent>());
       expect(events[2], isA<TaskProbeResultEvent>());
       expect(events[3], isA<TaskIncomingRequestEvent>());
+      expect((events[3] as TaskIncomingRequestEvent).saveDir, 'D:/inbox');
       expect(events[4], isA<TaskDoneEvent>());
       expect(events[5], isA<TaskDisconnectedEvent>());
-      expect(events[6], isA<TaskOpSettledEvent>());
-      expect((events[6] as TaskOpSettledEvent).ok, isFalse);
+      expect((events[6] as TaskDisconnectedEvent).reason, 'done');
+      expect(events[7], isA<TaskOpSettledEvent>());
+      expect((events[7] as TaskOpSettledEvent).ok, isFalse);
+      expect(events[8], isA<TaskConsentExpiredEvent>());
+      expect((events[8] as TaskConsentExpiredEvent).job, 'ef' * 16);
     });
 
     test('unknown event names fall forward, broken payloads throw', () {
@@ -359,6 +368,139 @@ void main() {
           throwsA(isA<FormatException>()));
       expect(() => TaskEvent.fromJson({'event': 'done', 'files': 'many'}),
           throwsA(isA<FormatException>()));
+      expect(() => TaskEvent.fromJson({'event': 'consent_expired'}),
+          throwsA(isA<FormatException>()));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Wave-30: progress renewal (P2-10), code-id cancel (P2-04), native
+  // consent expiry (P2-11), the request's saveDir snapshot (P2-06).
+  // -------------------------------------------------------------------------
+
+  group('wave-30: engine-wide progress queue (P2-10)', () {
+    test('emitProgress feeds pollProgressLine; empty answers null; the -3 '
+        'grow loop is lossless', () {
+      final fake = FakeAkTaskCalls();
+      final runtime =
+          TaskFfi(calls: fake).start(AkTaskStartSpec(
+              registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/p1'));
+      expect(runtime.pollProgressLine(), isNull, reason: 'empty queue → null');
+
+      fake.emitProgress('cd' * 16);
+      fake.forceBufferTooSmallOnce = true; // first poll -3, retry lossless
+      final line = runtime.pollProgressLine();
+      expect(line, isNotNull);
+      expect(line, contains('"job":"cdcd'));
+      expect(fake.progressLines, isEmpty, reason: 'the line was consumed');
+      expect(runtime.pollProgressLine(), isNull);
+    });
+
+    test('wait(onPoll) renews the deadline — progress outlives the nominal '
+        'timeout, no progress stalls out', () async {
+      final fake = FakeAkTaskCalls(autoCompleteOps: false);
+      final runtime =
+          TaskFfi(calls: fake).start(AkTaskStartSpec(
+              registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/p2'));
+      final handle = runtime
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender));
+
+      // "Progress" keeps flowing while the op stays pending: 400 ms with
+      // a 120 ms budget — only renewal can carry the wait that far.
+      final progress = Timer.periodic(const Duration(milliseconds: 20),
+          (Timer _) => fake.emitProgress('cd' * 16));
+      final waiting = handle.wait(
+        interval: const Duration(milliseconds: 10),
+        timeout: const Duration(milliseconds: 120),
+        onPoll: () => runtime.pollProgressLine() != null,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      fake.pumpOps(runtime.runtimeIdHex); // settle: done
+      final result = await waiting;
+      progress.cancel();
+      expect(result['op'], 'task_create_code');
+
+      // Without progress the same budget is a stall deadline.
+      final stalled = runtime
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender));
+      await expectLater(
+        stalled.wait(
+          interval: const Duration(milliseconds: 5),
+          timeout: const Duration(milliseconds: 60),
+        ),
+        throwsA(isA<TimeoutException>()),
+      );
+    });
+  });
+
+  group('wave-30: code-id cancel (P2-04) and consent expiry (P2-11)', () {
+    test('disconnect(codeId) revokes an un-joined code, emits '
+        'code_cancelled, repeats silently, and the code is dead',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/c1'));
+      runtime.pollEvent(); // drain runtime_ready
+      final created = await runtime
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.receiver))
+          .wait(delay: immediateDelay);
+      final codeId = created['code_id'] as String;
+      expect(codeId, isNotEmpty);
+
+      runtime.disconnect(codeId); // the revoke
+      expect(fake.disconnectCalls, [codeId]);
+      final cancelled =
+          drainUntil(runtime, (event) => event.name == 'code_cancelled');
+      expect(cancelled, isNotNull, reason: '撤码必须发 code_cancelled 事件');
+
+      runtime.disconnect(codeId); // repeated cancel: silently OK
+      final joiner = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/c2'));
+      await expectLater(
+        joiner
+            .join(AkTaskJoinSpec(code: created['code'] as String))
+            .wait(delay: immediateDelay),
+        throwsA(isA<AkFfiException>()),
+        reason: '被撤销的码不能再兑换',
+      );
+    });
+
+    test('expireConsent mirrors the native window: pending removed, '
+        'consent_expired emitted, decided jobs stay quiet', () {
+      final fake = FakeAkTaskCalls();
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/x1'));
+      expect(runtime.pollEvent(), isA<TaskRuntimeReadyEvent>()); // drain
+
+      final job = fake.emitIncomingRequest(runtime.runtimeIdHex,
+          connId: 'cd' * 16, files: 1, bytes: 1);
+      final request = drainUntil(
+          runtime, (event) => event is TaskIncomingRequestEvent);
+      expect((request as TaskIncomingRequestEvent).saveDir, 'C:/ak/downloads',
+          reason: '未脚本化时 saveDir 默认为运行时当前目录');
+
+      fake.expireConsent(runtime.runtimeIdHex, job);
+      final expired =
+          drainUntil(runtime, (event) => event is TaskConsentExpiredEvent);
+      expect((expired as TaskConsentExpiredEvent).job, job);
+      expect(runtime.consent(job, accept: true), isFalse,
+          reason: '窗口已自动拒绝：迟到决定为 -4');
+
+      fake.expireConsent(runtime.runtimeIdHex, job); // decided: silent
+      expect(runtime.pollEvent(), isNull,
+          reason: '已决定的请求不再产生事件');
+    });
+
+    test('emitIncomingRequest carries a scripted saveDir (P2-06)', () {
+      final fake = FakeAkTaskCalls();
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/x2'));
+      runtime.pollEvent(); // drain runtime_ready
+      fake.emitIncomingRequest(runtime.runtimeIdHex,
+          files: 2, bytes: 9, saveDir: 'D:/offer-time');
+      final event =
+          drainUntil(runtime, (e) => e is TaskIncomingRequestEvent);
+      expect((event as TaskIncomingRequestEvent).saveDir, 'D:/offer-time');
     });
   });
 }

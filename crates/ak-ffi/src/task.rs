@@ -44,9 +44,13 @@
 //! transcript to `PairReady` OVER THE REGISTRY — a join across engines,
 //! processes and devices is the same code path as an in-process one. The
 //! owner side runs the resident task-aware owner loop
-//! (`spawn_owner_loop_verified` + `complete_owner_pairing`), so its
-//! `connected` event, connection entry, verified peer key and probe all
-//! come from the registry-relayed pairing, not from local state.
+//! (`spawn_owner_loop_verified` + `complete_owner_pairing`) BEHIND the
+//! pre-commit redeem-offer gate (`install_redeem_offer_gate`, wave-30
+//! P1-05: a same-direction or endpoint-less join is vetoed before the
+//! server commits, so the code's single redeem is never burned by a
+//! refused task), so its `connected` event, connection entry, verified
+//! peer key and probe all come from the registry-relayed pairing, not
+//! from local state.
 //!
 //! * **Peer identity** — the joiner pins the owner's device fingerprint
 //!   from `TaskPaired::verified.owner_fingerprint()` (the relayed,
@@ -75,15 +79,18 @@
 //!   at the registry (a pending redeem of a revoked code aborts), and the
 //!   [`TaskEvent`] stream (`TaskPairing::subscribe`) is pumped into the
 //!   task event queue: `TaskDisconnected{ByPeer}` → `disconnected` with
-//!   reason `peer`, `Network` → the frozen `receiver_failed` wording. A
-//!   `local` line is pushed directly by `ak_task_disconnect`, so the pump
-//!   never repeats it. While IDLE (no live transfer whose QUIC drop the
-//!   peer would see) the disconnecting side additionally dials the paired
-//!   peer's advertised data endpoint and hands it an authenticated
-//!   TASK-CLOSE Error frame (wave-29 P2-03), so the LISTENING peer
-//!   learns `ByPeer` immediately instead of staying "connected"; a peer
-//!   that never bound a data listener (a pure sender side) still learns
-//!   honestly at its next send, which fails to connect.
+//!   reason `peer`, `Network` → the frozen `receiver_failed` wording (a
+//!   genuine DATA-plane link loss — wave-30 P2-08: a registry/control
+//!   disconnect produces no task event at all; the data plane is
+//!   independent of the registry). A `local` line is pushed directly by
+//!   `ak_task_disconnect`, so the pump never repeats it. While IDLE (no
+//!   live transfer whose QUIC drop the peer would see) the disconnecting
+//!   side additionally dials the paired peer's advertised data endpoint
+//!   and hands it an authenticated TASK-CLOSE Error frame (wave-29
+//!   P2-03), so the LISTENING peer learns `ByPeer` immediately instead
+//!   of staying "connected"; a peer that never bound a data listener (a
+//!   pure sender side) still learns honestly at its next send, which
+//!   fails to connect.
 //!
 //! The endpoint blob each side registers carries its dial candidates:
 //! the RECEIVER side's real resident-receiver port first, then — when the
@@ -347,11 +354,18 @@ impl TaskRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnState {
     /// Paired over the registry, the `probe_peer` reachability test still
-    /// running (the entry flips to `connected` when the probe settles —
-    /// whichever way it settles; the verdict itself rides the
-    /// `probe_result` event and the join result).
+    /// running (the entry settles to `connected`/`unreachable` when the
+    /// probe verdict arrives — wave-30 P2-09: the settle is HONEST, a
+    /// total probe failure is not a `connected`; the verdict itself rides
+    /// the `probe_result` event and the join result).
     Probing,
     Connected,
+    /// Every advertised candidate failed the reachability probe
+    /// (wave-30 P2-09): the pairing stands and a send may still be
+    /// attempted (the probe proves UDP liveness of candidates, not
+    /// dialability of the QUIC path), but `ak_task_list` reports the
+    /// honest verdict instead of `connected`.
+    Unreachable,
     Disconnected,
 }
 
@@ -360,6 +374,7 @@ impl ConnState {
         match self {
             ConnState::Probing => "probing",
             ConnState::Connected => "connected",
+            ConnState::Unreachable => "unreachable",
             ConnState::Disconnected => "disconnected",
         }
     }
@@ -437,12 +452,14 @@ pub(crate) struct TaskCodeEntry {
 /// one orchestrator (journal + trust book under `id_dir`), one
 /// `TaskPairing` on top, plus the resident tasks that keep it alive — the
 /// task-aware owner loop (answers redeems of this device's codes and
-/// completes pairings), the network watcher (registry loss → Network task
-/// ends) and the event pump ([`TaskEvent`]s → task event lines).
+/// completes pairings, behind the pre-commit redeem-offer gate) and the
+/// event pump ([`TaskEvent`]s → task event lines). Wave 30 (review
+/// 2026-11-07, P2-08): there is NO registry-connection watcher any more —
+/// a control-plane disconnect is not a task verdict; the data planes of
+/// paired tasks are independent of the registry.
 struct TaskStack {
     pairing: TaskPairing,
     owner_loop: StdMutex<Option<JoinHandle<()>>>,
-    network_watcher: StdMutex<Option<JoinHandle<()>>>,
     event_pump: StdMutex<Option<JoinHandle<()>>>,
 }
 
@@ -451,11 +468,6 @@ impl TaskStack {
     /// closing the client afterwards unblocks their awaits).
     fn abort_tasks(&self) {
         if let Ok(mut slot) = self.owner_loop.lock() {
-            if let Some(task) = slot.take() {
-                task.abort();
-            }
-        }
-        if let Ok(mut slot) = self.network_watcher.lock() {
             if let Some(task) = slot.take() {
                 task.abort();
             }
@@ -721,7 +733,10 @@ impl TaskRt {
 
     /// Resolve every pending consent of one connection with a
     /// declination (a disconnect must wake its parked offers — the sender
-    /// learns over the wire, the user's stale banner answers `-4`).
+    /// learns over the wire, the user's stale banner answers `-4`). Each
+    /// resolution is a REQUEST-TERMINAL event (wave-30 P2-11 residual):
+    /// `request_closed`/`disconnected` closes the banner at the same
+    /// moment the request dies, not when a mirror timer guesses.
     fn decline_pending_of_conn(&self, conn_id: &[u8; 16]) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
@@ -733,6 +748,17 @@ impl TaskRt {
             .collect();
         for job in doomed {
             if let Some(entry) = pending.remove(&job) {
+                // The terminal event is queued BEFORE the oneshot resolves
+                // (the same ordering the expiry timer uses): the request's
+                // visible end and its resolution are never observably
+                // apart.
+                if let Some(conn) = entry.conn {
+                    self.push_event(format!(
+                        "{{\"event\":\"request_closed\",\"job\":\"{}\",\"conn\":\"{}\",\"reason\":\"disconnected\"}}",
+                        core::hex_encode(&job),
+                        core::hex_encode(&conn),
+                    ));
+                }
                 let _ = entry.sender.send(false);
             }
         }
@@ -784,18 +810,45 @@ fn register_consent(
         core::hex_encode(&job),
         core::hex_encode(&conn.conn_id),
     ));
+    // saveDir: the snapshot of where THIS request will land (wave-30
+    // P2-06 residual): the UI banner shows the real target — the value
+    // the transfer will actually use when consented (resolved per task
+    // at accept time; the event reflects the snapshot at offer time).
     line.push_str(&format!(
-        ",\"root\":{},\"files\":{},\"bytes\":{}}}",
+        ",\"root\":{},\"files\":{},\"bytes\":{},\"saveDir\":{}",
         crate::core::json::quoted(&info.root_name),
         info.file_count,
         info.total_bytes,
+        {
+            let text = rt
+                .save_dir
+                .lock()
+                .expect("save dir lock")
+                .to_string_lossy()
+                .into_owned();
+            crate::core::json::quoted(&text)
+        }
     ));
+    line.push('}');
     rt.push_event(line);
     // The frozen 30 s auto-decline: a timer task, never a blocked thread.
+    // Wave-30 P2-11 residual: the expiry is a REQUEST-TERMINAL event, not
+    // just a silent resolution — the native source of truth the UI mirror
+    // timer only guessed at (`consent_expired`).
     let timer_rt = Arc::clone(rt);
     tokio::spawn(async move {
         tokio::time::sleep(window).await;
         if let Some(entry) = timer_rt.pending.lock().ok().and_then(|mut m| m.remove(&job)) {
+            // The terminal event is queued BEFORE the oneshot resolves:
+            // whoever observes the resolution (a parked receive, a test)
+            // can already read the request's terminal state.
+            if let Some(conn) = entry.conn {
+                timer_rt.push_event(format!(
+                    "{{\"event\":\"consent_expired\",\"job\":\"{}\",\"conn\":\"{}\"}}",
+                    core::hex_encode(&job),
+                    core::hex_encode(&conn),
+                ));
+            }
             let _ = entry.sender.send(false);
         }
     });
@@ -1089,9 +1142,10 @@ fn parse_candidates(args: &crate::core::json::Json) -> Result<Vec<SocketAddr>, F
 /// Build (or fetch) this runtime's [`TaskStack`]: a REAL v2 registry
 /// client (pinned TLS, the runtime's device key and display name), the
 /// orchestrator (journal + trust book under `id_dir`), the `TaskPairing`
-/// on top, and its three resident tasks — the task-aware owner loop, the
-/// network watcher and the event pump. Runs inside op bodies, i.e. on the
-/// engine's embedded runtime (the client's reader tasks spawn there).
+/// on top, and its resident tasks — the task-aware owner loop (behind the
+/// pre-commit redeem-offer gate, P1-05) and the event pump. Runs inside
+/// op bodies, i.e. on the engine's embedded runtime (the client's reader
+/// tasks spawn there).
 ///
 /// The build is serialized by [`TaskRt::stack_init`] (wave-29 P2-02):
 /// concurrent first ops await the gate and then find the finished stack,
@@ -1167,9 +1221,18 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
     let stack = Arc::new(TaskStack {
         pairing,
         owner_loop: StdMutex::new(None),
-        network_watcher: StdMutex::new(None),
         event_pump: StdMutex::new(None),
     });
+    // Wave 30 (review 2026-11-07, P1-05): the PRODUCTION owner loop runs
+    // behind the same pre-commit redeem-offer gate the library's
+    // `TaskPairing::spawn_owner_loop` installs. This stack deliberately
+    // spawns `spawn_owner_loop_verified` directly (the synchronous
+    // fingerprint registration below must run inside the completion
+    // callback), so the gate is installed explicitly FIRST — without it a
+    // wrong-direction or endpoint-less join completed the pairing and
+    // burned the code's single redeem before the post-completion check
+    // refused it.
+    stack.pairing.install_redeem_offer_gate();
     // The task-aware owner loop: ak-session's own completion bookkeeping
     // (direction rule + active-task registry) PLUS the task plane's —
     // the connection entry, `connected` event and probe. `spawn_owner_
@@ -1210,9 +1273,8 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         .pairing
         .orchestrator()
         .spawn_owner_loop_verified(Some(on_paired));
-    let watcher = stack.pairing.spawn_network_watcher();
     let pump = spawn_task_event_pump(Arc::clone(rt), &stack);
-    let mut unbuilt: Option<[JoinHandle<()>; 3]> = Some([owner_loop, watcher, pump]);
+    let mut unbuilt: Option<[JoinHandle<()>; 2]> = Some([owner_loop, pump]);
     // Install under the stack lock, re-checking `stopped` INSIDE it: either
     // teardown took the slot first (we see `stopped` and abort what we
     // built) or we install first (teardown then finds and closes our
@@ -1223,12 +1285,9 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
             .lock()
             .map_err(|_| "task stack lock poisoned".to_string())?;
         if !rt.is_stopped() {
-            if let Some([owner_loop, watcher, pump]) = unbuilt.take() {
+            if let Some([owner_loop, pump]) = unbuilt.take() {
                 if let Ok(mut handle) = stack.owner_loop.lock() {
                     *handle = Some(owner_loop);
-                }
-                if let Ok(mut handle) = stack.network_watcher.lock() {
-                    *handle = Some(watcher);
                 }
                 if let Ok(mut handle) = stack.event_pump.lock() {
                     *handle = Some(pump);
@@ -1267,7 +1326,14 @@ fn spawn_task_event_pump(rt: Arc<TaskRt>, stack: &Arc<TaskStack>) -> JoinHandle<
                         continue;
                     };
                     // The frozen ffi-v2 §8.3 vocabulary: `peer` for a peer
-                    // departure, `receiver_failed` for the link-loss end.
+                    // departure, `receiver_failed` for a data-plane link
+                    // loss. Wave 30 (review 2026-11-07, P2-08): a
+                    // registry/control-connection drop no longer produces
+                    // `Network` at all — ak-session's task layer only
+                    // reports it for the task's OWN data plane now, so
+                    // `receiver_failed` is always a genuine data-plane
+                    // terminal verdict and the Dart terminal-reason table
+                    // agrees with it.
                     let text = match reason {
                         TaskDisconnectReason::ByPeer => "peer",
                         _ => "receiver_failed",
@@ -1329,7 +1395,9 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
 
 /// The owner side of a completed registry pairing, asynchronous half: the
 /// real reachability probe over the peer's advertised candidates and the
-/// connection's `probing → connected` settle.
+/// connection's honest `probing → connected|unreachable` settle (wave-30
+/// P2-09 residual: a total probe failure settles to `unreachable`, never
+/// a fake `connected`).
 async fn owner_side_probe(rt: &Arc<TaskRt>, stack: &Arc<TaskStack>, paired: TaskPaired) {
     let conn_id = paired.pairing_id;
     let endpoint_probe = PeerEndpoint {
@@ -1338,15 +1406,29 @@ async fn owner_side_probe(rt: &Arc<TaskRt>, stack: &Arc<TaskStack>, paired: Task
         direction: paired.peer.direction,
     };
     let outcome = probe_with_retry(&stack.pairing, &endpoint_probe).await;
+    settle_probe_state(rt, &conn_id, &outcome);
+    let (line, _verdict) = probe_result_line(&conn_id, &outcome);
+    rt.push_event(line);
+}
+
+/// Settle one connection's `probing` state by the probe's honest verdict
+/// (wave-30 P2-09 residual): success → `connected`, total failure →
+/// `unreachable`. A connection that already reached a terminal state
+/// (`disconnected`) keeps it; `ak_task_list` and the join result agree
+/// with the `probe_result` event.
+fn settle_probe_state(rt: &Arc<TaskRt>, conn_id: &[u8; 16], outcome: &ProbeOutcome) {
+    let reachable = matches!(outcome, ProbeOutcome::Success { .. });
     if let Ok(mut conns) = rt.conns.lock() {
-        if let Some(conn) = conns.get_mut(&conn_id) {
+        if let Some(conn) = conns.get_mut(conn_id) {
             if conn.state == ConnState::Probing {
-                conn.state = ConnState::Connected;
+                conn.state = if reachable {
+                    ConnState::Connected
+                } else {
+                    ConnState::Unreachable
+                };
             }
         }
     }
-    let (line, _verdict) = probe_result_line(&conn_id, &outcome);
-    rt.push_event(line);
 }
 
 /// The owner's display form of one of its cached codes (fallback: the
@@ -1694,26 +1776,40 @@ enum RequestGate {
     /// the live-state re-validation below applies (a replay answers even
     /// after its connection later disconnected).
     Replay([u8; 16]),
-    /// Fresh request; its op id is RESERVED atomically with the check —
-    /// the caller must launch exactly this op id.
-    Fresh([u8; 16]),
+    /// Fresh request; its op id is reserved AND its running op entry
+    /// registered atomically with the check (wave-30 R29-P2-03): a
+    /// concurrent retry that replays this op id can poll it immediately
+    /// (`running`, never the `-4` of an unregistered op). The caller must
+    /// launch exactly this reservation.
+    Fresh(ReservedOp),
     /// The request carried no `request_id`: nothing to dedupe, the op id
     /// is minted by the launcher.
     NoId,
 }
 
+/// One atomically accepted request: the minted op id plus the RUNNING op
+/// entry the gate already published in the op table (wave-30 R29-P2-03 —
+/// reservation and registration share the request registry's critical
+/// section, so no other thread can observe the id before the entry).
+struct ReservedOp {
+    op_id: [u8; 16],
+    entry: Arc<OpEntry>,
+}
+
 /// The ONE atomic acceptance point of the task plane (wave-29 P2-01):
 /// replay check, conflict rejection, (for sends) the live-connection
-/// rule, and the reservation of the minted op id all happen inside a
-/// single critical section on the request registry, so two racing
-/// identical requests can never both launch. `enforce_live_conn` (sends)
-/// refuses a FRESH request whose connection is already disconnected —
-/// after the replay branch, so an accepted request's answer stays
-/// retrievable forever. Lock order is request_ids → conns; no other path
-/// takes these two together.
+/// rule, the reservation of the minted op id AND the registration of its
+/// RUNNING op entry (wave-30 R29-P2-03) all happen inside a single
+/// critical section on the request registry, so two racing identical
+/// requests can never both launch and a replayed op id is always already
+/// pollable. `enforce_live_conn` (sends) refuses a FRESH request whose
+/// connection is already disconnected — after the replay branch, so an
+/// accepted request's answer stays retrievable forever. Lock order is
+/// request_ids → conns and request_ids → ops; no other path takes either
+/// pair together in reverse.
 fn gate_request(
     rt: &TaskRt,
-    op: &str,
+    op: &'static str,
     conn: Option<[u8; 16]>,
     enforce_live_conn: bool,
     args: &crate::core::json::Json,
@@ -1744,8 +1840,24 @@ fn gate_request(
                 ensure_conn_live(rt, &conn.expect("send gate carries a conn id"))?;
             }
             let op_id = random_id16();
+            let entry = Arc::new(OpEntry {
+                outcome: StdMutex::new(OpOutcome::Running { op }),
+                task: StdMutex::new(None),
+            });
+            // Wave-30 R29-P2-03: the RUNNING entry is registered in the
+            // SAME critical section that reserves the id (lock order
+            // request_ids → ops, taken nowhere in reverse). A concurrent
+            // retry can only replay an op id whose entry is already
+            // pollable — the reserve/publish window that returned a
+            // not-yet-existing op id (first poll `-4`) is closed.
+            let mut ops = rt
+                .ops
+                .lock()
+                .map_err(|_| FfiError::internal("task op table lock poisoned"))?;
+            ops.insert(op_id, Arc::clone(&entry));
+            drop(ops);
             registry.insert(request_id, (op_id, canonical));
-            Ok(RequestGate::Fresh(op_id))
+            Ok(RequestGate::Fresh(ReservedOp { op_id, entry }))
         }
     }
 }
@@ -1776,30 +1888,38 @@ fn ensure_conn_live(rt: &TaskRt, conn_id: &[u8; 16]) -> Result<(), FfiError> {
 /// stamp the terminal JSON (kept for lossless repeated reads), announce
 /// `op_done`/`op_failed` in the task event queue. The body owns ONLY
 /// `Arc` clones — never an engine borrow (module doc). `reserved` is the
-/// op id the idempotency gate already recorded (`None` mints a fresh one
-/// for requests without a `request_id`).
+/// idempotency gate's atomic reservation (id + already-registered RUNNING
+/// entry, wave-30 R29-P2-03); `None` mints and registers a fresh entry
+/// for requests without a `request_id`.
 fn launch_task_op(
     engine: &AkEngine,
     rt: &Arc<TaskRt>,
     spec: TaskOpSpec,
-    reserved: Option<[u8; 16]>,
+    reserved: Option<ReservedOp>,
 ) -> Result<[u8; 16], FfiError> {
     let op = spec.op();
-    let op_id = reserved.unwrap_or_else(random_id16);
+    let (op_id, entry) = match reserved {
+        // Already registered (atomically with the request reservation).
+        Some(reserved) => (reserved.op_id, reserved.entry),
+        None => {
+            let op_id = random_id16();
+            let entry = Arc::new(OpEntry {
+                outcome: StdMutex::new(OpOutcome::Running { op }),
+                task: StdMutex::new(None),
+            });
+            {
+                let mut ops = rt
+                    .ops
+                    .lock()
+                    .map_err(|_| FfiError::internal("task op table lock poisoned"))?;
+                ops.insert(op_id, Arc::clone(&entry));
+            }
+            (op_id, entry)
+        }
+    };
     // Sends are abortable by a disconnect of their connection.
     if let TaskOpSpec::Send { conn_id, .. } = &spec {
         rt.track_conn_op(*conn_id, op_id);
-    }
-    let entry = Arc::new(OpEntry {
-        outcome: StdMutex::new(OpOutcome::Running { op }),
-        task: StdMutex::new(None),
-    });
-    {
-        let mut ops = rt
-            .ops
-            .lock()
-            .map_err(|_| FfiError::internal("task op table lock poisoned"))?;
-        ops.insert(op_id, Arc::clone(&entry));
     }
     let task = {
         let entry = Arc::clone(&entry);
@@ -1869,7 +1989,7 @@ pub fn task_create_code_start(
     };
     let reserved = match gate_request(&rt, "task_create_code", None, false, &args)? {
         RequestGate::Replay(op_id) => return Ok(op_id),
-        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::Fresh(reserved) => Some(reserved),
         RequestGate::NoId => None,
     };
     launch_task_op(
@@ -1911,7 +2031,7 @@ pub fn task_join_start(
     let candidates = parse_candidates(&args)?;
     let reserved = match gate_request(&rt, "task_join", None, false, &args)? {
         RequestGate::Replay(op_id) => return Ok(op_id),
-        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::Fresh(reserved) => Some(reserved),
         RequestGate::NoId => None,
     };
     launch_task_op(
@@ -1972,7 +2092,7 @@ pub fn task_send_start(
     // connection (inside the gate's atomic acceptance).
     let reserved = match gate_request(&rt, "task_send", Some(*conn_id), true, &args)? {
         RequestGate::Replay(op_id) => return Ok(op_id),
-        RequestGate::Fresh(op_id) => Some(op_id),
+        RequestGate::Fresh(reserved) => Some(reserved),
         RequestGate::NoId => None,
     };
     launch_task_op(
@@ -2497,6 +2617,13 @@ async fn bind_resident_receiver(
 ///   refused at the TLS gate and the loop keeps waiting: a stranger can
 ///   neither deliver an Offer nor consume the receiver. The consent hook
 ///   re-checks the attribution independently (fingerprint, not port).
+/// * **Handshake failures are per-connection (wave-30 P1-04 residual)** —
+///   a dial whose TLS handshake fails on OUR side of the accept
+///   (`Transport`/`PeerIdentity`: a stranger's aborted handshake or a
+///   rejected certificate) is recorded as a bounded `handshake_failed`
+///   event and the loop keeps listening; only the endpoint's own death
+///   or a task terminal state ends the listener. A stranger cannot end
+///   the receiver by dialing badly.
 /// * **Decline keeps the listener (P2-05)** — a DECLINED offer ends only
 ///   that connection; the sender may retry on the same code (a fresh
 ///   `incoming_request` fires).
@@ -2594,7 +2721,29 @@ async fn run_resident_receiver(
         let channel = match endpoint.accept(&authorize).await {
             Ok(channel) => channel,
             Err(ak_net::ConnectError::Unauthorized) => continue,
-            Err(_) => return, // endpoint closed / transport gone
+            Err(ak_net::ConnectError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotConnected
+                    && err.to_string().contains("endpoint closed") =>
+            {
+                // The ENDPOINT itself is gone (teardown/driver dropped):
+                // the one honest end of the listener.
+                return;
+            }
+            Err(failure) => {
+                // Wave 30 (review 2026-11-07, P1-04 residual): ONE
+                // connection's handshake failed (a stranger's aborted
+                // dial — Transport — or a certificate the server side
+                // rejected — PeerIdentity). That is a per-connection
+                // fact, never a listener verdict: record the bounded
+                // event and keep serving; the listener only ends with a
+                // task terminal state above or the endpoint's own death.
+                rt.push_event(format!(
+                    "{{\"event\":\"handshake_failed\",\"code\":\"{}\",\"reason\":{}}}",
+                    core::hex_encode(&current_code()),
+                    quoted(handshake_failure_word(&failure)),
+                ));
+                continue;
+            }
         };
         // P2-06: resolve the save folder NOW (each transfer start), not
         // at code-creation time.
@@ -2663,6 +2812,16 @@ fn report_peer_departure(rt: &Arc<TaskRt>, code_id: &[u8; 16]) {
         if let Some(stack) = rt.stack.lock().ok().and_then(|slot| slot.clone()) {
             stack.pairing.report_peer_disconnect(*code_id);
         }
+    }
+}
+
+/// Bounded reason word of one failed accept (wave-30 P1-04 residual): a
+/// fixed two-word vocabulary, never the raw transport text (hostile peers
+/// control parts of it).
+fn handshake_failure_word(error: &ak_net::ConnectError) -> &'static str {
+    match error {
+        ak_net::ConnectError::PeerIdentity(_) => "peer certificate rejected",
+        _ => "handshake transport failure",
     }
 }
 
@@ -2787,16 +2946,12 @@ async fn run_join(
         endpoint,
         quoted(code),
     ));
-    // The REAL reachability probe over the peer's advertised candidates.
+    // The REAL reachability probe over the peer's advertised candidates;
+    // the settle is honest (P2-09): all-failed leaves the entry
+    // `unreachable`, matching the join result's `probe` verdict.
     let outcome = probe_with_retry(&stack.pairing, &paired.peer).await;
     let (probe_line, verdict) = probe_result_line(&conn_id, &outcome);
-    if let Ok(mut conns) = rt.conns.lock() {
-        if let Some(conn) = conns.get_mut(&conn_id) {
-            if conn.state == ConnState::Probing {
-                conn.state = ConnState::Connected;
-            }
-        }
-    }
+    settle_probe_state(rt, &conn_id, &outcome);
     rt.push_event(probe_line);
     Ok(format!(
         "{{\"op\":\"task_join\",\"conn\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"probe\":\"{verdict}\"}}",
@@ -4380,6 +4535,42 @@ mod task_tests {
         }
     }
 
+    /// A stranger dial whose TLS handshake FAILS MID-WAY (wave-30 P1-04
+    /// residual): the dialer pins a fingerprint the listener does NOT
+    /// hold, so the client aborts right after the server certificate
+    /// arrives — the SERVER side of the accept then reports a
+    /// Transport/PeerIdentity failure, the per-connection error class the
+    /// accept loop must survive. Returns the failure text; a transfer
+    /// that SUCCEEDS fails the test.
+    fn wrong_pin_send_fails(endpoint: SocketAddr, payload: &std::path::Path) -> String {
+        let key = DeviceKeyPair::generate();
+        let wrong_pin = key.fingerprint(); // nobody listening holds this key
+        let mut spec = SendSpec::new(
+            payload.to_path_buf(),
+            endpoint,
+            wrong_pin,
+            make_self_signed(&key),
+        );
+        spec.bind = if endpoint.is_ipv6() {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+        spec.idle_timeout = Duration::from_secs(5);
+        let stranger = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("stranger runtime");
+        let attempt = stranger.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), send(spec, &|_| {})).await
+        });
+        match attempt {
+            Ok(Ok(report)) => panic!("a wrong-pin transfer must not succeed: {report:?}"),
+            Ok(Err(error)) => format!("{error}"),
+            Err(_) => "wrong-pin send timed out".to_string(),
+        }
+    }
+
     /// Safe-layer op wait for the OWNED-engine tests (no raw pointers).
     fn wait_op_owned(
         engine: &AkEngine,
@@ -4840,6 +5031,10 @@ mod task_tests {
 
         // Done is the single-transfer terminal state on BOTH sides.
         let _ = wait_event(engine_a, &owner, "\"event\":\"done\"");
+        // Wave-30 P2-05 residual: the converge line's reason IS `done` —
+        // a decidable terminal state for the Dart table to agree on.
+        let done_line = wait_event(engine_a, &owner, "\"reason\":\"done\"");
+        assert!(done_line.contains("\"event\":\"disconnected\""), "{done_line}");
         let mut buf = cbuf(CAP);
         assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
         assert!(
@@ -5067,6 +5262,451 @@ mod task_tests {
             .expect("fresh probe");
         let (len, _) = probe_socket.recv_from(&mut buffer).expect("responder two answers");
         assert_eq!(len, 24);
+    }
+
+    // -- wave-30 review findings (P1-04/05 residuals, P2-08/09/11
+    //    residuals, R29-P2-03) -----------------------------------------------
+
+    /// P1-05 (production wiring): the FFI's own owner loop runs behind the
+    /// pre-commit redeem-offer gate. A CROSS-ENGINE join that declares the
+    /// SAME direction as the code (explicitly, or through the FFI's
+    /// no-hint default on a receiver-role code) is refused BEFORE the
+    /// server's commit — the join op fails, no `connected` event fires on
+    /// the owner, and the code's single redeem is NOT consumed: a
+    /// correctly-directed join of the very same code still pairs.
+    #[test]
+    fn production_owner_loop_refuses_same_direction_joins_before_commit() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+
+        // Phase 1: an EXPLICIT same-direction join is refused pre-commit.
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "receiver-role create: {json}");
+        let code = code_of(&json);
+        let (wrong_ok, wrong_json) = join_code_as(engine_b, &joiner, &code, Some("receiver"));
+        assert!(
+            !wrong_ok,
+            "a receiver-role join of a receiver-role code must be refused: {wrong_json}"
+        );
+        assert!(
+            wrong_json.contains("unknown task code"),
+            "the pre-commit gate refuses with the unified unavailable answer: {wrong_json}"
+        );
+        assert_no_event_within(engine_a, &owner, "\"event\":\"connected\"", 1500);
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            !text_of(&buf).contains("\"conn\""),
+            "the refused joiner holds no connection: {}",
+            text_of(&buf)
+        );
+        // The single redeem survived the refusal: a complementary join of
+        // the SAME code pairs (a consumed code would answer exhausted).
+        let (right_ok, right_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(right_ok, "the code must still pair: {right_json}");
+
+        // Phase 2: the FFI's no-hint DEFAULT direction (receiver) on a
+        // FRESH receiver-role code is equally refused pre-commit, and the
+        // code stays usable for an explicit complementary join.
+        let (_, ok_two, json_two) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok_two, "{json_two}");
+        let code_two = code_of(&json_two);
+        let (default_ok, default_json) = join_code(engine_b, &joiner, &code_two);
+        assert!(
+            !default_ok,
+            "the no-role default (receiver) must be refused on a receiver code: {default_json}"
+        );
+        let dir_c = tempfile::tempdir().expect("tempdir c");
+        let joiner_two = start_task_on(engine_b, &registry, dir_c.path());
+        let (fixed_ok, fixed_json) = join_code_as(engine_b, &joiner_two, &code_two, Some("sender"));
+        assert!(fixed_ok, "the second code still pairs: {fixed_json}");
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-08: the registry CONTROL connection is not a data-plane verdict.
+    /// With the whole registry gone, the paired tasks stay live (no
+    /// `disconnected` event, `ak_task_list` keeps the connection) and a
+    /// real send still delivers bytes — the data plane never depended on
+    /// the registry.
+    #[test]
+    fn registry_connection_loss_keeps_paired_tasks_and_sends_working() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let inbox = dir_a.path().join("inbox");
+        let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+        // Let both probes settle, then take the ENTIRE registry away.
+        let _ = wait_event(engine_a, &owner, "probe_result");
+        drop(registry);
+
+        // No kill event: the tasks outlive the control plane.
+        assert_no_event_within(engine_a, &owner, "disconnected", 1500);
+        assert_no_event_within(engine_b, &joiner, "disconnected", 1500);
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"connected\""),
+            "the paired task outlives the registry: {}",
+            text_of(&buf)
+        );
+
+        // A real send over the (registry-free) data plane still lands.
+        let payload = b"data plane without a registry".repeat(32);
+        std::fs::write(dir_b.path().join("noreg.bin"), &payload).unwrap();
+        let paths = CString::new(json_paths(&dir_b.path().join("noreg.bin"))).unwrap();
+        let mut send_op = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            0,
+            "the send is accepted after the registry died: {}",
+            last_error_of(engine_b)
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
+        assert!(send_ok, "the transfer completes: {send_json}");
+        let delivered = find_file(&inbox, "noreg.bin").expect("the bytes landed");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P1-04 residual: ONE connection's failed handshake (a stranger whose
+    /// TLS the server side rejects — wrong pin, so the client aborts
+    /// mid-handshake) does NOT end the resident receiver: the bounded
+    /// `handshake_failed` event fires and the legitimate paired sender
+    /// still completes a transfer on the very same listener.
+    #[test]
+    fn failed_stranger_handshake_does_not_end_the_listener() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let inbox = dir_a.path().join("inbox");
+        let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
+        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let endpoint = endpoint_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "{join_json}");
+        let conn = conn_of(&join_json);
+        let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
+
+        // The stranger pins the WRONG fingerprint: the client aborts the
+        // TLS handshake after the server certificate arrives, so the
+        // server side of the accept fails (Transport/PeerIdentity) — the
+        // exact error class the old loop treated as "endpoint dead".
+        std::fs::write(dir_a.path().join("midhandshake.bin"), b"stranger").unwrap();
+        let failure = wrong_pin_send_fails(endpoint, &dir_a.path().join("midhandshake.bin"));
+        assert!(!failure.is_empty(), "the wrong-pin dial must fail: {failure}");
+        // The failure is recorded and the loop CONTINUES listening.
+        let recorded = wait_event(engine_a, &owner, "handshake_failed");
+        assert!(
+            recorded.contains(&core::hex_encode(&code_id_of(&json))),
+            "the bounded failure names the code: {recorded}"
+        );
+
+        // The legitimate sender completes on the very same listener.
+        let payload = b"legitimate after a failed stranger handshake".repeat(16);
+        std::fs::write(dir_b.path().join("after.bin"), &payload).unwrap();
+        let paths = CString::new(json_paths(&dir_b.path().join("after.bin"))).unwrap();
+        let mut send_op = [0u8; 16];
+        assert_eq!(
+            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            0,
+            "the send is accepted: {}",
+            last_error_of(engine_b)
+        );
+        let request = wait_event(engine_a, &owner, "incoming_request");
+        let job = hex16_id(
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
+        assert!(send_ok, "the listener survived the handshake failure: {send_json}");
+        let delivered = find_file(&inbox, "after.bin").expect("the file landed");
+        assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// R29-P2-03 (deterministic half): the op id a request reserves and
+    /// the RUNNING op entry are published ATOMICICALLY — polling the id
+    /// while the launcher has not even run yet answers `running`, never
+    /// the `-4` of an unregistered op.
+    #[test]
+    fn reserved_op_id_is_pollable_before_the_launcher_runs() {
+        let registry = TestRegistry::spawn();
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &registry_spec(&registry, dir.path())).expect("rt");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let args = crate::core::json::parse(
+            "{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"e1e2e3d4e5f60718293a4b5c6d7e8f90\"}",
+        )
+        .expect("args");
+        // The gate reserves AND registers — then we STOP between the gate
+        // and the launcher (the report's exact interleaving).
+        let reserved = match gate_request(&rt, "task_create_code", None, false, &args)
+            .expect("gate accepts")
+        {
+            RequestGate::Fresh(reserved) => reserved,
+            _other => panic!("fresh request, got a different gate outcome"),
+        };
+        let snapshot =
+            task_op_result_maybe(&engine, &runtime, &reserved.op_id).expect("pollable");
+        match snapshot {
+            Some(OpResult::Running) => {}
+            _other => panic!("the reserved op must read running, got a settled or missing op"),
+        }
+        // The reservation launches exactly once and completes normally.
+        let op_id = launch_task_op(
+            &engine,
+            &rt,
+            TaskOpSpec::CreateCode {
+                role: TaskRole::Sender,
+                candidates: Vec::new(),
+                ttl_secs: TASK_CODE_TTL_SECS,
+            },
+            Some(reserved),
+        )
+        .expect("launch");
+        let (ok, json) = wait_op_owned(&engine, &runtime, &op_id);
+        assert!(ok, "{json}");
+        // The replay of the same request answers the SAME op.
+        match gate_request(&rt, "task_create_code", None, false, &args).expect("replay") {
+            RequestGate::Replay(replayed) => assert_eq!(replayed, op_id),
+            _other => panic!("replay, got a different gate outcome"),
+        }
+    }
+
+    /// R29-P2-03 (race half): a concurrent retry that replays a just-
+    /// reserved request polls the op IMMEDIATELY — running or finished,
+    /// never `-4` — and the whole race starts exactly one op.
+    #[test]
+    fn concurrent_retry_polls_a_registered_op_never_minus_four() {
+        let registry = TestRegistry::spawn();
+        let engine = Arc::new(AkEngine::new().expect("engine"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &registry_spec(&registry, dir.path())).expect("rt");
+        let request_id = "f1f2f3d4e5f60718293a4b5c6d7e8f90";
+        let spec = format!(
+            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}"
+        );
+        let racer = threaded_create(Arc::clone(&engine), runtime, spec.clone());
+        // From THIS thread: retry the same request concurrently — the
+        // gate answers the racer's op id (fresh or replay, one atomic
+        // acceptance) — and poll that id at once, before the racer's
+        // launcher (let alone its op body) necessarily ran.
+        let op_id = task_create_code_start(&engine, &runtime, &spec)
+            .expect("same-spec retry is accepted (fresh or replay)");
+        // The immediate poll must never observe an unregistered op.
+        match task_op_result_maybe(&engine, &runtime, &op_id).expect("poll") {
+            Some(OpResult::Running) | Some(OpResult::Finished { .. }) => {}
+            _other => panic!("registered op expected, got a missing op"),
+        }
+        // Exactly one op for the whole race: the racer's answer is the
+        // same id and it completes once.
+        let racer_op = racer.recv().expect("racer answered").expect("accepted");
+        assert_eq!(racer_op, op_id, "one atomically accepted op");
+        let (ok, json) = wait_op_owned(&engine, &runtime, &op_id);
+        assert!(ok, "{json}");
+        assert!(json.contains("\"code\":\"AKI1-"), "exactly one claim: {json}");
+    }
+
+    /// P2-09 residual: the connection settle is HONEST. A joiner that
+    /// advertises only a dead candidate leaves the OWNER's entry
+    /// `unreachable` in `ak_task_list` (matching its `probe_result`
+    /// event), while the joiner's own probe of the owner's live endpoint
+    /// settles `connected`.
+    #[test]
+    fn all_failed_probe_settles_unreachable_not_connected() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+        let (_, ok, json) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        // Explicit candidates are advertised verbatim (no echo responder,
+        // no real port): the owner's probe of 127.0.0.1:1 is honestly
+        // dead, and the settle must SAY so.
+        let spec = CString::new(format!(
+            "{{\"spec_version\":1,\"code\":\"{code}\",\"role\":\"sender\",\
+              \"candidates\":[\"127.0.0.1:1\"]}}"
+        ))
+        .expect("spec CString");
+        let mut op_id = [0u8; 16];
+        assert_eq!(
+            ak_task_join(engine_b, joiner.as_ptr(), spec.as_ptr(), op_id.as_mut_ptr()),
+            0,
+            "join accepted: {}",
+            last_error_of(engine_b)
+        );
+        let (join_ok, join_json) = wait_op(engine_b, &joiner, &op_id);
+        assert!(join_ok, "{join_json}");
+        // The joiner's own probe of the owner's live endpoint succeeds...
+        assert!(
+            join_json.contains("\"probe\":\"verified\""),
+            "the joiner's probe verdict rides the result: {join_json}"
+        );
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"connected\""),
+            "the joiner settles connected: {}",
+            text_of(&buf)
+        );
+        // ...while the owner's probe of the dead candidate settles
+        // unreachable — never a fake connected.
+        let probe = wait_event(engine_a, &owner, "probe_result");
+        assert!(probe.contains("\"reachable\":false"), "{probe}");
+        let mut buf = cbuf(CAP);
+        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert!(
+            text_of(&buf).contains("\"state\":\"unreachable\""),
+            "ak_task_list agrees with the probe verdict: {}",
+            text_of(&buf)
+        );
+        assert!(
+            !text_of(&buf).contains("\"state\":\"connected\""),
+            "a dead candidate must not settle connected: {}",
+            text_of(&buf)
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// P2-11 residual: a pending receive-consent request ends VISIBLY —
+    /// the 30 s window's auto-decline emits `consent_expired`, a
+    /// disconnect of the attributed connection resolves the request and
+    /// emits `request_closed`/`disconnected`, and decided requests answer
+    /// the frozen `-4`.
+    #[test]
+    fn consent_requests_close_visibly_on_expiry_and_disconnect() {
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &spec_for(dir.path())).expect("rt");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let code_id = [7u8; 16];
+        let conn_id = [9u8; 16];
+        let sender_fp = DeviceKeyPair::generate().fingerprint();
+        {
+            let mut conns = rt.conns.lock().expect("conn table");
+            conns.insert(
+                conn_id,
+                TaskConn {
+                    conn_id,
+                    role: TaskRole::Receiver,
+                    state: ConnState::Connected,
+                    candidates: Vec::new(),
+                    peer_endpoint: None,
+                    peer_fp: Some(sender_fp),
+                    code_id,
+                    code: "AKI1-TEST".into(),
+                },
+            );
+        }
+        let info = ConsentInfo {
+            job_id: [0u8; 16],
+            root_name: "expiry.bin".into(),
+            file_count: 1,
+            total_bytes: 16,
+            sender_fingerprint: sender_fp,
+        };
+        let rt_for_close = Arc::clone(&rt);
+        let rt_in = Arc::clone(&rt);
+        let (expired_declined, closed_declined) = engine.runtime().block_on(async move {
+            // Short window: the auto-decline fires while we await.
+            let ConsentAnswer::Pending(expiry_rx) =
+                register_consent(&rt_in, &code_id, &info, Duration::from_millis(300))
+            else {
+                panic!("the attributed offer must register as pending");
+            };
+            // Long window: only the connection's disconnect resolves it.
+            let ConsentAnswer::Pending(closed_rx) =
+                register_consent(&rt_in, &code_id, &info, Duration::from_secs(60))
+            else {
+                panic!("the second offer must register as pending");
+            };
+            let expired = expiry_rx.await.unwrap_or(false);
+            // The disconnect drives the still-pending request to its end.
+            rt_for_close.decline_pending_of_conn(&conn_id);
+            let closed = closed_rx.await.unwrap_or(false);
+            (expired, closed)
+        });
+        assert!(!expired_declined, "the window auto-declines");
+        assert!(!closed_declined, "the disconnect declines");
+        // Both terminal events are observable, attributed to the conn.
+        let events: Vec<String> = rt
+            .events
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        let conn_hex = core::hex_encode(&conn_id);
+        let expired_line = events
+            .iter()
+            .find(|line| line.contains("consent_expired") && line.contains(&conn_hex))
+            .expect("the expiry is a visible request-terminal event");
+        let expired_job = hex16_id(
+            expired_line
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("job id"),
+        );
+        assert!(
+            events.iter().any(|line| line.contains("request_closed")
+                && line.contains("\"reason\":\"disconnected\"")
+                && line.contains(&conn_hex)),
+            "the disconnect closes its pending request visibly: {events:?}"
+        );
+        // Decided requests answer the frozen -4.
+        let decided = task_consent(&engine, &runtime, &expired_job, true);
+        assert!(decided.is_err(), "the expired request is already decided");
+        assert_eq!(decided.err().map(|e| e.code), Some(crate::core::AK_ERR_NOT_FOUND));
     }
 
     // -- helpers --------------------------------------------------------------

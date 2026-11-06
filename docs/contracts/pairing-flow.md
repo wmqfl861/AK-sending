@@ -81,7 +81,7 @@ TLS 解决链路窃听与假协调端问题；**仅有 TLS 不足以防止被入
 
 - `max_redeems=1` 是 v1 极简模型：一码＝一次传输任务＝恰好两个对象；一次配对 Commit 后该码即失效。
 - 计数口径为该码名下 **committed/applied/ready** 状态的配对事务数；pending、aborted、过期尝试不消耗额度（一次失败尝试不会杀掉码）。
-- 额度在**两处**强制（wave-29 修订）：redeem begin 时预检只是快速拒绝；**“一码恰双方”的不变量由最终 Commit 的同一写事务保证**——判定性 `PairPrepared` 在写入 `committed` 之前，于同一事务内重读 `max_redeems` 并重计 committed/applied/ready。多个 pending 同时在途（pending 不占额度）后竞争 Commit 时，恰好额度内的竞争者成功；超限者在**同一事务**内转为 `aborted`（aborted 不消耗额度），双端收到明确的 `PairError 0x2109 REDEEM_EXHAUSTED`（scope＝Code，object＝code_id）。不允许只在 begin 预占额度后永不释放，也不允许提交后补减计数。
+- 额度在**两处**强制（wave-29 修订）：redeem begin 时预检只是快速拒绝；**“一码恰双方”的不变量由最终 Commit 的同一写事务保证**——判定性 `PairPrepared` 在写入 `committed` 之前，于同一事务内重读 `max_redeems` 并重计 committed/applied/ready。多个 pending 同时在途（pending 不占额度）后竞争 Commit 时，恰好额度内的竞争者成功；超限者在**同一事务**内转为 `aborted`（aborted 不消耗额度），双端收到明确的 `PairError 0x2109 REDEEM_EXHAUSTED`（wave-30 修订 R29-P2-01：Commit 竞争路径 **scope＝Pairing，object＝pairing_id**，使生产客户端分派与 orchestrator 等待方真正送达；begin 预检路径保持 scope＝Code＋真实 request_id）。不允许只在 begin 预占额度后永不释放，也不允许提交后补减计数。
 - 达到上限后，新的（不同 `request_id` 的）redeem 尝试**立即**返回 `PairError 0x2109 REDEEM_EXHAUSTED`（scope＝Code，object＝code_id）——该路径不做“统一期限”延迟：redeemer 已持有码本身，不存在存在性泄露新增面。
 - 幂等/回放语义不变：同 `(redeemer, request_id)` 重放仍返回原 `InviteRedeemPending`（第 11 节防枚举形状不变），**包括 Commit 竞争失败（`0x2109`）之后重试同一 `request_id` 的情形**——失败事务已按 aborted 收尾，不改变重放答案；claim 侧同 `request_id` 同内容（含扩展段内容）仍重放原 `InviteClaimed`。
 - 服务器实现：`invite_codes` 表新增 `max_redeems INTEGER NOT NULL DEFAULT 0` 列（schema v2，迁移为增量 `ALTER TABLE`，见第 12a 节末）。
@@ -365,7 +365,7 @@ PeerBookStore::apply_pairing(
 - 存储变更（registry schema v1 → v2，迁移为增量 `ALTER TABLE`，保留全部 tombstone/唯一性记录；wave-29 起迁移 DDL 与版本推进在同一写事务内原子完成，半迁移库按列存在性识别并补齐，见 `storage-schema.md` §5）：
   - `invite_codes` ＋ `owner_endpoint BLOB NULL`、`max_redeems INTEGER NOT NULL DEFAULT 0`；
   - `pairing_transactions` ＋ `owner_endpoint BLOB NULL`、`redeemer_endpoint BLOB NULL`（redeem 开始时从码行/redeem 帧快照）。
-- claim 幂等体的规范编码跨版本稳定（wave-29）：默认扩展下与 v1 布局逐字节一致，升级前 journal 的旧 claim 记录升级后重放原响应（见 `storage-schema.md` §5）。
+- claim 幂等体的规范编码跨版本稳定（wave-29；wave-30 增补 36B/41B 等价条款，R29-P2-02）：默认扩展下与 v1 布局逐字节一致，升级前 journal 的旧 claim 记录升级后重放原响应；wave-28 服务器对默认扩展也无条件写入尾部，产生的 41 字节记录（`cap=0[4]+presence=0[1]` 全零尾）与 36B canonical 体视为**同一 canonical 请求**——重放比较在读取侧归一化，存量磁盘行不迁移、不改写，非默认扩展仍逐字节比较，真实 ttl/cap/endpoint 差异仍 `REQUEST_CONFLICT`（等价性与不可碰撞论证见 `storage-schema.md` §5）。
 - `storage-schema.md` 的 DDL 附录待集成者随本次修订一并同步（本波协议/服务器代理的文档权限不含该文件）。
 
 ## 13. 安全边界补充（第十七波边界全部保留）

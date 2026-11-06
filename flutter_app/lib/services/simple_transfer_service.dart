@@ -40,14 +40,17 @@
 ///   `reachable:true` → connected, `false` → unreachable, `null` keeps
 ///   probing (verdict pending).
 /// * Row state merges are MONOTONIC (wave-29 P2-09): `probing < connected
-///   = unreachable < disconnected`. A late `join` result never rebuilds a
-///   row the event pump already advanced (nor revives a disconnected
-///   one), and a late `connected` event never downgrades a row the probe
+///   = unreachable < terminal`. A late `join` result never rebuilds a
+///   row the event pump already advanced (nor revives a terminal one),
+///   and a late `connected` event never downgrades a row the probe
 ///   already settled.
 /// * `disconnected` events only kill a row for the DATA-PLANE reasons
-///   (`local` | `peer` | `receiver_failed`, wave-29 P2-08): a
-///   coordination-plane notice (any other reason, e.g. a registry link
-///   loss) leaves still-healthy direct connections untouched.
+///   (`local` | `peer` | `receiver_failed` | `done`, wave-29 P2-08 +
+///   wave-30 P2-05): a coordination-plane notice (any other reason, e.g.
+///   a registry link loss) leaves still-healthy direct connections
+///   untouched. `done` marks the one-task transfer COMPLETED — the row
+///   converges to a completed state that no longer offers sends (the
+///   `done` EVENT converges the row the same way).
 /// * disconnecting the last live connection returns to `idle`;
 ///   `failed(reason)` carries the engine's last-error detail.
 ///
@@ -60,9 +63,9 @@
 /// facade), exactly like `FfiInviteService` borrows the facade's engine.
 library;
 
-import 'dart:async'
-    show StreamController, StreamSubscription, Timer, TimeoutException;
+import 'dart:async' show StreamController, Timer, TimeoutException;
 import 'dart:collection' show UnmodifiableListView;
+import 'dart:convert' show jsonDecode;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show
@@ -75,6 +78,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         AkTaskSendSpec,
         AkTaskStartSpec,
         TaskConnectedEvent,
+        TaskConsentExpiredEvent,
         TaskDisconnectedEvent,
         TaskDoneEvent,
         TaskEvent,
@@ -178,6 +182,7 @@ final class SimpleIncomingRequest {
     required this.rootName,
     required this.files,
     required this.bytes,
+    this.saveDir,
   });
 
   /// The pending-request id — the [SimpleTransferService.consent] key.
@@ -192,9 +197,40 @@ final class SimpleIncomingRequest {
 
   final int bytes;
 
+  /// The save directory THIS request will use, snapshotted native-side at
+  /// offer time (wave-30 P2-06, the event's `saveDir` field): the files
+  /// land there even when the settings change before the user answers,
+  /// so the UI shows this value as the request's real target. Null = an
+  /// engine predating the field (fall back to the live [saveDir]).
+  final String? saveDir;
+
   @override
   String toString() =>
-      'SimpleIncomingRequest($jobId root=$rootName files=$files bytes=$bytes)';
+      'SimpleIncomingRequest($jobId root=$rootName files=$files bytes=$bytes '
+      'saveDir=$saveDir)';
+}
+
+/// The result of a successful task-code creation (wave-30 P2-04): the
+/// DISPLAY code plus the engine's `code_id` — the cancel key. Calling
+/// [SimpleTransferService.disconnect] with [codeId] while the code is
+/// still un-joined revokes the registry row (`ak_task_disconnect` covers
+/// code ids per ffi-v2 §8.4).
+final class SimpleCreatedCode {
+  const SimpleCreatedCode({
+    required this.code,
+    required this.role,
+    this.codeId,
+  });
+
+  /// The display code (`AKI1-XXXX-…`, the Rust `InviteCode::to_display`).
+  final String code;
+
+  /// The creating device's role for this code.
+  final SimpleTransferRole role;
+
+  /// The engine's code id (32 hex) — null only from an engine predating
+  /// the field.
+  final String? codeId;
 }
 
 /// The v1 minimal-pairing service. Construct with the FFI seam
@@ -205,7 +241,6 @@ final class SimpleTransferService {
     required this.calls,
     this.eventPollInterval = const Duration(milliseconds: 50),
     this.opPollInterval = const Duration(milliseconds: 200),
-    this.consentWindow = const Duration(seconds: 30),
     Future<void> Function(Duration)? delay,
   })  : _delay = delay ?? Future<void>.delayed;
 
@@ -237,29 +272,39 @@ final class SimpleTransferService {
 
   Timer? _pump;
   // The live connection-change fan-out. Per-subscriber SNAPSHOT replay is
-  // implemented by [connections] (wave-29 P1-06): a broadcast controller's
-  // onListen only fires on the 0→1 listener transition, which is why this
-  // controller itself carries NO onListen — every new subscriber gets a
-  // dedicated wrapper stream that first yields the current snapshot and
-  // then forwards this controller's events.
+  // implemented by [connections] (wave-29 P1-06, wave-30 completed): a
+  // broadcast controller's onListen only fires on the 0→1 listener
+  // transition, which is why this controller itself carries NO onListen —
+  // the getter's Stream.multi runs its per-LISTEN setup for EVERY
+  // subscriber, even two listeners on the SAME saved stream object.
   final StreamController<List<SimpleConnection>> _connectionsController =
       StreamController<List<SimpleConnection>>.broadcast();
   final StreamController<SimpleIncomingRequest> _incomingController =
       StreamController<SimpleIncomingRequest>.broadcast();
   final StreamController<TaskDoneEvent> _doneController =
       StreamController<TaskDoneEvent>.broadcast();
-
-  /// Wave-29 P2-11: the 30 s engine auto-decline window, mirrored
-  /// locally per pending request so the UI can close banners the engine
-  /// already auto-declined. A timer fires only when the request is still
-  /// undecided here; [consent] cancels its timer.
-  final Map<String, Timer> _consentTimers = <String, Timer>{};
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
 
-  /// Engine-side auto-decline window (tests may shorten construction —
-  /// the fake engine never auto-declines on its own).
-  final Duration consentWindow;
+  /// Wave-30 P2-04: the code ids this runtime minted, by normalized code
+  /// key — the cancel keys for un-joined codes, and the receive-progress
+  /// job ids of the P2-10 stall budgets (a receive row keys its progress
+  /// by the CODE id, a send row by the connection id).
+  final Map<String, String> _codeIdOfKey = <String, String>{};
+
+  /// Wave-30 P2-10: monotonic per-job progress ticks fed by the
+  /// ENGINE-WIDE `ak_poll_progress` queue (drained by the pump and by the
+  /// send/receive stall loops). A tick advancing means "bytes moved since
+  /// the last look" — the deadline-renewal fact.
+  final Map<String, int> _progressTicks = <String, int>{};
+
+  /// Wave-30 P2-11: pending (undecided) incoming requests — job id → the
+  /// event's conn id. Drained by [consent] (decided), the native
+  /// `consent_expired` event, and the request's connection going
+  /// data-plane terminal (the engine rejects the pending offer with the
+  /// connection; the banner must close, not wait for an event that will
+  /// never come).
+  final Map<String, String?> _pendingJobs = <String, String?>{};
 
   bool _disposed = false;
 
@@ -321,11 +366,6 @@ final class SimpleTransferService {
     // (2) the pump.
     _pump?.cancel();
     _pump = null;
-    // Consent-window timers (P2-11) go with the channels.
-    for (final timer in _consentTimers.values) {
-      timer.cancel();
-    }
-    _consentTimers.clear();
     // (3) streams (listeners get a done event; late pollers throw nothing).
     _connectionsController.close();
     _incomingController.close();
@@ -337,10 +377,12 @@ final class SimpleTransferService {
 
   /// Action 1 — generate a task code for [role]. Returns the DISPLAY code
   /// (`AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, the Rust
-  /// `InviteCode::to_display` shape) once the create op completed
-  /// (receiver-role creations bind the resident receiver first,
-  /// engine-side).
-  Future<String> createCode(
+  /// `InviteCode::to_display` shape) plus the engine's `code_id` (wave-30
+  /// P2-04: [disconnect] with that id cancels the UN-JOINED code — the
+  /// registry row is revoked, so a cancelled code can never be redeemed)
+  /// once the create op completed (receiver-role creations bind the
+  /// resident receiver first, engine-side).
+  Future<SimpleCreatedCode> createCode(
     SimpleTransferRole role, {
     List<String>? candidates,
     Duration timeout = const Duration(seconds: 30),
@@ -360,7 +402,12 @@ final class SimpleTransferService {
             ensureLive: _ensureLive,
           );
       _setPhase(SimpleTransferPhase.paired);
-      return result['code'] as String;
+      final code = result['code'] as String;
+      final codeId = result['code_id'] as String?;
+      if (codeId != null && codeId.isNotEmpty) {
+        _codeIdOfKey[_codeKey(code)] = codeId;
+      }
+      return SimpleCreatedCode(code: code, role: role, codeId: codeId);
     } on Object catch (error) {
       _fail(error);
       rethrow;
@@ -422,34 +469,40 @@ final class SimpleTransferService {
     }
   }
 
-  /// Action 3a — the live connection list. Wave-29 P1-06 semantics: EVERY
-  /// subscription (each call of this getter returns an independent
-  /// stream) first receives the CURRENT snapshot, then the live change
-  /// events — a detail page opened while the home page is already
-  /// listening still sees the live list immediately, with no gap between
-  /// the snapshot and the forwarded events (the live tap is attached
-  /// synchronously before the snapshot is emitted). The same snapshot is
-  /// also readable synchronously via [currentConnections].
-  Stream<List<SimpleConnection>> get connections {
-    final out = StreamController<List<SimpleConnection>>.broadcast();
-    StreamSubscription<List<SimpleConnection>>? live;
-    out.onListen = () {
-      live = _connectionsController.stream.listen(
-        out.add,
-        onError: out.addError,
-        onDone: out.close,
-      );
-      out.add(currentConnections); // the per-subscriber snapshot replay
-    };
-    out.onCancel = () {
-      live?.cancel();
-      live = null;
-    };
-    return out.stream;
-  }
+  /// Action 3a — the live connection list. Wave-30 P1-06 completion:
+  /// EVERY LISTEN — not every getter call — first receives the CURRENT
+  /// snapshot, then the live change events. The getter returns a
+  /// `Stream.multi` view whose per-listen setup attaches the live tap to
+  /// the fan-out controller FIRST (no gap: an event added after the tap
+  /// can only be delivered after the already-enqueued snapshot) and then
+  /// enqueues the snapshot, so even two subscribers of the SAME saved
+  /// stream object each get their own snapshot+live pair. The snapshot
+  /// is also readable synchronously via [currentConnections].
+  Stream<List<SimpleConnection>> get connections =>
+      Stream.multi((controller) {
+        // Attach the live forwarding FIRST — a source event added after
+        // this point queues behind the snapshot below (the controller
+        // delivers FIFO).
+        final live = _connectionsController.stream.listen(
+          controller.add,
+          onError: controller.addError,
+          onDone: controller.close,
+        );
+        // The per-LISTEN snapshot replay (the reason Stream.multi, not a
+        // broadcast wrapper: onListen of a broadcast wrapper fires only
+        // on the 0→1 transition, leaving a second listener snapshot-less
+        // — the wave-29 residual this closes).
+        controller.add(currentConnections);
+        // Cancel the live tap when THIS listener goes away.
+        controller.onCancel = () => live.cancel();
+      });
 
   /// Action 3b — sever one connection (idempotent; the peer side learns
-  /// engine-side).
+  /// engine-side). Wave-30 P2-04: [connId] may ALSO be a task code's
+  /// `code_id` ([SimpleCreatedCode.codeId]) — disconnecting an UN-JOINED
+  /// code cancels it: the registry row is revoked (`code_cancelled`
+  /// event) and the code can never be redeemed; a code id unknown to the
+  /// engine (`-4`, e.g. already joined or expired) folds away benignly.
   Future<void> disconnect(String connId) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
@@ -458,8 +511,9 @@ final class SimpleTransferService {
     } on AkFfiException catch (error) {
       if (error.code == AkStatus.errNotFound) {
         // Already gone: fold the local view anyway (the event may have
-        // raced the call).
-        _markDisconnected(connId);
+        // raced the call; an unknown code id means the code is no longer
+        // redeemable either way).
+        _markTerminal(connId, 'disconnected');
         return;
       }
       _fail(error);
@@ -473,12 +527,15 @@ final class SimpleTransferService {
   /// the engine's report map (`files`/`bytes`/`peer`); the offer waits
   /// receiver-side for the 30 s consent window engine-side.
   ///
-  /// Wave-29 P2-10: when [timeout] elapses the UI wait does NOT simply
-  /// give up while the native task keeps writing — the only FFI cancel
-  /// path of the v1 one-task model (`ak_task_disconnect` of the task
-  /// connection) is issued best-effort and the rethrown
-  /// [TimeoutException] says so. The disconnect event then folds the row
-  /// to `disconnected` through the normal pump.
+  /// Wave-30 P2-10: [timeout] is a STALL budget, not an overall cap —
+  /// every `ak_poll_progress` line keyed by this connection (the send
+  /// row's job id) RENEWS the deadline, so a long transfer that keeps
+  /// making progress is never cut off; only a true no-progress stall of
+  /// [timeout] elapses. On stall the only FFI cancel path of the v1
+  /// one-task model (`ak_task_disconnect` of the task connection) is
+  /// issued, and the rethrown [TimeoutException] reports HONESTLY: when
+  /// the cancel itself fails, the message says the transfer may still be
+  /// running in the background instead of claiming it was cancelled.
   Future<Map<String, dynamic>> sendFiles(
     String connId,
     List<String> paths, {
@@ -492,56 +549,139 @@ final class SimpleTransferService {
             timeout: timeout,
             delay: _delay,
             ensureLive: _ensureLive,
+            onPoll: () => _progressAdvancedFor(<String>[connId]),
           );
     } on TimeoutException {
-      await _cancelTaskConnection(runtime, connId);
+      final cancelFailure = _tryCancelTaskConnection(runtime, connId);
+      if (cancelFailure != null) {
+        throw TimeoutException(
+          '发送超时（${timeout.inSeconds} 秒无进展），且取消原生任务失败'
+          '（$cancelFailure）——传输可能仍在后台进行，请稍后重试或手动断开连接。',
+          timeout,
+        );
+      }
+      _markTerminal(connId, 'disconnected');
       throw TimeoutException(
-        '发送等待超时（${timeout.inSeconds} 秒），已取消原生发送任务并断开该连接。',
+        '发送超时（${timeout.inSeconds} 秒无进展），已取消原生发送任务并断开该连接。',
         timeout,
       );
     }
   }
 
-  /// The FFI cancel path (P2-10): disconnect the task connection and fold
-  /// the local row. Best-effort by design — the op may complete on its
-  /// own in the race window, in which case the event pump owns the final
-  /// state and a disconnect error is deliberately swallowed.
-  Future<void> _cancelTaskConnection(TaskRuntimeFfi runtime, String connId) async {
+  /// The FFI cancel path (P2-10): disconnect the task connection. Returns
+  /// null when the cancel went through (or the target was already gone —
+  /// `-4` folds the row all the same), or the failure detail when the
+  /// cancel itself failed — the caller must then NOT claim "已取消".
+  Object? _tryCancelTaskConnection(TaskRuntimeFfi runtime, String connId) {
     try {
       runtime.disconnect(connId);
-    } on Object {
-      // Raced the op's own completion/teardown — nothing else to do.
-      return;
+      return null;
+    } on AkFfiException catch (error) {
+      if (error.code == AkStatus.errNotFound) {
+        // Already gone: the event may have raced the call — the row folds
+        // just the same, and "cancelled" is not a lie.
+        return null;
+      }
+      return error.message.isNotEmpty ? error.message : error;
+    } on Object catch (error) {
+      return error;
     }
-    _markDisconnected(connId);
   }
 
   /// Incoming transfer requests (receiver side) — one event per offer,
-  /// waiting for [consent]; the engine auto-declines after 30 s.
+  /// waiting for [consent]; the engine auto-declines undecided offers
+  /// after its 30 s window. Each request carries its native-side
+  /// `saveDir` snapshot (wave-30 P2-06) — the folder THIS receive will
+  /// use, not necessarily the live setting.
   Stream<SimpleIncomingRequest> get incomingRequests =>
       _incomingController.stream;
 
-  /// Wave-29 P2-11: job ids whose consent window closed undecided — the
-  /// engine auto-declined them, so the UI closes/removes their banners.
-  /// Firing is driven by the local mirror of the 30 s window (started at
-  /// event-pump time, cancelled by [consent]); a decline click that
-  /// races the window resolves as false from [consent] and is handled
-  /// idempotently by the adapter.
+  /// Wave-30 P2-11: job ids whose consent request became TERMINAL
+  /// undecided — the UI closes/removes their banners. Driven by NATIVE
+  /// facts only (no Dart-side timer mirror of the 30 s window): the
+  /// engine's `consent_expired` event, and the request's connection
+  /// going data-plane terminal (the engine rejects its pending offers
+  /// with the connection). A later decline of such a job resolves as
+  /// false from [consent] and is handled idempotently by the adapter.
   Stream<String> get expiredIncomingRequests =>
       _expiredIncomingController.stream;
 
   /// Successful transfer completions (either side) with files/bytes.
+  /// A `done` also converges its connection row to the terminal
+  /// completed state (wave-30 P2-05: the row no longer offers sends).
   Stream<TaskDoneEvent> get doneEvents => _doneController.stream;
 
   /// Decide one pending [SimpleIncomingRequest]. Returns false when the
   /// request is unknown or already decided (including auto-declined by
-  /// the 30 s window — deciding such a request locally is a no-op).
+  /// the engine's 30 s window — deciding such a request locally is a
+  /// no-op).
   Future<bool> consent(String jobId, {required bool accept}) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
-    _consentTimers.remove(jobId)?.cancel();
+    _pendingJobs.remove(jobId); // decided — no longer closeable by expiry
     return runtime.consent(jobId, accept: accept);
   }
+
+  /// Wave-30 P2-10 progress plumbing — drains the ENGINE-WIDE
+  /// `ak_poll_progress` queue into per-job ticks. Safe to call from the
+  /// event pump and from the send/receive stall loops alike (each line
+  /// is consumed exactly once and credited to its own job id).
+  void drainProgress() {
+    final runtime = _runtime;
+    if (runtime == null) {
+      return;
+    }
+    while (true) {
+      final line = runtime.pollProgressLine();
+      if (line == null) {
+        return;
+      }
+      try {
+        final decoded = jsonDecode(line);
+        if (decoded is Map<String, dynamic>) {
+          final job = decoded['job'];
+          if (job is String && job.isNotEmpty) {
+            _progressTicks[job] = (_progressTicks[job] ?? 0) + 1;
+          }
+        }
+      } on Object {
+        // A malformed progress line never breaks the timeout machinery.
+      }
+    }
+  }
+
+  /// The monotonic progress tick of [job] (0 = no progress line ever
+  /// seen). Compare two reads to learn "did bytes move since I looked".
+  int progressTick(String job) => _progressTicks[job] ?? 0;
+
+  /// True when any of [jobs] ticked since the caller's last baseline —
+  /// the deadline-renewal fact of the stall budgets. Drains the queue
+  /// first so pump-driven tests and live loops observe fresh lines.
+  bool _progressAdvancedFor(List<String> jobs) {
+    final baseline = <String, int>{
+      for (final job in jobs) job: progressTick(job),
+    };
+    drainProgress();
+    return jobs.any((job) => progressTick(job) > (baseline[job] ?? 0));
+  }
+
+  /// The receive-side progress job of [connId] (wave-30 P2-10): the CODE
+  /// id the connection was paired through — a receive row keys its
+  /// `ak_poll_progress` lines by it (a send row uses the connection id).
+  /// Null when this runtime never minted the code (it joined someone
+  /// else's code — that side never receives).
+  String? codeIdOfConnection(String connId) {
+    final code = _connections[connId]?.code;
+    if (code == null) {
+      return null;
+    }
+    return _codeIdOfKey[_codeKey(code)];
+  }
+
+  /// The engine's code-table key of a display code (uppercase,
+  /// separators stripped — the `normalize_code_key` shape).
+  static String _codeKey(String raw) =>
+      raw.trim().toUpperCase().replaceAll(RegExp(r'[- ]'), '');
 
   // -- the one setting ----------------------------------------------------
 
@@ -613,12 +753,15 @@ final class SimpleTransferService {
   }
 
   /// The monotonic state order of the P2-09 merge: probing < the probe
-  /// verdicts (connected = unreachable) < disconnected. A rank-equal
-  /// update overwrites (there is exactly one probe verdict per join).
+  /// verdicts (connected = unreachable) < terminal. `disconnected` and
+  /// `done` (wave-30 P2-05: the one-task transfer COMPLETED — a final
+  /// state that no longer offers sends) share the terminal rank. A
+  /// rank-equal update overwrites (there is exactly one probe verdict
+  /// per join).
   static int _stateRank(String state) => switch (state) {
         'probing' => 0,
         'connected' || 'unreachable' => 1,
-        _ => 2, // disconnected and anything unknown stay terminal
+        _ => 2, // disconnected / done / anything unknown stay terminal
       };
 
   /// Monotonic row upsert (P2-09): fills the optional fields, never
@@ -668,17 +811,25 @@ final class SimpleTransferService {
   }
 
   /// The `disconnected` reasons that are DATA-PLANE terminal verdicts
-  /// (wave-29 P2-08). Anything else (e.g. a registry/coordinator link
-  /// loss surfaced by the engine) is a coordination-plane notice: the
+  /// (wave-29 P2-08, wave-30 P2-05 adds `done` = the one-task transfer
+  /// completed). Anything else (e.g. a registry/coordinator link loss
+  /// surfaced by the engine) is a coordination-plane notice: the
   /// authorized direct connection may still be healthy, so the row keeps
-  /// its state until a real data-plane close arrives.
+  /// its state until a real data-plane close arrives — a registry notice
+  /// never rewrites the data-plane state.
   static const Set<String> _terminalDisconnectReasons = <String>{
     'local',
     'peer',
     'receiver_failed',
+    'done',
   };
 
-  void _markDisconnected(String connId) {
+  /// Converge the row to a TERMINAL state (`disconnected`, or `done` —
+  /// the completed state of wave-30 P2-05) and close the pending-banner
+  /// bookkeeping of every undecided request that belonged to the
+  /// connection (P2-11: the engine rejects pending offers with the
+  /// connection; the banner must go, not wait for a native event).
+  void _markTerminal(String connId, String state) {
     final existing = _connections[connId];
     if (existing == null) {
       return;
@@ -686,17 +837,35 @@ final class SimpleTransferService {
     _connections[connId] = SimpleConnection(
       connId: connId,
       role: existing.role,
-      state: 'disconnected',
+      state: state,
       peerEndpoint: existing.peerEndpoint,
       code: existing.code,
     );
     _notifyConnections();
-    if (!_connections.values.any((conn) => conn.state != 'disconnected')) {
+    _expirePendingJobsOf(connId);
+    if (!_connections.values.any((conn) => _stateRank(conn.state) < 2)) {
       _setPhase(SimpleTransferPhase.idle);
     }
   }
 
-  /// One pump tick: drain the runtime's event queue and route by type.
+  /// P2-11: fire the expiry stream for every STILL-PENDING request of
+  /// [connId] (undecided here — [consent] removes decided jobs, the
+  /// native `consent_expired` event removes engine-side ones).
+  void _expirePendingJobsOf(String connId) {
+    final doomed = _pendingJobs.entries
+        .where((entry) => entry.value == connId)
+        .map((entry) => entry.key)
+        .toList();
+    for (final job in doomed) {
+      _pendingJobs.remove(job);
+      if (!_expiredIncomingController.isClosed) {
+        _expiredIncomingController.add(job);
+      }
+    }
+  }
+
+  /// One pump tick: drain the runtime's event queue and route by type,
+  /// then drain the engine-wide progress queue into the P2-10 ticks.
   void _pumpOnce() {
     if (_disposed) {
       return;
@@ -713,17 +882,18 @@ final class SimpleTransferService {
         return; // transient poll failure — the next tick retries
       }
       if (event == null) {
-        return;
+        break;
       }
       _route(event);
     }
+    drainProgress(); // P2-10: keep the stall ticks fresh for the waiters
   }
 
   void _route(TaskEvent event) {
     if (event is TaskConnectedEvent) {
       // The engine announces the CONNECTION (pairing bookkeeping) before
       // probing: a fresh row starts at `probing`; a row the pump already
-      // settled (probe verdict / disconnected) keeps its state (P2-09).
+      // settled (probe verdict / terminal) keeps its state (P2-09).
       _upsert(
         connId: event.conn,
         role: event.role,
@@ -752,6 +922,7 @@ final class SimpleTransferService {
       return;
     }
     if (event is TaskIncomingRequestEvent) {
+      _pendingJobs[event.job] = event.conn; // undecided until consent
       if (!_incomingController.isClosed) {
         _incomingController.add(SimpleIncomingRequest(
           jobId: event.job,
@@ -759,23 +930,19 @@ final class SimpleTransferService {
           rootName: event.rootName,
           files: event.files,
           bytes: event.bytes,
+          saveDir: event.saveDir, // P2-06: the request's real target
         ));
-      }
-      // Mirror the engine's 30 s auto-decline window (P2-11): when it
-      // closes with the request still undecided here, tell the UI so the
-      // banner goes away instead of clicking into a dead request.
-      if (!_expiredIncomingController.isClosed &&
-          !_consentTimers.containsKey(event.job)) {
-        _consentTimers[event.job] = Timer(consentWindow, () {
-          _consentTimers.remove(event.job);
-          if (!_disposed && !_expiredIncomingController.isClosed) {
-            _expiredIncomingController.add(event.job);
-          }
-        });
       }
       return;
     }
     if (event is TaskDoneEvent) {
+      // P2-05: a finished one-task transfer converges the row to the
+      // completed terminal state BEFORE the fan-out — the UI must not
+      // keep offering a send the engine already refuses.
+      final conn = event.conn;
+      if (conn != null && conn.isNotEmpty) {
+        _markTerminal(conn, 'done');
+      }
       if (!_doneController.isClosed) {
         _doneController.add(event);
       }
@@ -791,10 +958,19 @@ final class SimpleTransferService {
         // independent — a still-healthy direct connection stays live.
         return;
       }
-      _markDisconnected(conn);
+      _markTerminal(conn, event.reason == 'done' ? 'done' : 'disconnected');
       return;
     }
-    // runtime_ready / op_done / op_failed / unknown: the op waiters read
-    // their own results; nothing to fold here.
+    if (event is TaskConsentExpiredEvent) {
+      // P2-11: the NATIVE 30 s window auto-declined the request — the
+      // banner closes on this engine fact, never on a Dart timer mirror.
+      _pendingJobs.remove(event.job);
+      if (!_expiredIncomingController.isClosed) {
+        _expiredIncomingController.add(event.job);
+      }
+      return;
+    }
+    // runtime_ready / op_done / op_failed / code_cancelled / unknown: the
+    // op waiters read their own results; nothing to fold here.
   }
 }

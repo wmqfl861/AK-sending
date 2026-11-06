@@ -27,7 +27,7 @@ enum TaskRole { send, receive }
 
 /// A freshly minted one-time pairing code.
 class TaskCode {
-  const TaskCode({required this.code, required this.role});
+  const TaskCode({required this.code, required this.role, this.codeId});
 
   /// The code in canonical display form: `AKI1-` + eight groups of four
   /// Crockford Base32 symbols, e.g.
@@ -39,6 +39,14 @@ class TaskCode {
 
   /// The direction this device declared when creating the code.
   final TaskRole role;
+
+  /// The engine's code id (wave-30 P2-04): the CANCEL key — calling
+  /// `disconnect(codeId)` on the code-creating service while the code is
+  /// still unconsumed revokes it (the registry row goes away, the code
+  /// can never be redeemed). Null from implementations without the fact
+  /// (the dev fake pre-wave-30, an old engine): cancelling then simply
+  /// resets the UI.
+  final String? codeId;
 }
 
 /// Live state of one [TaskConnection].
@@ -119,11 +127,19 @@ class IncomingRequest {
     required this.jobId,
     required this.fileCount,
     required this.totalBytes,
+    this.saveDir,
   });
 
   final String jobId;
   final int fileCount;
   final int totalBytes;
+
+  /// The save folder THIS request will use (wave-30 P2-06): snapshotted
+  /// by the engine at offer time and carried on the event — the receive
+  /// lands there even if the settings change before the user answers, so
+  /// the UI shows THIS value as the target. Null = the implementation
+  /// lacks the fact; show the service's live `saveDir` instead.
+  final String? saveDir;
 }
 
 /// The wave-28 minimal transfer service (frozen shape + the wave-29
@@ -164,9 +180,12 @@ abstract class SimpleTransferService {
   /// Incoming transfer offers (jobId/文件数/总字节), one event per offer.
   Stream<IncomingRequest> get incomingRequests;
 
-  /// Job ids whose 30 s consent window closed undecided (wave-29 P2-11):
-  /// the engine auto-declined them, so the UI closes their banners. A
-  /// later decline click on such a job resolves normally (idempotent).
+  /// Job ids whose consent request became terminal undecided (wave-29
+  /// P2-11, wave-30: driven by NATIVE facts — the engine's
+  /// `consent_expired` event for the 30 s window, and the request's
+  /// connection going away; never a Dart-side timer mirror): the UI
+  /// closes their banners. A later decline click on such a job resolves
+  /// normally (idempotent).
   Stream<String> get expiredIncomingRequests;
 
   /// Answers an [IncomingRequest]. With `accept: true` the returned future

@@ -24,10 +24,12 @@
 //!   hole-punch flow uses, so both sides probing simultaneously confirm
 //!   each other;
 //! * the task lives until either side disconnects
-//!   ([`TaskPairing::disconnect`] revokes the code) or the network goes
-//!   away (control-connection loss, data-plane idle timeout) — every end
-//!   maps to exactly one [`TaskEvent::TaskDisconnected`] with its
-//!   [`TaskDisconnectReason`].
+//!   ([`TaskPairing::disconnect`] revokes the code), the peer's data
+//!   plane closes on us, or this side's data-plane link times out —
+//!   every end maps to exactly one [`TaskEvent::TaskDisconnected`] with
+//!   its [`TaskDisconnectReason`]. A registry/control-connection drop is
+//!   deliberately NOT a task end (wave 30, review P2-08): the data plane
+//!   is independent of the registry.
 //!
 //! # Wire shape of the endpoint blob (this layer's codec)
 //!
@@ -61,7 +63,6 @@ use ak_signal::protocol_v2::{CodeId, PairingId};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::pairing::client::ClientState;
 use crate::pairing::error::PairFlowError;
 use crate::pairing::orchestrator::{CreatedInvite, PairingOrchestrator, RedeemOffer};
 
@@ -617,8 +618,12 @@ pub enum TaskDisconnectReason {
     /// The peer went away: its data-plane connection closed on us (or its
     /// side reported the task over).
     ByPeer,
-    /// The network went away: control-connection loss or a data-plane idle
-    /// timeout (QUIC keepalive expiry).
+    /// The task's DATA plane went away: an idle timeout / link loss on the
+    /// paired connection (QUIC keepalive expiry). Wave 30 (review
+    /// 2026-11-07, P2-08): a registry/control-connection drop is NOT this
+    /// reason — the data plane is independent of the registry, so a task
+    /// survives a registry outage until a real data-plane verdict (or a
+    /// local/peer action) ends it.
     Network,
     /// This device ended the task ([`TaskPairing::disconnect`]: the code
     /// is revoked server-side, a pending redeem aborts).
@@ -928,13 +933,36 @@ impl TaskPairing {
     }
 
     /// Report a data-plane idle timeout / link loss (QUIC keepalive
-    /// expiry): emits [`TaskDisconnectReason::Network`].
+    /// expiry) of the task's OWN connection: emits
+    /// [`TaskDisconnectReason::Network`]. This is a data-plane verdict —
+    /// a registry/control-connection drop must never be routed here
+    /// (wave-30 P2-08: the data plane is independent of the registry).
     pub fn report_connection_lost(&self, code_id: CodeId) {
         self.finish_task(code_id, TaskDisconnectReason::Network);
     }
 
-    /// Pre-commit veto over one redeem offer (P1-05, wave 29; installed
-    /// by [`TaskPairing::spawn_owner_loop`] as the orchestrator's
+    /// Install this pairing's pre-commit redeem-offer gate on the wrapped
+    /// orchestrator (P1-05, wave 29). Every owner loop spawned from that
+    /// orchestrator afterwards — including production embedders that use
+    /// [`PairingOrchestrator::spawn_owner_loop_verified`] directly instead
+    /// of [`TaskPairing::spawn_owner_loop`] — consults the gate before
+    /// answering an `InviteRedeemOffered`.
+    ///
+    /// Wave 30 (review 2026-11-07, R29-P2-05): the installed closure
+    /// captures ONLY the shared task table, never the `TaskPairing`. The
+    /// gate lives inside the orchestrator, so a closure holding the whole
+    /// pairing would form a strong reference ring
+    /// (gate → pairing → orchestrator → gate) that outlives every
+    /// external handle; the bare table keeps the gate's footprint to
+    /// exactly the data [`veto_task_offer`] reads.
+    pub fn install_redeem_offer_gate(&self) {
+        let tasks = Arc::clone(&self.tasks);
+        self.orch
+            .set_redeem_offer_gate(Arc::new(move |offer| Self::veto_task_offer(&tasks, offer)));
+    }
+
+    /// Pre-commit veto over one redeem offer (P1-05, wave 29; installed by
+    /// [`TaskPairing::install_redeem_offer_gate`] as the orchestrator's
     /// redeem-offer gate). For a code this `TaskPairing` created, the
     /// joiner's endpoint blob must be present and decodable and must
     /// declare the mirror of the code's direction — otherwise the offer
@@ -943,9 +971,11 @@ impl TaskPairing {
     /// budget, and neither side journals or books the pairing. Codes not
     /// created here (plain invites, adopted codes) carry no task rule
     /// and pass through untouched.
-    fn veto_task_offer(&self, offer: &RedeemOffer) -> Result<(), PairFlowError> {
-        let my_direction = self
-            .tasks
+    fn veto_task_offer(
+        tasks: &StdMutex<HashMap<CodeId, ActiveTask>>,
+        offer: &RedeemOffer,
+    ) -> Result<(), PairFlowError> {
+        let my_direction = tasks
             .lock()
             .expect("task pairing lock")
             .get(&offer.code_id)
@@ -990,9 +1020,7 @@ impl TaskPairing {
     /// those manually through [`TaskPairing::complete_owner_pairing`].
     pub fn spawn_owner_loop(&self) -> JoinHandle<()> {
         let pairing = self.clone();
-        let gate = pairing.clone();
-        self.orch
-            .set_redeem_offer_gate(Arc::new(move |offer| gate.veto_task_offer(offer)));
+        self.install_redeem_offer_gate();
         self.orch.spawn_owner_loop_verified(Some(Arc::new(move |verified| {
             let code_id = verified.record().transcript.code_id;
             let my_direction = pairing
@@ -1019,32 +1047,15 @@ impl TaskPairing {
         })))
     }
 
-    /// Watch the control connection and end every live task as
-    /// [`TaskDisconnectReason::Network`] when it drops (the client's
-    /// `Disconnected` state). The registry connection itself is not
-    /// re-established here — reconnecting is the daemon's policy decision.
-    pub fn spawn_network_watcher(&self) -> JoinHandle<()> {        let mut state = self.orch.client().state_watcher();
-        let pairing = self.clone();
-        tokio::spawn(async move {
-            loop {
-                if state.changed().await.is_err() {
-                    break; // client dropped
-                }
-                if matches!(*state.borrow_and_update(), ClientState::Disconnected) {
-                    let live: Vec<CodeId> = pairing
-                        .tasks
-                        .lock()
-                        .expect("task pairing lock")
-                        .keys()
-                        .copied()
-                        .collect();
-                    for code in live {
-                        pairing.report_connection_lost(code);
-                    }
-                }
-            }
-        })
-    }
+    // Wave 30 (review 2026-11-07, P2-08): the former registry-connection
+    // watcher — which ended every live task with
+    // `TaskDisconnectReason::Network` when the CONTROL connection
+    // dropped — is GONE. Task data planes are independent of the
+    // registry: a paired transfer keeps running through a registry
+    // outage, so a control-plane disconnect is not a task verdict. Tasks
+    // end only on data-plane verdicts (`report_connection_lost`,
+    // `report_peer_disconnect`) or local action (`disconnect`);
+    // reconnecting the registry remains the daemon's policy decision.
 
     /// One connectivity test against a paired peer's endpoint, using the
     /// configured [`ProbeOptions`].
@@ -1421,5 +1432,61 @@ mod tests {
             };
             assert_eq!(event, event.clone());
         }
+    }
+
+    // ---- gate lifecycle (R29-P2-05) ---------------------------------------------
+
+    /// The installed offer gate must capture ONLY the shared task table:
+    /// dropping every external `TaskPairing` reference (no owner loop
+    /// spawned) releases the table. The pre-fix closure captured the whole
+    /// pairing, forming the strong ring gate → pairing → orchestrator →
+    /// gate that outlived every handle and pinned the pairing context,
+    /// the client cache and the in-memory code secrets.
+    #[tokio::test]
+    async fn offer_gate_holds_no_reference_ring() {
+        use crate::pairing::client::RegistryClient;
+        use crate::pairing::orchestrator::{OrchestratorConfig, PairingOrchestrator};
+
+        // A real in-process registry: the client is genuinely connected
+        // (the pairing stack cannot be built without one).
+        let registry_key = ak_identity::DeviceKeyPair::generate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind registry port");
+        let addr = listener.local_addr().expect("registry addr");
+        let store =
+            ak_signal::server_v2::store::RegistryStore::open_in_memory().expect("store");
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let server_key = registry_key.clone();
+        let server = tokio::spawn(async move {
+            let _ = ak_signal::server_v2::engine::serve_v2(
+                listener,
+                &server_key,
+                store,
+                ak_signal::server_v2::Limits::default(),
+                stop_rx,
+            )
+            .await;
+        });
+
+        let dir = tempfile::tempdir().expect("id dir");
+        let key = ak_identity::DeviceKeyPair::generate();
+        let client =
+            RegistryClient::connect(addr, registry_key.public_key(), &key, "lifecycle")
+                .await
+                .expect("connect");
+        let orch = PairingOrchestrator::open(client, key, dir.path(), OrchestratorConfig::default())
+            .expect("orchestrator");
+        let pairing = TaskPairing::with_defaults(orch);
+        let tasks_weak = Arc::downgrade(&pairing.tasks);
+        pairing.install_redeem_offer_gate();
+        drop(pairing);
+        assert!(
+            tasks_weak.upgrade().is_none(),
+            "the gate must not hold a pairing→orchestrator→gate ring past drop"
+        );
+
+        let _ = stop_tx.send(true);
+        server.abort();
     }
 }

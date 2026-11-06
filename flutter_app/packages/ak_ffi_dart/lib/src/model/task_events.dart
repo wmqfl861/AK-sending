@@ -13,18 +13,31 @@
 ///  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
 /// {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":true|false|null}
 /// {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
-///  "root":"photos","files":3,"bytes":123456}
+///  "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox"}
 /// {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
-/// {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed"}
+/// {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
+/// {"event":"consent_expired","job":"<32hex>"}
 /// ```
 ///
-/// Wave-29 note on `disconnected` reasons (P2-08): `local`, `peer` and
-/// `receiver_failed` are DATA-PLANE terminal verdicts — the task's direct
-/// connection is gone. Any OTHER reason string is a coordination-plane
-/// notice (e.g. a registry/coordinator link loss): the authorized data
-/// channel may still be healthy, so consumers must keep such connections
-/// alive instead of mapping the notice to a terminal state. Only a real
-/// data-plane close drives the terminal state.
+/// Wave-30 contract-first notes (the Rust task plane lands the same
+/// shapes in parallel):
+/// * `incoming_request.saveDir` (camelCase key, wave-30 P2-06): the save
+///   directory THIS request will use, snapshotted native-side at offer
+///   time — the receive lands there even if the settings change before
+///   the user answers, and the UI shows this value as the target.
+/// * `consent_expired` (wave-30 P2-11): the native 30 s consent window
+///   auto-declined the request — the terminal request event that closes
+///   pending UI banners (no Dart-side timer mirror).
+///
+/// Wave-29 note on `disconnected` reasons (P2-08, wave-30 P2-05 widened):
+/// `local`, `peer`, `receiver_failed` and `done` are DATA-PLANE terminal
+/// verdicts — the task's direct connection is gone (`done` = the one-task
+/// transfer COMPLETED, wave-30: the row converges to a completed state
+/// that no longer offers sends). Any OTHER reason string is a
+/// coordination-plane notice (e.g. a registry/coordinator link loss): the
+/// authorized data channel may still be healthy, so consumers must keep
+/// such connections alive instead of mapping the notice to a terminal
+/// state. Only a real data-plane close drives the terminal state.
 ///
 /// Parsing policy mirrors `pairing_events.dart`: an unknown `"event"` name
 /// decodes to [TaskUnknownEvent] (forward compatibility); a missing or
@@ -77,6 +90,7 @@ sealed class TaskEvent {
           rootName: _optionalString(json, 'root') ?? '',
           files: _int(json, 'files'),
           bytes: _int(json, 'bytes'),
+          saveDir: _optionalString(json, 'saveDir'),
         );
       case 'done':
         return TaskDoneEvent(
@@ -90,6 +104,12 @@ sealed class TaskEvent {
           atMs: at,
           conn: _optionalString(json, 'conn'),
           reason: _optionalString(json, 'reason') ?? 'unknown',
+        );
+      case 'consent_expired':
+        return TaskConsentExpiredEvent(
+          atMs: at,
+          job: _string(json, 'job'),
+          conn: _optionalString(json, 'conn'),
         );
       case 'op_done':
       case 'op_failed':
@@ -221,6 +241,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
     this.rootName = '',
     this.files = 0,
     this.bytes = 0,
+    this.saveDir,
   });
 
   /// Hex pending-request id (32 chars) — the `ak_task_consent` key.
@@ -235,6 +256,13 @@ final class TaskIncomingRequestEvent extends TaskEvent {
 
   final int bytes;
 
+  /// The save directory THIS request will use, snapshotted native-side at
+  /// offer time (wave-30 P2-06, wire key `saveDir`). The receive lands
+  /// here even if the settings change before the user answers — the UI
+  /// shows this value as the request's real target. Null = an engine
+  /// predating the field (callers fall back to the live setting).
+  final String? saveDir;
+
   @override
   String get name => 'incoming_request';
 
@@ -245,6 +273,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
         'root': rootName,
         'files': files,
         'bytes': bytes,
+        if (saveDir != null) 'saveDir': saveDir,
       };
 }
 
@@ -269,10 +298,11 @@ final class TaskDoneEvent extends TaskEvent {
       };
 }
 
-/// A connection went away. `local`/`peer`/`receiver_failed` are
-/// DATA-PLANE terminal verdicts; any other reason is a coordination-plane
-/// notice that must NOT kill a healthy data connection (see the library
-/// doc, wave-29 P2-08).
+/// A connection went away. `local`/`peer`/`receiver_failed`/`done` are
+/// DATA-PLANE terminal verdicts (`done` = the one-task transfer completed,
+/// wave-30 P2-05); any other reason is a coordination-plane notice that
+/// must NOT kill a healthy data connection (see the library doc, wave-29
+/// P2-08).
 final class TaskDisconnectedEvent extends TaskEvent {
   const TaskDisconnectedEvent({super.atMs, this.conn, required this.reason});
 
@@ -287,6 +317,30 @@ final class TaskDisconnectedEvent extends TaskEvent {
   Map<String, Object?> get fields => {
         if (conn != null) 'conn': conn,
         'reason': reason,
+      };
+}
+
+/// The native 30 s consent window auto-declined a pending request
+/// (wave-30 P2-11): the request is TERMINAL — a request-level fact from
+/// the engine that times the window, replacing any Dart-side timer
+/// mirror. A later `ak_task_consent` on [job] answers `-4` (unknown or
+/// already decided).
+final class TaskConsentExpiredEvent extends TaskEvent {
+  const TaskConsentExpiredEvent({super.atMs, required this.job, this.conn});
+
+  /// The hex pending-request id whose window closed undecided.
+  final String job;
+
+  /// The request's connection, when the engine could attribute it.
+  final String? conn;
+
+  @override
+  String get name => 'consent_expired';
+
+  @override
+  Map<String, Object?> get fields => {
+        'job': job,
+        if (conn != null) 'conn': conn,
       };
 }
 

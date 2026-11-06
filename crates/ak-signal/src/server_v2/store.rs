@@ -453,7 +453,11 @@ impl RegistryStore {
     /// `InviteClaimed`, different content is `REQUEST_CONFLICT`. With
     /// both at their defaults the body is byte-identical to the
     /// pre-wave-28 canonical form, so claims journaled by a v1 server
-    /// still replay after the upgrade (P2-14, see [`claim_body`]).
+    /// still replay after the upgrade (P2-14, see [`claim_body`]); the
+    /// one historical divergence — wave-28 journaled default claims with
+    /// an explicit all-zero tail (41 bytes) — is folded into the
+    /// comparison, not the storage (R29-P2-02, see
+    /// [`claim_bodies_equivalent`]).
     #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &self,
@@ -474,8 +478,10 @@ impl RegistryStore {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Idempotency first: same owner+request_id replays or conflicts.
+        // The comparison tolerates the wave-28 41-byte default layout
+        // (R29-P2-02) without rewriting any stored row.
         if let Some((stored_body, response)) = journal_get(&tx, owner, request_id)? {
-            return Ok(if stored_body == body {
+            return Ok(if claim_bodies_equivalent(&stored_body, &body) {
                 ClaimOutcome::Replay(response)
             } else {
                 ClaimOutcome::RequestConflict
@@ -1530,6 +1536,31 @@ fn claim_body(
         }
     }
     body
+}
+
+/// Compare a journaled claim body against the canonical body of an
+/// incoming retry, folding in the one historical layout divergence
+/// (R29-P2-02).
+///
+/// wave-28 journaled **every** claim with the explicit extension tail,
+/// so a default extension (`max_redeems == 0`, no endpoint) was stored
+/// as 41 bytes: `digest[32] + ttl[4] + cap=0[4] + presence=0[1]`. Since
+/// wave-29 the canonical body for defaults is again the 36-byte v1
+/// layout. A 41-byte body whose 5-byte tail is all zero can only be
+/// such a wave-28 record — v1 never wrote a tail, and every non-default
+/// tail has a non-zero cap or a non-zero presence byte — so it compares
+/// equal to its own 36-byte prefix. All other bodies compare
+/// byte-for-byte: genuinely different ttl, cap, or endpoint content
+/// still yields `REQUEST_CONFLICT`. Stored rows are never rewritten;
+/// only this comparison normalizes.
+fn claim_bodies_equivalent(stored: &[u8], incoming: &[u8]) -> bool {
+    fn canonical(body: &[u8]) -> &[u8] {
+        match body {
+            [prefix @ .., 0x00, 0x00, 0x00, 0x00, 0x00] if prefix.len() == 36 => prefix,
+            other => other,
+        }
+    }
+    canonical(stored) == canonical(incoming)
 }
 
 fn revoke_body(code_id: &CodeId, expected_revision: u64) -> Vec<u8> {
@@ -2848,6 +2879,75 @@ mod tests {
         assert_ne!(claim_body(&lookup(2), 600, 0, None), legacy);
     }
 
+    /// The exact body bytes a wave-28 server journaled for a claim: the
+    /// extension tail was appended unconditionally (commit `7458e9f`),
+    /// so a default extension produced 41 bytes ending in
+    /// `cap=0[4] + presence=0[1]`. Used to fixture historical rows
+    /// (R29-P2-02); this build's [`claim_body`] is the canonical form.
+    fn wave28_claim_body(
+        lookup_digest: &Digest32,
+        ttl_secs: u32,
+        max_redeems: u32,
+        owner_endpoint: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(41);
+        body.extend_from_slice(lookup_digest);
+        body.extend_from_slice(&ttl_secs.to_be_bytes());
+        body.extend_from_slice(&max_redeems.to_be_bytes());
+        body.push(u8::from(owner_endpoint.is_some()));
+        if let Some(endpoint) = owner_endpoint {
+            body.extend_from_slice(endpoint);
+        }
+        body
+    }
+
+    /// R29-P2-02: the claim-body comparison folds wave-28's 41-byte
+    /// default layout into the 36-byte canonical form — and nothing
+    /// else: non-default tails stay byte-exact.
+    #[test]
+    fn claim_bodies_equivalent_folds_only_the_wave28_default_tail() {
+        let canonical = claim_body(&lookup(1), 600, 0, None);
+        assert_eq!(canonical.len(), 36);
+        let wave28_default = wave28_claim_body(&lookup(1), 600, 0, None);
+        assert_eq!(wave28_default.len(), 41);
+        // The two layouts name the same canonical request (both orders).
+        assert!(claim_bodies_equivalent(&wave28_default, &canonical));
+        assert!(claim_bodies_equivalent(&canonical, &wave28_default));
+        // Genuinely different extension or base content never matches.
+        assert!(!claim_bodies_equivalent(
+            &wave28_default,
+            &claim_body(&lookup(1), 600, 1, None)
+        ));
+        assert!(!claim_bodies_equivalent(
+            &wave28_default,
+            &claim_body(&lookup(1), 600, 0, Some(&[0x0E; 32]))
+        ));
+        assert!(!claim_bodies_equivalent(
+            &wave28_default,
+            &claim_body(&lookup(1), 900, 0, None)
+        ));
+        assert!(!claim_bodies_equivalent(
+            &wave28_default,
+            &claim_body(&lookup(2), 600, 0, None)
+        ));
+        // Non-default wave-28 rows keep byte-exact comparison: identical
+        // current encoding matches, any change conflicts.
+        let wave28_cap2 = wave28_claim_body(&lookup(1), 600, 2, None);
+        assert_eq!(wave28_cap2, claim_body(&lookup(1), 600, 2, None));
+        assert!(claim_bodies_equivalent(
+            &wave28_cap2,
+            &claim_body(&lookup(1), 600, 2, None)
+        ));
+        assert!(!claim_bodies_equivalent(
+            &wave28_cap2,
+            &claim_body(&lookup(1), 600, 3, None)
+        ));
+        assert!(!claim_bodies_equivalent(
+            &wave28_cap2,
+            &claim_body(&lookup(1), 600, 2, Some(&[0x0E; 8]))
+        ));
+    }
+
     /// Create a pre-wave-28 (schema v1) database exactly as waves 18-27
     /// wrote it (no endpoint columns, no cap column) holding one active
     /// code row, and optionally one legacy request_journal entry.
@@ -3092,6 +3192,219 @@ mod tests {
         assert_eq!(
             store
                 .claim(&owner(2), &[0x77; 16], &lookup(7), 600, 0, Some(&[0x0E; 32]), 9_004)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+    }
+
+    /// R29-P2-02: wave-28 journaled default-extension claims with the
+    /// explicit all-zero tail (41 bytes) — the schema-v2 library an
+    /// actual wave-28 deployment holds. After upgrading that library to
+    /// this build, retrying the original request must replay the
+    /// original `InviteClaimed` (not REQUEST_CONFLICT), the stored row
+    /// must stay untouched (no disk rewrite), and genuinely different
+    /// content must still conflict.
+    #[test]
+    fn wave28_default_journal_rows_replay_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.sqlite");
+        let now = 1_000_000u64;
+        let wave28_body = wave28_claim_body(&lookup(3), 600, 0, None);
+        assert_eq!(wave28_body.len(), 41);
+        let original_response = {
+            let store = RegistryStore::open(&path).unwrap();
+            assert!(matches!(
+                store
+                    .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 0, None, now)
+                    .unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
+            let conn = store.lock();
+            // Rewrite the journal body to exactly what the wave-28 build
+            // persisted for this request (unconditional extension tail).
+            conn.execute(
+                "UPDATE request_journal SET request_body=?3
+                 WHERE owner_device_id=?1 AND request_id=?2",
+                params![
+                    owner(3).as_slice(),
+                    &[0x33u8; 16].as_slice(),
+                    &wave28_body
+                ],
+            )
+            .unwrap();
+            let response: Vec<u8> = conn
+                .query_row(
+                    "SELECT response FROM request_journal
+                     WHERE owner_device_id=?1 AND request_id=?2",
+                    params![owner(3).as_slice(), &[0x33u8; 16].as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            response
+        };
+        // Upgrade: the same database file reopened by this build.
+        let store = RegistryStore::open(&path).unwrap();
+        // The original request retried: the exact original answer.
+        match store
+            .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 0, None, now + 1)
+            .unwrap()
+        {
+            ClaimOutcome::Replay(bytes) => assert_eq!(bytes, original_response),
+            other => panic!("wave-28 default journal row must replay, got {other:?}"),
+        }
+        // Replay never rewrote the historical row: still the 41B layout.
+        {
+            let conn = store.lock();
+            let body: Vec<u8> = conn
+                .query_row(
+                    "SELECT request_body FROM request_journal
+                     WHERE owner_device_id=?1 AND request_id=?2",
+                    params![owner(3).as_slice(), &[0x33u8; 16].as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(body, wave28_body);
+        }
+        // The same id now carrying a non-default extension (cap=1) is a
+        // change of content, not a replay.
+        assert_eq!(
+            store
+                .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 1, None, now + 2)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // Likewise a newly added endpoint, a different ttl, a different
+        // digest.
+        assert_eq!(
+            store
+                .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 0, Some(&[0x0D; 32]), now + 3)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(3), &[0x33; 16], &lookup(3), 900, 0, None, now + 4)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(3), &[0x33; 16], &lookup(4), 600, 0, None, now + 5)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // And the replay answer stays stable across further retries.
+        assert!(matches!(
+            store
+                .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 0, None, now + 6)
+                .unwrap(),
+            ClaimOutcome::Replay(_)
+        ));
+    }
+
+    /// R29-P2-02: a store holding a mix of journal layouts — a wave-28
+    /// 41B default row, a current 36B default row, and a non-default 41B
+    /// row — replays each request id against its own original answer;
+    /// no layout leaks into another row's comparison.
+    #[test]
+    fn mixed_journal_layouts_replay_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.sqlite");
+        let now = 2_000_000u64;
+        let mut expected = std::collections::HashMap::new();
+        {
+            let store = RegistryStore::open(&path).unwrap();
+            // r1: 41B default row as wave-28 wrote it (rewritten below).
+            assert!(matches!(
+                store
+                    .claim(&owner(4), &[0x51; 16], &lookup(5), 600, 0, None, now)
+                    .unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
+            // r2: 36B default row as this build writes it.
+            assert!(matches!(
+                store
+                    .claim(&owner(4), &[0x52; 16], &lookup(6), 600, 0, None, now)
+                    .unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
+            // r3: non-default extension — byte-identical under wave-28
+            // and this build.
+            assert!(matches!(
+                store
+                    .claim(&owner(4), &[0x53; 16], &lookup(7), 600, 2, None, now)
+                    .unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE request_journal SET request_body=?3
+                 WHERE owner_device_id=?1 AND request_id=?2",
+                params![
+                    owner(4).as_slice(),
+                    &[0x51u8; 16].as_slice(),
+                    wave28_claim_body(&lookup(5), 600, 0, None)
+                ],
+            )
+            .unwrap();
+            for seed in [0x51u8, 0x52, 0x53] {
+                let response: Vec<u8> = conn
+                    .query_row(
+                        "SELECT response FROM request_journal
+                         WHERE owner_device_id=?1 AND request_id=?2",
+                        params![owner(4).as_slice(), &[seed; 16].as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                expected.insert(seed, response);
+            }
+        }
+        let store = RegistryStore::open(&path).unwrap();
+        // Each layout replays its own original answer with matching
+        // content: 41B default, 36B default, non-default tail.
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x51; 16], &lookup(5), 600, 0, None, now + 1)
+                .unwrap(),
+            ClaimOutcome::Replay(expected[&0x51].clone())
+        );
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x52; 16], &lookup(6), 600, 0, None, now + 2)
+                .unwrap(),
+            ClaimOutcome::Replay(expected[&0x52].clone())
+        );
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x53; 16], &lookup(7), 600, 2, None, now + 3)
+                .unwrap(),
+            ClaimOutcome::Replay(expected[&0x53].clone())
+        );
+        // Crossing layouts under the same id is still a conflict: a
+        // default retry against the non-default row...
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x53; 16], &lookup(7), 600, 0, None, now + 4)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // ...a cap=1 retry against either default row (41B or 36B)...
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x51; 16], &lookup(5), 600, 1, None, now + 5)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x52; 16], &lookup(6), 600, 1, None, now + 6)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        // ...and swapping base content between the two default rows' ids.
+        assert_eq!(
+            store
+                .claim(&owner(4), &[0x51; 16], &lookup(6), 600, 0, None, now + 7)
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );

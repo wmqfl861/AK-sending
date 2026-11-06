@@ -132,4 +132,47 @@ void main() {
     expect(find.byKey(const ValueKey('incoming_progress_a')), findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_accept_b')), findsOneWidget);
   });
+
+  testWidgets('P2-06: the banner shows the request\'s offer-time target — '
+      'a settings change after the offer does not rewrite it',
+      (tester) async {
+    final fake = await pumpApp(tester);
+
+    // The engine snapshotted D:/offer-time at OFFER time.
+    fake.emitIncomingRequest(
+        jobId: 'dir1', fileCount: 1, totalBytes: 1, saveDir: 'D:/offer-time');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('将保存到：D:/offer-time'), findsOneWidget,
+        reason: '横幅必须显示请求的真实目标（事件字段）');
+
+    // The user changes the default folder BEFORE answering: the banner
+    // keeps the offer-time target (that is where the files will land).
+    await fake.setSaveDir('E:/changed-later');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('将保存到：D:/offer-time'), findsOneWidget);
+    expect(find.textContaining('E:/changed-later'), findsNothing,
+        reason: '同意前改目录不得改写提示目标（P2-06）');
+
+    // Accept and finish: the success card names the SAME folder.
+    await tester.tap(find.byKey(const ValueKey('incoming_accept_dir1')));
+    await tester.pump();
+    fake.finishIncoming('dir1');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.textContaining('保存在：D:/offer-time'), findsOneWidget);
+  });
+
+  testWidgets('P2-06 fallback: without the event field the banner shows '
+      'the live setting', (tester) async {
+    final fake = await pumpApp(tester);
+
+    fake.emitIncomingRequest(
+        jobId: 'legacy', fileCount: 1, totalBytes: 1, saveDir: null);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('将保存到：Download/AK-接收'), findsOneWidget,
+        reason: '事件缺字段时回退显示当前设置');
+  });
 }

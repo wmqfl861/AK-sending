@@ -1854,12 +1854,20 @@ fn handle_prepared(
             // P1-03: the cap bound at the commit linearization point — a
             // competing pending won this code's last redeem slot. The
             // store aborted this pairing without consuming the cap; both
-            // participants get the explicit, code-scoped failure.
+            // participants get the explicit failure. Wave-30 (recheck
+            // R29-P2-01): the error is PAIRING-scoped with THIS pairing's
+            // id — the production RegistryClient dispatch routes
+            // pairing-scope errors to the pairing inbox/plane and the
+            // orchestrator's wait_frame terminates on
+            // object_id == pairing_id, so the losing flow actually
+            // receives the terminal 0x2109 instead of waiting out its
+            // deadline (a Code-scoped frame with the all-zero request id
+            // had no waiter and no fan-out — silently dropped).
             if let Some(fresh) = shared.store.pairing_snapshot(&pairing_id).ok().flatten() {
                 let error = pair_error(
                     [0u8; 16],
-                    ErrorScope::Code,
-                    fresh.code_id,
+                    ErrorScope::Pairing,
+                    pairing_id,
                     REDEEM_EXHAUSTED,
                     0,
                 );
@@ -3369,8 +3377,11 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(code, REDEEM_EXHAUSTED, "{who}");
-                    assert_eq!(scope, ErrorScope::Code, "{who}");
-                    assert_eq!(object_id, code_id, "{who}");
+                    // Wave-30 (R29-P2-01): pairing-scoped and addressed to
+                    // THIS pairing so the production client dispatch and
+                    // orchestrator wait_frame actually deliver the loss.
+                    assert_eq!(scope, ErrorScope::Pairing, "{who}");
+                    assert_eq!(object_id, pairing_b, "{who}");
                 }
                 other => panic!("{who}: expected REDEEM_EXHAUSTED, got {other:?}"),
             }

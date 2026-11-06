@@ -142,7 +142,7 @@ struct Dispatch {
     /// Durable per-pairing inboxes (survive reconnects).
     pairing: HashMap<PairingId, Vec<mpsc::Sender<CtrlMessage>>>,
     /// Pairing-plane subscribers: every pairing-plane frame, `ServerError`
-    /// and pairing-scoped `PairError`, copied to each.
+    /// and pairing-/code-scoped `PairError`, copied to each.
     plane: Vec<mpsc::Sender<CtrlMessage>>,
     /// Wave-28 endpoint blobs relayed by extended frames
     /// (`InviteRedeemOffered`: the redeemer's settings; `PairCommit`: the
@@ -280,6 +280,18 @@ impl ClientInner {
                     if let Some(inboxes) = dispatch.pairing.get(object_id) {
                         delivered |= Dispatch::fan_out(inboxes, &message);
                     }
+                    delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                }
+                if *scope == ErrorScope::Code {
+                    // Code-scoped failures name no pairing and carry no
+                    // usable request id (the commit-time REDEEM_EXHAUSTED
+                    // refusal is sent with request_id all-zero), so the
+                    // waiter path cannot see them. Fan them to the
+                    // pairing plane (wave 30, review R29-P2-01): the
+                    // in-flight owner/redeem flows subscribed there
+                    // attribute the error to their own pairing (see the
+                    // orchestrator's `wait_frame`) instead of waiting out
+                    // their commit deadline.
                     delivered |= Dispatch::fan_out(&dispatch.plane, &message);
                 }
             }
@@ -528,8 +540,10 @@ impl RegistryClient {
     /// Subscribe to the pairing plane: every pairing-plane frame this client
     /// receives (including `InviteRedeemOffered` for not-yet-known pairing
     /// ids and relayed `PairChallenge`), plus `ServerError` and
-    /// pairing-scoped `PairError`. This is the owner-side discovery stream;
-    /// see the module docs.
+    /// pairing-scoped `PairError`, plus code-scoped `PairError` (the
+    /// commit-time `REDEEM_EXHAUSTED` refusal names a code, not a
+    /// pairing — wave 30, review R29-P2-01). This is the owner-side
+    /// discovery stream; see the module docs.
     pub fn subscribe_plane(&self) -> mpsc::Receiver<CtrlMessage> {
         let (tx, rx) = mpsc::channel(self.inner.config.plane_capacity.max(1));
         self.inner

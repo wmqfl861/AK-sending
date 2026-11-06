@@ -156,6 +156,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   final Future<String> Function() _androidIdentityDir;
   final task_engine.SimpleTransferService _engine;
 
+  /// How often the accepted-receive stall loop wakes to check settled
+  /// state and drain progress (wave-30 P2-10).
+  static const Duration receivePollInterval = Duration(milliseconds: 50);
+
   /// The path_provider-resolved default identity dir once it lands
   /// (Android only; null until then).
   String? _platformIdentityDir;
@@ -210,8 +214,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   @override
   Future<TaskCode> createCode(TaskRole role) async {
-    final code = await _engine.createCode(_engineRole(role));
-    return TaskCode(code: code, role: role);
+    final created = await _engine.createCode(_engineRole(role));
+    // Wave-30 P2-04: the code_id rides up with the display code — it is
+    // the cancel key (`disconnect(codeId)` revokes the un-joined code).
+    return TaskCode(code: created.code, role: role, codeId: created.codeId);
   }
 
   @override
@@ -228,10 +234,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   @override
   Stream<List<TaskConnection>> get connections => _engine.connections.map(
-      (rows) => rows
-          .where((row) => row.state != 'disconnected')
-          .map(_rowOf)
-          .toList());
+        (rows) => rows
+            .where((row) =>
+                row.state != 'disconnected' && row.state != 'done')
+            .map(_rowOf)
+            .toList());
 
   @override
   Stream<IncomingRequest> get incomingRequests => _engine.incomingRequests
@@ -239,6 +246,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
             jobId: request.jobId,
             fileCount: request.files,
             totalBytes: request.bytes,
+            saveDir: request.saveDir, // P2-06: the request's real target
           ));
 
   @override
@@ -252,7 +260,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
       if (!accept) {
         // Wave-29 P2-11: a decline of an already-expired/auto-declined
         // request is IDEMPOTENT — the engine declined it (or the 30 s
-        // window did); nothing is received either way.
+        // window did); nothing was received either way.
         return;
       }
       throw StateError('该请求已失效（可能已被处理或超过 30 秒自动拒绝）。');
@@ -262,43 +270,124 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     }
     // Accepted: the contract completes when the receive finishes. Watch
     // the done event of THIS request's connection AND the connection
-    // itself going away (a mid-transfer disconnect must not hang the
-    // wait until the timeout — P2-10); past [receiveTimeout] the native
-    // task is cancelled through the disconnect path.
+    // itself going terminal (a mid-transfer disconnect must not hang the
+    // wait — P2-10). Wave-30 P2-10: [receiveTimeout] is a STALL budget,
+    // not an overall cap — receive progress lines (keyed by the pairing
+    // code id; the connection id also watched defensively) RENEW the
+    // deadline, so only a true no-progress stall elapses.
     final conn = _connOfJob[jobId];
+    final progressJobs = <String>{?conn};
+    final codeId = conn == null ? null : _engine.codeIdOfConnection(conn);
+    if (codeId != null) {
+      progressJobs.add(codeId);
+    }
     try {
-      final done = _engine.doneEvents
-          .firstWhere((event) => conn == null || event.conn == conn)
-          .then<void>((_) {});
-      final lost = conn == null
-          ? null
-          : _engine.connections
-              .firstWhere((rows) => rows.any(
-                  (row) => row.connId == conn && row.state == 'disconnected'))
-              .then<void>((_) => throw StateError('连接已断开，接收已中断。'));
-      await (lost == null ? done : Future.any<void>([done, lost]))
-          .timeout(receiveTimeout);
+      await _awaitReceiveSettled(conn, progressJobs);
     } on TimeoutException {
-      await _cancelReceiveTask(conn);
+      final cancelFailure = await _cancelReceiveTask(conn);
+      if (cancelFailure != null) {
+        throw TimeoutException(
+          '接收超时（${receiveTimeout.inSeconds} 秒无进展），且取消原生任务失败'
+          '（$cancelFailure）——接收可能仍在后台进行，请稍后重试或手动断开连接。',
+          receiveTimeout,
+        );
+      }
       throw TimeoutException(
-        '接收未在 ${receiveTimeout.inSeconds} 秒内完成，已取消原生接收任务并断开该连接。',
+        '接收超时（${receiveTimeout.inSeconds} 秒无进展），已取消原生接收任务并断开该连接。',
         receiveTimeout,
       );
     }
   }
 
+  /// The accepted-receive wait (P2-10 stall semantics): settles when the
+  /// connection's `done` event lands or the row goes terminal, and
+  /// throws [TimeoutException] only after [receiveTimeout] WITHOUT any
+  /// progress line for [progressJobs] (every observed line renews the
+  /// deadline — a long, healthy receive is never cut by total duration).
+  Future<void> _awaitReceiveSettled(
+      String? conn, Set<String> progressJobs) async {
+    var settled = false;
+    Object? failure;
+    final doneSub = _engine.doneEvents.listen((event) {
+      if (conn == null || event.conn == conn) {
+        settled = true;
+      }
+    });
+    final lostSub = conn == null
+        ? null
+        : _engine.connections.listen((rows) {
+            for (final row in rows) {
+              if (row.connId != conn) {
+                continue;
+              }
+              if (row.state == 'done') {
+                // P2-05: the one-task transfer COMPLETED — the row
+                // converging to `done` is the success verdict itself
+                // (it may beat the done event through the pump).
+                settled = true;
+                return;
+              }
+              if (row.state == 'disconnected') {
+                settled = true;
+                failure = StateError('连接已断开，接收已中断。');
+                return;
+              }
+            }
+          });
+    try {
+      var baseline = <String, int>{
+        for (final job in progressJobs) job: _engine.progressTick(job),
+      };
+      var deadline = DateTime.now().add(receiveTimeout);
+      while (!settled) {
+        // A REAL timer yield (not the injectable op delay): the watchdog
+        // must give the event loop room to deliver the stream events it
+        // watches and let tests drive the fake synchronously around it.
+        await Future<void>.delayed(receivePollInterval);
+        _engine.drainProgress();
+        var advanced = false;
+        for (final job in progressJobs) {
+          final tick = _engine.progressTick(job);
+          if (tick > (baseline[job] ?? 0)) {
+            advanced = true;
+            baseline[job] = tick;
+          }
+        }
+        if (advanced) {
+          deadline = DateTime.now().add(receiveTimeout); // bytes moved
+        }
+        if (DateTime.now().isAfter(deadline)) {
+          throw TimeoutException('接收无进展超时', receiveTimeout);
+        }
+      }
+      final error = failure;
+      if (error != null) {
+        throw error;
+      }
+    } finally {
+      await doneSub.cancel();
+      await lostSub?.cancel();
+    }
+  }
+
   /// P2-10's receive-side cancel: the FFI disconnect path stops the
-  /// native receive; best-effort (the receive may complete in the race
-  /// window, in which case the pump owns the final state).
-  Future<void> _cancelReceiveTask(String? connId) async {
+  /// native receive. Returns null when the cancel went through (or the
+  /// connection was already gone — `-4` is benign); the failure detail
+  /// when the cancel itself failed — the caller must then NOT claim
+  /// "已取消". The engine call is AWAITED: its failure lives in the
+  /// future (an async method), not in a synchronous throw.
+  Future<Object?> _cancelReceiveTask(String? connId) async {
     final id = connId;
     if (id == null) {
-      return;
+      return null;
     }
     try {
       await _engine.disconnect(id);
-    } on Object {
-      // raced completion — the event pump owns the state
+      return null;
+    } on AkFfiException catch (error) {
+      return error.message.isNotEmpty ? error.message : error;
+    } on Object catch (error) {
+      return error;
     }
   }
 
@@ -409,6 +498,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         // "success" and not the terminal `disconnected` either.
         return TaskConnectionState.unreachable;
       case 'disconnected':
+      case 'done':
+        // `done` (P2-05): the one-task transfer completed — terminal for
+        // the pairing; the UI labels it like a dropped row (the live
+        // snapshot filters it out entirely).
         return TaskConnectionState.disconnected;
       case 'probing':
       default:

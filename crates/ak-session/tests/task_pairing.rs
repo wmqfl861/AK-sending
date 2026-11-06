@@ -455,10 +455,14 @@ async fn disconnect_revokes_the_code_and_emits_local() {
     }
 }
 
-/// A control-connection loss ends every live task as Network: the watcher
-/// maps the client's `Disconnected` state.
+/// Wave 30 (review 2026-11-07, P2-08): a registry CONTROL-connection loss
+/// is NOT a task verdict. The data planes of paired tasks are independent
+/// of the registry, so the control link dying ends nothing — the tasks
+/// stay registered and the event stream stays silent. Only a real
+/// data-plane verdict (this side's link loss, the peer's departure) or a
+/// local action ends a task.
 #[tokio::test]
-async fn network_loss_ends_the_task_as_network() {
+async fn registry_connection_loss_does_not_end_live_tasks() {
     let registry = spawn_registry().await;
     let owner = task_device(&registry, "alice").await;
     let mut events = owner.pairing.subscribe();
@@ -468,7 +472,6 @@ async fn network_loss_ends_the_task_as_network() {
         .create_task_code(TaskDirection::Send, &[localhost(52001)])
         .await
         .expect("create task code");
-    let watcher = owner.pairing.spawn_network_watcher();
 
     owner
         .pairing
@@ -476,6 +479,21 @@ async fn network_loss_ends_the_task_as_network() {
         .client()
         .simulate_connection_loss()
         .await;
+
+    // No task end, no state loss: the control plane is not the data plane.
+    let stale = tokio::time::timeout(Duration::from_millis(300), events.recv()).await;
+    assert!(
+        stale.is_err(),
+        "a registry disconnect must not end the task, got {stale:?}"
+    );
+    assert_eq!(
+        owner.pairing.active_tasks().len(),
+        1,
+        "the task stays live through a registry outage"
+    );
+
+    // A REAL data-plane link-loss report still ends it as Network.
+    owner.pairing.report_connection_lost(code.invite.code_id);
     assert_eq!(
         next_event(&mut events).await,
         TaskEvent::TaskDisconnected {
@@ -483,7 +501,66 @@ async fn network_loss_ends_the_task_as_network() {
             reason: TaskDisconnectReason::Network,
         }
     );
-    watcher.abort();
+}
+
+/// Wave 30 (review 2026-11-07, R29-P2-01): the commit-time redeem-cap
+/// refusal (0x2109 — CODE-scoped, request id all-zero) reaches the LOSING
+/// business flow through the REAL RegistryClient and orchestrator. Of two
+/// concurrent complementary joins of one task code, exactly one pairs;
+/// the loser fails PROMPTLY with the dedicated `REDEEM_EXHAUSTED`
+/// refusal, not by waiting out its commit deadline.
+#[tokio::test]
+async fn concurrent_joins_the_loser_fails_promptly_with_redeem_exhausted() {
+    let registry = spawn_registry().await;
+    let owner = task_device(&registry, "alice").await;
+    let bob = task_device(&registry, "bob").await;
+    let carol = task_device(&registry, "carol").await;
+
+    let code = owner
+        .pairing
+        .create_task_code(TaskDirection::Send, &[localhost(52001)])
+        .await
+        .expect("create task code");
+    owner.pairing.spawn_owner_loop();
+
+    let bob_candidates = [localhost(52011)];
+    let carol_candidates = [localhost(52021)];
+    let bob_join =
+        bob.pairing
+            .join_task_code(&code.invite.display, &bob_candidates, TaskDirection::Recv);
+    let carol_join = carol
+        .pairing
+        .join_task_code(&code.invite.display, &carol_candidates, TaskDirection::Recv);
+    let started = std::time::Instant::now();
+    let (bob_res, carol_res) = tokio::join!(bob_join, carol_join);
+
+    let loser = match (bob_res, carol_res) {
+        (Ok(_paired), Err(loser)) | (Err(loser), Ok(_paired)) => loser,
+        (Ok(_), Ok(_)) => panic!("max_redeems = 1 must not pair two joins"),
+        (Err(a), Err(b)) => panic!("exactly one join must win; both failed: {a:?} vs {b:?}"),
+    };
+    match &loser {
+        TaskError::Flow(err) => {
+            let code_err = match err {
+                ak_session::pairing::PairFlowError::Rejected { code } => *code,
+                ak_session::pairing::PairFlowError::Unavailable { code } => *code,
+                other => panic!("expected the redeem-exhausted refusal, got {other:?}"),
+            };
+            assert_eq!(
+                code_err, REDEEM_EXHAUSTED,
+                "the dedicated refusal, got 0x{code_err:04x}"
+            );
+        }
+        other => panic!("a flow failure was expected, got {other:?}"),
+    }
+    // PROMPT: the broken dispatch made the loser wait out its commit
+    // deadline (the fast test window is 1.5 s + a 10 s grace, > 11 s).
+    // The attributed refusal lands within the pairing round trips.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the loser must fail promptly, took {elapsed:?}"
+    );
 }
 
 /// A data-plane loss maps by source: a peer-initiated close is ByPeer, an

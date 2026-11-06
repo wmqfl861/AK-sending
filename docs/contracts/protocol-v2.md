@@ -263,6 +263,6 @@ pub struct CtrlFrame {
 
 - 码行新增 `max_redeems`（默认 0＝无限，兼容旧流；create 可传 1）。
 - 计数口径＝该码名下 **committed/applied/ready** 状态的配对事务数；pending/aborted 不消耗额度。
-- 额度在 redeem begin 与**最终 Commit 的同一写事务内**两处强制（wave-29 修订）：判定性 `PairPrepared` 写 `committed` 前重读 `max_redeems` 并重计 committed/applied/ready；多个 pending 竞争 Commit 时恰好额度内者成功，超限者同事务转 `aborted` 并由双端收到 `0x2109`（scope＝Code，object＝code_id）。“一码恰双方”由此在服务器提交点成立，不依赖 begin 预检或客户端限制。
+- 额度在 redeem begin 与**最终 Commit 的同一写事务内**两处强制（wave-29 修订）：判定性 `PairPrepared` 写 `committed` 前重读 `max_redeems` 并重计 committed/applied/ready；多个 pending 竞争 Commit 时恰好额度内者成功，超限者同事务转 `aborted` 并由双端收到 `0x2109`（wave-30 修订 R29-P2-01：**Commit 竞争路径 scope＝Pairing，object＝pairing_id**——pairing 域错误经客户端分派扇出到对应配对收件箱/配对面，orchestrator 的等待方能真正收到终态；begin 路径（:267）保持 scope＝Code + 真实 request_id 的 waiter 路由不变）。“一码恰双方”由此在服务器提交点成立，不依赖 begin 预检或客户端限制。
 - 达到上限后，新的（不同 request_id 的）redeem 立即返回 `PairError`，错误码 `0x2109 REDEEM_EXHAUSTED`（scope＝Code，object＝code_id）。
 - 幂等/回放语义不变：同 `(redeemer, request_id)` 重放仍返回原 `InviteRedeemPending`（含 Commit 竞争失败后重试）；claim 侧同 `request_id` 同内容仍重放原 `InviteClaimed`。claim 幂等体的规范编码跨版本稳定：默认扩展（无 endpoint、cap 0）时与 v1 的 `lookup_digest[32]+ttl_secs[4]` 逐字节一致，仅非默认扩展追加尾部（见 `storage-schema.md` §5）。

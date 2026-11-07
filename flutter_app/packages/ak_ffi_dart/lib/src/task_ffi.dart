@@ -41,6 +41,14 @@
 ///   op id and answer; same id + different spec → `-2`).
 /// * One native engine handle is owned by ONE Dart isolate; calls on it
 ///   are serialized (the Dart event loop does this for free).
+/// * C07 (crash-analysis 2026-11-07): the borrowing layer carries the
+///   OWNER's liveness probe. [AkTaskFfiBindings] takes an optional
+///   [AkTaskLeaseProbe] and checks it at the TOP of every exported call,
+///   throwing a clear [StateError] instead of touching an engine handle
+///   the owner already freed. [FakeAkTaskCalls] has no owner and stays
+///   probe-free; [AkTaskLeaseGate] is the same check as a composable
+///   wrapper over any [AkTaskCalls] (the lease tests drive it with the
+///   fake — no DLL needed).
 library;
 
 import 'dart:async' show TimeoutException;
@@ -426,9 +434,130 @@ const List<String> akTaskExportNames = <String>[
   'ak_pairing_poll_event',
 ];
 
+// ---------------------------------------------------------------------------
+// C07: the owner/lease liveness probe (crash-analysis 2026-11-07).
+// ---------------------------------------------------------------------------
+
+/// C07 lease probe: the OWNER's liveness view of the engine handle this
+/// layer borrows — `true` while the handle's owner (the facade that ran
+/// `ak_engine_new`) still holds the engine alive. The owner flips it
+/// `false` in its dispose BEFORE the native `engine_free` runs, so a
+/// borrower racing the release gets the explicit [StateError] below
+/// instead of a dangling native call.
+typedef AkTaskLeaseProbe = bool Function();
+
+/// The [StateError] every lease-checked call throws once the probe
+/// reports the owner released the engine (C07).
+StateError taskLeaseRevokedError() => StateError(
+    '任务平面绑定已失效：引擎句柄的持有者已释放原生引擎（C07 lease）。'
+    '请通过服务重建恢复。');
+
+/// The one-line lease check shared by [AkTaskFfiBindings] and
+/// [AkTaskLeaseGate]: a null probe (no owner — the fake, or a bindings
+/// instance constructed bare) never refuses.
+void _ensureTaskLease(AkTaskLeaseProbe? probe) {
+  if (probe != null && !probe()) {
+    throw taskLeaseRevokedError();
+  }
+}
+
+/// C07: the lease check as a composable [AkTaskCalls] wrapper — every
+/// exported call checks [isAlive] FIRST and throws [StateError] when the
+/// owner already released the engine, WITHOUT touching [inner]. Wrap the
+/// real bindings under an owner, or a fake in tests (the fake itself has
+/// no owner and is never affected).
+final class AkTaskLeaseGate implements AkTaskCalls {
+  AkTaskLeaseGate(this.inner, {required this.isAlive});
+
+  /// The wrapped seam (FFI bindings or a test fake).
+  final AkTaskCalls inner;
+
+  /// The owner's liveness probe of the borrowed engine handle.
+  final AkTaskLeaseProbe isAlive;
+
+  @override
+  int start(String specJson, Uint8List runtimeIdOut) {
+    _ensureTaskLease(isAlive);
+    return inner.start(specJson, runtimeIdOut);
+  }
+
+  @override
+  int createCode(Uint8List runtimeId, String specJson, Uint8List opIdOut) {
+    _ensureTaskLease(isAlive);
+    return inner.createCode(runtimeId, specJson, opIdOut);
+  }
+
+  @override
+  int join(Uint8List runtimeId, String specJson, Uint8List opIdOut) {
+    _ensureTaskLease(isAlive);
+    return inner.join(runtimeId, specJson, opIdOut);
+  }
+
+  @override
+  int send(Uint8List runtimeId, Uint8List connId, String pathsJson,
+      Uint8List opIdOut) {
+    _ensureTaskLease(isAlive);
+    return inner.send(runtimeId, connId, pathsJson, opIdOut);
+  }
+
+  @override
+  int list(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _ensureTaskLease(isAlive);
+    return inner.list(runtimeId, buffer, cap);
+  }
+
+  @override
+  int disconnect(Uint8List runtimeId, Uint8List connId) {
+    _ensureTaskLease(isAlive);
+    return inner.disconnect(runtimeId, connId);
+  }
+
+  @override
+  int setSaveDir(Uint8List runtimeId, String path) {
+    _ensureTaskLease(isAlive);
+    return inner.setSaveDir(runtimeId, path);
+  }
+
+  @override
+  int consent(Uint8List runtimeId, Uint8List jobId, int accept) {
+    _ensureTaskLease(isAlive);
+    return inner.consent(runtimeId, jobId, accept);
+  }
+
+  @override
+  int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
+    _ensureTaskLease(isAlive);
+    return inner.opResult(runtimeId, opId, buffer, cap);
+  }
+
+  @override
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _ensureTaskLease(isAlive);
+    return inner.pollEvent(runtimeId, buffer, cap);
+  }
+
+  @override
+  int pollProgress(Uint8List buffer, int cap) {
+    _ensureTaskLease(isAlive);
+    return inner.pollProgress(buffer, cap);
+  }
+
+  /// Passes through unchanged: it reads the inner seam's CACHED Dart
+  /// detail (never a native engine call), exactly like the E4 gate.
+  @override
+  String? lastError() => inner.lastError();
+}
+
 /// [AkTaskCalls] over one `DynamicLibrary` and a BORROWED engine handle
 /// (ffi-v2.md §2: the shared facade borrows the handle and never
 /// double-disposes — this class owns no native resource).
+///
+/// C07: [isAlive] is the OWNER's liveness probe of [engine]. When given,
+/// every exported call checks it FIRST and throws the explicit
+/// [StateError] of [taskLeaseRevokedError] instead of touching a handle
+/// the owner already freed — the owner (see `AkEngineDartFacade`) flips
+/// the probe false BEFORE the native `engine_free`. Omit it for ownerless
+/// use (the seam then behaves exactly as before).
 ///
 /// The constructor resolves all ten symbols; a library predating wave 28
 /// makes `DynamicLibrary.lookup` throw `ArgumentError` — callers surface
@@ -436,9 +565,12 @@ const List<String> akTaskExportNames = <String>[
 /// [missingTaskExports] first.
 final class AkTaskFfiBindings implements AkTaskCalls {
   AkTaskFfiBindings(
-      {required Pointer<AkEngine> engine, required DynamicLibrary library})
+      {required Pointer<AkEngine> engine,
+      required DynamicLibrary library,
+      AkTaskLeaseProbe? isAlive})
       : _engine = engine,
-        _library = library {
+        _library = library,
+        _isAlive = isAlive {
     _start = _library.lookupFunction<_StartC, _StartDart>('ak_task_start');
     _createCode =
         _library.lookupFunction<_OpStartC, _OpStartDart>('ak_task_create_code');
@@ -462,6 +594,9 @@ final class AkTaskFfiBindings implements AkTaskCalls {
 
   final Pointer<AkEngine> _engine;
   final DynamicLibrary _library;
+
+  /// C07: the owner's liveness probe (null = ownerless, never refuses).
+  final AkTaskLeaseProbe? _isAlive;
 
   late final _StartDart _start;
   late final _OpStartDart _createCode;
@@ -510,8 +645,9 @@ final class AkTaskFfiBindings implements AkTaskCalls {
   }
 
   @override
-  int start(String specJson, Uint8List runtimeIdOut) =>
-      using((arena) {
+  int start(String specJson, Uint8List runtimeIdOut) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
         final spec = toNativeUtf8(specJson, allocator: arena);
         final idOut = arena<Uint8>(akPairingIdLength);
         final code = _note(_start(_engine, spec, idOut));
@@ -520,6 +656,7 @@ final class AkTaskFfiBindings implements AkTaskCalls {
         }
         return code;
       }, processAllocator);
+  }
 
   @override
   int createCode(Uint8List runtimeId, String specJson, Uint8List opIdOut) =>
@@ -530,8 +667,9 @@ final class AkTaskFfiBindings implements AkTaskCalls {
       _opStart(_join, runtimeId, specJson, opIdOut);
 
   int _opStart(_OpStartDart invoke, Uint8List runtimeId, String specJson,
-          Uint8List opIdOut) =>
-      using((arena) {
+          Uint8List opIdOut) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
         final id = _idIn(runtimeId, arena);
         final spec = toNativeUtf8(specJson, allocator: arena);
         final opOut = arena<Uint8>(akPairingIdLength);
@@ -541,11 +679,13 @@ final class AkTaskFfiBindings implements AkTaskCalls {
         }
         return code;
       }, processAllocator);
+  }
 
   @override
   int send(Uint8List runtimeId, Uint8List connId, String pathsJson,
-          Uint8List opIdOut) =>
-      using((arena) {
+          Uint8List opIdOut) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
         final runtime = _idIn(runtimeId, arena);
         final conn = _idIn(connId, arena);
         final paths = toNativeUtf8(pathsJson, allocator: arena);
@@ -556,61 +696,79 @@ final class AkTaskFfiBindings implements AkTaskCalls {
         }
         return code;
       }, processAllocator);
+  }
 
   @override
-  int list(Uint8List runtimeId, Uint8List buffer, int cap) =>
-      using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        return _bufCall(
-            (buf, capacity) => _list(_engine, runtime, buf, capacity), buffer, cap);
-      }, processAllocator);
+  int list(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      return _bufCall(
+          (buf, capacity) => _list(_engine, runtime, buf, capacity), buffer, cap);
+    }, processAllocator);
+  }
 
   @override
-  int disconnect(Uint8List runtimeId, Uint8List connId) => using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        final conn = _idIn(connId, arena);
-        return _note(_disconnect(_engine, runtime, conn));
-      }, processAllocator);
+  int disconnect(Uint8List runtimeId, Uint8List connId) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      final conn = _idIn(connId, arena);
+      return _note(_disconnect(_engine, runtime, conn));
+    }, processAllocator);
+  }
 
   @override
-  int setSaveDir(Uint8List runtimeId, String path) => using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        final native = toNativeUtf8(path, allocator: arena);
-        return _note(_setSaveDir(_engine, runtime, native));
-      }, processAllocator);
+  int setSaveDir(Uint8List runtimeId, String path) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      final native = toNativeUtf8(path, allocator: arena);
+      return _note(_setSaveDir(_engine, runtime, native));
+    }, processAllocator);
+  }
 
   @override
-  int consent(Uint8List runtimeId, Uint8List jobId, int accept) =>
-      using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        final job = _idIn(jobId, arena);
-        return _note(_consent(_engine, runtime, job, accept));
-      }, processAllocator);
+  int consent(Uint8List runtimeId, Uint8List jobId, int accept) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      final job = _idIn(jobId, arena);
+      return _note(_consent(_engine, runtime, job, accept));
+    }, processAllocator);
+  }
 
   @override
-  int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) =>
-      using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        final op = _idIn(opId, arena);
-        return _bufCall(
-            (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
-            buffer,
-            cap);
-      }, processAllocator);
+  int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      final op = _idIn(opId, arena);
+      return _bufCall(
+          (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
+          buffer,
+          cap);
+    }, processAllocator);
+  }
 
   @override
-  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) =>
-      using((arena) {
-        final runtime = _idIn(runtimeId, arena);
-        return _bufCall(
-            (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
-            buffer,
-            cap);
-      }, processAllocator);
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      return _bufCall(
+          (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
+          buffer,
+          cap);
+    }, processAllocator);
+  }
 
   @override
-  int pollProgress(Uint8List buffer, int cap) =>
-      _bufCall((buf, capacity) => _pollProgress(_engine, buf, capacity), buffer, cap);
+  int pollProgress(Uint8List buffer, int cap) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    return _bufCall(
+        (buf, capacity) => _pollProgress(_engine, buf, capacity), buffer, cap);
+  }
 
   /// Copies one validated 16-byte id into a fresh native buffer owned by
   /// [arena] (C14: a later allocation failure inside the same call site

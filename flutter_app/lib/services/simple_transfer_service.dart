@@ -121,6 +121,16 @@ enum SimpleTransferPhase {
   /// A pairing-level failure occurred; [SimpleTransferService.failureReason]
   /// carries the detail. A new createCode/join leaves the sink.
   failed,
+
+  /// TERMINAL engine-failure latch (C12, crash-analysis 2026-11-07):
+  /// [SimpleTransferPhase.pollFailureThreshold] CONSECUTIVE native poll
+  /// failures (event/progress poll exceptions and malformed progress
+  /// lines alike) stopped the pump — the transfer engine is presumed
+  /// broken. [SimpleTransferService.failureReason] carries the last
+  /// failure detail. Recovery is SERVICE REBUILD ONLY (dispose this
+  /// service and construct a new one); no phase transition ever leaves
+  /// this sink.
+  engineFailed,
 }
 
 /// One connection as the UI renders it (the `ak_task_list` row shape).
@@ -237,6 +247,21 @@ final class SimpleCreatedCode {
 /// The v1 minimal-pairing service. Construct with the FFI seam
 /// (`AkTaskFfiBindings`, borrowed engine) or a [FakeAkTaskCalls] for
 /// tests; ONE isolate owns the seam (calls serialize on the event loop).
+///
+/// C12 (crash-analysis 2026-11-07) pump discipline:
+///
+/// * Each pump tick processes at most [pumpEventBudget] events and
+///   drains at most [pumpEventBudget] progress lines — a runaway native
+///   queue can never monopolize the UI isolate between ticks; a backlog
+///   simply clears over consecutive ticks (event order unchanged).
+/// * [pollFailureThreshold] CONSECUTIVE failed native polls (event /
+///   progress poll [AkFfiException]s and malformed progress lines alike)
+///   latch the TERMINAL [SimpleTransferPhase.engineFailed] state: the
+///   pump stops (no further native polling) and [failureReason] carries
+///   the visible reason. One clean tick resets the streak — only truly
+///   persistent failures trip it. Recovery is SERVICE REBUILD ONLY:
+///   dispose this service and construct a new one (the engine failure is
+///   presumed native-side; [start] refuses on a latched service).
 final class SimpleTransferService {
   SimpleTransferService({
     required this.calls,
@@ -244,6 +269,16 @@ final class SimpleTransferService {
     this.opPollInterval = const Duration(milliseconds: 200),
     Future<void> Function(Duration)? delay,
   })  : _delay = delay ?? Future<void>.delayed;
+
+  /// C12: one pump tick handles at most this many events (and drains at
+  /// most this many progress lines) — the per-tick budget that keeps a
+  /// runaway native queue off the UI isolate.
+  static const int pumpEventBudget = 64;
+
+  /// C12: this many CONSECUTIVE failed native polls (event/progress poll
+  /// exceptions and malformed progress lines alike) latch
+  /// [SimpleTransferPhase.engineFailed] and stop the pump.
+  static const int pollFailureThreshold = 10;
 
   /// The task-plane call seam (FFI bindings or fake). Public read-only:
   /// the app shell wires `AkTaskFfiBindings` here; tests inject the fake.
@@ -323,6 +358,15 @@ final class SimpleTransferService {
 
   bool _disposed = false;
 
+  /// C12: consecutive failed native polls since the last clean tick
+  /// (event/progress poll exceptions + malformed progress lines).
+  int _consecutivePollFailures = 0;
+
+  /// C12: the terminal engine-failure latch (see
+  /// [SimpleTransferPhase.engineFailed]) — once set, the pump stays
+  /// stopped and no phase transition leaves the sink.
+  bool _engineFailed = false;
+
   // -- lifecycle ---------------------------------------------------------
 
   /// `ak_task_start`: boots the task runtime (registry config comes from
@@ -337,6 +381,12 @@ final class SimpleTransferService {
     String? saveDir,
   }) async {
     _ensureLive();
+    if (_engineFailed) {
+      // C12: the engine-failed latch is terminal — recovery is service
+      // REBUILD, never a restart on the same broken engine.
+      throw StateError(
+          '传输引擎已故障（${_failureReason ?? '连续轮询失败'}）：请新建传输服务恢复。');
+    }
     if (_runtime != null) {
       return; // idempotent: one task runtime per service
     }
@@ -659,22 +709,47 @@ final class SimpleTransferService {
   /// event pump and from the send/receive stall loops alike (each line
   /// is consumed exactly once and credited to its own job id).
   ///
+  /// C12: one call drains at most [pumpEventBudget] lines — a runaway
+  /// progress queue clears over successive calls, and each MALFORMED
+  /// line (a `jsonDecode` failure) counts toward the consecutive poll
+  /// failure streak (returned as this call's malformed count, which the
+  /// pump tick uses to reset or escalate); the line itself is still
+  /// consumed, so one bad line never blocks the queue.
+  ///
   /// Wave-31 R30-P1-01: LIVENESS GATE at the entry — dispose invalidates
   /// every call channel before the native owner is released, so a stall
-  /// loop's racing tick must never re-poll a freed engine pointer.
-  void drainProgress() {
-    if (_disposed) {
-      return;
+  /// loop's racing tick must never re-poll a freed engine pointer. C12
+  /// adds the engine-failed latch to the same gate (no polling a broken
+  /// engine either).
+  ///
+  /// Returns the number of MALFORMED lines consumed this call (0 = all
+  /// clean; a call that never reached the queue also reports 0).
+  int drainProgress() {
+    if (_disposed || _engineFailed) {
+      return 0;
     }
     final runtime = _runtime;
     if (runtime == null) {
-      return;
+      return 0;
     }
-    while (true) {
-      final line = runtime.pollProgressLine();
-      if (line == null) {
-        return;
+    var malformed = 0;
+    var drained = 0;
+    while (drained < pumpEventBudget && !_engineFailed) {
+      final String? line;
+      try {
+        line = runtime.pollProgressLine();
+      } on AkFfiException catch (error) {
+        _notePollFailure('进度事件轮询失败', error);
+        return malformed;
+      } on StateError catch (error) {
+        // C07: revoked lease — the same immediate stop as the event loop.
+        _latchEngineFailed('引擎租约已撤销（C07 lease）', error);
+        return malformed;
       }
+      if (line == null) {
+        return malformed;
+      }
+      drained++;
       try {
         final decoded = jsonDecode(line);
         if (decoded is Map<String, dynamic>) {
@@ -684,9 +759,13 @@ final class SimpleTransferService {
           }
         }
       } on Object {
-        // A malformed progress line never breaks the timeout machinery.
+        // A malformed progress line never breaks the timeout machinery —
+        // but it IS an engine-protocol failure: count it (C12).
+        malformed++;
+        _notePollFailure('进度行解析失败', line);
       }
     }
+    return malformed;
   }
 
   /// The monotonic progress tick of [job] (0 = no progress line ever
@@ -755,8 +834,14 @@ final class SimpleTransferService {
   /// The pairing phase (the state machine above).
   SimpleTransferPhase get phase => _phase;
 
-  /// The failure detail when [phase] is [SimpleTransferPhase.failed].
+  /// The failure detail when [phase] is [SimpleTransferPhase.failed] or
+  /// [SimpleTransferPhase.engineFailed].
   String? get failureReason => _failureReason;
+
+  /// C12: the terminal engine-failure latch — true once
+  /// [pollFailureThreshold] consecutive native polls failed; the pump is
+  /// stopped and only disposing + rebuilding this service recovers.
+  bool get isEngineFailed => _engineFailed;
 
   /// The synchronous connection snapshot.
   List<SimpleConnection> get currentConnections =>
@@ -782,11 +867,18 @@ final class SimpleTransferService {
   }
 
   void _setPhase(SimpleTransferPhase next) {
+    if (_engineFailed && next != SimpleTransferPhase.engineFailed) {
+      // C12: the engine-failed latch is TERMINAL — a late join result,
+      // row transition or action failure never masks it. Recovery is
+      // service rebuild.
+      return;
+    }
     if (_phase == next) {
       return;
     }
     _phase = next;
-    if (next != SimpleTransferPhase.failed) {
+    if (next != SimpleTransferPhase.failed &&
+        next != SimpleTransferPhase.engineFailed) {
       _failureReason = null;
     }
   }
@@ -795,7 +887,41 @@ final class SimpleTransferService {
     _failureReason = error is AkFfiException
         ? error.message
         : (error is TimeoutException ? error.message : error.toString());
+    if (_engineFailed) {
+      return; // C12: the engine-failed latch outranks the generic sink
+    }
     _setPhase(SimpleTransferPhase.failed);
+  }
+
+  /// C12: one more consecutive native poll failure (an event/progress
+  /// poll exception or a malformed progress line). The streak spans pump
+  /// ticks and stall-loop drains alike; a fully clean pump tick resets
+  /// it (see [_pumpOnce]). At [pollFailureThreshold] the terminal
+  /// engine-failed state latches: the reason becomes visible and the
+  /// pump stops — the engine is presumed broken and only a service
+  /// rebuild recovers.
+  void _notePollFailure(String what, Object detail) {
+    _consecutivePollFailures++;
+    if (_consecutivePollFailures < pollFailureThreshold || _engineFailed) {
+      return; // transient so far, or already latched (reason stays put)
+    }
+    _latchEngineFailed('连续 $pollFailureThreshold 次$what', detail);
+  }
+
+  /// Latches the terminal engine-failed state (C12): visible reason, pump
+  /// stopped. Idempotent — the first latch's reason stays.
+  void _latchEngineFailed(String what, Object detail) {
+    if (_engineFailed) {
+      return;
+    }
+    _engineFailed = true;
+    final reason = detail is AkFfiException
+        ? detail.message
+        : (detail is TimeoutException ? detail.message : detail.toString());
+    _failureReason = '传输引擎故障：$what（$reason）。泵已停止，请新建传输服务恢复。';
+    _setPhase(SimpleTransferPhase.engineFailed);
+    _pump?.cancel(); // C12: stop polling a broken engine
+    _pump = null;
   }
 
   void _notifyConnections() {
@@ -942,27 +1068,47 @@ final class SimpleTransferService {
 
   /// One pump tick: drain the runtime's event queue and route by type,
   /// then drain the engine-wide progress queue into the P2-10 ticks.
+  ///
+  /// C12: the tick handles at most [pumpEventBudget] events — a backlog
+  /// beyond the budget stays queued and clears on the following ticks
+  /// (FIFO order preserved). A poll [AkFfiException] no longer retries
+  /// silently forever: it counts toward the consecutive-failure streak,
+  /// and [pollFailureThreshold] failures in a row latch
+  /// [SimpleTransferPhase.engineFailed] and STOP the pump. A fully clean
+  /// tick (queue drained, no parse failures) resets the streak.
   void _pumpOnce() {
-    if (_disposed) {
+    if (_disposed || _engineFailed) {
       return;
     }
     final runtime = _runtime;
     if (runtime == null) {
       return;
     }
-    while (true) {
+    var handled = 0;
+    while (handled < pumpEventBudget) {
       final TaskEvent? event;
       try {
         event = runtime.pollEvent();
-      } on AkFfiException {
-        return; // transient poll failure — the next tick retries
+      } on AkFfiException catch (error) {
+        _notePollFailure('任务事件轮询失败', error);
+        return; // the streak escalates in _notePollFailure
+      } on StateError catch (error) {
+        // C07: the owner's lease is revoked — the borrowed handle is
+        // gone. Stop NOW (never retry into a dangling pointer) and
+        // surface it through the same visible engine-failed latch.
+        _latchEngineFailed('引擎租约已撤销（C07 lease）', error);
+        return;
       }
       if (event == null) {
         break;
       }
       _route(event);
+      handled++;
     }
-    drainProgress(); // P2-10: keep the stall ticks fresh for the waiters
+    final malformed = drainProgress(); // P2-10: keep the stall ticks fresh
+    if (malformed == 0 && _consecutivePollFailures > 0) {
+      _consecutivePollFailures = 0; // a clean tick clears the streak (C12)
+    }
   }
 
   void _route(TaskEvent event) {

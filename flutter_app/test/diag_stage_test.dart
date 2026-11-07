@@ -58,6 +58,13 @@ final class FakeStagedOwner implements AkStagedEngineOwner {
 
   DynamicLibrary? _opened;
 
+  /// The C07 lease probe witness: flips false in dispose, exactly like
+  /// the real facade (before the native engine would be freed).
+  bool disposed = false;
+
+  @override
+  bool get isEngineAlive => !disposed;
+
   @override
   DynamicLibrary openLibrary() {
     final existing = _opened;
@@ -93,6 +100,7 @@ final class FakeStagedOwner implements AkStagedEngineOwner {
   @override
   void dispose() {
     ops.add('dispose');
+    disposed = true; // C07: the lease flips BEFORE the engine would free
   }
 }
 
@@ -309,6 +317,30 @@ void main() {
         'libak_ffi.so',
         reason: 'System.loadLibrary semantics need the bare SONAME',
       );
+    });
+  });
+
+  group('C07: owner lease probe (facade + staged-owner wiring)', () {
+    test('AkEngineDartFacade.isEngineAlive flips false on dispose — before '
+        'the engine would free', () {
+      final (_, log) = freshStageLog('c07-facade');
+      final facade = AkEngineDartFacade(stageLog: log);
+      expect(facade.isEngineAlive, isTrue,
+          reason: '释放前置位：dispose 前探针按存活报告');
+      facade.dispose();
+      expect(facade.isEngineAlive, isFalse,
+          reason: 'dispose 先翻转 _disposed 再释放原生引擎——借用者先看到'
+              '租约撤销（C07 lease）');
+      facade.dispose(); // idempotent
+      expect(facade.isEngineAlive, isFalse);
+    });
+
+    test('FakeStagedOwner (the injected-owner seam) flips the same way', () {
+      final owner = FakeStagedOwner();
+      expect(owner.isEngineAlive, isTrue);
+      owner.dispose();
+      expect(owner.isEngineAlive, isFalse,
+          reason: 'bootstrap 传入的 owner 探针与真实 facade 同语义');
     });
   });
 

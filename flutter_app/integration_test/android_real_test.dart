@@ -431,7 +431,11 @@ void _wireRealStack() {
     final realRegistry = _registryAddr.isNotEmpty && _registryIdHex.isNotEmpty;
     _service = FfiSimpleTransferService(
       calls: AkTaskFfiBindings(
-          engine: engine.nativeHandle, library: library),
+          engine: engine.nativeHandle, library: library,
+          // C07 lease probe: the facade flips not-alive BEFORE
+          // engine_free, so a late poll after teardown throws a
+          // StateError instead of touching a freed handle.
+          isAlive: () => facade.isEngineAlive),
       // Real registry when both compile constants exist; otherwise the
       // never-dialed loopback placeholder keeps start()'s SPEC validation
       // satisfiable so the REAL runtime still boots (header note).

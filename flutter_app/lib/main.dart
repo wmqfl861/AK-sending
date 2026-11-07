@@ -7,7 +7,8 @@
 /// main.dart ─▶ AkEngineDartFacade (owns AkEngineDart: DLL probe + handle)
 ///                     ▼ borrowEngine() (ffi-v2 §2: borrow, never dispose)
 ///             AkTaskFfiBindings (engine pointer + library, task-plane
-///                     ▼          export probe via missingTaskExports)
+///                     ▼          export probe via missingTaskExports;
+///                 C07: carries the facade's isEngineAlive lease probe)
 ///             FfiSimpleTransferService (the UI contract adapter; resolves
 ///                     ▼          AK_REGISTRY_ADDR/AK_REGISTRY_ID env →
 ///                 compiled --dart-define defaults; Android identity dir
@@ -434,9 +435,17 @@ AppServiceBootstrap bootstrapAppService({
     }
 
     // Stages E/F/G: build the real service over the borrowed engine.
+    // C07: the bindings carry the OWNER's lease probe — the facade flips
+    // it not-alive in dispose BEFORE the native engine_free, so every
+    // task-plane call after the release throws the explicit StateError
+    // instead of touching the freed handle.
     final innerCalls = taskCalls != null
         ? taskCalls()
-        : AkTaskFfiBindings(engine: owner.engineHandle, library: owner.library);
+        : AkTaskFfiBindings(
+            engine: owner.engineHandle,
+            library: owner.library,
+            isAlive: () => owner.isEngineAlive,
+          );
     String? note;
     DiagTaskCallsGate? gate;
     if (stage == DiagStage.e || stage == DiagStage.f) {

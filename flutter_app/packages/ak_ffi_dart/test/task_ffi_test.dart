@@ -7,6 +7,8 @@ library;
 
 import 'dart:async' show Timer, TimeoutException;
 
+import 'dart:typed_data' show Uint8List;
+
 import 'package:ak_ffi_dart/ak_ffi_dart.dart';
 import 'package:test/test.dart';
 
@@ -627,6 +629,85 @@ void main() {
           reason: '请求已随连接终结：迟到决定为 -4');
       fake.closePendingRequest(runtime.runtimeIdHex, job); // gone: silent
       expect(runtime.pollEvent(), isNull);
+    });
+  });
+
+  group('C07: owner lease probe (borrowed engine handle)', () {
+    AkTaskStartSpec spec() => AkTaskStartSpec(
+        registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/c07');
+
+    test('a live owner never interferes: the gate is transparent', () async {
+      final fake = FakeAkTaskCalls();
+      var alive = true;
+      final gate = AkTaskLeaseGate(fake, isAlive: () => alive);
+      final runtime = TaskFfi(calls: gate).start(spec());
+      expect(fake.runtimes, contains(runtime.runtimeIdHex));
+      expect(runtime.pollEvent(), isA<TaskRuntimeReadyEvent>());
+      final created = await runtime
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender))
+          .wait(delay: immediateDelay);
+      expect(created['op'], 'task_create_code');
+      expect(runtime.list().saveDir, 'C:/ak/downloads');
+      expect(runtime.pollProgressLine(), isNull); // engine-wide queue empty
+      expect(fake.acceptedSpecs, isNotEmpty);
+    });
+
+    test('owner released → every exported call throws StateError and the '
+        'fake is never touched', () {
+      final fake = FakeAkTaskCalls();
+      final runtime = TaskFfi(calls: fake).start(spec());
+      runtime.pollEvent(); // drain runtime_ready
+      final pollsBefore = fake.pollEventCallCount;
+      final specsBefore = fake.acceptedSpecs.length;
+
+      var alive = false; // the owner disposed: lease revoked
+      final gate = AkTaskLeaseGate(fake, isAlive: () => alive);
+      final id = Uint8List(16);
+      final buffer = Uint8List(256);
+      expect(() => gate.start(spec().toJsonString(), id), throwsStateError);
+      expect(() => gate.createCode(id, '{}', id), throwsStateError);
+      expect(() => gate.join(id, '{}', id), throwsStateError);
+      expect(() => gate.send(id, id, '{"paths":["a"]}', id), throwsStateError);
+      expect(() => gate.list(id, buffer, 256), throwsStateError);
+      expect(() => gate.disconnect(id, id), throwsStateError);
+      expect(() => gate.setSaveDir(id, 'D:/x'), throwsStateError);
+      expect(() => gate.consent(id, id, 1), throwsStateError);
+      expect(() => gate.opResult(id, id, buffer, 256), throwsStateError);
+      expect(() => gate.pollEvent(id, buffer, 256), throwsStateError);
+      expect(() => gate.pollProgress(buffer, 256), throwsStateError);
+
+      // Not-alive errors are the explicit lease StateError, distinguishable
+      // from AkFfiException (which would mean native was reached).
+      Object? caught;
+      try {
+        gate.pollProgress(buffer, 256);
+      } on Object catch (error) {
+        caught = error;
+      }
+      expect(caught, isA<StateError>());
+      expect((caught as StateError).message, contains('C07'));
+
+      // Native NEVER touched: every observable fake counter is static.
+      expect(fake.acceptedSpecs, hasLength(specsBefore));
+      expect(fake.pollEventCallCount, pollsBefore);
+      expect(fake.disconnectCalls, isEmpty);
+      expect(fake.runtimes, hasLength(1)); // the pre-gate start only
+    });
+
+    test('the lease error message names the revoked handle', () {
+      expect(taskLeaseRevokedError().message, contains('已释放'));
+      expect(taskLeaseRevokedError().message, contains('C07 lease'));
+    });
+
+    test('lastError passes through the gate (a cached Dart read, not a '
+        'native call)', () {
+      final fake = FakeAkTaskCalls();
+      final gate = AkTaskLeaseGate(fake, isAlive: () => false);
+      expect(gate.lastError(), isNull); // refused before, but cache readable
+      expect(
+          () => gate.pollEvent(Uint8List(16), Uint8List(64), 64),
+          throwsStateError,
+          reason: 'a revoked lease refuses the exported calls');
     });
   });
 }

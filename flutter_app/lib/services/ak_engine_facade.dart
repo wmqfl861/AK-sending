@@ -135,6 +135,15 @@ abstract interface class AkStagedEngineOwner {
   /// The live engine's native handle (after [engineNew]).
   Pointer<AkEngine> get engineHandle;
 
+  /// C07 (crash-analysis 2026-11-07): the owner's liveness view of the
+  /// engine handle borrowers hold. `true` while this owner keeps the
+  /// engine alive; [dispose] flips it `false` BEFORE the native
+  /// `engine_free` runs, so a task-plane borrower that races the release
+  /// observes the revoked lease (a clear [StateError]) instead of
+  /// calling into a freed handle. Bootstrap wires this into
+  /// `AkTaskFfiBindings` as its `isAlive` probe.
+  bool get isEngineAlive;
+
   /// The opened library (after [openLibrary]).
   DynamicLibrary get library;
 
@@ -279,6 +288,10 @@ final class AkEngineDartFacade implements AkEngineFacade, AkStagedEngineOwner {
   /// Releases the engine when this facade opened its own. Idempotent.
   /// The loaded library itself is never unloaded (DynamicLibrary exposes
   /// no unload — Windows keeps the module mapped for the process life).
+  ///
+  /// C07 lease order: `_disposed` (what [isEngineAlive] reads) flips
+  /// FIRST; the native `engine_free` runs after it — every borrower
+  /// already sees a revoked lease before the handle dies.
   @override
   void dispose() {
     if (_disposed) {
@@ -345,6 +358,19 @@ final class AkEngineDartFacade implements AkEngineFacade, AkStagedEngineOwner {
 
   @override
   Pointer<AkEngine> get engineHandle => _engineOrThrow().nativeHandle;
+
+  /// C07 lease probe: alive until THIS facade's dispose — which sets
+  /// `_disposed` FIRST and only then runs the native `engine_free` — and
+  /// while the held engine itself is not disposed out-of-band. Borrowers
+  /// of the handle handed out before that moment observe the flip.
+  @override
+  bool get isEngineAlive {
+    if (_disposed) {
+      return false;
+    }
+    final engine = _engine;
+    return engine == null || !engine.isDisposed;
+  }
 
   /// Opens (once) and returns the engine handle; missing DLL throws so the
   /// caller can degrade. A disposed facade always throws [StateError].

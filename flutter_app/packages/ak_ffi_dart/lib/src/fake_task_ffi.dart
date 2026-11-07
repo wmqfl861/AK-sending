@@ -105,6 +105,24 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   /// pushed by [emitProgress] and drained by [pollProgress].
   final List<Map<String, dynamic>> progressLines = <Map<String, dynamic>>[];
 
+  /// RAW progress lines served FIRST by [pollProgress] (FIFO, ahead of
+  /// [progressLines]) — the C12 malformed-line rehearsal: any string
+  /// goes out verbatim, so a line the service cannot parse is one
+  /// `rawProgressLines.add('{oops')` away.
+  final List<String> rawProgressLines = <String>[];
+
+  /// C12 rehearsal: while positive, the next that-many `pollEvent` calls
+  /// answer `-1` (errInternal) with [pollEventFailureDetail] — the
+  /// persistent native-poll-failure script (events stay queued).
+  int failPollEventCalls = 0;
+
+  /// The detail of the scripted [failPollEventCalls] failures.
+  String pollEventFailureDetail = 'fake: poll_event 持续故障';
+
+  /// Total `pollEvent` calls served — the "native untouched" witness of
+  /// the C07 lease tests and the C12 pump-stop assertion.
+  int pollEventCallCount = 0;
+
   // -- seam ------------------------------------------------------------
 
   @override
@@ -473,9 +491,14 @@ final class FakeAkTaskCalls implements AkTaskCalls {
 
   @override
   int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
+    pollEventCallCount++;
     final runtime = _runtimeOf(runtimeId);
     if (runtime == null) {
       return _fail(AkStatus.errNotFound, 'fake: 未知任务运行时');
+    }
+    if (failPollEventCalls > 0) {
+      failPollEventCalls--;
+      return _fail(AkStatus.errInternal, pollEventFailureDetail);
     }
     if (runtime.events.isEmpty) {
       _lastErrorDetail = null;
@@ -494,6 +517,16 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   @override
   int pollProgress(Uint8List buffer, int cap) {
     // The ENGINE-WIDE queue (no runtime scoping — one fake == one engine).
+    if (rawProgressLines.isNotEmpty) {
+      // C12 rehearsal: raw (possibly malformed) lines go out verbatim.
+      final payload = rawProgressLines.first;
+      final wrote = _writePayload(payload, buffer, cap);
+      if (wrote > 0) {
+        rawProgressLines.removeAt(0);
+        return 1;
+      }
+      return wrote; // -3: nothing consumed
+    }
     if (progressLines.isEmpty) {
       _lastErrorDetail = null;
       return AkStatus.pending;

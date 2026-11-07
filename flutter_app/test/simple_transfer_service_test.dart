@@ -12,7 +12,7 @@ library;
 import 'dart:async' show Timer, TimeoutException;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
-    show AkFfiException, FakeAkTaskCalls, TaskDoneEvent;
+    show AkFfiException, AkTaskLeaseGate, FakeAkTaskCalls, TaskDoneEvent;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ak_sending_app/services/simple_transfer_service.dart';
 
@@ -1020,6 +1020,215 @@ void main() {
           reason: '健康连接上的 incoming 照常登记');
       await reqSub.cancel();
       await expSub.cancel();
+      service.dispose();
+    });
+  });
+
+  group('C12: pump budget + engine-failure latch', () {
+    test('a >budget backlog clears across ticks, in order (64/tick)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final runtimeId = fake.runtimes.values.first.id;
+      final runtimeEvents = fake.runtimes[runtimeId]!.events;
+
+      final doneEvents = <TaskDoneEvent>[];
+      final sub = service.doneEvents.listen(doneEvents.add);
+
+      // 100 no-op events, then ONE done event last: the done must not
+      // overtake the budget — it lands only when the whole backlog did.
+      for (var i = 0; i < 100; i++) {
+        runtimeEvents
+            .add(<String, dynamic>{'event': 'runtime_ready', 'runtime': runtimeId});
+      }
+      runtimeEvents.add(<String, dynamic>{
+        'event': 'done',
+        'files': 1,
+        'bytes': 42,
+      });
+
+      service.pumpEvents(); // tick 1: at most pumpEventBudget events
+      expect(
+          runtimeEvents.length, 101 - SimpleTransferService.pumpEventBudget,
+          reason: '一轮不清空：预算内事件已路由，其余留在队列');
+      expect(doneEvents, isEmpty,
+          reason: '队尾事件未越过预算被提前处理');
+
+      service.pumpEvents(); // tick 2: the remaining backlog, in order
+      await pumpEventQueue(); // broadcast deliveries are async
+      expect(runtimeEvents, isEmpty,
+          reason: '分轮清空：余量在后续轮次按序处理');
+      expect(doneEvents, hasLength(1));
+      expect(doneEvents.single.files, 1);
+      expect(doneEvents.single.bytes, 42);
+      expect(service.phase, SimpleTransferPhase.idle,
+          reason: '正常事件流不受预算影响');
+      await sub.cancel();
+      service.dispose();
+    });
+
+    test('progress drain is bounded too: a >budget backlog splits across '
+        'ticks', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      const job = 'abababababababababababababababab';
+      for (var i = 0; i < 100; i++) {
+        fake.emitProgress(job);
+      }
+      service.pumpEvents();
+      expect(service.progressTick(job), SimpleTransferService.pumpEventBudget,
+          reason: '一轮最多 drain 预算条进度行');
+      service.pumpEvents();
+      service.pumpEvents();
+      expect(service.progressTick(job), 100);
+      expect(service.phase, SimpleTransferPhase.idle);
+      service.dispose();
+    });
+
+    test('10 consecutive poll failures latch engineFailed, stop the pump, '
+        'and stay visible', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+
+      // threshold-1 failures: still the transient regime.
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        fake.failPollEventCalls = 1;
+        service.pumpEvents();
+      }
+      expect(service.isEngineFailed, isFalse);
+      expect(service.phase, isNot(SimpleTransferPhase.engineFailed));
+
+      fake.failPollEventCalls = 1;
+      final pollsBeforeLatch = fake.pollEventCallCount;
+      service.pumpEvents(); // the threshold failure
+      expect(service.isEngineFailed, isTrue);
+      expect(service.phase, SimpleTransferPhase.engineFailed);
+      expect(service.failureReason, contains('传输引擎故障'));
+      expect(service.failureReason, contains(fake.pollEventFailureDetail),
+          reason: '可观察错误带上最后一次原生失败细节');
+
+      // The pump is dead: even scripted failures and a backlog never
+      // reach native again (fake counters static).
+      fake.failPollEventCalls = 1000;
+      final runtimeId = fake.runtimes.values.first.id;
+      fake.runtimes[runtimeId]!.events
+          .add(<String, dynamic>{'event': 'runtime_ready', 'runtime': runtimeId});
+      service.pumpEvents();
+      expect(fake.pollEventCallCount, pollsBeforeLatch + 1,
+          reason: '闩上后仅本次越限轮询，其后泵不再触达原生');
+
+      // The latch is TERMINAL: a later successful action never masks it.
+      final created = await service.createCode(SimpleTransferRole.sender);
+      expect(created.code.startsWith('AKI1-'), isTrue);
+      expect(service.phase, SimpleTransferPhase.engineFailed,
+          reason: '任何后续状态迁移都不遮蔽 engineFailed');
+      service.dispose();
+    });
+
+    test('one clean tick resets the failure streak', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        fake.failPollEventCalls = 1;
+        service.pumpEvents();
+      }
+      service.pumpEvents(); // a clean tick: queue empty, streak resets
+      expect(service.isEngineFailed, isFalse);
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        fake.failPollEventCalls = 1;
+        service.pumpEvents();
+      }
+      expect(service.isEngineFailed, isFalse,
+          reason: '9 + clean + 9 不是“连续”10 次');
+      service.dispose();
+    });
+
+    test('malformed progress lines count toward the same threshold', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      const job = 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd';
+      // The fake serves raw lines FIRST: one HEALTHY raw line ahead of
+      // the malformed ones — it must still be credited before the latch.
+      fake.rawProgressLines.add('{"job":"$job","event":"chunk_sent"}');
+      const extraMalformed = 5; // beyond the threshold: never drained
+      for (var i = 0;
+          i < SimpleTransferService.pollFailureThreshold + extraMalformed;
+          i++) {
+        fake.rawProgressLines.add('{oops not json');
+      }
+      service.pumpEvents();
+      expect(service.progressTick(job), 1,
+          reason: '坏行前的好行照常计分');
+      expect(service.isEngineFailed, isTrue);
+      expect(service.phase, SimpleTransferPhase.engineFailed);
+      expect(service.failureReason, contains('解析失败'));
+      // Latched mid-drain: the malformed lines beyond the threshold are
+      // never polled.
+      expect(fake.rawProgressLines.length, extraMalformed,
+          reason: '闩上即停：剩余坏行不再被 drain');
+      service.dispose();
+    });
+
+    test('start() refuses after the latch: recovery is service rebuild',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold; i++) {
+        fake.failPollEventCalls = 1; // one failure per tick
+        service.pumpEvents();
+      }
+      expect(service.isEngineFailed, isTrue);
+      await expectLater(
+        service.start(
+            registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/x'),
+        throwsStateError,
+      );
+      service.dispose();
+    });
+
+    testWidgets('the real 50ms timer pump stops itself at the threshold',
+        (tester) async {
+      final fake = FakeAkTaskCalls()..failPollEventCalls = 1000;
+      final service = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(milliseconds: 50),
+      );
+      await service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/t');
+      // The startup pump already failed once; each 50ms tick adds one.
+      for (var i = 0; i < 12 && !service.isEngineFailed; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(service.isEngineFailed, isTrue,
+          reason: '连续 10 次轮询异常后进入传输引擎故障态');
+      final pollsAtStop = fake.pollEventCallCount;
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(fake.pollEventCallCount, pollsAtStop,
+          reason: '泵已停：50ms tick 不再触达原生');
+      service.dispose();
+    });
+
+    test('C07×C12: a revoked owner lease latches engineFailed WITHOUT '
+        'touching native', () {
+      final fake = FakeAkTaskCalls();
+      var alive = true;
+      final service = SimpleTransferService(
+        calls: AkTaskLeaseGate(fake, isAlive: () => alive),
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/l');
+      final polls = fake.pollEventCallCount;
+
+      alive = false; // the owner released the engine under the live pump
+      service.pumpEvents();
+      expect(service.isEngineFailed, isTrue,
+          reason: '租约撤销即刻闩上：绝不重试悬空指针');
+      expect(service.phase, SimpleTransferPhase.engineFailed);
+      expect(service.failureReason, contains('租约'));
+      expect(fake.pollEventCallCount, polls,
+          reason: '原生从未被触达：StateError 在绑定层就挡住了');
       service.dispose();
     });
   });

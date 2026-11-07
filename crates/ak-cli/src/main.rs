@@ -18,6 +18,7 @@ mod daemon;
 mod doctor;
 mod errors;
 mod invite;
+mod task_cli;
 
 use std::future::Future;
 use std::io::Write as _;
@@ -113,6 +114,13 @@ enum Command {
     Invite {
         #[command(subcommand)]
         cmd: InviteCommand,
+    },
+    /// v1 minimal task codes (wave 32): one random code = one task,
+    /// exactly two sides, generated on demand, disconnect ends the task,
+    /// zero configuration (the GUI's task model as CLI commands).
+    Task {
+        #[command(subcommand)]
+        cmd: task_cli::TaskCommand,
     },
     /// Run the authoritative v2 pairing registry (TLS + SQLite invite
     /// store; default port 7200). Print its registry id so devices can
@@ -1403,7 +1411,7 @@ fn checkpoint_dir(id: &Path) -> PathBuf {
     id.join("checkpoints")
 }
 
-fn load_identity(id: &Path) -> Result<(DeviceKeyPair, TlsBundle)> {
+pub(crate) fn load_identity(id: &Path) -> Result<(DeviceKeyPair, TlsBundle)> {
     let (key, created) = DeviceKeyPair::load_or_create(&id.join("device.key"))
         .with_context(|| format!("cannot load device key in {}", id.display()))?;
     if created {
@@ -1519,7 +1527,9 @@ impl ProgressLine {
     }
 }
 
-fn progress_printer(direction: &'static str) -> Arc<dyn Fn(Progress) + Send + Sync> {
+pub(crate) fn progress_printer(
+    direction: &'static str,
+) -> Arc<dyn Fn(Progress) + Send + Sync> {
     let line = Arc::new(ProgressLine::new(direction));
     Arc::new(move |progress: Progress| {
         if std::env::var_os("AK_QUIET").is_none() {
@@ -2678,7 +2688,7 @@ impl AttemptFailure {
 
 /// Single-line rendering of an engine error for progress/summary lines
 /// (multi-line Display output would garble the fallback report).
-fn one_line_reason(err: &EngineError) -> String {
+pub(crate) fn one_line_reason(err: &EngineError) -> String {
     let text = err.to_string();
     let first = text.split(['\n', '\r']).next().unwrap_or("");
     clip_line(first, 120).to_owned()
@@ -3772,6 +3782,7 @@ async fn main() -> Result<()> {
         }
         Command::Pair { cmd } => pair_command(&id, cmd),
         Command::Invite { cmd } => invite_command(&id, cmd).await,
+        Command::Task { cmd } => task_cli::task_command(&id, cmd).await,
         Command::RegistryServer {
             port,
             bind,

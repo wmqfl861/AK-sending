@@ -2,6 +2,15 @@
 
 本文件记录用户可感知的主要里程碑，按时间线组织；逐轮测试证据见 `reports/dev-validation-2026-11-02.txt`，任务级完成状态见 [docs/BACKLOG.zh-CN.md](docs/BACKLOG.zh-CN.md)，平台支持范围见 [docs/SUPPORT_MATRIX.zh-CN.md](docs/SUPPORT_MATRIX.zh-CN.md)。格式参照 Keep a Changelog；版本号语义为预发布（0.x）。
 
+## [未发布] - 2026-11-07：第三十二波——v1 任务码模型接入 CLI（`ak-cli task` 命令族，"GUI 功能 CLI 化"）
+
+v1 极简任务码模型（wave-28~31：一个随机码=一次任务、恰好双方、按需生成、断开即失效、零配置）此前仅 GUI（`ak_task_*` FFI→Dart→Flutter）。本波在 `ak-cli` 内用公开库 API（ak-session `TaskPairing` + ak-engine + ak-net，**不依赖 ak-ffi**）重建同一模型，Linux/CLI 用户获得与 GUI 等价的任务码入口：
+
+- **命令族 `ak-cli task`（命名冻结）**：`code-send <PATHS...> [--ttl-secs N] [--server/--registry-fp]`（生成发送方码并打印醒目 AKI1 码块，等待加入→配对→探测→自动发送→报告→断开）；`code-recv [--out DIR]`（生成接收方码，等待→常驻接收，每笔入站请求打印「对端请求发送 N 个文件（共 X，保存到 DIR）」并 30 秒 [Y/n] 提示，超时拒绝、拒绝零落盘；完成一次任务即断开）；`join-send <CODE> <PATHS...>`（作为发送方兑换，显式方向）；`join-recv <CODE> [--out DIR]`（作为接收方兑换+同意提示）。注册中心参数沿用 invite 家族解析（`--server`/`--registry-fp` 成对给出即持久化 pin，此后复用）。
+- **语义与 native/FFI 平面对齐**：接收准入绑定已配对指纹（`authorize` 只认 transcript 验证的对端；陌生人拨号在 TLS 门被拒且不消耗接收器，握手失败继续监听）；Offer 级同意走引擎非阻塞 `TransferConsent`（30 秒窗口自动拒绝，终端提示读 stdin 与定时器竞速）；探测 echo responder 沿用防反射设计（全零 nonce 不应答+按源预算）；方向冲突由 ak-session redeem-offer 前置门禁拒绝（同向加入不烧码）；进度沿用引擎 `[recv]/[send]` 行；Ctrl-C=本地断开（撤码+TASK-CLOSE 尽力通知对端，退出码 130）；对端/网络断开打印明确原因并非零退出；CLI 一次性，无 request_id 概念。
+- **实现中发现并修复的竞态**：joiner 侧接收器会在配对指纹就绪前拒绝发送方首轮拨号（发送方"已连接"后连接即被关）——发送驱动现把"连接后、Offer 前"的失败视为可重试（wave-29 P1-04 竞态的镜像），且配对→发送阶段整体可被 Ctrl-C 取消。
+- **验证**：`cargo test -p ak-cli` 138/138（原 129 基线零回归＋新增 9 项：双方向真实 e2e（真注册表 fixture+真传输+blake3 字节校验+同意 Y 分支）、拒绝 n 分支（零落盘+发送方明确报错）、同意窗口超时分支（短窗注入）、方向冲突不烧码、对端断开明确原因退出、TTL 解析边界、候选排序/封顶、等待超时）；`cargo clippy -p ak-cli --all-targets -- -D warnings` 干净；手工冒烟＝本机 loopback 真注册表+两终端命令（`code-recv`+`join-send`）真实传输 1.43 MiB，`cmp` 字节一致、双方退出码 0；契约检查 5/5。限制如实：新命令族尚未在 Linux 实机运行（Windows 开发机验证）。
+
 ## [未发布] - 2026-11-06：第二十九波（进行中）——wave-28 终审 21 项发现修复轮（P1×6 / P2×15）
 
 Codex 终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`，P0×0 / P1×6 / P2×15）。本波进行中：修复落在未提交工作树，按"已完成 / 在途"如实区分；全量 workspace 测试尚未复跑。

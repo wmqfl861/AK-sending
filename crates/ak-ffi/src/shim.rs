@@ -5,13 +5,27 @@
 //! covering pointer non-nullness, lifetime, and (for inputs) UTF-8
 //! validation before any engine call.
 //!
+//! Every export that takes a raw pointer is declared `pub unsafe extern
+//! "C" fn` (C02): dereferencing or freeing a caller-provided pointer is
+//! exactly the operation `unsafe` marks, and this crate builds as an
+//! `rlib`, so safe Rust CAN reach these functions — a safe wrapper around
+//! a pointer dereference would hand out undefined behavior to any Rust
+//! caller passing a bogus pointer. The C ABI is unchanged: symbol names,
+//! arities, parameter types, and calling convention are identical (the
+//! `unsafe` keyword is compile-time only, invisible across the boundary);
+//! it only makes the pointer-validity preconditions explicit at the type
+//! level for Rust callers.
+//!
 //! Calling conventions (the frozen contract):
 //!
 //! - Handles: [`ak_engine_new`] returns an owned `*mut AkEngine`;
 //!   [`ak_engine_free`] is its only matching destructor. Calls on one
 //!   handle must be serialized by the caller (one UI thread / isolate).
-//! - Strings IN: NUL-terminated UTF-8 `*const c_char`; invalid UTF-8 or a
-//!   missing NUL is an error return, never a panic.
+//! - Strings IN: NUL-terminated UTF-8 `*const c_char`. NUL termination
+//!   within the caller's allocation is a PRECONDITION, not something the
+//!   shim can check: `CStr::from_ptr` scans forward for the first NUL and
+//!   cannot detect a missing one (see [`read_cstr`]). Invalid UTF-8 (after
+//!   a NUL was found) is an error return, never a panic.
 //! - Strings OUT: caller-provided `*mut c_char` buffer plus capacity in
 //!   bytes; the shim writes the payload plus one NUL and never writes
 //!   beyond `cap`. On `AK_ERR_BUFFER` nothing was consumed — retry with a
@@ -24,23 +38,25 @@
 //! # Memory-safety contract (honest scope)
 //!
 //! Entry points validate everything they CAN observe — null pointers,
-//! buffer capacities, UTF-8, NUL termination — and refuse bad input with a
-//! status code. What they CANNOT observe is lifetime misuse: calling
-//! `ak_engine_free` twice, or using any handle/pointer argument after its
-//! allocation was freed, is **undefined behavior**, not an error return.
-//! There is no cheap, portable way to detect a freed handle, and none is
-//! attempted; single-free and use-before-free are caller obligations, the
-//! same as every C library. (A capacity larger than the real buffer is the
-//! same class of caller bug with the same consequence.)
+//! buffer capacities, UTF-8 — and refuse bad input with a status code.
+//! What they CANNOT observe: NUL TERMINATION (a `*const c_char` pointing
+//! at memory with no NUL anywhere ahead causes an out-of-bounds read, not
+//! an error return — `CStr::from_ptr` has no length to check against), a
+//! capacity that overstates the real allocation (the writes stay within
+//! `cap` but possibly beyond the true buffer), and lifetime misuse:
+//! calling `ak_engine_free` twice, or using any handle/pointer argument
+//! after its allocation was freed, is **undefined behavior**, not an error
+//! return. There is no cheap, portable way to detect a freed handle, and
+//! none is attempted; single-free and use-before-free are caller
+//! obligations, the same as every C library.
 //!
-//! `clippy::not_unsafe_ptr_arg_deref` is allowed module-wide: dereferencing
-//! caller-provided pointers under a documented C contract is this module's
-//! entire purpose. The Rust-side concern behind the lint (a safe Rust fn
-//! handing out UB to Rust callers passing bogus pointers) does not apply to
-//! the C/FFI frontends this ABI serves; every entry point re-validates
-//! null/capacity/UTF-8 before touching a pointer and never panics across
-//! the boundary.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! Panic containment has the same honest scope (C10): each export wraps
+//! its safe body in [`crate::core::guarded`], which converts an ordinary
+//! unwinding panic into `AK_ERR_INTERNAL` — the pointer adapters
+//! themselves, the last-error bookkeeping, and `ak_engine_free`'s
+//! destructor path run outside any catch, and no catch can recover a
+//! fail-fast death (access violation, abort). Error reporting, not a
+//! memory-safety promise.
 
 use std::os::raw::c_char;
 
@@ -93,11 +109,15 @@ unsafe fn write_cstr(buf: *mut c_char, cap: usize, text: &str) -> Result<usize, 
 ///
 /// # Safety
 ///
-/// SAFETY: `ptr` must be non-null and point to a NUL-terminated sequence
-/// of bytes that stays valid and unmodified for the duration of `'a` (in
-/// practice: the FFI call); `CStr::from_ptr` stops at the first NUL, so
-/// the borrow never reads past the terminator. UTF-8 validity is checked
-/// before the string is handed on.
+/// SAFETY: `ptr` must be non-null and point to a sequence of bytes that
+/// contains a NUL within the caller's allocation and stays valid and
+/// unmodified for the duration of `'a` (in practice: the FFI call).
+/// `CStr::from_ptr` scans forward for the FIRST NUL — it has no length,
+/// so it CANNOT detect a missing terminator: a pointer into memory with
+/// no NUL anywhere ahead reads past the allocation (undefined behavior,
+/// not an error return). NUL termination is therefore a strict caller
+/// precondition, not a validated property. UTF-8 validity of the bytes up
+/// to the terminator IS checked before the string is handed on.
 unsafe fn read_cstr<'a>(ptr: *const c_char) -> Result<&'a str, FfiError> {
     if ptr.is_null() {
         return Err(FfiError {
@@ -171,11 +191,19 @@ fn fail_buffer(need: usize, capacity: usize, what: &str) -> i32 {
 ///
 /// Returns an owned `*mut AkEngine`, or null on failure (see the
 /// thread-local last error on the SAME thread; the message is only set on
-/// the thread that observed the failure).
+/// the thread that observed the failure and carries the runtime builder's
+/// OS reason verbatim — e.g. a worker-thread creation failure under
+/// resource exhaustion — so the caller's error card can tell a real
+/// init failure apart from a crash, C13).
+///
+/// The fn itself stays safe (C02 marks only pointer-ARGUMENT exports
+/// `unsafe`; calling this cannot violate memory safety by itself, exactly
+/// like `Box::into_raw`) — the safety obligations below attach to the
+/// RETURNED handle, enforced at every use site that takes it.
 ///
 /// # Safety
 ///
-/// SAFETY (caller contract): the returned pointer is OWNED by the caller
+/// SAFETY (handle contract): the returned pointer is OWNED by the caller
 /// and must be released exactly once with `ak_engine_free`. While any call
 /// on the handle is in flight the handle must not be freed; calls on one
 /// handle must be serialized by the caller. Using or freeing a handle
@@ -185,7 +213,9 @@ fn fail_buffer(need: usize, capacity: usize, what: &str) -> i32 {
 pub extern "C" fn ak_engine_new() -> *mut AkEngine {
     core::clear_last_error();
     let build = || {
-        AkEngine::new().ok_or_else(|| FfiError::internal("cannot build the embedded tokio runtime"))
+        AkEngine::new().map_err(|error| {
+            FfiError::internal(format!("cannot build the embedded tokio runtime: {error}"))
+        })
     };
     match guarded(build) {
         Ok(engine) => Box::into_raw(Box::new(engine)),
@@ -198,7 +228,11 @@ pub extern "C" fn ak_engine_new() -> *mut AkEngine {
 
 /// Destroy an engine handle returned by [`ak_engine_new`]. Frees the
 /// runtime and aborts every still-running job first. Passing null is a
-/// no-op. The handle must not be used after this call.
+/// no-op. The handle must not be used after this call. Honest scope
+/// (C10): the destructor path is deliberately NOT wrapped in a catch —
+/// there is no status code to report into — so an ordinary panic while
+/// dropping the engine would unwind across the boundary (UB); it is the
+/// same class of residual risk as the un-catchable faults.
 ///
 /// # Safety
 ///
@@ -210,7 +244,7 @@ pub extern "C" fn ak_engine_new() -> *mut AkEngine {
 /// returns, is undefined behavior — the ABI cannot and does not detect
 /// double-free or use-after-free.
 #[no_mangle]
-pub extern "C" fn ak_engine_free(engine: *mut AkEngine) {
+pub unsafe extern "C" fn ak_engine_free(engine: *mut AkEngine) {
     core::clear_last_error();
     if engine.is_null() {
         return;
@@ -240,7 +274,7 @@ pub extern "C" fn ak_engine_free(engine: *mut AkEngine) {
 /// beyond the true capacity are caller-side undefined behavior). `engine`
 /// is never dereferenced.
 #[no_mangle]
-pub extern "C" fn ak_engine_last_error(
+pub unsafe extern "C" fn ak_engine_last_error(
     engine: *const AkEngine,
     buf: *mut c_char,
     cap: usize,
@@ -276,7 +310,7 @@ pub extern "C" fn ak_engine_last_error(
 /// the call. The engine handle must come from `ak_engine_new`, must not be
 /// freed concurrently, and calls on it must be serialized by the caller.
 #[no_mangle]
-pub extern "C" fn ak_send_start(
+pub unsafe extern "C" fn ak_send_start(
     engine: *mut AkEngine,
     spec_json: *const c_char,
     job_out: *mut u8,
@@ -328,7 +362,7 @@ pub extern "C" fn ak_send_start(
 /// the call. The engine handle must come from `ak_engine_new`, must not be
 /// freed concurrently, and calls on it must be serialized by the caller.
 #[no_mangle]
-pub extern "C" fn ak_receive_start(
+pub unsafe extern "C" fn ak_receive_start(
     engine: *mut AkEngine,
     spec_json: *const c_char,
     job_out: *mut u8,
@@ -380,7 +414,11 @@ pub extern "C" fn ak_receive_start(
 /// concurrently; `cap` must not overstate the real allocation. The engine
 /// handle must be live (see [`ak_engine_free`]).
 #[no_mangle]
-pub extern "C" fn ak_poll_progress(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
+pub unsafe extern "C" fn ak_poll_progress(
+    engine: *mut AkEngine,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
     core::clear_last_error();
     // SAFETY: same unique-handle contract as ak_send_start.
     let Some(engine) = (unsafe { engine.as_ref() }) else {
@@ -429,7 +467,7 @@ pub extern "C" fn ak_poll_progress(engine: *mut AkEngine, buf: *mut c_char, cap:
 /// writable for `cap` bytes and must not be modified concurrently; `cap`
 /// must not overstate the real allocation. The engine handle must be live.
 #[no_mangle]
-pub extern "C" fn ak_job_result(
+pub unsafe extern "C" fn ak_job_result(
     engine: *mut AkEngine,
     job: *const u8,
     buf: *mut c_char,
@@ -489,7 +527,7 @@ pub extern "C" fn ak_job_result(
 /// calls on it serialized (this call may block for a bounded few hundred
 /// milliseconds while the aborted task is reaped).
 #[no_mangle]
-pub extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
+pub unsafe extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
     core::clear_last_error();
     // SAFETY: same unique-handle contract as ak_send_start.
     let Some(engine) = (unsafe { engine.as_ref() }) else {
@@ -531,7 +569,7 @@ pub extern "C" fn ak_job_cancel(engine: *mut AkEngine, job: *const u8) -> i32 {
 /// `buf` (when non-null) must be writable for `cap` bytes and must not be
 /// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_identity_info(
+pub unsafe extern "C" fn ak_identity_info(
     engine: *const AkEngine,
     id_dir: *const c_char,
     buf: *mut c_char,
@@ -583,7 +621,7 @@ pub extern "C" fn ak_identity_info(
 /// `buf` (when non-null) must be writable for `cap` bytes and must not be
 /// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_jobs_list(
+pub unsafe extern "C" fn ak_jobs_list(
     engine: *const AkEngine,
     id_dir: *const c_char,
     buf: *mut c_char,
@@ -635,7 +673,7 @@ pub extern "C" fn ak_jobs_list(
 /// `buf` (when non-null) must be writable for `cap` bytes and must not be
 /// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_peer_list(
+pub unsafe extern "C" fn ak_peer_list(
     engine: *mut AkEngine,
     id_dir: *const c_char,
     buf: *mut c_char,
@@ -696,7 +734,7 @@ pub extern "C" fn ak_peer_list(
 /// bytes, not modified concurrently; `cap` must not overstate the real
 /// allocation.
 #[no_mangle]
-pub extern "C" fn ak_peer_add(
+pub unsafe extern "C" fn ak_peer_add(
     engine: *mut AkEngine,
     id_dir: *const c_char,
     fingerprint_hex: *const c_char,
@@ -772,7 +810,7 @@ pub extern "C" fn ak_peer_add(
 /// bytes, not modified concurrently; `cap` must not overstate the real
 /// allocation.
 #[no_mangle]
-pub extern "C" fn ak_peer_remove(
+pub unsafe extern "C" fn ak_peer_remove(
     engine: *mut AkEngine,
     id_dir: *const c_char,
     fingerprint_hex: *const c_char,
@@ -823,7 +861,7 @@ pub extern "C" fn ak_peer_remove(
 /// `cap` bytes for the duration of the call and must not be modified
 /// concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_version(buf: *mut c_char, cap: usize) -> i32 {
+pub unsafe extern "C" fn ak_version(buf: *mut c_char, cap: usize) -> i32 {
     core::clear_last_error();
     let text = core::version_string();
     // SAFETY: write_cstr checks null/bounds itself and writes only within
@@ -881,7 +919,7 @@ fn engine_or_fail<'a>(engine: *const AkEngine) -> Option<&'a AkEngine> {
 /// BEFORE the spec is parsed or anything is registered). The engine handle
 /// contract is that of [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_start(
+pub unsafe extern "C" fn ak_pairing_start(
     engine: *mut AkEngine,
     spec_json: *const c_char,
     runtime_id_out: *mut u8,
@@ -973,7 +1011,7 @@ fn op_start(
 /// `op_id_out` non-null and writable for 16 bytes (all checked before any
 /// side effect). Engine handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_create_start(
+pub unsafe extern "C" fn ak_pairing_create_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     spec_json: *const c_char,
@@ -996,7 +1034,7 @@ pub extern "C" fn ak_pairing_create_start(
 ///
 /// SAFETY (caller contract): as [`ak_pairing_create_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_redeem_start(
+pub unsafe extern "C" fn ak_pairing_redeem_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     spec_json: *const c_char,
@@ -1019,7 +1057,7 @@ pub extern "C" fn ak_pairing_redeem_start(
 ///
 /// SAFETY (caller contract): as [`ak_pairing_create_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_list_start(
+pub unsafe extern "C" fn ak_pairing_list_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     query_json: *const c_char,
@@ -1042,7 +1080,7 @@ pub extern "C" fn ak_pairing_list_start(
 ///
 /// SAFETY (caller contract): as [`ak_pairing_create_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_revoke_start(
+pub unsafe extern "C" fn ak_pairing_revoke_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     spec_json: *const c_char,
@@ -1074,7 +1112,7 @@ pub extern "C" fn ak_pairing_revoke_start(
 /// for 16 bytes; when non-null, `buf` writable for `cap` bytes, not
 /// modified concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_pairing_op_result(
+pub unsafe extern "C" fn ak_pairing_op_result(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     op_id: *const u8,
@@ -1099,15 +1137,18 @@ pub extern "C" fn ak_pairing_op_result(
         Err(error) => return fail(error),
     };
     match guarded(|| {
-        // Pairing plane first; a runtime-id miss falls through to the
-        // wave-28 task plane before the -4 leaves the boundary.
-        match v2::pairing_op_result(engine, &runtime_id, &op_id) {
-            Ok(result) => Ok(result),
-            Err(error) => match crate::task::task_op_result_maybe(engine, &runtime_id, &op_id) {
-                Ok(Some(result)) => Ok(result),
-                Ok(None) => Err(error),
-                Err(task_error) => Err(task_error),
-            },
+        // C11: ONE table pass decides which plane owns the id; the plane's
+        // own errors (including internal ones like lock poisoning)
+        // propagate as-is, and only a miss on BOTH tables is a -4.
+        match v2::runtime_plane(engine, &runtime_id)? {
+            Some(v2::RuntimePlane::Pairing) => v2::pairing_op_result(engine, &runtime_id, &op_id),
+            Some(v2::RuntimePlane::Task) => {
+                crate::task::task_op_result(engine, &runtime_id, &op_id)
+            }
+            None => Err(FfiError::not_found(format!(
+                "unknown runtime {}",
+                core::hex_encode(&runtime_id)
+            ))),
         }
     }) {
         Ok(v2::OpResult::Running) => AK_PENDING,
@@ -1148,7 +1189,7 @@ pub extern "C" fn ak_pairing_op_result(
 /// bytes; when non-null, `buf` writable for `cap` bytes, not modified
 /// concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_pairing_poll_event(
+pub unsafe extern "C" fn ak_pairing_poll_event(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     buf: *mut c_char,
@@ -1167,17 +1208,19 @@ pub extern "C" fn ak_pairing_poll_event(
         Err(error) => return fail(error),
     };
     let line = match guarded(|| {
-        // Pairing plane first: its Ok(None) means a KNOWN pairing runtime
-        // with an empty queue (AK_PENDING — never a task runtime, the
-        // tables are disjoint), so only the -4 miss falls through to the
-        // wave-28 task plane.
-        match v2::pairing_poll_event(engine, &runtime_id) {
-            Ok(option) => Ok(option),
-            Err(error) => match crate::task::task_poll_event_maybe(engine, &runtime_id) {
-                Ok(Some((line, _queue))) => Ok(line),
-                Ok(None) => Err(error),
-                Err(task_error) => Err(task_error),
-            },
+        // C11: route by which v2 table owns the id — ONE table pass, no
+        // speculative pairing lookup (an empty task-plane poll no longer
+        // constructs and discards a pairing-plane not-found first). The
+        // owning plane's errors, internal ones included, propagate as-is;
+        // only a miss on BOTH tables is a -4.
+        match v2::runtime_plane(engine, &runtime_id)? {
+            Some(v2::RuntimePlane::Pairing) => v2::pairing_poll_event(engine, &runtime_id),
+            Some(v2::RuntimePlane::Task) => crate::task::task_poll_event(engine, &runtime_id)
+                .map(|polled| polled.and_then(|(line, _queue)| line)),
+            None => Err(FfiError::not_found(format!(
+                "unknown runtime {}",
+                core::hex_encode(&runtime_id)
+            ))),
         }
     }) {
         Ok(Some(line)) => line,
@@ -1204,21 +1247,24 @@ pub extern "C" fn ak_pairing_poll_event(
     }
 }
 
-/// Push one event line back to the owning plane's queue (pairing first,
-/// then the wave-28 task plane) — the `-3`/null-buffer pushback of
-/// [`ak_pairing_poll_event`].
+/// Push one event line back to the owning plane's queue — the `-3`/
+/// null-buffer pushback of [`ak_pairing_poll_event`]. Same C11 routing as
+/// the pop: one table pass picks the plane, its errors propagate as-is,
+/// and only a miss on BOTH tables is a -4.
 fn push_pairing_or_task_event_front(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
     line: String,
 ) -> Result<(), FfiError> {
-    match v2::pairing_push_event_front(engine, runtime_id, line.clone()) {
-        Ok(()) => Ok(()),
-        Err(error) => match crate::task::task_push_event_front_maybe(engine, runtime_id, line) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(error),
-            Err(task_error) => Err(task_error),
-        },
+    match v2::runtime_plane(engine, runtime_id)? {
+        Some(v2::RuntimePlane::Pairing) => v2::pairing_push_event_front(engine, runtime_id, line),
+        Some(v2::RuntimePlane::Task) => {
+            crate::task::task_push_event_front(engine, runtime_id, line)
+        }
+        None => Err(FfiError::not_found(format!(
+            "unknown runtime {}",
+            core::hex_encode(runtime_id)
+        ))),
     }
 }
 
@@ -1231,7 +1277,7 @@ fn push_pairing_or_task_event_front(
 /// SAFETY (caller contract): `runtime_id`/`op_id` non-null and readable
 /// for 16 bytes. Engine handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_pairing_cancel_op(
+pub unsafe extern "C" fn ak_pairing_cancel_op(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     op_id: *const u8,
@@ -1254,13 +1300,17 @@ pub extern "C" fn ak_pairing_cancel_op(
         Err(error) => return fail(error),
     };
     match guarded(|| {
-        match v2::pairing_cancel_op(engine, &runtime_id, &op_id) {
-            Ok(()) => Ok(()),
-            Err(error) => match crate::task::task_cancel_op_maybe(engine, &runtime_id, &op_id) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(error),
-                Err(task_error) => Err(task_error),
-            },
+        // C11: same one-pass plane routing as the op-result and event
+        // polls — internal errors propagate, only a both-tables miss is -4.
+        match v2::runtime_plane(engine, &runtime_id)? {
+            Some(v2::RuntimePlane::Pairing) => v2::pairing_cancel_op(engine, &runtime_id, &op_id),
+            Some(v2::RuntimePlane::Task) => {
+                crate::task::task_cancel_op(engine, &runtime_id, &op_id)
+            }
+            None => Err(FfiError::not_found(format!(
+                "unknown runtime {}",
+                core::hex_encode(&runtime_id)
+            ))),
         }
     }) {
         Ok(()) => AK_OK,
@@ -1279,7 +1329,7 @@ pub extern "C" fn ak_pairing_cancel_op(
 /// UTF-8, readable up to its NUL for the duration of the call. Engine
 /// handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_sched_start(engine: *mut AkEngine, spec_json: *const c_char) -> i32 {
+pub unsafe extern "C" fn ak_sched_start(engine: *mut AkEngine, spec_json: *const c_char) -> i32 {
     core::clear_last_error();
     let Some(engine) = engine_or_fail(engine) else {
         return fail(FfiError {
@@ -1309,7 +1359,7 @@ pub extern "C" fn ak_sched_start(engine: *mut AkEngine, spec_json: *const c_char
 /// UTF-8; `task_id_out` non-null and writable for 16 bytes (checked before
 /// anything is submitted). Engine handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_sched_enqueue(
+pub unsafe extern "C" fn ak_sched_enqueue(
     engine: *mut AkEngine,
     spec_json: *const c_char,
     task_id_out: *mut u8,
@@ -1351,7 +1401,10 @@ pub extern "C" fn ak_sched_enqueue(
 /// SAFETY (caller contract): `policy_json` non-null, NUL-terminated, valid
 /// UTF-8. Engine handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_sched_set_policy(engine: *mut AkEngine, policy_json: *const c_char) -> i32 {
+pub unsafe extern "C" fn ak_sched_set_policy(
+    engine: *mut AkEngine,
+    policy_json: *const c_char,
+) -> i32 {
     core::clear_last_error();
     let Some(engine) = engine_or_fail(engine) else {
         return fail(FfiError {
@@ -1379,7 +1432,7 @@ pub extern "C" fn ak_sched_set_policy(engine: *mut AkEngine, policy_json: *const
 /// SAFETY (caller contract): `task_id` non-null and readable for 16 bytes.
 /// Engine handle as [`ak_send_start`].
 #[no_mangle]
-pub extern "C" fn ak_sched_cancel(engine: *mut AkEngine, task_id: *const u8) -> i32 {
+pub unsafe extern "C" fn ak_sched_cancel(engine: *mut AkEngine, task_id: *const u8) -> i32 {
     core::clear_last_error();
     let Some(engine) = engine_or_fail(engine) else {
         return fail(FfiError {
@@ -1409,7 +1462,11 @@ pub extern "C" fn ak_sched_cancel(engine: *mut AkEngine, task_id: *const u8) -> 
 /// bytes, not modified concurrently; `cap` must not overstate the real
 /// allocation.
 #[no_mangle]
-pub extern "C" fn ak_sched_snapshot(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
+pub unsafe extern "C" fn ak_sched_snapshot(
+    engine: *mut AkEngine,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
     core::clear_last_error();
     let Some(engine) = engine_or_fail(engine) else {
         return fail(FfiError {
@@ -1445,7 +1502,11 @@ pub extern "C" fn ak_sched_snapshot(engine: *mut AkEngine, buf: *mut c_char, cap
 /// bytes, not modified concurrently; `cap` must not overstate the real
 /// allocation.
 #[no_mangle]
-pub extern "C" fn ak_sched_poll_event(engine: *mut AkEngine, buf: *mut c_char, cap: usize) -> i32 {
+pub unsafe extern "C" fn ak_sched_poll_event(
+    engine: *mut AkEngine,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
     core::clear_last_error();
     let Some(engine) = engine_or_fail(engine) else {
         return fail(FfiError {
@@ -1534,8 +1595,7 @@ mod abi_shape_tests {
         let _: unsafe extern "C" fn(*mut AkEngine, *const c_char) -> i32 = ak_sched_set_policy;
         let _: unsafe extern "C" fn(*mut AkEngine, *const u8) -> i32 = ak_sched_cancel;
         let _: unsafe extern "C" fn(*mut AkEngine, *mut c_char, usize) -> i32 = ak_sched_snapshot;
-        let _: unsafe extern "C" fn(*mut AkEngine, *mut c_char, usize) -> i32 =
-            ak_sched_poll_event;
+        let _: unsafe extern "C" fn(*mut AkEngine, *mut c_char, usize) -> i32 = ak_sched_poll_event;
 
         // ---- scheduler plane, wave-23 entries carrying runtime_id: 4
         // exports (the id must name the bound pairing runtime, else -4).

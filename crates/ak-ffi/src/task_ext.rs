@@ -23,16 +23,16 @@
 //!
 //! Op RESULTS and EVENTS do not add symbols: they flow through the
 //! existing `ak_pairing_op_result` / `ak_pairing_poll_event` /
-//! `ak_pairing_cancel_op` exports (shim.rs), which fall through to the
-//! task table when the runtime id names a task runtime — the wave-28
-//! brief's "结果经 poll_event/op_result 取 / 接收提示断开事件走现有
+//! `ak_pairing_cancel_op` exports (shim.rs), which route to the task
+//! table when the runtime id names a task runtime (one `runtime_plane`
+//! table pass decides which plane owns the id) — the wave-28 brief's
+//! "结果经 poll_event/op_result 取 / 接收提示断开事件走现有
 //! poll_event 通道扩展事件类型" ruling.
 //!
 //! Nothing here returns a NOT_IMPLEMENTED code; the registry relay,
 //! real probes and remote-disconnect events are fully wired at the
 //! safe layer (`src/task.rs` — see the module docs for the final
 //! wave-28 shape).
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::os::raw::c_char;
 
@@ -81,11 +81,15 @@ unsafe fn write_cstr(buf: *mut c_char, cap: usize, text: &str) -> Result<usize, 
 ///
 /// # Safety
 ///
-/// SAFETY: `ptr` must be non-null and point to a NUL-terminated sequence
-/// of bytes that stays valid and unmodified for the duration of `'a` (in
-/// practice: the FFI call); `CStr::from_ptr` stops at the first NUL, so
-/// the borrow never reads past the terminator. UTF-8 validity is checked
-/// before the string is handed on.
+/// SAFETY: `ptr` must be non-null and point to a sequence of bytes that
+/// contains a NUL within the caller's allocation and stays valid and
+/// unmodified for the duration of `'a` (in practice: the FFI call).
+/// `CStr::from_ptr` scans forward for the FIRST NUL — it has no length,
+/// so it CANNOT detect a missing terminator: a pointer into memory with
+/// no NUL anywhere ahead reads past the allocation (undefined behavior,
+/// not an error return). NUL termination is therefore a strict caller
+/// precondition, not a validated property. UTF-8 validity of the bytes up
+/// to the terminator IS checked before the string is handed on.
 unsafe fn read_cstr<'a>(ptr: *const c_char) -> Result<&'a str, FfiError> {
     if ptr.is_null() {
         return Err(FfiError {
@@ -177,7 +181,7 @@ fn engine_or_fail<'a>(engine: *const AkEngine) -> Option<&'a AkEngine> {
 /// BEFORE the spec is parsed or anything is registered). The engine handle
 /// contract is that of `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_start(
+pub unsafe extern "C" fn ak_task_start(
     engine: *mut AkEngine,
     spec_json: *const c_char,
     runtime_id_out: *mut u8,
@@ -270,7 +274,7 @@ fn task_op_start(
 /// non-null and writable for 16 bytes (all checked before any side
 /// effect). Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_create_code(
+pub unsafe extern "C" fn ak_task_create_code(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     role_and_cands_json: *const c_char,
@@ -293,7 +297,7 @@ pub extern "C" fn ak_task_create_code(
 ///
 /// SAFETY (caller contract): as [`ak_task_create_code`].
 #[no_mangle]
-pub extern "C" fn ak_task_join(
+pub unsafe extern "C" fn ak_task_join(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     code_and_cands_json: *const c_char,
@@ -320,7 +324,7 @@ pub extern "C" fn ak_task_join(
 /// `op_id_out` non-null and writable for 16 bytes (all checked before any
 /// side effect). Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_send(
+pub unsafe extern "C" fn ak_task_send(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     conn_id: *const u8,
@@ -377,7 +381,7 @@ pub extern "C" fn ak_task_send(
 /// bytes; when non-null, `buf` writable for `cap` bytes, not modified
 /// concurrently; `cap` must not overstate the real allocation.
 #[no_mangle]
-pub extern "C" fn ak_task_list(
+pub unsafe extern "C" fn ak_task_list(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     buf: *mut c_char,
@@ -423,7 +427,7 @@ pub extern "C" fn ak_task_list(
 /// SAFETY (caller contract): `runtime_id`/`task_id` non-null and readable
 /// for 16 bytes. Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_disconnect(
+pub unsafe extern "C" fn ak_task_disconnect(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     task_id: *const u8,
@@ -460,7 +464,7 @@ pub extern "C" fn ak_task_disconnect(
 /// bytes; `path` non-null, NUL-terminated, valid UTF-8, readable up to
 /// its NUL for the duration of the call. Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_set_save_dir(
+pub unsafe extern "C" fn ak_task_set_save_dir(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     path: *const c_char,
@@ -498,7 +502,7 @@ pub extern "C" fn ak_task_set_save_dir(
 /// SAFETY (caller contract): `runtime_id`/`job_id` non-null and readable
 /// for 16 bytes. Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_task_consent(
+pub unsafe extern "C" fn ak_task_consent(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     job_id: *const u8,
@@ -559,5 +563,154 @@ mod abi_shape_tests {
             ak_task_set_save_dir;
         let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const u8, i32) -> i32 =
             ak_task_consent;
+    }
+}
+
+/// C02 fall-out for `task.rs`'s `#![forbid(unsafe_code)]` test module: the
+/// exports are `unsafe extern "C" fn` now, and that module cannot spell
+/// the `unsafe` blocks itself. Each adapter below is the audited one-line
+/// call — every argument the tests pass is constructed right there (live
+/// engine handles from `ak_engine_new`, 16-byte id arrays,
+/// NUL-terminated `CString`s, buffers sized to their capacities) — and
+/// nothing outside `#[cfg(test)]` can reach them.
+#[cfg(test)]
+pub(crate) mod testabi {
+    use std::os::raw::c_char;
+
+    use crate::core::AkEngine;
+    // The real exports, renamed so the same-name safe adapters below can
+    // mirror their call shapes one-to-one.
+    use crate::shim::{
+        ak_engine_free as ffi_engine_free, ak_engine_last_error as ffi_engine_last_error,
+        ak_pairing_op_result as ffi_pairing_op_result,
+        ak_pairing_poll_event as ffi_pairing_poll_event,
+    };
+    use crate::task_ext::{
+        ak_task_consent as ffi_task_consent, ak_task_create_code as ffi_task_create_code,
+        ak_task_disconnect as ffi_task_disconnect, ak_task_join as ffi_task_join,
+        ak_task_list as ffi_task_list, ak_task_send as ffi_task_send,
+        ak_task_set_save_dir as ffi_task_set_save_dir, ak_task_start as ffi_task_start,
+    };
+
+    /// Safe as-is (no pointer arguments; C02 only made pointer-taking
+    /// exports unsafe).
+    pub(crate) use crate::shim::ak_engine_new;
+
+    pub(crate) fn ak_engine_free(engine: *mut AkEngine) {
+        // SAFETY: `engine` is null or the live, non-concurrently-used
+        // handle `ak_engine_new` handed the test on this thread.
+        unsafe { ffi_engine_free(engine) }
+    }
+
+    pub(crate) fn ak_engine_last_error(
+        engine: *const AkEngine,
+        buf: *mut c_char,
+        cap: usize,
+    ) -> i32 {
+        // SAFETY: `buf` is the test's own buffer, writable for `cap`
+        // bytes; the engine pointer is never dereferenced.
+        unsafe { ffi_engine_last_error(engine, buf, cap) }
+    }
+
+    pub(crate) fn ak_pairing_op_result(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        op_id: *const u8,
+        buf: *mut c_char,
+        cap: usize,
+    ) -> i32 {
+        // SAFETY: both ids are the test's 16-byte arrays; `buf` is
+        // writable for `cap` bytes and not touched concurrently.
+        unsafe { ffi_pairing_op_result(engine, runtime_id, op_id, buf, cap) }
+    }
+
+    pub(crate) fn ak_pairing_poll_event(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        buf: *mut c_char,
+        cap: usize,
+    ) -> i32 {
+        // SAFETY: the id is the test's 16-byte array; `buf` is writable
+        // for `cap` bytes and not touched concurrently.
+        unsafe { ffi_pairing_poll_event(engine, runtime_id, buf, cap) }
+    }
+
+    pub(crate) fn ak_task_start(
+        engine: *mut AkEngine,
+        spec_json: *const c_char,
+        runtime_id_out: *mut u8,
+    ) -> i32 {
+        // SAFETY: `spec_json` is a NUL-terminated `CString` alive for the
+        // call; `runtime_id_out` is a 16-byte test array.
+        unsafe { ffi_task_start(engine, spec_json, runtime_id_out) }
+    }
+
+    pub(crate) fn ak_task_create_code(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        role_and_cands_json: *const c_char,
+        op_id_out: *mut u8,
+    ) -> i32 {
+        // SAFETY: 16-byte id array, NUL-terminated spec, 16-byte out.
+        unsafe { ffi_task_create_code(engine, runtime_id, role_and_cands_json, op_id_out) }
+    }
+
+    pub(crate) fn ak_task_join(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        code_and_cands_json: *const c_char,
+        op_id_out: *mut u8,
+    ) -> i32 {
+        // SAFETY: 16-byte id array, NUL-terminated spec, 16-byte out.
+        unsafe { ffi_task_join(engine, runtime_id, code_and_cands_json, op_id_out) }
+    }
+
+    pub(crate) fn ak_task_send(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        conn_id: *const u8,
+        paths_json: *const c_char,
+        op_id_out: *mut u8,
+    ) -> i32 {
+        // SAFETY: 16-byte id arrays, NUL-terminated spec, 16-byte out.
+        unsafe { ffi_task_send(engine, runtime_id, conn_id, paths_json, op_id_out) }
+    }
+
+    pub(crate) fn ak_task_list(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        buf: *mut c_char,
+        cap: usize,
+    ) -> i32 {
+        // SAFETY: 16-byte id array; `buf` writable for `cap` bytes.
+        unsafe { ffi_task_list(engine, runtime_id, buf, cap) }
+    }
+
+    pub(crate) fn ak_task_disconnect(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        task_id: *const u8,
+    ) -> i32 {
+        // SAFETY: both ids are the test's 16-byte arrays.
+        unsafe { ffi_task_disconnect(engine, runtime_id, task_id) }
+    }
+
+    pub(crate) fn ak_task_set_save_dir(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        path: *const c_char,
+    ) -> i32 {
+        // SAFETY: 16-byte id array; NUL-terminated path `CString`.
+        unsafe { ffi_task_set_save_dir(engine, runtime_id, path) }
+    }
+
+    pub(crate) fn ak_task_consent(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        job_id: *const u8,
+        accept: i32,
+    ) -> i32 {
+        // SAFETY: both ids are the test's 16-byte arrays.
+        unsafe { ffi_task_consent(engine, runtime_id, job_id, accept) }
     }
 }

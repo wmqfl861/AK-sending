@@ -19,6 +19,34 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
+  // --- Crash-analysis diagnostics, experiment E7 ---
+  // (reports/codex-crash-analysis-2026-11-07.md; kept DISABLED by default -
+  // these lines are documentation of the correct hook points, not settings.)
+  //
+  // The local ephemeral wrapper exposes two independent diagnostic switches
+  // that would be set HERE, after constructing the DartProject and before
+  // window.Create(...) spawns the engine:
+  //
+  //   project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
+  //     Forces the non-Impeller backend. Caveat: the FLTEnableImpeller
+  //     environment variable has no read point in this repository, so
+  //     setting it proves nothing. After flipping this switch, verify from
+  //     engine logs that the backend ACTUALLY changed before comparing
+  //     crash behavior.
+  //
+  //   project.set_ui_thread_policy(flutter::UIThreadPolicy::RunOnSeparateThread);
+  //     Moves the UI thread off the platform thread (compare against
+  //     RunOnPlatformThread). Record which thread the DEFAULT mode actually
+  //     uses first, so the comparison is against a known baseline.
+  //
+  // Usage rules from the report: run each switch as a SEPARATE experiment
+  // (never change renderer and thread policy at the same time), keep the
+  // bundle and every other setting identical, and only after E0/E1 produced
+  // a faulting-thread stack that points at this path. An unverified switch
+  // must not be promoted to a permanent fix, and command-line arguments
+  // passed to this exe reach the DART entrypoint (see set_dart_entrypoint_
+  // arguments below), NOT these C++ switches.
+
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
 

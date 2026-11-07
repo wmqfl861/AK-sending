@@ -15,10 +15,15 @@
 //! - serialization of engine [`Progress`] / [`Report`] values into the
 //!   compact lowercase-key JSON lines the ABI documents.
 //!
-//! Panics from any task spawned here stay inside the runtime; every entry
-//! point the shim calls is additionally wrapped by [`guarded`] so a panic
-//! degrades to an `AK_ERR_INTERNAL` status plus message, never UB across
-//! the C boundary.
+//! Panic containment, honest scope (C10): panics from any task spawned
+//! here stay inside the runtime. Every export additionally wraps its SAFE
+//! body — the logic call between the pointer reads and the buffer
+//! write-backs — in [`guarded`], which turns an ordinary unwinding panic
+//! into an `AK_ERR_INTERNAL` status plus message. That is the whole
+//! guarantee: the pointer adapters, the last-error TLS bookkeeping, and
+//! `ak_engine_free`'s destructor run OUTSIDE any catch, and no catch can
+//! recover a fail-fast death (access violation, `panic = "abort"` or OOM
+//! abort). It is error reporting, never a memory-safety promise.
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, VecDeque};
@@ -65,7 +70,10 @@ pub const AK_ERR_INVALID: i32 = -2;
 pub const AK_ERR_BUFFER: i32 = -3;
 /// The job id is unknown to this engine handle.
 pub const AK_ERR_NOT_FOUND: i32 = -4;
-/// Internal failure (lock poisoning, runtime build failure, panic).
+/// Internal failure: lock poisoning, runtime build failure (C13: the
+/// runtime builder's OS reason travels in the last-error message), or an
+/// ordinary unwinding panic caught by [`guarded`] — fail-fast faults are
+/// NOT catchable and kill the process instead of producing this code.
 pub const AK_ERR_INTERNAL: i32 = -5;
 
 /// This crate's C ABI revision (not the wire protocol version).
@@ -102,11 +110,19 @@ impl FfiError {
     }
 }
 
-/// Run a shim body, converting a panic into `AK_ERR_INTERNAL` instead of
-/// unwinding across the C boundary (which would be UB). `AssertUnwindSafe`
-/// is honest here: a panic mid-call may leave engine bookkeeping
-/// inconsistent, but every structure is mutex-guarded and the worst case is
-/// a poisoned lock surfaced as `AK_ERR_INTERNAL` on later calls.
+/// Run a safe body, converting an ordinary unwinding panic into
+/// `AK_ERR_INTERNAL` instead of letting it unwind across the C boundary
+/// (which would be UB). Honest scope (C10): the catch covers ONLY the
+/// closure — the pointer adapters (caller-buffer reads and write-backs)
+/// and the last-error TLS bookkeeping run in the shim OUTSIDE this guard,
+/// `ak_engine_free`'s destructor path has no catch at all, and no
+/// `catch_unwind` can intercept a fail-fast death: an access violation,
+/// an aborting panic (`panic = "abort"` builds), or an allocation-failure
+/// abort kills the process regardless. This is error reporting, not a
+/// memory-safety guarantee. `AssertUnwindSafe` is honest here: a panic
+/// mid-call may leave engine bookkeeping inconsistent, but every structure
+/// is mutex-guarded and the worst case is a poisoned lock surfaced as
+/// `AK_ERR_INTERNAL` on later calls.
 pub fn guarded<T>(body: impl FnOnce() -> Result<T, FfiError>) -> Result<T, FfiError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(result) => result,
@@ -913,20 +929,23 @@ pub struct AkEngine {
 }
 
 impl AkEngine {
-    /// Build the engine with a 2-worker multi-thread runtime. `None` only
-    /// when the runtime itself cannot start (resource exhaustion).
-    pub fn new() -> Option<AkEngine> {
+    /// Build the engine with a 2-worker multi-thread runtime. `Err` carries
+    /// the runtime builder's `io::Error` VERBATIM (C13): the OS reason —
+    /// e.g. worker-thread creation refused under resource exhaustion —
+    /// survives to the caller's error card instead of collapsing into a
+    /// generic "cannot build" message, which is what distinguishes a
+    /// thread-creation failure from a crash.
+    pub fn new() -> Result<AkEngine, std::io::Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
-            .build()
-            .ok()?;
+            .build()?;
         let tag = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|since| since.as_nanos() as u64)
             .unwrap_or(1)
             | 1; // never zero so a minted id can never be all-zero
-        Some(AkEngine {
+        Ok(AkEngine {
             runtime,
             state: Mutex::new(HashMap::new()),
             events: Arc::new(Mutex::new(VecDeque::new())),

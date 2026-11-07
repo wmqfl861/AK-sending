@@ -74,20 +74,20 @@ fn cbuf_to_string(buf: &[c_char]) -> String {
 
 fn last_error_text(engine: *mut AkEngine) -> String {
     let mut buf = [0 as c_char; 2048];
-    let code = ak_engine_last_error(engine, buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_engine_last_error(engine, buf.as_mut_ptr(), buf.len()) };
     assert!(code >= 0, "last_error itself failed: {code}");
     cbuf_to_string(&buf)
 }
 
 fn poll_big(engine: *mut AkEngine) -> (i32, String) {
     let mut buf = [0 as c_char; 8192];
-    let code = ak_poll_progress(engine, buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_poll_progress(engine, buf.as_mut_ptr(), buf.len()) };
     (code, cbuf_to_string(&buf))
 }
 
 fn result_big(engine: *mut AkEngine, job: &[u8; 16]) -> (i32, String) {
     let mut buf = [0 as c_char; 8192];
-    let code = ak_job_result(engine, job.as_ptr(), buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_job_result(engine, job.as_ptr(), buf.as_mut_ptr(), buf.len()) };
     (code, cbuf_to_string(&buf))
 }
 
@@ -238,11 +238,13 @@ fn run_loopback(
         path_jstr(recv_id_dir)
     );
     let mut recv_job = [0u8; 16];
-    let code = ak_receive_start(
-        engine,
-        CString::new(recv_spec).unwrap().as_ptr(),
-        recv_job.as_mut_ptr(),
-    );
+    let code = unsafe {
+        ak_receive_start(
+            engine,
+            CString::new(recv_spec).unwrap().as_ptr(),
+            recv_job.as_mut_ptr(),
+        )
+    };
     assert_eq!(code, AK_OK, "receive_start: {}", last_error_text(engine));
 
     let send_spec = format!(
@@ -252,11 +254,13 @@ fn run_loopback(
         path_jstr(src)
     );
     let mut send_job = [0u8; 16];
-    let code = ak_send_start(
-        engine,
-        CString::new(send_spec).unwrap().as_ptr(),
-        send_job.as_mut_ptr(),
-    );
+    let code = unsafe {
+        ak_send_start(
+            engine,
+            CString::new(send_spec).unwrap().as_ptr(),
+            send_job.as_mut_ptr(),
+        )
+    };
     assert_eq!(code, AK_OK, "send_start: {}", last_error_text(engine));
     assert_ne!(send_job, [0u8; 16], "job ids must never be all-zero");
     assert_ne!(send_job, recv_job, "each job gets its own id");
@@ -285,7 +289,7 @@ fn pump_jobs(
             // Cap 4 can never hold a real event line; the pending event
             // must stay queued when this returns AK_ERR_BUFFER.
             let mut tiny = [0 as c_char; 4];
-            let code = ak_poll_progress(engine, tiny.as_mut_ptr(), tiny.len());
+            let code = unsafe { ak_poll_progress(engine, tiny.as_mut_ptr(), tiny.len()) };
             if code == AK_ERR_BUFFER {
                 let message = last_error_text(engine);
                 assert!(
@@ -341,7 +345,8 @@ fn pump_jobs(
         // jobs produced, ending in `done` for both sides.
         // (checked by the callers via `lines`)
         let mut tiny = [0 as c_char; 8];
-        let code = ak_job_result(engine, send_job.as_ptr(), tiny.as_mut_ptr(), tiny.len());
+        let code =
+            unsafe { ak_job_result(engine, send_job.as_ptr(), tiny.as_mut_ptr(), tiny.len()) };
         assert_eq!(code, AK_ERR_BUFFER, "result must refuse a tiny buffer");
         let message = last_error_text(engine);
         assert!(
@@ -397,14 +402,17 @@ fn version_new_free_last_error_roundtrip() {
     // Version: exact string, NUL termination, negative length semantics.
     let expected = "ak-ffi 1 (wire v1, caps 0x0007)";
     let mut buf = [0 as c_char; 128];
-    let code = ak_version(buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_version(buf.as_mut_ptr(), buf.len()) };
     assert_eq!(code, expected.len() as i32);
     assert_eq!(cbuf_to_string(&buf), expected);
     assert_eq!(buf[code as usize], 0, "NUL terminator right after payload");
 
     // Too-small capacity: specific negative code, capacity hint, lossless.
     let mut tiny = [0 as c_char; 4];
-    assert_eq!(ak_version(tiny.as_mut_ptr(), tiny.len()), AK_ERR_BUFFER);
+    assert_eq!(
+        unsafe { ak_version(tiny.as_mut_ptr(), tiny.len()) },
+        AK_ERR_BUFFER
+    );
     let message = last_error_text(std::ptr::null_mut());
     assert!(
         message.contains("buffer too small") && message.contains("need"),
@@ -412,27 +420,30 @@ fn version_new_free_last_error_roundtrip() {
     );
     // Reading does not clear the message (other entry points do).
     let mut buf = [0 as c_char; 256];
-    let code = ak_engine_last_error(std::ptr::null(), buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_engine_last_error(std::ptr::null(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(code as usize, message.len(), "full message written");
     assert_eq!(cbuf_to_string(&buf), message, "message survives reading");
     // Null buffer.
-    assert_eq!(ak_version(std::ptr::null_mut(), 128), AK_ERR_NULL);
+    assert_eq!(
+        unsafe { ak_version(std::ptr::null_mut(), 128) },
+        AK_ERR_NULL
+    );
 
     // A fresh successful call clears the slot.
     let mut buf = [0 as c_char; 64];
     assert_eq!(
-        ak_version(buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_version(buf.as_mut_ptr(), buf.len()) },
         expected.len() as i32
     );
-    let code = ak_engine_last_error(std::ptr::null(), buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_engine_last_error(std::ptr::null(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(code, 0, "successful calls clear the last error");
     assert_eq!(cbuf_to_string(&buf), "");
 
     // Engine lifecycle.
     let engine = ak_engine_new();
     assert!(!engine.is_null(), "engine_new must return a handle");
-    ak_engine_free(std::ptr::null_mut()); // no-op, must not crash
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(std::ptr::null_mut()) }; // no-op, must not crash
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -535,21 +546,26 @@ fn send_receive_loopback_through_the_abi() {
     // Unknown job ids are rejected, not guessed.
     let bogus = [9u8; 16];
     assert_eq!(
-        ak_job_result(engine, bogus.as_ptr(), [0 as c_char; 64].as_mut_ptr(), 64),
+        unsafe { ak_job_result(engine, bogus.as_ptr(), [0 as c_char; 64].as_mut_ptr(), 64) },
         AK_ERR_NOT_FOUND
     );
-    assert_eq!(ak_job_cancel(engine, bogus.as_ptr()), AK_ERR_NOT_FOUND);
+    assert_eq!(
+        unsafe { ak_job_cancel(engine, bogus.as_ptr()) },
+        AK_ERR_NOT_FOUND
+    );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 /// `ak_send_start` with error-message sanity, usable many times per test.
 fn try_send(engine: *mut AkEngine, spec: &str, job: &mut [u8; 16]) -> i32 {
-    let code = ak_send_start(
-        engine,
-        CString::new(spec).unwrap().as_ptr(),
-        job.as_mut_ptr(),
-    );
+    let code = unsafe {
+        ak_send_start(
+            engine,
+            CString::new(spec).unwrap().as_ptr(),
+            job.as_mut_ptr(),
+        )
+    };
     if code < 0 {
         assert!(!last_error_text(engine).is_empty(), "errors set last_error");
     }
@@ -557,11 +573,13 @@ fn try_send(engine: *mut AkEngine, spec: &str, job: &mut [u8; 16]) -> i32 {
 }
 
 fn try_receive(engine: *mut AkEngine, spec: &str, job: &mut [u8; 16]) -> i32 {
-    let code = ak_receive_start(
-        engine,
-        CString::new(spec).unwrap().as_ptr(),
-        job.as_mut_ptr(),
-    );
+    let code = unsafe {
+        ak_receive_start(
+            engine,
+            CString::new(spec).unwrap().as_ptr(),
+            job.as_mut_ptr(),
+        )
+    };
     if code < 0 {
         assert!(!last_error_text(engine).is_empty(), "errors set last_error");
     }
@@ -765,23 +783,23 @@ fn bad_spec_json_is_rejected_with_clear_codes() {
 
     // Null arguments.
     assert_eq!(
-        ak_send_start(engine, std::ptr::null(), job.as_mut_ptr()),
+        unsafe { ak_send_start(engine, std::ptr::null(), job.as_mut_ptr()) },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_receive_start(engine, std::ptr::null(), job.as_mut_ptr()),
+        unsafe { ak_receive_start(engine, std::ptr::null(), job.as_mut_ptr()) },
         AK_ERR_NULL
     );
     let ok_spec = CString::new(good).unwrap();
     assert_eq!(
-        ak_send_start(engine, ok_spec.as_ptr(), std::ptr::null_mut()),
+        unsafe { ak_send_start(engine, ok_spec.as_ptr(), std::ptr::null_mut()) },
         AK_ERR_NULL
     );
 
     // Invalid UTF-8 in the C string.
     let bad_utf8: [c_char; 3] = [0xC3u8 as c_char, 0x28u8 as c_char, 0];
     assert_eq!(
-        ak_send_start(engine, bad_utf8.as_ptr(), job.as_mut_ptr()),
+        unsafe { ak_send_start(engine, bad_utf8.as_ptr(), job.as_mut_ptr()) },
         AK_ERR_INVALID
     );
     assert!(last_error_text(engine).contains("UTF-8"));
@@ -802,12 +820,12 @@ fn bad_spec_json_is_rejected_with_clear_codes() {
         "unknown fields must not block a start"
     );
     assert_ne!(job, [0u8; 16]);
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_FAILED, "cancelled job reports failure");
     assert!(json.contains("cancelled by caller"), "body: {json}");
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -841,11 +859,13 @@ fn cancel_mid_transfer_fails_without_fake_completion() {
     );
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec).unwrap().as_ptr(),
-            recv_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec).unwrap().as_ptr(),
+                recv_job.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     let send_spec = format!(
@@ -855,11 +875,13 @@ fn cancel_mid_transfer_fails_without_fake_completion() {
     );
     let mut send_job = [0u8; 16];
     assert_eq!(
-        ak_send_start(
-            engine,
-            CString::new(send_spec).unwrap().as_ptr(),
-            send_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_send_start(
+                engine,
+                CString::new(send_spec).unwrap().as_ptr(),
+                send_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -892,7 +914,7 @@ fn cancel_mid_transfer_fails_without_fake_completion() {
     // The job is genuinely mid-flight; abort it through the ABI.
     let (code, json) = result_big(engine, &send_job);
     assert_eq!(code, AK_PENDING, "still running before cancel ({json})");
-    assert_eq!(ak_job_cancel(engine, send_job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, send_job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &send_job);
     assert_eq!(code, AK_FAILED, "cancelled job must read as failed");
     assert!(
@@ -935,7 +957,7 @@ fn cancel_mid_transfer_fails_without_fake_completion() {
         );
     }
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 // ---------------------------------------------------------------------------
@@ -998,11 +1020,13 @@ fn null_job_out_is_refused_before_any_task_starts() {
         path_jstr(src.path())
     );
     assert_eq!(
-        ak_send_start(
-            engine,
-            CString::new(send_spec).unwrap().as_ptr(),
-            std::ptr::null_mut()
-        ),
+        unsafe {
+            ak_send_start(
+                engine,
+                CString::new(send_spec).unwrap().as_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
         AK_ERR_NULL
     );
     let message = last_error_text(engine);
@@ -1023,11 +1047,13 @@ fn null_job_out_is_refused_before_any_task_starts() {
         path_jstr(id_dir.path())
     );
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec.clone()).unwrap().as_ptr(),
-            std::ptr::null_mut()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec.clone()).unwrap().as_ptr(),
+                std::ptr::null_mut(),
+            )
+        },
         AK_ERR_NULL
     );
     assert!(last_error_text(engine).contains("job_out"));
@@ -1047,19 +1073,21 @@ fn null_job_out_is_refused_before_any_task_starts() {
     // engine (the job table and queue still work).
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec).unwrap().as_ptr(),
-            recv_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec).unwrap().as_ptr(),
+                recv_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
     );
     wait_for_event(engine, &recv_job, "listening", Duration::from_secs(20));
-    assert_eq!(ak_job_cancel(engine, recv_job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, recv_job.as_ptr()) }, AK_OK);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1122,12 +1150,12 @@ fn receive_spec_without_expect_is_rejected() {
     let spec =
         format!("{{\"out_dir\":{out_field},\"port\":0,\"expect\":\"any\",\"id_dir\":{id_field}}}");
     assert_eq!(try_receive(engine, &spec, &mut job), AK_OK);
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_FAILED);
     assert!(json.contains("cancelled by caller"), "{json}");
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1151,7 +1179,7 @@ fn cancelled_single_receive_port_rebinds_immediately() {
     let job_hex = hex16(&job);
 
     // Cancel through the ABI; the result flips to the cancelled failure.
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_FAILED, "cancelled job reports failure");
     assert!(
@@ -1184,9 +1212,9 @@ fn cancelled_single_receive_port_rebinds_immediately() {
         last_error_text(engine)
     );
     wait_for_event(engine, &job2, "listening", Duration::from_secs(20));
-    assert_eq!(ak_job_cancel(engine, job2.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job2.as_ptr()) }, AK_OK);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1215,7 +1243,7 @@ fn cancelled_concurrent_receive_releases_its_port() {
     // Cancel converges (abort + await, then the port is knocked so the
     // detached accept task drops the endpoint instead of holding it for
     // the full 60 s accept deadline).
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_FAILED);
     assert!(json.contains("cancelled by caller"), "{json}");
@@ -1259,9 +1287,9 @@ fn cancelled_concurrent_receive_releases_its_port() {
         saw_listening,
         "the cancelled port rebinds and listens right away"
     );
-    assert_eq!(ak_job_cancel(engine, job2.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job2.as_ptr()) }, AK_OK);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1285,7 +1313,7 @@ fn cancelled_send_job_is_cancelled_and_stays_quiet() {
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_PENDING, "still connecting before cancel: {json}");
 
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
     let (code, json) = result_big(engine, &job);
     assert_eq!(code, AK_FAILED);
     assert!(json.contains("cancelled by caller"), "{json}");
@@ -1301,7 +1329,7 @@ fn cancelled_send_job_is_cancelled_and_stays_quiet() {
         "no done for a cancelled job: {lines:?}"
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1375,7 +1403,7 @@ fn del_and_c1_control_characters_are_refused() {
         "refused adds paired nothing"
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1415,7 +1443,7 @@ fn two_engines_run_loopbacks_without_cross_talk() {
                     return Err("wire job mismatch between sides".to_string());
                 }
                 assert_trees_identical(&src, dst.path());
-                ak_engine_free(engine);
+                unsafe { ak_engine_free(engine) };
                 Ok(())
             })
         })
@@ -1446,11 +1474,13 @@ fn concurrent_receive_aggregates_two_senders() {
     );
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec).unwrap().as_ptr(),
-            recv_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec).unwrap().as_ptr(),
+                recv_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -1477,11 +1507,13 @@ fn concurrent_receive_aggregates_two_senders() {
         );
         let mut job = [0u8; 16];
         assert_eq!(
-            ak_send_start(
-                engine,
-                CString::new(spec).unwrap().as_ptr(),
-                job.as_mut_ptr()
-            ),
+            unsafe {
+                ak_send_start(
+                    engine,
+                    CString::new(spec).unwrap().as_ptr(),
+                    job.as_mut_ptr(),
+                )
+            },
             AK_OK,
             "{}",
             last_error_text(engine)
@@ -1555,7 +1587,7 @@ fn concurrent_receive_aggregates_two_senders() {
             .iter()
             .any(|(job, _)| line_job(line) == hex16(job))));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,24 +1597,28 @@ fn concurrent_receive_aggregates_two_senders() {
 /// Drive `ak_identity_info` through the C ABI with a large buffer.
 fn call_identity_info(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
     let mut buf = [0 as c_char; 4096];
-    let code = ak_identity_info(
-        engine,
-        CString::new(id_dir).unwrap().as_ptr(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
+    let code = unsafe {
+        ak_identity_info(
+            engine,
+            CString::new(id_dir).unwrap().as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
     (code, cbuf_to_string(&buf))
 }
 
 /// Drive `ak_jobs_list` through the C ABI with a large buffer.
 fn call_jobs_list(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
     let mut buf = [0 as c_char; 8192];
-    let code = ak_jobs_list(
-        engine,
-        CString::new(id_dir).unwrap().as_ptr(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
+    let code = unsafe {
+        ak_jobs_list(
+            engine,
+            CString::new(id_dir).unwrap().as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
     (code, cbuf_to_string(&buf))
 }
 
@@ -1667,7 +1703,7 @@ fn identity_info_creates_once_and_matches_independent_key_load() {
     assert_eq!(public_hex, device_id);
     assert_eq!(ak_identity::pairing_code(&key.fingerprint()), pairing);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1718,23 +1754,23 @@ fn identity_info_counts_peers_and_flags_corrupt_book() {
     // Argument errors: null id_dir / empty id_dir / null buffer / tiny cap.
     let c_path = CString::new(path_text.clone()).unwrap();
     assert_eq!(
-        ak_identity_info(engine, std::ptr::null(), [0 as c_char; 64].as_mut_ptr(), 64),
+        unsafe { ak_identity_info(engine, std::ptr::null(), [0 as c_char; 64].as_mut_ptr(), 64) },
         AK_ERR_NULL
     );
     let empty = CString::new("").unwrap();
     let mut buf = [0 as c_char; 64];
     assert_eq!(
-        ak_identity_info(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_identity_info(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()) },
         AK_ERR_INVALID
     );
     assert!(last_error_text(engine).contains("id_dir"));
     assert_eq!(
-        ak_identity_info(engine, c_path.as_ptr(), std::ptr::null_mut(), 64),
+        unsafe { ak_identity_info(engine, c_path.as_ptr(), std::ptr::null_mut(), 64) },
         AK_ERR_NULL
     );
     let mut tiny = [0 as c_char; 2];
     assert_eq!(
-        ak_identity_info(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        unsafe { ak_identity_info(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()) },
         AK_ERR_BUFFER
     );
     let message = last_error_text(engine);
@@ -1751,7 +1787,7 @@ fn identity_info_counts_peers_and_flags_corrupt_book() {
     assert_eq!(code, AK_ERR_INVALID, "bad id_dir is -2");
     assert_eq!(body, "", "nothing written on failure");
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1773,7 +1809,7 @@ fn jobs_list_missing_directory_is_an_empty_array() {
     let c_path = CString::new(path_text.clone()).unwrap();
     let mut tiny = [0 as c_char; 2];
     assert_eq!(
-        ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        unsafe { ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()) },
         AK_ERR_BUFFER
     );
     let message = last_error_text(engine);
@@ -1786,18 +1822,18 @@ fn jobs_list_missing_directory_is_an_empty_array() {
 
     // Argument errors.
     assert_eq!(
-        ak_jobs_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8),
+        unsafe { ak_jobs_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8) },
         AK_ERR_NULL
     );
     let empty = CString::new("").unwrap();
     let mut buf = [0 as c_char; 8];
     assert_eq!(
-        ak_jobs_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_jobs_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()) },
         AK_ERR_INVALID
     );
     assert!(last_error_text(engine).contains("id_dir"));
     assert_eq!(
-        ak_jobs_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8),
+        unsafe { ak_jobs_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8) },
         AK_ERR_NULL
     );
 
@@ -1808,7 +1844,7 @@ fn jobs_list_missing_directory_is_an_empty_array() {
     let (code, body) = call_jobs_list(engine, &file_path.to_string_lossy());
     assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1892,14 +1928,14 @@ fn jobs_list_after_loopback_lists_completed_records() {
     let c_path = CString::new(send_id.path().to_string_lossy().into_owned()).unwrap();
     let mut tiny = [0 as c_char; 8];
     assert_eq!(
-        ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        unsafe { ak_jobs_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()) },
         AK_ERR_BUFFER
     );
     let (code, retry) = call_jobs_list(engine, &send_id.path().to_string_lossy());
     assert_eq!(code, AK_DONE);
     assert_eq!(retry, body, "retry is lossless");
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -1938,11 +1974,13 @@ fn receive_expect_book_accepts_paired_sender() {
     );
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec).unwrap().as_ptr(),
-            recv_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec).unwrap().as_ptr(),
+                recv_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -1955,11 +1993,13 @@ fn receive_expect_book_accepts_paired_sender() {
     );
     let mut send_job = [0u8; 16];
     assert_eq!(
-        ak_send_start(
-            engine,
-            CString::new(send_spec).unwrap().as_ptr(),
-            send_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_send_start(
+                engine,
+                CString::new(send_spec).unwrap().as_ptr(),
+                send_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -1983,7 +2023,7 @@ fn receive_expect_book_accepts_paired_sender() {
     assert_eq!(field_str(&record, "state"), "completed");
     assert_eq!(field_str(&record, "peer"), send_fp.to_hex());
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2062,9 +2102,9 @@ fn receive_expect_book_rejects_bad_books_at_start() {
         path_jstr(any_id.path())
     );
     assert_eq!(try_receive(engine, &spec, &mut job), AK_OK);
-    assert_eq!(ak_job_cancel(engine, job.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_job_cancel(engine, job.as_ptr()) }, AK_OK);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2097,11 +2137,13 @@ fn receive_expect_book_rejects_unpaired_sender() {
     );
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(
-            engine,
-            CString::new(recv_spec).unwrap().as_ptr(),
-            recv_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_receive_start(
+                engine,
+                CString::new(recv_spec).unwrap().as_ptr(),
+                recv_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -2114,11 +2156,13 @@ fn receive_expect_book_rejects_unpaired_sender() {
     );
     let mut send_job = [0u8; 16];
     assert_eq!(
-        ak_send_start(
-            engine,
-            CString::new(send_spec).unwrap().as_ptr(),
-            send_job.as_mut_ptr()
-        ),
+        unsafe {
+            ak_send_start(
+                engine,
+                CString::new(send_spec).unwrap().as_ptr(),
+                send_job.as_mut_ptr(),
+            )
+        },
         AK_OK,
         "{}",
         last_error_text(engine)
@@ -2171,7 +2215,7 @@ fn receive_expect_book_rejects_unpaired_sender() {
     let (code, body) = call_jobs_list(engine, &recv_id.path().to_string_lossy());
     assert_eq!((code, body.as_str()), (AK_DONE, "[]"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2181,12 +2225,14 @@ fn receive_expect_book_rejects_unpaired_sender() {
 /// Drive `ak_peer_list` through the C ABI with a large buffer.
 fn call_peer_list(engine: *mut AkEngine, id_dir: &str) -> (i32, String) {
     let mut buf = [0 as c_char; 8192];
-    let code = ak_peer_list(
-        engine,
-        CString::new(id_dir).unwrap().as_ptr(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
+    let code = unsafe {
+        ak_peer_list(
+            engine,
+            CString::new(id_dir).unwrap().as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
     (code, cbuf_to_string(&buf))
 }
 
@@ -2202,16 +2248,18 @@ fn call_peer_add(
     let c_fp = CString::new(fingerprint_hex).unwrap();
     let c_name = name.map(|text| CString::new(text).unwrap());
     let mut buf = [0 as c_char; 128];
-    let code = ak_peer_add(
-        engine,
-        c_dir.as_ptr(),
-        c_fp.as_ptr(),
-        c_name
-            .as_ref()
-            .map_or(std::ptr::null(), |text| text.as_ptr()),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
+    let code = unsafe {
+        ak_peer_add(
+            engine,
+            c_dir.as_ptr(),
+            c_fp.as_ptr(),
+            c_name
+                .as_ref()
+                .map_or(std::ptr::null(), |text| text.as_ptr()),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
     (code, cbuf_to_string(&buf))
 }
 
@@ -2220,13 +2268,15 @@ fn call_peer_remove(engine: *mut AkEngine, id_dir: &str, fingerprint_hex: &str) 
     let c_dir = CString::new(id_dir).unwrap();
     let c_fp = CString::new(fingerprint_hex).unwrap();
     let mut buf = [0 as c_char; 128];
-    let code = ak_peer_remove(
-        engine,
-        c_dir.as_ptr(),
-        c_fp.as_ptr(),
-        buf.as_mut_ptr(),
-        buf.len(),
-    );
+    let code = unsafe {
+        ak_peer_remove(
+            engine,
+            c_dir.as_ptr(),
+            c_fp.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
     (code, cbuf_to_string(&buf))
 }
 
@@ -2278,7 +2328,7 @@ fn peer_list_missing_and_empty_book_is_empty_array() {
     let c_path = CString::new(path_text.clone()).unwrap();
     let mut tiny = [0 as c_char; 2];
     assert_eq!(
-        ak_peer_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+        unsafe { ak_peer_list(engine, c_path.as_ptr(), tiny.as_mut_ptr(), tiny.len()) },
         AK_ERR_BUFFER
     );
     let message = last_error_text(engine);
@@ -2291,22 +2341,22 @@ fn peer_list_missing_and_empty_book_is_empty_array() {
 
     // Argument errors: null id_dir / null buf / empty id_dir.
     assert_eq!(
-        ak_peer_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8),
+        unsafe { ak_peer_list(engine, std::ptr::null(), [0 as c_char; 8].as_mut_ptr(), 8) },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_peer_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8),
+        unsafe { ak_peer_list(engine, c_path.as_ptr(), std::ptr::null_mut(), 8) },
         AK_ERR_NULL
     );
     let empty = CString::new("").unwrap();
     let mut buf = [0 as c_char; 8];
     assert_eq!(
-        ak_peer_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_peer_list(engine, empty.as_ptr(), buf.as_mut_ptr(), buf.len()) },
         AK_ERR_INVALID
     );
     assert!(last_error_text(engine).contains("id_dir"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2372,7 +2422,7 @@ fn peer_list_parses_cli_written_book_sorted() {
         )
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2416,7 +2466,7 @@ fn peer_list_corrupt_book_is_invalid() {
         "the corrupt book is left untouched"
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2462,7 +2512,7 @@ fn peer_add_pairs_new_peers_with_name_or_unnamed_default() {
         assert!(field_u64(element, "paired_unix_ms") > 0);
     }
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2518,7 +2568,7 @@ fn peer_add_upsert_keeps_original_pairing_time_like_cli() {
         ("renamed", 1000)
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2572,36 +2622,42 @@ fn peer_add_rejects_bad_fingerprints_and_control_names() {
     let c_dir = CString::new(path_text.clone()).unwrap();
     let c_good = CString::new(good.clone()).unwrap();
     assert_eq!(
-        ak_peer_add(
-            engine,
-            c_dir.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_add(
+                engine,
+                c_dir.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_peer_add(
-            engine,
-            std::ptr::null(),
-            c_good.as_ptr(),
-            std::ptr::null(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_add(
+                engine,
+                std::ptr::null(),
+                c_good.as_ptr(),
+                std::ptr::null(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_peer_add(
-            engine,
-            c_dir.as_ptr(),
-            c_good.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            64
-        ),
+        unsafe {
+            ak_peer_add(
+                engine,
+                c_dir.as_ptr(),
+                c_good.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                64,
+            )
+        },
         AK_ERR_NULL
     );
     assert!(
@@ -2612,14 +2668,16 @@ fn peer_add_rejects_bad_fingerprints_and_control_names() {
     // Empty id_dir.
     let empty = CString::new("").unwrap();
     assert_eq!(
-        ak_peer_add(
-            engine,
-            empty.as_ptr(),
-            c_good.as_ptr(),
-            std::ptr::null(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_add(
+                engine,
+                empty.as_ptr(),
+                c_good.as_ptr(),
+                std::ptr::null(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_INVALID
     );
     assert!(last_error_text(engine).contains("id_dir"));
@@ -2628,7 +2686,7 @@ fn peer_add_rejects_bad_fingerprints_and_control_names() {
     let (code, body) = call_peer_add(engine, &path_text, &good, None);
     assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2681,48 +2739,56 @@ fn peer_remove_deletes_existing_and_reports_missing() {
     let c_dir = CString::new(path_text.clone()).unwrap();
     let c_b = CString::new(b.clone()).unwrap();
     assert_eq!(
-        ak_peer_remove(
-            engine,
-            std::ptr::null(),
-            c_b.as_ptr(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_remove(
+                engine,
+                std::ptr::null(),
+                c_b.as_ptr(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_peer_remove(
-            engine,
-            c_dir.as_ptr(),
-            std::ptr::null(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_remove(
+                engine,
+                c_dir.as_ptr(),
+                std::ptr::null(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_peer_remove(
-            engine,
-            c_dir.as_ptr(),
-            c_b.as_ptr(),
-            std::ptr::null_mut(),
-            16
-        ),
+        unsafe {
+            ak_peer_remove(
+                engine,
+                c_dir.as_ptr(),
+                c_b.as_ptr(),
+                std::ptr::null_mut(),
+                16,
+            )
+        },
         AK_ERR_NULL
     );
     let empty = CString::new("").unwrap();
     assert_eq!(
-        ak_peer_remove(
-            engine,
-            empty.as_ptr(),
-            c_b.as_ptr(),
-            [0 as c_char; 16].as_mut_ptr(),
-            16
-        ),
+        unsafe {
+            ak_peer_remove(
+                engine,
+                empty.as_ptr(),
+                c_b.as_ptr(),
+                [0 as c_char; 16].as_mut_ptr(),
+                16,
+            )
+        },
         AK_ERR_INVALID
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2755,7 +2821,7 @@ fn peer_add_and_remove_feed_identity_info_peer_count() {
     assert_eq!(code, AK_DONE);
     assert_eq!(field_u64(&body, "peers"), 1);
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2775,14 +2841,16 @@ fn peer_writers_pre_flight_the_buffer_before_persisting() {
 
     // ADD with a too-small cap: refused BEFORE the save, so the book is
     // untouched and the retry is a plain fresh call.
-    let code = ak_peer_add(
-        engine,
-        c_dir.as_ptr(),
-        c_b.as_ptr(),
-        std::ptr::null(),
-        tiny.as_mut_ptr(),
-        tiny.len(),
-    );
+    let code = unsafe {
+        ak_peer_add(
+            engine,
+            c_dir.as_ptr(),
+            c_b.as_ptr(),
+            std::ptr::null(),
+            tiny.as_mut_ptr(),
+            tiny.len(),
+        )
+    };
     assert_eq!(code, AK_ERR_BUFFER);
     let message = last_error_text(engine);
     assert!(
@@ -2804,13 +2872,15 @@ fn peer_writers_pre_flight_the_buffer_before_persisting() {
     assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
 
     // REMOVE with a too-small cap: nothing removed, retry then works.
-    let code = ak_peer_remove(
-        engine,
-        c_dir.as_ptr(),
-        c_b.as_ptr(),
-        tiny.as_mut_ptr(),
-        tiny.len(),
-    );
+    let code = unsafe {
+        ak_peer_remove(
+            engine,
+            c_dir.as_ptr(),
+            c_b.as_ptr(),
+            tiny.as_mut_ptr(),
+            tiny.len(),
+        )
+    };
     assert_eq!(code, AK_ERR_BUFFER);
     let (code, list) = call_peer_list(engine, &path_text);
     assert_eq!(code, AK_DONE);
@@ -2821,7 +2891,7 @@ fn peer_writers_pre_flight_the_buffer_before_persisting() {
     let (code, body) = call_peer_remove(engine, &path_text, &b);
     assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":1}"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -2872,5 +2942,5 @@ fn peer_writer_save_failure_is_internal_and_leaves_book_intact() {
     let (code, body) = call_peer_add(engine, &path_text, &b, None);
     assert_eq!((code, body.as_str()), (AK_DONE, "{\"peers\":2}"));
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }

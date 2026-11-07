@@ -11,6 +11,8 @@ library;
 import 'dart:ffi';
 import 'dart:io' show Platform;
 
+import 'package:ffi/ffi.dart' show malloc;
+
 /// The opaque `AkEngine` handle owned by `ak_engine_new` and released only
 /// by `ak_engine_free`.
 final class AkEngine extends Opaque {}
@@ -65,36 +67,49 @@ class AkFfiException implements Exception {
 }
 
 // ---------------------------------------------------------------------------
-// A minimal C heap allocator via the platform CRT, so the package needs no
-// package:ffi dependency (dart:ffi ships no malloc/calloc instances).
+// The package's single C heap allocator (C03).
 // ---------------------------------------------------------------------------
 
-/// Allocator backed by the process CRT `malloc`/`free` resolved through
-/// `DynamicLibrary.process()`. All native buffers in this package are
-/// allocated and freed on the Dart side; the DLL only reads/writes them
-/// inside a call, so no cross-allocator free ever occurs.
-final Allocator processAllocator = _ProcessAllocator();
+/// The ONE allocator every native buffer in this package is allocated and
+/// freed with: `package:ffi`'s [malloc].
+///
+/// C03 (codex-crash-analysis-2026-11-07.md): the previous implementation
+/// resolved `malloc` and `free` as two INDEPENDENT process-wide symbol
+/// lookups, so on a Windows host carrying several CRTs the pair could be
+/// served by different modules — freeing on a foreign heap corrupts it.
+/// [malloc] is one implementation object whose `allocate` and `free` are
+/// matched by construction (Windows: `CoTaskMemAlloc`/`CoTaskMemFree` from
+/// ole32.dll; POSIX: the libc `malloc`/`free` pair bound together), which
+/// removes that ambiguity. The DLL only reads/writes these buffers inside
+/// a call and never frees them, so Dart stays the owning side.
+///
+/// The name is historical; call sites must keep routing through this single
+/// alias instead of opening their own allocator.
+final Allocator processAllocator = malloc;
 
-final class _ProcessAllocator implements Allocator {
-  static final Pointer<Void> Function(int) _malloc =
-      DynamicLibrary.process().lookupFunction<
-          Pointer<Void> Function(IntPtr), Pointer<Void> Function(int)>('malloc');
+/// Human-readable provenance of [processAllocator]'s allocate/free pair —
+/// recorded by tests and diagnostics so the "one matched pair" property of
+/// C03 stays auditable.
+const String processAllocatorSource =
+    'package:ffi malloc (Windows: ole32!CoTaskMemAlloc/CoTaskMemFree; '
+    'POSIX: libc malloc/free) — matched allocate/free pair';
 
-  static final void Function(Pointer<Void>) _free =
-      DynamicLibrary.process().lookupFunction<
-          Void Function(Pointer<Void>), void Function(Pointer<Void>)>('free');
+/// The native boundary broke its own OUTPUT contract (C05/C06 of the
+/// crash analysis): a returned byte length outside `0 <= len < cap`, a
+/// missing NUL terminator inside the caller buffer, or a similar reply
+/// malformation.
+///
+/// Distinct from [AkFfiException] — that one means the engine REPORTED a
+/// negative status; this one means the reply itself cannot be trusted and
+/// reading it on would be an out-of-bounds access. Throwing here is the
+/// deliberate substitute for the old unbounded NUL scans.
+class AkFfiProtocolException implements Exception {
+  const AkFfiProtocolException(this.message);
+
+  final String message;
 
   @override
-  Pointer<T> allocate<T extends NativeType>(int byteCount, {int? alignment}) {
-    final pointer = _malloc(byteCount == 0 ? 1 : byteCount);
-    if (pointer == nullptr) {
-      throw StateError('native allocation of $byteCount bytes failed');
-    }
-    return pointer.cast<T>();
-  }
-
-  @override
-  void free(Pointer pointer) => _free(pointer.cast<Void>());
+  String toString() => 'AkFfiProtocolException: $message';
 }
 
 // ---------------------------------------------------------------------------

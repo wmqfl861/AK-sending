@@ -39,7 +39,7 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
 
-# --- ak-ffi: bundle ak_ffi.dll next to the exe (append-only wave-11 step) ---
+# --- ak-ffi: bundle ak_ffi.dll next to the exe (C09, crash analysis 2026-11-07) ---
 # Resolution order (first hit wins; see flutter_app/README.md "DLL 三级探测"):
 #   1. AK_FFI_DLL cache variable  — cmake -DAK_FFI_DLL=C:/path/ak_ffi.dll ...
 #   2. AK_FFI_DLL environment variable (captured at configure time)
@@ -58,12 +58,46 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/release/ak_ffi.dll")
 endif()
 
 if(_ak_ffi_dll_src)
-  add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  # C09 fix: the previous POST_BUILD copy_if_different only ran when the exe
+  # itself relinked, so a rebuilt cargo DLL (target/release/ak_ffi.dll) could
+  # leave a stale copy next to the exe. The Rust DLL is now an explicit
+  # build-system input, re-copied and verified on EVERY build of the runner:
+  #   * DEPENDS makes the source DLL a hard input - if it disappears the
+  #     build fails instead of silently shipping the stale bundle copy.
+  #   * The ALL custom target has no tracked output, so its commands run on
+  #     every build (flutter builds the INSTALL target, which builds ALL),
+  #     and the copy always reflects the current source DLL even when
+  #     nothing else in the runner changed. Using $<TARGET_FILE_DIR:...> in
+  #     the commands adds the ordering dependency ak_ffi_bundle -> runner,
+  #     so the copy lands after the exe link (like the old POST_BUILD);
+  #     runner must NOT also depend on ak_ffi_bundle - that made a cycle.
+  #     (A BYPRODUCTS entry with $<TARGET_FILE_DIR:...> is not accepted by
+  #     CMake's generator-expression evaluation here - "No target" - so the
+  #     copy is not declared as a byproduct.)
+  #   * compare_files verifies the bundle copy byte-for-byte right after the
+  #     copy; any mismatch (locked/partial write, AV interference) fails the
+  #     build loudly.
+  add_custom_target(ak_ffi_bundle ALL
+    COMMAND ${CMAKE_COMMAND} -E copy
             "${_ak_ffi_dll_src}"
             "$<TARGET_FILE_DIR:${BINARY_NAME}>/ak_ffi.dll"
-    COMMENT "Bundling ak_ffi.dll from: ${_ak_ffi_dll_src}"
+    COMMAND ${CMAKE_COMMAND} -E compare_files
+            "${_ak_ffi_dll_src}"
+            "$<TARGET_FILE_DIR:${BINARY_NAME}>/ak_ffi.dll"
+    DEPENDS "${_ak_ffi_dll_src}"
+    COMMENT "Bundling + verifying ak_ffi.dll from: ${_ak_ffi_dll_src}"
     VERBATIM)
+
+  # Standalone install rule from the SAME source path, so the install step
+  # (the INSTALL project of the generated solution, built by
+  # `flutter build windows`) installs the DLL as a first-class artifact
+  # instead of relying on the always-copy target alone. The destination
+  # repeats $<TARGET_FILE_DIR:...> (= BUILD_BUNDLE_DIR in the top-level
+  # CMakeLists.txt) because the parent only sets CMAKE_INSTALL_PREFIX after
+  # this subdirectory is processed.
+  install(FILES "${_ak_ffi_dll_src}"
+          DESTINATION "$<TARGET_FILE_DIR:${BINARY_NAME}>"
+          COMPONENT Runtime)
 else()
   message(WARNING "ak_ffi.dll not found (no AK_FFI_DLL override, no ${CMAKE_CURRENT_SOURCE_DIR}/../../../target/release/ak_ffi.dll). Build it with: cargo build -p ak-ffi --release — otherwise the app starts without a transfer engine.")
 endif()

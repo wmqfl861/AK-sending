@@ -16,6 +16,8 @@ import 'dart:ffi';
 
 import 'dart:typed_data' show Uint8List;
 
+import 'package:ffi/ffi.dart' show using;
+
 import 'bindings.dart';
 import 'ffi_json.dart'
     show AkReceiveSpec, AkSendSpec, decodeFfiJson, fromNativeUtf8, toNativeUtf8;
@@ -234,29 +236,23 @@ class AkEngineDart {
   /// here is automatic); a failed save surfaces as -5.
   int peerAdd(String idDir, String fingerprintHex, {String name = ''}) {
     _ensureLive();
-    final idPointer = toNativeUtf8(idDir);
-    final fpPointer = toNativeUtf8(fingerprintHex);
-    Pointer<Uint8>? namePointer;
-    try {
+    // C14: all string allocations share one arena, so a failure of a later
+    // one cannot leak an earlier one.
+    return using((arena) {
+      final idPointer = toNativeUtf8(idDir, allocator: arena);
+      final fpPointer = toNativeUtf8(fingerprintHex, allocator: arena);
       // `name` is the ABI's one OPTIONAL string argument: a null pointer
       // means "no name given" (an empty string is equivalent), so the
       // empty Dart default maps to null.
-      if (name.isNotEmpty) {
-        namePointer = toNativeUtf8(name);
-      }
+      final namePointer =
+          name.isNotEmpty ? toNativeUtf8(name, allocator: arena) : nullptr;
       final json = _jsonCall(
           'ak_peer_add',
           _maxPeersJsonBytes,
-          (buf, cap) => bindings.peerAdd(_handle, idPointer, fpPointer,
-              namePointer ?? nullptr, buf, cap));
+          (buf, cap) => bindings.peerAdd(
+              _handle, idPointer, fpPointer, namePointer, buf, cap));
       return decodeFfiJson(json)['peers'] as int;
-    } finally {
-      if (namePointer != null) {
-        processAllocator.free(namePointer);
-      }
-      processAllocator.free(fpPointer);
-      processAllocator.free(idPointer);
-    }
+    }, processAllocator);
   }
 
   /// Removes one paired peer from `<idDir>/peers.book` via
@@ -269,16 +265,18 @@ class AkEngineDart {
   /// the automatic retry removes exactly once.
   int peerRemove(String idDir, String fingerprintHex) {
     _ensureLive();
-    final idPointer = toNativeUtf8(idDir);
-    final fpPointer = toNativeUtf8(fingerprintHex);
-    try {
-      final json = _jsonCall('ak_peer_remove', _maxPeersJsonBytes,
-          (buf, cap) => bindings.peerRemove(_handle, idPointer, fpPointer, buf, cap));
+    // C14: both string allocations share one arena (no leak on the failure
+    // of the second).
+    return using((arena) {
+      final idPointer = toNativeUtf8(idDir, allocator: arena);
+      final fpPointer = toNativeUtf8(fingerprintHex, allocator: arena);
+      final json = _jsonCall(
+          'ak_peer_remove',
+          _maxPeersJsonBytes,
+          (buf, cap) =>
+              bindings.peerRemove(_handle, idPointer, fpPointer, buf, cap));
       return decodeFfiJson(json)['peers'] as int;
-    } finally {
-      processAllocator.free(fpPointer);
-      processAllocator.free(idPointer);
-    }
+    }, processAllocator);
   }
 
   /// Starting buffer for peer-book payloads (the count JSON is tiny; lists
@@ -306,8 +304,9 @@ class AkEngineDart {
   }
 
   /// Shared grow-retry loop for the JSON-out calls: status `1` decodes the
-  /// payload, `-3` doubles the capacity and retries (nothing was consumed),
-  /// other negatives throw an [AkFfiException] carrying the last error.
+  /// payload (bounded by the capacity — C05), `-3` doubles the capacity and
+  /// retries (nothing was consumed), other negatives throw an
+  /// [AkFfiException] carrying the last error.
   String _jsonCall(
     String symbol,
     int initialCapacity,
@@ -319,7 +318,7 @@ class AkEngineDart {
       try {
         final code = invoke(buf, capacity);
         if (code == AkStatus.done) {
-          return fromNativeUtf8(buf);
+          return fromNativeUtf8(buf, capacity);
         }
         if (code == AkStatus.errBuffer) {
           capacity *= 2; // nothing was consumed; retry losslessly
@@ -359,9 +358,11 @@ class AkEngineDart {
     final symbol = send ? 'ak_send_start' : 'ak_receive_start';
     final invoke =
         send ? bindings.sendStart : bindings.receiveStart;
-    final specPointer = toNativeUtf8(specJson);
-    final jobOut = processAllocator.allocate<Uint8>(akJobIdLength);
-    try {
+    // C14: one arena owns both allocations, so a failure of the second can
+    // never leak the first.
+    return using((arena) {
+      final specPointer = toNativeUtf8(specJson, allocator: arena);
+      final jobOut = arena<Uint8>(akJobIdLength);
       final code = invoke(_handle, specPointer, jobOut);
       if (code != AkStatus.ok) {
         throw _exceptionFor(code, symbol);
@@ -371,10 +372,7 @@ class AkEngineDart {
         job[i] = jobOut[i];
       }
       return job;
-    } finally {
-      processAllocator.free(jobOut);
-      processAllocator.free(specPointer);
-    }
+    }, processAllocator);
   }
 
   // -------------------------------------------------------------------------
@@ -397,7 +395,8 @@ class AkEngineDart {
           return null;
         }
         if (code == AkStatus.event) {
-          return jsonDecode(fromNativeUtf8(buf)) as Map<String, dynamic>;
+          return jsonDecode(fromNativeUtf8(buf, capacity))
+              as Map<String, dynamic>;
         }
         if (code == AkStatus.errBuffer) {
           capacity *= 2; // nothing was consumed; retry losslessly
@@ -438,10 +437,12 @@ class AkEngineDart {
               return const AkJobResult.running();
             case AkStatus.done:
               return AkJobResult.done(
-                  jsonDecode(fromNativeUtf8(buf)) as Map<String, dynamic>);
+                  jsonDecode(fromNativeUtf8(buf, capacity))
+                      as Map<String, dynamic>);
             case AkStatus.failed:
               return AkJobResult.failed(
-                  jsonDecode(fromNativeUtf8(buf)) as Map<String, dynamic>);
+                  jsonDecode(fromNativeUtf8(buf, capacity))
+                      as Map<String, dynamic>);
             case AkStatus.errBuffer:
               capacity *= 2; // retry losslessly with a larger buffer
               continue;
@@ -496,10 +497,12 @@ class AkEngineDart {
       _readInto(256, (buf, cap) => ffi.engineLastError(handle, buf, cap),
           'ak_engine_last_error');
 
-  /// Shared grow-retry loop for the char-out functions. Returns the
-  /// decoded NUL-terminated payload; negative codes other than `-3` throw
-  /// [AkFfiException]; `-3` doubles the capacity and retries (nothing was
-  /// consumed).
+  /// Shared grow-retry loop for the char-out functions (`ak_version`,
+  /// `ak_engine_last_error`): a success code IS the payload byte length, so
+  /// the read validates `0 <= len < cap` with the promised NUL at `buf[len]`
+  /// (C05 — a violating DLL throws [AkFfiProtocolException] instead of an
+  /// unbounded scan). Other negative codes throw [AkFfiException]; `-3`
+  /// doubles the capacity and retries (nothing was consumed).
   static String _readInto(
     int initialCapacity,
     int Function(Pointer<Uint8> buf, int cap) invoke,
@@ -511,7 +514,7 @@ class AkEngineDart {
       try {
         final code = invoke(buf, capacity);
         if (code >= 0) {
-          return fromNativeUtf8(buf);
+          return fromNativeUtf8(buf, capacity, length: code);
         }
         if (code == AkStatus.errBuffer) {
           capacity *= 2; // stored message untouched; retry losslessly

@@ -6,6 +6,14 @@ publish_to: none
 environment:
   sdk: ^3.0.0
 
-# No runtime dependencies: dart:ffi, dart:convert, dart:typed_data are core.
+dependencies:
+  # C03 (codex-crash-analysis-2026-11-07): the ONE matched C heap pair used
+  # for every native buffer this package allocates/frees. package:ffi's
+  # malloc/free come from a single implementation (Windows:
+  # CoTaskMemAlloc/CoTaskMemFree out of ole32.dll; POSIX: the libc
+  # malloc/free pair), so a cross-CRT free can no longer occur even when
+  # several modules in the process each export malloc/free.
+  ffi: ^2.0.0
+
 dev_dependencies:
   test: ^1.24.0

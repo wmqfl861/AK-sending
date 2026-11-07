@@ -48,6 +48,8 @@ import 'dart:convert' show jsonEncode;
 import 'dart:ffi';
 import 'dart:typed_data' show Uint8List;
 
+import 'package:ffi/ffi.dart' show Arena, using;
+
 import 'bindings.dart' show AkEngine, AkFfiException, AkStatus, processAllocator;
 import 'ffi_json.dart' show AkSpecException, decodeFfiJson, toNativeUtf8;
 import 'model/task_events.dart';
@@ -55,6 +57,7 @@ import 'pairing_ffi.dart'
     show
         EngineLastErrorC,
         EngineLastErrorDart,
+        akBufferCall,
         akCallFailure,
         akIdFromHex,
         akIdToHex,
@@ -507,20 +510,16 @@ final class AkTaskFfiBindings implements AkTaskCalls {
   }
 
   @override
-  int start(String specJson, Uint8List runtimeIdOut) {
-    final spec = toNativeUtf8(specJson);
-    final idOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(_start(_engine, spec, idOut));
-      if (code == AkStatus.ok) {
-        runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(idOut);
-      processAllocator.free(spec);
-    }
-  }
+  int start(String specJson, Uint8List runtimeIdOut) =>
+      using((arena) {
+        final spec = toNativeUtf8(specJson, allocator: arena);
+        final idOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(_start(_engine, spec, idOut));
+        if (code == AkStatus.ok) {
+          runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
   int createCode(Uint8List runtimeId, String specJson, Uint8List opIdOut) =>
@@ -531,154 +530,109 @@ final class AkTaskFfiBindings implements AkTaskCalls {
       _opStart(_join, runtimeId, specJson, opIdOut);
 
   int _opStart(_OpStartDart invoke, Uint8List runtimeId, String specJson,
-      Uint8List opIdOut) {
-    final id = _idIn(runtimeId);
-    final spec = toNativeUtf8(specJson);
-    final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(invoke(_engine, id, spec, opOut));
-      if (code == AkStatus.ok) {
-        opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(opOut);
-      processAllocator.free(spec);
-      processAllocator.free(id);
-    }
-  }
+          Uint8List opIdOut) =>
+      using((arena) {
+        final id = _idIn(runtimeId, arena);
+        final spec = toNativeUtf8(specJson, allocator: arena);
+        final opOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(invoke(_engine, id, spec, opOut));
+        if (code == AkStatus.ok) {
+          opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
   int send(Uint8List runtimeId, Uint8List connId, String pathsJson,
-      Uint8List opIdOut) {
-    final runtime = _idIn(runtimeId);
-    final conn = _idIn(connId);
-    final paths = toNativeUtf8(pathsJson);
-    final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(_send(_engine, runtime, conn, paths, opOut));
-      if (code == AkStatus.ok) {
-        opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(opOut);
-      processAllocator.free(paths);
-      processAllocator.free(conn);
-      processAllocator.free(runtime);
-    }
-  }
+          Uint8List opIdOut) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final conn = _idIn(connId, arena);
+        final paths = toNativeUtf8(pathsJson, allocator: arena);
+        final opOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(_send(_engine, runtime, conn, paths, opOut));
+        if (code == AkStatus.ok) {
+          opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
-  int list(Uint8List runtimeId, Uint8List buffer, int cap) {
-    final runtime = _idIn(runtimeId);
-    try {
-      return _bufCall(
-          (buf, capacity) => _list(_engine, runtime, buf, capacity), buffer, cap);
-    } finally {
-      processAllocator.free(runtime);
-    }
-  }
+  int list(Uint8List runtimeId, Uint8List buffer, int cap) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        return _bufCall(
+            (buf, capacity) => _list(_engine, runtime, buf, capacity), buffer, cap);
+      }, processAllocator);
 
   @override
-  int disconnect(Uint8List runtimeId, Uint8List connId) {
-    final runtime = _idIn(runtimeId);
-    final conn = _idIn(connId);
-    try {
-      return _note(_disconnect(_engine, runtime, conn));
-    } finally {
-      processAllocator.free(conn);
-      processAllocator.free(runtime);
-    }
-  }
+  int disconnect(Uint8List runtimeId, Uint8List connId) => using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final conn = _idIn(connId, arena);
+        return _note(_disconnect(_engine, runtime, conn));
+      }, processAllocator);
 
   @override
-  int setSaveDir(Uint8List runtimeId, String path) {
-    final runtime = _idIn(runtimeId);
-    final native = toNativeUtf8(path);
-    try {
-      return _note(_setSaveDir(_engine, runtime, native));
-    } finally {
-      processAllocator.free(native);
-      processAllocator.free(runtime);
-    }
-  }
+  int setSaveDir(Uint8List runtimeId, String path) => using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final native = toNativeUtf8(path, allocator: arena);
+        return _note(_setSaveDir(_engine, runtime, native));
+      }, processAllocator);
 
   @override
-  int consent(Uint8List runtimeId, Uint8List jobId, int accept) {
-    final runtime = _idIn(runtimeId);
-    final job = _idIn(jobId);
-    try {
-      return _note(_consent(_engine, runtime, job, accept));
-    } finally {
-      processAllocator.free(job);
-      processAllocator.free(runtime);
-    }
-  }
+  int consent(Uint8List runtimeId, Uint8List jobId, int accept) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final job = _idIn(jobId, arena);
+        return _note(_consent(_engine, runtime, job, accept));
+      }, processAllocator);
 
   @override
-  int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
-    final runtime = _idIn(runtimeId);
-    final op = _idIn(opId);
-    try {
-      return _bufCall(
-          (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
-          buffer,
-          cap);
-    } finally {
-      processAllocator.free(op);
-      processAllocator.free(runtime);
-    }
-  }
+  int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final op = _idIn(opId, arena);
+        return _bufCall(
+            (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
+            buffer,
+            cap);
+      }, processAllocator);
 
   @override
-  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
-    final runtime = _idIn(runtimeId);
-    try {
-      return _bufCall(
-          (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
-          buffer,
-          cap);
-    } finally {
-      processAllocator.free(runtime);
-    }
-  }
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        return _bufCall(
+            (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
+            buffer,
+            cap);
+      }, processAllocator);
 
   @override
   int pollProgress(Uint8List buffer, int cap) =>
       _bufCall((buf, capacity) => _pollProgress(_engine, buf, capacity), buffer, cap);
 
-  Pointer<Uint8> _idIn(Uint8List id) {
+  /// Copies one validated 16-byte id into a fresh native buffer owned by
+  /// [arena] (C14: a later allocation failure inside the same call site
+  /// can no longer leak an earlier id buffer).
+  Pointer<Uint8> _idIn(Uint8List id, Arena arena) {
     if (id.length != akPairingIdLength) {
       throw ArgumentError.value(id.length, 'id.length',
           'wave-28 ids are exactly $akPairingIdLength bytes');
     }
-    final pointer = processAllocator.allocate<Uint8>(akPairingIdLength);
+    final pointer = arena<Uint8>(akPairingIdLength);
     for (var i = 0; i < akPairingIdLength; i++) {
       pointer[i] = id[i];
     }
     return pointer;
   }
 
-  /// Runs one buffer call: on a positive code copies the NUL-terminated
-  /// payload into [buffer] (bounded by [cap]); `-3` and the other negative
-  /// codes leave it untouched (nothing consumed).
-  int _bufCall(int Function(Pointer<Uint8>, int) invoke, Uint8List buffer, int cap) {
-    final buf = processAllocator.allocate<Uint8>(cap);
-    try {
-      final code = _note(invoke(buf, cap));
-      if (code > 0) {
-        var length = 0;
-        while (length < cap && buf[length] != 0) {
-          length++;
-        }
-        buffer.setAll(0, buf.asTypedList(length));
-      }
-      return code;
-    } finally {
-      processAllocator.free(buf);
-    }
-  }
+  /// Runs one buffer call via the shared C06 contract ([akBufferCall]);
+  /// `_note` still captures the last-error detail of a negative status.
+  int _bufCall(int Function(Pointer<Uint8>, int) invoke, Uint8List buffer,
+          int cap) =>
+      akBufferCall(
+          (buf, capacity) => _note(invoke(buf, capacity)), buffer, cap);
 }
 
 // ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ import 'dart:convert' show jsonEncode;
 import 'dart:ffi';
 import 'dart:typed_data' show Uint8List;
 
+import 'package:ffi/ffi.dart' show Arena, using;
+
 import 'bindings.dart' show AkEngine, AkStatus, processAllocator;
 import 'ffi_json.dart' show AkSpecException, decodeFfiJson, toNativeUtf8;
 import 'model/sched_events.dart';
@@ -50,6 +52,7 @@ import 'pairing_ffi.dart'
     show
         EngineLastErrorC,
         EngineLastErrorDart,
+        akBufferCall,
         akCallFailure,
         akPairingIdLength,
         fromNativeUtf8Text,
@@ -381,30 +384,21 @@ final class AkSchedFfiBindings implements AkSchedCalls {
   }
 
   @override
-  int enqueue(String specJson, Uint8List taskIdOut) {
-    final spec = toNativeUtf8(specJson);
-    final out = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(_enqueue(_engine, spec, out));
-      if (code == AkStatus.ok) {
-        taskIdOut.setAll(0, out.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(out);
-      processAllocator.free(spec);
-    }
-  }
+  int enqueue(String specJson, Uint8List taskIdOut) => using((arena) {
+        final spec = toNativeUtf8(specJson, allocator: arena);
+        final out = arena<Uint8>(akPairingIdLength);
+        final code = _note(_enqueue(_engine, spec, out));
+        if (code == AkStatus.ok) {
+          taskIdOut.setAll(0, out.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
-  int cancel(Uint8List taskId) {
-    final task = _idIn(taskId);
-    try {
-      return _note(_cancel(_engine, task));
-    } finally {
-      processAllocator.free(task);
-    }
-  }
+  int cancel(Uint8List taskId) => using((arena) {
+        final task = _idIn(taskId, arena);
+        return _note(_cancel(_engine, task));
+      }, processAllocator);
 
   @override
   int snapshot(String queryJson, Uint8List buffer, int cap) {
@@ -419,35 +413,24 @@ final class AkSchedFfiBindings implements AkSchedCalls {
   int pollEvent(Uint8List buffer, int cap) => _bufCall(
       (buf, capacity) => _pollEvent(_engine, buf, capacity), buffer, cap);
 
-  Pointer<Uint8> _idIn(Uint8List id) {
+  Pointer<Uint8> _idIn(Uint8List id, Arena arena) {
     if (id.length != akPairingIdLength) {
       throw ArgumentError.value(id.length, 'id.length',
           'wave-22 ids are exactly $akPairingIdLength bytes');
     }
-    final pointer = processAllocator.allocate<Uint8>(akPairingIdLength);
+    final pointer = arena<Uint8>(akPairingIdLength);
     for (var i = 0; i < akPairingIdLength; i++) {
       pointer[i] = id[i];
     }
     return pointer;
   }
 
+  /// Runs one buffer call via the shared C06 contract ([akBufferCall]);
+  /// `_note` still captures the last-error detail of a negative status.
   int _bufCall(int Function(Pointer<Uint8>, int) invoke, Uint8List buffer,
-      int cap) {
-    final buf = processAllocator.allocate<Uint8>(cap);
-    try {
-      final code = _note(invoke(buf, cap));
-      if (code > 0) {
-        var length = 0;
-        while (length < cap && buf[length] != 0) {
-          length++;
-        }
-        buffer.setAll(0, buf.asTypedList(length));
-      }
-      return code;
-    } finally {
-      processAllocator.free(buf);
-    }
-  }
+          int cap) =>
+      akBufferCall(
+          (buf, capacity) => _note(invoke(buf, capacity)), buffer, cap);
 }
 
 // ---------------------------------------------------------------------------

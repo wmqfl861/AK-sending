@@ -15,7 +15,7 @@ import 'dart:convert' show jsonDecode, jsonEncode, utf8;
 
 import 'dart:ffi';
 
-import 'bindings.dart' show processAllocator;
+import 'bindings.dart' show AkFfiProtocolException, processAllocator;
 
 /// A spec rejected by the Dart-side mirror of the Rust validation.
 class AkSpecException implements Exception {
@@ -47,16 +47,51 @@ Pointer<Uint8> toNativeUtf8(String text, {Allocator? allocator}) {
   return pointer;
 }
 
-/// Decode the NUL-terminated UTF-8 C string at [pointer].
+/// Decode the NUL-terminated UTF-8 C string at [pointer], STRICTLY bounded
+/// by [capacity] bytes (C05 of codex-crash-analysis-2026-11-07.md).
 ///
-/// Reads up to the first NUL byte; invalid UTF-8 throws (the ak-ffi shim
-/// only ever writes valid UTF-8).
-String fromNativeUtf8(Pointer<Uint8> pointer) {
+/// Two reader forms share this one implementation:
+/// * **Length form** — when the export returned the payload byte length
+///   (`ak_engine_last_error`, `ak_version`), pass it as [length]; the reader
+///   then validates `0 <= length < capacity` AND `pointer[length] == 0`.
+/// * **Scan form** — when the export only returned a status (`1` = payload
+///   written), omit [length]; the reader scans for the NUL byte but stops
+///   at [capacity].
+///
+/// Any violation (length out of range, NUL missing at the claimed position,
+/// no NUL within [capacity]) throws [AkFfiProtocolException] instead of
+/// reading past the caller's allocation — a stub or old DLL that breaks the
+/// output contract surfaces as an explicit protocol error. Invalid UTF-8
+/// still throws the `FormatException` of [utf8.decode].
+String fromNativeUtf8(Pointer<Uint8> pointer, int capacity, {int? length}) {
+  final limit = length ?? _scanNul(pointer, capacity);
+  if (limit < 0 || limit >= capacity) {
+    throw AkFfiProtocolException(
+      'native reply length $limit is outside 0 <= len < $capacity',
+    );
+  }
+  if (pointer[limit] != 0) {
+    throw AkFfiProtocolException(
+      'native reply claims $limit payload bytes but byte [$limit] is not '
+      'the promised NUL terminator',
+    );
+  }
+  return utf8.decode(pointer.asTypedList(limit));
+}
+
+/// Bounded NUL scan: the index of the first zero byte within [capacity],
+/// or a protocol violation when none exists (never reads past [capacity]).
+int _scanNul(Pointer<Uint8> pointer, int capacity) {
   var length = 0;
-  while (pointer[length] != 0) {
+  while (length < capacity && pointer[length] != 0) {
     length++;
   }
-  return utf8.decode(pointer.asTypedList(length));
+  if (length == capacity) {
+    throw AkFfiProtocolException(
+      'no NUL terminator within the $capacity-byte caller buffer',
+    );
+  }
+  return length;
 }
 
 // ---------------------------------------------------------------------------

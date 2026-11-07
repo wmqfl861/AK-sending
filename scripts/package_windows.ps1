@@ -248,6 +248,26 @@ try {
             Get-ChildItem -LiteralPath $flutterRelease -Filter '*.dll' -File -ErrorAction SilentlyContinue |
                 ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $flutterOut }
             Copy-Item -LiteralPath (Join-Path $flutterRelease 'data') -Destination $flutterOut -Recurse
+
+            # C09 (reports/codex-crash-analysis-2026-11-07.md): the runner dir
+            # can hold a STALE ak_ffi.dll left by an older CMake build, while
+            # the root of this package carries the DLL cargo just built in
+            # step 2. Two different sources for "the" ak_ffi.dll in one
+            # package could mix builds. Unify: the cargo artifact
+            # (target\$Profile\ak_ffi.dll) is authoritative - overwrite the
+            # flutter\ copy with it, then SHA256-verify BOTH packaged copies
+            # against the source so a mismatched package fails loudly.
+            $flutterDll = Join-Path $flutterOut 'ak_ffi.dll'
+            Copy-Item -LiteralPath $ffiDll -Destination $flutterDll -Force
+            $sourceDllHash = (Get-FileHash -LiteralPath $ffiDll -Algorithm SHA256).Hash
+            foreach ($dllCopy in @((Join-Path $OutDirFull 'ak_ffi.dll'), $flutterDll)) {
+                $copyHash = (Get-FileHash -LiteralPath $dllCopy -Algorithm SHA256).Hash
+                if ($copyHash -ne $sourceDllHash) {
+                    Fail ("packaged ak_ffi.dll does not match target\{0}\ak_ffi.dll (SHA256 differs): {1}" -f $Profile, $dllCopy)
+                }
+            }
+            Write-Host ("==> flutter\ak_ffi.dll unified with target\{0}\ak_ffi.dll (SHA256 {1}... verified on both copies)" -f $Profile, $sourceDllHash.Substring(0, 16))
+
             Write-Host ("==> flutter app included: {0} exe(s) + dlls + data\ (from {1})" -f $flutterExes.Count, $flutterRelease)
         }
         else {

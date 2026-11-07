@@ -46,8 +46,15 @@ import 'dart:ffi';
 import 'dart:math' show Random;
 import 'dart:typed_data' show Uint8List;
 
+import 'package:ffi/ffi.dart' show Arena, using;
+
 import 'bindings.dart'
-    show AkEngine, AkFfiException, AkStatus, processAllocator;
+    show
+        AkEngine,
+        AkFfiException,
+        AkFfiProtocolException,
+        AkStatus,
+        processAllocator;
 import 'ffi_json.dart'
     show AkSpecException, decodeFfiJson, fromNativeUtf8, toNativeUtf8;
 import 'model/invite.dart';
@@ -77,6 +84,11 @@ typedef EngineLastErrorDart = int Function(
 /// resolved binding function with the shared lossless `-3` grow loop —
 /// the pattern of `engine.dart`'s `_exceptionFor`. The engine handle is
 /// never dereferenced (thread-local storage), and '' means "no detail".
+///
+/// C05: a success code IS the payload byte length, so the read is bounded
+/// by `0 <= len < cap` with the promised NUL at `buf[len]` — a violating
+/// (stub/old) DLL throws [AkFfiProtocolException] instead of being scanned
+/// past the buffer.
 String readEngineLastError(
     int Function(Pointer<AkEngine>, Pointer<Uint8>, int) lastError,
     Pointer<AkEngine> engine) {
@@ -86,7 +98,7 @@ String readEngineLastError(
     try {
       final code = lastError(engine, buf, capacity);
       if (code >= 0) {
-        return fromNativeUtf8(buf);
+        return fromNativeUtf8(buf, capacity, length: code);
       }
       if (code == AkStatus.errBuffer) {
         capacity *= 2; // stored message untouched; retry losslessly
@@ -113,6 +125,53 @@ AkFfiException akCallFailure(
       detail == null || detail.isEmpty
           ? '$what（${AkStatus.name(code)}）'
           : '$what（${AkStatus.name(code)}）：$detail');
+}
+
+/// Runs ONE `buf`/`cap` buffer call for the dart:ffi bindings layers
+/// (pairing/task/sched share this implementation — C06 of the crash
+/// analysis):
+///
+/// * [cap] must equal `buffer.length` — the Dart list models the native
+///   pair, a mismatch is an [ArgumentError] at the seam, never a
+///   `RangeError` mid-copy.
+/// * On a positive code the payload must be NUL-terminated INSIDE [cap];
+///   otherwise the DLL broke its output contract and an
+///   [AkFfiProtocolException] is thrown rather than accepting the whole
+///   cap as payload. On success the Dart [buffer] receives the payload
+///   bytes plus an explicit NUL at the end, so a REUSED buffer decodes
+///   correctly even without prior zeroing.
+/// * On `-3` ([AkStatus.errBuffer], nothing consumed) the Dart buffer is
+///   zeroed: a grow-retry that reuses it can never see stale residue.
+/// * Other codes leave the buffer untouched (nothing consumed).
+int akBufferCall(
+    int Function(Pointer<Uint8>, int) invoke, Uint8List buffer, int cap) {
+  if (cap != buffer.length) {
+    throw ArgumentError.value(cap, 'cap',
+        'must equal buffer.length (${buffer.length}) — the buffer models the native buf/cap pair');
+  }
+  final buf = processAllocator.allocate<Uint8>(cap == 0 ? 1 : cap);
+  try {
+    final code = invoke(buf, cap);
+    if (code > 0) {
+      var length = 0;
+      while (length < cap && buf[length] != 0) {
+        length++;
+      }
+      if (length == cap) {
+        throw AkFfiProtocolException(
+          'buffer call returned $code without a NUL terminator within '
+          '$cap bytes',
+        );
+      }
+      buffer.setAll(0, buf.asTypedList(length));
+      buffer[length] = 0;
+    } else if (code == AkStatus.errBuffer) {
+      buffer.fillRange(0, cap, 0);
+    }
+    return code;
+  } finally {
+    processAllocator.free(buf);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -631,20 +690,16 @@ final class AkPairingFfiBindings implements AkPairingCalls {
   }
 
   @override
-  int start(String specJson, Uint8List runtimeIdOut) {
-    final spec = toNativeUtf8(specJson);
-    final idOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(_start(_engine, spec, idOut));
-      if (code == AkStatus.ok) {
-        runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(idOut);
-      processAllocator.free(spec);
-    }
-  }
+  int start(String specJson, Uint8List runtimeIdOut) =>
+      using((arena) {
+        final spec = toNativeUtf8(specJson, allocator: arena);
+        final idOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(_start(_engine, spec, idOut));
+        if (code == AkStatus.ok) {
+          runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
   int createStart(
@@ -667,63 +722,46 @@ final class AkPairingFfiBindings implements AkPairingCalls {
       _specStart(_revokeStart, runtimeId, specJson, opIdOut);
 
   int _specStart(_SpecStartDart invoke, Uint8List runtimeId, String specJson,
-      Uint8List opIdOut) {
-    final id = _idIn(runtimeId);
-    final spec = toNativeUtf8(specJson);
-    final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
-      final code = _note(invoke(_engine, id, spec, opOut));
-      if (code == AkStatus.ok) {
-        opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
-      }
-      return code;
-    } finally {
-      processAllocator.free(opOut);
-      processAllocator.free(spec);
-      processAllocator.free(id);
-    }
-  }
+          Uint8List opIdOut) =>
+      using((arena) {
+        final id = _idIn(runtimeId, arena);
+        final spec = toNativeUtf8(specJson, allocator: arena);
+        final opOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(invoke(_engine, id, spec, opOut));
+        if (code == AkStatus.ok) {
+          opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
 
   @override
   int opResult(
-      Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
-    final runtime = _idIn(runtimeId);
-    final op = _idIn(opId);
-    try {
-      return _bufCall(
-          (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
-          buffer,
-          cap);
-    } finally {
-      processAllocator.free(op);
-      processAllocator.free(runtime);
-    }
-  }
+          Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final op = _idIn(opId, arena);
+        return _bufCall(
+            (buf, capacity) => _opResult(_engine, runtime, op, buf, capacity),
+            buffer,
+            cap);
+      }, processAllocator);
 
   @override
-  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) {
-    final runtime = _idIn(runtimeId);
-    try {
-      return _bufCall(
-          (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
-          buffer,
-          cap);
-    } finally {
-      processAllocator.free(runtime);
-    }
-  }
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) =>
+      using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        return _bufCall(
+            (buf, capacity) => _pollEvent(_engine, runtime, buf, capacity),
+            buffer,
+            cap);
+      }, processAllocator);
 
   @override
-  int cancelOp(Uint8List runtimeId, Uint8List opId) {
-    final runtime = _idIn(runtimeId);
-    final op = _idIn(opId);
-    try {
-      return _note(_cancelOp(_engine, runtime, op));
-    } finally {
-      processAllocator.free(op);
-      processAllocator.free(runtime);
-    }
-  }
+  int cancelOp(Uint8List runtimeId, Uint8List opId) => using((arena) {
+        final runtime = _idIn(runtimeId, arena);
+        final op = _idIn(opId, arena);
+        return _note(_cancelOp(_engine, runtime, op));
+      }, processAllocator);
 
   @override
   int stopStart(Uint8List runtimeId, Uint8List opIdOut) {
@@ -733,52 +771,38 @@ final class AkPairingFfiBindings implements AkPairingCalls {
           '当前 ak_ffi 运行时尚未导出 ak_pairing_stop_start'
           '（见 akPairingPendingExportNames）');
     }
-    final runtime = _idIn(runtimeId);
-    final opOut = processAllocator.allocate<Uint8>(akPairingIdLength);
-    try {
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      final opOut = arena<Uint8>(akPairingIdLength);
       final code = _note(invoke(_engine, runtime, opOut));
       if (code == AkStatus.ok) {
         opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
       }
       return code;
-    } finally {
-      processAllocator.free(opOut);
-      processAllocator.free(runtime);
-    }
+    }, processAllocator);
   }
 
-  Pointer<Uint8> _idIn(Uint8List id) {
+  /// Copies one validated 16-byte id into a fresh native buffer owned by
+  /// [arena] (C14: every allocation of a multi-allocation call site shares
+  /// one arena, so a later failure frees the earlier ones).
+  Pointer<Uint8> _idIn(Uint8List id, Arena arena) {
     if (id.length != akPairingIdLength) {
       throw ArgumentError.value(id.length, 'id.length',
           'wave-22 ids are exactly $akPairingIdLength bytes');
     }
-    final pointer = processAllocator.allocate<Uint8>(akPairingIdLength);
+    final pointer = arena<Uint8>(akPairingIdLength);
     for (var i = 0; i < akPairingIdLength; i++) {
       pointer[i] = id[i];
     }
     return pointer;
   }
 
-  /// Runs one buffer call: on a positive code copies the NUL-terminated
-  /// payload into [buffer] (bounded by [cap]); `-3` and the other negative
-  /// codes leave it untouched (nothing consumed).
+  /// Runs one buffer call via the shared C06 contract ([akBufferCall]);
+  /// `_note` still captures the last-error detail of a negative status.
   int _bufCall(int Function(Pointer<Uint8>, int) invoke, Uint8List buffer,
-      int cap) {
-    final buf = processAllocator.allocate<Uint8>(cap);
-    try {
-      final code = _note(invoke(buf, cap));
-      if (code > 0) {
-        var length = 0;
-        while (length < cap && buf[length] != 0) {
-          length++;
-        }
-        buffer.setAll(0, buf.asTypedList(length));
-      }
-      return code;
-    } finally {
-      processAllocator.free(buf);
-    }
-  }
+          int cap) =>
+      akBufferCall(
+          (buf, capacity) => _note(invoke(buf, capacity)), buffer, cap);
 }
 
 // ---------------------------------------------------------------------------

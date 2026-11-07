@@ -174,7 +174,7 @@ fn start_runtime(engine: *mut AkEngine, registry: &TestRegistry, id_dir: &Path) 
     ))
     .unwrap();
     let mut runtime_id = [0u8; 16];
-    let code = ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr());
+    let code = unsafe { ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()) };
     assert_eq!(code, AK_OK, "ak_pairing_start");
     wait_event(engine, &runtime_id, "runtime_ready", 15);
     runtime_id
@@ -185,7 +185,9 @@ fn wait_event(engine: *mut AkEngine, runtime_id: &[u8; 16], name: &str, secs: u6
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut buf = [0 as c_char; 4096];
     loop {
-        let code = ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len());
+        let code = unsafe {
+            ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
         assert!(code == AK_EVENT || code == AK_PENDING, "poll code {code}");
         if code == AK_EVENT {
             let line = cbuf_to_string(&buf);
@@ -232,13 +234,15 @@ fn run_op(engine: *mut AkEngine, runtime_id: &[u8; 16], op: Op) -> (i32, String)
     let mut buf = [0 as c_char; 8192];
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let code = ak_pairing_op_result(
-            engine,
-            runtime_id.as_ptr(),
-            op_id.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        );
+        let code = unsafe {
+            ak_pairing_op_result(
+                engine,
+                runtime_id.as_ptr(),
+                op_id.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
         assert!(
             code == AK_PENDING || code == AK_DONE || code == AK_FAILED,
             "op_result {code}"
@@ -287,7 +291,7 @@ fn paired_fixture() -> Pair {
 impl Drop for Pair {
     fn drop(&mut self) {
         // Best effort: forget the engine only after freeing it once.
-        ak_engine_free(self.engine);
+        unsafe { ak_engine_free(self.engine) };
     }
 }
 
@@ -319,32 +323,35 @@ fn pairing_start_ready_event_and_unknown_runtime_poll() {
 
     // The ready event was consumed by the helper; a fresh poll is empty.
     let mut buf = [0 as c_char; 256];
-    let code = ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len());
+    let code =
+        unsafe { ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
     assert_eq!(code, AK_PENDING);
 
     // Unknown runtime: every runtime-keyed call answers -4.
     let bogus = [9u8; 16];
     assert_eq!(
-        ak_pairing_poll_event(engine, bogus.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_pairing_poll_event(engine, bogus.as_ptr(), buf.as_mut_ptr(), buf.len()) },
         AK_ERR_NOT_FOUND
     );
     let mut op_buf = [0 as c_char; 64];
     assert_eq!(
-        ak_pairing_op_result(
-            engine,
-            bogus.as_ptr(),
-            bogus.as_ptr(),
-            op_buf.as_mut_ptr(),
-            op_buf.len()
-        ),
+        unsafe {
+            ak_pairing_op_result(
+                engine,
+                bogus.as_ptr(),
+                bogus.as_ptr(),
+                op_buf.as_mut_ptr(),
+                op_buf.len(),
+            )
+        },
         AK_ERR_NOT_FOUND
     );
     assert_eq!(
-        ak_pairing_cancel_op(engine, bogus.as_ptr(), bogus.as_ptr()),
+        unsafe { ak_pairing_cancel_op(engine, bogus.as_ptr(), bogus.as_ptr()) },
         AK_ERR_NOT_FOUND
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -356,18 +363,18 @@ fn pairing_start_validates_arguments_before_side_effects() {
     // Null spec / null output pointer: -1, nothing registered.
     let spec = CString::new("{}").unwrap();
     assert_eq!(
-        ak_pairing_start(engine, std::ptr::null(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, std::ptr::null(), runtime_id.as_mut_ptr()) },
         AK_ERR_NULL
     );
     assert_eq!(
-        ak_pairing_start(engine, spec.as_ptr(), std::ptr::null_mut()),
+        unsafe { ak_pairing_start(engine, spec.as_ptr(), std::ptr::null_mut()) },
         AK_ERR_NULL
     );
 
     // Missing registry / bad registry_id: -2 (validation before IO).
     let missing = CString::new(format!("{{\"id_dir\":{}}}", path_jstr(&dir))).unwrap();
     assert_eq!(
-        ak_pairing_start(engine, missing.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, missing.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_ERR_INVALID
     );
     let bad_pin = CString::new(format!(
@@ -376,7 +383,7 @@ fn pairing_start_validates_arguments_before_side_effects() {
     ))
     .unwrap();
     assert_eq!(
-        ak_pairing_start(engine, bad_pin.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, bad_pin.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_ERR_INVALID
     );
 
@@ -389,7 +396,7 @@ fn pairing_start_validates_arguments_before_side_effects() {
     ))
     .unwrap();
     assert_eq!(
-        ak_pairing_start(engine, dead.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, dead.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_OK
     );
     let failed = wait_event(engine, &runtime_id, "runtime_failed", 20);
@@ -398,12 +405,12 @@ fn pairing_start_validates_arguments_before_side_effects() {
     // A sched bind against the dead runtime is refused before it starts.
     let sched = CString::new("{}").unwrap();
     assert_eq!(
-        ak_sched_start(engine, sched.as_ptr()),
+        unsafe { ak_sched_start(engine, sched.as_ptr()) },
         AK_ERR_INVALID,
         "sched_start needs a connected runtime"
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 // ---------------------------------------------------------------------------
@@ -489,23 +496,27 @@ fn op_result_buffer_retry_is_lossless() {
     let spec = CString::new("{\"spec_version\":1,\"ttl_secs\":0}").unwrap();
     let mut op_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_create_start(
-            pair.engine,
-            pair.b.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_pairing_create_start(
+                pair.engine,
+                pair.b.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     let mut big = [0 as c_char; 8192];
     let (code, json) = loop {
-        let code = ak_pairing_op_result(
-            pair.engine,
-            pair.b.as_ptr(),
-            op_id.as_ptr(),
-            big.as_mut_ptr(),
-            big.len(),
-        );
+        let code = unsafe {
+            ak_pairing_op_result(
+                pair.engine,
+                pair.b.as_ptr(),
+                op_id.as_ptr(),
+                big.as_mut_ptr(),
+                big.len(),
+            )
+        };
         if code == AK_DONE || code == AK_FAILED {
             break (code, cbuf_to_string(&big));
         }
@@ -517,13 +528,15 @@ fn op_result_buffer_retry_is_lossless() {
     let mut tiny = [0 as c_char; 4];
     for _ in 0..3 {
         assert_eq!(
-            ak_pairing_op_result(
-                pair.engine,
-                pair.b.as_ptr(),
-                op_id.as_ptr(),
-                tiny.as_mut_ptr(),
-                tiny.len()
-            ),
+            unsafe {
+                ak_pairing_op_result(
+                    pair.engine,
+                    pair.b.as_ptr(),
+                    op_id.as_ptr(),
+                    tiny.as_mut_ptr(),
+                    tiny.len(),
+                )
+            },
             AK_ERR_BUFFER,
             "a too-small buffer must be -3"
         );
@@ -532,13 +545,15 @@ fn op_result_buffer_retry_is_lossless() {
     // no second invite code was generated.
     let mut again = [0 as c_char; 8192];
     assert_eq!(
-        ak_pairing_op_result(
-            pair.engine,
-            pair.b.as_ptr(),
-            op_id.as_ptr(),
-            again.as_mut_ptr(),
-            again.len()
-        ),
+        unsafe {
+            ak_pairing_op_result(
+                pair.engine,
+                pair.b.as_ptr(),
+                op_id.as_ptr(),
+                again.as_mut_ptr(),
+                again.len(),
+            )
+        },
         AK_DONE
     );
     let again_json = cbuf_to_string(&again);
@@ -562,7 +577,7 @@ fn poll_event_buffer_pushback_keeps_the_event() {
     .unwrap();
     let mut runtime_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_OK
     );
 
@@ -571,8 +586,9 @@ fn poll_event_buffer_pushback_keeps_the_event() {
     let mut tiny = [0 as c_char; 2];
     loop {
         assert!(Instant::now() < deadline, "ready event never arrived");
-        let code =
-            ak_pairing_poll_event(engine, runtime_id.as_ptr(), tiny.as_mut_ptr(), tiny.len());
+        let code = unsafe {
+            ak_pairing_poll_event(engine, runtime_id.as_ptr(), tiny.as_mut_ptr(), tiny.len())
+        };
         if code == AK_PENDING {
             // Not queued yet (still connecting).
             thread::sleep(Duration::from_millis(20));
@@ -580,7 +596,9 @@ fn poll_event_buffer_pushback_keeps_the_event() {
         }
         assert_eq!(code, AK_ERR_BUFFER, "a queued event must not fit 2 bytes");
         let mut big = [0 as c_char; 4096];
-        let code = ak_pairing_poll_event(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len());
+        let code = unsafe {
+            ak_pairing_poll_event(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len())
+        };
         if code == AK_EVENT {
             let line = cbuf_to_string(&big);
             assert!(line.contains("runtime_ready"), "{line}");
@@ -592,11 +610,11 @@ fn poll_event_buffer_pushback_keeps_the_event() {
     // The event was consumed exactly once by the successful poll.
     let mut big = [0 as c_char; 4096];
     assert_eq!(
-        ak_pairing_poll_event(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()),
+        unsafe { ak_pairing_poll_event(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()) },
         AK_PENDING
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -613,7 +631,7 @@ fn cancel_op_stamps_cancelled_and_unknown_op_is_not_found() {
     .unwrap();
     let mut runtime_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_OK
     );
     wait_event(engine, &runtime_id, "runtime_ready", 15);
@@ -629,29 +647,33 @@ fn cancel_op_stamps_cancelled_and_unknown_op_is_not_found() {
     .unwrap();
     let mut op_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_redeem_start(
-            engine,
-            runtime_id.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_pairing_redeem_start(
+                engine,
+                runtime_id.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     thread::sleep(Duration::from_millis(150));
     assert_eq!(
-        ak_pairing_cancel_op(engine, runtime_id.as_ptr(), op_id.as_ptr()),
+        unsafe { ak_pairing_cancel_op(engine, runtime_id.as_ptr(), op_id.as_ptr()) },
         AK_OK
     );
     let mut buf = [0 as c_char; 2048];
     let deadline = Instant::now() + Duration::from_secs(5);
     let json = loop {
-        let code = ak_pairing_op_result(
-            engine,
-            runtime_id.as_ptr(),
-            op_id.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        );
+        let code = unsafe {
+            ak_pairing_op_result(
+                engine,
+                runtime_id.as_ptr(),
+                op_id.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
         assert!(Instant::now() < deadline, "cancelled op never resolved");
         if code == AK_FAILED {
             break cbuf_to_string(&buf);
@@ -662,11 +684,11 @@ fn cancel_op_stamps_cancelled_and_unknown_op_is_not_found() {
 
     let bogus = [9u8; 16];
     assert_eq!(
-        ak_pairing_cancel_op(engine, runtime_id.as_ptr(), bogus.as_ptr()),
+        unsafe { ak_pairing_cancel_op(engine, runtime_id.as_ptr(), bogus.as_ptr()) },
         AK_ERR_NOT_FOUND
     );
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -721,7 +743,7 @@ fn list_and_revoke_roundtrip() {
 
 fn snapshot_text(engine: *mut AkEngine) -> (i32, String) {
     let mut buf = [0 as c_char; 16384];
-    let code = ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()) };
     (code, cbuf_to_string(&buf))
 }
 
@@ -751,7 +773,7 @@ fn drain_sched_events(engine: *mut AkEngine) -> Vec<String> {
     let mut lines = Vec::new();
     let mut buf = [0 as c_char; 4096];
     loop {
-        let code = ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len());
+        let code = unsafe { ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len()) };
         assert!(code == AK_EVENT || code == AK_PENDING, "sched poll {code}");
         if code == AK_PENDING {
             return lines;
@@ -791,7 +813,10 @@ fn transfer_fixture(
         hex16(&pair.a),
     ))
     .unwrap();
-    assert_eq!(ak_sched_start(pair.engine, sched_spec.as_ptr()), AK_OK);
+    assert_eq!(
+        unsafe { ak_sched_start(pair.engine, sched_spec.as_ptr()) },
+        AK_OK
+    );
 
     // One applied pairing per group: the sender redeems `groups` distinct
     // invites of the owner (distinct code groups for the cross-code mode).
@@ -814,7 +839,7 @@ fn transfer_fixture(
     let mut buf = [0 as c_char; 2048];
     let id_str = CString::new(pair.a_dir.to_string_lossy().into_owned()).unwrap();
     assert_eq!(
-        ak_identity_info(pair.engine, id_str.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_identity_info(pair.engine, id_str.as_ptr(), buf.as_mut_ptr(), buf.len()) },
         AK_DONE
     );
     let sender_fp = field_str(&cbuf_to_string(&buf), "fingerprint");
@@ -832,7 +857,7 @@ fn transfer_fixture(
     .unwrap();
     let mut recv_job = [0u8; 16];
     assert_eq!(
-        ak_receive_start(pair.engine, recv_spec.as_ptr(), recv_job.as_mut_ptr()),
+        unsafe { ak_receive_start(pair.engine, recv_spec.as_ptr(), recv_job.as_mut_ptr()) },
         AK_OK
     );
 
@@ -865,7 +890,7 @@ fn transfer_fixture(
         .unwrap();
         let mut task_id = [0u8; 16];
         assert_eq!(
-            ak_sched_enqueue(pair.engine, spec.as_ptr(), task_id.as_mut_ptr()),
+            unsafe { ak_sched_enqueue(pair.engine, spec.as_ptr(), task_id.as_mut_ptr()) },
             AK_OK,
             "enqueue {}",
             path.display()
@@ -898,12 +923,14 @@ impl TransferFixture {
                 let mut buf = [0 as c_char; 8192];
                 let recv_deadline = Instant::now() + Duration::from_secs(60);
                 loop {
-                    let code = ak_job_result(
-                        self.pair.engine,
-                        self.recv_job.as_ptr(),
-                        buf.as_mut_ptr(),
-                        buf.len(),
-                    );
+                    let code = unsafe {
+                        ak_job_result(
+                            self.pair.engine,
+                            self.recv_job.as_ptr(),
+                            buf.as_mut_ptr(),
+                            buf.len(),
+                        )
+                    };
                     if code == AK_DONE || code == AK_FAILED {
                         return (max_active, json);
                     }
@@ -945,23 +972,26 @@ fn sched_requires_runtime_and_single_start() {
     let engine = ak_engine_new();
     // No pairing runtime at all: -4 on every scheduler call.
     let spec = CString::new("{}").unwrap();
-    assert_eq!(ak_sched_start(engine, spec.as_ptr()), AK_ERR_NOT_FOUND);
+    assert_eq!(
+        unsafe { ak_sched_start(engine, spec.as_ptr()) },
+        AK_ERR_NOT_FOUND
+    );
     let mut buf = [0 as c_char; 256];
     assert_eq!(
-        ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()) },
         AK_ERR_NOT_FOUND
     );
     assert_eq!(
-        ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len()) },
         AK_ERR_NOT_FOUND
     );
     let policy = CString::new("{\"same_code\":\"serial\"}").unwrap();
     assert_eq!(
-        ak_sched_set_policy(engine, policy.as_ptr()),
+        unsafe { ak_sched_set_policy(engine, policy.as_ptr()) },
         AK_ERR_NOT_FOUND
     );
     assert_eq!(
-        ak_sched_cancel(engine, [0u8; 16].as_ptr()),
+        unsafe { ak_sched_cancel(engine, [0u8; 16].as_ptr()) },
         AK_ERR_NOT_FOUND
     );
     let enqueue =
@@ -969,10 +999,10 @@ fn sched_requires_runtime_and_single_start() {
             .unwrap();
     let mut task_id = [0u8; 16];
     assert_eq!(
-        ak_sched_enqueue(engine, enqueue.as_ptr(), task_id.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(engine, enqueue.as_ptr(), task_id.as_mut_ptr()) },
         AK_ERR_NOT_FOUND
     );
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 #[test]
@@ -989,13 +1019,19 @@ fn sched_snapshot_and_set_policy_fields() {
 
     // Switch to parallel cross-code; the revision bumps.
     let policy = CString::new("{\"cross_code\":\"serial\"}").unwrap();
-    assert_eq!(ak_sched_set_policy(engine, policy.as_ptr()), AK_OK);
+    assert_eq!(
+        unsafe { ak_sched_set_policy(engine, policy.as_ptr()) },
+        AK_OK
+    );
     let json = snapshot_until(engine, |json| field_u64(json, "policy_revision") == 2, 10);
     assert!(json.contains("\"cross_code\":\"serial\""), "{json}");
 
     // A bad policy word is -2 and changes nothing.
     let bad = CString::new("{\"same_code\":\"diagonal\"}").unwrap();
-    assert_eq!(ak_sched_set_policy(engine, bad.as_ptr()), AK_ERR_INVALID);
+    assert_eq!(
+        unsafe { ak_sched_set_policy(engine, bad.as_ptr()) },
+        AK_ERR_INVALID
+    );
     let (_, json) = snapshot_text(engine);
     assert_eq!(field_u64(&json, "policy_revision"), 2, "{json}");
 
@@ -1126,7 +1162,10 @@ fn sched_cancel_removes_a_queued_task() {
             u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16).expect("hex id");
     }
 
-    assert_eq!(ak_sched_cancel(engine, queued_id.as_ptr()), AK_OK);
+    assert_eq!(
+        unsafe { ak_sched_cancel(engine, queued_id.as_ptr()) },
+        AK_OK
+    );
 
     let final_snapshot = snapshot_until(
         engine,
@@ -1139,12 +1178,14 @@ fn sched_cancel_removes_a_queued_task() {
     let mut recv_buf = [0 as c_char; 8192];
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let code = ak_job_result(
-            engine,
-            fixture.recv_job.as_ptr(),
-            recv_buf.as_mut_ptr(),
-            recv_buf.len(),
-        );
+        let code = unsafe {
+            ak_job_result(
+                engine,
+                fixture.recv_job.as_ptr(),
+                recv_buf.as_mut_ptr(),
+                recv_buf.len(),
+            )
+        };
         if code == AK_DONE || code == AK_FAILED {
             break;
         }
@@ -1163,7 +1204,7 @@ fn sched_cancel_removes_a_queued_task() {
 
     // Cancelling the already-terminal task is -4.
     assert_eq!(
-        ak_sched_cancel(engine, queued_id.as_ptr()),
+        unsafe { ak_sched_cancel(engine, queued_id.as_ptr()) },
         AK_ERR_NOT_FOUND
     );
 }
@@ -1179,7 +1220,7 @@ fn sched_transfer_progress_flows_into_engine_progress_queue() {
     let mut lines = Vec::new();
     let mut buf = [0 as c_char; 8192];
     loop {
-        let code = ak_poll_progress(fixture.pair.engine, buf.as_mut_ptr(), buf.len());
+        let code = unsafe { ak_poll_progress(fixture.pair.engine, buf.as_mut_ptr(), buf.len()) };
         if code == AK_PENDING {
             break;
         }
@@ -1206,7 +1247,7 @@ fn sched_enqueue_resolves_relations_locally_only() {
     .unwrap();
     let mut task_id = [0u8; 16];
     assert_eq!(
-        ak_sched_enqueue(engine, spec.as_ptr(), task_id.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(engine, spec.as_ptr(), task_id.as_mut_ptr()) },
         AK_ERR_NOT_FOUND
     );
     let last = last_error_text(engine);
@@ -1222,21 +1263,21 @@ fn sched_enqueue_resolves_relations_locally_only() {
     )
     .unwrap();
     assert_eq!(
-        ak_sched_enqueue(engine, bad_peer.as_ptr(), task_id.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(engine, bad_peer.as_ptr(), task_id.as_mut_ptr()) },
         AK_ERR_INVALID
     );
     let bad_hex =
         CString::new("{\"pairing_id\":\"zz\",\"source_roots\":[\"/x\"],\"peer\":\"127.0.0.1:1\"}")
             .unwrap();
     assert_eq!(
-        ak_sched_enqueue(engine, bad_hex.as_ptr(), task_id.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(engine, bad_hex.as_ptr(), task_id.as_mut_ptr()) },
         AK_ERR_INVALID
     );
 }
 
 fn last_error_text(engine: *mut AkEngine) -> String {
     let mut buf = [0 as c_char; 2048];
-    let code = ak_engine_last_error(engine, buf.as_mut_ptr(), buf.len());
+    let code = unsafe { ak_engine_last_error(engine, buf.as_mut_ptr(), buf.len()) };
     assert!(code >= 0, "last_error itself failed: {code}");
     cbuf_to_string(&buf)
 }
@@ -1254,13 +1295,15 @@ fn wait_op_result(engine: *mut AkEngine, runtime_id: &[u8; 16], op_id: &[u8; 16]
     let mut buf = [0 as c_char; 8192];
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let code = ak_pairing_op_result(
-            engine,
-            runtime_id.as_ptr(),
-            op_id.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        );
+        let code = unsafe {
+            ak_pairing_op_result(
+                engine,
+                runtime_id.as_ptr(),
+                op_id.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
         assert!(
             code == AK_PENDING || code == AK_DONE || code == AK_FAILED,
             "op_result {code}"
@@ -1278,7 +1321,7 @@ fn wait_sched_event(engine: *mut AkEngine, name: &str, secs: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut buf = [0 as c_char; 4096];
     loop {
-        let code = ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len());
+        let code = unsafe { ak_sched_poll_event(engine, buf.as_mut_ptr(), buf.len()) };
         assert!(code == AK_EVENT || code == AK_PENDING, "sched poll {code}");
         if code == AK_EVENT {
             let line = cbuf_to_string(&buf);
@@ -1323,12 +1366,14 @@ fn sched_listen_start_binds_named_runtime_and_reports_listener_scope() {
     let spec = CString::new("{\"spec_version\":1,\"same_code\":\"serial\"}").unwrap();
     let mut op_id = [0u8; 16];
     assert_eq!(
-        ak_sched_listen_start(
-            pair.engine,
-            pair.a.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_sched_listen_start(
+                pair.engine,
+                pair.a.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     // The op is immediately terminal and honest about the wave-22 listener
@@ -1346,34 +1391,38 @@ fn sched_listen_start_binds_named_runtime_and_reports_listener_scope() {
 
     // One scheduler per engine: a second listen_start is -2.
     assert_eq!(
-        ak_sched_listen_start(
-            pair.engine,
-            pair.a.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_sched_listen_start(
+                pair.engine,
+                pair.a.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_ERR_INVALID
     );
     // A spec naming a DIFFERENT runtime than the id argument is -2 before
     // anything is rebound.
     let conflict = CString::new(format!("{{\"runtime_id\":\"{}\"}}", hex16(&pair.b))).unwrap();
     assert_eq!(
-        ak_sched_listen_start(
-            pair.engine,
-            pair.a.as_ptr(),
-            conflict.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_sched_listen_start(
+                pair.engine,
+                pair.a.as_ptr(),
+                conflict.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_ERR_INVALID
     );
     // The sched calls that take a runtime id must name the BOUND runtime.
     assert_eq!(
-        ak_sched_retry(pair.engine, pair.b.as_ptr(), [0x55; 16].as_ptr()),
+        unsafe { ak_sched_retry(pair.engine, pair.b.as_ptr(), [0x55; 16].as_ptr()) },
         AK_ERR_NOT_FOUND
     );
     // Unknown task on the correct binding: -4 as well.
     assert_eq!(
-        ak_sched_retry(pair.engine, pair.a.as_ptr(), [0x55; 16].as_ptr()),
+        unsafe { ak_sched_retry(pair.engine, pair.a.as_ptr(), [0x55; 16].as_ptr()) },
         AK_ERR_NOT_FOUND
     );
 }
@@ -1396,13 +1445,15 @@ fn sched_task_result_tracks_a_real_task_and_retry_rejects_nonparked() {
 
     // AK_DONE with the snapshot-shaped task object, terminal state visible.
     assert_eq!(
-        ak_sched_task_result(
-            engine,
-            runtime.as_ptr(),
-            task.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        ),
+        unsafe {
+            ak_sched_task_result(
+                engine,
+                runtime.as_ptr(),
+                task.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        },
         AK_DONE
     );
     let json = cbuf_to_string(&buf);
@@ -1412,23 +1463,27 @@ fn sched_task_result_tracks_a_real_task_and_retry_rejects_nonparked() {
     // A too-small buffer is -3 and the retry is lossless.
     let mut tiny = [0 as c_char; 8];
     assert_eq!(
-        ak_sched_task_result(
-            engine,
-            runtime.as_ptr(),
-            task.as_ptr(),
-            tiny.as_mut_ptr(),
-            tiny.len(),
-        ),
+        unsafe {
+            ak_sched_task_result(
+                engine,
+                runtime.as_ptr(),
+                task.as_ptr(),
+                tiny.as_mut_ptr(),
+                tiny.len(),
+            )
+        },
         AK_ERR_BUFFER
     );
     assert_eq!(
-        ak_sched_task_result(
-            engine,
-            runtime.as_ptr(),
-            task.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        ),
+        unsafe {
+            ak_sched_task_result(
+                engine,
+                runtime.as_ptr(),
+                task.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        },
         AK_DONE
     );
     assert_eq!(
@@ -1439,18 +1494,20 @@ fn sched_task_result_tracks_a_real_task_and_retry_rejects_nonparked() {
 
     // retry only restarts PARKED tasks: a completed task is -4.
     assert_eq!(
-        ak_sched_retry(engine, runtime.as_ptr(), task.as_ptr()),
+        unsafe { ak_sched_retry(engine, runtime.as_ptr(), task.as_ptr()) },
         AK_ERR_NOT_FOUND
     );
     // Unknown task id: -4.
     assert_eq!(
-        ak_sched_task_result(
-            engine,
-            runtime.as_ptr(),
-            [0x77; 16].as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        ),
+        unsafe {
+            ak_sched_task_result(
+                engine,
+                runtime.as_ptr(),
+                [0x77; 16].as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        },
         AK_ERR_NOT_FOUND
     );
 }
@@ -1461,12 +1518,14 @@ fn sched_shutdown_and_pairing_stop_lifecycle() {
     let spec = CString::new("{\"spec_version\":1}").unwrap();
     let mut op_id = [0u8; 16];
     assert_eq!(
-        ak_sched_listen_start(
-            pair.engine,
-            pair.a.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_sched_listen_start(
+                pair.engine,
+                pair.a.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
 
@@ -1474,12 +1533,14 @@ fn sched_shutdown_and_pairing_stop_lifecycle() {
     let mut shut_op = [0u8; 16];
     let shut_spec = CString::new("{\"mode\":\"cancel\"}").unwrap();
     assert_eq!(
-        ak_sched_shutdown_start(
-            pair.engine,
-            pair.a.as_ptr(),
-            shut_spec.as_ptr(),
-            shut_op.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_sched_shutdown_start(
+                pair.engine,
+                pair.a.as_ptr(),
+                shut_spec.as_ptr(),
+                shut_op.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     let (code, json) = wait_op_result(pair.engine, &pair.a, &shut_op);
@@ -1493,7 +1554,7 @@ fn sched_shutdown_and_pairing_stop_lifecycle() {
     // Stopping one pairing runtime does not touch the other: b still runs.
     let mut stop_op = [0u8; 16];
     assert_eq!(
-        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        unsafe { ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()) },
         AK_OK
     );
     let (code, stopped) = wait_op_result(pair.engine, &pair.b, &stop_op);
@@ -1514,7 +1575,7 @@ fn sched_shutdown_and_pairing_stop_lifecycle() {
     // accepted and idempotent (tearing down an already-torn-down runtime
     // is a no-op that re-records the terminal op).
     assert_eq!(
-        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        unsafe { ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()) },
         AK_OK
     );
 }
@@ -1548,10 +1609,18 @@ fn gated_registry_proxy(real: std::net::SocketAddr) -> GatedRegistryProxy {
             if gate.recv().is_err() {
                 break;
             }
-            let Ok(mut up_read) = upstream.try_clone() else { break };
-            let Ok(mut client_read) = client.try_clone() else { break };
-            let Ok(mut client_write) = client.try_clone() else { break };
-            let Ok(mut up_write) = upstream.try_clone() else { break };
+            let Ok(mut up_read) = upstream.try_clone() else {
+                break;
+            };
+            let Ok(mut client_read) = client.try_clone() else {
+                break;
+            };
+            let Ok(mut client_write) = client.try_clone() else {
+                break;
+            };
+            let Ok(mut up_write) = upstream.try_clone() else {
+                break;
+            };
             thread::spawn(move || {
                 let _ = std::io::copy(&mut client_read, &mut up_write);
             });
@@ -1582,7 +1651,7 @@ fn pairing_stop_during_starting_prevents_late_connect_resurrection() {
     .unwrap();
     let mut runtime_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+        unsafe { ak_pairing_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()) },
         AK_OK
     );
 
@@ -1590,15 +1659,13 @@ fn pairing_stop_during_starting_prevents_late_connect_resurrection() {
     // before the TLS handshake ever completes.
     let mut stop_op = [0u8; 16];
     assert_eq!(
-        ak_pairing_stop_start(engine, runtime_id.as_ptr(), stop_op.as_mut_ptr()),
+        unsafe { ak_pairing_stop_start(engine, runtime_id.as_ptr(), stop_op.as_mut_ptr()) },
         AK_OK
     );
     let (code, stopped) = wait_op_result(engine, &runtime_id, &stop_op);
     assert_eq!(code, AK_DONE, "{stopped}");
     assert!(stopped.starts_with("{\"op\":\"stop\""), "{stopped}");
-    assert!(
-        wait_event(engine, &runtime_id, "runtime_stopped", 5).contains("runtime_stopped")
-    );
+    assert!(wait_event(engine, &runtime_id, "runtime_stopped", 5).contains("runtime_stopped"));
 
     // NOW the delayed connect completes on the wire. The resurrection
     // window is open: give it real time to misbehave in.
@@ -1606,12 +1673,9 @@ fn pairing_stop_during_starting_prevents_late_connect_resurrection() {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let mut buf = [0 as c_char; 512];
-        let code = ak_pairing_poll_event(
-            engine,
-            runtime_id.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        );
+        let code = unsafe {
+            ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
         assert!(code == AK_EVENT || code == AK_PENDING, "poll code {code}");
         if code == AK_EVENT {
             let line = cbuf_to_string(&buf);
@@ -1635,10 +1699,10 @@ fn pairing_stop_during_starting_prevents_late_connect_resurrection() {
     // A second stop stays accepted and idempotent.
     let mut again = [0u8; 16];
     assert_eq!(
-        ak_pairing_stop_start(engine, runtime_id.as_ptr(), again.as_mut_ptr()),
+        unsafe { ak_pairing_stop_start(engine, runtime_id.as_ptr(), again.as_mut_ptr()) },
         AK_OK
     );
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }
 
 /// P1-04 (doc-contradiction half): accepted op results stay readable
@@ -1650,12 +1714,14 @@ fn pairing_stop_keeps_finished_op_results_readable() {
     let spec = CString::new("{\"spec_version\":1,\"ttl_secs\":0}").unwrap();
     let mut op_id = [0u8; 16];
     assert_eq!(
-        ak_pairing_create_start(
-            pair.engine,
-            pair.b.as_ptr(),
-            spec.as_ptr(),
-            op_id.as_mut_ptr(),
-        ),
+        unsafe {
+            ak_pairing_create_start(
+                pair.engine,
+                pair.b.as_ptr(),
+                spec.as_ptr(),
+                op_id.as_mut_ptr(),
+            )
+        },
         AK_OK
     );
     let (code, before) = wait_op_result(pair.engine, &pair.b, &op_id);
@@ -1664,7 +1730,7 @@ fn pairing_stop_keeps_finished_op_results_readable() {
 
     let mut stop_op = [0u8; 16];
     assert_eq!(
-        ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()),
+        unsafe { ak_pairing_stop_start(pair.engine, pair.b.as_ptr(), stop_op.as_mut_ptr()) },
         AK_OK
     );
     let (code, stopped) = wait_op_result(pair.engine, &pair.b, &stop_op);
@@ -1672,13 +1738,15 @@ fn pairing_stop_keeps_finished_op_results_readable() {
 
     let mut buf = [0 as c_char; 8192];
     assert_eq!(
-        ak_pairing_op_result(
-            pair.engine,
-            pair.b.as_ptr(),
-            op_id.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-        ),
+        unsafe {
+            ak_pairing_op_result(
+                pair.engine,
+                pair.b.as_ptr(),
+                op_id.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        },
         AK_DONE,
         "a finished op must survive the stop of its runtime"
     );
@@ -1701,7 +1769,7 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
         hex16(&pair.a),
     ))
     .unwrap();
-    assert_eq!(ak_sched_start(pair.engine, spec.as_ptr()), AK_OK);
+    assert_eq!(unsafe { ak_sched_start(pair.engine, spec.as_ptr()) }, AK_OK);
 
     let (code, json) = snapshot_text(pair.engine);
     assert_eq!(code, AK_DONE, "{json}");
@@ -1717,8 +1785,15 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
         "{\"max_active_tasks\":1,\"max_queued_tasks_per_code\":2,\"max_pending_admissions\":3}",
     )
     .unwrap();
-    assert_eq!(ak_sched_set_policy(pair.engine, policy.as_ptr()), AK_OK);
-    let json = snapshot_until(pair.engine, |json| field_u64(json, "max_active_tasks") == 1, 10);
+    assert_eq!(
+        unsafe { ak_sched_set_policy(pair.engine, policy.as_ptr()) },
+        AK_OK
+    );
+    let json = snapshot_until(
+        pair.engine,
+        |json| field_u64(json, "max_active_tasks") == 1,
+        10,
+    );
     assert_eq!(field_u64(&json, "max_queued_tasks_per_code"), 2, "{json}");
     assert_eq!(field_u64(&json, "max_pending_admissions"), 3, "{json}");
 
@@ -1726,7 +1801,7 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
     // 后按另一套值执行"), and nothing changed.
     let unknown = CString::new("{\"max_tasks\":1}").unwrap();
     assert_eq!(
-        ak_sched_set_policy(pair.engine, unknown.as_ptr()),
+        unsafe { ak_sched_set_policy(pair.engine, unknown.as_ptr()) },
         AK_ERR_INVALID
     );
     let last = last_error_text(pair.engine);
@@ -1737,7 +1812,7 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
     // Out of the frozen range: -2.
     let big = CString::new("{\"max_active_tasks\":65}").unwrap();
     assert_eq!(
-        ak_sched_set_policy(pair.engine, big.as_ptr()),
+        unsafe { ak_sched_set_policy(pair.engine, big.as_ptr()) },
         AK_ERR_INVALID
     );
 
@@ -1745,14 +1820,21 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
     // global bound is rejected.
     let coupled = CString::new("{\"max_queued_tasks\":8,\"max_queued_tasks_per_code\":9}").unwrap();
     assert_eq!(
-        ak_sched_set_policy(pair.engine, coupled.as_ptr()),
+        unsafe { ak_sched_set_policy(pair.engine, coupled.as_ptr()) },
         AK_ERR_INVALID
     );
 
     // A DEFAULTED per-code bound above a shrunk global bound clamps down.
     let clamp = CString::new("{\"max_queued_tasks\":8}").unwrap();
-    assert_eq!(ak_sched_set_policy(pair.engine, clamp.as_ptr()), AK_OK);
-    let json = snapshot_until(pair.engine, |json| field_u64(json, "max_queued_tasks") == 8, 10);
+    assert_eq!(
+        unsafe { ak_sched_set_policy(pair.engine, clamp.as_ptr()) },
+        AK_OK
+    );
+    let json = snapshot_until(
+        pair.engine,
+        |json| field_u64(json, "max_queued_tasks") == 8,
+        10,
+    );
     assert_eq!(field_u64(&json, "max_queued_tasks_per_code"), 8, "{json}");
 }
 
@@ -1764,10 +1846,15 @@ fn sched_policy_wave24_caps_apply_and_unknown_fields_reject() {
 #[test]
 fn sched_enqueue_request_id_is_idempotent() {
     let mut pair = paired_fixture();
-    let sched_spec =
-        CString::new(format!("{{\"runtime_id\":\"{}\",\"same_code\":\"serial\"}}", hex16(&pair.a)))
-            .unwrap();
-    assert_eq!(ak_sched_start(pair.engine, sched_spec.as_ptr()), AK_OK);
+    let sched_spec = CString::new(format!(
+        "{{\"runtime_id\":\"{}\",\"same_code\":\"serial\"}}",
+        hex16(&pair.a)
+    ))
+    .unwrap();
+    assert_eq!(
+        unsafe { ak_sched_start(pair.engine, sched_spec.as_ptr()) },
+        AK_OK
+    );
     create_invite_on(&mut pair);
     let (code, json) = run_op(
         pair.engine,
@@ -1803,13 +1890,13 @@ fn sched_enqueue_request_id_is_idempotent() {
     let mut first = [0u8; 16];
     let spec = CString::new(spec_a).unwrap();
     assert_eq!(
-        ak_sched_enqueue(pair.engine, spec.as_ptr(), first.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(pair.engine, spec.as_ptr(), first.as_mut_ptr()) },
         AK_OK
     );
     let mut replay = [0u8; 16];
     let spec = CString::new(spec_a_reordered).unwrap();
     assert_eq!(
-        ak_sched_enqueue(pair.engine, spec.as_ptr(), replay.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(pair.engine, spec.as_ptr(), replay.as_mut_ptr()) },
         AK_OK
     );
     assert_eq!(
@@ -1826,7 +1913,7 @@ fn sched_enqueue_request_id_is_idempotent() {
     .unwrap();
     let mut conflict = [0u8; 16];
     assert_eq!(
-        ak_sched_enqueue(pair.engine, spec_conflict.as_ptr(), conflict.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(pair.engine, spec_conflict.as_ptr(), conflict.as_mut_ptr()) },
         AK_ERR_INVALID
     );
     let last = last_error_text(pair.engine);
@@ -1841,7 +1928,7 @@ fn sched_enqueue_request_id_is_idempotent() {
     .unwrap();
     let mut fresh = [0u8; 16];
     assert_eq!(
-        ak_sched_enqueue(pair.engine, spec_fresh.as_ptr(), fresh.as_mut_ptr()),
+        unsafe { ak_sched_enqueue(pair.engine, spec_fresh.as_ptr(), fresh.as_mut_ptr()) },
         AK_OK
     );
     assert_ne!(first, fresh, "an unkeyed enqueue is a new task");
@@ -1866,7 +1953,7 @@ fn synchronous_failure_paths_leave_last_error_messages() {
     // -1: null output pointer (argument validation).
     let spec = CString::new("{}").unwrap();
     assert_eq!(
-        ak_sched_enqueue(engine, spec.as_ptr(), std::ptr::null_mut()),
+        unsafe { ak_sched_enqueue(engine, spec.as_ptr(), std::ptr::null_mut()) },
         AK_ERR_NULL
     );
     assert!(!last_error_text(engine).is_empty(), "-1 needs a message");
@@ -1875,24 +1962,30 @@ fn synchronous_failure_paths_leave_last_error_messages() {
     let bad = CString::new("{not json").unwrap();
     let mut job = [0u8; 16];
     assert_eq!(
-        ak_send_start(engine, bad.as_ptr(), job.as_mut_ptr()),
+        unsafe { ak_send_start(engine, bad.as_ptr(), job.as_mut_ptr()) },
         AK_ERR_INVALID
     );
     assert!(!last_error_text(engine).is_empty(), "-2 needs a message");
 
     // -3: caller buffer too small names the needed size.
     let mut tiny = [0 as c_char; 2];
-    assert_eq!(ak_version(tiny.as_mut_ptr(), tiny.len()), AK_ERR_BUFFER);
+    assert_eq!(
+        unsafe { ak_version(tiny.as_mut_ptr(), tiny.len()) },
+        AK_ERR_BUFFER
+    );
     let last = last_error_text(engine);
-    assert!(last.contains("need"), "the -3 message names the size: {last}");
+    assert!(
+        last.contains("need"),
+        "the -3 message names the size: {last}"
+    );
 
     // -4: no scheduler runtime on this engine.
     let mut buf = [0 as c_char; 256];
     assert_eq!(
-        ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()),
+        unsafe { ak_sched_snapshot(engine, buf.as_mut_ptr(), buf.len()) },
         AK_ERR_NOT_FOUND
     );
     assert!(!last_error_text(engine).is_empty(), "-4 needs a message");
 
-    ak_engine_free(engine);
+    unsafe { ak_engine_free(engine) };
 }

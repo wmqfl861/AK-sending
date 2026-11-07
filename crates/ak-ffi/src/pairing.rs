@@ -105,7 +105,8 @@ pub(crate) struct V2State {
     /// runtime id (`ak_task_*`; see [`crate::task`]). Task runtime ids
     /// share the 16-byte space with pairing runtime ids but a different
     /// table — the `ak_pairing_op_result`/`ak_pairing_poll_event` exports
-    /// fall through to this table when the pairing lookup misses.
+    /// route to this table when the id names a task runtime (one
+    /// [`runtime_plane`] pass decides; only a miss on both tables is -4).
     pub tasks: HashMap<[u8; 16], Arc<crate::task::TaskRt>>,
     /// The engine-shared task-code table (`ak_task_create_code` /
     /// `ak_task_join`), keyed by the normalized display code. An `Arc` so
@@ -205,7 +206,11 @@ impl PairingRt {
             // concurrently can never install a live client (or emit
             // runtime_ready) at or after this point.
             self.phase.send_replace(RtPhase::Stopped);
-            (slot.connect.take(), slot.owner_loop.take(), slot.live.take())
+            (
+                slot.connect.take(),
+                slot.owner_loop.take(),
+                slot.live.take(),
+            )
         };
         if let Some(connect) = connect {
             connect.abort();
@@ -346,6 +351,42 @@ fn runtime_of(engine: &AkEngine, runtime_id: &[u8; 16]) -> Result<Arc<PairingRt>
     v2.runtimes.get(runtime_id).cloned().ok_or_else(|| {
         FfiError::not_found(format!("unknown runtime {}", core::hex_encode(runtime_id)))
     })
+}
+
+/// Which v2 table a runtime id routes to — the dispatch decision shared by
+/// `ak_pairing_op_result` / `ak_pairing_poll_event` / `ak_pairing_cancel_op`
+/// (and the event push-back half). C11: one table pass decides the plane,
+/// so only a miss on BOTH tables can surface as `-4` and an internal error
+/// (lock poisoning) always reaches the caller instead of being masked by a
+/// speculative lookup on the other plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimePlane {
+    /// The pairing table of `ak_pairing_start`.
+    Pairing,
+    /// The wave-28 task table of `ak_task_start`.
+    Task,
+}
+
+/// Resolve which plane owns `runtime_id` under ONE `v2` lock: the pairing
+/// table first, then the task table (ids cannot collide — each `*_start`
+/// mints into its own table only). `Ok(None)` means the id is unknown to
+/// both tables (the plain not-found); lock poisoning propagates as an
+/// internal error and is never masked.
+pub(crate) fn runtime_plane(
+    engine: &AkEngine,
+    runtime_id: &[u8; 16],
+) -> Result<Option<RuntimePlane>, FfiError> {
+    let v2 = engine
+        .v2
+        .lock()
+        .map_err(|_| FfiError::internal("v2 state lock poisoned"))?;
+    if v2.runtimes.contains_key(runtime_id) {
+        Ok(Some(RuntimePlane::Pairing))
+    } else if v2.tasks.contains_key(runtime_id) {
+        Ok(Some(RuntimePlane::Task))
+    } else {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,8 +1491,7 @@ const POLICY_ENVELOPE_FIELDS: &[&str] = &["spec_version", "request_id", "runtime
 /// values than the caller wrote.
 fn parse_policy(args: &crate::core::json::Json) -> Result<SchedulerPolicy, FfiError> {
     for (key, _) in args.members() {
-        if !POLICY_FIELDS.contains(&key.as_str())
-            && !POLICY_ENVELOPE_FIELDS.contains(&key.as_str())
+        if !POLICY_FIELDS.contains(&key.as_str()) && !POLICY_ENVELOPE_FIELDS.contains(&key.as_str())
         {
             return Err(FfiError::invalid(format!(
                 "unknown policy field \"{key}\" (supported: same_code, cross_code, \
@@ -1486,15 +1526,14 @@ fn parse_policy(args: &crate::core::json::Json) -> Result<SchedulerPolicy, FfiEr
         .unwrap_or(u64::from(defaults.max_active_code_connections));
     let queued =
         field_u64(args, "max_queued_tasks")?.unwrap_or(u64::from(defaults.max_queued_tasks));
-    let active =
-        field_u64(args, "max_active_tasks")?.unwrap_or(defaults.max_active_tasks as u64);
+    let active = field_u64(args, "max_active_tasks")?.unwrap_or(defaults.max_active_tasks as u64);
     let mut queued_per_code = field_u64(args, "max_queued_tasks_per_code")?
         .unwrap_or(defaults.max_queued_tasks_per_code as u64);
     let pending = field_u64(args, "max_pending_admissions")?
         .unwrap_or(defaults.max_pending_admissions as u64);
-    let explicit_per_code = args.get("max_queued_tasks_per_code").is_some_and(|value| {
-        !matches!(value, crate::core::json::Json::Null)
-    });
+    let explicit_per_code = args
+        .get("max_queued_tasks_per_code")
+        .is_some_and(|value| !matches!(value, crate::core::json::Json::Null));
     if per_code == 0
         || per_code > 16
         || groups == 0
@@ -2245,13 +2284,18 @@ mod cancel_tests {
 
     /// Cancel mid-transfer freezes the delivered bytes: after `ak_sched_
     /// cancel` the destination tree stops growing (real receiver, real
-    /// `ak_engine` loopback transfer of a 64 MiB file).
+    /// `ak_engine` loopback transfer of a 16 MiB file).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sched_cancel_stops_file_transfer_growth() {
         let src = tempfile::tempdir().expect("src tempdir");
         let dst = tempfile::tempdir().expect("dst tempdir");
-        let payload = vec![0x3Cu8; 64 << 20];
-        std::fs::write(src.path().join("big.bin"), &payload).expect("write 64 MiB source");
+        // 16 MiB (was 64): the mid-transfer cancel semantics only need
+        // >1 MiB staged before cancel; the smaller payload keeps this
+        // test inside the staging window even when the whole suite runs
+        // in parallel on a loaded machine (the old 64 MiB run was the
+        // suite's known load-sensitive flake).
+        let payload = vec![0x3Cu8; 16 << 20];
+        std::fs::write(src.path().join("big.bin"), &payload).expect("write 16 MiB source");
 
         let sender_key = DeviceKeyPair::generate();
         let receiver_key = DeviceKeyPair::generate();

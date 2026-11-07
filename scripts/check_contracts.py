@@ -269,7 +269,7 @@ def check_ffi_exports() -> dict:
     exported: dict[str, set[str]] = {}
     src = ROOT / "crates/ak-ffi/src"
     for path in sorted(src.glob("*.rs")):
-        found = re.findall(r'#\[no_mangle\]\s*pub extern "C" fn (\w+)\s*\(', path.read_text(encoding="utf-8"))
+        found = re.findall(r'#\[no_mangle\]\s*pub (?:unsafe )?extern "C" fn (\w+)\s*\(', path.read_text(encoding="utf-8"))
         if found:
             exported[path.name] = set(found)
     code: set[str] = set().union(*exported.values()) if exported else set()

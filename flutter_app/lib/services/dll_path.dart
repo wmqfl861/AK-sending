@@ -155,6 +155,23 @@ List<String> akDllProbeCandidates({
   ];
 }
 
+/// The stable load path for [resolution] — the ONE path handed to
+/// `DynamicLibrary.open` (C08: resolve once, open exactly that).
+///
+/// Non-bundled filesystem tiers are made absolute against the current
+/// working directory WITHOUT touching the filesystem
+/// (`File(path).absolute`), so a CWD change between resolve and open can
+/// no longer redirect the load to a different file. The Android bundled
+/// tier keeps its bare SONAME verbatim (`DynamicLibrary.open` resolves it
+/// against the apk's native library dir — an absolute path would break
+/// those System.loadLibrary semantics).
+String absoluteAkDllLoadPath(DllResolution resolution) {
+  if (resolution.source == DllSource.bundled) {
+    return resolution.path;
+  }
+  return File(resolution.path).absolute.path;
+}
+
 /// Directory part of [path] ('' when no separator). Both separators count so
 /// Windows exe paths work whichever flavor the platform reports.
 String _dirname(String path) {

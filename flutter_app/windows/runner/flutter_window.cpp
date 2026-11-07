@@ -63,7 +63,16 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 
   switch (message) {
     case WM_FONTCHANGE:
-      flutter_controller_->engine()->ReloadSystemFonts();
+      // C01 (reports/codex-crash-analysis-2026-11-07.md): the controller can be
+      // null here. Messages routed through Win32Window::WndProc reach this
+      // handler as soon as WM_NCCREATE stores the instance pointer, i.e.
+      // before OnCreate() assigns flutter_controller_, and they can also
+      // arrive after OnDestroy() has reset it. Only the forwarding block above
+      // was guarded, so this branch previously dereferenced a null
+      // flutter_controller_ unconditionally.
+      if (flutter_controller_ && flutter_controller_->engine()) {
+        flutter_controller_->engine()->ReloadSystemFonts();
+      }
       break;
   }
 

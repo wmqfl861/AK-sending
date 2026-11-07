@@ -26,9 +26,16 @@
 //! discipline, while [`core`] is
 //! compiled with `#![forbid(unsafe_code)]` and owns every line of logic:
 //! the engine handle and job table, JSON parsing/serialization, spec
-//! construction, and progress/report rendering. Panics never cross the
-//! boundary: each entry point wraps its body in a catch-all that turns a
-//! panic into an `AK_ERR_INTERNAL` status plus message.
+//! construction, and progress/report rendering. Every pointer-taking
+//! export is `pub unsafe extern "C" fn` (C02): the symbol set, arities,
+//! and calling convention are unchanged, but Rust callers must now spell
+//! the pointer-validity preconditions in an `unsafe` block. Panic
+//! containment, honest scope (C10): each export wraps its safe body in a
+//! catch-all that turns an ordinary unwinding panic into an
+//! `AK_ERR_INTERNAL` status plus message — the pointer adapters, the
+//! last-error bookkeeping, and `ak_engine_free`'s destructor run outside
+//! that guard, and no catch can intercept a fail-fast fault (access
+//! violation, abort); it is error reporting, not a memory-safety promise.
 //!
 //! # Status codes
 //!
@@ -470,8 +477,10 @@
 //!
 //! Op results and events add NO symbols: the task plane reads through
 //! the existing `ak_pairing_op_result` / `ak_pairing_poll_event` /
-//! `ak_pairing_cancel_op` exports with a task runtime id (the pairing
-//! lookup falls through to the task table on a miss). Event types:
+//! `ak_pairing_cancel_op` exports with a task runtime id (one
+//! `runtime_plane` table pass routes the id to the plane that owns it;
+//! only a miss on both tables is `-4`, and internal errors propagate
+//! unmasked). Event types:
 //! `runtime_ready`, `op_done`/`op_failed`, `connected`,
 //! `probe_result` (`reachable:null` until ak-session `probe_peer`),
 //! `incoming_request` (held for `ak_task_consent` or the 30 s

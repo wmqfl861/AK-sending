@@ -600,11 +600,15 @@ unsafe fn write_cstr(buf: *mut c_char, cap: usize, text: &str) -> Result<usize, 
 ///
 /// # Safety
 ///
-/// SAFETY: `ptr` must be non-null and point to a NUL-terminated sequence of
-/// bytes that stays valid and unmodified for the duration of `'a` (in
-/// practice: the FFI call); `CStr::from_ptr` stops at the first NUL, so the
-/// borrow never reads past the terminator. UTF-8 validity is checked before
-/// the string is handed on.
+/// SAFETY: `ptr` must be non-null and point to a sequence of bytes that
+/// contains a NUL within the caller's allocation and stays valid and
+/// unmodified for the duration of `'a` (in practice: the FFI call).
+/// `CStr::from_ptr` scans forward for the FIRST NUL — it has no length,
+/// so it CANNOT detect a missing terminator: a pointer into memory with
+/// no NUL anywhere ahead reads past the allocation (undefined behavior,
+/// not an error return). NUL termination is therefore a strict caller
+/// precondition, not a validated property. UTF-8 validity of the bytes up
+/// to the terminator IS checked before the string is handed on.
 unsafe fn read_cstr<'a>(ptr: *const c_char) -> Result<&'a str, FfiError> {
     if ptr.is_null() {
         return Err(FfiError {
@@ -706,7 +710,7 @@ unsafe fn engine_or_fail<'a>(engine: *const AkEngine) -> Option<&'a AkEngine> {
 /// anything); the engine handle contract is that of `ak_send_start`
 /// (live, not freed concurrently, calls serialized by the caller).
 #[no_mangle]
-pub extern "C" fn ak_pairing_stop_start(
+pub unsafe extern "C" fn ak_pairing_stop_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     op_id_out: *mut u8,
@@ -762,7 +766,7 @@ pub extern "C" fn ak_pairing_stop_start(
 /// to its NUL; `op_id_out` non-null and writable for 16 bytes (all checked
 /// before any side effect). Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_sched_listen_start(
+pub unsafe extern "C" fn ak_sched_listen_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     spec_json: *const c_char,
@@ -815,7 +819,7 @@ pub extern "C" fn ak_sched_listen_start(
 /// readable for 16 bytes each (checked before any side effect). Engine
 /// handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_sched_retry(
+pub unsafe extern "C" fn ak_sched_retry(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     task_id: *const u8,
@@ -862,7 +866,7 @@ pub extern "C" fn ak_sched_retry(
 /// modified concurrently; `cap` must not overstate the real allocation.
 /// Engine handle as `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_sched_task_result(
+pub unsafe extern "C" fn ak_sched_task_result(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     task_id: *const u8,
@@ -925,7 +929,7 @@ pub extern "C" fn ak_sched_task_result(
 /// effect — a rejected shutdown never begins). Engine handle as
 /// `ak_send_start`.
 #[no_mangle]
-pub extern "C" fn ak_sched_shutdown_start(
+pub unsafe extern "C" fn ak_sched_shutdown_start(
     engine: *mut AkEngine,
     runtime_id: *const u8,
     spec_json: *const c_char,
@@ -1008,29 +1012,35 @@ mod tests {
         let null_out: *mut u8 = std::ptr::null_mut();
         // Null engine → -1 on every export; nothing is dereferenced.
         assert_eq!(
-            ak_pairing_stop_start(std::ptr::null_mut(), null_id, null_out),
+            unsafe { ak_pairing_stop_start(std::ptr::null_mut(), null_id, null_out) },
             AK_ERR_NULL
         );
         assert_eq!(
-            ak_sched_listen_start(std::ptr::null_mut(), null_id, std::ptr::null(), null_out,),
+            unsafe {
+                ak_sched_listen_start(std::ptr::null_mut(), null_id, std::ptr::null(), null_out)
+            },
             AK_ERR_NULL
         );
         assert_eq!(
-            ak_sched_retry(std::ptr::null_mut(), null_id, null_id),
+            unsafe { ak_sched_retry(std::ptr::null_mut(), null_id, null_id) },
             AK_ERR_NULL
         );
         assert_eq!(
-            ak_sched_task_result(
-                std::ptr::null_mut(),
-                null_id,
-                null_id,
-                std::ptr::null_mut(),
-                0,
-            ),
+            unsafe {
+                ak_sched_task_result(
+                    std::ptr::null_mut(),
+                    null_id,
+                    null_id,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
             AK_ERR_NULL
         );
         assert_eq!(
-            ak_sched_shutdown_start(std::ptr::null_mut(), null_id, std::ptr::null(), null_out),
+            unsafe {
+                ak_sched_shutdown_start(std::ptr::null_mut(), null_id, std::ptr::null(), null_out)
+            },
             AK_ERR_NULL
         );
 
@@ -1038,24 +1048,27 @@ mod tests {
         let engine = ak_engine_new();
         assert!(!engine.is_null());
         assert_eq!(
-            ak_pairing_stop_start(engine, null_id, null_out),
+            unsafe { ak_pairing_stop_start(engine, null_id, null_out) },
             AK_ERR_NULL
         );
-        assert_eq!(ak_sched_retry(engine, null_id, null_id), AK_ERR_NULL);
         assert_eq!(
-            ak_sched_task_result(engine, null_id, null_id, std::ptr::null_mut(), 8),
+            unsafe { ak_sched_retry(engine, null_id, null_id) },
+            AK_ERR_NULL
+        );
+        assert_eq!(
+            unsafe { ak_sched_task_result(engine, null_id, null_id, std::ptr::null_mut(), 8) },
             AK_ERR_NULL
         );
         let spec = std::ffi::CString::new("{\"mode\":\"cancel\"}").expect("spec");
         assert_eq!(
-            ak_sched_listen_start(engine, null_id, spec.as_ptr(), null_out),
+            unsafe { ak_sched_listen_start(engine, null_id, spec.as_ptr(), null_out) },
             AK_ERR_NULL
         );
         assert_eq!(
-            ak_sched_shutdown_start(engine, null_id, spec.as_ptr(), null_out),
+            unsafe { ak_sched_shutdown_start(engine, null_id, spec.as_ptr(), null_out) },
             AK_ERR_NULL
         );
-        ak_engine_free(engine);
+        unsafe { ak_engine_free(engine) };
     }
 
     #[test]
@@ -1068,26 +1081,35 @@ mod tests {
         let mut buf = [0 as c_char; 256];
         let spec = std::ffi::CString::new("{\"mode\":\"cancel\"}").expect("spec");
         assert_eq!(
-            ak_pairing_stop_start(engine, runtime.as_ptr(), op_out.as_mut_ptr()),
+            unsafe { ak_pairing_stop_start(engine, runtime.as_ptr(), op_out.as_mut_ptr()) },
             AK_ERR_NOT_FOUND
         );
         // No scheduler runtime at all → -4 before the ids are even used.
         assert_eq!(
-            ak_sched_retry(engine, runtime.as_ptr(), task.as_ptr()),
+            unsafe { ak_sched_retry(engine, runtime.as_ptr(), task.as_ptr()) },
             AK_ERR_NOT_FOUND
         );
         assert_eq!(
-            ak_sched_task_result(
-                engine,
-                runtime.as_ptr(),
-                task.as_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-            ),
+            unsafe {
+                ak_sched_task_result(
+                    engine,
+                    runtime.as_ptr(),
+                    task.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            },
             AK_ERR_NOT_FOUND
         );
         assert_eq!(
-            ak_sched_shutdown_start(engine, runtime.as_ptr(), spec.as_ptr(), op_out.as_mut_ptr()),
+            unsafe {
+                ak_sched_shutdown_start(
+                    engine,
+                    runtime.as_ptr(),
+                    spec.as_ptr(),
+                    op_out.as_mut_ptr(),
+                )
+            },
             AK_ERR_NOT_FOUND
         );
         // listen_start: unknown runtime with a valid spec → -4 (the spec's
@@ -1096,12 +1118,14 @@ mod tests {
         // a -2 mismatch even when neither runtime exists.
         let listen_spec = std::ffi::CString::new("{\"spec_version\":1}").expect("spec");
         assert_eq!(
-            ak_sched_listen_start(
-                engine,
-                runtime.as_ptr(),
-                listen_spec.as_ptr(),
-                op_out.as_mut_ptr(),
-            ),
+            unsafe {
+                ak_sched_listen_start(
+                    engine,
+                    runtime.as_ptr(),
+                    listen_spec.as_ptr(),
+                    op_out.as_mut_ptr(),
+                )
+            },
             AK_ERR_NOT_FOUND
         );
         let conflicting = std::ffi::CString::new(
@@ -1109,14 +1133,16 @@ mod tests {
         )
         .expect("spec");
         assert_eq!(
-            ak_sched_listen_start(
-                engine,
-                runtime.as_ptr(),
-                conflicting.as_ptr(),
-                op_out.as_mut_ptr(),
-            ),
+            unsafe {
+                ak_sched_listen_start(
+                    engine,
+                    runtime.as_ptr(),
+                    conflicting.as_ptr(),
+                    op_out.as_mut_ptr(),
+                )
+            },
             AK_ERR_INVALID
         );
-        ak_engine_free(engine);
+        unsafe { ak_engine_free(engine) };
     }
 }

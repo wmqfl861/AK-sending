@@ -246,7 +246,7 @@ test('version string is exact; -3/-1 paths and last-error semantics hold',
       try {
         final length = bindings.version(buf, 64);
         expect(length, _versionString.length);
-        expect(fromNativeUtf8(buf), _versionString);
+        expect(fromNativeUtf8(buf, 64, length: length), _versionString);
         expect(buf[length], 0, reason: 'NUL terminator right after payload');
       } finally {
         processAllocator.free(buf);

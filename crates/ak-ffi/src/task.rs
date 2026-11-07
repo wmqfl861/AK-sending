@@ -188,8 +188,8 @@ use std::time::Duration;
 
 use ak_core::error::ErrorCode;
 use ak_engine::{
-    receive_accepted_consent, send, ConsentAnswer, ConsentInfo, EngineError, Progress,
-    ReceiveSpec, Report, SendSpec, TransferConsent,
+    receive_accepted_consent, send, ConsentAnswer, ConsentInfo, EngineError, Progress, ReceiveSpec,
+    Report, SendSpec, TransferConsent,
 };
 use ak_identity::pairing_txn::{random_id16, VerifiedPairing};
 use ak_identity::tls::make_self_signed;
@@ -197,7 +197,7 @@ use ak_identity::{DeviceKeyPair, Fingerprint};
 use ak_session::pairing::{
     ClientConfig, OrchestratorConfig, PairFlowError, PairingOrchestrator, PeerEndpoint,
     ProbeOptions, ProbeOutcome, RegistryClient, TaskDirection, TaskDisconnectReason, TaskError,
-    TaskEvent, TaskPairing, TaskPairingConfig, TaskPaired, TASK_CODE_TTL_SECS,
+    TaskEvent, TaskPaired, TaskPairing, TaskPairingConfig, TASK_CODE_TTL_SECS,
 };
 use ak_wire::{Frame, Message};
 use tokio::sync::{oneshot, Notify};
@@ -592,11 +592,7 @@ impl TaskRt {
         // not leave active registry rows no local secret can answer for),
         // then close the control client bounded — an open client would
         // otherwise hold the TCP connection past the engine drop.
-        let stack = self
-            .stack
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
+        let stack = self.stack.lock().ok().and_then(|mut slot| slot.take());
         if let Some(stack) = stack {
             stack.abort_tasks();
             let owned: Vec<[u8; 16]> = self
@@ -728,11 +724,7 @@ impl TaskRt {
     /// offer's actual TLS sender and which has not reached a terminal
     /// state. `None` means the sender is not this task's paired peer —
     /// the offer is refused without ever surfacing to the user.
-    fn conn_for_sender(
-        &self,
-        code_id: &[u8; 16],
-        sender: &Fingerprint,
-    ) -> Option<TaskConn> {
+    fn conn_for_sender(&self, code_id: &[u8; 16], sender: &Fingerprint) -> Option<TaskConn> {
         let conns = self.conns.lock().ok()?;
         conns
             .values()
@@ -890,7 +882,12 @@ fn register_consent(
     let timer_rt = Arc::clone(rt);
     tokio::spawn(async move {
         tokio::time::sleep(window).await;
-        if let Some(entry) = timer_rt.pending.lock().ok().and_then(|mut m| m.remove(&job)) {
+        if let Some(entry) = timer_rt
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&job))
+        {
             // The terminal event is queued BEFORE the oneshot resolves:
             // whoever observes the resolution (a parked receive, a test)
             // can already read the request's terminal state.
@@ -1032,8 +1029,8 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
     let registry_hex = field_str(&args, "registry_id", true)?
         .ok_or_else(|| FfiError::invalid("missing \"registry_id\""))?;
     let registry_id = hex32(&registry_hex, "field \"registry_id\"")?;
-    let id_dir = field_str(&args, "id_dir", true)?
-        .ok_or_else(|| FfiError::invalid("missing \"id_dir\""))?;
+    let id_dir =
+        field_str(&args, "id_dir", true)?.ok_or_else(|| FfiError::invalid("missing \"id_dir\""))?;
     if id_dir.is_empty() {
         return Err(FfiError::invalid("field \"id_dir\" must be non-empty"));
     }
@@ -1043,7 +1040,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
             "field \"device_name\" must be at most 64 characters",
         ));
     }
-    let trimmed_dir = id_dir.trim_end_matches(['/','\\']);
+    let trimmed_dir = id_dir.trim_end_matches(['/', '\\']);
     let save_dir_text = field_str(&args, "save_dir", false)?
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| format!("{trimmed_dir}/downloads"));
@@ -1051,9 +1048,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
     // requires an existing directory, so a missing default would fail the
     // receiver-role code creation later (better to fail at start).
     std::fs::create_dir_all(&save_dir_text).map_err(|error| {
-        FfiError::invalid(format!(
-            "cannot create save dir {save_dir_text}: {error}"
-        ))
+        FfiError::invalid(format!("cannot create save dir {save_dir_text}: {error}"))
     })?;
 
     // Local, synchronous bootstrap (disk under id_dir, no network).
@@ -1307,7 +1302,10 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         // pairing stands server-side but this side refuses to register
         // the task — no `connected` event is the honest surface
         // (ak-session logged the refusal on its own stream).
-        if let Ok(paired) = owner_stack.pairing.complete_owner_pairing(&verified, direction) {
+        if let Ok(paired) = owner_stack
+            .pairing
+            .complete_owner_pairing(&verified, direction)
+        {
             // The connection entry and `connected` event are inserted
             // SYNCHRONOUSLY here, before any await: the resident
             // receiver's P1-04 admission is bound to this entry, and the
@@ -1639,10 +1637,7 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
                     };
                     if allowed {
                         let _ = socket
-                            .send_to(
-                                &ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE),
-                                source,
-                            )
+                            .send_to(&ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE), source)
                             .await;
                     }
                 }
@@ -1810,11 +1805,7 @@ fn canonical_spec_json(value: &crate::core::json::Json) -> String {
 /// collide only when they are the SAME operation for the SAME connection
 /// with the SAME spec; anything else under the same `request_id` is a
 /// conflict, never a false replay hit.
-fn canonical_request(
-    op: &str,
-    conn: Option<[u8; 16]>,
-    args: &crate::core::json::Json,
-) -> String {
+fn canonical_request(op: &str, conn: Option<[u8; 16]>, args: &crate::core::json::Json) -> String {
     match conn {
         Some(conn_id) => format!(
             "{op}|{}|{}",
@@ -2028,8 +2019,8 @@ pub fn task_create_code_start(
 ) -> Result<[u8; 16], FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
     let args = crate::core::json::parse(spec).map_err(FfiError::invalid)?;
-    let role_text = field_str(&args, "role", true)?
-        .ok_or_else(|| FfiError::invalid("missing \"role\""))?;
+    let role_text =
+        field_str(&args, "role", true)?.ok_or_else(|| FfiError::invalid("missing \"role\""))?;
     let role = TaskRole::parse(&role_text)?;
     let candidates = parse_candidates(&args)?;
     let ttl_secs = field_u64(&args, "ttl_secs")?.unwrap_or(0);
@@ -2075,8 +2066,8 @@ pub fn task_join_start(
 ) -> Result<[u8; 16], FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
     let args = crate::core::json::parse(spec).map_err(FfiError::invalid)?;
-    let code = field_str(&args, "code", true)?
-        .ok_or_else(|| FfiError::invalid("missing \"code\""))?;
+    let code =
+        field_str(&args, "code", true)?.ok_or_else(|| FfiError::invalid("missing \"code\""))?;
     if code.trim().is_empty() {
         return Err(FfiError::invalid("field \"code\" must be non-empty"));
     }
@@ -2142,7 +2133,9 @@ pub fn task_send_start(
         return Err(FfiError::invalid("field \"paths\" must not be empty"));
     }
     if paths.iter().any(|path| path.is_empty()) {
-        return Err(FfiError::invalid("entries of \"paths\" must be non-empty paths"));
+        return Err(FfiError::invalid(
+            "entries of \"paths\" must be non-empty paths",
+        ));
     }
     // Replay answers first; a FRESH send additionally requires a live
     // connection (inside the gate's atomic acceptance).
@@ -2328,10 +2321,7 @@ fn cancel_unjoined_code(
         let Ok(table) = rt.codes.lock() else {
             return Err(FfiError::internal("task code cache lock poisoned"));
         };
-        let Some(entry) = table
-            .values()
-            .find(|entry| &entry.code_id == code_id)
-        else {
+        let Some(entry) = table.values().find(|entry| &entry.code_id == code_id) else {
             return Err(FfiError::not_found(format!(
                 "unknown connection {} on task runtime {}",
                 core::hex_encode(code_id),
@@ -2447,8 +2437,9 @@ pub fn task_set_save_dir(
         return Err(FfiError::invalid("path must be non-empty"));
     }
     let dir = PathBuf::from(path);
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| FfiError::invalid(format!("cannot create save dir {}: {error}", dir.display())))?;
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        FfiError::invalid(format!("cannot create save dir {}: {error}", dir.display()))
+    })?;
     let mut save_dir = rt
         .save_dir
         .lock()
@@ -2706,15 +2697,11 @@ async fn run_resident_receiver(
             .unwrap_or_else(|poisoned| *poisoned.into_inner())
     };
     let identity = make_self_signed(&rt.key);
-    let endpoint = match ak_net::DirectEndpoint::bind(
-        SocketAddr::from(([0, 0, 0, 0], 0)),
-        &identity,
-    )
-    .await
-    {
-        Ok(endpoint) => endpoint,
-        Err(_) => return, // the dropped oneshot fails the create/join op
-    };
+    let endpoint =
+        match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await {
+            Ok(endpoint) => endpoint,
+            Err(_) => return, // the dropped oneshot fails the create/join op
+        };
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
@@ -2852,7 +2839,10 @@ async fn run_resident_receiver(
                 let mut line = String::with_capacity(160);
                 line.push_str("{\"event\":\"done\"");
                 if let Some(conn) = &conn {
-                    line.push_str(&format!(",\"conn\":\"{}\"", core::hex_encode(&conn.conn_id)));
+                    line.push_str(&format!(
+                        ",\"conn\":\"{}\"",
+                        core::hex_encode(&conn.conn_id)
+                    ));
                 }
                 // saveDir (wave-31 P2-06): the ACTUAL landing directory —
                 // the same binding the consent event showed, so the UI
@@ -3142,7 +3132,9 @@ async fn run_send(
                     if peer_gone {
                         report_peer_gone(rt, &conn);
                     }
-                    return Err(format!("transfer failed after connecting via {addr}: {reason}"));
+                    return Err(format!(
+                        "transfer failed after connecting via {addr}: {reason}"
+                    ));
                 }
                 AttemptOutcome::ConnectFailed(reason) => {
                     failures.push((*addr, reason));
@@ -3332,18 +3324,18 @@ where
 // The op-result / event-channel extension of the pairing exports.
 // ---------------------------------------------------------------------------
 
-/// `ak_pairing_op_result` fallback: read a TASK op's outcome. Returns
-/// `Ok(None)` when the runtime id is not a task runtime (the caller keeps
-/// the pairing plane's own error).
-pub(crate) fn task_op_result_maybe(
+/// `ak_pairing_op_result` task-plane half: read a TASK op's outcome. The
+/// shim has already routed on the plane (C11: one
+/// `pairing::runtime_plane` pass decides), so a not-found here is the
+/// honest `-4` (unknown op, or the runtime left the table between the two
+/// locks) and internal errors propagate as-is — never masked by a
+/// speculative pairing-plane lookup.
+pub(crate) fn task_op_result(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
     op_id: &[u8; 16],
-) -> Result<Option<OpResult>, FfiError> {
-    let rt = match task_runtime_of(engine, runtime_id) {
-        Ok(rt) => rt,
-        Err(_) => return Ok(None),
-    };
+) -> Result<OpResult, FfiError> {
+    let rt = task_runtime_of(engine, runtime_id)?;
     let ops = rt
         .ops
         .lock()
@@ -3359,27 +3351,25 @@ pub(crate) fn task_op_result_maybe(
         .outcome
         .lock()
         .map_err(|_| FfiError::internal("task op outcome lock poisoned"))?;
-    Ok(Some(match &*outcome {
+    Ok(match &*outcome {
         OpOutcome::Running { .. } => OpResult::Running,
         OpOutcome::Finished { ok, json } => OpResult::Finished {
             ok: *ok,
             json: json.clone(),
         },
-    }))
+    })
 }
 
-/// `ak_pairing_poll_event` fallback: pop a TASK runtime's event. Returns
-/// the popped line plus the queue it came from (the shim pushes back to
-/// THE queue on `-3`), or `Ok(None)` when the runtime id is not a task
-/// runtime.
-pub(crate) fn task_poll_event_maybe(
+/// `ak_pairing_poll_event` task-plane half: pop a TASK runtime's event.
+/// Returns the popped line plus the queue it came from (the shim pushes
+/// back to THE queue on `-3`); `Ok(None)` is a known runtime with an empty
+/// queue — the caller has routed already (C11), so errors propagate
+/// strictly.
+pub(crate) fn task_poll_event(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
 ) -> Result<Option<PolledTaskLine>, FfiError> {
-    let rt = match task_runtime_of(engine, runtime_id) {
-        Ok(rt) => rt,
-        Err(_) => return Ok(None),
-    };
+    let rt = task_runtime_of(engine, runtime_id)?;
     let queue = Arc::clone(&rt.events);
     let line = queue
         .lock()
@@ -3389,37 +3379,31 @@ pub(crate) fn task_poll_event_maybe(
 }
 
 /// `ak_pairing_poll_event` pushback half: push one event line back to a
-/// TASK runtime's queue (after an `AK_ERR_BUFFER`). Returns `Ok(false)`
-/// when the runtime id is not a task runtime.
-pub(crate) fn task_push_event_front_maybe(
+/// TASK runtime's queue (after an `AK_ERR_BUFFER`). Strict like the pop
+/// (C11): the caller routed on the plane, errors propagate as-is.
+pub(crate) fn task_push_event_front(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
     line: String,
-) -> Result<bool, FfiError> {
-    let rt = match task_runtime_of(engine, runtime_id) {
-        Ok(rt) => rt,
-        Err(_) => return Ok(false),
-    };
+) -> Result<(), FfiError> {
+    let rt = task_runtime_of(engine, runtime_id)?;
     let mut queue = rt
         .events
         .lock()
         .map_err(|_| FfiError::internal("task event queue lock poisoned"))?;
     queue.push_front(line);
-    Ok(true)
+    Ok(())
 }
 
-/// `ak_pairing_cancel_op` fallback: cancel a TASK op (abort + terminal
-/// "cancelled by caller"). Returns `Ok(false)` when the runtime id is not
-/// a task runtime.
-pub(crate) fn task_cancel_op_maybe(
+/// `ak_pairing_cancel_op` task-plane half: cancel a TASK op (abort +
+/// terminal "cancelled by caller"). Strict like the op read (C11): the
+/// caller routed on the plane, errors propagate as-is.
+pub(crate) fn task_cancel_op(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
     op_id: &[u8; 16],
-) -> Result<bool, FfiError> {
-    let rt = match task_runtime_of(engine, runtime_id) {
-        Ok(rt) => rt,
-        Err(_) => return Ok(false),
-    };
+) -> Result<(), FfiError> {
+    let rt = task_runtime_of(engine, runtime_id)?;
     let ops = rt
         .ops
         .lock()
@@ -3446,10 +3430,13 @@ pub(crate) fn task_cancel_op_maybe(
     if let OpOutcome::Running { op } = &*outcome {
         *outcome = OpOutcome::Finished {
             ok: false,
-            json: format!("{{\"op\":{},\"error\":\"cancelled by caller\"}}", quoted(op)),
+            json: format!(
+                "{{\"op\":{},\"error\":\"cancelled by caller\"}}",
+                quoted(op)
+            ),
         };
     }
-    Ok(true)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3462,13 +3449,15 @@ pub(crate) fn task_cancel_op_maybe(
 #[cfg(test)]
 mod task_tests {
     use super::*;
-    use crate::shim::{
+    // C02: the C exports are `unsafe extern "C" fn` now; this module is
+    // `#![forbid(unsafe_code)]` (whole file), so the audited one-line
+    // unsafe calls live in `task_ext::testabi` and are imported here under
+    // the SAME names — the call sites below are unchanged and still drive
+    // the real exported shapes, just through the test-only adapters.
+    use crate::task_ext::testabi::{
         ak_engine_free, ak_engine_last_error, ak_engine_new, ak_pairing_op_result,
-        ak_pairing_poll_event,
-    };
-    use crate::task_ext::{
-        ak_task_consent, ak_task_create_code, ak_task_disconnect, ak_task_join, ak_task_list,
-        ak_task_send, ak_task_set_save_dir, ak_task_start,
+        ak_pairing_poll_event, ak_task_consent, ak_task_create_code, ak_task_disconnect,
+        ak_task_join, ak_task_list, ak_task_send, ak_task_set_save_dir, ak_task_start,
     };
     use std::ffi::CString;
     use std::os::raw::c_char;
@@ -3665,7 +3654,11 @@ mod task_tests {
         }
     }
 
-    fn create_code(engine: *mut AkEngine, runtime_id: &[u8; 16], spec: &str) -> ([u8; 16], bool, String) {
+    fn create_code(
+        engine: *mut AkEngine,
+        runtime_id: &[u8; 16],
+        spec: &str,
+    ) -> ([u8; 16], bool, String) {
         let c_spec = CString::new(spec).expect("spec CString");
         let mut op_id = [0u8; 16];
         let code = ak_task_create_code(
@@ -3729,9 +3722,18 @@ mod task_tests {
         ))
         .expect("spec CString");
         let mut op_id = [0u8; 16];
-        let status =
-            ak_task_join(engine, runtime_id.as_ptr(), spec.as_ptr(), op_id.as_mut_ptr());
-        assert_eq!(status, 0, "ak_task_join not accepted: {}", last_error_of(engine));
+        let status = ak_task_join(
+            engine,
+            runtime_id.as_ptr(),
+            spec.as_ptr(),
+            op_id.as_mut_ptr(),
+        );
+        assert_eq!(
+            status,
+            0,
+            "ak_task_join not accepted: {}",
+            last_error_of(engine)
+        );
         wait_op(engine, runtime_id, &op_id)
     }
 
@@ -3745,7 +3747,10 @@ mod task_tests {
         let runtime_id = start_task(engine, dir.path());
         assert_ne!(runtime_id, [0u8; 16]);
         let event = wait_event(engine, &runtime_id, "runtime_ready");
-        assert!(event.contains("\"runtime\":"), "runtime id rides the event: {event}");
+        assert!(
+            event.contains("\"runtime\":"),
+            "runtime id rides the event: {event}"
+        );
         ak_engine_free(engine);
     }
 
@@ -3756,13 +3761,22 @@ mod task_tests {
         let good = CString::new(spec_for(dir.path())).expect("spec");
         let mut out = [0u8; 16];
         // Null output pointer: refused BEFORE parsing (no runtime minted).
-        assert_eq!(ak_task_start(engine, good.as_ptr(), std::ptr::null_mut()), -1);
+        assert_eq!(
+            ak_task_start(engine, good.as_ptr(), std::ptr::null_mut()),
+            -1
+        );
         // Null spec.
-        assert_eq!(ak_task_start(engine, std::ptr::null(), out.as_mut_ptr()), -1);
+        assert_eq!(
+            ak_task_start(engine, std::ptr::null(), out.as_mut_ptr()),
+            -1
+        );
         // Malformed JSON.
         let bad = CString::new("{nope").expect("bad");
         assert_eq!(ak_task_start(engine, bad.as_ptr(), out.as_mut_ptr()), -2);
-        assert!(!last_error_of(engine).is_empty(), "the parse detail lands in last_error");
+        assert!(
+            !last_error_of(engine).is_empty(),
+            "the parse detail lands in last_error"
+        );
         // Missing registry.
         let no_reg = CString::new(format!(
             "{{\"id_dir\":\"{}\"}}",
@@ -3777,12 +3791,16 @@ mod task_tests {
             dir.path().to_string_lossy().replace('\\', "/")
         ))
         .expect("spec");
-        assert_eq!(ak_task_start(engine, bad_pin.as_ptr(), out.as_mut_ptr()), -2);
+        assert_eq!(
+            ak_task_start(engine, bad_pin.as_ptr(), out.as_mut_ptr()),
+            -2
+        );
         assert!(last_error_of(engine).contains("registry_id"));
         // Empty id_dir.
-        let no_dir =
-            CString::new("{\"registry\":\"127.0.0.1:7200\",\"registry_id\":\"11\",\"id_dir\":\"\"}")
-                .expect("spec");
+        let no_dir = CString::new(
+            "{\"registry\":\"127.0.0.1:7200\",\"registry_id\":\"11\",\"id_dir\":\"\"}",
+        )
+        .expect("spec");
         assert_eq!(ak_task_start(engine, no_dir.as_ptr(), out.as_mut_ptr()), -2);
         // No runtime was registered by any failed call: poll says -4.
         assert_eq!(
@@ -3800,12 +3818,18 @@ mod task_tests {
         let engine = ak_engine_new();
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = start_task_on(engine, &registry, dir.path());
-        let (_, ok, json) =
-            create_code(engine, &runtime_id, "{\"spec_version\":1,\"role\":\"sender\"}");
+        let (_, ok, json) = create_code(
+            engine,
+            &runtime_id,
+            "{\"spec_version\":1,\"role\":\"sender\"}",
+        );
         assert!(ok, "create must succeed at the real registry: {json}");
         assert!(json.contains("\"op\":\"task_create_code\""), "{json}");
         // The registry mints the invite display form (AKI1-…).
-        assert!(json.contains("\"code\":\"AKI1-"), "registry display code: {json}");
+        assert!(
+            json.contains("\"code\":\"AKI1-"),
+            "registry display code: {json}"
+        );
         assert!(json.contains("\"role\":\"sender\""), "{json}");
         assert!(json.contains("\"code_id\":\""), "{json}");
         assert!(json.contains("\"endpoint\":"), "{json}");
@@ -3820,8 +3844,11 @@ mod task_tests {
         let engine = ak_engine_new();
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = start_task_on(engine, &registry, dir.path());
-        let (_, ok, json) =
-            create_code(engine, &runtime_id, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine,
+            &runtime_id,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "receiver-role create must bind a real socket: {json}");
         // The endpoint is a real ip:port (the derivation rewrote the
         // wildcard bind to interface addresses).
@@ -3939,8 +3966,7 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine, &registry, dir_a.path());
         let joiner = start_task_on(engine, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
+        let (_, ok, json) = create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
         assert!(ok, "{json}");
         let code = code_of(&json);
         // Separator tolerance: the UI's normalized (hyphen-less) form of
@@ -3948,7 +3974,10 @@ mod task_tests {
         let stripped = code.split('-').collect::<String>();
         let stripped_lower = stripped.to_lowercase();
         let (join_ok, join_json) = join_code(engine, &joiner, &stripped_lower);
-        assert!(join_ok, "join must succeed through the registry: {join_json}");
+        assert!(
+            join_ok,
+            "join must succeed through the registry: {join_json}"
+        );
         assert!(join_json.contains("\"op\":\"task_join\""), "{join_json}");
         assert!(
             join_json.contains("\"role\":\"receiver\""),
@@ -3968,13 +3997,25 @@ mod task_tests {
         // Both lists show the connection (the probe runs INSIDE the join
         // op, so both sides have settled by the time the op answered).
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         let owner_list = text_of(&buf);
-        assert!(owner_list.contains("\"state\":\"connected\""), "{owner_list}");
+        assert!(
+            owner_list.contains("\"state\":\"connected\""),
+            "{owner_list}"
+        );
         buf.iter_mut().for_each(|slot| *slot = 0);
-        assert_eq!(ak_task_list(engine, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         let joiner_list = text_of(&buf);
-        assert!(joiner_list.contains("\"state\":\"connected\""), "{joiner_list}");
+        assert!(
+            joiner_list.contains("\"state\":\"connected\""),
+            "{joiner_list}"
+        );
         assert!(joiner_list.contains("\"code\":\""), "{joiner_list}");
         ak_engine_free(engine);
     }
@@ -3999,7 +4040,12 @@ mod task_tests {
         let no_code = CString::new("{}").expect("spec");
         let mut op_id = [0u8; 16];
         assert_eq!(
-            ak_task_join(engine, runtime_id.as_ptr(), no_code.as_ptr(), op_id.as_mut_ptr()),
+            ak_task_join(
+                engine,
+                runtime_id.as_ptr(),
+                no_code.as_ptr(),
+                op_id.as_mut_ptr()
+            ),
             -2
         );
         ak_engine_free(engine);
@@ -4013,19 +4059,31 @@ mod task_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = start_task(engine, dir.path());
         let mut big = cbuf(CAP);
-        assert_eq!(ak_task_list(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()),
+            1
+        );
         let full = text_of(&big);
         // Tiny buffer: -3, nothing consumed, the message names the size.
         let mut tiny = cbuf(8);
-        assert_eq!(ak_task_list(engine, runtime_id.as_ptr(), tiny.as_mut_ptr(), tiny.len()), -3);
+        assert_eq!(
+            ak_task_list(engine, runtime_id.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+            -3
+        );
         let detail = last_error_of(engine);
         assert!(detail.contains("buffer too small"), "{detail}");
         // Retry with the full capacity: the SAME JSON.
         big.iter_mut().for_each(|slot| *slot = 0);
-        assert_eq!(ak_task_list(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, runtime_id.as_ptr(), big.as_mut_ptr(), big.len()),
+            1
+        );
         assert_eq!(text_of(&big), full);
         // Unknown runtime: -4.
-        assert_eq!(ak_task_list(engine, [9u8; 16].as_ptr(), big.as_mut_ptr(), big.len()), -4);
+        assert_eq!(
+            ak_task_list(engine, [9u8; 16].as_ptr(), big.as_mut_ptr(), big.len()),
+            -4
+        );
         ak_engine_free(engine);
     }
 
@@ -4038,16 +4096,28 @@ mod task_tests {
         let runtime_id = start_task(engine, dir.path());
         let inbox = dir.path().join("inbox");
         let path = CString::new(inbox.to_string_lossy().replace('\\', "/")).expect("path CString");
-        assert_eq!(ak_task_set_save_dir(engine, runtime_id.as_ptr(), path.as_ptr()), 0);
+        assert_eq!(
+            ak_task_set_save_dir(engine, runtime_id.as_ptr(), path.as_ptr()),
+            0
+        );
         assert!(inbox.is_dir(), "the save dir is created eagerly");
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         let list = text_of(&buf);
         assert!(list.contains("inbox"), "{list}");
         // Empty path: -2. Unknown runtime: -4.
         let empty = CString::new("").expect("empty");
-        assert_eq!(ak_task_set_save_dir(engine, runtime_id.as_ptr(), empty.as_ptr()), -2);
-        assert_eq!(ak_task_set_save_dir(engine, [7u8; 16].as_ptr(), path.as_ptr()), -4);
+        assert_eq!(
+            ak_task_set_save_dir(engine, runtime_id.as_ptr(), empty.as_ptr()),
+            -2
+        );
+        assert_eq!(
+            ak_task_set_save_dir(engine, [7u8; 16].as_ptr(), path.as_ptr()),
+            -4
+        );
         ak_engine_free(engine);
     }
 
@@ -4061,14 +4131,16 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine, &registry, dir_a.path());
         let joiner = start_task_on(engine, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
+        let (_, ok, json) = create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code(engine, &joiner, &code);
         assert!(join_ok, "{join_json}");
         let conn = conn_of(&join_json);
-        assert_eq!(ak_task_disconnect(engine, joiner.as_ptr(), conn.as_ptr()), 0);
+        assert_eq!(
+            ak_task_disconnect(engine, joiner.as_ptr(), conn.as_ptr()),
+            0
+        );
         // Local side: reason local; peer side: reason peer (the
         // same-engine instant cache notify).
         let local = wait_event(engine, &joiner, "disconnected");
@@ -4077,12 +4149,21 @@ mod task_tests {
         assert!(peer.contains("\"reason\":\"peer\""), "{peer}");
         // Both lists now report the connection disconnected.
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(text_of(&buf).contains("\"state\":\"disconnected\""));
         // Idempotent: a second disconnect is a silent AK_OK; an unknown
         // conn id is -4.
-        assert_eq!(ak_task_disconnect(engine, joiner.as_ptr(), conn.as_ptr()), 0);
-        assert_eq!(ak_task_disconnect(engine, joiner.as_ptr(), [5u8; 16].as_ptr()), -4);
+        assert_eq!(
+            ak_task_disconnect(engine, joiner.as_ptr(), conn.as_ptr()),
+            0
+        );
+        assert_eq!(
+            ak_task_disconnect(engine, joiner.as_ptr(), [5u8; 16].as_ptr()),
+            -4
+        );
         ak_engine_free(engine);
     }
 
@@ -4102,7 +4183,10 @@ mod task_tests {
         let joiner = start_task_on(engine, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine, owner.as_ptr(), save_path.as_ptr()), 0);
+        assert_eq!(
+            ak_task_set_save_dir(engine, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
 
         let (_, ok, json) =
             create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
@@ -4150,8 +4234,7 @@ mod task_tests {
         // The receiver's done event + the delivered bytes.
         let done = wait_event(engine, &owner, "\"event\":\"done\"");
         assert!(done.contains("\"conn\":\""), "{done}");
-        let delivered =
-            find_file(&inbox, "e2e.bin").expect("the file landed in the save dir");
+        let delivered = find_file(&inbox, "e2e.bin").expect("the file landed in the save dir");
         assert_eq!(std::fs::read(&delivered).unwrap(), payload);
         // The sender-side done event too.
         let _ = wait_event(engine, &joiner, "\"event\":\"done\"");
@@ -4170,7 +4253,10 @@ mod task_tests {
         let joiner = start_task_on(engine, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine, owner.as_ptr(), save_path.as_ptr()), 0);
+        assert_eq!(
+            ak_task_set_save_dir(engine, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
         let (_, ok, json) =
             create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
         assert!(ok, "{json}");
@@ -4201,8 +4287,14 @@ mod task_tests {
         );
         assert_eq!(ak_task_consent(engine, owner.as_ptr(), job.as_ptr(), 0), 0);
         let (send_ok, send_json) = wait_op(engine, &joiner, &send_op);
-        assert!(!send_ok, "a declined transfer must fail the op: {send_json}");
-        assert!(find_file(&inbox, "no.bin").is_none(), "nothing may land on a decline");
+        assert!(
+            !send_ok,
+            "a declined transfer must fail the op: {send_json}"
+        );
+        assert!(
+            find_file(&inbox, "no.bin").is_none(),
+            "nothing may land on a decline"
+        );
         // A decided request cannot be decided again: -4.
         assert_eq!(ak_task_consent(engine, owner.as_ptr(), job.as_ptr(), 1), -4);
         ak_engine_free(engine);
@@ -4266,8 +4358,7 @@ mod task_tests {
         // The OWNER holds the receiver-side conn entry — it arrives with
         // its owner-loop completion, so wait for that first.
         let _ = wait_event(engine, &owner, "\"event\":\"connected\"");
-        let paths =
-            CString::new(json_paths(std::path::Path::new("C:/nowhere/none.bin"))).unwrap();
+        let paths = CString::new(json_paths(std::path::Path::new("C:/nowhere/none.bin"))).unwrap();
         let mut op_id = [0u8; 16];
         assert_eq!(
             ak_task_send(
@@ -4292,8 +4383,14 @@ mod task_tests {
         let engine = ak_engine_new();
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = start_task(engine, dir.path());
-        assert_eq!(ak_task_consent(engine, runtime_id.as_ptr(), [4u8; 16].as_ptr(), 1), -4);
-        assert_eq!(ak_task_consent(engine, [4u8; 16].as_ptr(), [4u8; 16].as_ptr(), 1), -4);
+        assert_eq!(
+            ak_task_consent(engine, runtime_id.as_ptr(), [4u8; 16].as_ptr(), 1),
+            -4
+        );
+        assert_eq!(
+            ak_task_consent(engine, [4u8; 16].as_ptr(), [4u8; 16].as_ptr(), 1),
+            -4
+        );
         ak_engine_free(engine);
     }
 
@@ -4373,8 +4470,11 @@ mod task_tests {
         let engine = ak_engine_new();
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = start_task_on(engine, &registry, dir.path());
-        let (_, ok, json) =
-            create_code(engine, &runtime_id, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine,
+            &runtime_id,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let started = Instant::now();
         ak_engine_free(engine); // would hang if the parked accept leaked
@@ -4424,7 +4524,10 @@ mod task_tests {
         // Cross-engine: the engine-local cache cannot help — the join
         // must succeed through the registry relay alone.
         let (join_ok, join_json) = join_code(engine_b, &joiner, &code);
-        assert!(join_ok, "the registry relay must carry the code across engines: {join_json}");
+        assert!(
+            join_ok,
+            "the registry relay must carry the code across engines: {join_json}"
+        );
         assert!(join_json.contains("\"op\":\"task_join\""), "{join_json}");
         assert!(join_json.contains("\"role\":\"receiver\""), "{join_json}");
         // The owner learns the pairing through its owner loop: the same
@@ -4466,7 +4569,10 @@ mod task_tests {
         );
         let probe = wait_event(engine_b, &joiner, "probe_result");
         assert!(probe.contains("\"reachable\":true"), "{probe}");
-        assert!(probe.contains("\"endpoint\":\""), "the confirmed address rides the event: {probe}");
+        assert!(
+            probe.contains("\"endpoint\":\""),
+            "the confirmed address rides the event: {probe}"
+        );
 
         // Dead leg: the caller advertises exactly one closed port.
         let (_, ok_two, json_two) = create_code(
@@ -4483,7 +4589,10 @@ mod task_tests {
             "a silent candidate reports every candidate failed: {dead_json}"
         );
         let dead_probe = wait_event(engine_b, &joiner, "\"reachable\":false");
-        assert!(dead_probe.contains("\"candidate\":\"127.0.0.1:1\""), "{dead_probe}");
+        assert!(
+            dead_probe.contains("\"candidate\":\"127.0.0.1:1\""),
+            "{dead_probe}"
+        );
         assert!(dead_probe.contains("\"reason\":"), "{dead_probe}");
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
@@ -4509,9 +4618,15 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         // Cross-engine: the joiner's side is the mirror of the owner's
@@ -4550,8 +4665,14 @@ mod task_tests {
         // (the mid-transfer data-plane departure is what the peer can
         // actually observe — a mid-OFFER close is swallowed by the consent
         // gate's own 30 s window, which declines rather than erroring).
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
-        assert_eq!(ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
+        assert_eq!(
+            ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()),
+            0
+        );
         let local = wait_event(engine_b, &joiner, "disconnected");
         assert!(local.contains("\"reason\":\"local\""), "{local}");
 
@@ -4562,7 +4683,10 @@ mod task_tests {
             "the peer device must learn the disconnect: {remote}"
         );
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(text_of(&buf).contains("\"state\":\"disconnected\""));
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
@@ -4581,7 +4705,10 @@ mod task_tests {
                 ak_pairing_poll_event(engine, runtime_id.as_ptr(), buf.as_mut_ptr(), buf.len());
             if code == 1 {
                 let line = text_of(&buf);
-                assert!(!line.contains(needle), "unexpected event {needle:?}: {line}");
+                assert!(
+                    !line.contains(needle),
+                    "unexpected event {needle:?}: {line}"
+                );
             } else {
                 assert!(code == 0, "poll_event failed: {code}");
             }
@@ -4683,20 +4810,18 @@ mod task_tests {
     }
 
     /// Safe-layer op wait for the OWNED-engine tests (no raw pointers).
-    fn wait_op_owned(
-        engine: &AkEngine,
-        runtime_id: &[u8; 16],
-        op_id: &[u8; 16],
-    ) -> (bool, String) {
+    fn wait_op_owned(engine: &AkEngine, runtime_id: &[u8; 16], op_id: &[u8; 16]) -> (bool, String) {
         let deadline = Instant::now() + WAIT;
         loop {
-            let snapshot = crate::task::task_op_result_maybe(engine, runtime_id, op_id)
-                .expect("task op read")
-                .expect("task runtime");
+            let snapshot =
+                crate::task::task_op_result(engine, runtime_id, op_id).expect("task op read");
             if let OpResult::Finished { ok, json } = snapshot {
                 return (ok, json);
             }
-            assert!(Instant::now() < deadline, "timed out waiting for the owned op");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the owned op"
+            );
             std::thread::sleep(POLL);
         }
     }
@@ -4736,10 +4861,16 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
 
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "receiver-role create (real bind): {json}");
         let code = code_of(&json);
         let endpoint = endpoint_of(&json);
@@ -4810,9 +4941,15 @@ mod task_tests {
                 .and_then(|rest| rest.split('"').next())
                 .expect("job id"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
-        assert!(send_ok, "B still succeeds after the stranger attempts: {send_json}");
+        assert!(
+            send_ok,
+            "B still succeeds after the stranger attempts: {send_json}"
+        );
         let delivered = find_file(&inbox, "legit.bin").expect("B's file landed");
         assert_eq!(std::fs::read(&delivered).unwrap(), payload);
         ak_engine_free(engine_a);
@@ -4830,20 +4967,28 @@ mod task_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime_id = task_start(&engine, &registry_spec(&registry, dir.path())).expect("rt");
         let request_id = "b1b2c3d4e5f60718293a4b5c6d7e8f90";
-        let spec = format!(
-            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}"
-        );
+        let spec =
+            format!("{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}");
         let racer_one = threaded_create(Arc::clone(&engine), runtime_id, spec.clone());
         let racer_two = threaded_create(Arc::clone(&engine), runtime_id, spec.clone());
-        let op_one = racer_one.recv().expect("racer one answered").expect("accepted");
-        let op_two = racer_two.recv().expect("racer two answered").expect("accepted");
+        let op_one = racer_one
+            .recv()
+            .expect("racer one answered")
+            .expect("accepted");
+        let op_two = racer_two
+            .recv()
+            .expect("racer two answered")
+            .expect("accepted");
         assert_eq!(
             op_one, op_two,
             "both racers must observe the ONE atomically accepted op"
         );
         let (ok, json) = wait_op_owned(&engine, &runtime_id, &op_one);
         assert!(ok, "{json}");
-        assert!(json.contains("\"code\":\"AKI1-"), "exactly one claim: {json}");
+        assert!(
+            json.contains("\"code\":\"AKI1-"),
+            "exactly one claim: {json}"
+        );
 
         // Cross-operation domain: the same request id under task_join is
         // a conflict (-2), not a replay of the create's op.
@@ -4853,7 +4998,11 @@ mod task_tests {
         );
         let error = task_join_start(&engine, &runtime_id, &join_spec).expect_err("conflict");
         assert_eq!(error.code, crate::core::AK_ERR_INVALID);
-        assert!(error.message.contains("different spec"), "{}", error.message);
+        assert!(
+            error.message.contains("different spec"),
+            "{}",
+            error.message
+        );
     }
 
     /// P2-01 (second half): an ACCEPTED send request's answer stays
@@ -4868,8 +5017,11 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine_a, &registry, dir_a.path());
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
@@ -4881,12 +5033,22 @@ mod task_tests {
         let spec = CString::new(format!(
             "{{\"spec_version\":1,\"paths\":[\"{}\"],\
               \"request_id\":\"c1c2c3d4e5f60718293a4b5c6d7e8f90\"}}",
-            dir_b.path().join("re.bin").to_string_lossy().replace('\\', "/"),
+            dir_b
+                .path()
+                .join("re.bin")
+                .to_string_lossy()
+                .replace('\\', "/"),
         ))
         .unwrap();
         let mut op_one = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), spec.as_ptr(), op_one.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                spec.as_ptr(),
+                op_one.as_mut_ptr()
+            ),
             0
         );
         let request = wait_event(engine_a, &owner, "incoming_request");
@@ -4897,15 +5059,27 @@ mod task_tests {
                 .and_then(|rest| rest.split('"').next())
                 .expect("job id"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &op_one);
         assert!(send_ok, "{send_json}");
 
         // The connection goes away; the ORIGINAL request still answers.
-        assert_eq!(ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()), 0);
+        assert_eq!(
+            ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()),
+            0
+        );
         let mut op_two = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), spec.as_ptr(), op_two.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                spec.as_ptr(),
+                op_two.as_mut_ptr()
+            ),
             0,
             "the replay is answered, not state-rejected: {}",
             last_error_of(engine_b)
@@ -4918,7 +5092,13 @@ mod task_tests {
         let fresh = CString::new(json_paths(&dir_b.path().join("re.bin"))).unwrap();
         let mut op_three = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), fresh.as_ptr(), op_three.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                fresh.as_ptr(),
+                op_three.as_mut_ptr()
+            ),
             -2
         );
         ak_engine_free(engine_a);
@@ -4945,8 +5125,14 @@ mod task_tests {
         );
         let racer_one = threaded_create(Arc::clone(&engine), runtime_id, spec_one);
         let racer_two = threaded_create(Arc::clone(&engine), runtime_id, spec_two);
-        let op_one = racer_one.recv().expect("racer one answered").expect("accepted");
-        let op_two = racer_two.recv().expect("racer two answered").expect("accepted");
+        let op_one = racer_one
+            .recv()
+            .expect("racer one answered")
+            .expect("accepted");
+        let op_two = racer_two
+            .recv()
+            .expect("racer two answered")
+            .expect("accepted");
         assert_ne!(op_one, op_two, "distinct requests, distinct ops");
         let mut codes = Vec::new();
         for op in [&op_one, &op_two] {
@@ -4980,8 +5166,11 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine_a, &registry, dir_a.path());
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
@@ -4990,14 +5179,20 @@ mod task_tests {
         // A's connection entry arrives with its owner-loop completion.
         let _ = wait_event(engine_a, &owner, "\"event\":\"connected\"");
         // IDLE: no send ever happens. B walks away.
-        assert_eq!(ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()), 0);
+        assert_eq!(
+            ak_task_disconnect(engine_b, joiner.as_ptr(), conn.as_ptr()),
+            0
+        );
         let remote = wait_event(engine_a, &owner, "disconnected");
         assert!(
             remote.contains("\"reason\":\"peer\""),
             "the idle peer must learn the disconnect: {remote}"
         );
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(text_of(&buf).contains("\"state\":\"disconnected\""));
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
@@ -5028,7 +5223,10 @@ mod task_tests {
         let code_id = code_id_of(&json);
         let code = code_of(&json);
         assert!(
-            rt.spawned.lock().map(|m| m.contains_key(&code_id)).unwrap_or(false),
+            rt.spawned
+                .lock()
+                .map(|m| m.contains_key(&code_id))
+                .unwrap_or(false),
             "the receiver/echo listeners are registered under the code id"
         );
 
@@ -5045,7 +5243,10 @@ mod task_tests {
             "the cancel is observable: {events:?}"
         );
         assert!(
-            !rt.spawned.lock().map(|m| m.contains_key(&code_id)).unwrap_or(true),
+            !rt.spawned
+                .lock()
+                .map(|m| m.contains_key(&code_id))
+                .unwrap_or(true),
             "the listeners are released"
         );
         // Idempotent repeat: a silent AK_OK.
@@ -5055,9 +5256,12 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let spec_b = registry_spec(&registry, dir_b.path());
         let runtime_b = task_start(&engine, &spec_b).expect("second runtime");
-        let join_op =
-            task_join_start(&engine, &runtime_b, &format!("{{\"spec_version\":1,\"code\":\"{code}\"}}"))
-                .expect("join accepted");
+        let join_op = task_join_start(
+            &engine,
+            &runtime_b,
+            &format!("{{\"spec_version\":1,\"code\":\"{code}\"}}"),
+        )
+        .expect("join accepted");
         let (join_ok, join_json) = wait_op_owned(&engine, &runtime_b, &join_op);
         assert!(!join_ok, "a cancelled code cannot be joined: {join_json}");
         assert!(join_json.contains("unknown task code"), "{join_json}");
@@ -5083,9 +5287,15 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
@@ -5099,19 +5309,35 @@ mod task_tests {
         let paths = CString::new(json_paths(&dir_b.path().join("retry.bin"))).unwrap();
         let mut op_one = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_one.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                op_one.as_mut_ptr()
+            ),
             0
         );
         let request = wait_event(engine_a, &owner, "incoming_request");
         let job = hex16_id(
-            request.split("\"job\":\"").nth(1).and_then(|r| r.split('"').next()).expect("job"),
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .expect("job"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 0), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 0),
+            0
+        );
         let (declined_ok, _) = wait_op(engine_b, &joiner, &op_one);
         assert!(!declined_ok, "the declined attempt fails the op");
         // The listener (and the connection) survived the decline.
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"connected\""),
             "a decline is not a task terminal state: {}",
@@ -5121,7 +5347,13 @@ mod task_tests {
         // Attempt 2 (a fresh op on the SAME connection): accepted, lands.
         let mut op_two = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_two.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                op_two.as_mut_ptr()
+            ),
             0,
             "the retry is accepted: {}",
             last_error_of(engine_b)
@@ -5134,7 +5366,10 @@ mod task_tests {
                 .and_then(|r| r.split('"').next())
                 .expect("job"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job_two.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job_two.as_ptr(), 1),
+            0
+        );
         let (retry_ok, retry_json) = wait_op(engine_b, &joiner, &op_two);
         assert!(retry_ok, "the retry after a decline succeeds: {retry_json}");
         let delivered = find_file(&inbox, "retry.bin").expect("the retry landed");
@@ -5145,16 +5380,25 @@ mod task_tests {
         // Wave-30 P2-05 residual: the converge line's reason IS `done` —
         // a decidable terminal state for the Dart table to agree on.
         let done_line = wait_event(engine_a, &owner, "\"reason\":\"done\"");
-        assert!(done_line.contains("\"event\":\"disconnected\""), "{done_line}");
+        assert!(
+            done_line.contains("\"event\":\"disconnected\""),
+            "{done_line}"
+        );
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"disconnected\""),
             "the receiver converges: {}",
             text_of(&buf)
         );
         buf.iter_mut().for_each(|slot| *slot = 0);
-        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"disconnected\""),
             "the sender converges: {}",
@@ -5163,7 +5407,13 @@ mod task_tests {
         // A third send on the terminal connection is refused up front.
         let mut op_three = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), op_three.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                op_three.as_mut_ptr()
+            ),
             -2
         );
         ak_engine_free(engine_a);
@@ -5184,13 +5434,19 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         // Create the code FIRST (the receiver captures the DEFAULT dir),
         // then change the setting — the change must govern the task.
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let inbox = dir_a.path().join("later-inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
 
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
         assert!(join_ok, "{join_json}");
@@ -5200,14 +5456,27 @@ mod task_tests {
         let paths = CString::new(json_paths(&dir_b.path().join("moved.bin"))).unwrap();
         let mut send_op = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                send_op.as_mut_ptr()
+            ),
             0
         );
         let request = wait_event(engine_a, &owner, "incoming_request");
         let job = hex16_id(
-            request.split("\"job\":\"").nth(1).and_then(|r| r.split('"').next()).expect("job"),
+            request
+                .split("\"job\":\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .expect("job"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
         assert!(send_ok, "{send_json}");
         let delivered = find_file(&inbox, "moved.bin")
@@ -5240,9 +5509,15 @@ mod task_tests {
             let inbox = dir.path().join(format!("inbox{index}"));
             let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
             let runtime = start_task_on(engine, &registry, dir.path());
-            assert_eq!(ak_task_set_save_dir(engine, runtime.as_ptr(), save_path.as_ptr()), 0);
-            let (_, ok, json) =
-                create_code(engine, &runtime, "{\"spec_version\":1,\"role\":\"receiver\"}");
+            assert_eq!(
+                ak_task_set_save_dir(engine, runtime.as_ptr(), save_path.as_ptr()),
+                0
+            );
+            let (_, ok, json) = create_code(
+                engine,
+                &runtime,
+                "{\"spec_version\":1,\"role\":\"receiver\"}",
+            );
             assert!(ok, "{json}");
             codes.push((code_of(&json), dir, inbox));
             receivers.push(runtime);
@@ -5302,7 +5577,10 @@ mod task_tests {
 
         // Both pending gates then resolve and both transfers land.
         for (index, runtime) in receivers.iter().enumerate() {
-            assert_eq!(ak_task_consent(engine, runtime.as_ptr(), jobs[index].as_ptr(), 1), 0);
+            assert_eq!(
+                ak_task_consent(engine, runtime.as_ptr(), jobs[index].as_ptr(), 1),
+                0
+            );
             let (send_ok, send_json) = wait_op(engine_f, &senders[index].0, &ops[index]);
             assert!(send_ok, "transfer {index} lands: {send_json}");
             assert!(
@@ -5347,9 +5625,15 @@ mod task_tests {
             .send_to(&ak_net::holepunch::probe_packet(&nonce), addr_one)
             .expect("probe sent");
         let mut buffer = [0u8; 1500];
-        let (len, from) = probe_socket.recv_from(&mut buffer).expect("a reply arrives");
+        let (len, from) = probe_socket
+            .recv_from(&mut buffer)
+            .expect("a reply arrives");
         assert_eq!(len, 24, "the reply is a probe-shaped packet");
-        assert_eq!(&buffer[8..len], &[0u8; 16][..], "the reply nonce is the marker");
+        assert_eq!(
+            &buffer[8..len],
+            &[0u8; 16][..],
+            "the reply nonce is the marker"
+        );
         assert_eq!(from, addr_one);
         let reply = buffer[..len].to_vec();
 
@@ -5361,7 +5645,9 @@ mod task_tests {
         );
 
         // Two responders fed a reply stay silent — no mutual answering loop.
-        probe_socket.send_to(&reply, addr_two).expect("cross reply sent");
+        probe_socket
+            .send_to(&reply, addr_two)
+            .expect("cross reply sent");
         assert!(
             probe_socket.recv_from(&mut buffer).is_err(),
             "a second responder must never answer a reply either"
@@ -5371,7 +5657,9 @@ mod task_tests {
         probe_socket
             .send_to(&ak_net::holepunch::probe_packet(&[0x5Au8; 16]), addr_two)
             .expect("fresh probe");
-        let (len, _) = probe_socket.recv_from(&mut buffer).expect("responder two answers");
+        let (len, _) = probe_socket
+            .recv_from(&mut buffer)
+            .expect("responder two answers");
         assert_eq!(len, 24);
     }
 
@@ -5396,8 +5684,11 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
 
         // Phase 1: an EXPLICIT same-direction join is refused pre-commit.
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "receiver-role create: {json}");
         let code = code_of(&json);
         let (wrong_ok, wrong_json) = join_code_as(engine_b, &joiner, &code, Some("receiver"));
@@ -5411,7 +5702,10 @@ mod task_tests {
         );
         assert_no_event_within(engine_a, &owner, "\"event\":\"connected\"", 1500);
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             !text_of(&buf).contains("\"conn\""),
             "the refused joiner holds no connection: {}",
@@ -5425,8 +5719,11 @@ mod task_tests {
         // Phase 2: the FFI's no-hint DEFAULT direction (receiver) on a
         // FRESH receiver-role code is equally refused pre-commit, and the
         // code stays usable for an explicit complementary join.
-        let (_, ok_two, json_two) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok_two, json_two) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok_two, "{json_two}");
         let code_two = code_of(&json_two);
         let (default_ok, default_json) = join_code(engine_b, &joiner, &code_two);
@@ -5458,9 +5755,15 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
@@ -5475,7 +5778,10 @@ mod task_tests {
         assert_no_event_within(engine_a, &owner, "disconnected", 1500);
         assert_no_event_within(engine_b, &joiner, "disconnected", 1500);
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"connected\""),
             "the paired task outlives the registry: {}",
@@ -5488,7 +5794,13 @@ mod task_tests {
         let paths = CString::new(json_paths(&dir_b.path().join("noreg.bin"))).unwrap();
         let mut send_op = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                send_op.as_mut_ptr()
+            ),
             0,
             "the send is accepted after the registry died: {}",
             last_error_of(engine_b)
@@ -5501,7 +5813,10 @@ mod task_tests {
                 .and_then(|rest| rest.split('"').next())
                 .expect("job id"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
         assert!(send_ok, "the transfer completes: {send_json}");
         let delivered = find_file(&inbox, "noreg.bin").expect("the bytes landed");
@@ -5526,9 +5841,15 @@ mod task_tests {
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
         let inbox = dir_a.path().join("inbox");
         let save_path = CString::new(inbox.to_string_lossy().replace('\\', "/")).unwrap();
-        assert_eq!(ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()), 0);
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        assert_eq!(
+            ak_task_set_save_dir(engine_a, owner.as_ptr(), save_path.as_ptr()),
+            0
+        );
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let endpoint = endpoint_of(&json);
@@ -5543,7 +5864,10 @@ mod task_tests {
         // exact error class the old loop treated as "endpoint dead".
         std::fs::write(dir_a.path().join("midhandshake.bin"), b"stranger").unwrap();
         let failure = wrong_pin_send_fails(endpoint, &dir_a.path().join("midhandshake.bin"));
-        assert!(!failure.is_empty(), "the wrong-pin dial must fail: {failure}");
+        assert!(
+            !failure.is_empty(),
+            "the wrong-pin dial must fail: {failure}"
+        );
         // The failure is recorded and the loop CONTINUES listening.
         let recorded = wait_event(engine_a, &owner, "handshake_failed");
         assert!(
@@ -5557,7 +5881,13 @@ mod task_tests {
         let paths = CString::new(json_paths(&dir_b.path().join("after.bin"))).unwrap();
         let mut send_op = [0u8; 16];
         assert_eq!(
-            ak_task_send(engine_b, joiner.as_ptr(), conn.as_ptr(), paths.as_ptr(), send_op.as_mut_ptr()),
+            ak_task_send(
+                engine_b,
+                joiner.as_ptr(),
+                conn.as_ptr(),
+                paths.as_ptr(),
+                send_op.as_mut_ptr()
+            ),
             0,
             "the send is accepted: {}",
             last_error_of(engine_b)
@@ -5570,9 +5900,15 @@ mod task_tests {
                 .and_then(|rest| rest.split('"').next())
                 .expect("job id"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
-        assert!(send_ok, "the listener survived the handshake failure: {send_json}");
+        assert!(
+            send_ok,
+            "the listener survived the handshake failure: {send_json}"
+        );
         let delivered = find_file(&inbox, "after.bin").expect("the file landed");
         assert_eq!(std::fs::read(&delivered).unwrap(), payload);
         ak_engine_free(engine_a);
@@ -5602,10 +5938,9 @@ mod task_tests {
             RequestGate::Fresh(reserved) => reserved,
             _other => panic!("fresh request, got a different gate outcome"),
         };
-        let snapshot =
-            task_op_result_maybe(&engine, &runtime, &reserved.op_id).expect("pollable");
+        let snapshot = task_op_result(&engine, &runtime, &reserved.op_id).expect("pollable");
         match snapshot {
-            Some(OpResult::Running) => {}
+            OpResult::Running => {}
             _other => panic!("the reserved op must read running, got a settled or missing op"),
         }
         // The reservation launches exactly once and completes normally.
@@ -5639,9 +5974,8 @@ mod task_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = task_start(&engine, &registry_spec(&registry, dir.path())).expect("rt");
         let request_id = "f1f2f3d4e5f60718293a4b5c6d7e8f90";
-        let spec = format!(
-            "{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}"
-        );
+        let spec =
+            format!("{{\"spec_version\":1,\"role\":\"sender\",\"request_id\":\"{request_id}\"}}");
         let racer = threaded_create(Arc::clone(&engine), runtime, spec.clone());
         // From THIS thread: retry the same request concurrently — the
         // gate answers the racer's op id (fresh or replay, one atomic
@@ -5650,9 +5984,8 @@ mod task_tests {
         let op_id = task_create_code_start(&engine, &runtime, &spec)
             .expect("same-spec retry is accepted (fresh or replay)");
         // The immediate poll must never observe an unregistered op.
-        match task_op_result_maybe(&engine, &runtime, &op_id).expect("poll") {
-            Some(OpResult::Running) | Some(OpResult::Finished { .. }) => {}
-            _other => panic!("registered op expected, got a missing op"),
+        match task_op_result(&engine, &runtime, &op_id).expect("poll") {
+            OpResult::Running | OpResult::Finished { .. } => {}
         }
         // Exactly one op for the whole race: the racer's answer is the
         // same id and it completes once.
@@ -5660,7 +5993,10 @@ mod task_tests {
         assert_eq!(racer_op, op_id, "one atomically accepted op");
         let (ok, json) = wait_op_owned(&engine, &runtime, &op_id);
         assert!(ok, "{json}");
-        assert!(json.contains("\"code\":\"AKI1-"), "exactly one claim: {json}");
+        assert!(
+            json.contains("\"code\":\"AKI1-"),
+            "exactly one claim: {json}"
+        );
     }
 
     /// P2-09 residual: the connection settle is HONEST. A joiner that
@@ -5677,8 +6013,11 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine_a, &registry, dir_a.path());
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         // Explicit candidates are advertised verbatim (no echo responder,
@@ -5704,7 +6043,10 @@ mod task_tests {
             "the joiner's probe verdict rides the result: {join_json}"
         );
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_b, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"connected\""),
             "the joiner settles connected: {}",
@@ -5715,7 +6057,10 @@ mod task_tests {
         let probe = wait_event(engine_a, &owner, "probe_result");
         assert!(probe.contains("\"reachable\":false"), "{probe}");
         let mut buf = cbuf(CAP);
-        assert_eq!(ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+        assert_eq!(
+            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            1
+        );
         assert!(
             text_of(&buf).contains("\"state\":\"unreachable\""),
             "ak_task_list agrees with the probe verdict: {}",
@@ -5783,13 +6128,9 @@ mod task_tests {
                 panic!("the attributed offer must register as pending");
             };
             // Long window: only the connection's disconnect resolves it.
-            let ConsentAnswer::Pending(closed_rx) = register_consent(
-                &rt_in,
-                &code_id,
-                &info,
-                &bound_dir,
-                Duration::from_secs(60),
-            ) else {
+            let ConsentAnswer::Pending(closed_rx) =
+                register_consent(&rt_in, &code_id, &info, &bound_dir, Duration::from_secs(60))
+            else {
                 panic!("the second offer must register as pending");
             };
             let expired = expiry_rx.await.unwrap_or(false);
@@ -5827,14 +6168,19 @@ mod task_tests {
         // Wave-31 P2-06: the consent event carries the transfer's BOUND
         // save dir — the one binding, not a fresh read of the setting.
         assert!(
-            events.iter().any(|line| line.contains("\"event\":\"incoming_request\"")
-                && line.contains(&format!("\"saveDir\":{bound_save_json}"))),
+            events
+                .iter()
+                .any(|line| line.contains("\"event\":\"incoming_request\"")
+                    && line.contains(&format!("\"saveDir\":{bound_save_json}"))),
             "the consent event carries the bound save dir: {events:?}"
         );
         // Decided requests answer the frozen -4.
         let decided = task_consent(&engine, &runtime, &expired_job, true);
         assert!(decided.is_err(), "the expired request is already decided");
-        assert_eq!(decided.err().map(|e| e.code), Some(crate::core::AK_ERR_NOT_FOUND));
+        assert_eq!(
+            decided.err().map(|e| e.code),
+            Some(crate::core::AK_ERR_NOT_FOUND)
+        );
     }
 
     // -- wave-31 review findings (R30-P2-02, R30-P2-03, P2-06 residual) ----
@@ -5878,8 +6224,11 @@ mod task_tests {
         let dir_b = tempfile::tempdir().expect("tempdir b");
         let owner = start_task_on(engine_a, &registry, dir_a.path());
         let joiner = start_task_on(engine_b, &registry, dir_b.path());
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let code_id_hex = core::hex_encode(&code_id_of(&json));
@@ -5972,12 +6321,16 @@ mod task_tests {
             .map(|queue| queue.iter().cloned().collect())
             .unwrap_or_default();
         assert!(
-            recv_rows.iter().any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))
-                && row.contains("\"event\":\"accepted\"")),
+            recv_rows
+                .iter()
+                .any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))
+                    && row.contains("\"event\":\"accepted\"")),
             "receive progress rides under the connection id: {recv_rows:?}"
         );
         assert!(
-            recv_rows.iter().all(|row| !row.contains(&format!("\"job\":\"{code_id_hex}\""))),
+            recv_rows
+                .iter()
+                .all(|row| !row.contains(&format!("\"job\":\"{code_id_hex}\""))),
             "no receive row may ride under the code id: {recv_rows:?}"
         );
         // The SENDER's rows on its own engine share the SAME key.
@@ -5988,7 +6341,9 @@ mod task_tests {
             .map(|queue| queue.iter().cloned().collect())
             .unwrap_or_default();
         assert!(
-            send_rows.iter().any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))),
+            send_rows
+                .iter()
+                .any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))),
             "send progress keeps the connection-id key: {send_rows:?}"
         );
     }
@@ -6059,7 +6414,10 @@ mod task_tests {
             "no incoming_request may surface for a dead request: {events:?}"
         );
         assert!(
-            rt.pending.lock().map(|pending| pending.is_empty()).unwrap_or(false),
+            rt.pending
+                .lock()
+                .map(|pending| pending.is_empty())
+                .unwrap_or(false),
             "nothing stays pending"
         );
         let decided = task_consent(&engine, &runtime, &[1u8; 16], true);
@@ -6203,8 +6561,11 @@ mod task_tests {
             0
         );
 
-        let (_, ok, json) =
-            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
         assert!(ok, "{json}");
         let code = code_of(&json);
         let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
@@ -6246,15 +6607,17 @@ mod task_tests {
                 .and_then(|rest| rest.split('"').next())
                 .expect("job id"),
         );
-        assert_eq!(ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1), 0);
+        assert_eq!(
+            ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
+            0
+        );
         let (send_ok, send_json) = wait_op(engine_b, &joiner, &send_op);
         assert!(send_ok, "{send_json}");
 
         // The in-flight transfer landed in its BOUND folder and `done`
         // reports exactly that — the actual disk result, not the newer
         // setting.
-        let delivered =
-            find_file(&alpha, "bound.bin").expect("the file lands in the bound folder");
+        let delivered = find_file(&alpha, "bound.bin").expect("the file lands in the bound folder");
         assert_eq!(std::fs::read(&delivered).unwrap(), payload);
         assert!(
             find_file(&beta, "bound.bin").is_none(),

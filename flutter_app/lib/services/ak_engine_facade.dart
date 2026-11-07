@@ -33,9 +33,115 @@
 /// fake of this interface and never touch the real one.
 library;
 
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show AkEngineDart;
+import 'dart:ffi' show DynamicLibrary, Pointer;
+
+import 'dart:io' show File, FileMode, Platform;
+
+import 'package:ak_ffi_dart/ak_ffi_dart.dart'
+    show AkEngine, AkEngineDart, AkFfiBindings, AkTaskFfiBindings;
 
 import 'dll_path.dart' show resolveAkDllPath;
+
+// ---------------------------------------------------------------------------
+// E2/E4 startup phase log (`%TEMP%\ak-stage.log`).
+// ---------------------------------------------------------------------------
+
+/// Append-only startup phase log (crash-analysis E2/E4): one line per
+/// event, `<epoch-milliseconds> <phase>`, written SYNCHRONOUSLY (flushed)
+/// so the last line brackets a native crash against wall-clock dump
+/// times. Best-effort by contract — a broken log (missing `%TEMP%`,
+/// unwritable) disables itself and NEVER disturbs startup.
+final class AkStageLog {
+  AkStageLog._(this._path);
+
+  /// The log file path, or null when the environment names no temp dir
+  /// (the log is then a permanent no-op).
+  final String? _path;
+
+  /// Set after the first failed write; further [write]s are skipped.
+  bool _broken = false;
+
+  static AkStageLog? _shared;
+
+  /// The process-wide instance (`%TEMP%\ak-stage.log`, resolved lazily
+  /// from [Platform.environment]; resolved ONCE so every writer agrees).
+  static AkStageLog shared() =>
+      _shared ??= AkStageLog._(defaultAkStageLogPath(Platform.environment));
+
+  /// A log writing to an explicit [path] (tests inject a temp file).
+  factory AkStageLog.file(String path) => AkStageLog._(path);
+
+  /// Appends one `<ms> <phase>` line. Never throws; failures disable the
+  /// log permanently (there is nowhere left to report a broken log).
+  void write(String phase) {
+    final path = _path;
+    if (path == null || _broken) {
+      return;
+    }
+    try {
+      File(path).writeAsStringSync(
+        '${DateTime.now().millisecondsSinceEpoch} $phase\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } on Object {
+      _broken = true;
+    }
+  }
+
+  /// The default log location: `ak-stage.log` under the platform temp
+  /// dir (`TEMP`/`TMP` on Windows, `TMPDIR` elsewhere).
+  static String? defaultAkStageLogPath(Map<String, String> environment) {
+    final dir = environment['TEMP'] ?? environment['TMP'] ?? environment['TMPDIR'];
+    if (dir == null || dir.isEmpty) {
+      return null;
+    }
+    final separator = dir.endsWith('/') || dir.endsWith(r'\')
+        ? ''
+        : Platform.pathSeparator;
+    return '$dir${separator}ak-stage.log';
+  }
+}
+
+/// The native-lifecycle steps `bootstrapAppService` drives, one method
+/// per E4 diagnostic stage (crash-analysis report, E4 table):
+///
+/// | stage | owner call | native effect |
+/// |---|---|---|
+/// | B | [openLibrary] | `DynamicLibrary.open` only — no lookup, no call |
+/// | C | [probeTaskExports] | task-plane export LOOKUP, no engine |
+/// | D | [engineNew] | `ak_engine_new`; the engine is HELD by the owner |
+///
+/// C08 ordering is baked into the protocol the real facade implements:
+/// open once at the ONE injected path, probe the task-plane exports, and
+/// only then create the engine over the SAME opened library (probe before
+/// `engine_new`, single resolution). [AkEngineDartFacade] is the real
+/// implementation; tests inject fakes that intercept at a chosen depth.
+abstract interface class AkStagedEngineOwner {
+  /// Stage B: opens the DLL (idempotent — later stages reuse the handle)
+  /// without looking up or calling ANY export. Throws the loader's own
+  /// error when the path cannot be opened.
+  DynamicLibrary openLibrary();
+
+  /// Stage C: probes the ten task-plane exports and returns the MISSING
+  /// names (empty = fully supported). Lookup only — no export is called,
+  /// no engine is created.
+  List<String> probeTaskExports();
+
+  /// Stage D: `ak_engine_new` over the already-open library. Idempotent;
+  /// the engine stays owned (and alive) until [dispose].
+  void engineNew();
+
+  /// The live engine's native handle (after [engineNew]).
+  Pointer<AkEngine> get engineHandle;
+
+  /// The opened library (after [openLibrary]).
+  DynamicLibrary get library;
+
+  /// Releases the engine when this owner created it. The loaded library
+  /// itself is never unloaded (DynamicLibrary has no unload). Idempotent.
+  void dispose();
+}
 
 /// The engine-side identity/jobs-store surface [FfiTransferService] needs.
 abstract interface class AkEngineFacade {
@@ -72,22 +178,47 @@ abstract interface class AkEngineFacade {
   int peerRemove(String idDir, String fpHex);
 }
 
-/// Real [AkEngineFacade] over one lazily-opened [AkEngineDart].
+/// Real [AkEngineFacade] over one lazily-opened [AkEngineDart], and the
+/// real [AkStagedEngineOwner] the app bootstrap drives (E4 staged
+/// diagnosis + C08 single-resolution loading).
+///
+/// C08 loading contract: when [dllPath] is injected, it is the ONE
+/// resolution — the facade opens exactly that path (`DynamicLibrary.open`
+/// once), probes the task-plane exports on the SAME opened library, and
+/// creates the engine over that library (`ak_engine_new`), never
+/// re-resolving. Without an injected path the legacy lazy behavior is
+/// preserved (the three-tier probe runs on first use) for the invite /
+/// transfer services that construct this facade bare.
 ///
 /// The engine handle is opened on first use through the same three-tier
-/// DLL probe as [AkEngineBackend] (a missing DLL therefore throws here,
-/// which [FfiTransferService] turns into the degraded identity/empty
-/// history). Wave-12 integration note: when the bindings land, this class
-/// may instead be handed the engine already owned by `AkEngineBackend`
-/// (constructor parameter) so the app keeps a single native engine.
-final class AkEngineDartFacade implements AkEngineFacade {
+/// DLL probe as [AkEngineBackend] when no [dllPath] is given (a missing
+/// DLL therefore throws here, which [FfiTransferService] turns into the
+/// degraded identity/empty history).
+final class AkEngineDartFacade implements AkEngineFacade, AkStagedEngineOwner {
   /// [engine] may be supplied at integration time (e.g. the handle owned
   /// by `AkEngineBackend`); when null the facade opens its own lazily.
-  AkEngineDartFacade({AkEngineDart? engine}) {
+  ///
+  /// [dllPath] (C08) pins the exact library file to open — the bootstrap
+  /// resolves once and hands the absolute path here, eliminating the
+  /// second, potentially different, probe this facade used to run.
+  /// [stageLog] (E2) receives the startup phase timing lines; it defaults
+  /// to the process-wide [AkStageLog.shared].
+  AkEngineDartFacade({AkEngineDart? engine, String? dllPath, AkStageLog? stageLog})
+      : _dllPath = (dllPath == null || dllPath.isEmpty) ? null : dllPath,
+        _log = stageLog ?? AkStageLog.shared() {
     _engine = engine;
   }
 
   AkEngineDart? _engine;
+
+  /// The injected single resolution (C08); null = resolve lazily.
+  String? _dllPath;
+
+  /// The opened library — opened ONCE, reused by every later stage.
+  DynamicLibrary? _library;
+
+  final AkStageLog _log;
+
   bool _disposed = false;
 
   @override
@@ -146,6 +277,9 @@ final class AkEngineDartFacade implements AkEngineFacade {
   }
 
   /// Releases the engine when this facade opened its own. Idempotent.
+  /// The loaded library itself is never unloaded (DynamicLibrary exposes
+  /// no unload — Windows keeps the module mapped for the process life).
+  @override
   void dispose() {
     if (_disposed) {
       return;
@@ -155,8 +289,69 @@ final class AkEngineDartFacade implements AkEngineFacade {
     _engine = null;
   }
 
+  // -- AkStagedEngineOwner (E4 stages B/C/D; C08 open-once) --------------
+
+  @override
+  DynamicLibrary get library => openLibrary();
+
+  @override
+  DynamicLibrary openLibrary() {
+    if (_disposed) {
+      throw StateError('AkEngineDartFacade is disposed');
+    }
+    final opened = _library;
+    if (opened != null) {
+      return opened; // open ONCE — every stage reuses this handle
+    }
+    final injected = _engine;
+    if (injected != null && !injected.isDisposed) {
+      // Engine-injected seam: its library is already open.
+      return _library = injected.bindings.library;
+    }
+    final path = _dllPathForOpen();
+    _log.write('dll_open_before');
+    final library = DynamicLibrary.open(path);
+    _log.write('dll_open_after');
+    return _library = library;
+  }
+
+  /// The one open path: the injected [AkStagedEngineOwner] resolution
+  /// (C08), else the legacy lazy three-tier probe.
+  String _dllPathForOpen() {
+    final injected = _dllPath;
+    if (injected != null) {
+      return injected;
+    }
+    final resolution = resolveAkDllPath();
+    if (resolution == null) {
+      // Reuse AkEngineBackend's probe-diagnostics exception shape.
+      throw _DllMissing();
+    }
+    return _dllPath = resolution.path;
+  }
+
+  @override
+  List<String> probeTaskExports() {
+    _log.write('probe_task_exports_before');
+    final missing = AkTaskFfiBindings.missingTaskExports(openLibrary());
+    _log.write('probe_task_exports_after');
+    return missing;
+  }
+
+  @override
+  void engineNew() {
+    _engineOrThrow();
+  }
+
+  @override
+  Pointer<AkEngine> get engineHandle => _engineOrThrow().nativeHandle;
+
   /// Opens (once) and returns the engine handle; missing DLL throws so the
   /// caller can degrade. A disposed facade always throws [StateError].
+  ///
+  /// The engine is created OVER the already-open library (C08: probe the
+  /// exports first, then `ak_engine_new` on the same handle — no second
+  /// `DynamicLibrary.open`, no re-resolution of the path).
   AkEngineDart _engineOrThrow() {
     if (_disposed) {
       throw StateError('AkEngineDartFacade is disposed');
@@ -165,13 +360,13 @@ final class AkEngineDartFacade implements AkEngineFacade {
     if (existing != null && !existing.isDisposed) {
       return existing;
     }
-    final resolution = resolveAkDllPath();
-    if (resolution == null) {
-      // Reuse AkEngineBackend's probe-diagnostics exception shape.
-      throw _DllMissing();
-    }
-    _engine = AkEngineDart(dllPath: resolution.path);
-    return _engine!;
+    final library = openLibrary();
+    _log.write('engine_new_before');
+    final created = AkEngineDart(
+      bindings: AkFfiBindings(library: library, dllPath: _dllPath),
+    );
+    _log.write('engine_new_after');
+    return _engine = created;
   }
 
   /// The live engine handle for wave-22 borrowers: the pairing/scheduler

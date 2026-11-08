@@ -33,6 +33,16 @@ android {
         // armeabi-v7a libs WITHOUT libak_ffi.so — a 32-bit ARM phone
         // would install that variant and die at System.loadLibrary.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        // Hard strip: some AAR-native libs (e.g. datastore's shared-counter)
+        // slip past ndk.abiFilters and re-introduce an armeabi-v7a lib/ dir
+        // WITHOUT libak_ffi.so — a 32-bit phone would pick that ABI and die
+        // at System.loadLibrary. packaging.jniLibs.excludes removes every
+        // non-supported ABI dir outright.
+        packaging {
+            jniLibs {
+                excludes += listOf("lib/armeabi-v7a/**", "lib/x86/**")
+            }
+        }
     }
 
     buildTypes {

@@ -319,7 +319,7 @@ PeerBookStore::apply_pairing(
 | redeem 每设备 | 5 次/分钟，30 次/小时 |
 | redeem 每 IP / IPv6 前缀 | 60 次/分钟，另有全局限额 |
 | 同时 pending redeem | 每发起设备 4、每 owner 32、全局 4096 |
-| 邀请码创建 | 每 owner 6 次/小时 |
+| 邀请码创建 | 每 owner 30 次/小时（2026-11-09 从 6 上调：6/时对正常使用过紧，诊断期一设备即可烧尽） |
 | active 邀请码 | 每 owner 32 |
 | 名下配对关系 | 有界存储配额，建议首版 1024；达到上限明确拒绝 |
 | TLS / 未认证连接 | 独立握手并发、IP 预算、首帧与写入 deadline |

@@ -1563,6 +1563,14 @@ fn task_error_message(error: TaskError) -> String {
         {
             "the task code was already joined (one code pairs exactly once)".to_string()
         }
+        // RATE_LIMITED (0x2102, pairing-flow.md §12): the device exhausted
+        // its hourly invite-creation budget. Actionable copy beats the raw
+        // code — the user learns it REFILLS and roughly when.
+        TaskError::Flow(PairFlowError::Rejected { code })
+            if *code == ak_signal::protocol_v2::message::RATE_LIMITED =>
+        {
+            "rate limited: too many codes created this hour; the budget refills within an hour — wait and retry".to_string()
+        }
         TaskError::Flow(PairFlowError::Unavailable { .. }) => {
             "unknown task code (or expired, revoked, owner offline)".to_string()
         }

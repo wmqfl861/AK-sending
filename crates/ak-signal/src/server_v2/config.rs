@@ -24,7 +24,7 @@ pub const INVITE_TTL_MAX_SECS: u32 = 30 * 24 * 3600;
 /// Active invites one owner may hold (contract §11).
 pub const MAX_ACTIVE_INVITES_PER_OWNER: usize = 32;
 /// Invite claims one owner may make per hour (contract §11).
-pub const INVITE_CLAIMS_PER_HOUR: u32 = 6;
+pub const INVITE_CLAIMS_PER_HOUR: u32 = 30;
 /// Simultaneously pending redeems per issuing owner (contract §11).
 pub const MAX_PENDING_REDEEM_PER_OWNER: usize = 32;
 /// Server-wide simultaneously pending redeems (contract §11).

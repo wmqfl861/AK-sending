@@ -474,6 +474,17 @@ struct TaskStack {
     pairing: TaskPairing,
     owner_loop: StdMutex<Option<JoinHandle<()>>>,
     event_pump: StdMutex<Option<JoinHandle<()>>>,
+    /// Wave 34 (Android "unknown task code" after idle): the registry
+    /// drops idle sessions at its 120 s SESSION_TTL, and a code owner
+    /// sitting on "waiting for the peer" goes silently offline — the
+    /// phone's join then gets 0x2101 PAIR_UNAVAILABLE ("owner offline")
+    /// even though the GUI still shows a live code. This keeper does two
+    /// things on the SHARED registry client: a keepalive ping well inside
+    /// the TTL (so the session never idles out), and a reconnect whenever
+    /// the client reports Disconnected (server restart, NAT drop, WiFi
+    /// change) — pairing-plane subscriptions survive reconnection by
+    /// design, so the owner loop keeps answering redeems across the gap.
+    keeper: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl TaskStack {
@@ -486,6 +497,11 @@ impl TaskStack {
             }
         }
         if let Ok(mut slot) = self.event_pump.lock() {
+            if let Some(task) = slot.take() {
+                task.abort();
+            }
+        }
+        if let Ok(mut slot) = self.keeper.lock() {
             if let Some(task) = slot.take() {
                 task.abort();
             }
@@ -1269,7 +1285,48 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         pairing,
         owner_loop: StdMutex::new(None),
         event_pump: StdMutex::new(None),
+        keeper: StdMutex::new(None),
     });
+    // Wave 34: keepalive + reconnect keeper on the shared registry client
+    // (see the TaskStack::keeper field docs). Ping every 20s (well inside
+    // the 30s FRAME_IO_DEADLINE — 45s was already too sparse and the server cut the idle owner at 30s); reconnect on Disconnected.
+    {
+        let client = stack.pairing.orchestrator().client().clone();
+        let keeper_rt = Arc::clone(rt);
+        let keeper = tokio::spawn(async move {
+            let mut state = client.state_watcher();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+                        if keeper_rt.is_stopped() {
+                            break;
+                        }
+                        // Keepalive: a ping inside the TTL keeps the
+                        // session from being swept as idle. A failure here
+                        // means the connection just dropped — the state
+                        // watcher arm below performs the recovery.
+                        let _ = client.ping().await;
+                    }
+                    _ = state.changed() => {
+                        if keeper_rt.is_stopped() {
+                            break;
+                        }
+                        if matches!(
+                            *state.borrow_and_update(),
+                            ak_session::pairing::ClientState::Disconnected
+                        ) {
+                            // Subscriptions survive reconnection; a bounded
+                            // backoff is built into client.reconnect().
+                            let _ = client.reconnect().await;
+                        }
+                    }
+                }
+            }
+        });
+        if let Ok(mut slot) = stack.keeper.lock() {
+            *slot = Some(keeper);
+        }
+    }
     // Wave 30 (review 2026-11-07, P1-05): the PRODUCTION owner loop runs
     // behind the same pre-commit redeem-offer gate the library's
     // `TaskPairing::spawn_owner_loop` installs. This stack deliberately

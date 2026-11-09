@@ -1116,9 +1116,14 @@ void main() {
       expect(fake.pollEventCallCount, pollsBeforeLatch + 1,
           reason: '闩上后仅本次越限轮询，其后泵不再触达原生');
 
-      // The latch is TERMINAL: a later successful action never masks it.
-      final created = await service.createCode(SimpleTransferRole.sender);
-      expect(created.code.startsWith('AKI1-'), isTrue);
+      // The latch is TERMINAL: a later action ends with the SAME failure
+      // (R36-P2-03 — never runs against the broken engine) and no state
+      // transition ever masks it.
+      await expectLater(
+        service.createCode(SimpleTransferRole.sender),
+        throwsA(isA<StateError>().having(
+            (e) => e.message, 'message', contains('传输引擎故障'))),
+      );
       expect(service.phase, SimpleTransferPhase.engineFailed,
           reason: '任何后续状态迁移都不遮蔽 engineFailed');
       service.dispose();
@@ -1229,6 +1234,128 @@ void main() {
       expect(service.failureReason, contains('租约'));
       expect(fake.pollEventCallCount, polls,
           reason: '原生从未被触达：StateError 在绑定层就挡住了');
+      service.dispose();
+    });
+
+    test('R36-P2-02: healthy events + persistently failing progress poll '
+        'latch engineFailed at the 10th consecutive tick', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      // The events channel stays healthy; ONLY the native progress poll
+      // keeps failing (the exact split the old reset bug hid — each tick
+      // was 0→1→0 and the latch could never trip).
+      fake.failPollProgressCalls = 1000;
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        service.pumpEvents();
+        expect(
+            service.isEngineFailed, isFalse,
+            reason: '阈值前不闩：第 ${i + 1} 次失败仍在瞬态区间');
+      }
+      service.pumpEvents(); // the threshold failure
+      expect(service.isEngineFailed, isTrue,
+          reason: '事件通道健康不得清零进度通道的连续失败计数');
+      expect(service.phase, SimpleTransferPhase.engineFailed);
+      expect(service.failureReason, contains('进度事件轮询失败'));
+      expect(service.failureReason, contains(fake.pollProgressFailureDetail),
+          reason: '可观察错误带上最后一次原生失败细节');
+      service.dispose();
+    });
+
+    test('R36-P2-02: a FULLY clean tick (events + progress both healthy) '
+        'still resets the progress-failure streak', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        fake.failPollProgressCalls = 1;
+        service.pumpEvents(); // events healthy, progress fails once
+      }
+      service.pumpEvents(); // both channels clean: the streak resets
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold - 1; i++) {
+        fake.failPollProgressCalls = 1;
+        service.pumpEvents();
+      }
+      expect(service.isEngineFailed, isFalse,
+          reason: '9 + 全净 + 9 不是“连续”10 次（进度通道同理）');
+      service.dispose();
+    });
+
+    test('R36-P2-02: drainProgress reports the explicit poll outcome '
+        '(polled=false on native failure, clean=true when healthy)', () {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      expect(service.drainProgress().clean, isTrue,
+          reason: '健康时（队列空）poll 到头且无坏行');
+      fake.failPollProgressCalls = 1;
+      expect(service.drainProgress().polled, isFalse,
+          reason: '原生轮询异常必须显式报告为“未完成”，不再折叠成 0');
+      expect(service.drainProgress().clean, isTrue,
+          reason: '单次失败后的干净调用照常 poll 到头');
+      service.dispose();
+    });
+
+    test('R36-P2-03: the latch fans out on the replayable engineHealth '
+        'stream; a late subscriber replays it; entries end with the SAME '
+        'failure', () async {
+      final fake = FakeAkTaskCalls();
+      final service = booted(fake);
+      final health = <EngineHealth>[];
+      final sub = service.engineHealth.listen(health.add);
+      await pumpEventQueue();
+      expect(health, hasLength(1), reason: '订阅即快照：先收到当前健康态');
+      expect(health.single.isEngineFailed, isFalse);
+
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold; i++) {
+        fake.failPollEventCalls = 1;
+        service.pumpEvents();
+      }
+      await pumpEventQueue();
+      expect(health, hasLength(2), reason: '闩上即刻推送（不是只改内部字段）');
+      expect(health.last.isEngineFailed, isTrue);
+      expect(health.last.failureReason, service.failureReason);
+      expect(health.last.failureReason, contains('传输引擎故障'));
+
+      // A LATE subscriber replays the latched state without any new event.
+      final late = <EngineHealth>[];
+      final lateSub = service.engineHealth.listen(late.add);
+      await pumpEventQueue();
+      expect(late, hasLength(1));
+      expect(late.single.isEngineFailed, isTrue,
+          reason: '回放契约：迟到的订阅者也看到闩上的故障');
+
+      // Entries after the latch end with the SAME failure (R36-P2-03).
+      expect(() => service.sendFiles('ab' * 16, const ['C:/x']),
+          throwsA(isA<StateError>().having(
+              (e) => e.message, 'message', contains('传输引擎故障'))));
+      await sub.cancel();
+      await lateSub.cancel();
+      service.dispose();
+    });
+
+    test('R36-P2-03: an IN-FLIGHT op ends with the same engine failure at '
+        'its next poll tick (never hangs to its own timeout)', () async {
+      final fake = FakeAkTaskCalls(autoCompleteOps: false);
+      final service = SimpleTransferService(
+        calls: fake,
+        delay: immediate,
+        eventPollInterval: const Duration(days: 1),
+      );
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/p203');
+
+      final pending = service.createCode(SimpleTransferRole.sender);
+      // The engine latches while the op is still waiting on microtask
+      // polls — the waiter's next ensureLive iteration must abort with
+      // the engine failure, not a timeout and not another seam call.
+      for (var i = 0; i < SimpleTransferService.pollFailureThreshold; i++) {
+        fake.failPollEventCalls = 1;
+        service.pumpEvents();
+      }
+      expect(service.isEngineFailed, isTrue);
+      await expectLater(
+        pending,
+        throwsA(isA<StateError>().having(
+            (e) => e.message, 'message', contains('传输引擎故障'))),
+      );
       service.dispose();
     });
   });

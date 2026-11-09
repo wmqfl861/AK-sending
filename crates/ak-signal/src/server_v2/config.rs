@@ -23,7 +23,8 @@ pub const INVITE_TTL_MIN_SECS: u32 = 60;
 pub const INVITE_TTL_MAX_SECS: u32 = 30 * 24 * 3600;
 /// Active invites one owner may hold (contract §11).
 pub const MAX_ACTIVE_INVITES_PER_OWNER: usize = 32;
-/// Invite claims one owner may make per hour (contract §11).
+/// Invite claims one owner may make per hour (contract §11; raised from 6
+/// to 30 on 2026-11-09 — 6/hour proved too tight for normal use).
 pub const INVITE_CLAIMS_PER_HOUR: u32 = 30;
 /// Simultaneously pending redeems per issuing owner (contract §11).
 pub const MAX_PENDING_REDEEM_PER_OWNER: usize = 32;
@@ -149,7 +150,10 @@ mod tests {
         // The frozen numbers themselves (task A2 / contract §11).
         assert_eq!(REDEEM_PER_CONN_PER_MIN, 10);
         assert_eq!(REDEEM_GLOBAL_PER_MIN, 60);
-        assert_eq!(INVITE_CLAIMS_PER_HOUR, 6);
+        // 2026-11-09: the contract raised the per-owner claim budget from
+        // 6 to 30 per hour (pairing-flow.md §11/§12 note); the frozen
+        // literal follows the contract (R36-P2-06).
+        assert_eq!(INVITE_CLAIMS_PER_HOUR, 30);
         assert_eq!(MAX_ACTIVE_INVITES_PER_OWNER, 32);
         assert_eq!(MAX_RELATIONS_PER_OWNER, 1024);
         assert_eq!(INVITE_TTL_MIN_SECS, 60);

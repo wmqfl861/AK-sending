@@ -1287,42 +1287,33 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         event_pump: StdMutex::new(None),
         keeper: StdMutex::new(None),
     });
-    // Wave 34: keepalive + reconnect keeper on the shared registry client
-    // (see the TaskStack::keeper field docs). Ping every 20s (well inside
-    // the 30s FRAME_IO_DEADLINE — 45s was already too sparse and the server cut the idle owner at 30s); reconnect on Disconnected.
+    // Wave 36 (R36-P1-02): the shared connection keeper from ak-session
+    // (RegistryClient::spawn_connection_keeper — the same component the
+    // CLI task plane and the daemon use since this wave): 20s ping inside
+    // the 30s FRAME_IO_DEADLINE, bounded-backoff reconnect on Disconnected
+    // (a failed batch now terminal-publishes Disconnected, so recovery
+    // continues across prolonged outages), 3-timeout black-hole recovery.
+    // Shutdown rides the runtime-stopped watch: stop flips it, the keeper
+    // exits; abort_tasks still aborts the handle for prompt teardown.
     {
         let client = stack.pairing.orchestrator().client().clone();
-        let keeper_rt = Arc::clone(rt);
-        let keeper = tokio::spawn(async move {
-            let mut state = client.state_watcher();
+        // Shutdown: poll the runtime-stopped flag at the ping cadence —
+        // abort_tasks() also aborts the handle on teardown, so the poll
+        // is a cooperative fast path, not the only exit.
+        let stop_rt = Arc::clone(rt);
+        let (keeper_stop_tx, keeper_stop_rx) =
+            tokio::sync::watch::channel(false);
+        let _watcher = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
-                        if keeper_rt.is_stopped() {
-                            break;
-                        }
-                        // Keepalive: a ping inside the TTL keeps the
-                        // session from being swept as idle. A failure here
-                        // means the connection just dropped — the state
-                        // watcher arm below performs the recovery.
-                        let _ = client.ping().await;
-                    }
-                    _ = state.changed() => {
-                        if keeper_rt.is_stopped() {
-                            break;
-                        }
-                        if matches!(
-                            *state.borrow_and_update(),
-                            ak_session::pairing::ClientState::Disconnected
-                        ) {
-                            // Subscriptions survive reconnection; a bounded
-                            // backoff is built into client.reconnect().
-                            let _ = client.reconnect().await;
-                        }
-                    }
+                if stop_rt.is_stopped() {
+                    let _ = keeper_stop_tx.send(true);
+                    break;
                 }
+                interval.tick().await;
             }
         });
+        let keeper = client.spawn_connection_keeper(keeper_stop_rx);
         if let Ok(mut slot) = stack.keeper.lock() {
             *slot = Some(keeper);
         }

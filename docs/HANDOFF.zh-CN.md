@@ -58,12 +58,16 @@
 - UI：导航收敛为**连接＋设置**两页（生码选角色/输码自动探测/连接列表/详情页系统选择器/入站横幅接受→进度→保存路径；唯一设置＝默认保存文件夹；旧身份/指纹/配对簿/邀请码页全部移除；390dp 回归测试）。
 - 验证（`7458e9f` 时点）：workspace 1085/0＋clippy 干净＋契约 5/5；dart 128/128、flutter 86/86；升级后 v2 服务器跨设备向后兼容 6/6（W→L 4.3s、L→W 19.4s，SHA256 一致）。
 
-**第二十九波（进行中，修复在未提交工作树）——wave-28 终审修复轮**。终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`；P0×0 / P1×6 / P2×15；结论"不宜按已完成通过终审"，最直接阻断是 GUI 入口 Fake、八位码校验、方向错误、快照缺失）。修复状态（已完成／在途如实区分）：
+**第二十九波（已收口）——wave-28 终审修复轮**。终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`；P0×0 / P1×6 / P2×15；结论"不宜按已完成通过终审"，最直接阻断是 GUI 入口 Fake、八位码校验、方向错误、快照缺失）。**修复状态（2026-11-09 同步）：21 项已全部关闭**——wave-29（`77d9559`）关 P1×6＋P2-08/09/10/11 等，wave-30（`5dade17`）关 2 个未关 P1 生产接线＋13 个部分残项＋5 个新 P2，wave-31（`df7d4ee`）关 dispose 悬空指针 P1＋续期路径＋终态/迟到事件竞态；第三轮复核（`reports/codex-recheck3-2026-11-07-wave31.md`）总结论**通过**（历史 31 项 26 关闭/5 文档化边界/0 未关闭，余 2 项 P3 当轮顺手修复）。收口验证：workspace 1123/0＋clippy 干净＋契约 5/5；dart 139/139、flutter 133/133；真机 E2E（Windows 4/4、Android 模拟器 4P/2S/0F）；跨设备向后兼容 6/6；服务器 122.51.121.24 运行 v2 协议。
+- 口径变化：**v1 一次性任务码模型为 GUI 主线路径**；旧 invite/调度多码模型（`invite create/redeem`、`daemon --pairing`、两维并发策略）保留为 **CLI 高级能力**。v1 任务码自第三十二波（`0cf1382`，`ak-cli task code-send/code-recv/join-send/join-recv`）起**已接入 CLI**，不再是 GUI-only。
 
-- 已完成：P1-03 服务器额度竞态（Commit 同事务复查 `max_redeems`，含竞态/cap>1/不消耗额度三类测试）；P2-13 迁移原子性（单一写事务＋可重入）；P2-14 幂等跨版本（默认扩展保持 v1 36B canonical body，旧 journal 升级后重放幂等）；P1-05 会话侧方向前置门禁（`join_task_code` 显式 `my_direction`＋`veto_task_offer` 在 RedeemOffer 阶段否决，Dart 已传显式角色）；P1-01 Dart 真接线（`main()` 构造真实栈，构造失败降级错误卡片，Fake 仅测试注入）；P1-02 真实 AKI1 码格式（UI 接受完整 `AKI1-…` 码）；P1-06 流快照（逐订阅者快照＋后续事件）；P2-08/09/10/11（协调断开与直连状态分离、探测真值归并、终态跟踪替代固定超时、30s 自动拒绝关横幅且过期拒绝幂等）。
-- 在途（无法预知结果）：P1-04 FFI 接收器身份绑定（接收器 `authorize` 绑定配对已验证指纹、`ConsentInfo.sender_fingerprint`、陌生身份不触发合法任务提示——工作树已有实质实现与测试，收口验收进行中）；P2×9：P2-01 request_id 原子受理、P2-02 并发懒初始化、P2-03 空闲断开跨设备通知、P2-04 未加入码取消/TTL、P2-05 接收器终态收敛、P2-06 保存目录变更时点、P2-07 consent 阻塞 worker、P2-12 echo 响应互投、P2-15 endpoint 缓存回收。
-- 验证基线（如实）：dart 129/129、flutter 107/107（wave-29 工作树时点）；workspace 1085/0 为 wave-28 时点（`7458e9f`），wave-29 修复后未复跑全量；契约 5/5；跨设备向后兼容 6/6；服务器 122.51.121.24 已运行 v2 协议。
-- 口径变化：**v1 一次性任务码模型为 GUI 主线路径**；旧 invite/调度多码模型（`invite create/redeem`、`daemon --pairing`、两维并发策略）保留为 **CLI 高级能力**，两条路径并存、CLI 未接 v1 任务码（GUI-only）。
+## 第三十二至三十五波：CLI 任务码、crash-analysis 关闭、限额与 keeper（2026-11-07/09，dev/local-parallel）
+
+- 第三十二波（`0cf1382`）：v1 任务码接入 CLI（ak-session `TaskPairing`＋ak-engine 公开 API，不依赖 ak-ffi）；`cargo test -p ak-cli` 138/138＋真注册表 loopback 双终端手工冒烟。
+- 第三十三波（`3eb931f`＋`bcf5de0`）：Codex crash-analysis **C01–C14 全部 14 项关闭**（含 C07 FFI 绑定租约、C12 Dart 泵预算/故障闩）＋E4 分段诊断宿主；Windows GUI 启动崩溃修复；wave-33 独立复核通过。
+- 第三十四波（`8e5ba7e`）：RATE_LIMITED 友好文案＋claim 限额 6→**30 次/小时**（按 owner 持久计数、含撤销后的行；30/时限的是 claim——redeem 是另一组预算：每连接 10 次/分钟＋全局 60 次/分钟）。
+- 第三十五波（`e7fc1e0`＋`37a57c0`）：任务面 registry keeper——共享 registry 控制连接 20 秒保活 ping＋Disconnected 自动重连（配对订阅跨重连保留），修复空闲后 "unknown task code"；保活间隔必须落在服务器 **30 秒 FRAME_IO_DEADLINE** 静默断连预算之内（不是 120 秒 SESSION_TTL）。Android jniLibs 随 keeper 刷新。
+- 第三十六波（2026-11-09，进行中，工作树未提交）：全项目终审 `reports/codex-full-review-2026-11-09.md`（13 项：P1×5/P2×8，基线 `37a57c0`）修复轮。
 
 ## 实现与验证边界（如实）
 
@@ -91,10 +95,10 @@ README 初始化提交：`4923b178860de198867f6de7b7d9cb7942200bb3`。
 2026-11-02 方案评审见 [方案评审](REVIEW_2026-11-02.zh-CN.md)；D1/D5/D6 已按所有者指示经 ADR-002 采纳，D2/D3 细节仍待确认。
 第一阶段验证记录见 [Rust 验证记录](../reports/rust-validation-2026-11-02.txt)、[上传验收记录](../reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。
 
-## 下一工程节点（更新到第二十八/二十九波，2026-11-06）
+## 下一工程节点（更新到第三十六波，2026-11-09）
 
-1. **wave-29 终审修复收口（当前主线，进行中）**：P1-04 FFI 接收器身份绑定＋P2×9（P2-01/02/03/04/05/06/07/12/15）在途；收口门槛＝workspace 全量复跑（当前 1085/0 为 `7458e9f` 时点）＋clippy＋契约 5/5＋dart/flutter 复跑＋终审报告"后续验证建议"表中实际 GUI 接线、单次额度、身份绑定、生命周期、并发时序、存储长传输六组场景（`reports/codex-review-2026-11-06-wave28.md`）。
-2. **v1 极简模型双端 GUI 验收（主线路径）**：真实 `main()` 启动（wave-29 P1-01 已接线）、双方各生一次真实 AKI1 码、真实码复制/输入（P1-02）、稳定连接进详情发送（P1-06）、同意后字节一致——P1-04 收口后补陌生第三方抢先拨号的负例。Android 侧 v1 极简 UI 走查（System UI ANR 史见下第 6 条）。
+1. **wave-36 全项目终审修复轮（当前主线，进行中）**：`reports/codex-full-review-2026-11-09.md`（P1×5/P2×8，基线 `37a57c0`）。wave-28~31 终审修复已于 2026-11-07 收口（`77d9559`/`5dade17`/`df7d4ee`，第三轮复核通过）；本轮最直接阻断＝CLI 任务码等待链无保活（P1-01，registry v2 完整入站帧静默 30 秒断连）与 FFI 重连耗尽后停留 Connecting（P1-02）。
+2. **v1 极简模型双端 GUI 验收（主线路径）**：真实 `main()` 启动（wave-29 P1-01 已接线）、双方各生一次真实 AKI1 码、真实码复制/输入（P1-02）、稳定连接进详情发送（P1-06）、同意后字节一致——陌生第三方抢先拨号负例已随 wave-29 P1-04 收口。CLI 等价入口＝`ak-cli task` 族（`0cf1382`）。Android 侧 v1 极简 UI 走查（System UI ANR 史见下第 6 条）。
 3. **旧 invite/调度多码模型＝CLI 高级能力保留**：不进 v1 GUI 主线；`invite create/redeem`、`daemon --pairing` 两维并发（第二十七波 `5a5dac1`）与配对簿/mDNS 流程按 CLI 高级用法维护，向后兼容由服务器 v2 schema 迁移＋跨设备 6/6 保障。
 4. **物理双机跨网段实测（P0-01/P0-05/P0-07 依赖环境）**：Windows↔Linux 跨公网（`scripts/cross_device_test.sh`，部署服务器 122.51.121.24，6/6 PASS，2026-11-05）与 Android 模拟器↔宿主已通；剩余＝两台真实物理机（家宽/热点）公网直连成功率＋抓包级无中继证据（L3）。
 5. 所有者确认 D2（公网失败提示文案）与 D3（端口映射默认开关）；视实测结果冻结网络库 ADR（评审 D1 尾项）。

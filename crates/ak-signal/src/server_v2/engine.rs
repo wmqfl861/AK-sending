@@ -81,9 +81,17 @@ type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
 /// Budget for one TLS handshake after the TCP accept.
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum simultaneously served TLS connections (accepted-and-counted,
-/// including handshakes in progress); beyond it the handshake completes
-/// and the peer receives one `ServerError` before the disconnect.
+/// including handshakes in progress). Beyond it a connection may still
+/// complete the handshake and receive one `ServerError`, but those
+/// rejection tasks run under their own small budget
+/// ([`MAX_REJECT_TASKS`]) — past that budget the socket is dropped at
+/// accept time, so a flood of excess connections can never stack
+/// unbounded handshake work (R36-P1-03).
 const MAX_LIVE_CONNECTIONS: usize = 256;
+/// Simultaneous over-cap rejection tasks (the polite one-`ServerError`
+/// answer). Small by design: it bounds CPU/sockets/tasks spent on
+/// connections that are already past the real serving cap.
+const MAX_REJECT_TASKS: usize = 32;
 /// Deadline for the client's first frame — the `Hello` answering the
 /// `AuthChallenge` this server sends immediately after the handshake.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(15);
@@ -131,6 +139,7 @@ pub async fn serve_v2(
         limits,
         inner: Mutex::new(Inner::default()),
         conn_count: AtomicUsize::new(0),
+        reject_count: AtomicUsize::new(0),
     });
     log::info!(
         "v2 registry server listening on tls {} (registry {})",
@@ -164,55 +173,81 @@ pub async fn serve_v2(
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
                     // Reserve a live-connection slot at accept time: the
-                    // cap must also bound half-open handshakes.
+                    // cap must also bound half-open handshakes. The slot
+                    // is released by the task's RAII guard on EVERY exit
+                    // path (R36-P1-03): failed or timed-out TLS
+                    // handshake, ALPN mismatch, over-cap rejection,
+                    // cancellation (abort drops the future, running
+                    // `Drop`) and the normal connection-loop return.
                     let admitted = shared
                         .conn_count
                         .fetch_add(1, Ordering::SeqCst)
                         < MAX_LIVE_CONNECTIONS;
-                    if !admitted {
+                    if admitted {
+                        let task_id = alloc_conn_task_id(&shared);
+                        let conn_shared = Arc::clone(&shared);
+                        let slot = ConnSlotGuard::admitted(Arc::clone(&conn_shared), task_id);
+                        let task = tokio::spawn(async move {
+                            let _slot = slot;
+                            // P1-5: the TLS handshake itself is bounded.
+                            let stream = match tokio::time::timeout(
+                                TLS_ACCEPT_TIMEOUT,
+                                conn_shared.acceptor.accept(tcp),
+                            )
+                            .await
+                            {
+                                Ok(Ok(stream)) => stream,
+                                Ok(Err(e)) => {
+                                    log::debug!("v2 tls handshake with {peer} failed: {e}");
+                                    return;
+                                }
+                                Err(_) => {
+                                    log::debug!(
+                                        "v2 tls handshake with {peer} exceeded {:?}",
+                                        TLS_ACCEPT_TIMEOUT
+                                    );
+                                    return;
+                                }
+                            };
+                            if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
+                                log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
+                                return;
+                            }
+                            connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
+                        });
+                        register_conn_task(&shared, task_id, task);
+                    } else {
                         shared.conn_count.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    let task_id = admitted.then(|| {
-                        let mut inner = shared.lock();
-                        inner.next_conn_task_id = inner.next_conn_task_id.wrapping_add(1);
-                        inner.next_conn_task_id
-                    });
-                    let conn_shared = shared.clone();
-                    let task = tokio::spawn(async move {
-                        // P1-5: the TLS handshake itself is bounded.
-                        let mut stream = match tokio::time::timeout(
-                            TLS_ACCEPT_TIMEOUT,
-                            conn_shared.acceptor.accept(tcp),
-                        )
-                        .await
-                        {
-                            Ok(Ok(stream)) => stream,
-                            Ok(Err(e)) => {
-                                log::debug!("v2 tls handshake with {peer} failed: {e}");
-                                return;
-                            }
-                            Err(_) => {
-                                log::debug!(
-                                    "v2 tls handshake with {peer} exceeded {:?}",
-                                    TLS_ACCEPT_TIMEOUT
-                                );
-                                return;
-                            }
-                        };
-                        if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
-                            log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
-                            return;
-                        }
-                        match task_id {
-                            Some(id) => {
-                                connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
-                                conn_shared.conn_count.fetch_sub(1, Ordering::SeqCst);
-                                let mut inner = conn_shared.lock();
-                                inner.conn_tasks.remove(&id);
-                            }
-                            None => {
-                                // Over the global cap: one bounded
-                                // ServerError, then the connection dies.
+                        // Over the global cap. The polite rejection (one
+                        // bounded ServerError) still needs a full TLS
+                        // handshake, so it runs in its own task under a
+                        // SEPARATE small budget — never an unbounded
+                        // stack of handshakes past the real cap — and
+                        // every reject task is tracked like any other so
+                        // shutdown aborts it too. Past the reject budget
+                        // the socket is dropped at accept time.
+                        let budgeted = shared
+                            .reject_count
+                            .fetch_add(1, Ordering::SeqCst)
+                            < MAX_REJECT_TASKS;
+                        if budgeted {
+                            let task_id = alloc_conn_task_id(&shared);
+                            let conn_shared = Arc::clone(&shared);
+                            let slot = ConnSlotGuard::reject(Arc::clone(&conn_shared), task_id);
+                            let task = tokio::spawn(async move {
+                                let _slot = slot;
+                                let mut stream = match tokio::time::timeout(
+                                    TLS_ACCEPT_TIMEOUT,
+                                    conn_shared.acceptor.accept(tcp),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(stream)) => stream,
+                                    Ok(Err(_)) | Err(_) => return,
+                                };
+                                if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
+                                    return;
+                                }
                                 log::warn!(
                                     "v2 connection limit ({MAX_LIVE_CONNECTIONS}) reached; rejecting {peer}"
                                 );
@@ -224,13 +259,21 @@ pub async fn serve_v2(
                                 )
                                 .await;
                                 if matches!(sent, Ok(Ok(()))) {
-                                    let _ = stream.shutdown().await;
+                                    let _ = tokio::time::timeout(
+                                        TEARDOWN_GRACE,
+                                        stream.shutdown(),
+                                    )
+                                    .await;
                                 }
-                            }
+                            });
+                            register_conn_task(&shared, task_id, task);
+                        } else {
+                            shared.reject_count.fetch_sub(1, Ordering::SeqCst);
+                            log::warn!(
+                                "v2 connection limit ({MAX_LIVE_CONNECTIONS}) reached and \
+                                 reject budget ({MAX_REJECT_TASKS}) exhausted; dropping {peer}"
+                            );
                         }
-                    });
-                    if let Some(id) = task_id {
-                        shared.lock().conn_tasks.insert(id, task);
                     }
                 }
                 Err(e) => {
@@ -300,11 +343,9 @@ struct Inner {
     redeem_journal: HashMap<(DeviceId, RequestId), RedeemReplay>,
     next_conn_id: u64,
     /// Registry of live connection tasks so shutdown can abort them all
-    /// (P1-5); the strict live-connection cap is `Shared::conn_count`,
-    /// this map is the abort list. A task that exits in the tiny window
-    /// before its handle is registered leaves a finished handle behind —
-    /// harmless (abort on a finished task is a no-op) and swept at
-    /// shutdown.
+    /// (P1-5); the strict live-connection caps are `Shared::conn_count`
+    /// and `Shared::reject_count`, this map is the abort list. Each task
+    /// removes its own entry via its [`ConnSlotGuard`] (R36-P1-03).
     conn_tasks: HashMap<u64, JoinHandle<()>>,
     next_conn_task_id: u64,
     hello_replay: HelloReplayCache,
@@ -344,8 +385,90 @@ struct Shared {
     inner: Mutex<Inner>,
     /// Live (accepted, not yet finished) connections — the admission
     /// counter for [`MAX_LIVE_CONNECTIONS`], reserved atomically at
-    /// accept time and released when the connection task exits.
+    /// accept time and released by the owning task's [`ConnSlotGuard`]
+    /// on every exit path (R36-P1-03).
     conn_count: AtomicUsize,
+    /// Over-cap rejection tasks in flight — the admission counter for
+    /// [`MAX_REJECT_TASKS`], so a flood past the serving cap can never
+    /// stack unbounded handshake work (R36-P1-03).
+    reject_count: AtomicUsize,
+}
+
+/// Which admission counter a [`ConnSlotGuard`] releases on drop.
+enum SlotKind {
+    /// One of the [`MAX_LIVE_CONNECTIONS`] served-connection slots.
+    Live,
+    /// One of the [`MAX_REJECT_TASKS`] over-cap rejection slots.
+    Reject,
+}
+
+/// RAII ownership of one accepted connection's admission slot and
+/// shutdown-abort registration (R36-P1-03). The counter returns exactly
+/// once per connection task — failed or timed-out TLS handshake, ALPN
+/// mismatch, early return, cancellation (abort drops the future, running
+/// `Drop`) and the normal connection-loop exit — and the task removes
+/// itself from the abort list on the same paths. A task that exits in
+/// the tiny window before its handle is registered leaves a finished
+/// handle behind — harmless (abort on a finished task is a no-op) and
+/// swept at shutdown.
+struct ConnSlotGuard {
+    shared: Option<Arc<Shared>>,
+    task_id: u64,
+    kind: SlotKind,
+}
+
+impl ConnSlotGuard {
+    /// Guard for a connection holding one live-connection slot.
+    fn admitted(shared: Arc<Shared>, task_id: u64) -> Self {
+        Self {
+            shared: Some(shared),
+            task_id,
+            kind: SlotKind::Live,
+        }
+    }
+
+    /// Guard for an over-cap rejection task: tracked for shutdown abort,
+    /// but counted against [`MAX_REJECT_TASKS`], not the serving cap.
+    fn reject(shared: Arc<Shared>, task_id: u64) -> Self {
+        Self {
+            shared: Some(shared),
+            task_id,
+            kind: SlotKind::Reject,
+        }
+    }
+}
+
+impl Drop for ConnSlotGuard {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            match self.kind {
+                SlotKind::Live => {
+                    shared.conn_count.fetch_sub(1, Ordering::SeqCst);
+                }
+                SlotKind::Reject => {
+                    shared.reject_count.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            shared.lock().conn_tasks.remove(&self.task_id);
+        }
+    }
+}
+
+/// Fresh id for the shutdown-abort registry.
+fn alloc_conn_task_id(shared: &Shared) -> u64 {
+    let mut inner = shared.lock();
+    inner.next_conn_task_id = inner.next_conn_task_id.wrapping_add(1);
+    inner.next_conn_task_id
+}
+
+/// Track a spawned connection task so shutdown can abort it. A task
+/// that already exited unregisters itself via its guard; when that is
+/// observable (`is_finished`) the stale handle is not registered at all.
+fn register_conn_task(shared: &Shared, id: u64, task: JoinHandle<()>) {
+    let mut inner = shared.lock();
+    if !task.is_finished() {
+        inner.conn_tasks.insert(id, task);
+    }
 }
 
 impl Shared {
@@ -2776,6 +2899,224 @@ mod tests {
         );
         drop(held);
         drop(extra);
+        server.stop().await;
+    }
+
+    /// R36-P1-03: a failed handshake (peer dies before the TLS handshake
+    /// completes, or sends garbage into it) must return its admission
+    /// slot. A full cap's worth of failures may not lock legal clients
+    /// out until process restart — before the RAII guard the counter was
+    /// only released on the successful connection-loop path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn failed_handshakes_release_their_admission_quota() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // A full cap's worth of connections that close before the TLS
+        // handshake even starts, then a batch that connects, pushes
+        // garbage into the handshake, and closes. The tiny periodic
+        // yield keeps the OS accept backlog from saturating on hosts
+        // with a small listen queue.
+        for index in 0..MAX_LIVE_CONNECTIONS {
+            let stream = TcpStream::connect(server.addr).await.unwrap();
+            drop(stream);
+            if index.is_multiple_of(64) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        for index in 0..MAX_LIVE_CONNECTIONS {
+            let mut stream = TcpStream::connect(server.addr).await.unwrap();
+            let _ = stream.write_all(&[0xB0_u8; 32]).await;
+            drop(stream);
+            if index.is_multiple_of(64) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // Every failed handshake returned its slot: a legal client gets
+        // the AuthChallenge (an over-cap server would answer one
+        // ServerError instead). Poll with retries so the assertion does
+        // not race the failure cleanup; the deadline is the verdict.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut admitted = false;
+        while !admitted {
+            assert!(
+                Instant::now() < deadline,
+                "legal client never re-admitted after failed handshakes \
+                 (admission quota leaked)"
+            );
+            let mut probe = tls::connect_pinned(server.addr, &registry_id)
+                .await
+                .expect("tls handshake");
+            match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut probe)).await {
+                Ok(Ok(Some(bytes))) => {
+                    match CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message {
+                        CtrlMessage::AuthChallenge { .. } => admitted = true,
+                        CtrlMessage::ServerError { code, .. } => {
+                            assert_eq!(
+                                code, ERR_SESSION_LIMIT,
+                                "only the connection-cap error may intervene here"
+                            );
+                        }
+                        other => panic!("unexpected first frame: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected probe read: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Full end-to-end proof: Hello/Welcome still served.
+        let client = TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "c")
+            .await;
+        drop(client);
+        server.stop().await;
+    }
+
+    /// R36-P1-03: past the serving cap, polite rejections run under their
+    /// own small budget. Once that budget is pinned by silent sockets,
+    /// further over-cap connections are dropped at accept time — no
+    /// handshake task is spawned for them (the socket sees an immediate
+    /// close instead of parking until the TLS timeout), and shutdown
+    /// still tracks and reaps everything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn over_cap_flood_beyond_the_reject_budget_is_dropped_immediately() {
+        use tokio::io::AsyncReadExt as _;
+
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // Hold the cap's worth of live connections (TLS up, challenge
+        // read, never Hello — they stay counted until closed).
+        let mut held = Vec::new();
+        for _ in 0..MAX_LIVE_CONNECTIONS {
+            let mut stream = tls::connect_pinned(server.addr, &registry_id)
+                .await
+                .expect("tls handshake");
+            let bytes = read_frame(&mut stream).await.unwrap().expect("challenge");
+            match CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message {
+                CtrlMessage::AuthChallenge { .. } => {}
+                other => panic!("expected AuthChallenge, got {other:?}"),
+            }
+            held.push(stream);
+        }
+
+        // Pin the whole reject budget with plain TCP sockets that never
+        // start the TLS handshake (each holds one reject task parked in
+        // acceptor.accept until the TLS budget expires).
+        let mut silent = Vec::new();
+        for _ in 0..MAX_REJECT_TASKS {
+            silent.push(TcpStream::connect(server.addr).await.unwrap());
+        }
+
+        // The next over-cap connection is not even handshaked: the server
+        // closes it at accept time (immediate EOF/reset), it does not
+        // park until the TLS timeout.
+        let mut extra = TcpStream::connect(server.addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("no bytes may be sent to a dropped over-cap connection"),
+            Err(_) => panic!("over-cap connection must be dropped immediately, not parked"),
+        }
+
+        drop(held);
+        drop(silent);
+        drop(extra);
+        server.stop().await;
+    }
+
+    /// R36-P2-06: the per-owner hourly claim budget is exactly the
+    /// contract's 30 — the first 30 claims succeed, the 31st NEW claim
+    /// is `RATE_LIMITED`, and neither a reconnect (fresh control
+    /// connection, same identity) nor revoking codes resets the hour
+    /// window: the counter is persisted per owner, not held per
+    /// connection, and revoked rows still count.
+    #[tokio::test]
+    async fn hourly_claim_budget_boundary_is_thirty_and_survives_reconnect_and_revoke() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let key = DeviceKeyPair::generate();
+        let mut owner =
+            TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
+
+        // The first 30 claims of the hour succeed (distinct requests and
+        // lookups under one owner).
+        let mut first_code = None;
+        for index in 0..crate::server_v2::config::INVITE_CLAIMS_PER_HOUR {
+            let mut lookup = [0u8; 32];
+            lookup[..8].copy_from_slice(&u64::from(index).to_be_bytes());
+            owner
+                .send(&CtrlMessage::InviteClaim {
+                    request_id: random_id16(),
+                    lookup_digest: lookup,
+                    ttl_secs: 0,
+                })
+                .await;
+            match owner.recv().await {
+                CtrlMessage::InviteClaimed { code_id, .. } => {
+                    if index == 0 {
+                        first_code = Some(code_id);
+                    }
+                }
+                other => panic!(
+                    "claim {index} inside the 30/hour budget must succeed, got {other:?}"
+                ),
+            }
+        }
+        // The 31st NEW claim of the hour: RATE_LIMITED.
+        owner
+            .send(&CtrlMessage::InviteClaim {
+                request_id: random_id16(),
+                lookup_digest: [0xE1; 32],
+                ttl_secs: 0,
+            })
+            .await;
+        match owner.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, RATE_LIMITED),
+            other => panic!("expected RATE_LIMITED on the 31st claim, got {other:?}"),
+        }
+
+        // A reconnect (fresh control connection, same owner identity)
+        // does not reset the hour window.
+        drop(owner);
+        let mut owner2 =
+            TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
+        owner2
+            .send(&CtrlMessage::InviteClaim {
+                request_id: random_id16(),
+                lookup_digest: [0xE2; 32],
+                ttl_secs: 0,
+            })
+            .await;
+        match owner2.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, RATE_LIMITED),
+            other => panic!("reconnect must not reset the hourly window, got {other:?}"),
+        }
+
+        // Revoking a code does not reset the window either: the count
+        // includes revoked rows.
+        owner2
+            .send(&CtrlMessage::InviteRevoke {
+                request_id: random_id16(),
+                code_id: first_code.expect("the first claim answered"),
+                expected_revision: 1,
+            })
+            .await;
+        match owner2.recv().await {
+            CtrlMessage::InviteRevoked { .. } => {}
+            other => panic!("expected InviteRevoked, got {other:?}"),
+        }
+        owner2
+            .send(&CtrlMessage::InviteClaim {
+                request_id: random_id16(),
+                lookup_digest: [0xE3; 32],
+                ttl_secs: 0,
+            })
+            .await;
+        match owner2.recv().await {
+            CtrlMessage::PairError { code, .. } => assert_eq!(code, RATE_LIMITED),
+            other => panic!("revoke must not reset the hourly window, got {other:?}"),
+        }
         server.stop().await;
     }
 

@@ -506,12 +506,18 @@ impl TaskLink {
 type LinkWatch = tokio::sync::watch::Receiver<Option<TaskLink>>;
 
 /// The registry task stack of one CLI run: one client, one orchestrator
-/// (journal + trust book under `id_dir`), one `TaskPairing`, plus the
-/// task-aware owner loop behind the pre-commit redeem-offer gate
-/// (code-* verbs only — a joiner answers no redeems).
+/// (journal + trust book under `id_dir`), one `TaskPairing`, the
+/// connection keeper (wave 35, common ak-session component — 20 s ping +
+/// capped-backoff reconnect, R36-P1-01/R36-P1-02: without it the registry
+/// v2 server cuts an idle owner after 30 s of inbound silence while the
+/// CLI still displays a live task code), plus the task-aware owner loop
+/// behind the pre-commit redeem-offer gate (code-* verbs only — a joiner
+/// answers no redeems). All four task commands share exactly one stack
+/// per run.
 struct TaskStack {
     pairing: TaskPairing,
     owner_loop: Option<tokio::task::JoinHandle<()>>,
+    keeper: Option<tokio::task::JoinHandle<()>>,
     link_rx: LinkWatch,
 }
 
@@ -524,6 +530,14 @@ struct Session {
     events: tokio::sync::broadcast::Receiver<TaskEvent>,
     receiver: Option<tokio::task::JoinHandle<()>>,
     echo: Option<tokio::task::JoinHandle<()>>,
+    /// The connection lock heartbeat refresher (R36-P2-04).
+    lock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// Stops the connection keeper at teardown (the keeper additionally
+    /// ends itself when the client reaches Closed).
+    keeper_stop: tokio::sync::watch::Sender<bool>,
+    /// This run's hold on the identity's control connection; released
+    /// (file removed) when the session ends or the build failed midway.
+    lock: Option<ConnectionLock>,
     code_id: Option<[u8; 16]>,
     link: Option<TaskLink>,
     /// The pairing-completion publisher (the owner loop holds a clone; the
@@ -532,11 +546,17 @@ struct Session {
 }
 
 /// Build the run's registry stack: real pinned-TLS client, orchestrator
-/// with the task redeem window, `TaskPairing`, and — for code owners — the
-/// owner loop behind the redeem-offer gate (a same-direction join is
-/// vetoed BEFORE the server commits, so the code's single redeem survives
-/// the refusal).
+/// with the task redeem window, `TaskPairing`, the connection keeper on
+/// the shared client, and — for code owners — the owner loop behind the
+/// redeem-offer gate (a same-direction join is vetoed BEFORE the server
+/// commits, so the code's single redeem survives the refusal).
 async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
+    // R36-P2-04 (CLI side): one live control connection per identity per
+    // machine. The registry REPLACES an older same-device connection, so
+    // a second local process on the same id-dir would silently kick this
+    // one (and be kicked back); refuse loudly instead. The guard releases
+    // itself if anything below fails.
+    let lock = acquire_connection_lock(&cfg.id_dir)?;
     let (key, _) = crate::load_identity(&cfg.id_dir)?;
     let name = crate::whoami();
     let connect = RegistryClient::connect_with_config(
@@ -574,6 +594,18 @@ async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
         },
     );
     let (link_tx, link_rx) = tokio::sync::watch::channel(None);
+    // The connection keeper (R36-P1-01): keepalive pings inside the
+    // server's 30 s silence budget + reconnect with capped backoff +
+    // black-hole recovery, so a code owner waiting on "the peer to join"
+    // stays online for the whole code TTL. The common ak-session
+    // component — the same implementation the daemon uses.
+    let (keeper_stop, keeper_stop_rx) = tokio::sync::watch::channel(false);
+    let keeper =
+        pairing
+            .orchestrator()
+            .client()
+            .spawn_connection_keeper(keeper_stop_rx);
+    let lock_heartbeat = spawn_connection_lock_heartbeat(&lock);
     let mut owner_handle = None;
     if owner {
         // The pre-commit gate: veto a same-direction or endpoint-less join
@@ -611,11 +643,15 @@ async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
         stack: TaskStack {
             pairing: pairing.clone(),
             owner_loop: owner_handle,
+            keeper: Some(keeper),
             link_rx,
         },
         events: pairing.subscribe(),
         receiver: None,
         echo: None,
+        lock_heartbeat: Some(lock_heartbeat),
+        keeper_stop,
+        lock: Some(lock),
         code_id: None,
         link: None,
         link_tx,
@@ -701,6 +737,9 @@ impl Session {
         if let Some(task) = self.echo.take() {
             task.abort();
         }
+        if let Some(task) = self.lock_heartbeat.take() {
+            task.abort();
+        }
         if !completed {
             if let Some(link) = self.link.clone() {
                 close_notify_peer(&self.key, &link).await;
@@ -709,12 +748,116 @@ impl Session {
         if let Some(task) = self.stack.owner_loop.take() {
             task.abort();
         }
+        if let Some(task) = self.stack.keeper.take() {
+            let _ = self.keeper_stop.send(true);
+            task.abort();
+        }
         if let Some(code_id) = self.code_id {
             let pairing = self.stack.pairing.clone();
             let _ = tokio::time::timeout(Duration::from_secs(3), pairing.disconnect(code_id)).await;
         }
         let client = self.stack.pairing.orchestrator().client().clone();
         let _ = tokio::time::timeout(Duration::from_secs(1), client.close()).await;
+        // Release the identity's control connection (the last Arc of the
+        // terminal input source drops with the receiver's ctx; the
+        // detached stdin thread dies with the process).
+        if let Some(lock) = self.lock.take() {
+            drop(lock);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The per-identity control-connection lock (R36-P2-04, CLI side)
+// ---------------------------------------------------------------------------
+
+/// Lock file under `id_dir` marking which local process holds this
+/// identity's registry control connection (`pid` + heartbeat `unix-ms`).
+const CONNECTION_LOCK_FILE: &str = "registry-connection.lock";
+/// While holding, the session refreshes the heartbeat at this cadence.
+const CONNECTION_LOCK_REFRESH: Duration = Duration::from_secs(5);
+/// A heartbeat older than this means the holder crashed (or suspended):
+/// the lock is breakable by the next run. Generous versus the refresh
+/// cadence, short versus a user's patience.
+const CONNECTION_LOCK_STALE: Duration = Duration::from_secs(15);
+
+/// One parsed lock file (`pid heartbeat-ms`).
+struct LockHolder {
+    pid: u32,
+    beat_ms: u64,
+}
+
+fn parse_lock_holder(text: &str) -> Option<LockHolder> {
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let beat_ms = parts.next()?.parse().ok()?;
+    Some(LockHolder { pid, beat_ms })
+}
+
+fn write_lock_file(path: &Path) {
+    let _ = std::fs::write(path, format!("{}\n{}\n", std::process::id(), crate::now_unix_ms()));
+}
+
+/// The run's hold on the identity's control connection: acquired before
+/// the registry dial, released (file removed) on drop — including the
+/// failure paths inside [`open_session`].
+#[derive(Debug)]
+struct ConnectionLock {
+    path: PathBuf,
+}
+
+/// Claim the identity's control connection for THIS process
+/// ([`CONNECTION_LOCK_FILE`]). A live holder (fresh heartbeat, different
+/// PID) refuses loudly — the registry would otherwise let the two
+/// processes silently kick each other's connection forever. A stale lock
+/// (crashed/suspended holder, heartbeat past [`CONNECTION_LOCK_STALE`])
+/// or our own PID (same process) is broken/refreshed. Best-effort by
+/// design: no atomic file locking, only the documented pid+heartbeat
+/// protocol.
+fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
+    let path = id_dir.join(CONNECTION_LOCK_FILE);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(holder) = parse_lock_holder(&text) {
+            let age = crate::now_unix_ms().saturating_sub(holder.beat_ms);
+            if holder.pid != std::process::id()
+                && age < CONNECTION_LOCK_STALE.as_millis() as u64
+            {
+                bail!(
+                    "this identity is already holding a control connection (process {}); \
+                     reuse that process or pass a different --id-dir",
+                    holder.pid
+                );
+            }
+        }
+        // Unparseable, our own PID, or stale: breakable below.
+    }
+    write_lock_file(&path);
+    Ok(ConnectionLock { path })
+}
+
+/// Keep the heartbeat fresh while the session lives, so a later run on
+/// the same id-dir sees a LIVE holder (a crashed process stops
+/// refreshing and its lock goes stale).
+fn spawn_connection_lock_heartbeat(lock: &ConnectionLock) -> tokio::task::JoinHandle<()> {
+    let path = lock.path.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CONNECTION_LOCK_REFRESH).await;
+            write_lock_file(&path);
+        }
+    })
+}
+
+impl Drop for ConnectionLock {
+    fn drop(&mut self) {
+        // Remove the file only when it still names THIS process: a run
+        // that broke our stale lock (we suspended past the stale window)
+        // owns it now and must not be unlocked by our exit.
+        if let Ok(text) = std::fs::read_to_string(&self.path) {
+            if parse_lock_holder(&text).is_some_and(|holder| holder.pid == std::process::id()) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
@@ -765,6 +908,14 @@ async fn run_task_receiver(
     };
     let _ = first_addr.send(bound);
     let printer = crate::progress_printer("recv");
+    // The session's ONE managed terminal input source (R36-P2-01): a
+    // single detached reader thread serves every consent prompt of this
+    // run; expired prompts' answers are discarded by
+    // [`TerminalInput::answer`], never left to answer the next offer.
+    let terminal = match ctx.consent {
+        ConsentInput::Terminal => Some(TerminalInput::start()),
+        _ => None,
+    };
     let current_code = || -> [u8; 16] {
         code_slot
             .lock()
@@ -813,6 +964,7 @@ async fn run_task_receiver(
             let ctx = Arc::clone(&ctx);
             let link_rx = ctx.link_rx.clone();
             let consent_out_dir = out_dir.clone();
+            let consent_terminal = terminal.clone();
             Arc::new(move |info: &ConsentInfo| {
                 let Some(link) = link_rx.borrow().clone() else {
                     return ConsentAnswer::Now(false);
@@ -821,7 +973,7 @@ async fn run_task_receiver(
                     return ConsentAnswer::Now(false);
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                spawn_consent_decider(&ctx, info, &consent_out_dir, tx);
+                spawn_consent_decider(&ctx, info, &consent_out_dir, consent_terminal.clone(), tx);
                 ConsentAnswer::Pending(rx)
             })
         };
@@ -876,14 +1028,202 @@ fn handshake_failure_word(error: &ak_net::ConnectError) -> &'static str {
     }
 }
 
-/// Print the consent banner and decide: the terminal branch reads one
-/// stdin line on a blocking thread and races the window (an expired window
-/// declines — never auto-accepts); the scripted branches keep the engine's
-/// pending path exercised.
+// ---------------------------------------------------------------------------
+// The session terminal input source (R36-P1-04 / R36-P2-01)
+// ---------------------------------------------------------------------------
+
+/// One stdin read outcome as the reader thread reports it. EOF (`Ok(0)`)
+/// and I/O failures are NEVER "an empty answer" — a prompt that could not
+/// read a decision declines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StdinLine {
+    /// A line was read (`Ok(n > 0)`); `complete` = it ended in a real
+    /// newline (a final fragment at EOF does not).
+    Line { text: String, complete: bool },
+    /// End of input: closed stdin, an empty pipe, a finished heredoc.
+    Eof,
+    /// The read failed (bounded reason string).
+    Io(String),
+}
+
+impl StdinLine {
+    /// The consent verdict of one read (R36-P1-04): EOF, I/O failure, an
+    /// incomplete final line (input ended without Enter) and unrecognized
+    /// text all DECLINE; only a complete line that is empty (a genuine
+    /// Enter), `y` or `yes` accepts.
+    fn consent_decision(&self) -> bool {
+        match self {
+            StdinLine::Eof | StdinLine::Io(_) => false,
+            StdinLine::Line { text, complete } => {
+                if !complete {
+                    return false; // no real newline was ever read
+                }
+                matches!(
+                    text.trim().to_ascii_lowercase().as_str(),
+                    "" | "y" | "yes"
+                )
+            }
+        }
+    }
+}
+
+/// One line as the reader delivers it, stamped when it became available
+/// (the freshness boundary of a consent prompt: input older than the
+/// prompt answered a DEAD prompt).
+struct TerminalLine {
+    at: Instant,
+    kind: StdinLine,
+}
+
+/// The session-managed terminal input source (R36-P2-01): ONE plain OS
+/// thread reads stdin for the whole session — not one unowned blocking
+/// read per Offer. Each consent prompt ([`TerminalInput::answer`])
+/// discards input that predates it (the late answer to an EXPIRED
+/// prompt, or stray input), so a stale line can never silently accept
+/// the next offer, and no per-Offer reader tasks are left behind.
+///
+/// The reader is deliberately a detached OS thread rather than a Tokio
+/// blocking task: a parked `read_line` cannot be cancelled, and a
+/// blocking-pool task would hold the runtime (and thus process exit)
+/// open after the command already printed its summary; a detached
+/// thread simply dies with the process. When the session ends, the
+/// channel receiver drops, the thread's next send fails and it exits.
+struct TerminalInput {
+    lines: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<TerminalLine>>,
+}
+
+impl TerminalInput {
+    /// Start the session's one stdin reader thread. If the thread cannot
+    /// be spawned the source fails CLOSED: the failed spawn drops the
+    /// closure (and with it the sender), the channel then reports
+    /// "closed" and every prompt declines instead of silently waiting
+    /// out its window.
+    fn start() -> Arc<TerminalInput> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let _ = std::thread::Builder::new()
+            .name("ak-task-stdin".to_string())
+            .spawn(move || Self::read_loop(tx));
+        Arc::new(TerminalInput {
+            lines: tokio::sync::Mutex::new(rx),
+        })
+    }
+
+    /// The reader body: stdin lines → channel, forever. EOF and I/O
+    /// errors are delivered once (so the pending prompt declines with the
+    /// honest reason), then the thread ends.
+    fn read_loop(tx: tokio::sync::mpsc::Sender<TerminalLine>) {
+        let stdin = std::io::stdin();
+        loop {
+            let mut text = String::new();
+            let kind = match stdin.read_line(&mut text) {
+                Ok(0) => StdinLine::Eof,
+                Ok(_) => StdinLine::Line {
+                    complete: text.ends_with('\n'),
+                    text,
+                },
+                Err(error) => StdinLine::Io(error.to_string()),
+            };
+            let terminal = matches!(kind, StdinLine::Eof | StdinLine::Io(_));
+            let line = TerminalLine {
+                at: Instant::now(),
+                kind,
+            };
+            if tx.blocking_send(line).is_err() {
+                return; // the session ended
+            }
+            if terminal {
+                return; // stdin is finished for good
+            }
+        }
+    }
+
+    /// Ask the CURRENT consent question and wait one window:
+    ///
+    /// * input already queued BEFORE this question (the late answer to an
+    ///   expired prompt, stray keystrokes) is discarded — it can never
+    ///   answer this offer (R36-P2-01);
+    /// * EOF, I/O failure, an incomplete final line and an expired window
+    ///   all DECLINE (R36-P1-04);
+    /// * only a genuinely read Enter (an empty complete line), `y` or
+    ///   `yes` accepts.
+    async fn answer(&self, window: Duration) -> bool {
+        let started = Instant::now();
+        let mut lines = self.lines.lock().await;
+        while lines.try_recv().is_ok() {
+            // Answered a dead prompt (or arrived before this one): drop.
+        }
+        let deadline = started + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                print_expiry_note(window);
+                return false;
+            }
+            let line = match tokio::time::timeout(remaining, lines.recv()).await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    println!("[task] the terminal input closed: declined");
+                    return false;
+                }
+                Err(_elapsed) => {
+                    print_expiry_note(window);
+                    return false;
+                }
+            };
+            if line.at < started {
+                // Read completed before this prompt existed (it was parked
+                // in the sender when the prompt started): a dead prompt's
+                // answer — drop it and keep waiting.
+                continue;
+            }
+            let verdict = line.kind.consent_decision();
+            if !verdict {
+                match &line.kind {
+                    StdinLine::Eof => {
+                        println!("[task] stdin closed before an answer: declined");
+                    }
+                    StdinLine::Io(reason) => {
+                        println!("[task] cannot read the terminal ({reason}): declined");
+                    }
+                    StdinLine::Line {
+                        complete: false, ..
+                    } => {
+                        println!("[task] input ended without Enter: declined");
+                    }
+                    StdinLine::Line { text, .. } if !matches!(
+                        text.trim().to_ascii_lowercase().as_str(),
+                        "n" | "no"
+                    ) =>
+                    {
+                        println!(
+                            "[task] unrecognized answer {:?}: declined",
+                            text.trim()
+                        );
+                    }
+                    _ => {} // an explicit n/no declines silently
+                }
+            }
+            return verdict;
+        }
+    }
+}
+
+/// The inline-prompt expiry note (a fresh line first, because the prompt
+/// has no trailing newline).
+fn print_expiry_note(window: Duration) {
+    println!();
+    println!("[task] no answer within {}s: declined", window.as_secs());
+}
+
+/// Print the consent banner and decide: the terminal branch asks the
+/// session's managed input source ([`TerminalInput::answer`] declines on
+/// EOF/I/O/expiry — never auto-accepts); the scripted branches keep the
+/// engine's pending path exercised.
 fn spawn_consent_decider(
     ctx: &ReceiverCtx,
     info: &ConsentInfo,
     out_dir: &Path,
+    terminal: Option<Arc<TerminalInput>>,
     decide: tokio::sync::oneshot::Sender<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let window = ctx.consent_window;
@@ -917,21 +1257,12 @@ fn spawn_consent_decider(
                 );
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
-                let decision = tokio::select! {
-                    line = tokio::task::spawn_blocking(read_stdin_line) => {
-                        let answer = line.unwrap_or_default().trim().to_ascii_lowercase();
-                        match answer.as_str() {
-                            "" | "y" | "yes" => true,
-                            "n" | "no" => false,
-                            other => {
-                                println!("[task] unrecognized answer {other:?}: declined");
-                                false
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(window) => {
-                        println!();
-                        println!("[task] no answer within {}s: declined", window.as_secs());
+                let decision = match terminal {
+                    Some(source) => source.answer(window).await,
+                    None => {
+                        // No managed source (the reader thread could not
+                        // be spawned): fail closed.
+                        println!("[task] the terminal input is unavailable: declined");
                         false
                     }
                 };
@@ -939,17 +1270,6 @@ fn spawn_consent_decider(
             }
         }
     })
-}
-
-/// One stdin line for the terminal consent prompt (runs on a blocking
-/// thread; an unread line after a window expiry is harmless — the process
-/// exits with the task).
-fn read_stdin_line() -> String {
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(_) => line,
-        Err(_) => String::new(),
-    }
 }
 
 /// The echo responder body: answer ak-net hole-punch probe packets from
@@ -2345,5 +2665,262 @@ mod tests {
             .await
             .expect_err("nothing pairs");
         assert!(error.to_string().contains("expired"), "{error}");
+    }
+
+    // ---- R36-P1-04: the consent stdin contract --------------------------
+    // EOF, I/O errors and truncated input DECLINE; only a genuinely read
+    // newline (empty line), `y` or `yes` accepts.
+
+    impl TerminalInput {
+        /// Tests: build the source from a caller-fed channel (no stdin
+        /// reader thread involved).
+        fn from_receiver(rx: tokio::sync::mpsc::Receiver<TerminalLine>) -> Arc<TerminalInput> {
+            Arc::new(TerminalInput {
+                lines: tokio::sync::Mutex::new(rx),
+            })
+        }
+    }
+
+    fn stdin_line(text: &str) -> StdinLine {
+        StdinLine::Line {
+            text: text.to_string(),
+            complete: text.ends_with('\n'),
+        }
+    }
+
+    #[test]
+    fn consent_verdicts_pin_the_stdin_contract() {
+        // A genuine Enter (a complete empty line) accepts — the default Y.
+        assert!(stdin_line("\n").consent_decision());
+        assert!(stdin_line("   \n").consent_decision());
+        // Explicit yes/no.
+        assert!(stdin_line("y\n").consent_decision());
+        assert!(stdin_line("Y\n").consent_decision());
+        assert!(stdin_line("yes\r\n").consent_decision());
+        assert!(!stdin_line("n\n").consent_decision());
+        assert!(!stdin_line(" No \n").consent_decision());
+        assert!(!stdin_line("maybe\n").consent_decision());
+        // R36-P1-04: EOF and I/O failure are NOT an answer — decline.
+        assert!(!StdinLine::Eof.consent_decision());
+        assert!(!StdinLine::Io("broken pipe".to_string()).consent_decision());
+        // Input that ended WITHOUT a newline (a truncated pipe) never
+        // counts as Enter — decline even for `y`.
+        assert!(!StdinLine::Line {
+            text: "y".to_string(),
+            complete: false,
+        }
+        .consent_decision());
+        assert!(!StdinLine::Line {
+            text: String::new(),
+            complete: false,
+        }
+        .consent_decision());
+    }
+
+    #[tokio::test]
+    async fn terminal_input_answers_fresh_input_and_expires() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TerminalLine>(8);
+        let input = TerminalInput::from_receiver(rx);
+
+        // A fresh `y` line answers the prompt.
+        let asker = {
+            let input = Arc::clone(&input);
+            tokio::spawn(async move { input.answer(Duration::from_secs(2)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(TerminalLine {
+            at: Instant::now(),
+            kind: stdin_line("y\n"),
+        })
+        .await
+        .expect("feed a fresh answer");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), asker)
+                .await
+                .expect("bounded")
+                .expect("asker alive"),
+            "a fresh y accepts"
+        );
+
+        // A fresh EOF declines (never "empty = yes").
+        tx.send(TerminalLine {
+            at: Instant::now(),
+            kind: StdinLine::Eof,
+        })
+        .await
+        .expect("feed EOF");
+        let verdict = input.answer(Duration::from_secs(2)).await;
+        assert!(!verdict, "EOF declines");
+
+        // The window expires with no input at all.
+        let started = Instant::now();
+        let verdict = input.answer(Duration::from_millis(150)).await;
+        assert!(!verdict, "an expired window declines");
+        assert!(
+            started.elapsed() >= Duration::from_millis(140),
+            "the window was actually waited"
+        );
+    }
+
+    /// R36-P2-01: the answer to an EXPIRED prompt (input that predates
+    /// the next question) is discarded — it must never silently accept
+    /// the next offer.
+    #[tokio::test]
+    async fn terminal_input_discards_expired_prompts_answers() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TerminalLine>(8);
+        let input = TerminalInput::from_receiver(rx);
+
+        // A queued `y` that predates the question…
+        tx.send(TerminalLine {
+            at: Instant::now() - Duration::from_secs(1),
+            kind: stdin_line("y\n"),
+        })
+        .await
+        .expect("queue a stale answer");
+        // …and a fresh-looking `y` parked in the reader thread (read
+        // completed before the prompt started, delivered after the drain).
+        tx.send(TerminalLine {
+            at: Instant::now() - Duration::from_millis(1),
+            kind: stdin_line("y\n"),
+        })
+        .await
+        .expect("queue a second stale answer");
+
+        // The next prompt declines: both stale answers were discarded and
+        // the (short) window expires.
+        let started = Instant::now();
+        let verdict = input.answer(Duration::from_millis(200)).await;
+        assert!(!verdict, "stale answers never accept the next offer");
+        assert!(
+            started.elapsed() >= Duration::from_millis(190),
+            "the full window was waited after discarding"
+        );
+
+        // The channel is now empty: an Enter typed DURING the next prompt
+        // (sent after it started — pre-prompt input would be drained as
+        // stale by design) accepts.
+        let asker = {
+            let input = Arc::clone(&input);
+            tokio::spawn(async move { input.answer(Duration::from_secs(2)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(TerminalLine {
+            at: Instant::now(),
+            kind: stdin_line("\n"),
+        })
+        .await
+        .expect("feed a fresh Enter");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), asker)
+                .await
+                .expect("bounded")
+                .expect("asker alive"),
+            "a fresh Enter accepts after the stale ones were dropped"
+        );
+    }
+
+    // ---- R36-P2-04: the per-identity connection lock --------------------
+
+    fn write_holder_lock(id_dir: &Path, pid: u32, age: Duration) {
+        let beat = crate::now_unix_ms().saturating_sub(age.as_millis() as u64);
+        std::fs::write(
+            id_dir.join(CONNECTION_LOCK_FILE),
+            format!("{pid}\n{beat}\n"),
+        )
+        .expect("write the holder's lock");
+    }
+
+    #[test]
+    fn connection_lock_refuses_a_live_second_holder() {
+        let id_dir = identity_dir("lk-live");
+        write_holder_lock(id_dir.path(), 424_242, Duration::from_secs(1));
+        let error = acquire_connection_lock(id_dir.path())
+            .expect_err("a live holder must refuse a second process");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("424242"),
+            "the error names the holding process: {text}"
+        );
+        assert!(
+            text.contains("--id-dir"),
+            "the error tells the user how to proceed: {text}"
+        );
+    }
+
+    #[test]
+    fn connection_lock_breaks_stale_and_own_locks_and_releases() {
+        let id_dir = identity_dir("lk-stale");
+
+        // A crashed holder (heartbeat far past the stale window) is
+        // breakable.
+        write_holder_lock(id_dir.path(), 424_242, CONNECTION_LOCK_STALE * 4);
+        let lock = acquire_connection_lock(id_dir.path()).expect("stale lock is breakable");
+        let text = std::fs::read_to_string(id_dir.path().join(CONNECTION_LOCK_FILE)).unwrap();
+        assert!(
+            text.starts_with(&format!("{}\n", std::process::id())),
+            "the broken lock now names THIS process: {text:?}"
+        );
+        drop(lock);
+        assert!(
+            !id_dir.path().join(CONNECTION_LOCK_FILE).exists(),
+            "drop removes the lock we own"
+        );
+
+        // A fresh lock naming OUR OWN pid never refuses us (sequential
+        // runs of the same process).
+        write_holder_lock(id_dir.path(), std::process::id(), Duration::ZERO);
+        let lock = acquire_connection_lock(id_dir.path()).expect("own pid is not a conflict");
+        drop(lock);
+        assert!(!id_dir.path().join(CONNECTION_LOCK_FILE).exists());
+    }
+
+    /// R36-P1-01 (the real validation, loopback + a real v2 registry
+    /// fixture): the code owner idles FAR past the registry server's 30 s
+    /// inbound-silence cut — the connection keeper's 20 s pings keep the
+    /// session online, so a joiner arriving after 65 s still pairs and
+    /// transfers. Without a keeper the owner goes offline at ~30 s and the
+    /// join fails with "unknown task code (owner offline)".
+    #[tokio::test]
+    async fn keeper_keeps_an_idle_code_owner_online_past_the_silence_cut() {
+        let registry = TestRegistry::spawn();
+        let id_owner = identity_dir("idle-owner");
+        let id_joiner = identity_dir("idle-joiner");
+        let out_owner = identity_dir("idle-out");
+        let src = id_joiner.path().join("late.bin");
+        let hash = write_payload(&src, 64_000);
+
+        let (code_tx, code_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(run_code_recv(
+            receiver_cfg(
+                &id_owner,
+                &registry,
+                &out_owner,
+                ConsentInput::Scripted(true),
+                CONSENT_WINDOW,
+            ),
+            hooks(Some(code_tx), None, &no_cancel()),
+        ));
+        let code = code_rx.await.expect("code is displayed");
+
+        // Idle the owner past TWO server silence cuts (30 s each): the
+        // keeper's 20 s pings must keep the control session alive.
+        tokio::time::sleep(Duration::from_secs(65)).await;
+
+        let sent = run_join_send(
+            sender_cfg(&id_joiner, &registry, 600),
+            hooks(None, None, &no_cancel()),
+            code,
+            vec![src],
+        )
+        .await
+        .expect("a joiner arriving after the idle window still pairs");
+        assert_eq!(sent.files, 1);
+        assert_eq!(sent.bytes, 64_000);
+        let received = owner.await.expect("owner task").expect("code-recv ok");
+        assert_eq!(received.files, 1);
+        assert_eq!(
+            blake3::hash(&std::fs::read(out_owner.path().join("late.bin")).unwrap()),
+            hash
+        );
     }
 }

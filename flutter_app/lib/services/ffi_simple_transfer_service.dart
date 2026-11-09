@@ -76,6 +76,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
 
 import '../ui/service/simple_transfer_service.dart'
     show
+        EngineHealth,
         IncomingRequest,
         JoinResult,
         SimpleTransferService,
@@ -254,6 +255,16 @@ final class FfiSimpleTransferService implements SimpleTransferService {
       _engine.expiredIncomingRequests;
 
   @override
+  Stream<EngineHealth> get engineHealth =>
+      // R36-P2-03: forward the engine service's replayable health stream
+      // (each getter call builds a fresh per-listen pipeline, so the
+      // snapshot replay survives the mapping).
+      _engine.engineHealth.map((health) => health.isEngineFailed
+          ? EngineHealth.engineFailed(
+              health.failureReason ?? '连续原生轮询失败。')
+          : const EngineHealth.ok());
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     final decided = await _engine.consent(jobId, accept: accept);
     if (!decided) {
@@ -357,6 +368,13 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         // the wait here, never poll the (soon freed) native engine.
         if (_engine.isDisposed) {
           throw StateError('接收等待中止：任务服务已释放。');
+        }
+        // R36-P2-03: the engine-failed latch ends the receive wait
+        // PROMPTLY with the SAME visible failure — never let it hang to
+        // its own stall budget on an engine that stopped answering.
+        if (_engine.isEngineFailed) {
+          throw StateError(
+              '接收等待中止：${_engine.failureReason ?? '传输引擎已故障（连续轮询失败）。'}');
         }
         _engine.drainProgress();
         var advanced = false;

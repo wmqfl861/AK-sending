@@ -316,10 +316,10 @@ PeerBookStore::apply_pairing(
 | 层级 | 默认限制 |
 |---|---|
 | 既有帧限频 | 保持每连接 32 帧/秒、突发 64 |
-| redeem 每设备 | 5 次/分钟，30 次/小时 |
-| redeem 每 IP / IPv6 前缀 | 60 次/分钟，另有全局限额 |
+| redeem（已实现） | **每连接 10 次/分钟＋全局 60 次/分钟滑动窗口**（2026-11-09 基线 `37a57c0` 的 `server_v2` 生产值；重连获得新的每连接桶，全局窗口不因重连重置） |
+| redeem 每设备 / 每 IP / IPv6 前缀 | **设计建议，未等价实现**——当前实现为上面的共享双桶（每连接＋全局），没有按设备/按 IP 的 redeem 细分预算；如实记录该可用性边界 |
 | 同时 pending redeem | 每发起设备 4、每 owner 32、全局 4096 |
-| 邀请码创建 | 每 owner 30 次/小时（2026-11-09 从 6 上调：6/时对正常使用过紧，诊断期一设备即可烧尽） |
+| 邀请码创建（claim，已实现） | 每 owner **30 次/小时**（2026-11-09 wave-34 `8e5ba7e` 从 6 上调：6/时对正常使用过紧，诊断期一设备即可烧尽；按 owner 持久计数、含已撤销的行，重连与撤码不重置）。**claim 与 redeem 是两组独立预算** |
 | active 邀请码 | 每 owner 32 |
 | 名下配对关系 | 有界存储配额，建议首版 1024；达到上限明确拒绝 |
 | TLS / 未认证连接 | 独立握手并发、IP 预算、首帧与写入 deadline |
@@ -361,11 +361,12 @@ PeerBookStore::apply_pairing(
 
 ## 12a. wave-28 修订：`0x2109 REDEEM_EXHAUSTED` 与存储变更
 
-- `0x2109 REDEEM_EXHAUSTED`（第二十八波新增；wave-29 扩展到 Commit 竞争路径）：码行 `max_redeems ≥ 1` 且已达到 committed 配对数上限时，对新 redeemer 的立即拒绝码（scope＝Code，object＝code_id，`retry_after_ms=0`）；同一码上竞争 Commit 的超限 pending 也在判定性 `PairPrepared` 的事务内以同码失败（双端送达）。语义与第 4a 节同步。
+- `0x2109 REDEEM_EXHAUSTED`（第二十八波新增；wave-29 扩展到 Commit 竞争路径）：码行 `max_redeems ≥ 1` 且已达到 committed 配对数上限时的拒绝码，`retry_after_ms=0`，**两条路径的 scope 不同（与 §4a 及实现一致）**——(a) 对新 redeemer 的立即拒绝路径 scope＝**Code**，object＝code_id；(b) 同一码上竞争 Commit 的超限 pending 在判定性 `PairPrepared` 的事务内失败时 scope＝**Pairing**，object＝pairing_id（wave-30 R29-P2-01：使生产客户端分派与 orchestrator 等待方真正送达），双端收到明确错误。语义与第 4a 节同步。
 - 存储变更（registry schema v1 → v2，迁移为增量 `ALTER TABLE`，保留全部 tombstone/唯一性记录；wave-29 起迁移 DDL 与版本推进在同一写事务内原子完成，半迁移库按列存在性识别并补齐，见 `storage-schema.md` §5）：
   - `invite_codes` ＋ `owner_endpoint BLOB NULL`、`max_redeems INTEGER NOT NULL DEFAULT 0`；
   - `pairing_transactions` ＋ `owner_endpoint BLOB NULL`、`redeemer_endpoint BLOB NULL`（redeem 开始时从码行/redeem 帧快照）。
 - claim 幂等体的规范编码跨版本稳定（wave-29；wave-30 增补 36B/41B 等价条款，R29-P2-02）：默认扩展下与 v1 布局逐字节一致，升级前 journal 的旧 claim 记录升级后重放原响应；wave-28 服务器对默认扩展也无条件写入尾部，产生的 41 字节记录（`cap=0[4]+presence=0[1]` 全零尾）与 36B canonical 体视为**同一 canonical 请求**——重放比较在读取侧归一化，存量磁盘行不迁移、不改写，非默认扩展仍逐字节比较，真实 ttl/cap/endpoint 差异仍 `REQUEST_CONFLICT`（等价性与不可碰撞论证见 `storage-schema.md` §5）。
+- claim 幂等在 journal 回收后仍成立（2026-11-09 修订，R36-P2-05）：服务器把"同 owner+create_request_id 的既有请求"识别放在新建配额与 lookup 碰撞检查**之前**；journal 行被回收（24 小时/4096 行上限）后，迟到重试按 `invite_codes` 行持久化的 canonical 请求体与原响应字节恢复原结果（schema v2→v3 增列，v3 前旧行由不可变列重建、claim 时刻 revision 恒为 1），不得返回 `CODE_CONFLICT` 或配额拒绝；真实 ttl/cap/endpoint/lookup 差异仍 `REQUEST_CONFLICT`（详见 `storage-schema.md` §2/§5）。
 - `storage-schema.md` 的 DDL 附录待集成者随本次修订一并同步（本波协议/服务器代理的文档权限不含该文件）。
 
 ## 13. 安全边界补充（第十七波边界全部保留）

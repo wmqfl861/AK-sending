@@ -1,12 +1,14 @@
 //! Signaling server: TCP signaling plus a UDP STUN responder in one process.
 //!
-//! Limits (independent of any file quota): per-connection message rate,
-//! bounded candidates, bounded sessions per device, session TTL, Hello
-//! freshness, and a Hello replay window (an exact re-send of an already
-//! accepted signed Hello inside the freshness window is rejected as a
-//! suspected replay — see [`HelloReplayCache`]). The server verifies Hello
-//! signatures but trusts nothing else; it never sees file names, manifests,
-//! or bytes.
+//! Limits (independent of any file quota): a global admission cap on
+//! simultaneously served connections, first-frame and steady per-frame
+//! I/O deadlines, per-connection message rate, bounded candidates,
+//! bounded sessions per device, session TTL, Hello freshness, a bounded
+//! per-connection outbox with non-blocking delivery, and a Hello replay
+//! window (an exact re-send of an already accepted signed Hello inside
+//! the freshness window is rejected as a suspected replay — see
+//! [`HelloReplayCache`]). The server verifies Hello signatures but
+//! trusts nothing else; it never sees file names, manifests, or bytes.
 //!
 //! There is intentionally no upload/download/forward route. A test locks the
 //! closed message set so no blob route can appear silently.
@@ -14,11 +16,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -40,6 +42,34 @@ pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 /// Capacity of the Hello replay window (accepted-signature digests kept).
 /// Bounded memory: 256 entries x (32-byte digest + Instant) is a few KiB.
 pub const HELLO_REPLAY_CAPACITY: usize = 256;
+
+// ---- resource bounds (R36-P1-05) --------------------------------------------
+//
+// The legacy plane bounds the same sprawl dimensions as the v2 registry:
+// unauthenticated sockets that never speak, handshakes... there is no
+// handshake here (plaintext), so the admission cap alone bounds
+// pre-Hello sockets; frame reads and writes run under deadlines so a
+// stalled peer loses its task instead of pinning it forever; the
+// per-connection outbox delivers non-blocking and a full queue actively
+// closes the slow consumer.
+
+/// Maximum simultaneously served TCP connections (accepted-and-counted,
+/// including pre-Hello ones) — the same magnitude as the v2 registry.
+/// The legacy plane has no in-band handshake, so an over-cap socket is
+/// closed at accept time; no task is ever spawned for it.
+pub const MAX_LIVE_CONNECTIONS: usize = 256;
+/// Deadline for a connection's first frame — the signed Hello. A
+/// connected-but-silent peer is closed at this budget.
+pub const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(15);
+/// Per-frame read and write budget once the first frame arrived; a
+/// stalled reader or a write that cannot drain ends the connection.
+pub const FRAME_IO_DEADLINE: Duration = Duration::from_secs(30);
+/// Grace period for a connection's writer to wind down on its own
+/// before the handler aborts it.
+pub const TEARDOWN_GRACE: Duration = Duration::from_millis(250);
+/// Depth of one connection's outbound queue; a slow consumer that lets
+/// it fill is actively closed rather than allowed to spread backpressure.
+pub const OUTBOX_DEPTH: usize = 64;
 
 /// 256-bit digest of (device_id || signature) for the Hello replay cache.
 ///
@@ -147,6 +177,13 @@ pub struct Limits {
     pub frame_rate_per_sec: u32,
     /// Burst allowance for the token bucket.
     pub frame_burst: u32,
+    /// Deadline for a connection's first frame — the signed Hello. A
+    /// connected-but-silent peer is closed at this budget (R36-P1-05).
+    pub first_frame_deadline: Duration,
+    /// Per-frame read and write budget once the first frame arrived; a
+    /// stalled reader or a write that cannot drain ends the connection
+    /// (R36-P1-05).
+    pub frame_io_deadline: Duration,
 }
 
 impl Default for Limits {
@@ -157,6 +194,8 @@ impl Default for Limits {
             hello_max_age: Duration::from_secs(10),
             frame_rate_per_sec: 32,
             frame_burst: 64,
+            first_frame_deadline: FIRST_FRAME_DEADLINE,
+            frame_io_deadline: FRAME_IO_DEADLINE,
         }
     }
 }
@@ -203,6 +242,7 @@ pub(crate) async fn serve(
     let shared = Arc::new(Shared {
         limits,
         inner: Mutex::new(Inner::default()),
+        conn_count: AtomicUsize::new(0),
     });
     tokio::spawn(stun_responder(stun_socket, shutdown.clone()));
     let sweep_every = shared
@@ -220,19 +260,34 @@ pub(crate) async fn serve(
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = tick.tick() => {
+                // R36-P1-05: expired-session notifications flush
+                // non-blocking — one slow consumer can never stall the
+                // shared accept/sweep/shutdown loop.
                 let outbound = {
                     let mut inner = shared.lock();
                     sweep_expired(&mut inner)
                 };
-                for (tx, msg) in outbound {
-                    deliver(&tx, msg).await;
-                }
+                flush(&shared, outbound);
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    let shared = shared.clone();
-                    let shutdown = shutdown.clone();
-                    tokio::spawn(connection_loop(stream, peer, shared, shutdown));
+                    // R36-P1-05: admission cap, the same magnitude as
+                    // the v2 registry. Over-cap sockets are closed at
+                    // accept time — no task, no read, no outbox is ever
+                    // created for them.
+                    if shared.conn_count.fetch_add(1, Ordering::SeqCst)
+                        >= MAX_LIVE_CONNECTIONS
+                    {
+                        shared.conn_count.fetch_sub(1, Ordering::SeqCst);
+                        log::warn!(
+                            "connection limit ({MAX_LIVE_CONNECTIONS}) reached; dropping {peer}"
+                        );
+                        drop(stream);
+                    } else {
+                        let shared = shared.clone();
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(connection_loop(stream, peer, shared, shutdown));
+                    }
                 }
                 Err(e) => {
                     log::warn!("accept failed: {e}");
@@ -301,7 +356,16 @@ struct Inner {
 struct Shared {
     limits: Limits,
     inner: Mutex<Inner>,
+    /// Live (accepted, not yet finished) connections — the admission
+    /// counter for [`MAX_LIVE_CONNECTIONS`], reserved atomically at
+    /// accept time and released by the connection task's RAII slot on
+    /// every exit path (R36-P1-05).
+    conn_count: AtomicUsize,
 }
+
+/// One queued peer notification: the target device (so a stalled
+/// consumer can be actively closed), its outbox sender, and the message.
+type Outbound = (DeviceId, mpsc::Sender<CtrlMessage>, CtrlMessage);
 
 impl Shared {
     /// Locks the registry; a poisoned lock (impossible without a panic
@@ -316,11 +380,7 @@ impl Shared {
 
 /// Remove sessions by id and produce Cancel notifications for the other
 /// endpoints. `except` skips one device (e.g. the cancelling endpoint).
-fn remove_sessions(
-    inner: &mut Inner,
-    ids: &[SessionId],
-    except: Option<&DeviceId>,
-) -> Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)> {
+fn remove_sessions(inner: &mut Inner, ids: &[SessionId], except: Option<&DeviceId>) -> Vec<Outbound> {
     let mut outbound = Vec::new();
     for id in ids {
         let Some(entry) = inner.sessions.remove(id) else {
@@ -331,14 +391,14 @@ fn remove_sessions(
                 continue;
             }
             if let Some(device) = inner.devices.get(&endpoint) {
-                outbound.push((device.out.clone(), CtrlMessage::Cancel { session: *id }));
+                outbound.push((endpoint, device.out.clone(), CtrlMessage::Cancel { session: *id }));
             }
         }
     }
     outbound
 }
 
-fn sweep_expired(inner: &mut Inner) -> Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)> {
+fn sweep_expired(inner: &mut Inner) -> Vec<Outbound> {
     let now = Instant::now();
     let expired: Vec<SessionId> = inner
         .sessions
@@ -349,11 +409,7 @@ fn sweep_expired(inner: &mut Inner) -> Vec<(mpsc::Sender<CtrlMessage>, CtrlMessa
     remove_sessions(inner, &expired, None)
 }
 
-fn disconnect_device(
-    inner: &mut Inner,
-    device: &DeviceId,
-    conn_id: u64,
-) -> Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)> {
+fn disconnect_device(inner: &mut Inner, device: &DeviceId, conn_id: u64) -> Vec<Outbound> {
     let mine = inner
         .devices
         .get(device)
@@ -383,9 +439,41 @@ fn fresh_session_id(inner: &Inner) -> SessionId {
     id
 }
 
-async fn deliver(tx: &mpsc::Sender<CtrlMessage>, message: CtrlMessage) {
-    if tx.send(message).await.is_err() {
-        log::debug!("peer outbound channel closed; message dropped");
+/// Non-blocking flush of queued peer notifications (R36-P1-05): the
+/// per-connection outbox is [`OUTBOX_DEPTH`] deep; a full queue means a
+/// stalled consumer — the message is dropped and that endpoint's
+/// connection is actively closed (its handler and writer unwind now
+/// instead of waiting out the write deadline). The shared
+/// accept/sweep/shutdown loop can never block on one client's outbox.
+fn flush(shared: &Shared, outbound: Vec<Outbound>) {
+    if outbound.is_empty() {
+        return;
+    }
+    let mut stalled: Vec<DeviceId> = Vec::new();
+    let inner = shared.lock();
+    for (device, tx, message) in outbound {
+        if let Err(e) = tx.try_send(message) {
+            log::debug!("outbound queue full or closed; dropping message: {e}");
+            stalled.push(device);
+        }
+    }
+    for device in stalled {
+        if let Some(entry) = inner.devices.get(&device) {
+            log::debug!(
+                "actively closing stalled device {}",
+                util::hex_prefix(&device, 4)
+            );
+            entry.close.notify_one();
+        }
+    }
+}
+
+/// Bounded single-queue push (the requesting connection's own queue):
+/// never blocks — a full queue means that connection is already
+/// stalled and its writer deadline / close signal will reap it.
+fn deliver_one(tx: &mpsc::Sender<CtrlMessage>, message: CtrlMessage) {
+    if let Err(e) = tx.try_send(message) {
+        log::debug!("outbound queue full or closed; dropping message: {e}");
     }
 }
 
@@ -448,43 +536,75 @@ enum Flow {
     Disconnect,
 }
 
+/// RAII release of one accepted-connection admission slot (R36-P1-05):
+/// the counter returns exactly once per connection-task exit path —
+/// first-frame deadline, steady-frame deadline, rate-limit break, decode
+/// failure, EOF/I-O error, shutdown, cancellation (abort drops the
+/// future, running `Drop`) and normal teardown.
+struct ConnSlot(Arc<Shared>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.conn_count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn connection_loop(
     stream: TcpStream,
     peer: SocketAddr,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Releases the admission slot on every exit path (R36-P1-05).
+    let _slot = ConnSlot(shared.clone());
     let _ = stream.set_nodelay(true);
     let (mut reader, writer) = stream.into_split();
-    let (out_tx, out_rx) = mpsc::channel::<CtrlMessage>(64);
-    let writer_task = tokio::spawn(write_loop(writer, out_rx));
+    let (out_tx, out_rx) = mpsc::channel::<CtrlMessage>(OUTBOX_DEPTH);
     let mut state = ConnState {
         device: None,
         conn_id: 0,
         close: Arc::new(Notify::new()),
         peer_ip: peer.ip(),
     };
+    let mut writer_task = tokio::spawn(write_loop(
+        writer,
+        out_rx,
+        state.close.clone(),
+        shared.limits.frame_io_deadline,
+    ));
     let mut bucket = TokenBucket::new(shared.limits.frame_rate_per_sec, shared.limits.frame_burst);
     log::debug!("signaling connection from {peer}");
+    let mut first_frame = true;
     loop {
+        // R36-P1-05: every read is bounded. The first frame (the signed
+        // Hello) runs under the admission deadline, later frames under
+        // the steady I/O deadline — a silent or stalled peer can never
+        // pin its task or its admission slot. A deadline ends the
+        // connection (break), so a partially-read frame never desyncs
+        // the stream.
+        let budget = if first_frame {
+            shared.limits.first_frame_deadline
+        } else {
+            shared.limits.frame_io_deadline
+        };
         let bytes = tokio::select! {
             _ = shutdown.changed() => break,
             _ = state.close.notified() => break,
-            received = util::read_frame(&mut reader) => match received {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) | Err(_) => break,
+            received = tokio::time::timeout(budget, util::read_frame(&mut reader)) => match received {
+                Ok(Ok(Some(bytes))) => bytes,
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
             },
         };
+        first_frame = false;
         if !bucket.allow() {
             log::warn!("rate limit hit on connection from {peer}");
-            deliver(
+            deliver_one(
                 &out_tx,
                 CtrlMessage::ServerError {
                     code: ERR_RATE_LIMITED,
                     message: error_message(ERR_RATE_LIMITED),
                 },
-            )
-            .await;
+            );
             break;
         }
         let frame = match CtrlFrame::decode(&bytes) {
@@ -494,7 +614,7 @@ async fn connection_loop(
                 break;
             }
         };
-        match process(&shared, &mut state, &out_tx, frame.message).await {
+        match process(&shared, &mut state, &out_tx, frame.message) {
             Flow::Continue => {}
             Flow::Disconnect => break,
         }
@@ -504,17 +624,39 @@ async fn connection_loop(
             let mut inner = shared.lock();
             disconnect_device(&mut inner, &device, state.conn_id)
         };
-        for (tx, msg) in outbound {
-            deliver(&tx, msg).await;
-        }
+        flush(&shared, outbound);
         log::info!("device {} disconnected", util::hex_prefix(&device, 4));
     }
     drop(out_tx);
-    // Give the writer a moment to flush queued messages, then move on.
-    let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
+    // R36-P1-05: the writer is reaped bounded — a flush grace, then an
+    // explicit abort of a still-running writer instead of leaking it.
+    join_or_abort(&mut writer_task).await;
 }
 
-async fn write_loop(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<CtrlMessage>) {
+/// Wait for a connection task to finish within [`TEARDOWN_GRACE`];
+/// abort it if the grace expires (the task is parked on I/O that will
+/// not progress once the socket halves start closing).
+async fn join_or_abort(task: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(TEARDOWN_GRACE, &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = (&mut *task).await;
+    }
+}
+
+/// The single writer of one connection (R36-P1-05): every queued
+/// message is written under the per-frame budget. A stalled or failed
+/// write actively closes the whole connection via `close` — the handler
+/// unwinds and the reader's own deadline (or the closing socket) ends
+/// it — instead of parking the writer forever.
+async fn write_loop<W: tokio::io::AsyncWrite + Unpin>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<CtrlMessage>,
+    close: Arc<Notify>,
+    write_budget: Duration,
+) {
     while let Some(message) = rx.recv().await {
         let mut buf = Vec::with_capacity(128);
         CtrlFrame {
@@ -522,13 +664,17 @@ async fn write_loop(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<CtrlMessa
             message,
         }
         .encode(&mut buf);
-        if writer.write_all(&buf).await.is_err() {
+        let sent = tokio::time::timeout(write_budget, writer.write_all(&buf)).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            log::debug!("outbound write stalled or failed; closing connection");
+            close.notify_one();
             return;
         }
     }
+    let _ = writer.shutdown().await;
 }
 
-async fn process(
+fn process(
     shared: &Shared,
     state: &mut ConnState,
     out: &mpsc::Sender<CtrlMessage>,
@@ -598,7 +744,7 @@ async fn process(
                 "hello from {} rejected: replay suspected (signature already seen in window)",
                 util::hex_prefix(&device_id, 4)
             );
-            deliver(
+            deliver_one(
                 out,
                 CtrlMessage::ServerError {
                     code: ERR_BAD_REQUEST,
@@ -606,20 +752,18 @@ async fn process(
                         "replay suspected: hello signature already accepted in the freshness window"
                             .to_string(),
                 },
-            )
-            .await;
+            );
             return Flow::Disconnect;
         };
         state.device = Some(device_id);
         state.conn_id = conn_id;
         log::info!("device {} online", util::hex_prefix(&device_id, 4));
-        deliver(
+        deliver_one(
             out,
             CtrlMessage::Welcome {
                 session_ttl_secs: shared.limits.session_ttl.as_secs() as u32,
             },
-        )
-        .await;
+        );
         return Flow::Continue;
     }
 
@@ -642,14 +786,13 @@ async fn process(
             if candidates.len() > codec::MAX_CANDIDATES
                 || candidates.iter().any(|addr| addr.port() == 0)
             {
-                deliver(
+                deliver_one(
                     out,
                     CtrlMessage::ServerError {
                         code: ERR_BAD_REQUEST,
                         message: error_message(ERR_BAD_REQUEST),
                     },
-                )
-                .await;
+                );
             } else {
                 let mut inner = shared.lock();
                 if let Some(entry) = inner.devices.get_mut(&me) {
@@ -666,15 +809,15 @@ async fn process(
             Flow::Continue
         }
         CtrlMessage::ConnectRequest { target } => {
-            handle_connect(shared, out, me, target).await;
+            handle_connect(shared, out, me, target);
             Flow::Continue
         }
         CtrlMessage::Signal { session, signal } => {
-            handle_signal(shared, out, me, session, signal).await;
+            handle_signal(shared, out, me, session, signal);
             Flow::Continue
         }
         CtrlMessage::Cancel { session } => {
-            handle_cancel(shared, me, session).await;
+            handle_cancel(shared, me, session);
             Flow::Continue
         }
     }
@@ -695,7 +838,7 @@ pub(crate) fn same_egress(ip_a: Option<IpAddr>, ip_b: Option<IpAddr>) -> bool {
 /// their `SessionOpened`. Distinct or unknown IPs send no hint.
 fn announce_session(
     inner: &Inner,
-    outbound: &mut Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)>,
+    outbound: &mut Vec<Outbound>,
     session: SessionId,
     me: DeviceId,
     target: DeviceId,
@@ -704,6 +847,7 @@ fn announce_session(
     let target_ip = inner.devices.get(&target).map(|entry| entry.peer_ip);
     if let Some(entry) = inner.devices.get(&me) {
         outbound.push((
+            me,
             entry.out.clone(),
             CtrlMessage::SessionOpened {
                 session,
@@ -713,6 +857,7 @@ fn announce_session(
     }
     if let Some(entry) = inner.devices.get(&target) {
         outbound.push((
+            target,
             entry.out.clone(),
             CtrlMessage::SessionOpened { session, peer: me },
         ));
@@ -725,6 +870,7 @@ fn announce_session(
         for device in [me, target] {
             if let Some(entry) = inner.devices.get(&device) {
                 outbound.push((
+                    device,
                     entry.out.clone(),
                     CtrlMessage::Signal {
                         session,
@@ -736,13 +882,8 @@ fn announce_session(
     }
 }
 
-async fn handle_connect(
-    shared: &Shared,
-    out: &mpsc::Sender<CtrlMessage>,
-    me: DeviceId,
-    target: DeviceId,
-) {
-    let mut outbound: Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)> = Vec::new();
+fn handle_connect(shared: &Shared, out: &mpsc::Sender<CtrlMessage>, me: DeviceId, target: DeviceId) {
+    let mut outbound: Vec<Outbound> = Vec::new();
     let mut error: Option<u16> = None;
     {
         let mut inner = shared.lock();
@@ -797,29 +938,26 @@ async fn handle_connect(
             }
         }
     }
-    for (tx, msg) in outbound {
-        deliver(&tx, msg).await;
-    }
+    flush(shared, outbound);
     if let Some(code) = error {
-        deliver(
+        deliver_one(
             out,
             CtrlMessage::ServerError {
                 code,
                 message: error_message(code),
             },
-        )
-        .await;
+        );
     }
 }
 
-async fn handle_signal(
+fn handle_signal(
     shared: &Shared,
     out: &mpsc::Sender<CtrlMessage>,
     me: DeviceId,
     session: SessionId,
     signal: PeerSignal,
 ) {
-    let mut outbound: Vec<(mpsc::Sender<CtrlMessage>, CtrlMessage)> = Vec::new();
+    let mut outbound: Vec<Outbound> = Vec::new();
     let mut error: Option<u16> = None;
     {
         let mut inner = shared.lock();
@@ -837,7 +975,7 @@ async fn handle_signal(
                 };
                 if let Some(device) = inner.devices.get(&other) {
                     // Verbatim relay of one bounded, structured signal.
-                    outbound.push((device.out.clone(), CtrlMessage::Signal { session, signal }));
+                    outbound.push((other, device.out.clone(), CtrlMessage::Signal { session, signal }));
                 }
             }
             // Unknown session id, or one this device is not part of. Both
@@ -847,22 +985,19 @@ async fn handle_signal(
             }
         }
     }
-    for (tx, msg) in outbound {
-        deliver(&tx, msg).await;
-    }
+    flush(shared, outbound);
     if let Some(code) = error {
-        deliver(
+        deliver_one(
             out,
             CtrlMessage::ServerError {
                 code,
                 message: error_message(code),
             },
-        )
-        .await;
+        );
     }
 }
 
-async fn handle_cancel(shared: &Shared, me: DeviceId, session: SessionId) {
+fn handle_cancel(shared: &Shared, me: DeviceId, session: SessionId) {
     let outbound = {
         let mut inner = shared.lock();
         let participant = inner
@@ -877,9 +1012,7 @@ async fn handle_cancel(shared: &Shared, me: DeviceId, session: SessionId) {
             Vec::new()
         }
     };
-    for (tx, msg) in outbound {
-        deliver(&tx, msg).await;
-    }
+    flush(shared, outbound);
 }
 
 /// Encode helper re-exported for tests.
@@ -1485,6 +1618,7 @@ mod tests {
         Arc::new(Shared {
             limits: Limits::default(),
             inner: Mutex::new(Inner::default()),
+            conn_count: AtomicUsize::new(0),
         })
     }
 
@@ -1527,7 +1661,7 @@ mod tests {
             inner.devices.insert(target, entry_target);
         }
         let (requester, mut rx_requester) = mpsc::channel(8);
-        handle_connect(&shared, &requester, me, target).await;
+        handle_connect(&shared, &requester, me, target);
 
         match rx_me.try_recv() {
             Ok(CtrlMessage::SessionOpened { peer, .. }) => assert_eq!(peer, target),
@@ -1559,7 +1693,7 @@ mod tests {
             inner.devices.insert(target, entry_target);
         }
         let (requester, mut rx_requester) = mpsc::channel(8);
-        handle_connect(&shared, &requester, me, target).await;
+        handle_connect(&shared, &requester, me, target);
 
         let session = match rx_me.try_recv() {
             Ok(CtrlMessage::SessionOpened { session, .. }) => session,
@@ -1590,7 +1724,7 @@ mod tests {
         shared.lock().devices.insert(target, replacement);
 
         // Pair reuse re-announces from the current records: no hint now.
-        handle_connect(&shared, &requester, me, target).await;
+        handle_connect(&shared, &requester, me, target);
         match rx_me.try_recv() {
             Ok(CtrlMessage::SessionOpened { session: s, peer }) => {
                 assert_eq!(s, session); // reused, not a new session
@@ -1943,5 +2077,210 @@ mod tests {
         };
         assert_eq!(mapped, expected);
         server.stop().await.unwrap();
+    }
+
+    // ---- R36-P1-05: bounded admission, frame deadlines, slow consumers ----
+
+    /// A connected-but-silent peer is closed at the first-frame deadline
+    /// — before the fix an unauthenticated socket could park its task
+    /// forever.
+    #[tokio::test]
+    async fn silent_connection_is_closed_at_the_first_frame_deadline() {
+        let limits = Limits {
+            first_frame_deadline: Duration::from_millis(150),
+            ..Limits::default()
+        };
+        let server = test_support::start(limits).await;
+        let mut silent = TcpStream::connect(server.tcp).await.unwrap();
+        // Connected, never speaks: only the deadline can end this.
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("no bytes may be sent to a deadline-killed connection"),
+            Err(_) => panic!("silent pre-Hello connection must be closed at the deadline"),
+        }
+        server.stop().await.unwrap();
+    }
+
+    /// A peer that authenticated (signed Hello, Welcome read) and then
+    /// went silent is closed at the steady per-frame deadline.
+    #[tokio::test]
+    async fn authenticated_silence_is_closed_at_the_frame_deadline() {
+        let limits = Limits {
+            first_frame_deadline: Duration::from_secs(5),
+            frame_io_deadline: Duration::from_millis(150),
+            ..Limits::default()
+        };
+        let server = test_support::start(limits).await;
+        let key = client_support::key(31);
+        let device_id = client_support::device(&key);
+        let timestamp = util::now_unix_ms();
+        let signature = key
+            .sign(&codec::hello_signing_bytes(1, &device_id, "silent", timestamp))
+            .to_bytes();
+        let mut hello = Vec::new();
+        CtrlFrame {
+            version: codec::VERSION,
+            message: CtrlMessage::Hello {
+                version: 1,
+                device_id,
+                name: "silent".to_string(),
+                timestamp_unix_ms: timestamp,
+                signature,
+            },
+        }
+        .encode(&mut hello);
+        let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+        stream.write_all(&hello).await.unwrap();
+        match read_one_frame(&mut stream).await {
+            Some(frame) => assert!(matches!(frame.message, CtrlMessage::Welcome { .. })),
+            None => panic!("expected Welcome after the signed Hello"),
+        }
+        // Then silence: the steady read budget ends the connection.
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("no bytes may be sent to a deadline-killed connection"),
+            Err(_) => panic!("silent authenticated connection must be closed at the deadline"),
+        }
+        server.stop().await.unwrap();
+    }
+
+    /// The admission cap bounds unauthenticated sockets; an over-cap
+    /// connection is dropped at accept time (immediate close, no task),
+    /// and the quota returns as the held connections close so a legal
+    /// client is served again.
+    #[tokio::test]
+    async fn admission_cap_drops_excess_and_releases_on_close() {
+        // Long first-frame deadline so the held pre-Hello sockets keep
+        // their slots for the whole test.
+        let limits = Limits {
+            first_frame_deadline: Duration::from_secs(30),
+            ..Limits::default()
+        };
+        let server = test_support::start(limits).await;
+        let mut held = Vec::new();
+        for index in 0..MAX_LIVE_CONNECTIONS {
+            held.push(TcpStream::connect(server.tcp).await.unwrap());
+            // Tiny periodic yield so the OS accept backlog never
+            // saturates on hosts with a small listen queue.
+            if index.is_multiple_of(64) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // One beyond the cap: closed at accept time, not parked.
+        let mut extra = TcpStream::connect(server.tcp).await.unwrap();
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("no bytes may be sent to a dropped over-cap connection"),
+            Err(_) => panic!("over-cap connection must be dropped immediately, not parked"),
+        }
+        // The held sockets never spoke: no ServerError, no bytes.
+        assert!(held.len() == MAX_LIVE_CONNECTIONS);
+        drop(held);
+        drop(extra);
+
+        // Quota returns as the server unwinds the closed sockets: a
+        // legal client gets the full Hello/Welcome again (retry so the
+        // assertion does not race the unwinding).
+        let key = client_support::key(32);
+        let device_id = client_support::device(&key);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut connected = false;
+        while !connected {
+            assert!(
+                Instant::now() < deadline,
+                "admission quota never released after the held sockets closed"
+            );
+            // A fresh timestamp per attempt: a new signature, so a retry
+            // never trips the Hello replay window.
+            let timestamp = util::fresh_now_unix_ms();
+            let signature = key
+                .sign(&codec::hello_signing_bytes(1, &device_id, "late", timestamp))
+                .to_bytes();
+            let hello = CtrlMessage::Hello {
+                version: 1,
+                device_id,
+                name: "late".to_string(),
+                timestamp_unix_ms: timestamp,
+                signature,
+            };
+            // Over-cap drops surface as a closed handshake — every
+            // non-Ok outcome just retries until the unwinding ends.
+            if let Ok(Ok(client)) = tokio::time::timeout(
+                Duration::from_secs(2),
+                SignalClient::connect_hello(server.tcp, hello),
+            )
+            .await
+            {
+                drop(client);
+                connected = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        server.stop().await.unwrap();
+    }
+
+    /// The writer's write budget: a write that can never drain (1-byte
+    /// duplex buffer, nobody reading) reports the dead connection via
+    /// `close` and the writer returns instead of parking forever.
+    #[tokio::test]
+    async fn writer_write_deadline_closes_the_connection() {
+        let (_client, server_end) = tokio::io::duplex(1);
+        let (tx, rx) = mpsc::channel::<CtrlMessage>(8);
+        let close = Arc::new(Notify::new());
+        let mut writer = tokio::spawn(write_loop(
+            server_end,
+            rx,
+            close.clone(),
+            Duration::from_millis(75),
+        ));
+        tx.try_send(CtrlMessage::Register {
+            candidates: Vec::new(),
+        })
+        .unwrap();
+        let signaled = tokio::select! {
+            _ = close.notified() => true,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => false,
+        };
+        assert!(signaled, "a stalled write must signal the connection close");
+        tokio::time::timeout(Duration::from_secs(5), &mut writer)
+            .await
+            .expect("writer returns after the stalled write")
+            .unwrap();
+    }
+
+    /// A full outbox is a stalled consumer: the notification is dropped
+    /// (never queued, never blocking the caller) and the endpoint is
+    /// actively closed.
+    #[tokio::test]
+    async fn flush_drops_to_a_full_outbox_and_closes_the_consumer() {
+        let shared = shared_registry();
+        let me = [1u8; 32];
+        let (entry, mut rx) = device_entry("127.0.0.1".parse().unwrap());
+        let close = entry.close.clone();
+        let sender = entry.out.clone();
+        shared.lock().devices.insert(me, entry);
+        // Fill the 16-deep outbox of the forged entry.
+        for index in 0..16u8 {
+            sender
+                .try_send(CtrlMessage::Cancel { session: [index; 16] })
+                .unwrap();
+        }
+        flush(
+            &shared,
+            vec![(me, sender, CtrlMessage::Cancel { session: [0xAA; 16] })],
+        );
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 16, "the overflow message must be dropped, not queued");
+        let signaled = tokio::select! {
+            _ = close.notified() => true,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => false,
+        };
+        assert!(signaled, "a full outbox must actively close the slow consumer");
     }
 }

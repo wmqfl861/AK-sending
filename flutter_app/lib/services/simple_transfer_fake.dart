@@ -78,6 +78,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
   final List<String> saveDirRequests = [];
 
   String? _joinError;
+  String? _engineFailureReason;
   String _saveDir;
 
   TaskCode? _pendingCode;
@@ -96,6 +97,14 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// explicitly by tests via [expireIncoming] — no timers in the fake).
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
+
+  /// R36-P2-03: the engine-health fan-out (see [engineHealth] /
+  /// [failEngine]).
+  final StreamController<EngineHealth> _engineHealthController =
+      StreamController<EngineHealth>.broadcast();
+
+  /// True after [failEngine] (the fake's terminal latch).
+  bool _engineFailed = false;
 
   /// Job ids the fake reported expired (assertion material).
   final List<String> expiredJobs = [];
@@ -194,6 +203,17 @@ class LocalSimpleTransferService implements SimpleTransferService {
       _expiredIncomingController.stream;
 
   @override
+  Stream<EngineHealth> get engineHealth async* {
+    // R36-P2-03: replay the current snapshot to every subscriber, then
+    // forward live changes (the real service's Stream.multi contract in
+    // the fake's async* idiom).
+    yield _engineFailed
+        ? EngineHealth.engineFailed(_engineFailureReason ?? '连续原生轮询失败。')
+        : const EngineHealth.ok();
+    yield* _engineHealthController.stream;
+  }
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     consentCalls += 1;
     consentRequests.add((jobId, accept));
@@ -246,6 +266,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _connectionsController.close();
     _incomingController.close();
     _expiredIncomingController.close();
+    _engineHealthController.close();
   }
 
   // ---------------------------------------------------------------------
@@ -254,6 +275,20 @@ class LocalSimpleTransferService implements SimpleTransferService {
 
   /// Makes the NEXT [joinCode] fail with [reason] (one-shot).
   set nextJoinError(String reason) => _joinError = reason;
+
+  /// R36-P2-03 test knob: simulates the engine's TERMINAL failure latch
+  /// — [engineHealth] fans the failure out (the home page's
+  /// engine-failed card rehearsal). Idempotent like the real latch.
+  void failEngine([String reason = '连续 10 次任务事件轮询失败（fake: poll_event 持续故障）。']) {
+    if (_engineFailed) {
+      return;
+    }
+    _engineFailed = true;
+    _engineFailureReason = reason;
+    if (!_engineHealthController.isClosed) {
+      _engineHealthController.add(EngineHealth.engineFailed(reason));
+    }
+  }
 
   /// Simulates the remote joining my pending code (create-flow): consumes
   /// the code and adds a `connecting` connection with my declared role.

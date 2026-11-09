@@ -244,6 +244,61 @@ final class SimpleCreatedCode {
   final String? codeId;
 }
 
+/// R36-P2-03: the engine-health state of the replayable
+/// [SimpleTransferService.engineHealth] stream.
+enum EngineHealthState {
+  /// The native engine answers polls (no latch tripped).
+  ok,
+
+  /// The TERMINAL C12 engine-failure latch: [pollFailureThreshold]
+  /// consecutive failed native polls (or a revoked C07 lease) stopped the
+  /// pump. Recovery is service rebuild only — the failure is fanned out
+  /// to the UI the moment it trips, never left an internal field.
+  engineFailed,
+}
+
+/// R36-P2-03: one engine-health snapshot — [state] plus the visible
+/// [failureReason] when the latch tripped.
+final class EngineHealth {
+  const EngineHealth.ok()
+      : state = EngineHealthState.ok,
+        failureReason = null;
+
+  const EngineHealth.engineFailed(String this.failureReason)
+      : state = EngineHealthState.engineFailed;
+
+  final EngineHealthState state;
+
+  /// The latch's visible reason (null while healthy).
+  final String? failureReason;
+
+  bool get isEngineFailed => state == EngineHealthState.engineFailed;
+}
+
+/// R36-P2-02: the EXPLICIT outcome of one
+/// [SimpleTransferService.drainProgress] call. Returning only the
+/// malformed-line count let a healthy event poll reset the C12 streak
+/// while the native progress poll kept failing (0→1→0 forever — the
+/// latch could never trip); the pump now asks BOTH channels whether THIS
+/// tick succeeded before clearing the streak.
+final class ProgressDrainResult {
+  const ProgressDrainResult({required this.polled, required this.malformed});
+
+  /// Whether this call polled the native progress queue to its end
+  /// (queue drained/empty or the per-tick budget reached) WITHOUT a poll
+  /// [AkFfiException] or a revoked-lease latch ending it early. False
+  /// when the call was gated (disposed / engine-failed / no runtime) or
+  /// ended on an exception — such a tick NEVER resets the streak.
+  final bool polled;
+
+  /// How many malformed lines were consumed this call (each already
+  /// counted toward the streak inside the call).
+  final int malformed;
+
+  /// A fully clean drain: polled to the end with nothing malformed.
+  bool get clean => polled && malformed == 0;
+}
+
 /// The v1 minimal-pairing service. Construct with the FFI seam
 /// (`AkTaskFfiBindings`, borrowed engine) or a [FakeAkTaskCalls] for
 /// tests; ONE isolate owns the seam (calls serialize on the event loop).
@@ -258,10 +313,16 @@ final class SimpleCreatedCode {
 ///   progress poll [AkFfiException]s and malformed progress lines alike)
 ///   latch the TERMINAL [SimpleTransferPhase.engineFailed] state: the
 ///   pump stops (no further native polling) and [failureReason] carries
-///   the visible reason. One clean tick resets the streak — only truly
-///   persistent failures trip it. Recovery is SERVICE REBUILD ONLY:
-///   dispose this service and construct a new one (the engine failure is
+///   the visible reason. One clean tick resets the streak — and "clean"
+///   means the EVENT and the PROGRESS channels BOTH succeeded this tick
+///   (R36-P2-02: a healthy event poll no longer rescues a persistently
+///   failing progress poll). Recovery is SERVICE REBUILD ONLY: dispose
+///   this service and construct a new one (the engine failure is
 ///   presumed native-side; [start] refuses on a latched service).
+/// * R36-P2-03: the latch is DELIVERED, not just recorded —
+///   [engineHealth] fans the failure out to the UI the moment it trips,
+///   and every entry/op ends promptly with the same failure through
+///   [_ensureLive]'s latch gate.
 final class SimpleTransferService {
   SimpleTransferService({
     required this.calls,
@@ -321,6 +382,13 @@ final class SimpleTransferService {
       StreamController<TaskDoneEvent>.broadcast();
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
+
+  /// R36-P2-03: the engine-health fan-out — the latch's DELIVERY channel
+  /// (see [engineHealth]). Per-subscriber SNAPSHOT replay like
+  /// [connections]: a late subscriber learns the latched state without
+  /// waiting for an event that already fired.
+  final StreamController<EngineHealth> _healthController =
+      StreamController<EngineHealth>.broadcast();
 
   /// Wave-30 P2-04: the code ids this runtime's pairings used, by
   /// normalized code key — the cancel keys for un-joined codes. Both
@@ -436,6 +504,7 @@ final class SimpleTransferService {
     _incomingController.close();
     _doneController.close();
     _expiredIncomingController.close();
+    _healthController.close();
   }
 
   // -- the three actions --------------------------------------------------
@@ -693,6 +762,28 @@ final class SimpleTransferService {
   /// completed state (wave-30 P2-05: the row no longer offers sends).
   Stream<TaskDoneEvent> get doneEvents => _doneController.stream;
 
+  /// R36-P2-03: the replayable engine-health stream. EVERY listen first
+  /// receives the CURRENT snapshot (`ok`, or the latched failure with its
+  /// visible reason), then the live changes — the C12 latch fans out HERE
+  /// the moment it trips, so the UI never depends on polling a getter or
+  /// on a connection-snapshot update that a broken engine never produces.
+  Stream<EngineHealth> get engineHealth => Stream.multi((controller) {
+        // Attach the live tap FIRST — a latch fired after this point
+        // queues behind the snapshot below (FIFO delivery, no gap).
+        final live = _healthController.stream.listen(
+          controller.add,
+          onError: controller.addError,
+          onDone: controller.close,
+        );
+        controller.add(_currentHealth);
+        controller.onCancel = () => live.cancel();
+      });
+
+  /// The health snapshot [engineHealth] replays per listen.
+  EngineHealth get _currentHealth => _engineFailed
+      ? EngineHealth.engineFailed(_failureReason ?? '连续轮询失败')
+      : const EngineHealth.ok();
+
   /// Decide one pending [SimpleIncomingRequest]. Returns false when the
   /// request is unknown or already decided (including auto-declined by
   /// the engine's 30 s window — deciding such a request locally is a
@@ -712,9 +803,8 @@ final class SimpleTransferService {
   /// C12: one call drains at most [pumpEventBudget] lines — a runaway
   /// progress queue clears over successive calls, and each MALFORMED
   /// line (a `jsonDecode` failure) counts toward the consecutive poll
-  /// failure streak (returned as this call's malformed count, which the
-  /// pump tick uses to reset or escalate); the line itself is still
-  /// consumed, so one bad line never blocks the queue.
+  /// failure streak; the line itself is still consumed, so one bad line
+  /// never blocks the queue.
   ///
   /// Wave-31 R30-P1-01: LIVENESS GATE at the entry — dispose invalidates
   /// every call channel before the native owner is released, so a stall
@@ -722,15 +812,19 @@ final class SimpleTransferService {
   /// adds the engine-failed latch to the same gate (no polling a broken
   /// engine either).
   ///
-  /// Returns the number of MALFORMED lines consumed this call (0 = all
-  /// clean; a call that never reached the queue also reports 0).
-  int drainProgress() {
+  /// R36-P2-02: returns the EXPLICIT [ProgressDrainResult] — whether the
+  /// native progress poll COMPLETED this call (not just the malformed
+  /// count). The pump tick combines it with the event channel's outcome:
+  /// only a tick whose BOTH channels succeeded may reset the C12 streak
+  /// (a healthy event poll no longer rescues a persistently failing
+  /// progress poll).
+  ProgressDrainResult drainProgress() {
     if (_disposed || _engineFailed) {
-      return 0;
+      return const ProgressDrainResult(polled: false, malformed: 0);
     }
     final runtime = _runtime;
     if (runtime == null) {
-      return 0;
+      return const ProgressDrainResult(polled: false, malformed: 0);
     }
     var malformed = 0;
     var drained = 0;
@@ -740,14 +834,14 @@ final class SimpleTransferService {
         line = runtime.pollProgressLine();
       } on AkFfiException catch (error) {
         _notePollFailure('进度事件轮询失败', error);
-        return malformed;
+        return ProgressDrainResult(polled: false, malformed: malformed);
       } on StateError catch (error) {
         // C07: revoked lease — the same immediate stop as the event loop.
         _latchEngineFailed('引擎租约已撤销（C07 lease）', error);
-        return malformed;
+        return ProgressDrainResult(polled: false, malformed: malformed);
       }
       if (line == null) {
-        return malformed;
+        return ProgressDrainResult(polled: true, malformed: malformed);
       }
       drained++;
       try {
@@ -765,7 +859,7 @@ final class SimpleTransferService {
         _notePollFailure('进度行解析失败', line);
       }
     }
-    return malformed;
+    return ProgressDrainResult(polled: true, malformed: malformed);
   }
 
   /// The monotonic progress tick of [job] (0 = no progress line ever
@@ -855,6 +949,14 @@ final class SimpleTransferService {
     if (_disposed) {
       throw StateError('SimpleTransferService 已释放。');
     }
+    if (_engineFailed) {
+      // R36-P2-03: the latch ends every pending op and every new entry
+      // PROMPTLY with the SAME failure — the op waiters' `ensureLive`
+      // hook runs at the top of each poll iteration, so an in-flight
+      // action aborts at its next tick instead of hanging to its own
+      // timeout or polling a broken engine.
+      throw StateError(_failureReason ?? '传输引擎已故障：请新建传输服务恢复。');
+    }
   }
 
   TaskRuntimeFfi _runtimeOrThrow() {
@@ -884,12 +986,15 @@ final class SimpleTransferService {
   }
 
   void _fail(Object error) {
+    if (_engineFailed) {
+      // C12: the engine-failed latch outranks the generic sink — and its
+      // reason STAYS (the documented latch idempotence; a later action
+      // failure must not rewrite what the UI already shows).
+      return;
+    }
     _failureReason = error is AkFfiException
         ? error.message
         : (error is TimeoutException ? error.message : error.toString());
-    if (_engineFailed) {
-      return; // C12: the engine-failed latch outranks the generic sink
-    }
     _setPhase(SimpleTransferPhase.failed);
   }
 
@@ -909,7 +1014,10 @@ final class SimpleTransferService {
   }
 
   /// Latches the terminal engine-failed state (C12): visible reason, pump
-  /// stopped. Idempotent — the first latch's reason stays.
+  /// stopped. Idempotent — the first latch's reason stays. R36-P2-03: the
+  /// latch is DELIVERED — [engineHealth] fans the failure out to every
+  /// listener the moment it trips (a getter-only latch never reaches a
+  /// real GUI).
   void _latchEngineFailed(String what, Object detail) {
     if (_engineFailed) {
       return;
@@ -918,10 +1026,13 @@ final class SimpleTransferService {
     final reason = detail is AkFfiException
         ? detail.message
         : (detail is TimeoutException ? detail.message : detail.toString());
-    _failureReason = '传输引擎故障：$what（$reason）。泵已停止，请新建传输服务恢复。';
+    _failureReason = '传输引擎故障：$what（$reason）。泵已停止，请重启应用恢复。';
     _setPhase(SimpleTransferPhase.engineFailed);
     _pump?.cancel(); // C12: stop polling a broken engine
     _pump = null;
+    if (!_healthController.isClosed) {
+      _healthController.add(_currentHealth);
+    }
   }
 
   void _notifyConnections() {
@@ -1076,6 +1187,12 @@ final class SimpleTransferService {
   /// and [pollFailureThreshold] failures in a row latch
   /// [SimpleTransferPhase.engineFailed] and STOP the pump. A fully clean
   /// tick (queue drained, no parse failures) resets the streak.
+  ///
+  /// R36-P2-02: "clean" is measured PER CHANNEL — the streak clears only
+  /// when the EVENT poll AND the progress drain BOTH succeeded this
+  /// tick. A healthy event channel must not zero the counter while the
+  /// progress channel keeps failing natively (the 0→1→0 loop that kept
+  /// the latch from ever tripping).
   void _pumpOnce() {
     if (_disposed || _engineFailed) {
       return;
@@ -1105,9 +1222,12 @@ final class SimpleTransferService {
       _route(event);
       handled++;
     }
-    final malformed = drainProgress(); // P2-10: keep the stall ticks fresh
-    if (malformed == 0 && _consecutivePollFailures > 0) {
-      _consecutivePollFailures = 0; // a clean tick clears the streak (C12)
+    // The event channel completed cleanly this tick (no exception above).
+    // P2-10: keep the stall ticks fresh — and P2-02: only a tick whose
+    // PROGRESS drain also completed cleanly may reset the streak.
+    final drain = drainProgress();
+    if (drain.clean && _consecutivePollFailures > 0) {
+      _consecutivePollFailures = 0; // BOTH channels clean: clear the streak
     }
   }
 

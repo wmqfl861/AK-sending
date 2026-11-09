@@ -123,6 +123,19 @@ final class FakeAkTaskCalls implements AkTaskCalls {
   /// the C07 lease tests and the C12 pump-stop assertion.
   int pollEventCallCount = 0;
 
+  /// R36-P2-02 rehearsal: while positive, the next that-many
+  /// `pollProgress` calls answer `-1` (errInternal) with
+  /// [pollProgressFailureDetail] — the persistent native PROGRESS-poll
+  /// failure script while the EVENT channel stays healthy (exactly the
+  /// split-channel shape the old streak-reset bug hid).
+  int failPollProgressCalls = 0;
+
+  /// The detail of the scripted [failPollProgressCalls] failures.
+  String pollProgressFailureDetail = 'fake: poll_progress 持续故障';
+
+  /// Total `pollProgress` calls served (assertion material).
+  int pollProgressCallCount = 0;
+
   // -- seam ------------------------------------------------------------
 
   @override
@@ -516,6 +529,13 @@ final class FakeAkTaskCalls implements AkTaskCalls {
 
   @override
   int pollProgress(Uint8List buffer, int cap) {
+    pollProgressCallCount++;
+    // R36-P2-02 rehearsal: the scripted persistent progress-poll failure
+    // answers BEFORE the queue is consulted (nothing is consumed).
+    if (failPollProgressCalls > 0) {
+      failPollProgressCalls--;
+      return _fail(AkStatus.errInternal, pollProgressFailureDetail);
+    }
     // The ENGINE-WIDE queue (no runtime scoping — one fake == one engine).
     if (rawProgressLines.isNotEmpty) {
       // C12 rehearsal: raw (possibly malformed) lines go out verbatim.

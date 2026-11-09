@@ -555,6 +555,9 @@ class UnusableSimpleTransferService implements SimpleTransferService {
   Stream<String> get expiredIncomingRequests => const Stream.empty();
 
   @override
+  Stream<EngineHealth> get engineHealth => const Stream.empty();
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     throw StateError(reason);
   }

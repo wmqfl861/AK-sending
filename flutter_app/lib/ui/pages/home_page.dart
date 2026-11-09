@@ -16,6 +16,7 @@ import 'package:flutter/services.dart'
 import '../service/file_pick_gateway.dart';
 import '../service/pairing_flow_controller.dart';
 import '../service/simple_transfer_service.dart';
+import '../widgets/engine_error_card.dart';
 import '../widgets/task_connection_views.dart';
 import 'connection_detail_page.dart';
 
@@ -40,7 +41,12 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   late final PairingFlowController _flow;
   StreamSubscription<List<TaskConnection>>? _connectionsSub;
+  StreamSubscription<EngineHealth>? _engineHealthSub;
   List<TaskConnection> _connections = const [];
+
+  /// The engine health as the health stream last reported it (R36-P2-03)
+  /// — a latched failure renders the recoverable engine-failed card.
+  EngineHealth _engineHealth = const EngineHealth.ok();
 
   /// True while the join-code input panel is open (the 输入配对码 action).
   bool _joinInputOpen = false;
@@ -58,6 +64,18 @@ class _HomePageState extends State<HomePage> {
       },
       onError: (Object _) {},
     );
+    // R36-P2-03: an engine failure must be VISIBLE on the page the user
+    // is looking at — the replayable health stream delivers the latch
+    // (and replays it to a page rebuilt mid-failure) instead of leaving
+    // stale waiting/connecting UI on screen.
+    _engineHealthSub = widget.service.engineHealth.listen(
+      (health) {
+        if (mounted) {
+          setState(() => _engineHealth = health);
+        }
+      },
+      onError: (Object _) {},
+    );
   }
 
   @override
@@ -65,6 +83,7 @@ class _HomePageState extends State<HomePage> {
     _flow.removeListener(_onFlowChanged);
     _flow.dispose();
     _connectionsSub?.cancel();
+    _engineHealthSub?.cancel();
     super.dispose();
   }
 
@@ -101,6 +120,17 @@ class _HomePageState extends State<HomePage> {
       key: const ValueKey('home_page'),
       padding: const EdgeInsets.all(16),
       children: [
+        if (_engineHealth.isEngineFailed)
+          // R36-P2-03: the terminal engine-failure latch made VISIBLE —
+          // the shared engine-error style, with the honest recoverable
+          // affordance (restart the app; the engine is presumed broken
+          // native-side, retrying actions on this service cannot heal it).
+          EngineErrorCard(
+            key: const ValueKey('engine_failed_card'),
+            title: '传输引擎故障，请重启应用',
+            detail: _engineHealth.failureReason ?? '连续原生轮询失败。',
+            detailKey: const ValueKey('engine_failed_card_detail'),
+          ),
         Text('连接', style: theme.textTheme.headlineSmall),
         const SizedBox(height: 4),
         Text('无需设置任何信息——一个配对码即可互传文件',

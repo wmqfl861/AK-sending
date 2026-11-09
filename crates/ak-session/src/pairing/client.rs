@@ -998,9 +998,19 @@ impl RegistryClient {
     // ---- lifecycle ---------------------------------------------------------
 
     /// Tear down and reconnect with the frozen backoff (1 s / 2 s / 4 s …
-    /// cap 30 s). Subscriptions survive; one-shot waiters were failed.
-    /// On reconnect the registry re-pushes pending offers / challenges /
-    /// proofs (Hello catch-up), which the plane stream delivers.
+    /// cap 30 s between the attempts of ONE batch). Subscriptions survive;
+    /// one-shot waiters were failed. On reconnect the registry re-pushes
+    /// pending offers / challenges / proofs (Hello catch-up), which the
+    /// plane stream delivers.
+    ///
+    /// A batch in which every attempt fails ends in the RETRYABLE terminal
+    /// state [`ClientState::Disconnected`] — never [`ClientState::
+    /// Connecting`] (R36-P1-02): a keeper that only reacts to
+    /// `Disconnected` would otherwise wedge forever after one exhausted
+    /// batch, because nothing ever publishes a fresh transition. Callers
+    /// reschedule the next batch with their own capped backoff (see
+    /// [`RegistryClient::spawn_connection_keeper`] /
+    /// [`keeper_retry_pause`]).
     pub async fn reconnect(&self) -> Result<(), ClientError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ClientError::Closed);
@@ -1023,21 +1033,34 @@ impl RegistryClient {
                 }
             }
         }
+        // The lifecycle lock is held, so `close()` cannot have interleaved:
+        // publishing the retryable terminal state here is race-free.
+        self.inner.state_tx.send_replace(ClientState::Disconnected);
         Err(last.unwrap_or(ClientError::Offline))
     }
 
-    /// Simulate an abrupt connection loss (tests and fault injection):
-    /// tears the TLS stream down and fails the waiters **without** setting
-    /// the closed flag, so a subsequent
-    /// [`RegistryClient::reconnect`] can bring the client back. The
-    /// registry observes EOF and marks this device offline (its pending
-    /// pushes move to the Hello catch-up queue).
-    pub async fn simulate_connection_loss(&self) {
+    /// Actively drop the current connection and publish
+    /// [`ClientState::Disconnected`]: the black-hole recovery primitive a
+    /// connection keeper uses after repeated ping timeouts — a TCP
+    /// connection whose far end silently vanished may never surface an
+    /// I/O error, so the keeper tears it down itself and lets
+    /// [`RegistryClient::reconnect`] rebuild it. Subscriptions survive;
+    /// one-shot waiters fail; the closed flag stays unset.
+    pub async fn drop_connection(&self) {
         let _lifecycle = self.inner.lifecycle.lock().await;
         self.force_disconnect();
         // Dropping the live outbox sender makes the writer exit and close
         // the TLS stream; the reader then observes EOF.
         *self.inner.outbox.lock().expect("client outbox lock") = mpsc::channel(1).0;
+    }
+
+    /// Simulate an abrupt connection loss (tests and fault injection):
+    /// [`RegistryClient::drop_connection`] — a subsequent
+    /// [`RegistryClient::reconnect`] can bring the client back. The
+    /// registry observes EOF and marks this device offline (its pending
+    /// pushes move to the Hello catch-up queue).
+    pub async fn simulate_connection_loss(&self) {
+        self.drop_connection().await;
     }
 
     /// Close the connection and stop dispatching. Idempotent.
@@ -1118,6 +1141,183 @@ impl RegistryClient {
         Err(ClientError::Timeout {
             attempts: attempts.max(1),
         })
+    }
+
+    // ---- connection keeper --------------------------------------------------
+
+    /// Spawn the connection keeper (wave 35, common component) with the
+    /// production schedule: a keepalive [`RegistryClient::ping`] every
+    /// [`KEEPER_PING_INTERVAL`] (well inside the registry v2 server's 30 s
+    /// per-frame `FRAME_IO_DEADLINE`, so a waiting code owner never idles
+    /// out), a reconnect whenever the state watcher reports
+    /// [`ClientState::Disconnected`], a capped backoff between failed
+    /// reconnect batches ([`keeper_retry_pause`]) and black-hole recovery
+    /// after [`KEEPER_PING_TIMEOUT_LIMIT`] consecutive ping timeouts
+    /// ([`RegistryClient::drop_connection`] + reconnect).
+    ///
+    /// The keeper ends when `shutdown` flips to `true`, when its sender is
+    /// dropped, or when the client reaches [`ClientState::Closed`]; the
+    /// returned handle is detached (abort it to converge a teardown
+    /// faster).
+    pub fn spawn_connection_keeper(
+        &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_connection_keeper_with(ConnectionKeeperConfig::default(), shutdown)
+    }
+
+    /// [`RegistryClient::spawn_connection_keeper`] with an explicit
+    /// schedule (tests inject a fast ping cadence; production uses the
+    /// [`ConnectionKeeperConfig::default`]).
+    pub fn spawn_connection_keeper_with(
+        &self,
+        config: ConnectionKeeperConfig,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = self.clone();
+        tokio::spawn(async move {
+            connection_keeper_loop(client, config, shutdown).await;
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection keeper (wave 35 common component, R36-P1-01/R36-P1-02)
+// ---------------------------------------------------------------------------
+
+/// Keepalive ping interval of [`RegistryClient::spawn_connection_keeper`]:
+/// 20 s, well inside the registry v2 server's 30 s per-frame
+/// `FRAME_IO_DEADLINE` — an owner waiting on a task code stays online.
+pub const KEEPER_PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Consecutive ping timeouts after which the keeper actively drops the
+/// connection and reconnects (black-hole recovery): a TCP connection whose
+/// far end silently vanished may never surface an I/O error, so the ping
+/// budget is the only detector.
+pub const KEEPER_PING_TIMEOUT_LIMIT: u32 = 3;
+
+/// Capped backoff between reconnect BATCHES (the pause before batch *n+1*
+/// where *n* batches failed in a row — each batch already backs off
+/// 1/2/4…30 s internally between its own attempts). The first retry is
+/// immediate (a plain blip recovers with no added delay); a long outage
+/// settles at the 30 s cap so the keeper can never spin.
+pub const KEEPER_RETRY_BACKOFF_STEPS: [Duration; 6] = [
+    Duration::ZERO,
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(30),
+];
+
+/// The pause before reconnect batch `failed_batches + 1`
+/// ([`KEEPER_RETRY_BACKOFF_STEPS`], saturating at the cap).
+pub fn keeper_retry_pause(failed_batches: usize) -> Duration {
+    KEEPER_RETRY_BACKOFF_STEPS[failed_batches.min(KEEPER_RETRY_BACKOFF_STEPS.len() - 1)]
+}
+
+/// Schedule of [`RegistryClient::spawn_connection_keeper_with`].
+#[derive(Debug, Clone)]
+pub struct ConnectionKeeperConfig {
+    /// Keepalive ping cadence ([`KEEPER_PING_INTERVAL`] by default).
+    pub ping_interval: Duration,
+}
+
+impl Default for ConnectionKeeperConfig {
+    fn default() -> Self {
+        ConnectionKeeperConfig {
+            ping_interval: KEEPER_PING_INTERVAL,
+        }
+    }
+}
+
+/// The keeper body (see [`RegistryClient::spawn_connection_keeper`]).
+///
+/// Each iteration first reacts to the CURRENT watcher value — not only to
+/// transitions: a drop that landed before this loop's first poll (or
+/// while it was parked in a ping) publishes no further transition, so a
+/// purely `changed()`-driven keeper would sit on a dead `Disconnected`
+/// client forever. `Disconnected` reconnects after [`keeper_retry_pause`],
+/// `Connected` resets the counters, `Closed` ends the loop; the select
+/// below pings on cadence (timeouts count toward the black-hole limit,
+/// connection-level errors are left to the reader's own `Disconnected`).
+/// Because [`RegistryClient::reconnect`] publishes `Disconnected` again
+/// when a whole batch fails (R36-P1-02), the loop reschedules itself
+/// through this same top-of-loop check instead of wedging on
+/// `Connecting`.
+async fn connection_keeper_loop(
+    client: RegistryClient,
+    config: ConnectionKeeperConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut state = client.state_watcher();
+    let mut ping_timeouts: u32 = 0;
+    let mut failed_batches: usize = 0;
+    loop {
+        let current = *state.borrow_and_update();
+        match current {
+            ClientState::Closed => break,
+            ClientState::Connected(_) => {
+                failed_batches = 0;
+                ping_timeouts = 0;
+            }
+            ClientState::Connecting => {}
+            ClientState::Disconnected => {
+                let pause = keeper_retry_pause(failed_batches);
+                if !pause.is_zero() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(pause) => {}
+                        _ = shutdown.changed() => break,
+                    }
+                    // Someone else may have reconnected during the pause;
+                    // tearing their connection down would be pure churn.
+                    if matches!(*state.borrow_and_update(), ClientState::Connected(_)) {
+                        failed_batches = 0;
+                        continue;
+                    }
+                }
+                match client.reconnect().await {
+                    Ok(()) => failed_batches = 0,
+                    Err(ClientError::Closed) => break,
+                    Err(_) => failed_batches += 1,
+                }
+                continue; // re-evaluate: Connected resets, still-Disconnected retries
+            }
+        }
+        let next_ping = tokio::time::sleep(config.ping_interval);
+        tokio::pin!(next_ping);
+        tokio::select! {
+            _ = &mut next_ping => {
+                match client.ping().await {
+                    Ok(()) => ping_timeouts = 0,
+                    Err(ClientError::Closed) => break,
+                    Err(ClientError::Timeout { .. }) => {
+                        ping_timeouts += 1;
+                        if ping_timeouts >= KEEPER_PING_TIMEOUT_LIMIT {
+                            ping_timeouts = 0;
+                            log::warn!(
+                                "pairing client: {KEEPER_PING_TIMEOUT_LIMIT} consecutive ping \
+                                 timeouts, dropping the control connection (black-hole recovery)"
+                            );
+                            client.drop_connection().await; // -> Disconnected; the top reconnects
+                        }
+                    }
+                    Err(_) => {
+                        // Connection-level failure (Offline/ConnectionLost/…):
+                        // the reader surfaces it as Disconnected on its own;
+                        // never count it toward the black-hole budget.
+                        ping_timeouts = 0;
+                    }
+                }
+            }
+            changed = state.changed() => {
+                if changed.is_err() {
+                    break; // the client itself is gone
+                }
+                // The loop top re-evaluates the new value.
+            }
+            _ = shutdown.changed() => break,
+        }
     }
 }
 
@@ -1347,5 +1547,150 @@ mod tests {
         assert!(check_display_name(&"x".repeat(65)).is_err());
         assert!(check_display_name("a\u{7}b").is_err());
         assert!(check_display_name("a\u{9b}b").is_err());
+    }
+
+    // ---- R36-P1-01 / R36-P1-02: keeper constants, state machine, recovery --
+
+    #[test]
+    fn keeper_constants_pin_the_registry_silence_budget() {
+        // The registry v2 server cuts a connection after 30 s of inbound
+        // silence (FRAME_IO_DEADLINE); the keepalive must sit well inside
+        // that budget, and the black-hole detector trips on 3 timeouts.
+        assert_eq!(KEEPER_PING_INTERVAL, Duration::from_secs(20));
+        assert_eq!(ConnectionKeeperConfig::default().ping_interval, KEEPER_PING_INTERVAL);
+        assert_eq!(KEEPER_PING_TIMEOUT_LIMIT, 3);
+    }
+
+    #[test]
+    fn keeper_backoff_is_immediate_then_capped() {
+        assert_eq!(keeper_retry_pause(0), Duration::ZERO);
+        assert_eq!(keeper_retry_pause(1), Duration::from_secs(1));
+        assert_eq!(keeper_retry_pause(2), Duration::from_secs(2));
+        assert_eq!(keeper_retry_pause(3), Duration::from_secs(4));
+        assert_eq!(keeper_retry_pause(4), Duration::from_secs(8));
+        assert_eq!(keeper_retry_pause(5), Duration::from_secs(30));
+        assert_eq!(keeper_retry_pause(1000), Duration::from_secs(30));
+    }
+
+    mod registry {
+        use super::super::*;
+        use ak_signal::server_v2::engine::serve_v2;
+        use ak_signal::server_v2::store::RegistryStore;
+        use ak_signal::server_v2::Limits;
+        use tokio::net::TcpListener;
+
+        pub(super) struct TestRegistry {
+            pub addr: std::net::SocketAddr,
+            pub registry_id: [u8; 32],
+            shutdown: watch::Sender<bool>,
+        }
+
+        impl Drop for TestRegistry {
+            fn drop(&mut self) {
+                let _ = self.shutdown.send(true);
+            }
+        }
+
+        pub(super) async fn spawn() -> TestRegistry {
+            let registry_key = DeviceKeyPair::generate();
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind v2 port");
+            let addr = listener.local_addr().expect("local addr");
+            let store = RegistryStore::open_in_memory().expect("open registry store");
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let key = registry_key.clone();
+            tokio::spawn(async move {
+                let _ = serve_v2(listener, &key, store, Limits::default(), shutdown_rx).await;
+            });
+            TestRegistry {
+                addr,
+                registry_id: registry_key.public_key(),
+                shutdown,
+            }
+        }
+    }
+
+    /// R36-P1-02 core: a reconnect batch that fails ENTIRELY must end in
+    /// `Disconnected` (the retryable terminal state), never leave the
+    /// client parked in `Connecting` — so a watcher-driven keeper can keep
+    /// rescheduling batches.
+    #[tokio::test]
+    async fn reconnect_batch_failure_ends_disconnected_not_connecting() {
+        let registry = registry::spawn().await;
+        let key = DeviceKeyPair::generate();
+        let config = ClientConfig {
+            reconnect_attempts: 1, // one fast failing attempt
+            ..ClientConfig::default()
+        };
+        let client = RegistryClient::connect_with_config(
+            registry.addr,
+            registry.registry_id,
+            &key,
+            "keeper-probe",
+            config,
+        )
+        .await
+        .expect("connect to the live registry");
+        client.ping().await.expect("live ping before the outage");
+        drop(registry); // server gone: every dial now fails fast
+
+        for batch in 1..=2 {
+            let error = client.reconnect().await.expect_err("batch must fail");
+            assert!(
+                !matches!(error, ClientError::Closed),
+                "the failure is the dead server, not a closed client"
+            );
+            // A FRESH subscriber (the shape every keeper has) must see the
+            // retryable terminal state — batch {batch} included.
+            let watcher = client.state_watcher();
+            assert!(
+                matches!(*watcher.borrow(), ClientState::Disconnected),
+                "failed batch {batch} must end Disconnected, not Connecting"
+            );
+            drop(watcher);
+        }
+        client.close().await;
+    }
+
+    /// R36-P1-01: after an abrupt connection loss the keeper re-establishes
+    /// the connection on its own (a fast injected ping cadence keeps the
+    /// test quick) and the client is pingable again.
+    #[tokio::test]
+    async fn keeper_recovers_a_dropped_connection() {
+        let registry = registry::spawn().await;
+        let key = DeviceKeyPair::generate();
+        let client = RegistryClient::connect(
+            registry.addr,
+            registry.registry_id,
+            &key,
+            "keeper-recovery",
+        )
+        .await
+        .expect("connect to the live registry");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let keeper = client.spawn_connection_keeper_with(
+            ConnectionKeeperConfig {
+                ping_interval: Duration::from_millis(100),
+            },
+            shutdown_rx,
+        );
+        client.simulate_connection_loss().await;
+        let mut state = client.state_watcher();
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ClientState::Connected(_)) {
+                    return;
+                }
+                state.changed().await.expect("watcher alive");
+            }
+        })
+        .await;
+        assert!(recovered.is_ok(), "keeper must reconnect after the loss");
+        client.ping().await.expect("pingable after recovery");
+        shutdown_tx.send(true).expect("stop the keeper");
+        let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;
+        client.close().await;
+        drop(registry);
     }
 }

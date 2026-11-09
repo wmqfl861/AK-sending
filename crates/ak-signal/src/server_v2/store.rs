@@ -59,7 +59,17 @@ use crate::server_v2::config::{
 /// `ALTER TABLE ... ADD COLUMN` statements — tombstones, uniqueness
 /// records and every pre-existing row survive verbatim — and runs as one
 /// atomic, re-entrant transaction (see [`migrate_v1_to_v2`]).
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// R36-P2-05 bumped 2 → 3: `invite_codes` gained `claim_request_body
+/// BLOB NULL` (the canonical claim idempotency body at claim time) and
+/// `claim_response BLOB NULL` (the original encoded `InviteClaimed`
+/// frame), so a retry of a claim whose journal row was already recycled
+/// still replays the exact original result instead of a `CODE_CONFLICT`.
+/// The v2→v3 migration is additive and atomic/re-entrant exactly like
+/// v1→v2 (see [`migrate_v2_to_v3`]); pre-v3 rows replay through the
+/// deterministic reconstruction (claim-time revision is 1 by
+/// construction — see [`prior_claim_replay`]).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Why a store operation failed at the storage layer. Business outcomes
 /// are typed decisions, not errors.
@@ -95,10 +105,11 @@ fn blob_req<const N: usize>(value: Vec<u8>) -> rusqlite::Result<[u8; N]> {
 // ---- DDL -----------------------------------------------------------------
 
 /// `invite_codes` — contract DDL (storage-schema.md §2) plus the wave-28
-/// columns `owner_endpoint` / `max_redeems`. SQLite reads `BLOB(32)` as
-/// BLOB affinity; length is checked app-side (endpoint blobs are bounded
-/// by the codec at 512 bytes). No plaintext code, no `auth_key`, no MAC
-/// material — ever.
+/// columns `owner_endpoint` / `max_redeems` and the v3 columns
+/// `claim_request_body` / `claim_response` (R36-P2-05 durable claim
+/// replay). SQLite reads `BLOB(32)` as BLOB affinity; length is checked
+/// app-side (endpoint blobs are bounded by the codec at 512 bytes). No
+/// plaintext code, no `auth_key`, no MAC material — ever.
 const DDL_INVITE_CODES: &str = "
 CREATE TABLE IF NOT EXISTS invite_codes (
   lookup_digest       BLOB(32) PRIMARY KEY,
@@ -111,6 +122,8 @@ CREATE TABLE IF NOT EXISTS invite_codes (
   create_request_id   BLOB(16) NOT NULL,
   owner_endpoint      BLOB NULL,
   max_redeems         INTEGER NOT NULL DEFAULT 0,
+  claim_request_body  BLOB NULL,
+  claim_response      BLOB NULL,
   UNIQUE (owner_device_id, create_request_id)
 );";
 
@@ -408,6 +421,9 @@ impl RegistryStore {
             tx.commit()?;
         } else if version == 1 {
             migrate_v1_to_v2(&mut conn)?;
+            migrate_v2_to_v3(&mut conn)?;
+        } else if version == 2 {
+            migrate_v2_to_v3(&mut conn)?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion(version));
         }
@@ -487,7 +503,19 @@ impl RegistryStore {
                 ClaimOutcome::RequestConflict
             });
         }
-        // Quotas (contract §11).
+        // R36-P2-05: recognize the same create request from the durable
+        // code row BEFORE the quotas and the lookup-collision check. The
+        // journal is bounded (24 h / 4096 rows) and may already have
+        // recycled this request; the row keeps the canonical request and
+        // the original response, so a late retry still replays the
+        // original result instead of dying as a lookup conflict (or
+        // being quota-rejected first). ttl/cap/endpoint differences and
+        // a different lookup still refuse.
+        if let Some(outcome) = prior_claim_replay(&tx, owner, request_id, &body, now_ms)? {
+            tx.commit()?;
+            return Ok(outcome);
+        }
+        // Quotas (contract §11) — genuinely new requests only.
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM invite_codes WHERE owner_device_id=?1 AND state='active'",
             params![owner.as_slice()],
@@ -517,45 +545,6 @@ impl RegistryStore {
         if lookup_taken.is_some() {
             return Ok(ClaimOutcome::CodeConflict);
         }
-        // Same owner+create_request_id with an evicted journal row: the
-        // invite_codes UNIQUE(owner, create_request_id) still applies.
-        let prior_lookup: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT lookup_digest FROM invite_codes
-                 WHERE owner_device_id=?1 AND create_request_id=?2",
-                params![owner.as_slice(), request_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(prior) = prior_lookup {
-            return Ok(if prior.as_slice() == lookup_digest.as_slice() {
-                // Original journal entry was pruned; reconstruct the
-                // replay response from the row so the retry still gets
-                // its original result, then re-journal it.
-                let row: (Vec<u8>, i64, Option<i64>, i64) = tx.query_row(
-                    "SELECT code_id, created_unix_ms, expires_unix_ms, revision
-                     FROM invite_codes WHERE owner_device_id=?1 AND create_request_id=?2",
-                    params![owner.as_slice(), request_id.as_slice()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )?;
-                let code_id = blob_req::<16>(row.0)?;
-                let created = row.1.max(0) as u64;
-                let expires = row.2.map(|v| v.max(0) as u64).unwrap_or(0);
-                let revision = row.3.max(0) as u64;
-                let response = encode_response(&CtrlMessage::InviteClaimed {
-                    request_id: *request_id,
-                    code_id,
-                    created_ms: created,
-                    expires_ms: expires,
-                    revision,
-                })?;
-                journal_put(&tx, owner, request_id, "claim", &body, &response, now_ms)?;
-                tx.commit()?;
-                return Ok(ClaimOutcome::Replay(response));
-            } else {
-                ClaimOutcome::RequestConflict
-            });
-        }
         let expires_unix_ms: Option<i64> = if ttl_secs == 0 {
             None
         } else {
@@ -572,8 +561,9 @@ impl RegistryStore {
         tx.execute(
             "INSERT INTO invite_codes
              (lookup_digest, code_id, owner_device_id, created_unix_ms, expires_unix_ms,
-              state, revision, create_request_id, owner_endpoint, max_redeems)
-             VALUES (?1,?2,?3,?4,?5,'active',1,?6,?7,?8)",
+              state, revision, create_request_id, owner_endpoint, max_redeems,
+              claim_request_body, claim_response)
+             VALUES (?1,?2,?3,?4,?5,'active',1,?6,?7,?8,?9,?10)",
             params![
                 lookup_digest.as_slice(),
                 code_id.as_slice(),
@@ -582,7 +572,9 @@ impl RegistryStore {
                 expires_unix_ms,
                 request_id.as_slice(),
                 owner_endpoint,
-                max_redeems as i64
+                max_redeems as i64,
+                &body,
+                &response,
             ],
         )?;
         journal_put(&tx, owner, request_id, "claim", &body, &response, now_ms)?;
@@ -1351,6 +1343,45 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), StoreError> {
             tx.execute(ddl, [])?;
         }
     }
+    // Stamps v2 explicitly (not SCHEMA_VERSION): the v1→v2 step must
+    // leave exactly a v2 database so the chain can continue to v3.
+    tx.pragma_update(None, "user_version", 2)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// R36-P2-05 migration (schema 2 → 3), atomic and re-entrant exactly as
+/// [`migrate_v1_to_v2`]: `invite_codes` gains `claim_request_body BLOB
+/// NULL` and `claim_response BLOB NULL`, the durable replay record for
+/// claims whose bounded journal row was already recycled. Additive only
+/// — no tombstone, uniqueness record or pre-existing row is touched, and
+/// pre-v3 rows replay through the deterministic reconstruction (see
+/// [`prior_claim_replay`]).
+fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), StoreError> {
+    const COLUMNS: [(&str, &str, &str); 2] = [
+        (
+            "invite_codes",
+            "claim_request_body",
+            "ALTER TABLE invite_codes ADD COLUMN claim_request_body BLOB NULL",
+        ),
+        (
+            "invite_codes",
+            "claim_response",
+            "ALTER TABLE invite_codes ADD COLUMN claim_response BLOB NULL",
+        ),
+    ];
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Fixed literals only (no user input ever reaches these statements).
+    for (table, column, ddl) in COLUMNS {
+        let present: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='{column}'"),
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            tx.execute(ddl, [])?;
+        }
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -1561,6 +1592,112 @@ fn claim_bodies_equivalent(stored: &[u8], incoming: &[u8]) -> bool {
         }
     }
     canonical(stored) == canonical(incoming)
+}
+
+/// Durable replay of a claim whose journal row was already recycled
+/// (R36-P2-05). Looks the code row up by `(owner, create_request_id)`
+/// — BEFORE any quota or lookup-collision check — and, when the row is
+/// this very request, rebuilds the original outcome:
+///
+/// - request equality: the persisted canonical body when present (v3+
+///   rows), otherwise the body rebuilt from the row's immutable
+///   claim-time fields (`lookup_digest`, the ttl derived from
+///   `expires_unix_ms - created_unix_ms`, `max_redeems`,
+///   `owner_endpoint`); [`claim_bodies_equivalent`] folds the wave-28
+///   41-byte default tail exactly as the journal path does. A lookup,
+///   ttl, cap or endpoint difference is a `REQUEST_CONFLICT`.
+/// - response: the persisted original `InviteClaimed` bytes when
+///   present, otherwise the deterministic reconstruction with revision
+///   **1** — a claim always inserts at revision 1, while the row's
+///   current revision may since have been bumped by revoke/expiry and
+///   must not impersonate the original response version.
+///
+/// Returns `None` when no such row exists (a genuinely new request; the
+/// caller continues with quotas and the lookup check). A rebuilt replay
+/// re-journals the request so subsequent retries hit the fast path
+/// again; the caller owns the commit.
+fn prior_claim_replay(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &DeviceId,
+    request_id: &RequestId,
+    body: &[u8],
+    now_ms: u64,
+) -> rusqlite::Result<Option<ClaimOutcome>> {
+    let row = tx
+        .query_row(
+            "SELECT lookup_digest, created_unix_ms, expires_unix_ms, code_id,
+                    max_redeems, owner_endpoint, claim_request_body, claim_response
+             FROM invite_codes WHERE owner_device_id=?1 AND create_request_id=?2",
+            params![owner.as_slice(), request_id.as_slice()],
+            |row| {
+                Ok(PriorClaim {
+                    lookup_digest: blob_req::<32>(row.get(0)?)?,
+                    created_ms: row.get::<_, i64>(1)?.max(0) as u64,
+                    expires_ms: row
+                        .get::<_, Option<i64>>(2)?
+                        .map(|value| value.max(0) as u64),
+                    code_id: blob_req::<16>(row.get(3)?)?,
+                    max_redeems: row.get::<_, i64>(4)?.max(0) as u32,
+                    owner_endpoint: row.get::<_, Option<Vec<u8>>>(5)?,
+                    claim_request_body: row.get::<_, Option<Vec<u8>>>(6)?,
+                    claim_response: row.get::<_, Option<Vec<u8>>>(7)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(prior) = row else {
+        return Ok(None);
+    };
+    let equivalent = match &prior.claim_request_body {
+        Some(stored) => claim_bodies_equivalent(stored, body),
+        // Pre-v3 row (the columns are NULL after the v2→v3 migration):
+        // rebuild the canonical body from the row's immutable claim-time
+        // fields — the original ttl is exactly (expires - created)/1000
+        // because the claim wrote expires = created + ttl*1000.
+        None => {
+            let ttl_secs = prior
+                .expires_ms
+                .map(|expires| (expires.saturating_sub(prior.created_ms)) / 1000)
+                .unwrap_or(0) as u32;
+            claim_bodies_equivalent(
+                &claim_body(
+                    &prior.lookup_digest,
+                    ttl_secs,
+                    prior.max_redeems,
+                    prior.owner_endpoint.as_deref(),
+                ),
+                body,
+            )
+        }
+    };
+    if !equivalent {
+        return Ok(Some(ClaimOutcome::RequestConflict));
+    }
+    let response = match prior.claim_response {
+        Some(bytes) => bytes,
+        None => encode_response(&CtrlMessage::InviteClaimed {
+            request_id: *request_id,
+            code_id: prior.code_id,
+            created_ms: prior.created_ms,
+            expires_ms: prior.expires_ms.unwrap_or(0),
+            revision: 1,
+        })?,
+    };
+    journal_put(tx, owner, request_id, "claim", body, &response, now_ms)?;
+    Ok(Some(ClaimOutcome::Replay(response)))
+}
+
+/// One `invite_codes` row read back for a durable claim replay
+/// (R36-P2-05); see [`prior_claim_replay`].
+struct PriorClaim {
+    lookup_digest: Digest32,
+    created_ms: u64,
+    expires_ms: Option<u64>,
+    code_id: CodeId,
+    max_redeems: u32,
+    owner_endpoint: Option<Vec<u8>>,
+    claim_request_body: Option<Vec<u8>>,
+    claim_response: Option<Vec<u8>>,
 }
 
 fn revoke_body(code_id: &CodeId, expected_revision: u64) -> Vec<u8> {
@@ -3195,6 +3332,331 @@ mod tests {
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
+    }
+
+    // ---- R36-P2-05: durable claim replay past journal recycling ----
+
+    /// The idempotency journal is bounded (24 h / 4096 rows) and recycles;
+    /// after that a retry of the SAME claim used to die as CODE_CONFLICT
+    /// (the lookup-collision check fired first) or as a quota rejection.
+    /// The durable replay record on the code row must restore the
+    /// ORIGINAL result — including the original revision (1), even after
+    /// a revoke bumped the row's current revision.
+    #[test]
+    fn claim_retry_after_journal_recycle_replays_the_original_result() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        let first = store
+            .claim(
+                &owner(5),
+                &[0x50; 16],
+                &lookup(5),
+                600,
+                1,
+                Some(&[0x0F; 16]),
+                now,
+            )
+            .unwrap();
+        let ClaimOutcome::Claimed {
+            code_id,
+            created_ms,
+            expires_ms,
+            revision,
+        } = first
+        else {
+            panic!("first claim must succeed: {first:?}");
+        };
+        assert_eq!(revision, 1);
+
+        // The owner revokes the code: the ROW revision is now 2 — a
+        // reconstruction using the current revision would answer the
+        // retry with a version the original response never had.
+        assert!(matches!(
+            store
+                .revoke(&owner(5), &[0x51; 16], &code_id, 1, now + 10)
+                .unwrap(),
+            RevokeOutcome::Revoked { .. }
+        ));
+
+        // The journal rows recycle (retention window / row-cap eviction).
+        {
+            let conn = store.lock();
+            conn.execute("DELETE FROM request_journal", []).unwrap();
+        }
+
+        // Same request, byte-identical content: the ORIGINAL answer.
+        match store
+            .claim(
+                &owner(5),
+                &[0x50; 16],
+                &lookup(5),
+                600,
+                1,
+                Some(&[0x0F; 16]),
+                now + 20,
+            )
+            .unwrap()
+        {
+            ClaimOutcome::Replay(bytes) => match CtrlFrame::decode(&bytes).unwrap().message {
+                CtrlMessage::InviteClaimed {
+                    request_id,
+                    code_id: answered,
+                    created_ms: answered_created,
+                    expires_ms: answered_expires,
+                    revision: answered_revision,
+                } => {
+                    assert_eq!(request_id, [0x50; 16]);
+                    assert_eq!(answered, code_id);
+                    assert_eq!(answered_created, created_ms);
+                    assert_eq!(answered_expires, expires_ms);
+                    assert_eq!(
+                        answered_revision, 1,
+                        "the claim-time revision, never the row's current one"
+                    );
+                }
+                other => panic!("expected InviteClaimed replay, got {other:?}"),
+            },
+            other => panic!("recycled-journal retry must replay, got {other:?}"),
+        }
+
+        // ttl / cap / endpoint / lookup differences still refuse.
+        assert_eq!(
+            store
+                .claim(&owner(5), &[0x50; 16], &lookup(5), 900, 1, Some(&[0x0F; 16]), now + 30)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 0, Some(&[0x0F; 16]), now + 31)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 1, None, now + 32)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert_eq!(
+            store
+                .claim(&owner(5), &[0x50; 16], &lookup(6), 600, 1, Some(&[0x0F; 16]), now + 33)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+    }
+
+    /// Recognition of the prior request runs BEFORE the quota checks: an
+    /// owner at the per-hour claim cap retrying an earlier request still
+    /// gets the original result, not `RATE_LIMITED`, and only genuinely
+    /// new requests consume the budget (the 31st new claim is refused).
+    #[test]
+    fn recycled_claim_retry_is_recognized_before_quota_checks() {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let now = 1_000_000u64;
+        // The first 30 claims of the hour succeed (the frozen cap).
+        for index in 0..INVITE_CLAIMS_PER_HOUR {
+            let request = [0x80 + index as u8; 16];
+            assert!(
+                matches!(
+                    store
+                        .claim(&owner(9), &request, &lookup(40 + index as u8), 0, 0, None, now)
+                        .unwrap(),
+                    ClaimOutcome::Claimed { .. }
+                ),
+                "claim {index} inside the cap must succeed"
+            );
+        }
+        // The 31st NEW claim of the hour is rate-limited.
+        assert_eq!(
+            store
+                .claim(&owner(9), &[0xA0; 16], &lookup(90), 0, 0, None, now + 1)
+                .unwrap(),
+            ClaimOutcome::RateLimited
+        );
+
+        // The journal recycles entirely.
+        {
+            let conn = store.lock();
+            conn.execute("DELETE FROM request_journal", []).unwrap();
+        }
+
+        // Retrying the hour's first claim replays its original result —
+        // the quota checks no longer preempt the durable recognition.
+        assert!(matches!(
+            store
+                .claim(&owner(9), &[0x80; 16], &lookup(40), 0, 0, None, now + 2)
+                .unwrap(),
+            ClaimOutcome::Replay(_)
+        ));
+        // A genuinely new claim is still refused by the same window.
+        assert_eq!(
+            store
+                .claim(&owner(9), &[0xA1; 16], &lookup(91), 0, 0, None, now + 3)
+                .unwrap(),
+            ClaimOutcome::RateLimited
+        );
+    }
+
+    /// Helper for the v2→v3 tests: a database in exactly the schema-v2
+    /// layout (wave-28 columns, no durable replay columns) holding one
+    /// claimed-and-revoked code of `owner(5)` under request `[0x50; 16]`.
+    fn create_v2_database(path: &Path) -> CodeId {
+        let store = RegistryStore::open(path).unwrap();
+        let now = 1_000_000u64;
+        let claimed = store
+            .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 0, None, now)
+            .unwrap();
+        let ClaimOutcome::Claimed { code_id, .. } = claimed else {
+            panic!("seed claim must succeed: {claimed:?}");
+        };
+        // Bump the row revision past 1: the reconstruction must still
+        // answer replays with the claim-time revision.
+        assert!(matches!(
+            store
+                .revoke(&owner(5), &[0x51; 16], &code_id, 1, now + 10)
+                .unwrap(),
+            RevokeOutcome::Revoked { .. }
+        ));
+        {
+            let conn = store.lock();
+            // Strip the v3 columns this build added and stamp v2: the
+            // exact layout a pre-R36-P2-05 deployment holds.
+            conn.execute_batch(
+                "ALTER TABLE invite_codes DROP COLUMN claim_request_body;
+                 ALTER TABLE invite_codes DROP COLUMN claim_response;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+            conn.execute("DELETE FROM request_journal", []).unwrap();
+        }
+        drop(store);
+        code_id
+    }
+
+    /// A schema-v2 database migrates 2 → 3 additively, and a pre-v3
+    /// claim row (NULL replay columns) still replays after the journal
+    /// recycles — via the deterministic reconstruction, with the
+    /// claim-time revision, never the row's current one.
+    #[test]
+    fn v2_database_migrates_to_v3_and_replays_pre_v3_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reg.sqlite");
+        let code_id = create_v2_database(&path);
+        let store = RegistryStore::open(&path).unwrap();
+        {
+            let conn = store.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+        match store
+            .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 0, None, 1_100_000)
+            .unwrap()
+        {
+            ClaimOutcome::Replay(bytes) => match CtrlFrame::decode(&bytes).unwrap().message {
+                CtrlMessage::InviteClaimed {
+                    code_id: answered,
+                    created_ms,
+                    expires_ms,
+                    revision,
+                    ..
+                } => {
+                    assert_eq!(answered, code_id);
+                    assert_eq!(created_ms, 1_000_000);
+                    assert_eq!(expires_ms, 1_000_000 + 600_000);
+                    assert_eq!(revision, 1, "claim-time revision, not the revoked row's 2");
+                }
+                other => panic!("expected InviteClaimed replay, got {other:?}"),
+            },
+            other => panic!("pre-v3 claim row must replay after migration, got {other:?}"),
+        }
+        // Different content under the same id still conflicts, and a
+        // fresh claim after the migration writes the v3 columns.
+        assert_eq!(
+            store
+                .claim(&owner(5), &[0x50; 16], &lookup(5), 900, 0, None, 1_100_001)
+                .unwrap(),
+            ClaimOutcome::RequestConflict
+        );
+        assert!(matches!(
+            store
+                .claim(&owner(5), &[0x52; 16], &lookup(6), 0, 0, None, 1_100_002)
+                .unwrap(),
+            ClaimOutcome::Claimed { .. }
+        ));
+        {
+            let conn = store.lock();
+            let (body, response): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT claim_request_body, claim_response FROM invite_codes
+                     WHERE owner_device_id=?1 AND create_request_id=?2",
+                    params![owner(5).as_slice(), &[0x52u8; 16].as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(body.is_some(), "fresh claims persist the canonical body");
+            assert!(response.is_some(), "fresh claims persist the response bytes");
+        }
+    }
+
+    /// The v2→v3 migration is atomic and re-entrant like v1→v2: a crash
+    /// between the two ALTERs (or after both, before the version stamp)
+    /// leaves a database the next startup completes instead of rejecting.
+    #[test]
+    fn interrupted_v2_to_v3_migration_resumes_and_completes() {
+        let partial_states: [&[&str]; 2] = [
+            // Only the first ALTER landed before the crash.
+            &["ALTER TABLE invite_codes ADD COLUMN claim_request_body BLOB NULL"],
+            // Both landed but the version stamp never did.
+            &[
+                "ALTER TABLE invite_codes ADD COLUMN claim_request_body BLOB NULL",
+                "ALTER TABLE invite_codes ADD COLUMN claim_response BLOB NULL",
+            ],
+        ];
+        for (index, applied) in partial_states.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reg.sqlite");
+            let code_id = create_v2_database(&path);
+            {
+                let conn = Connection::open(&path).unwrap();
+                for statement in applied.iter() {
+                    conn.execute_batch(statement).unwrap();
+                }
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, 2, "case {index}: still stamped v2");
+            }
+            let store = RegistryStore::open(&path)
+                .unwrap_or_else(|e| panic!("case {index}: reopen must migrate, got {e:?}"));
+            {
+                let conn = store.lock();
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(version, SCHEMA_VERSION, "case {index}");
+            }
+            // The pre-existing row survived and replays.
+            match store
+                .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 0, None, 1_100_003)
+                .unwrap()
+            {
+                ClaimOutcome::Replay(bytes) => match CtrlFrame::decode(&bytes).unwrap().message {
+                    CtrlMessage::InviteClaimed {
+                        code_id: answered,
+                        revision,
+                        ..
+                    } => {
+                        assert_eq!(answered, code_id, "case {index}");
+                        assert_eq!(revision, 1, "case {index}");
+                    }
+                    other => panic!("case {index}: expected replay, got {other:?}"),
+                },
+                other => panic!("case {index}: replay expected, got {other:?}"),
+            }
+        }
     }
 
     /// R29-P2-02: wave-28 journaled default-extension claims with the

@@ -1441,34 +1441,19 @@ pub(crate) async fn daemon_core(
     // process (`invite create`, a second daemon, a probe) KICKS this
     // connection; the client surfaces Disconnected but never re-establishes
     // on its own, which used to leave the owner loop deaf (its plane
-    // received nothing until a restart). The keeper reconnects with the
-    // client's built-in backoff; the server's Hello catch-up then re-pushes
-    // pending redeem offers onto the still-live plane subscription.
+    // received nothing until a restart). Wave 35/R36: the common ak-session
+    // keeper component — 20 s keepalive pings (inside the server's 30 s
+    // frame-silence cut, so an idle daemon also stays online), reconnect
+    // on Disconnected with a CAPPED backoff between failed batches
+    // (R36-P1-02: a failed batch ends retryable-Disconnected, never
+    // wedged in Connecting), and black-hole recovery after repeated ping
+    // timeouts. The server's Hello catch-up re-pushes pending redeem
+    // offers onto the still-live plane subscription. The keeper ends on
+    // the shared shutdown channel.
     if let Some((_settings, _key, client)) = shared_registry.as_ref() {
         let client = client.clone();
-        let mut shutdown_keeper = shutdown.clone();
-        tokio::spawn(async move {
-            let mut state = client.state_watcher();
-            loop {
-                tokio::select! {
-                    _ = shutdown_keeper.changed() => break,
-                    _ = state.changed() => {
-                        if matches!(
-                            *state.borrow_and_update(),
-                            ak_session::pairing::ClientState::Disconnected
-                        ) {
-                            if let Err(err) = client.reconnect().await {
-                                log::warn!("registry reconnect failed: {err}");
-                                // The watcher fires again on the next
-                                // state change; a hard failure also sets
-                                // Disconnected, so this retries with the
-                                // built-in backoff rather than spinning.
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let shutdown_keeper = shutdown.clone();
+        client.spawn_connection_keeper(shutdown_keeper);
     }
 
     let port = if opts.port == 0 {

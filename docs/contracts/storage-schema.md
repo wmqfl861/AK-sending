@@ -25,6 +25,10 @@ invite_codes
   state               active | revoked | expired
   revision            INTEGER NOT NULL
   create_request_id   BLOB(16) NOT NULL
+  owner_endpoint      BLOB NULL
+  max_redeems         INTEGER NOT NULL DEFAULT 0
+  claim_request_body  BLOB NULL
+  claim_response      BLOB NULL
 
   UNIQUE(owner_device_id, create_request_id)
 ```
@@ -38,6 +42,8 @@ invite_codes
 - `expires_unix_ms` 为 NULL（或协议层 `expires_ms=0`）表示长期有效。
 
 **wave-28 修订（schema v1→v2，增量迁移）**：`invite_codes` 增 `owner_endpoint BLOB NULL`（发起方连接设置，≤512B 透传 blob，随 claim 扩展段到达）与 `max_redeems INTEGER NOT NULL DEFAULT 0`（0=不限，1=任务码单次兑换；额度只计 committed/applied/ready 事务，pending/aborted 不消耗，且在 redeem begin 与最终 Commit 的同一写事务内两处强制——竞争 Commit 的超限事务同事务转 aborted 并返回 `0x2109`；耗尽后新 redeemer 得 `0x2109 REDEEM_EXHAUSTED`，同 request_id 重放幂等不变）；`pairing_transactions` 增 `owner_endpoint BLOB NULL`/`redeemer_endpoint BLOB NULL`（兑换时刻快照，双端点交付依据）。endpoint blob 是连接提示而非凭证，不受 transcript 签名覆盖。
+
+**2026-11-09 修订（schema v2→v3，增量迁移，R36-P2-05）**：`invite_codes` 增 `claim_request_body BLOB NULL`（claim 时刻的 canonical 幂等请求体）与 `claim_response BLOB NULL`（原 `InviteClaimed` 响应帧字节），为 journal 回收后的迟到重试提供持久重放依据。claim 流程把"同 owner+create_request_id 的既有请求"识别提前到配额检查与 lookup 碰撞检查**之前**：journal 已回收时按持久化信息恢复原响应（v3 行用保存的请求体与响应字节；v1/v2 行由不可变列 `lookup_digest`/`created_unix_ms`/`expires_unix_ms`/`max_redeems`/`owner_endpoint` 重建 canonical 体，响应以 claim 时刻 revision=1 重建，绝不以行当前 revision 冒充）；ttl/cap/endpoint/lookup 差异仍 `REQUEST_CONFLICT`。迁移为增量 `ALTER TABLE`，与 v1→v2 同一原子可重入纪律（链式 v1→v2→v3），不触碰任何 tombstone 或唯一性记录。
 
 ### 3. `pairing_transactions` 表（冻结）
 
@@ -72,7 +78,8 @@ invite_codes
 - 注册库自带 schema 版本；升级迁移不得破坏 tombstone 与唯一性记录。
 - 不保存文件任务记录、路径、内容或文件进度。
 - **幂等请求体跨版本稳定（wave-29 修订）**：claim 的 canonical 幂等体在扩展段为默认值（无 endpoint、`max_redeems=0`）时与 v1 布局逐字节一致（`lookup_digest[32]+ttl_secs[4]`，36 字节）；仅非默认扩展追加 v2 尾部（`max_redeems[4]+endpoint presence[1]+blob`），两种布局长度不同、不可碰撞。升级前持久化的旧 claim 幂等记录在升级后同请求重放命中原响应；真正改变扩展内容仍是 `REQUEST_CONFLICT`。revoke 等其他请求体的编码不受影响。
-- **历史 41B 默认记录等价（wave-30 修订，R29-P2-02）**：wave-28 服务器对**所有** claim 无条件写入扩展尾部，默认扩展因此留下 `lookup_digest[32]+ttl_secs[4]+max_redeems=0[4]+presence=0[1]` 的 41 字节 journal 行。该 41B 布局与本版 36B canonical 体视为**同一 canonical 请求**：重放比较在读取侧归一化（长度 41 且尾 5 字节全零 ⇔ 其 36B 前缀），存量磁盘行一律不迁移、不改写（schema 版本维持 2，无新迁移）；非默认扩展（cap>0 或含 endpoint）仍逐字节比较，真实 ttl/cap/endpoint 差异仍 `REQUEST_CONFLICT`。“41B 且尾 5 字节全零”只能源自 wave-28 默认扩展（v1 从不写尾部；非默认尾部必有非零 cap 字节或非零 presence 字节），故归一化不引入跨内容碰撞。
+- **历史 41B 默认记录等价（wave-30 修订，R29-P2-02）**：wave-28 服务器对**所有** claim 无条件写入扩展尾部，默认扩展因此留下 `lookup_digest[32]+ttl_secs[4]+max_redeems=0[4]+presence=0[1]` 的 41 字节 journal 行。该 41B 布局与本版 36B canonical 体视为**同一 canonical 请求**：重放比较在读取侧归一化（长度 41 且尾 5 字节全零 ⇔ 其 36B 前缀），存量磁盘行一律不迁移、不改写（wave-30 时点 schema 版本维持 2）；非默认扩展（cap>0 或含 endpoint）仍逐字节比较，真实 ttl/cap/endpoint 差异仍 `REQUEST_CONFLICT`。“41B 且尾 5 字节全零”只能源自 wave-28 默认扩展（v1 从不写尾部；非默认尾部必有非零 cap 字节或非零 presence 字节），故归一化不引入跨内容碰撞。
+- **journal 回收后的持久重放（2026-11-09 修订，schema v2→v3，R36-P2-05）**：journal 有界（24 小时/4096 行）并会回收；回收后同一 claim 请求的重试不得因 lookup 碰撞被判 `CODE_CONFLICT`、也不得先被配额拒绝。`invite_codes` 行持久化 `claim_request_body`（canonical 请求体）与 `claim_response`（原响应字节），claim 在新建配额与 lookup 检查**之前**按 owner+`create_request_id` 识别既有请求并恢复原结果（v3 前旧行由不可变列重建，claim 时刻 revision 恒为 1）；真实 ttl/cap/endpoint/lookup 差异仍 `REQUEST_CONFLICT`。重放恢复后重新写 journal，使后续重试回到快路径。
 - **迁移原子性与可重入（wave-29 修订）**：schema 迁移（如 v1→v2）的全部 DDL 与 `PRAGMA user_version` 推进必须在**单个写事务**内完成——中断要么整体回滚（库保持迁移前一致状态），要么完整提交；再次启动重入即可完成。对历史非原子代码留下的半迁移布局（部分列已存在而版本号未推进），按列存在性受控识别并补齐缺失列后推进版本，不删除库、tombstone 或唯一性记录。
 
 ### 6. 备份与时钟规则（冻结）

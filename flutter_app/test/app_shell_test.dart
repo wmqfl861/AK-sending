@@ -232,6 +232,9 @@ class _ThrowingStartService implements SimpleTransferService {
   Stream<String> get expiredIncomingRequests => const Stream.empty();
 
   @override
+  Stream<EngineHealth> get engineHealth => const Stream.empty();
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     throw StateError('引擎启动失败：注册中心不可达');
   }

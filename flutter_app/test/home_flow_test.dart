@@ -141,6 +141,30 @@ void main() {
     expect(fake.joinRoleRequests.single, TaskRole.send);
   });
 
+  testWidgets('R36-P2-03: the engine-failure latch shows the recoverable '
+      'engine-failed card on the home page', (tester) async {
+    final fake = await pumpApp(tester);
+    expect(find.byKey(const ValueKey('engine_failed_card')), findsNothing,
+        reason: '健康时不显示故障卡');
+
+    fake.failEngine('连续 10 次任务事件轮询失败（fake: poll_event 持续故障）。');
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('engine_failed_card')), findsOneWidget,
+        reason: '闩上必须达 UI——主页出现故障卡');
+    expect(find.textContaining('传输引擎故障'), findsOneWidget);
+    expect(find.textContaining('请重启应用'), findsOneWidget,
+        reason: '可恢复提示：重启应用');
+    expect(find.byKey(const ValueKey('engine_failed_card_detail')),
+        findsOneWidget);
+    expect(find.textContaining('连续 10 次'), findsOneWidget,
+        reason: '故障原因原文可见');
+    // The page stays usable (navigable degraded state, like the startup
+    // error card) — the actions remain, the card sits above them.
+    expect(
+        find.byKey(const ValueKey('home_create_code_button')), findsOneWidget);
+  });
+
   testWidgets('join flow failure: readable reason, retry reopens the '
       'input panel', (tester) async {
     final fake = await pumpApp(tester);

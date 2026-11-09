@@ -117,6 +117,33 @@ class JoinResult {
   final String? error;
 }
 
+/// Engine health of the transfer service (R36-P2-03): `ok` while the
+/// native transfer engine answers; `engineFailed` is the TERMINAL
+/// engine-failure latch (10 consecutive failed native polls or a revoked
+/// engine lease) — [EngineHealth.failureReason] carries the visible
+/// reason and recovery is an application restart (the engine is presumed
+/// broken native-side).
+enum EngineHealthState { ok, engineFailed }
+
+/// One engine-health snapshot of the replayable
+/// [SimpleTransferService.engineHealth] stream (R36-P2-03).
+class EngineHealth {
+  const EngineHealth.ok()
+      : state = EngineHealthState.ok,
+        failureReason = null;
+
+  const EngineHealth.engineFailed(String this.failureReason)
+      : state = EngineHealthState.engineFailed;
+
+  final EngineHealthState state;
+
+  /// The visible failure reason when [state] is
+  /// [EngineHealthState.engineFailed]; null while healthy.
+  final String? failureReason;
+
+  bool get isEngineFailed => state == EngineHealthState.engineFailed;
+}
+
 /// An incoming transfer offer: the peer wants to push [fileCount] files
 /// totalling [totalBytes] bytes. The UI asks 接受 / 拒绝 and answers via
 /// `consent(jobId, ...)`; accepted transfers land in the default save
@@ -187,6 +214,16 @@ abstract class SimpleTransferService {
   /// closes their banners. A later decline click on such a job resolves
   /// normally (idempotent).
   Stream<String> get expiredIncomingRequests;
+
+  /// Replayable engine-health stream (R36-P2-03): EVERY new subscription
+  /// first receives the CURRENT snapshot (`ok`, or the latched
+  /// `engineFailed` with its visible reason), then the live changes —
+  /// an engine failure reaches the UI the moment it trips, never only
+  /// as an internal field. `engineFailed` is terminal for the service
+  /// instance: pending receives/sends end with the same failure and the
+  /// UI's recoverable affordance is an application restart. Each call of
+  /// this getter returns an independent stream.
+  Stream<EngineHealth> get engineHealth;
 
   /// Answers an [IncomingRequest]. With `accept: true` the returned future
   /// completes when the receive finishes and rejects on failure; the files

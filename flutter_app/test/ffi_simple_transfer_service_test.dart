@@ -13,6 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ak_sending_app/services/ffi_simple_transfer_service.dart';
 import 'package:ak_sending_app/ui/service/simple_transfer_service.dart'
     show
+        EngineHealth,
         IncomingRequest,
         JoinResult,
         TaskConnection,
@@ -279,6 +280,73 @@ void main() {
       accepted,
       throwsA(isA<StateError>()
           .having((e) => e.message, 'message', contains('连接已断开'))),
+    );
+    service.dispose();
+  });
+
+  test('R36-P2-03: engineHealth forwards ok → engineFailed with the '
+      'visible reason (replayable per listen)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final health = <EngineHealth>[];
+    final sub = service.engineHealth.listen(health.add);
+    await pumpEventQueue();
+    expect(health, hasLength(1));
+    expect(health.single.isEngineFailed, isFalse);
+
+    for (var i = 0; i < 10; i++) {
+      fake.failPollEventCalls = 1;
+      service.engine.pumpEvents();
+    }
+    await pumpEventQueue();
+    expect(health.last.isEngineFailed, isTrue,
+        reason: '真实 adapter 必须转发引擎闩——故障要达 UI，不能只留内部字段');
+    expect(health.last.failureReason, contains('传输引擎故障'));
+
+    // A second listener on the SAME adapter gets the replayed latch.
+    final late = <EngineHealth>[];
+    final lateSub = service.engineHealth.listen(late.add);
+    await pumpEventQueue();
+    expect(late.single.isEngineFailed, isTrue);
+    await sub.cancel();
+    await lateSub.cancel();
+    service.dispose();
+  });
+
+  test('R36-P2-03: an accepted receive in flight ends PROMPTLY with the '
+      'engine failure when the latch trips (never waits out its stall '
+      'budget)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      // A huge stall budget proves the LATCH (not the timeout) ends the
+      // wait.
+      receiveTimeout: const Duration(days: 1),
+    );
+    await service.start();
+    final code = (await service.createCode(TaskRole.receive)).code;
+    final joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final job = fake.emitIncomingRequest(fake.runtimes.keys.first,
+        connId: joined.connectionId, rootName: 'x', files: 1, bytes: 1);
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    final accepted = service.consent(job, true);
+    await pumpEventQueue();
+    // The engine latches while the receive is still waiting.
+    for (var i = 0; i < 10; i++) {
+      fake.failPollEventCalls = 1;
+      service.engine.pumpEvents();
+    }
+    await expectLater(
+      accepted,
+      throwsA(isA<StateError>()
+          .having((e) => e.message, 'message', contains('传输引擎故障'))),
     );
     service.dispose();
   });

@@ -24,6 +24,7 @@ import 'pages/settings_page.dart';
 import 'service/file_pick_gateway.dart';
 import 'service/save_dir_store.dart';
 import 'service/simple_transfer_service.dart';
+import 'widgets/engine_error_card.dart';
 import 'widgets/incoming_requests_host.dart';
 
 /// Material 3 app root for the wave-28 minimal-pairing UI.
@@ -212,7 +213,9 @@ class _AppShellState extends State<AppShell> {
 
 /// The visible engine-unavailable state (wave-29 P1-01): construction
 /// failure or failed `start()` — the app stays navigable but honestly
-/// says pairing/transfers cannot run.
+/// says pairing/transfers cannot run. R36-P2-03: the visual lives in the
+/// shared [EngineErrorCard] (the home page's engine-failed banner reuses
+/// the exact same style).
 class _StartupErrorCard extends StatelessWidget {
   const _StartupErrorCard({required this.reason});
 
@@ -220,41 +223,11 @@ class _StartupErrorCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      color: scheme.errorContainer,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(Icons.error_outline, color: scheme.onErrorContainer),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '传输引擎不可用，配对与传输功能暂不能使用。',
-                    key: const ValueKey('app_startup_error'),
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(color: scheme.onErrorContainer),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    reason,
-                    key: const ValueKey('app_startup_error_detail'),
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: scheme.onErrorContainer),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
+    return EngineErrorCard(
+      title: '传输引擎不可用，配对与传输功能暂不能使用。',
+      titleKey: const ValueKey('app_startup_error'),
+      detail: reason,
+      detailKey: const ValueKey('app_startup_error_detail'),
     );
   }
 }

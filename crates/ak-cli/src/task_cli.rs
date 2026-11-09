@@ -782,19 +782,19 @@ const CONNECTION_LOCK_REFRESH: Duration = Duration::from_secs(5);
 const CONNECTION_LOCK_STALE: Duration = Duration::from_secs(15);
 
 /// One parsed lock file (`pid heartbeat-ms`).
-struct LockHolder {
+pub(crate) struct LockHolder {
     pid: u32,
     beat_ms: u64,
 }
 
-fn parse_lock_holder(text: &str) -> Option<LockHolder> {
+pub(crate) fn parse_lock_holder(text: &str) -> Option<LockHolder> {
     let mut parts = text.split_whitespace();
     let pid = parts.next()?.parse().ok()?;
     let beat_ms = parts.next()?.parse().ok()?;
     Some(LockHolder { pid, beat_ms })
 }
 
-fn write_lock_file(path: &Path) {
+pub(crate) fn write_lock_file(path: &Path) {
     let _ = std::fs::write(path, format!("{}\n{}\n", std::process::id(), crate::now_unix_ms()));
 }
 
@@ -802,7 +802,7 @@ fn write_lock_file(path: &Path) {
 /// the registry dial, released (file removed) on drop — including the
 /// failure paths inside [`open_session`].
 #[derive(Debug)]
-struct ConnectionLock {
+pub(crate) struct ConnectionLock {
     path: PathBuf,
 }
 
@@ -814,7 +814,7 @@ struct ConnectionLock {
 /// or our own PID (same process) is broken/refreshed. Best-effort by
 /// design: no atomic file locking, only the documented pid+heartbeat
 /// protocol.
-fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
+pub(crate) fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
     let path = id_dir.join(CONNECTION_LOCK_FILE);
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Some(holder) = parse_lock_holder(&text) {
@@ -838,7 +838,7 @@ fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
 /// Keep the heartbeat fresh while the session lives, so a later run on
 /// the same id-dir sees a LIVE holder (a crashed process stops
 /// refreshing and its lock goes stale).
-fn spawn_connection_lock_heartbeat(lock: &ConnectionLock) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_connection_lock_heartbeat(lock: &ConnectionLock) -> tokio::task::JoinHandle<()> {
     let path = lock.path.clone();
     tokio::spawn(async move {
         loop {

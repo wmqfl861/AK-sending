@@ -1349,6 +1349,18 @@ pub(crate) async fn daemon_core(
     // connection per device — a second connect used to kick the first,
     // silently rerouting every redeem offer to a plane nobody read.
     let shared_registry = if wired_mode || opts.pairing {
+        // R36-P2-04 (audit follow-up): the daemon participates in the
+        // SAME per-identity control-connection lock as the CLI task
+        // commands (task_cli::acquire_connection_lock) — a CLI task run
+        // against this daemon's id-dir now refuses loudly instead of
+        // silently kicking the daemon's registry connection (and being
+        // kicked back by the daemon's keeper). The lock lives for the
+        // whole daemon run; its heartbeat task is aborted at exit via
+        // the handle, the file cleans itself in Drop.
+        let _lock = crate::task_cli::acquire_connection_lock(id)
+            .context("cannot claim the identity's control-connection lock")?;
+        let _lock_heartbeat =
+            crate::task_cli::spawn_connection_lock_heartbeat(&_lock);
         let settings = match registry.as_ref() {
             Some(settings) => *settings,
             None => crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?,

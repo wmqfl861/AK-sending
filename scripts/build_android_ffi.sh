@@ -191,12 +191,14 @@ LLVM_NM="$NDK_BIN/llvm-nm.exe"
 [ "$HOST_TAG" = "linux-x86_64" ] && LLVM_NM="$NDK_BIN/llvm-nm"
 [ -f "$LLVM_NM" ] || die "llvm-nm not found in NDK: $LLVM_NM"
 
-# Frozen ABI v1 (ak_engine_new / ak_identity_info / ak_jobs_list) plus the
-# v2 contract spot check: ak_pairing_start and ak_sched_listen_start
-# (docs/contracts/ffi-v2.md §1 — the sched entry point is listen_start;
-# the contract defines no bare ak_sched_start). STRICT: every missing
-# symbol is listed per .so and the run FAILs (no WARNING fallback).
-REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list ak_pairing_start ak_sched_listen_start"
+# Frozen ABI v1 (ak_engine_new / ak_identity_info / ak_jobs_list) plus
+# the v2 contract spot check (ak_pairing_start / ak_sched_listen_start)
+# and, since R36-P2-07, the FULL task-plane set: all 8 ak_task_*
+# exports (ffi-v2.md §8) — the old 5-symbol spot check let a pre-task
+# .so pass while silently missing the entire v1-task-code surface.
+# STRICT: every missing symbol is listed per .so and the run FAILs (no
+# WARNING fallback).
+REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list ak_pairing_start ak_sched_listen_start ak_task_start ak_task_create_code ak_task_join ak_task_send ak_task_list ak_task_disconnect ak_task_set_save_dir ak_task_consent"
 verify_symbols() { # $1 = .so path, $2 = label
   local missing=""
   for sym in $REQUIRED_SYMBOLS; do

@@ -10,9 +10,17 @@
 library;
 
 import 'dart:async' show Timer, TimeoutException;
+import 'dart:typed_data' show Uint8List;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
-    show AkFfiException, AkTaskLeaseGate, FakeAkTaskCalls, TaskDoneEvent;
+    show
+        AkFfiException,
+        AkTaskCalls,
+        AkTaskDoorbell,
+        AkTaskDoorbellRegistrar,
+        AkTaskLeaseGate,
+        FakeAkTaskCalls,
+        TaskDoneEvent;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ak_sending_app/services/simple_transfer_service.dart';
 
@@ -21,6 +29,62 @@ const String regId =
 
 /// Zero-delay stand-in: op wait loops drain synchronously under the fake.
 Future<void> immediate(Duration d) async {}
+
+/// CR-P2-05 (2026-11-12) doorbell test kit: a fake doorbell whose
+/// [FakeDoorbell.ring] simulates the native side waking the isolate, and
+/// a registrar seam that records what the service registered.
+final class FakeDoorbell implements AkTaskDoorbell {
+  FakeDoorbell(this._onRing);
+
+  final void Function() _onRing;
+  bool closed = false;
+  int ringsDelivered = 0;
+
+  /// Simulate one native ring (a closed doorbell refuses, exactly like a
+  /// real NativeCallable after close).
+  void ring() {
+    if (closed) {
+      return;
+    }
+    ringsDelivered++;
+    _onRing();
+  }
+
+  @override
+  void close() => closed = true;
+}
+
+/// The registrar seam over the fake seam: hands each registered doorbell
+/// to the test and remembers the runtime ids it saw.
+final class DoorbellTestkit {
+  final List<FakeDoorbell> doorbells = <FakeDoorbell>[];
+  final List<Uint8List> registeredRuntimeIds = <Uint8List>[];
+
+  AkTaskDoorbell? registrar(
+      AkTaskCalls calls, Uint8List runtimeId, void Function() onRing) {
+    registeredRuntimeIds.add(Uint8List.fromList(runtimeId));
+    final doorbell = FakeDoorbell(onRing);
+    doorbells.add(doorbell);
+    return doorbell;
+  }
+}
+
+/// A service booted with a doorbell registrar (the CR-P2-05 test shape).
+SimpleTransferService doorbellService(
+    FakeAkTaskCalls fake, AkTaskDoorbellRegistrar registrar,
+    {Duration? activeInterval}) {
+  final service = SimpleTransferService(
+    calls: fake,
+    delay: immediate,
+    doorbellRegistrar: registrar,
+    eventPollInterval: activeInterval ?? const Duration(days: 1),
+  );
+  service.start(
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/doorbell');
+  return service;
+}
 
 SimpleTransferService booted(FakeAkTaskCalls fake) {
   final service = SimpleTransferService(
@@ -1541,6 +1605,137 @@ void main() {
       expect(ticks, lessThanOrEqualTo(15),
           reason: '500ms 稳态窗口内 tick 数受 50ms 节奏约束（10 拍＋粒度余量）；'
               '双链风暴会数倍超标');
+      service.dispose();
+    });
+  });
+
+  group('CR-P2-05 (2026-11-12): native-push doorbell + safety-net tick',
+      () {
+    test('(a) a doorbell ring drains IMMEDIATELY — no tick needed',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final kit = DoorbellTestkit();
+      final service = doorbellService(fake, kit.registrar);
+      expect(service.usesNativeEventPush, isTrue);
+      expect(kit.doorbells, hasLength(1));
+      // The registration happened INSIDE start(), with the REAL runtime
+      // id of the started runtime (the fake keys runtimes by hex id).
+      expect(kit.registeredRuntimeIds, hasLength(1));
+      final runtimeIdHex = kit.registeredRuntimeIds.single
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+      expect(fake.runtimes.containsKey(runtimeIdHex), isTrue,
+          reason: '门铃注册用了真实 runtime id');
+
+      // An event queues natively; NO timer advanced (the configured
+      // interval is days:1 — a tick would never come). The ring alone
+      // must drain it: _pumpOnce runs synchronously inside the listener
+      // callback, before this test regains control.
+      final requests = <dynamic>[];
+      final sub = service.incomingRequests.listen(requests.add);
+      fake.emitIncomingRequest(runtimeIdHex, files: 2, bytes: 2048);
+      final pollsBefore = fake.pollEventCallCount;
+      kit.doorbells.single.ring();
+      expect(fake.pollEventCallCount, greaterThan(pollsBefore),
+          reason: '门铃唤醒立即排空（不等任何 tick）');
+      await pumpEventQueue();
+      expect(requests, hasLength(1),
+          reason: '排空的事件送达 UI 流（无任何定时器参与）');
+      await sub.cancel();
+      service.dispose();
+    });
+
+    test('(b) a seam without the capability keeps PURE POLLING unchanged '
+        '(the D1 fallback)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(
+          calls: fake, delay: immediate, eventPollInterval: const Duration(days: 1));
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/pure');
+      expect(service.usesNativeEventPush, isFalse,
+          reason: '无能力 seam（普通 fake）必须安静退回纯轮询');
+      // D1 cadences exactly: the configured interval is a MINIMUM tick
+      // distance in every mode (days:1 here — manual pumping, idle
+      // included); an in-flight op flips to the configured ACTIVE
+      // interval, never to any doorbell value.
+      expect(service.effectiveEventPollInterval, const Duration(days: 1));
+      final op = service.createCode(SimpleTransferRole.sender);
+      expect(service.effectiveEventPollInterval, const Duration(days: 1));
+      await op;
+      service.dispose();
+
+      // The D1 pure decision keeps its shipped values.
+      expect(eventPollMs(hasActivity: true), 50);
+      expect(eventPollMs(hasActivity: false), 1000);
+      final production = SimpleTransferService(calls: FakeAkTaskCalls());
+      expect(production.eventPollInterval,
+          const Duration(milliseconds: SimpleTransferService.activeEventPollMs));
+      production.dispose();
+    });
+
+    testWidgets('(c) a MISSED doorbell never stalls the UI: the safety '
+        'tick still pumps', (tester) async {
+      final fake = FakeAkTaskCalls();
+      final kit = DoorbellTestkit();
+      // The PRODUCTION active interval so the 250 ms safety net applies.
+      final service = doorbellService(fake, kit.registrar,
+          activeInterval: const Duration(milliseconds: 50));
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      expect(created.code.startsWith('AKI1-'), isTrue);
+      expect(service.hasActivity, isTrue); // paired = active
+      expect(service.effectiveEventPollInterval,
+          const Duration(milliseconds: 250),
+          reason: '门铃模式下活动节奏降为 250ms 安全网');
+
+      // The event queues natively and the doorbell NEVER fires: the
+      // safety tick alone must deliver it within its cadence.
+      fake.runtimes[fake.runtimes.keys.first]!.events.add(<String, dynamic>{
+        'event': 'incoming_request',
+        'job': 'f' * 32,
+        'conn': 'a' * 32,
+        'root': 'photos',
+        'files': 1,
+        'bytes': 10,
+        'saveDir': 'D:/inbox',
+      });
+      final pollsBefore = fake.pollEventCallCount;
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(fake.pollEventCallCount, greaterThan(pollsBefore),
+          reason: '漏铃后安全网 tick 仍排空（UI 永不卡死）');
+      service.dispose();
+    });
+
+    test('(d) dispose closes the doorbell (unregister before release)',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final kit = DoorbellTestkit();
+      final service = doorbellService(fake, kit.registrar);
+      final doorbell = kit.doorbells.single;
+      service.dispose();
+      expect(doorbell.closed, isTrue, reason: 'dispose 必须注销门铃');
+
+      // A late ring on a disposed service is a no-op (the listener gate).
+      fake.emitIncomingRequest(fake.runtimes.keys.first, files: 1, bytes: 1);
+      final pollsBefore = fake.pollEventCallCount;
+      doorbell.ring(); // closed doorbells refuse; even a forced ring:
+      expect(fake.pollEventCallCount, pollsBefore,
+          reason: '已释放服务不再因响铃触碰引擎');
+    });
+
+    test('the safety net never runs FASTER than the configured interval',
+        () {
+      final fake = FakeAkTaskCalls();
+      final kit = DoorbellTestkit();
+      // A manual-pump configuration (days:1) with a REGISTERED doorbell:
+      // the safety net must respect the slower configured cadence in
+      // EVERY mode (the configured interval stays a minimum distance).
+      final service = doorbellService(fake, kit.registrar);
+      expect(service.effectiveEventPollInterval, const Duration(days: 1),
+          reason: '空闲也不得快于配置（days:1 手动泵语义保持）');
+      final op = service.createCode(SimpleTransferRole.sender);
+      expect(service.effectiveEventPollInterval, const Duration(days: 1),
+          reason: '安全网不得快于配置的活动间隔');
+      op.ignore();
       service.dispose();
     });
   });

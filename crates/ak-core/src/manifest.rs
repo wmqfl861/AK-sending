@@ -76,6 +76,122 @@ const RESERVED_NAMES: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Windows-reserved device-name stems BEYOND the classic [`RESERVED_NAMES`]
+/// set (CR-P3-02, review 2026-11-11): the two console pseudo-files and the
+/// DOS clock device, plus the superscript-digit serial-port/printer aliases
+/// modern Windows recognizes. Checked only by [`windows_incompatible`] —
+/// never by the platform-neutral [`validate_rel_path`] — because a
+/// Linux→Linux transfer may legitimately carry these names.
+const WINDOWS_EXTRA_RESERVED_NAMES: [&str; 9] = [
+    "CONIN$",
+    "CONOUT$",
+    "CLOCK$",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// Characters Win32 forbids in file names beyond the separators and control
+/// characters [`validate_rel_path`] already rejects for every platform
+/// (CR-P3-02): a name containing any of these cannot be CREATED on Windows,
+/// so a Windows receiver must refuse it before accepting the offer.
+const WINDOWS_FORBIDDEN_CHARS: [char; 6] = ['<', '>', '"', '|', '?', '*'];
+
+/// Why a name cannot exist on a Windows filesystem ([`windows_incompatible`],
+/// CR-P3-02): carried by receiver-side pre-Accept preflights so the refusal
+/// names its reason instead of surfacing an I/O error at file-creation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsNameIssue {
+    /// One of `< > " | ? *` appears in the name; Win32 refuses to create it.
+    ForbiddenChar(char),
+    /// The name's stem (before the first `.`) is a Windows-reserved device
+    /// name — the classic set (CON/PRN/AUX/NUL/COM1-9/LPT1-9) or the
+    /// CR-P3-02 extensions listed on [`windows_incompatible`].
+    ReservedStem,
+    /// The name ends in a space or dot; Win32 strips those, so the file the
+    /// receiver would create is not the file the manifest verifies.
+    TrailingDotOrSpace,
+}
+
+impl fmt::Display for WindowsNameIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowsNameIssue::ForbiddenChar(c) => {
+                write!(f, "Windows file names cannot contain {c:?}")
+            }
+            WindowsNameIssue::ReservedStem => {
+                f.write_str("Windows reserves this device name for its stem")
+            }
+            WindowsNameIssue::TrailingDotOrSpace => {
+                f.write_str("Windows strips names ending in a dot or space")
+            }
+        }
+    }
+}
+impl std::error::Error for WindowsNameIssue {}
+
+/// True when `name`'s stem (everything before the first `.`) matches one of
+/// the classic Windows-reserved device names — the platform-neutral rule
+/// [`validate_rel_path`] enforces for every transfer.
+fn classic_reserved_stem(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
+    RESERVED_NAMES.contains(&stem.to_ascii_uppercase().as_str())
+}
+
+/// True when `name`'s stem matches a reserved device name under the FULL
+/// Windows rule set (classic set plus the [`WINDOWS_EXTRA_RESERVED_NAMES`]
+/// extensions); see [`windows_incompatible`] for the exact spelling list.
+fn windows_reserved_stem(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
+    let upper = stem.to_ascii_uppercase();
+    classic_reserved_stem(name) || WINDOWS_EXTRA_RESERVED_NAMES.contains(&upper.as_str())
+}
+
+/// Check ONE `/`-free file name against the rules Windows itself enforces
+/// (CR-P3-02, review 2026-11-11), returning the first issue found.
+///
+/// This is the Windows-specific HALF of the validation split: the
+/// platform-neutral [`validate_rel_path`] already rejects (on every
+/// platform, for every transfer) backslash, colon, control characters,
+/// the classic reserved stems and trailing dots/spaces — so for any name
+/// that already passed it, the delta checked here is exactly:
+///
+/// * one of `< > " | ? *` anywhere in the name (Win32 refuses to create
+///   such files — the receiver would fail at file-creation time, after
+///   the user had already accepted);
+/// * a stem (before the first `.`, with or without an extension) equal
+///   case-insensitively to one of the extended reserved device names:
+///   `CONIN$`, `CONOUT$`, `CLOCK$` (the console pseudo-files and the DOS
+///   clock, per Microsoft's naming rules) and the superscript-digit
+///   aliases `COM¹` `COM²` `COM³` `LPT¹` `LPT²` `LPT³` where ¹ ² ³ are
+///   the Latin-1 superscripts U+00B9 U+00B2 U+00B3 Windows recognizes.
+///   Recognized spellings are exactly those: ASCII case-insensitive,
+///   superscripts only as U+00B9/U+00B2/U+00B3, and only ¹–³ (there is
+///   no `COM⁴`/U+2074 alias, no `COM⁰`, and fullwidth digits or other
+///   lookalikes are NOT reserved by Windows, so they are not rejected);
+/// * for standalone use the checker ALSO re-reports the classic reserved
+///   stems and trailing dot/space (defense in depth for raw input that
+///   skipped [`validate_rel_path`]).
+///
+/// `/`-separated paths must be checked one component at a time; callers
+/// gate on the local platform themselves so a Linux→Linux transfer is
+/// never rejected for Windows-only reasons.
+pub fn windows_incompatible(name: &str) -> Option<WindowsNameIssue> {
+    if let Some(found) = name.chars().find(|c| WINDOWS_FORBIDDEN_CHARS.contains(c)) {
+        return Some(WindowsNameIssue::ForbiddenChar(found));
+    }
+    if windows_reserved_stem(name) {
+        return Some(WindowsNameIssue::ReservedStem);
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Some(WindowsNameIssue::TrailingDotOrSpace);
+    }
+    None
+}
+
 /// Validate a digest algorithm identifier and return it unchanged; only
 /// [`DIGEST_ALG_BLAKE3`] is known. Entry constructors call this so an
 /// entry's algorithm is either one this build can verify or an error —
@@ -94,6 +210,13 @@ pub fn validate_digest_alg(alg: u8) -> Result<u8, InvalidDigestAlg> {
 /// letters), not rooted, no empty/`.`/`..` component, no control characters
 /// (C0 U+0000..=001F, DEL U+007F, and C1 U+0080..=009F), no component
 /// ending in space or dot, no Windows-reserved component stem.
+///
+/// This rule set is deliberately platform-NEUTRAL (the classic reserved
+/// stems are rejected everywhere because such files cannot exist portably).
+/// Rules that only break on Windows — `< > " | ? *` and the extended
+/// reserved names — live in [`windows_incompatible`] and are applied by
+/// receivers running on Windows, never globally (a Linux→Linux transfer
+/// may legitimately carry those characters).
 pub fn validate_rel_path(path: &str) -> Result<&str, InvalidRelPath> {
     if path.is_empty() || path.len() > MAX_REL_PATH_BYTES {
         return Err(InvalidRelPath);
@@ -116,8 +239,7 @@ pub fn validate_rel_path(path: &str) -> Result<&str, InvalidRelPath> {
         if component.is_empty() || component == "." || component == ".." {
             return Err(InvalidRelPath);
         }
-        let stem = component.split_once('.').map_or(component, |(s, _)| s);
-        if RESERVED_NAMES.contains(&stem.to_ascii_uppercase().as_str()) {
+        if classic_reserved_stem(component) {
             return Err(InvalidRelPath);
         }
         if component.ends_with(' ') || component.ends_with('.') {
@@ -264,6 +386,130 @@ mod tests {
             assert!(validate_rel_path(bad).is_err(), "accepted: {bad:?}");
         }
         assert!(validate_rel_path("console.txt").is_ok());
+    }
+
+    #[test]
+    fn windows_checker_rejects_each_win32_forbidden_character() {
+        for (bad, expected) in [
+            ("a<b", '<'),
+            ("a>b", '>'),
+            ("a\"b", '"'),
+            ("a|b", '|'),
+            ("a?b", '?'),
+            ("a*b", '*'),
+            ("?.txt", '?'),
+            ("pho<to>1.jpg", '<'),
+            ("a*b|c\"d?e>f.bin", '*'),
+        ] {
+            assert_eq!(
+                windows_incompatible(bad),
+                Some(WindowsNameIssue::ForbiddenChar(expected)),
+                "wrong verdict for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_checker_rejects_extended_reserved_stems() {
+        // CR-P3-02 extensions, case-insensitive, bare and with extensions
+        // (the stem before the FIRST dot must match).
+        for bad in [
+            "CONIN$",
+            "conin$",
+            "ConIn$.txt",
+            "CONOUT$",
+            "conout$.log",
+            "ConOut$",
+            "CLOCK$",
+            "clock$.txt",
+            "Clock$.tar.gz",
+            "COM\u{b9}",
+            "com\u{b9}",
+            "COM\u{b9}.dat",
+            "com\u{b2}.bin",
+            "COM\u{b3}.txt",
+            "LPT\u{b9}",
+            "lpt\u{b2}",
+            "LPT\u{b3}.cfg",
+        ] {
+            assert_eq!(
+                windows_incompatible(bad),
+                Some(WindowsNameIssue::ReservedStem),
+                "expected reserved stem for {bad:?}"
+            );
+        }
+        // The classic set is re-reported by the Windows checker too
+        // (defense in depth for raw input that skipped validate_rel_path).
+        for classic in ["CON", "nul.txt", "Aux", "LPT9.log", "com5"] {
+            assert_eq!(
+                windows_incompatible(classic),
+                Some(WindowsNameIssue::ReservedStem)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_checker_rejects_trailing_dot_or_space() {
+        for bad in ["a ", "a.", "a.txt ", "a.txt.", "trailing.bin "] {
+            assert_eq!(
+                windows_incompatible(bad),
+                Some(WindowsNameIssue::TrailingDotOrSpace),
+                "expected trailing-dot/space verdict for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_checker_accepts_names_windows_allows() {
+        for ok in [
+            "ab",
+            "console.txt",
+            "photo 1.jpg",
+            "mid dle.dot.txt",
+            "设备照片.bin",
+            "café.txt",
+            "lat\u{100}.bin",
+            "a.b.c",
+            // Reserved-looking but LEGAL: the stem must EQUAL a reserved
+            // name, and only the documented spellings count.
+            "COM10",           // only COM1-COM9 (plus ¹-³) are reserved
+            "comin",           // no dollar sign
+            "myconin$.txt",    // reserved name merely inside the stem
+            "com\u{2074}.txt", // superscript FOUR (U+2074): no such alias
+            "com\u{ff11}.txt", // fullwidth 1 (U+FF11): not recognized
+            "consoles.bin",
+        ] {
+            assert_eq!(windows_incompatible(ok), None, "wrongly rejected {ok:?}");
+        }
+    }
+
+    #[test]
+    fn windows_only_rules_stay_out_of_the_neutral_validation() {
+        // The split CR-P3-02 asks for: characters and extended reserved
+        // names that only break on Windows pass the platform-neutral
+        // validate_rel_path (a Linux→Linux transfer is legal) while the
+        // Windows checker flags them.
+        for linux_legal in [
+            "a?b",
+            "what<now>.txt",
+            "quote\"name",
+            "p|p",
+            "star*name",
+            "CONIN$/x",
+            "COM\u{b9}.bin",
+            "clock$",
+        ] {
+            assert!(
+                validate_rel_path(linux_legal).is_ok(),
+                "neutral validation must allow {linux_legal:?}"
+            );
+            assert!(
+                linux_legal
+                    .split('/')
+                    .any(|component| windows_incompatible(component).is_some()),
+                "windows checker must flag a component of {linux_legal:?}"
+            );
+        }
     }
 
     #[test]

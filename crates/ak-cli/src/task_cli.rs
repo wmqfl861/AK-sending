@@ -1261,6 +1261,15 @@ async fn run_task_receiver(
                 if link.peer_fp != info.sender_fingerprint {
                     return ConsentAnswer::Now(false);
                 }
+                // CR-P3-02 (review 2026-11-11), mirroring the FFI gate:
+                // on a Windows receiver, refuse an offer whose root name
+                // cannot exist here BEFORE the prompt — no question asked,
+                // no Accept answered, nothing written; the peer hears the
+                // standard DECLINED and the reason is printed locally.
+                if let Some(reason) = windows_root_name_refusal(&info.root_name) {
+                    println!("[task] offer refused before accept: {reason}; still listening");
+                    return ConsentAnswer::Now(false);
+                }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 spawn_consent_decider(&ctx, info, &consent_out_dir, consent_terminal.clone(), tx);
                 ConsentAnswer::Pending(rx)
@@ -1307,6 +1316,30 @@ async fn run_task_receiver(
             }
         }
     }
+}
+
+/// CR-P3-02 (review 2026-11-11) pre-Accept name preflight, the CLI twin
+/// of the FFI gate in `ak-ffi/src/task.rs`: the readable refusal reason
+/// when this receiver runs on Windows and the offered root name cannot
+/// exist on a Windows filesystem — one of `< > " | ? *`, or an extended
+/// reserved device stem (`CONIN$`, `CONOUT$`, `CLOCK$`, superscript
+/// `COM¹`–`COM³`/`LPT¹`–`LPT³`; the exact spelling list lives in
+/// `ak_core::manifest::windows_incompatible`). `None` on every other
+/// platform — the platform-neutral path rules already ran at decode time
+/// and a Linux→Linux transfer may legitimately carry these names — and
+/// for names Windows accepts.
+///
+/// Honest scope: the Offer's root name is the ONE payload name visible
+/// before the wire Accept. The full manifest arrives only after Accept
+/// inside ak-engine, so per-entry gating of every manifest row is an
+/// engine-side follow-up; this gate refuses the top-level name before
+/// the consent prompt is ever shown.
+fn windows_root_name_refusal(root_name: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    ak_core::manifest::windows_incompatible(root_name)
+        .map(|issue| format!("cannot save {root_name:?} on Windows: {issue}"))
 }
 
 /// Bounded reason word of one failed accept — a fixed vocabulary, never
@@ -3291,6 +3324,40 @@ mod tests {
         assert_eq!(resolve_ttl(Some(600)).unwrap(), 600);
         assert!(resolve_ttl(Some(59)).is_err());
         assert!(resolve_ttl(Some(2_592_001)).is_err());
+    }
+
+    /// CR-P3-02: the consent-time preflight is a verdict only on Windows —
+    /// the CLI twin of ak-ffi's gate; the platform-neutral rules stay the
+    /// only gate elsewhere (Linux→Linux transfers may carry these names).
+    #[test]
+    fn windows_root_name_preflight_follows_the_local_platform() {
+        if cfg!(windows) {
+            for (bad, expected_char) in [("a?b.bin", '?'), ("star*name", '*')] {
+                let reason = windows_root_name_refusal(bad)
+                    .unwrap_or_else(|| panic!("must refuse {bad:?} on Windows"));
+                assert!(
+                    reason.contains(bad) && reason.contains(expected_char),
+                    "reason must name the offender and the character: {reason}"
+                );
+            }
+            for reserved in ["CONIN$.txt", "clock$", "com\u{b9}.dat", "LPT\u{b3}"] {
+                assert!(
+                    windows_root_name_refusal(reserved).is_some(),
+                    "must refuse the extended reserved stem {reserved:?}"
+                );
+            }
+            for ok in ["plain.bin", "multi", "设备照片.jpg"] {
+                assert_eq!(
+                    windows_root_name_refusal(ok),
+                    None,
+                    "must keep prompting the user for {ok:?}"
+                );
+            }
+        } else {
+            for linux_legal in ["a?b.bin", "CONIN$.txt", "clock$", "com\u{b9}.dat"] {
+                assert_eq!(windows_root_name_refusal(linux_legal), None);
+            }
+        }
     }
 
     // ---- candidate enumeration (CR-P1-02 改法第 1 条, ak-ffi shape) -----

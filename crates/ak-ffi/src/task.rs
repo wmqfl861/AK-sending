@@ -888,6 +888,30 @@ impl TaskRt {
     }
 }
 
+/// CR-P3-02 (review 2026-11-11) pre-Accept name preflight: the readable
+/// refusal reason when this receiver runs on Windows and the offered root
+/// name cannot exist on a Windows filesystem — one of `< > " | ? *`, or an
+/// extended reserved device stem (`CONIN$`, `CONOUT$`, `CLOCK$`,
+/// superscript `COM¹`–`COM³`/`LPT¹`–`LPT³`; the exact spelling list lives
+/// in `ak_core::manifest::windows_incompatible`). `None` on every other
+/// platform — the platform-neutral path rules already ran at decode time
+/// and a Linux→Linux transfer may legitimately carry these names — and
+/// for names Windows accepts.
+///
+/// Honest scope: the Offer's root name is the ONE payload name visible
+/// before the wire Accept (single-root transfers land every entry under
+/// it; a multi-root offer labels itself "multi"). The full manifest
+/// arrives only after Accept inside ak-engine, so per-entry gating of
+/// every manifest row is an engine-side follow-up; this gate refuses the
+/// top-level name before the request is ever registered.
+fn windows_root_name_refusal(root_name: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    ak_core::manifest::windows_incompatible(root_name)
+        .map(|issue| format!("cannot save {root_name:?} on Windows: {issue}"))
+}
+
 /// Register one pending receive consent and hand back its pending half
 /// (wave-29 P2-07: this returns IMMEDIATELY — the engine's receive body
 /// awaits the oneshot, so no Tokio worker is ever parked on the user's
@@ -921,6 +945,13 @@ impl TaskRt {
 /// `request_closed` (emitted under the SAME lock) can only land AFTER
 /// the `incoming_request`. A late incoming after `request_closed` is
 /// structurally impossible.
+///
+/// CR-P3-02 (review 2026-11-11): on a Windows receiver the attribution
+/// is followed by a name preflight ([`windows_root_name_refusal`]) — an
+/// offered root name that cannot exist on this filesystem is refused
+/// BEFORE the request is registered, so no banner surfaces, no consent
+/// is ever asked and nothing is written; the peer hears the standard
+/// DECLINED.
 fn register_consent(
     rt: &Arc<TaskRt>,
     code_id: &[u8; 16],
@@ -959,6 +990,28 @@ fn register_consent(
             })
             .unwrap_or(false);
         if !still_live {
+            return ConsentAnswer::Now(false);
+        }
+        // CR-P3-02 (review 2026-11-11): a Windows receiver cannot create
+        // files whose names carry `< > " | ? *` or use the extended
+        // reserved device stems. The platform-neutral path validation
+        // deliberately allows them (a Linux→Linux transfer is legal), so
+        // the refusal is made per local platform exactly HERE — before
+        // the request is registered (no `incoming_request` banner, no
+        // pending entry) and before the engine could answer Accept. The
+        // peer is told the standard DECLINED, nothing is ever written to
+        // disk, and the refusal surfaces as its own bounded event so the
+        // reason is readable instead of an I/O error at file-creation
+        // time. Emitted while holding the pending lock, like the
+        // `incoming_request` line below, keeping every consent-path
+        // publication totally ordered by the one lock.
+        if let Some(reason) = windows_root_name_refusal(&info.root_name) {
+            rt.push_event(format!(
+                "{{\"event\":\"offer_refused\",\"conn\":\"{}\",\"root\":{},\"reason\":{}}}",
+                core::hex_encode(&conn.conn_id),
+                quoted(&info.root_name),
+                quoted(&reason),
+            ));
             return ConsentAnswer::Now(false);
         }
         pending.insert(
@@ -7601,6 +7654,135 @@ mod task_tests {
             decided.err().map(|error| error.code),
             Some(crate::core::AK_ERR_NOT_FOUND)
         );
+    }
+
+    /// CR-P3-02: the pure preflight is compiled to a verdict only on
+    /// Windows — the platform-neutral rules stay the only gate elsewhere.
+    #[test]
+    fn windows_root_name_preflight_follows_the_local_platform() {
+        if cfg!(windows) {
+            for (bad, expected_char) in [("a?b.bin", '?'), ("star*name", '*')] {
+                let reason = windows_root_name_refusal(bad)
+                    .unwrap_or_else(|| panic!("must refuse {bad:?} on Windows"));
+                assert!(
+                    reason.contains(bad) && reason.contains(expected_char),
+                    "reason must name the offender and the character: {reason}"
+                );
+            }
+            for reserved in ["CONIN$.txt", "com\u{b9}.dat"] {
+                assert!(
+                    windows_root_name_refusal(reserved).is_some(),
+                    "must refuse the extended reserved stem {reserved:?}"
+                );
+            }
+            for ok in ["plain.bin", "multi", "设备照片.jpg"] {
+                assert_eq!(
+                    windows_root_name_refusal(ok),
+                    None,
+                    "must keep asking the user for {ok:?}"
+                );
+            }
+        } else {
+            // A Linux/macOS receiver keeps the platform-neutral rules only:
+            // these names are legal there (Linux→Linux transfers exist).
+            for linux_legal in ["a?b.bin", "CONIN$.txt", "com\u{b9}.dat"] {
+                assert_eq!(windows_root_name_refusal(linux_legal), None);
+            }
+        }
+    }
+
+    /// CR-P3-02: on a Windows receiver, an offer whose root name cannot
+    /// exist here is refused at the consent registration — BEFORE any
+    /// `incoming_request` surfaces, before anything is pending, before
+    /// the engine could answer Accept or write a single file — and the
+    /// refusal surfaces as a readable `offer_refused` event. On other
+    /// platforms the same offer registers normally (the name is legal
+    /// there), pinning the platform split.
+    #[test]
+    fn windows_receiver_refuses_unsavable_root_name_before_registration() {
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = task_start(&engine, &spec_for(dir.path())).expect("rt");
+        let rt = task_runtime_of(&engine, &runtime).expect("task runtime");
+        let code_id = [7u8; 16];
+        let conn_id = [9u8; 16];
+        let sender_fp = DeviceKeyPair::generate().fingerprint();
+        {
+            let mut conns = rt.conns.lock().expect("conn table");
+            conns.insert(
+                conn_id,
+                TaskConn {
+                    conn_id,
+                    role: TaskRole::Receiver,
+                    state: ConnState::Connected,
+                    candidates: Vec::new(),
+                    peer_endpoint: None,
+                    peer_fp: Some(sender_fp),
+                    code_id,
+                    code: "AKI1-TEST".into(),
+                },
+            );
+        }
+        let info = ConsentInfo {
+            job_id: [0u8; 16],
+            root_name: "what?now.bin".into(),
+            file_count: 1,
+            total_bytes: 16,
+            sender_fingerprint: sender_fp,
+        };
+        let reg_rt = Arc::clone(&rt);
+        let answer = engine.runtime().block_on(async move {
+            register_consent(
+                &reg_rt,
+                &code_id,
+                &info,
+                std::path::Path::new("D:/unused"),
+                Duration::from_secs(60),
+            )
+        });
+        let events: Vec<String> = rt
+            .events
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        if cfg!(windows) {
+            assert!(
+                matches!(answer, ConsentAnswer::Now(false)),
+                "a Windows receiver must refuse the offer on the spot"
+            );
+            let refusal = events
+                .iter()
+                .find(|line| line.contains("\"event\":\"offer_refused\""))
+                .unwrap_or_else(|| panic!("no offer_refused event: {events:?}"));
+            assert!(
+                refusal.contains(&core::hex_encode(&conn_id)),
+                "the refusal is attributed to the connection: {refusal}"
+            );
+            assert!(
+                refusal.contains("what?now.bin") && refusal.contains("cannot save"),
+                "the refusal names the offender readably: {refusal}"
+            );
+            assert!(
+                !events.iter().any(|line| line.contains("incoming_request")),
+                "no incoming_request banner may surface: {events:?}"
+            );
+            assert!(
+                rt.pending
+                    .lock()
+                    .map(|pending| pending.is_empty())
+                    .unwrap_or(false),
+                "nothing stays pending — no consent to answer, no Accept"
+            );
+        } else {
+            assert!(
+                matches!(answer, ConsentAnswer::Pending(_)),
+                "a non-Windows receiver registers the offer normally"
+            );
+            assert!(
+                events.iter().any(|line| line.contains("incoming_request")),
+                "the offer reaches the user on platforms where the name is legal: {events:?}"
+            );
+        }
     }
 
     /// R30-P2-03 (race half): a registration racing a disconnect of its

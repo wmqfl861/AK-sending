@@ -2364,9 +2364,23 @@ mod cancel_tests {
         tokio::time::sleep(StdDuration::from_millis(500)).await;
         let second = tree_bytes(dst.path());
         assert_eq!(first, second, "delivered bytes grew after the cancel");
-        wait_until("task Cancelled", || async {
-            state_of(&handle, &task).await == Some(TaskState::Cancelled)
-        })
+        // Terminal state: Cancelled normally — but on a fast idle runner
+        // the loopback transfer can deliver everything between the cancel
+        // receipt and the scheduler's state flip, finalizing Completed
+        // instead (windows-latest, runs 43046223828/43050646660). The
+        // P1-3 cancel semantics themselves are pinned by
+        // `sched_cancel_aborts_an_in_flight_engine_send` (black-hole peer,
+        // cannot complete); this test's own assertion — bytes frozen after
+        // the cancel — has already held by this point.
+        wait_until(
+            "task terminal (Cancelled, or Completed racing the cancel)",
+            || async {
+                matches!(
+                    state_of(&handle, &task).await,
+                    Some(TaskState::Cancelled) | Some(TaskState::Completed)
+                )
+            },
+        )
         .await;
     }
 }

@@ -386,7 +386,8 @@ int32_t ak_task_consent(
 // 从 AK_REGISTRY_ADDR/AK_REGISTRY_ID 或 --dart-define 编译默认解析后传入）
 {"spec_version":1,
  "registry":"127.0.0.1:7200","registry_id":"<64hex>",
- "id_dir":"C:/ak/id","device_name":"phone","save_dir":"D:/inbox"}
+ "id_dir":"C:/ak/id","device_name":"phone","save_dir":"D:/inbox",
+ "stun_addr":"122.51.121.24:7101"}
 
 // ak_task_create_code（wave-29：ttl_secs 省略或 0 映射为任务码默认
 // 600 秒——v1 任务码绝不以 registry 的"长期有效"语义滞留）
@@ -403,6 +404,8 @@ int32_t ak_task_consent(
 ```
 
 `ak_task_start` 校验并保存 registry 端点与 pin、在 `id_dir` 下引导身份；默认保存夹为 `<id_dir>/downloads`。`role` 决定生码方角色，加入方得对侧角色；receiver 角色生码会先绑定真实常驻接收端（wildcard bind），候选拨号地址由本机接口推导（接口 IPv4 + 显式 loopback 兜底，LAN 优先排序）。
+
+`stun_addr`（可选，2026-11-11 CR-P1-02 改法第 2 条新增）：STUN 服务器 `ip:port`，"与注册中心一起配置"——Dart 层按 registry 同一优先级解析（`AK_STUN_ADDR` 环境变量，随后 `--dart-define` 编译默认，生产端点 `122.51.121.24:7101`）后随 spec 传入。接收端在**QUIC 将要使用的同一个 UDP socket**上做 STUN 查询（有界 2 秒，内部 1s/2s 重传受该总额约束），再把该 socket 交给 QUIC，反射地址（server-reflexive 候选）插入派生候选表的 v4 网卡块之后、loopback 之前（与既有条目去重；无 NAT 时跳过）。省略/空字符串 = 不查询（fail-open，仅本地候选）；非 ip:port 的非空值在校验期拒绝（-2）。查询失败（不可达/超时）同样 fail-open：接收端照常绑定并广播本地候选，失败原因进入 `receiver_bind` 事件新增的 `reflexive`/`stun_error` 字段。对称 NAT 下的残余限制见评审 4.1 改法第 4 条。
 
 ### 8.2 op 结果 JSON（经 ak_pairing_op_result）
 

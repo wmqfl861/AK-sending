@@ -604,3 +604,330 @@ fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
         "the v6-led task-code transfer must complete: {sender_log2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CR-P1-02 改法第 2 条 (REVIEW §4.1): STUN server-reflexive candidates on
+// the REAL product path. A minimal RFC5389 binding responder (the
+// ak-signal STUN codec on a std thread) runs in the test process; the
+// `task code-recv` subprocess is pointed at it with `--stun`. Three
+// assertion layers:
+//
+// 1. Same-socket proof: a TRUTHFUL responder (echoes the observed source)
+//    reflects the receiver's own socket address, so the `stun reflexive`
+//    line's port MUST equal the `receiver bound` line's port — a query on
+//    any throwaway socket would reflect a different ephemeral port.
+// 2. Wire shape: the reflexive address rides the ADVERTISED candidate
+//    list (the endpoint blob): the truthful loopback reflection dedups
+//    against the derived 127.0.0.1 candidate (appears exactly once), and
+//    a DISTINCT reflection (fixed 198.51.100.9:55555) is inserted after
+//    the v4 interface block, before the 127.0.0.1 entry.
+// 3. Fail-open: a silent server costs at most the bounded budget (2 s),
+//    the receiver still binds, local candidates still advertise, and the
+//    failure is logged.
+// Same-host loopback STUN is not a real NAT traversal claim — no NAT sits
+// on the path — that boundary stays the file header's.
+// ---------------------------------------------------------------------------
+
+/// One loopback STUN binding responder. `mapped = None` answers with the
+/// OBSERVED source (truthful); `Some(addr)` answers with a fixed
+/// reflection (the distinct-candidate case).
+struct StunResponder {
+    addr: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StunResponder {
+    fn spawn(mapped: Option<SocketAddr>) -> StunResponder {
+        let socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
+            Ok(socket) => socket,
+            Err(error) => {
+                panic!("cannot bind the test STUN responder on 127.0.0.1: {error}");
+            }
+        };
+        let addr = socket.local_addr().expect("responder local addr");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("t03-stun-responder".to_string())
+            .spawn(move || {
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .expect("responder read timeout");
+                let mut buffer = [0u8; 128];
+                loop {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let (len, from) = match socket.recv_from(&mut buffer) {
+                        Ok(received) => received,
+                        Err(_) => continue, // timeout tick: re-check the flag
+                    };
+                    let Ok(transaction) = ak_signal::stun::parse_binding_request(&buffer[..len])
+                    else {
+                        continue;
+                    };
+                    let reply =
+                        ak_signal::stun::binding_response(transaction, mapped.unwrap_or(from));
+                    let _ = socket.send_to(&reply, from);
+                }
+            })
+            .expect("spawn responder thread");
+        StunResponder { addr, stop }
+    }
+}
+
+impl Drop for StunResponder {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Spawn one `task code-recv` with an explicit `--stun` and return the
+/// process (the caller asserts on the stdout lines and drives or kills
+/// it). Skips with a printed reason when loopback UDP is unavailable.
+fn spawn_recv_with_stun(
+    tag: &str,
+    registry: &RegistryProc,
+    root: &std::path::Path,
+    stun: &str,
+) -> Proc {
+    let id_recv = root.join(format!("{tag}-id-recv"));
+    let out = root.join(format!("{tag}-out"));
+    for dir in [&id_recv, &out] {
+        std::fs::create_dir_all(dir).expect("create recv dir");
+    }
+    let args: Vec<String> = [
+        "--id-dir".to_string(),
+        id_recv.to_string_lossy().into_owned(),
+        "task".to_string(),
+        "code-recv".to_string(),
+        "--out".to_string(),
+        out.to_string_lossy().into_owned(),
+        "--stun".to_string(),
+        stun.to_string(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .to_vec();
+    Proc::spawn(tag, &args)
+}
+
+/// The same-socket + wire-shape proof over the real CLI receiver: the
+/// truthful responder's reflection carries the receiver socket's own
+/// port, the advertisement dedups it against the derived loopback
+/// candidate, and a full task-code transfer still completes through the
+/// STUN-configured receiver.
+#[test]
+fn stun_reflexive_rides_the_cli_receiver_socket() {
+    // Loopback UDP must be bindable for both the responder and the
+    // receiver under test.
+    match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(probe) => drop(probe),
+        Err(error) => {
+            eprintln!("skipping: 127.0.0.1 UDP bind unavailable: {error}");
+            return;
+        }
+    }
+    let responder = StunResponder::spawn(None); // truthful echo of the source
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-stun",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let mut recv = spawn_recv_with_stun(
+        "t03-stun-recv",
+        &registry,
+        tmp.path(),
+        &responder.addr.to_string(),
+    );
+    let bound = recv
+        .stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+    let reflexive_line = recv
+        .stdout
+        .wait_for("stun reflexive", std::time::Duration::from_secs(10));
+
+    // (1) THE same-socket proof: the reflected port equals the bound
+    // port — the query ran on the very socket QUIC then adopted (a
+    // throwaway query socket would reflect its own ephemeral port).
+    let reflexive_addr_text = reflexive_line
+        .split("[task] stun reflexive ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("reflexive address in the line: {reflexive_line}"));
+    let reflexive: SocketAddr = reflexive_addr_text
+        .parse()
+        .unwrap_or_else(|_| panic!("reflexive ip:port: {reflexive_addr_text}"));
+    let bound_port = bound
+        .split("receiver bound ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|| panic!("bound addr token in the line: {bound}"));
+    assert_eq!(
+        reflexive.port(),
+        bound_port,
+        "the STUN query must run on the socket QUIC adopts: {reflexive_line} vs {bound}"
+    );
+    assert_eq!(
+        reflexive.ip(),
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "the truthful loopback responder reflects the local source: {reflexive_line}"
+    );
+
+    // (2) Wire shape: the reflexive address rides the advertisement, and
+    // it DEDUPS against the derived 127.0.0.1 candidate (same address:
+    // exactly one occurrence — the no-NAT skip rule). The needle carries
+    // the "[task] " prefix: the CLI's STUN-FAILURE line also mentions
+    // "advertising local candidates only".
+    let advertised = recv
+        .stdout
+        .wait_for("[task] advertising", std::time::Duration::from_secs(10));
+    let reflexive_text = format!("127.0.0.1:{}", reflexive.port());
+    let occurrences = advertised
+        .split_whitespace()
+        .filter(|token| *token == reflexive_text)
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "the loopback reflection is the derived loopback candidate — deduped to one entry: {advertised}"
+    );
+
+    // (3) A full task-code transfer through the STUN-configured receiver.
+    let code_line = recv
+        .stdout
+        .wait_for("AKI1-", std::time::Duration::from_secs(60));
+    let code = code_line
+        .trim()
+        .strip_prefix("AKI1-")
+        .map(|rest| format!("AKI1-{rest}"))
+        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+    let src = tmp.path().join("t03-stun-src");
+    std::fs::create_dir_all(&src).expect("src dir");
+    write_file(
+        &src.join("payload.bin"),
+        &common::Lcg::new(0x57D0_0000_0000_0001).bytes(256 * 1024),
+    );
+    let send_args: Vec<String> = [
+        "--id-dir".to_string(),
+        tmp.path()
+            .join("t03-stun-id-send")
+            .to_string_lossy()
+            .into_owned(),
+        "task".to_string(),
+        "join-send".to_string(),
+        code,
+        src.to_string_lossy().into_owned(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .to_vec();
+    let mut sender = Proc::spawn("t03-stun-send", &send_args);
+    recv.stdout.wait_for(
+        "the peer wants to send",
+        std::time::Duration::from_secs(120),
+    );
+    recv.consent_yes(
+        &["[recv]", "task complete", "declined"],
+        std::time::Duration::from_secs(40),
+    );
+    sender.wait_exit_ok(std::time::Duration::from_secs(180));
+    recv.wait_exit_ok(std::time::Duration::from_secs(60));
+    let landed = std::fs::read(tmp.path().join("t03-stun-recv-out").join("payload.bin"))
+        .expect("received payload through the STUN-configured receiver");
+    assert_eq!(
+        landed,
+        std::fs::read(src.join("payload.bin")).expect("source payload"),
+        "payload bytes differ through the STUN-configured receiver"
+    );
+}
+
+/// A DISTINCT reflection (the responder answers with a fixed public
+/// address) is inserted into the advertisement after the v4 interface
+/// block, before the 127.0.0.1 entry — the documented blob position.
+#[test]
+fn distinct_stun_reflection_leads_the_non_lan_candidates() {
+    let fixed: SocketAddr = "198.51.100.9:55555".parse().unwrap();
+    let responder = StunResponder::spawn(Some(fixed));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-stun2",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let recv = spawn_recv_with_stun(
+        "t03-stun2-recv",
+        &registry,
+        tmp.path(),
+        &responder.addr.to_string(),
+    );
+    let advertised = recv
+        .stdout
+        .wait_for("[task] advertising", std::time::Duration::from_secs(15));
+    let reflexive_at = advertised
+        .find("198.51.100.9:55555")
+        .unwrap_or_else(|| panic!("the distinct reflection must ride the blob: {advertised}"));
+    let loopback_at = advertised.find("127.0.0.1:").unwrap_or_else(|| {
+        panic!("the derived loopback candidate must ride the blob: {advertised}")
+    });
+    assert!(
+        reflexive_at < loopback_at,
+        "the reflexive candidate inserts BEFORE the loopback tail: {advertised}"
+    );
+}
+
+/// Fail-open: a configured-but-silent STUN server costs at most the
+/// bounded budget (2 s query + startup), the receiver still binds, local
+/// candidates still advertise, and the bounded failure is logged.
+#[test]
+fn dead_stun_server_fails_open_within_the_budget() {
+    // A bound-but-silent socket: packets land, nothing answers — the
+    // deterministic timeout path on every OS (a dead port would fast-fail
+    // via ICMP/ConnectionReset on Windows only).
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the silent STUN socket");
+    let silent_addr = silent.local_addr().expect("silent STUN addr");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-stun3",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let started = Instant::now();
+    let recv = spawn_recv_with_stun(
+        "t03-stun3-recv",
+        &registry,
+        tmp.path(),
+        &silent_addr.to_string(),
+    );
+    // The bound line arriving at all proves the bind wait (10 s in the
+    // child) was never hit; the explicit time bound pins the 2 s budget.
+    let bound = recv
+        .stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "fail-open must stay inside the budget (query budget 2 s): {elapsed:?}; {bound}"
+    );
+    let advertised = recv
+        .stdout
+        .wait_for("[task] advertising", std::time::Duration::from_secs(10));
+    assert!(
+        advertised.contains("127.0.0.1:"),
+        "local candidates still advertise on STUN failure: {advertised}"
+    );
+    let failure = recv
+        .stdout
+        .wait_for("stun query failed", std::time::Duration::from_secs(5));
+    assert!(
+        !failure.contains("panicked"),
+        "the failure line is bounded diagnostics, not a crash: {failure}"
+    );
+}

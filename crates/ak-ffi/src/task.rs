@@ -108,9 +108,19 @@
 //! V6ONLY cleared), so a v6 candidate is genuinely served and two NAT'd
 //! IPv6-capable peers get a NAT-free path (a host without IPv6 falls
 //! back to the historical v4-only binds, logged via `receiver_bind`).
-//! Explicit `candidates` in the spec replace the derived list verbatim
-//! (caller-knows-better), and then no echo port is appended — the probe
-//! reports exactly what the caller advertised.
+//! Since CR-P1-02 改法第 2 条 the derived list additionally carries the
+//! STUN server-reflexive address: the receiver's UDP socket is created
+//! explicitly (`holepunch::bind_dual_stack_udp`, v4 wildcard fallback),
+//! the optional `stun_addr` of the start spec is queried ON THAT SAME
+//! SOCKET (bounded by [`STUN_QUERY_BUDGET`], fail-open), and only then is
+//! the socket handed to QUIC via `DirectEndpoint::bind_with_socket` — so
+//! the NAT mapping the query created stays valid for the QUIC listener
+//! and the reflected public address is genuinely dialable (`bind_receiver_socket`
+//! documents the full lifecycle; the symmetric-NAT residual is 改法第 4
+//! 条's honest-limit case). Explicit `candidates` in the spec replace the
+//! derived list verbatim (caller-knows-better), and then neither the
+//! reflexive candidate nor an echo port is appended — the probe reports
+//! exactly what the caller advertised.
 //!
 //! The engine-shared code table stays as a CACHE ONLY: same-engine
 //! joins use it to mirror the code's declared role onto the joiner (the
@@ -292,6 +302,18 @@ const MAX_ECHO_CANDIDATES: usize = 4;
 /// one entry), at most this many overall, so a GUA-heavy host cannot
 /// crowd the v4 candidates or push the blob at the 512-byte wire bound.
 const MAX_V6_IFACE_CANDIDATES: usize = 3;
+
+/// Total wall-clock budget one STUN server-reflexive query may add to
+/// receiver startup (CR-P1-02 改法第 2 条). Chosen against
+/// `ak_signal::stun::query_on`'s INTERNAL schedule — it retransmits on a
+/// 1 s / 2 s / 4 s backoff all bounded by the timeout it is handed, so a
+/// 2 s budget buys exactly two transmissions (t=0 and t≈1 s) and returns
+/// `Timeout` by t=2 s at the latest: an unreachable/silent server costs
+/// at most 2 s, fail-open, and never delays the bind past a fraction of
+/// [`RECEIVER_BIND_TIMEOUT`]. A reachable server answers in one
+/// round-trip (tens of ms in-region), where the second transmission is
+/// pure insurance.
+const STUN_QUERY_BUDGET: Duration = Duration::from_secs(2);
 
 /// Wire marker of the task-plane close notification (wave-29 P2-03): a
 /// disconnecting side that has no live transfer (whose QUIC drop the peer
@@ -539,6 +561,13 @@ pub(crate) struct TaskRt {
     /// Registry endpoint + pin the task-pairing stack dials.
     pub(crate) registry_addr: SocketAddr,
     pub(crate) registry_id: [u8; 32],
+    /// Optional STUN server (CR-P1-02 改法第 2 条, "STUN 地址与注册中心
+    /// 一起配置"): queried ON the receiver's own UDP socket before the
+    /// socket is handed to QUIC, so the reflected address rides the
+    /// endpoint blob as a dialable candidate. `None` (absent/empty
+    /// `stun_addr` in the start spec) = no query, fail-open — local
+    /// candidates still cover same-subnet/LAN joins.
+    pub(crate) stun_addr: Option<SocketAddr>,
     /// The one default save folder (`ak_task_set_save_dir`).
     pub(crate) save_dir: StdMutex<PathBuf>,
     /// Op table — the SAME forever-readable semantics as the pairing
@@ -1062,6 +1091,24 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
     let registry_hex = field_str(&args, "registry_id", true)?
         .ok_or_else(|| FfiError::invalid("missing \"registry_id\""))?;
     let registry_id = hex32(&registry_hex, "field \"registry_id\"")?;
+    // CR-P1-02 改法第 2 条 ("STUN 地址与注册中心一起配置"): the optional
+    // STUN endpoint the receiver's socket-reflexive query dials. The Rust
+    // layer stays DEFAULT-FREE on purpose — the registry endpoint itself
+    // is resolved by the Dart layer (env / --dart-define) and passed in
+    // the spec, and the STUN address rides the exact same resolution
+    // path (contract ffi-v2 §8.1); an absent/empty value means NO query
+    // (fail-open: derived local candidates still advertise, and
+    // same-subnet/LAN joins are unaffected).
+    let stun_addr = match field_str(&args, "stun_addr", false)? {
+        Some(text) if !text.trim().is_empty() => {
+            Some(text.trim().parse::<SocketAddr>().map_err(|_| {
+                FfiError::invalid(format!(
+                    "field \"stun_addr\" is not an ip:port address: {text:?}"
+                ))
+            })?)
+        }
+        _ => None,
+    };
     let id_dir =
         field_str(&args, "id_dir", true)?.ok_or_else(|| FfiError::invalid("missing \"id_dir\""))?;
     if id_dir.is_empty() {
@@ -1113,6 +1160,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         device_name,
         registry_addr,
         registry_id,
+        stun_addr,
         save_dir: StdMutex::new(PathBuf::from(save_dir_text)),
         ops: StdMutex::new(HashMap::new()),
         events: Arc::new(StdMutex::new(VecDeque::new())),
@@ -1239,6 +1287,60 @@ fn is_global_unicast_v6(addr: std::net::Ipv6Addr) -> bool {
     let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
     let benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
     global_block && !documentation && !benchmarking
+}
+
+/// Insert the STUN server-reflexive candidate (CR-P1-02 改法第 2 条) into
+/// a DERIVED candidate list — pure on purpose (tests pin the rule without
+/// any socket). Rules:
+///
+/// * `None` (no STUN server configured, or the caller-supplied list is
+///   explicit/verbatim) returns the list unchanged;
+/// * a v4-mapped reflexive address normalizes to plain IPv4 (same
+///   normalization as [`order_candidates`]); an unspecified address
+///   (`0.0.0.0`/`::`, a broken server's reflection) is dropped — the
+///   probe would skip it as undialable anyway;
+/// * a reflexive address that EQUALS an existing candidate means the host
+///   is not behind a mapping NAT for this socket (same-subnet server, or
+///   the public IP is already on an interface) — the duplicate is
+///   skipped, nothing new is dialable;
+/// * otherwise the reflexive address is inserted right after the v4
+///   INTERFACE block and before the loopback tail (the slot
+///   `filter_and_order_candidates` reserves between them). Position
+///   rationale: the reflexive address is public — HIGHER reachability
+///   across NATs than private LAN addresses, but the consumer
+///   ([`order_candidates`]) re-sorts LAN-first, so same-subnet matches
+///   still dial first; within the non-LAN group the v4 reflexive leads
+///   the interface IPv6 block (v4 reflection is the primary cross-NAT
+///   leg; a v6 reflexive from a v6 STUN server rides the same slot).
+fn insert_reflexive_candidate(
+    candidates: Vec<SocketAddr>,
+    reflexive: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let Some(reflexive) = reflexive else {
+        return candidates;
+    };
+    let reflexive = ak_net::classify::expand_mapped(reflexive);
+    if reflexive.ip().is_unspecified() {
+        return candidates;
+    }
+    if candidates
+        .iter()
+        .any(|addr| ak_net::classify::expand_mapped(*addr) == reflexive)
+    {
+        return candidates;
+    }
+    let mut out = candidates;
+    // The insertion slot: after the last plain-v4 interface address, i.e.
+    // just before the first loopback/v6 entry of the derived order.
+    let slot = out
+        .iter()
+        .position(|addr| match ak_net::classify::expand_mapped(*addr).ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(_) => true,
+        })
+        .unwrap_or(out.len());
+    out.insert(slot, reflexive);
+    out
 }
 
 /// LAN preference for one candidate (RFC1918 private IPv4 — loopback
@@ -2671,7 +2773,7 @@ async fn run_create_code(
     let mut code_slot: Option<ReceiverCodeSlot> = None;
     if !explicit {
         let derived = if role == TaskRole::Receiver {
-            let (bound, slot) = match bind_resident_receiver(rt, placeholder).await {
+            let ((bound, reflexive), slot) = match bind_resident_receiver(rt, placeholder).await {
                 Ok(bound) => bound,
                 Err(message) => {
                     abort_spawned(rt, placeholder);
@@ -2679,7 +2781,10 @@ async fn run_create_code(
                 }
             };
             code_slot = Some(slot);
-            local_candidates(bound)
+            // CR-P1-02 改法第 2 条: the STUN server-reflexive address of
+            // the receiver's own socket rides the derived list (inserted
+            // right after the v4 interface block — see the helper).
+            insert_reflexive_candidate(local_candidates(bound), reflexive)
         } else {
             // A sender-role code still advertises the creator's endpoints
             // (informational for v1 — the reverse direction's dial targets
@@ -2774,13 +2879,15 @@ async fn run_create_code(
 type ReceiverCodeSlot = Arc<StdMutex<[u8; 16]>>;
 
 /// Spawn the resident receiver for one code and wait (bounded) for its
-/// first bound address. The task registers under `key` in the spawned
-/// table (teardown / disconnect abort it); the returned slot carries the
-/// registry code id to the receiver once it is known.
+/// first bound address (plus the STUN server-reflexive address observed
+/// on the same socket, 改法第 2 条 — `None` when no server was configured
+/// or the query failed open). The task registers under `key` in the
+/// spawned table (teardown / disconnect abort it); the returned slot
+/// carries the registry code id to the receiver once it is known.
 async fn bind_resident_receiver(
     rt: &Arc<TaskRt>,
     key: [u8; 16],
-) -> Result<(SocketAddr, ReceiverCodeSlot), String> {
+) -> Result<((SocketAddr, Option<SocketAddr>), ReceiverCodeSlot), String> {
     let (addr_tx, addr_rx) = oneshot::channel();
     let code_slot: ReceiverCodeSlot = Arc::new(StdMutex::new(key));
     let task = {
@@ -2798,10 +2905,143 @@ async fn bind_resident_receiver(
         .or_default()
         .push(task);
     match tokio::time::timeout(RECEIVER_BIND_TIMEOUT, addr_rx).await {
-        Ok(Ok(addr)) => Ok((addr, code_slot)),
+        Ok(Ok(bound_and_reflexive)) => Ok((bound_and_reflexive, code_slot)),
         Ok(Err(_)) => Err("the resident receiver stopped before binding".to_string()),
         Err(_) => Err("resident receiver bind timed out".to_string()),
     }
+}
+
+/// The receiver's pre-QUIC bind outcome (CR-P1-02 改法第 2 条): the UDP
+/// socket QUIC will adopt, plus the diagnostics of the two optional steps
+/// that ran on it. Kept as one struct so the bind event reports a single
+/// coherent snapshot.
+struct ReceiverSocket {
+    /// The bound socket — handed to QUIC unchanged via
+    /// `DirectEndpoint::bind_with_socket`, so any NAT mapping the STUN
+    /// query created stays valid for the QUIC listener.
+    socket: std::net::UdpSocket,
+    /// The STUN server-reflexive address observed ON `socket` (the
+    /// address a peer on the far side of the NAT must dial), or `None`
+    /// when no server was configured or the query failed (fail-open).
+    reflexive: Option<SocketAddr>,
+    /// Whether `socket` is the dual-stack `[::]` bind (C1, 改法第 1 条).
+    /// Tracked HERE, not read back from the endpoint: adopted-socket
+    /// endpoints report `is_dual_stack() == false` by contract (ak-net
+    /// cannot portably re-query `IPV6_V6ONLY`), while dialing keys off
+    /// the socket family and works either way.
+    dual_stack: bool,
+    /// Bounded reason the dual-stack bind fell back to v4 (C1 pattern).
+    bind_fallback: Option<String>,
+    /// Bounded reason the STUN query failed (`None` on success or when
+    /// no server was configured — `reflexive` distinguishes those).
+    stun_error: Option<String>,
+}
+
+/// Create the receiver's UDP socket and — when a STUN server is
+/// configured — query its server-reflexive address ON THAT SAME SOCKET
+/// before the socket is handed to QUIC (CR-P1-02 改法第 2 条: the mapping
+/// the query opens on the NAT is exactly the mapping the QUIC listener
+/// needs, so the query must not run on a throwaway socket).
+///
+/// Socket lifecycle, in order:
+///
+/// 1. `holepunch::bind_dual_stack_udp(0)` — C1's dual-stack `[::]`
+///    wildcard (V6ONLY cleared, non-blocking armed). A host without IPv6
+///    (or an unclearable V6ONLY) falls back to the historical v4
+///    wildcard bind — C1's fallback chain, preserved verbatim.
+/// 2. Optional STUN: the std socket is wrapped in a tokio `UdpSocket`
+///    (same OS socket, so no new mapping), a v4 server address is sent
+///    in `::ffff:` mapped form from the v6-family socket (the honest
+///    form an AF_INET6 socket can dial; the NAT mapping this creates is
+///    the one THIS socket keeps — a symmetric NAT may still map
+///    destination-dependently, the known 改法第 4 条 residual),
+///    `ak_signal::stun::query_on` runs under [`STUN_QUERY_BUDGET`], and
+///    the std socket is recovered with `into_std` for QUIC.
+/// 3. The caller adopts the socket with
+///    `DirectEndpoint::bind_with_socket` (which re-arms non-blocking —
+///    tokio round-trips never leave it in a state QUIC rejects).
+///
+/// Fail-open by design: a STUN failure (unreachable, silent, malformed)
+/// costs at most [`STUN_QUERY_BUDGET`] and leaves the socket + local
+/// candidates fully working; the bounded reason rides the event below.
+async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSocket, String> {
+    // Step 1 — C1's chain: dual-stack first, historical v4 fallback.
+    let (mut socket, dual_stack, bind_fallback) = match ak_net::holepunch::bind_dual_stack_udp(0) {
+        Ok(socket) => (socket, true, None),
+        Err(reason) => (
+            std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+                .map_err(|error| format!("receiver socket bind failed: {error}"))?,
+            false,
+            Some(reason.to_string()),
+        ),
+    };
+    // Step 2 — the reflexive query on the SAME socket. `query_on` owns
+    // its retransmission schedule; STUN_QUERY_BUDGET bounds the whole
+    // exchange (see the const's rationale). The std socket MOVES into
+    // the tokio wrapper and back via `into_std` — the same OS socket
+    // handle throughout, so the query's send/recv map exactly the socket
+    // QUIC is about to own.
+    let Some(server) = stun else {
+        // Not configured: no query, fail-open.
+        return Ok(ReceiverSocket {
+            socket,
+            reflexive: None,
+            dual_stack,
+            bind_fallback,
+            stun_error: None,
+        });
+    };
+    if server.ip().is_unspecified() {
+        // A configured-but-meaningless server (0.0.0.0): treat as absent.
+        return Ok(ReceiverSocket {
+            socket,
+            reflexive: None,
+            dual_stack,
+            bind_fallback,
+            stun_error: None,
+        });
+    }
+    if let Err(error) = socket.set_nonblocking(true) {
+        // The dual-stack path already armed this; only the v4 fallback
+        // could refuse. Fail-open with the bounded reason.
+        return Ok(ReceiverSocket {
+            socket,
+            reflexive: None,
+            dual_stack,
+            bind_fallback,
+            stun_error: Some(format!("socket not queryable: {error}")),
+        });
+    }
+    let tokio_socket = tokio::net::UdpSocket::from_std(socket)
+        .map_err(|error| format!("receiver socket registration failed: {error}"))?;
+    // The v4 server must ride the mapped form on the v6-family socket
+    // (the ONLY v4 shape an AF_INET6 socket can send to; the reply's
+    // XOR-MAPPED address comes back in plain v4 either way).
+    let server_for_family = match (tokio_socket.local_addr(), server) {
+        (Ok(local), _) if local.is_ipv6() && server.is_ipv4() => {
+            ak_net::classify::to_mapped(server)
+        }
+        _ => server,
+    };
+    let outcome =
+        ak_signal::stun::query_on(&tokio_socket, server_for_family, STUN_QUERY_BUDGET).await;
+    socket = tokio_socket
+        .into_std()
+        .map_err(|error| format!("receiver socket recovery failed: {error}"))?;
+    let (reflexive, stun_error) = match outcome {
+        Ok(reflexive) => (Some(ak_net::classify::expand_mapped(reflexive)), None),
+        // Fail-open: bounded reason only (StunError's vocabulary is
+        // bounded; io errors carry the OS text like C1's fallback_reason
+        // does).
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(ReceiverSocket {
+        socket,
+        reflexive,
+        dual_stack,
+        bind_fallback,
+        stun_error,
+    })
 }
 
 /// The resident receiver (wave-29 P1-04/P2-05/P2-06): bind ONE wildcard
@@ -2837,7 +3077,7 @@ async fn bind_resident_receiver(
 async fn run_resident_receiver(
     rt: Arc<TaskRt>,
     code_slot: ReceiverCodeSlot,
-    first_addr: oneshot::Sender<SocketAddr>,
+    first_addr: oneshot::Sender<(SocketAddr, Option<SocketAddr>)>,
 ) {
     // The CURRENT registry code id (the placeholder until the claim or
     // redeem that owns this receiver assigned the real one).
@@ -2848,34 +3088,41 @@ async fn run_resident_receiver(
             .unwrap_or_else(|poisoned| *poisoned.into_inner())
     };
     let identity = make_self_signed(&rt.key);
-    // CR-P1-02 改法第 1 条: bind dual-stack FIRST — one [::] socket with
-    // V6ONLY cleared serves native IPv6 peers AND v4-mapped IPv4 peers, so
-    // the advertised IPv6 candidates are genuinely reachable. A host with
-    // no IPv6 stack (bind_dual_stack reports `Unsupported`) falls back to
-    // the historical IPv4-only wildcard bind; the fallback is logged as a
-    // bounded `receiver_bind` event so the capability is observable.
-    let mut fallback_reason: Option<String> = None;
-    let endpoint = match ak_net::DirectEndpoint::bind_dual_stack(0, &identity).await {
+    // CR-P1-02 改法第 1 条 + 第 2 条: the socket is created explicitly —
+    // dual-stack `[::]` first (C1; v4 wildcard fallback for hosts without
+    // IPv6) — the optional STUN reflexive query runs ON IT (same socket,
+    // so the NAT mapping survives), and only then is it handed to QUIC
+    // via `bind_with_socket`. Every optional step fails open; the outcome
+    // rides one bounded `receiver_bind` event (the reflexive address and
+    // the bounded STUN failure reason extend C1's shape — the Dart pump
+    // ignores unknown fields).
+    let sock = match bind_receiver_socket(rt.stun_addr).await {
+        Ok(sock) => sock,
+        Err(_) => return, // the dropped oneshot fails the create/join op
+    };
+    let endpoint = match ak_net::DirectEndpoint::bind_with_socket(sock.socket, &identity).await {
         Ok(endpoint) => endpoint,
-        Err(reason) => {
-            fallback_reason = Some(reason.to_string());
-            match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await
-            {
-                Ok(endpoint) => endpoint,
-                Err(_) => return, // the dropped oneshot fails the create/join op
-            }
-        }
+        Err(_) => return, // the dropped oneshot fails the create/join op
     };
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
     };
-    let _ = first_addr.send(bound);
+    let _ = first_addr.send((bound, sock.reflexive));
     rt.push_event(format!(
-        "{{\"event\":\"receiver_bind\",\"addr\":{},\"dual_stack\":{},\"fallback_reason\":{}}}",
+        "{{\"event\":\"receiver_bind\",\"addr\":{},\"dual_stack\":{},\"fallback_reason\":{},\"reflexive\":{},\"stun_error\":{}}}",
         quoted(&bound.to_string()),
-        endpoint.is_dual_stack(),
-        fallback_reason
+        // Tracked at bind time: adopted-socket endpoints always report
+        // is_dual_stack() == false (ak-net cannot portably re-query
+        // V6ONLY) — see ReceiverSocket::dual_stack.
+        sock.dual_stack,
+        sock.bind_fallback
+            .as_deref()
+            .map_or_else(|| "null".to_string(), quoted),
+        sock.reflexive
+            .as_ref()
+            .map_or_else(|| "null".to_string(), |addr| quoted(&addr.to_string())),
+        sock.stun_error
             .as_deref()
             .map_or_else(|| "null".to_string(), quoted),
     ));
@@ -3109,9 +3356,12 @@ async fn run_join(
     if !explicit {
         dial = if my_role == TaskRole::Receiver {
             match bind_resident_receiver(rt, placeholder).await {
-                Ok((bound, slot)) => {
+                Ok(((bound, reflexive), slot)) => {
                     code_slot = Some(slot);
-                    local_candidates(bound)
+                    // 改法第 2 条, the joiner-receiver mirror of the
+                    // create path: the socket-reflexive address rides the
+                    // derived candidates.
+                    insert_reflexive_candidate(local_candidates(bound), reflexive)
                 }
                 Err(message) => {
                     abort_spawned(rt, placeholder);
@@ -3713,6 +3963,59 @@ mod task_tests {
         }
     }
 
+    // ---- a REAL minimal RFC5389 binding responder on loopback -------------
+    // (CR-P1-02 改法第 2 条 product tests): the ak-signal STUN codec on a
+    // std thread — the same wire format `bind_receiver_socket` dials, so
+    // the tests exercise the real client against a real responder.
+
+    /// One loopback STUN responder. `mapped = None` answers with the
+    /// OBSERVED source address (a truthful reflection: on loopback the
+    /// reflexive address is the querier's own local socket address, which
+    // is exactly what the same-socket assertions need); `Some(addr)`
+    /// answers with a fixed address (the distinct-reflexive case).
+    struct TestStun {
+        addr: SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TestStun {
+        fn spawn(mapped: Option<SocketAddr>) -> TestStun {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test STUN");
+            let addr = socket.local_addr().expect("test STUN addr");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            thread::spawn(move || {
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .expect("STUN responder read timeout");
+                let mut buf = [0u8; 128];
+                loop {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let (len, from) = match socket.recv_from(&mut buf) {
+                        Ok(received) => received,
+                        Err(_) => continue, // timeout tick: re-check the flag
+                    };
+                    let Ok(transaction) = ak_signal::stun::parse_binding_request(&buf[..len])
+                    else {
+                        continue;
+                    };
+                    let reply =
+                        ak_signal::stun::binding_response(transaction, mapped.unwrap_or(from));
+                    let _ = socket.send_to(&reply, from);
+                }
+            });
+            TestStun { addr, stop }
+        }
+    }
+
+    impl Drop for TestStun {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn cbuf(cap: usize) -> Vec<c_char> {
         vec![0 as c_char; cap]
     }
@@ -3974,6 +4277,21 @@ mod task_tests {
         )
         .expect("spec");
         assert_eq!(ak_task_start(engine, no_dir.as_ptr(), out.as_mut_ptr()), -2);
+        // CR-P1-02 改法第 2 条: a present-but-malformed stun_addr is a
+        // validation failure (absent/empty stays legal — fail-open, no
+        // query).
+        let bad_stun = CString::new(format!(
+            "{{\"registry\":\"127.0.0.1:7200\",\"registry_id\":\"{}\",\
+             \"id_dir\":\"{}\",\"stun_addr\":\"not-an-address\"}}",
+            "11".repeat(32),
+            dir.path().to_string_lossy().replace('\\', "/"),
+        ))
+        .expect("spec");
+        assert_eq!(
+            ak_task_start(engine, bad_stun.as_ptr(), out.as_mut_ptr()),
+            -2
+        );
+        assert!(last_error_of(engine).contains("stun_addr"));
         // No runtime was registered by any failed call: poll says -4.
         assert_eq!(
             ak_pairing_poll_event(engine, out.as_ptr(), cbuf(CAP).as_mut_ptr(), CAP),
@@ -4761,6 +5079,233 @@ mod task_tests {
                 != std::net::IpAddr::V6("fe80::1".parse::<std::net::Ipv6Addr>().unwrap())),
             "link-local never rides the candidate list"
         );
+    }
+
+    // -- reflexive-candidate insertion (CR-P1-02 改法第 2 条) ---------------
+
+    fn addrs(texts: &[&str]) -> Vec<SocketAddr> {
+        texts
+            .iter()
+            .map(|text| text.parse().expect("test address"))
+            .collect()
+    }
+
+    /// The documented position: right after the v4 interface block, before
+    /// the loopback tail and the interface-IPv6 block; `None` (no STUN
+    /// server configured) leaves the derived list untouched.
+    #[test]
+    fn reflexive_candidate_inserts_after_the_v4_interface_block() {
+        let derived = addrs(&[
+            "192.168.1.5:7000",
+            "10.0.0.7:7000",
+            "127.0.0.1:7000",
+            "[2606:4700:4000::a]:7000",
+            "[::1]:7000",
+        ]);
+        assert_eq!(
+            insert_reflexive_candidate(derived.clone(), Some("203.0.113.7:7000".parse().unwrap())),
+            addrs(&[
+                "192.168.1.5:7000",
+                "10.0.0.7:7000",
+                "203.0.113.7:7000",
+                "127.0.0.1:7000",
+                "[2606:4700:4000::a]:7000",
+                "[::1]:7000",
+            ])
+        );
+        assert_eq!(insert_reflexive_candidate(derived.clone(), None), derived);
+        // No v4 interface at all: the reflexive address still takes the
+        // reserved slot (ahead of the loopback tail; the consumer's
+        // LAN-first re-sort keeps loopback first at dial time).
+        assert_eq!(
+            insert_reflexive_candidate(
+                addrs(&["127.0.0.1:7000", "[::1]:7000"]),
+                Some("203.0.113.7:7000".parse().unwrap())
+            ),
+            addrs(&["203.0.113.7:7000", "127.0.0.1:7000", "[::1]:7000"])
+        );
+    }
+
+    /// Dedup: a reflexive address that equals an existing candidate (no
+    /// NAT — the loopback-STUN same-socket case, or the public IP already
+    /// on an interface) adds nothing; a v4-mapped reflexive normalizes to
+    /// plain IPv4 before the comparison.
+    #[test]
+    fn reflexive_candidate_dedups_against_existing_entries() {
+        let derived = addrs(&["192.168.1.5:7000", "127.0.0.1:7000", "[::1]:7000"]);
+        // The reflected loopback (same socket, same port): nothing new.
+        assert_eq!(
+            insert_reflexive_candidate(derived.clone(), Some("127.0.0.1:7000".parse().unwrap())),
+            derived
+        );
+        // The public IP already sits on an interface (1:1 NAT / cloud VM):
+        // nothing new.
+        assert_eq!(
+            insert_reflexive_candidate(derived.clone(), Some("192.168.1.5:7000".parse().unwrap())),
+            derived
+        );
+        // v4-mapped reflexive form normalizes before dedup and insertion.
+        assert_eq!(
+            insert_reflexive_candidate(derived, Some("[::ffff:203.0.113.7]:7000".parse().unwrap())),
+            addrs(&[
+                "192.168.1.5:7000",
+                "203.0.113.7:7000",
+                "127.0.0.1:7000",
+                "[::1]:7000",
+            ])
+        );
+    }
+
+    /// A broken server reflecting an unspecified address adds nothing (the
+    /// probe would skip it as undialable — fail-open, no junk candidate).
+    #[test]
+    fn reflexive_candidate_drops_unspecified_reflections() {
+        let derived = addrs(&["192.168.1.5:7000", "127.0.0.1:7000"]);
+        assert_eq!(
+            insert_reflexive_candidate(derived.clone(), Some("0.0.0.0:7000".parse().unwrap())),
+            derived
+        );
+        assert_eq!(
+            insert_reflexive_candidate(derived, Some("[::]:7000".parse().unwrap())),
+            addrs(&["192.168.1.5:7000", "127.0.0.1:7000"])
+        );
+    }
+
+    // -- CR-P1-02 改法第 2 条: the STUN reflexive leg, product path ---------
+
+    /// The receiver's STUN query runs ON THE SAME SOCKET QUIC THEN OWNS,
+    /// observable as port equality: a truthful loopback responder reflects
+    /// the OBSERVED source, so the event's `reflexive` port must equal the
+    /// `addr` (bound) port — a throwaway query socket would reflect a
+    /// different ephemeral port and fail this. The reflexive loopback
+    /// dedups against the derived 127.0.0.1 candidate (same address), so
+    /// the advertisement carries it exactly once (the CLI itest pins the
+    /// wire-side of that).
+    #[test]
+    fn stun_reflexive_rides_the_receiver_socket() {
+        let registry = TestRegistry::spawn();
+        let stun = TestStun::spawn(None); // truthful echo of the source
+        let engine = ak_engine_new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = CString::new(format!(
+            "{{\"spec_version\":1,\"registry\":\"{}\",\
+             \"registry_id\":\"{}\",\"id_dir\":\"{}\",\"stun_addr\":\"{}\"}}",
+            registry.addr,
+            registry.id_hex(),
+            dir.path().to_string_lossy().replace('\\', "/"),
+            stun.addr,
+        ))
+        .expect("spec CString");
+        let mut runtime_id = [0u8; 16];
+        assert_eq!(
+            ak_task_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+            0,
+            "{}",
+            last_error_of(engine)
+        );
+        let (_, ok, json) = create_code(
+            engine,
+            &runtime_id,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
+        assert!(ok, "the receiver code must claim: {json}");
+        let event = wait_event(engine, &runtime_id, "receiver_bind");
+        // Success shape: a reflexive address, no failure reason.
+        let reflexive = event
+            .split("\"reflexive\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !reflexive.is_empty(),
+            "the reflexive address must ride the event: {event}"
+        );
+        assert!(
+            event.contains("\"stun_error\":null"),
+            "a successful query reports no error: {event}"
+        );
+        // THE same-socket proof: the reflected port equals the bound
+        // port (the responder truthfully echoed the socket's own source).
+        let reflexive_addr: SocketAddr = reflexive.parse().expect("reflexive ip:port");
+        let bound = event
+            .split("\"addr\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .and_then(|text| text.parse::<SocketAddr>().ok())
+            .expect("bound addr in the event");
+        assert_eq!(
+            reflexive_addr.port(),
+            bound.port(),
+            "the STUN query must run on the socket QUIC adopts: {event}"
+        );
+        assert_eq!(
+            reflexive_addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "the truthful loopback responder reflects the local source: {event}"
+        );
+        ak_engine_free(engine);
+    }
+
+    /// Fail-open (改法第 2 条): a configured-but-silent STUN server costs at
+    /// most STUN_QUERY_BUDGET, the receiver still binds, the code still
+    /// claims, and the bounded failure rides the `receiver_bind` event
+    /// with NO reflexive candidate.
+    #[test]
+    fn stun_failure_fails_open_within_the_budget() {
+        let registry = TestRegistry::spawn();
+        // A bound-but-silent socket: packets land, nothing answers — the
+        // deterministic timeout path on every OS (a dead port would
+        // fast-fail via ICMP/ConnectionReset on Windows only).
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent STUN bind");
+        let silent_addr = silent.local_addr().expect("silent STUN addr");
+        let engine = ak_engine_new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = CString::new(format!(
+            "{{\"spec_version\":1,\"registry\":\"{}\",\
+             \"registry_id\":\"{}\",\"id_dir\":\"{}\",\"stun_addr\":\"{}\"}}",
+            registry.addr,
+            registry.id_hex(),
+            dir.path().to_string_lossy().replace('\\', "/"),
+            silent_addr,
+        ))
+        .expect("spec CString");
+        let mut runtime_id = [0u8; 16];
+        assert_eq!(
+            ak_task_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr()),
+            0,
+            "{}",
+            last_error_of(engine)
+        );
+        let started = Instant::now();
+        let (_, ok, json) = create_code(
+            engine,
+            &runtime_id,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
+        let elapsed = started.elapsed();
+        assert!(ok, "a dead STUN server must not fail the code: {json}");
+        // The bounded budget: the 2 s query + the registry claim must stay
+        // far inside the 10 s receiver-bind wait (which would have failed
+        // the op outright at its deadline).
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "fail-open must be prompt (STUN_QUERY_BUDGET is 2 s): {elapsed:?}"
+        );
+        let event = wait_event(engine, &runtime_id, "receiver_bind");
+        assert!(
+            event.contains("\"reflexive\":null"),
+            "no reflexive candidate on failure: {event}"
+        );
+        assert!(
+            event.contains("\"addr\":\""),
+            "the receiver still bound: {event}"
+        );
+        assert!(
+            !event.contains("\"stun_error\":null"),
+            "the bounded failure reason rides the event: {event}"
+        );
+        ak_engine_free(engine);
     }
 
     // -- the registry relay (the three formerly-#[ignore] contracts) ---------

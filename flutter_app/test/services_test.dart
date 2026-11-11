@@ -46,33 +46,40 @@ void main() {
     });
 
     test('tier 2: exe-directory copy beats the dev path', () {
+      // The probe is platform-aware (dll/so/dylib) — first flutter-on-
+      // Linux CI run caught these tests hardcoding the Windows name.
+      final libName = defaultAkDllFileName();
+      final exeName =
+          Platform.isWindows ? 'ak_sending_app.exe' : 'ak_sending_app';
       final root = Directory.systemTemp.createTempSync('ak_probe_');
       addTearDown(() => root.deleteSync(recursive: true));
       final exeDir = Directory('${root.path}/bundle')..createSync();
-      File('${exeDir.path}/ak_ffi.dll').writeAsBytesSync([1, 2, 3]);
+      File('${exeDir.path}/$libName').writeAsBytesSync([1, 2, 3]);
       final resolution = resolveAkDllPath(
         environment: const {},
-        resolvedExecutable: '${exeDir.path}/ak_sending_app.exe',
+        resolvedExecutable: '${exeDir.path}/$exeName',
         workingDirectory: root.path,
       );
       expect(resolution!.source, DllSource.executableDirectory);
-      expect(resolution.path, endsWith('bundle/ak_ffi.dll'));
+      expect(resolution.path, endsWith('bundle/$libName'));
     });
 
     test('tier 3: ../target/release from a flutter_app-like cwd', () {
+      final libName = defaultAkDllFileName();
+      final toolName = Platform.isWindows ? 'tool.exe' : 'tool';
       final root = Directory.systemTemp.createTempSync('ak_probe_');
       addTearDown(() => root.deleteSync(recursive: true));
       Directory('${root.path}/target/release').createSync(recursive: true);
-      File('${root.path}/target/release/ak_ffi.dll').writeAsBytesSync([1]);
+      File('${root.path}/target/release/$libName').writeAsBytesSync([1]);
       // flutter_app sits ONE level below the repo root with target/.
       final cwd = Directory('${root.path}/flutter_app')..createSync();
       final resolution = resolveAkDllPath(
         environment: const {},
-        resolvedExecutable: '${root.path}/elsewhere/tool.exe',
+        resolvedExecutable: '${root.path}/elsewhere/$toolName',
         workingDirectory: cwd.path,
       );
       expect(resolution!.source, DllSource.workingDirectory);
-      expect(resolution.path, endsWith('../target/release/ak_ffi.dll'));
+      expect(resolution.path, endsWith('../target/release/$libName'));
       expect(File(resolution.path).existsSync(), isTrue);
     });
 

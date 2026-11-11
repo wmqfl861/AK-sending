@@ -140,10 +140,15 @@ echo "==> host: $HOST_TAG, API level $API"
 # ---------------------------------------------------------------------------
 # 2. Linker / compiler environment (per target; overrides nothing static)
 #    NOTE: on Windows the NDK clang wrappers are .cmd scripts — cargo and
-#    the cc crate both accept them directly as CC/LINKER values.
+#    the cc crate both accept them directly as CC/LINKER values; on Linux
+#    the wrappers are plain executables with no suffix.
 # ---------------------------------------------------------------------------
-X64_CLANG="$NDK_BIN/x86_64-linux-android$API-clang.cmd"
-ARM64_CLANG="$NDK_BIN/aarch64-linux-android$API-clang.cmd"
+case "$OSTYPE" in
+  msys*|cygwin*|win32) CLANG_SUFFIX=".cmd" ;;
+  *)                   CLANG_SUFFIX="" ;;
+esac
+X64_CLANG="$NDK_BIN/x86_64-linux-android$API-clang$CLANG_SUFFIX"
+ARM64_CLANG="$NDK_BIN/aarch64-linux-android$API-clang$CLANG_SUFFIX"
 LLVM_AR="$NDK_BIN/llvm-ar.exe"
 [ "$HOST_TAG" = "linux-x86_64" ] && LLVM_AR="$NDK_BIN/llvm-ar"
 

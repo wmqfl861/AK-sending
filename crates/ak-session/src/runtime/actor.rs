@@ -1,5 +1,5 @@
 //! The scheduler actor: one task serially owning
-//! [`SchedulerCore`](crate::scheduler::SchedulerCore) (contract §5 /
+//! [`SchedulerCore`] (contract §5 /
 //! B0 integration point 1).
 //!
 //! Everything that mutates scheduler state happens inside this loop:
@@ -10,7 +10,7 @@
 //! only transitions state.
 //!
 //! Per command the actor pumps admission (inside the core) and then runs
-//! [`SchedulerActor::after_mutation`]: broadcast drained core events on
+//! `SchedulerActor::after_mutation`: broadcast drained core events on
 //! the bounded event channel, spawn a task driver for every new admission
 //! (suppressed once a shutdown began — "stop new admissions"), requeue
 //! tasks parked by a queue-full retry, and check shutdown convergence.

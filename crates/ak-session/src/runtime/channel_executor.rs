@@ -11,7 +11,7 @@
 //! `TaskOpen`, validated it against the local Ready relations
 //! ([`AdmissionValidator`](crate::runtime::AdmissionValidator)) and now
 //! binds the connection into a
-//! [`TransferSpec`](crate::runtime::TransferSpec) whose group key came
+//! [`TransferSpec`] whose group key came
 //! from the *relation*, not the claim (contract §6). When the scheduler
 //! admits that task, the executor's `run` completes the admission reply
 //! and the whole receive body through the frozen wave-27 engine entry:

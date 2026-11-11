@@ -3,7 +3,7 @@
 //! This module tree binds the wave-20 deliverables into one end-to-end
 //! pairing flow over the **real** v2 control plane:
 //!
-//! * [`client`] — [`RegistryClient`]: a real v2 control client (pinned
+//! * [`crate::pairing::client`] — [`crate::pairing::RegistryClient`]: a real v2 control client (pinned
 //!   TLS 1.3 over `ak-signal::server_v2::tls::connect_pinned`, the frozen
 //!   `hello2` signature domains, the frozen frame codec) with a single
 //!   reader task, bounded inboxes, idempotent request round-trips and
@@ -13,13 +13,13 @@
 //!   from the shipped server on three handshake constants — ALPN token,
 //!   pin semantics, TLS-exporter label — so it cannot complete the opening
 //!   exchange against `serve_v2`; the details are recorded in the module
-//!   docs of [`client`].)
-//! * [`transport`] — [`RealTransport`]: the wave-21 real adapter that
+//!   docs of [`crate::pairing::client`].)
+//! * [`crate::pairing::transport`] — [`crate::pairing::RealTransport`]: the wave-21 real adapter that
 //!   implements [`crate::runtime::transport::PairingTransport`] over
-//!   [`RegistryClient`] and plugs into
+//!   [`crate::pairing::RegistryClient`] and plugs into
 //!   [`crate::runtime::RuntimeConfig::transport`], the injection seam the
 //!   wave-20 runtime left open.
-//! * [`orchestrator`] — [`PairingOrchestrator`]: the owner/redeemer
+//! * [`crate::pairing::orchestrator`] — [`crate::pairing::PairingOrchestrator`]: the owner/redeemer
 //!   orchestration of the frozen pairing transcript
 //!   (`InviteClaim` → `InviteRedeem` → offer → `PairChallenge` →
 //!   `PairProof` → `PairPrepared` → `PairCommit` → local trust-book apply

@@ -2,14 +2,14 @@
 //!
 //! Composition of the pieces (contract `docs/contracts/scheduler.md`):
 //!
-//! * [`config::SchedulerPolicy`] — two-dimensional concurrency modes and
+//! * [`crate::scheduler::config::SchedulerPolicy`] — two-dimensional concurrency modes and
 //!   caps, with strict JSON parsing/validation;
-//! * [`key`] — grouping keys, task handles, permits;
-//! * [`queue::FairQueue`] — bounded FIFO with group round-robin fairness
+//! * [`crate::scheduler::key`] — grouping keys, task handles, permits;
+//! * [`crate::scheduler::queue::FairQueue`] — bounded FIFO with group round-robin fairness
 //!   and O(1) queue-full rejection;
-//! * [`admission::decide`] — the pure four-mode admission decision;
-//! * [`state`] — the contract §9 task states and scheduler events;
-//! * [`core::SchedulerCore`] — the deterministic state machine gluing them
+//! * [`crate::scheduler::admission::decide`] — the pure four-mode admission decision;
+//! * [`crate::scheduler::state`] — the contract §9 task states and scheduler events;
+//! * [`crate::scheduler::core::SchedulerCore`] — the deterministic state machine gluing them
 //!   together, driven by the B6 runtime actor.
 //!
 //! No networking, no clocks, no I/O: everything here is testable with

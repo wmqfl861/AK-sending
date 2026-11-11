@@ -27,7 +27,7 @@
 //! files under `<root>/.ak-staging/<task-hex>/...` instead of next to the
 //! final name, so two concurrent tasks aiming at the same destination
 //! never share (or clobber) one in-flight part. Commit stays the same
-//! atomic no-replace [`commit_no_replace`] into the final location. A
+//! atomic no-replace ``commit_no_replace`` into the final location. A
 //! legacy same-directory `.akpart` left by a pre-staging run is migrated
 //! into the task's staging tree on prepare and resumed from there;
 //! [`discard_staging`] removes one task's whole staging tree on cancel or
@@ -1235,7 +1235,7 @@ impl LocalSaveTarget {
     /// * same validation (chunk-size cap, path safety, digest algorithm,
     ///   chunk-plan consistency), same already-committed fast path, same
     ///   resume-by-verified-prefix, same atomic no-replace
-    ///   [`commit_no_replace`] at finish;
+    ///   ``commit_no_replace`` at finish;
     /// * a legacy same-directory `.akpart` (pre-staging run) is moved into
     ///   this task's staging tree on first prepare and resumed from there —
     ///   migration only runs when no staging part exists yet, so it can

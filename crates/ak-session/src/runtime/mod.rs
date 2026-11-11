@@ -4,7 +4,7 @@
 //! in an actor and orchestrates the task lifecycle of contract
 //! `docs/contracts/scheduler.md` §5–§7:
 //!
-//! * [`actor`] — the scheduler actor: one task serially owning the core
+//! * [`crate::runtime::actor`] — the scheduler actor: one task serially owning the core
 //!   (B0 integration point 1), a bounded command channel
 //!   (`Submit`/`Cancel`/`SetPolicy`/`Retry`/`Snapshot`/`Shutdown` plus
 //!   executor reports and backoff timers), a bounded event broadcast
@@ -16,23 +16,23 @@
 //!   failures back off on the injected clock, then requeue or park
 //!   (retry budget exhausted); cancels remove queued items directly and
 //!   stop running ones through the executor (contract §10);
-//! * [`listener`] — [`RuntimeListener`]: resident consumption of pairing
+//! * [`crate::runtime::listener`] — [`crate::runtime::RuntimeListener`]: resident consumption of pairing
 //!   events; every completed pairing submits an inbound receive task into
 //!   the same scheduler (explicit stop + join);
 //! * shutdown — stop new admissions, wait in-flight (bounded by
 //!   `shutdown_timeout_ms` on the injected clock), cancel residuals,
-//!   return a [`ShutdownSummary`] and join actor + listener;
-//! * [`handle`] — the public seven-signature API of contract §4
+//!   return a [`crate::runtime::ShutdownSummary`] and join actor + listener;
+//! * [`crate::runtime::handle`] — the public seven-signature API of contract §4
 //!   (`SessionRuntime::start` + `SessionHandle::{enqueue, set_policy,
 //!   cancel, retry, snapshot, shutdown}`).
 //!
 //! **Fake-DI form (wave 20):** both real-world dependencies are injected
-//! traits — [`PairingTransport`] (signaling/pairing, method families
+//! traits — [`crate::runtime::PairingTransport`] (signaling/pairing, method families
 //! mirroring the A3 control plane: claim/redeem/pair/open-session/events)
-//! and [`TransferExecutor`] (engine: enqueue one task, report
+//! and [`crate::runtime::TransferExecutor`] (engine: enqueue one task, report
 //! phase/finish). This crate ships deterministic fakes
-//! ([`FakePairingTransport`], [`FakeTransferExecutor`], [`FakeClock`])
-//! plus a production [`RealClock`]; wave 21 binds the real `ak-signal`
+//! ([`crate::runtime::FakePairingTransport`], [`crate::runtime::FakeTransferExecutor`], [`crate::runtime::FakeClock`])
+//! plus a production [`crate::runtime::RealClock`]; wave 21 binds the real `ak-signal`
 //! client, the B2/B3 admission handshake and the `ak-engine` on-channel
 //! executor behind the same traits.
 //!

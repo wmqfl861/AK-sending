@@ -3150,7 +3150,7 @@ enum AdmissionAttempt {
 /// bind/QUIC+TLS handshake phase — admission runs after the connection is
 /// established, so the budget semantics of wave 26 are unchanged), then
 /// hand the connected channel to [`ak_engine::send_on_channel`] with the
-/// [`AdmissionCtx`] built from the Ready relation.
+/// [`ak_engine::AdmissionCtx`] built from the Ready relation.
 ///
 /// Error discipline (scheduler.md §6):
 ///

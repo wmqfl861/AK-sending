@@ -43,7 +43,7 @@ pub struct SignalClient {
 impl SignalClient {
     /// Connect, send a signed Hello, and await Welcome.
     ///
-    /// The Hello timestamp comes from [`crate::util::fresh_now_unix_ms`], so
+    /// The Hello timestamp comes from ``util::fresh_now_unix_ms``, so
     /// rapid retries never sign identical Hello bytes (which the server's
     /// replay window would reject).
     pub async fn connect(

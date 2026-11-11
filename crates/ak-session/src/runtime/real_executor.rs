@@ -1,10 +1,10 @@
 //! Real engine adapter: [`RealTransferExecutor`] (wave 24).
 //!
 //! This is the production binding of the injected
-//! [`TransferExecutor`](crate::runtime::TransferExecutor) trait: one
+//! [`TransferExecutor`] trait: one
 //! admitted task runs one real `ak-engine` transfer and reports the
 //! contract §9 phases plus the terminal outcome back through the
-//! [`ProgressSink`](crate::runtime::ProgressSink).
+//! [`ProgressSink`].
 //!
 //! **Entry-point choice (recorded per the wave-24 brief):** the adapter
 //! wraps the legacy [`ak_engine::receive_with_addr`] bind-accept-receive
@@ -32,7 +32,7 @@
 //! the legacy kernel verifies and commits before returning, so those two
 //! phases are reported back-to-back at completion. Failures report
 //! `Finished { Failed { code } }` with a stable
-//! [`ErrorCode`](ak_core::error::ErrorCode) classification.
+//! [`ErrorCode`] classification.
 //!
 //! Cancellation (P1-03): the engine kernel has no cooperative cancel
 //! handle, so the spawned work task races the kernel future against a

@@ -1,7 +1,7 @@
 //! Typed pairing transaction: transcript, endpoint proofs, and verification
 //! (plan A.4 §5 / `docs/contracts/protocol-v2.md` §5, plan A.5 §3–§4).
 //!
-//! The 256-byte [`PairTranscript`] binds everything a pairing decision
+//! The 256-byte [`crate::pairing_txn::PairTranscript`] binds everything a pairing decision
 //! rests on — registry identity, code, pairing/request ids, lookup digest,
 //! both device identities, both nonces, and the deadline. Each endpoint
 //! proves (a) knowledge of the invite-code secret via a domain-separated
@@ -15,10 +15,10 @@
 //! signature    = Ed25519.Sign(device_key, role domain || transcript || mac)
 //! ```
 //!
-//! [`PairingRecord::verify_transcript`] fails with an **independent error
+//! [`crate::pairing_txn::PairingRecord::verify_transcript`] fails with an **independent error
 //! variant per attack**: substituted public key, wrong invite code
 //! (MAC mismatch), replayed/foreign nonce, and expired proof, plus a
-//! transcript-digest integrity check. Success returns a [`VerifiedPairing`]
+//! transcript-digest integrity check. Success returns a [`crate::pairing_txn::VerifiedPairing`]
 //! whose fields are only obtainable through verification — the input for
 //! `PeerBookStore::commit_paired_peer` (plan A.5 §5) and the A6 pairing
 //! orchestration.
@@ -201,7 +201,7 @@ pub struct PairingRecord {
 /// the clock are public transcript material and stay visible.
 #[derive(Clone, Copy)]
 pub struct VerifyExpectations<'a> {
-    /// [`InviteCode::auth_key`] of the locally held invite code.
+    /// ``InviteCode::auth_key`` of the locally held invite code.
     pub auth_key: &'a [u8; 32],
     /// The owner nonce this pairing attempt must show.
     pub expected_owner_nonce: &'a Nonce32,
@@ -228,7 +228,7 @@ impl PairingRecord {
     /// transcript digest, both domain-separated MACs under `auth_key`, and
     /// both device signatures. Used by the owner when answering a redeem
     /// and by tests/fakes; wire peers instead build the struct from
-    /// received fields and call [`PairingRecord::verify_transcript`].
+    /// received fields and call [`crate::pairing_txn::PairingRecord::verify_transcript`].
     pub fn build(
         transcript: PairTranscript,
         auth_key: &[u8; 32],
@@ -258,7 +258,7 @@ impl PairingRecord {
 
     /// Assemble from already-received pieces (e.g. decoded `PairCommit`
     /// fields). No check happens here; verification is
-    /// [`PairingRecord::verify_transcript`].
+    /// [`crate::pairing_txn::PairingRecord::verify_transcript`].
     pub fn from_pieces(
         transcript: PairTranscript,
         transcript_digest: Digest32,
@@ -286,7 +286,7 @@ impl PairingRecord {
     ///    claims (`PublicKeyMismatch` — key substitution or role
     ///    reflection).
     ///
-    /// On success returns a [`VerifiedPairing`]; there is no other public
+    /// On success returns a [`crate::pairing_txn::VerifiedPairing`]; there is no other public
     /// way to construct one.
     pub fn verify_transcript(
         &self,
@@ -333,7 +333,7 @@ impl PairingRecord {
 }
 
 /// Proof-of-verification result. Only obtainable from
-/// [`PairingRecord::verify_transcript`], so downstream code (A6
+/// [`crate::pairing_txn::PairingRecord::verify_transcript`], so downstream code (A6
 /// orchestration, `PeerBookStore` callers) cannot accidentally treat an
 /// unverified record as a pairing decision.
 #[derive(Debug, Clone, PartialEq, Eq)]

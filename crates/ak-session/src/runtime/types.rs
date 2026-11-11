@@ -80,7 +80,7 @@ pub enum PairingPlan {
     /// local bind/accept (the daemon's resident receive loop) and goes
     /// straight from admission to its executor. The driver reports the
     /// `WaitingDirect`/`AwaitingAdmission` phases and skips
-    /// [`PairingTransport::open_session`](crate::runtime::PairingTransport::open_session):
+    /// [`PairingTransport::open_session`]:
     /// a resident listener has no signaling session to open toward the
     /// still-unknown connecting peer.
     Local,

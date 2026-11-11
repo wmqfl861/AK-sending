@@ -3,7 +3,7 @@
 //! [`PeerBook::save`] atomically replaces one local file, but a pairing
 //! commit is a read–modify–write of that file plus replay protection. This
 //! module adds the missing transactional entry point,
-//! [`PeerBookStore::commit_paired_peer`]:
+//! [`crate::peer_store::PeerBookStore::commit_paired_peer`]:
 //!
 //! * the read/merge/save sequence runs under one process-wide lock, so
 //!   concurrent commits (CLI `add`, FFI `ak_peer_*`, automatic pairing)
@@ -64,7 +64,7 @@ pub enum PeerBookTxnError {
     PairingIdConflict,
 }
 
-/// Result of a [`PeerBookStore::commit_paired_peer`] call.
+/// Result of a [`crate::peer_store::PeerBookStore::commit_paired_peer`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     /// The fingerprint was new; a book entry was created.

@@ -43,7 +43,7 @@
 //! # History: the parallel seam (agent A, wave 28)
 //!
 //! This module was written in parallel with the `ak-signal` frame
-//! extension. The three [`wire`] adapters below were the seam; they are
+//! extension. The three `wire` adapters below were the seam; they are
 //! now bound to the landed frames (claim with blob + `max_redeems = 1`,
 //! redeem with blob, peer blob off the relayed frames) and kept as the
 //! single place the wire details are named, so future frame changes
@@ -960,7 +960,7 @@ impl TaskPairing {
     /// pairing would form a strong reference ring
     /// (gate → pairing → orchestrator → gate) that outlives every
     /// external handle; the bare table keeps the gate's footprint to
-    /// exactly the data [`veto_task_offer`] reads.
+    /// exactly the data `veto_task_offer` reads.
     pub fn install_redeem_offer_gate(&self) {
         let tasks = Arc::clone(&self.tasks);
         self.orch

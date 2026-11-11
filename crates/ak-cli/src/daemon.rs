@@ -15,7 +15,7 @@
 //!   and accepts connections concurrently; every accepted connection
 //!   becomes a handler task that runs the scheduler handshake split. A
 //!   scheduler-capable sender is validated against the local Ready
-//!   pairing relations ([`AdmissionValidator`]) and enters the scheduler
+//!   pairing relations ([`ak_session::runtime::AdmissionValidator`]) and enters the scheduler
 //!   under the REAL code group of that relation (`PairingPlan::Ready`),
 //!   so `same_code_mode`/`cross_code_mode` govern real groups. A legacy
 //!   peer (no `CAP_SCHEDULER`, e.g. the previous `send --fp`) keeps the
@@ -304,9 +304,9 @@ pub(crate) fn scheduler_policy_from_flags(
 }
 
 /// The daemon's wired session runtime (wave 24): the real
-/// [`RealTransport`] over the pinned v2 registry client, the real
-/// [`RealTransferExecutor`] receive kernel as the inbound executor, and
-/// the initial [`SchedulerPolicy`] from the flags. The daemon's own
+/// [`ak_session::pairing::RealTransport`] over the pinned v2 registry client, the real
+/// [`ak_session::runtime::RealTransferExecutor`] receive kernel as the inbound executor, and
+/// the initial [`ak_session::runtime::SchedulerPolicy`] from the flags. The daemon's own
 /// receive loop is the resident consumer of pairing events, so the
 /// runtime's listener stays off (it would double-bind the receive port);
 /// retries are disabled (`max_attempts = 1`) because the daemon loop

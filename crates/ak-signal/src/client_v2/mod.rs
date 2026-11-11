@@ -14,7 +14,7 @@
 //! `request_id` / `pairing_id` / `connection_id` / `session` into the
 //! matching **bounded** inbox (capacity 64 by default). There is no shared
 //! unbounded inbox: a waiter that vanished, a full inbox, or an unsolicited
-//! frame is counted in [`ClientV2::dropped_unmatched_frames`] and logged,
+//! frame is counted in [`crate::client_v2::ClientV2::dropped_unmatched_frames`] and logged,
 //! never allowed to wedge the reader or grow memory (pairing-flow §11).
 //!
 //! # Idempotency and cancellation
@@ -26,7 +26,7 @@
 //! Dropping the request future cancels only the wait — the waiter is
 //! removed from the dispatch registry and the connection stays up. After a
 //! reconnect the one-shot waiters are failed with
-//! [`ClientV2Error::ConnectionLost`] and the request-id space restarts:
+//! [`crate::client_v2::ClientV2Error::ConnectionLost`] and the request-id space restarts:
 //! ids are fresh CSPRNG draws per logical request, the pending map is
 //! purged on disconnect, so a stale response can never be matched to a new
 //! request (collision probability 2^-128 aside).
@@ -38,13 +38,13 @@
 //! twice with the same `device_id` makes the server replace the older
 //! connection (v1 semantics carried into v2 — the old stream gets
 //! `ServerError { code: ERR_DEVICE_REPLACED }` and closes). The replaced
-//! side can observe that via [`ClientV2::is_replaced`] /
-//! [`ClientV2::replaced_watcher`]; the flag is sticky across reconnects so
+//! side can observe that via [`crate::client_v2::ClientV2::is_replaced`] /
+//! [`crate::client_v2::ClientV2::replaced_watcher`]; the flag is sticky across reconnects so
 //! an external duplicate process stays visible.
 //!
 //! # Reconnects
 //!
-//! [`ClientV2::reconnect`] retries the full pinned handshake with the
+//! [`crate::client_v2::ClientV2::reconnect`] retries the full pinned handshake with the
 //! frozen backoff (1 s / 2 s / 4 s doubling, cap 30 s). Pairing and session
 //! subscriptions survive a reconnect (committed transactions recover,
 //! pairing-flow §6); one-shot waiters do not.
@@ -407,7 +407,7 @@ impl ClientV2 {
         self.inner.replaced.load(Ordering::Acquire)
     }
 
-    /// Async notification for [`ClientV2::is_replaced`].
+    /// Async notification for [`crate::client_v2::ClientV2::is_replaced`].
     pub fn replaced_watcher(&self) -> watch::Receiver<bool> {
         self.inner.replaced_tx.subscribe()
     }

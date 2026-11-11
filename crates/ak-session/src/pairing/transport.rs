@@ -1,5 +1,5 @@
 //! The wave-21 real [`PairingTransport`] adapter over
-//! [`RegistryClient`](crate::pairing::client::RegistryClient).
+//! [`RegistryClient`].
 //!
 //! This is the "真实适配器挂入点" of the wave-20 runtime: construct it over
 //! the device's one [`RegistryClient`] and pass `Arc<RealTransport>` as

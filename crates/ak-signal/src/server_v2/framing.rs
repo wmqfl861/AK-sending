@@ -4,7 +4,7 @@
 //!
 //! Direction legality is enforced on the write path
 //! ([`write_message`]); the caller decodes with
-//! [`protocol_v2::frame::CtrlFrame::decode_as`] to enforce it on the read
+//! ``protocol_v2::frame::CtrlFrame::decode_as`` to enforce it on the read
 //! path. This module never speaks v1: a version-1 header byte is an I/O
 //! error, so the v2 port cannot be downgraded into the plaintext codec.
 

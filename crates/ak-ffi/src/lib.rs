@@ -8,8 +8,8 @@
 //!   to the caller that the caller must free except via explicit APIs.
 //! - Progress is pulled (poll) as small JSON lines, so any language loop
 //!   can render it; errors are status codes plus a message buffer.
-//! - `unsafe` exists ONLY in this crate's pointer-shim modules ([`shim`]
-//!   and, since wave 23, [`sched_ext`] for the five exports that complete
+//! - `unsafe` exists ONLY in this crate's pointer-shim modules (`shim`
+//!   and, since wave 23, `sched_ext` for the five exports that complete
 //!   the frozen v2 surface), each block carrying a SAFETY comment; all
 //!   logic lives in safe functions below the shims.
 //!
@@ -18,12 +18,12 @@
 //! Every other crate in this repository is `#![forbid(unsafe_code)]`; this
 //! crate is the single, deliberate exception, because a C ABI is exactly
 //! the place where raw pointers are the interface. The exception is
-//! contained: [`shim`] holds the `unsafe` blocks of the v1 + wave-22
+//! contained: `shim` holds the `unsafe` blocks of the v1 + wave-22
 //! exports (pointer dereference, `CStr` reads, buffer writes — each with a
 //! `SAFETY:` comment covering non-nullness, lifetime, and UTF-8
-//! validation), and [`sched_ext`] (wave 23) holds those of the five
+//! validation), and `sched_ext` (wave 23) holds those of the five
 //! ffi-v2 §1 exports that were still missing, under the identical
-//! discipline, while [`core`] is
+//! discipline, while `core` is
 //! compiled with `#![forbid(unsafe_code)]` and owns every line of logic:
 //! the engine handle and job table, JSON parsing/serialization, spec
 //! construction, and progress/report rendering. Every pointer-taking

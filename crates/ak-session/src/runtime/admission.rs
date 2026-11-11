@@ -11,7 +11,7 @@
 //! returns a [`CodeGroupKey`] rebuilt from the relation's own record.
 //!
 //! Fact source (chosen after reading `crate::pairing`): the `ak-store`
-//! [`PairingJournal`](ak_store::PairingJournal) — the
+//! [`PairingJournal`] — the
 //! `<id_dir>/pairing/<pairing>.akpair` records the orchestrator writes. It
 //! is the only local store that binds all three identity dimensions of a
 //! relation together:

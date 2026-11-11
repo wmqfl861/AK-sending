@@ -58,7 +58,7 @@ use crate::server_v2::config::{
 /// (both snapshotted at redeem time). The v1→v2 migration is additive
 /// `ALTER TABLE ... ADD COLUMN` statements — tombstones, uniqueness
 /// records and every pre-existing row survive verbatim — and runs as one
-/// atomic, re-entrant transaction (see [`migrate_v1_to_v2`]).
+/// atomic, re-entrant transaction (see ``migrate_v1_to_v2``).
 ///
 /// R36-P2-05 bumped 2 → 3: `invite_codes` gained `claim_request_body
 /// BLOB NULL` (the canonical claim idempotency body at claim time) and
@@ -66,9 +66,9 @@ use crate::server_v2::config::{
 /// frame), so a retry of a claim whose journal row was already recycled
 /// still replays the exact original result instead of a `CODE_CONFLICT`.
 /// The v2→v3 migration is additive and atomic/re-entrant exactly like
-/// v1→v2 (see [`migrate_v2_to_v3`]); pre-v3 rows replay through the
+/// v1→v2 (see ``migrate_v2_to_v3``); pre-v3 rows replay through the
 /// deterministic reconstruction (claim-time revision is 1 by
-/// construction — see [`prior_claim_replay`]).
+/// construction — see ``prior_claim_replay``).
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// Why a store operation failed at the storage layer. Business outcomes
@@ -469,11 +469,11 @@ impl RegistryStore {
     /// `InviteClaimed`, different content is `REQUEST_CONFLICT`. With
     /// both at their defaults the body is byte-identical to the
     /// pre-wave-28 canonical form, so claims journaled by a v1 server
-    /// still replay after the upgrade (P2-14, see [`claim_body`]); the
+    /// still replay after the upgrade (P2-14, see ``claim_body``); the
     /// one historical divergence — wave-28 journaled default claims with
     /// an explicit all-zero tail (41 bytes) — is folded into the
     /// comparison, not the storage (R29-P2-02, see
-    /// [`claim_bodies_equivalent`]).
+    /// ``claim_bodies_equivalent``).
     #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &self,
@@ -1353,12 +1353,12 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), StoreError> {
 }
 
 /// R36-P2-05 migration (schema 2 → 3), atomic and re-entrant exactly as
-/// [`migrate_v1_to_v2`]: `invite_codes` gains `claim_request_body BLOB
+/// ``migrate_v1_to_v2``: `invite_codes` gains `claim_request_body BLOB
 /// NULL` and `claim_response BLOB NULL`, the durable replay record for
 /// claims whose bounded journal row was already recycled. Additive only
 /// — no tombstone, uniqueness record or pre-existing row is touched, and
 /// pre-v3 rows replay through the deterministic reconstruction (see
-/// [`prior_claim_replay`]).
+/// ``prior_claim_replay``).
 fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), StoreError> {
     const COLUMNS: [(&str, &str, &str); 2] = [
         (
@@ -1605,7 +1605,7 @@ fn claim_bodies_equivalent(stored: &[u8], incoming: &[u8]) -> bool {
 ///   rows), otherwise the body rebuilt from the row's immutable
 ///   claim-time fields (`lookup_digest`, the ttl derived from
 ///   `expires_unix_ms - created_unix_ms`, `max_redeems`,
-///   `owner_endpoint`); [`claim_bodies_equivalent`] folds the wave-28
+///   `owner_endpoint`); ``claim_bodies_equivalent`` folds the wave-28
 ///   41-byte default tail exactly as the journal path does. A lookup,
 ///   ttl, cap or endpoint difference is a `REQUEST_CONFLICT`.
 /// - response: the persisted original `InviteClaimed` bytes when
@@ -1690,7 +1690,7 @@ fn prior_claim_replay(
 }
 
 /// One `invite_codes` row read back for a durable claim replay
-/// (R36-P2-05); see [`prior_claim_replay`].
+/// (R36-P2-05); see ``prior_claim_replay``.
 struct PriorClaim {
     lookup_digest: Digest32,
     created_ms: u64,
@@ -3167,7 +3167,7 @@ mod tests {
     /// extension tail was appended unconditionally (commit `7458e9f`),
     /// so a default extension produced 41 bytes ending in
     /// `cap=0[4] + presence=0[1]`. Used to fixture historical rows
-    /// (R29-P2-02); this build's [`claim_body`] is the canonical form.
+    /// (R29-P2-02); this build's ``claim_body`` is the canonical form.
     fn wave28_claim_body(
         lookup_digest: &Digest32,
         ttl_secs: u32,

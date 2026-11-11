@@ -33,7 +33,7 @@
 //! Semantics:
 //!
 //! - **Atomic writes**: same temp+fsync+rename discipline as the checkpoint
-//!   store (see [`atomic_write`]). A crash mid-write leaves a `.tmp` residue
+//!   store (see `atomic_write`). A crash mid-write leaves a `.tmp` residue
 //!   that loading ignores; a published record is always a complete file.
 //! - **Monotonic phases**: `pending < committed < applied`. Phases only move
 //!   forward. `applied` is terminal and never regresses; replaying a stale

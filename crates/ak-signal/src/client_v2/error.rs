@@ -12,7 +12,7 @@ use crate::protocol_v2::{CtrlMessage, DecodeError, EncodeError, ErrorScope};
 ///
 /// Alignment note for A2 (wave 21): the server should send
 /// `ServerError { code: ERR_DEVICE_REPLACED }` on the old connection before
-/// closing it, so this client can surface [`ClientV2::is_replaced`] instead
+/// closing it, so this client can surface [`crate::client_v2::ClientV2::is_replaced`] instead
 /// of a plain connection loss.
 pub const ERR_DEVICE_REPLACED: u16 = 0x1001;
 

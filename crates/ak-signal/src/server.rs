@@ -7,7 +7,7 @@
 //! per-connection outbox with non-blocking delivery, and a Hello replay
 //! window (an exact re-send of an already accepted signed Hello inside
 //! the freshness window is rejected as a suspected replay — see
-//! [`HelloReplayCache`]). The server verifies Hello signatures but
+//! ``HelloReplayCache``). The server verifies Hello signatures but
 //! trusts nothing else; it never sees file names, manifests, or bytes.
 //!
 //! There is intentionally no upload/download/forward route. A test locks the
@@ -171,7 +171,7 @@ pub struct Limits {
     /// Hello freshness window; doubles as the Hello replay window — an
     /// accepted Hello signature digest is remembered for this long, and a
     /// byte-identical Hello inside the window is rejected as a suspected
-    /// replay (see [`HelloReplayCache`]).
+    /// replay (see ``HelloReplayCache``).
     pub hello_max_age: Duration,
     /// Steady-state frames per second per connection.
     pub frame_rate_per_sec: u32,
@@ -349,7 +349,7 @@ struct Inner {
     devices: HashMap<DeviceId, DeviceEntry>,
     sessions: HashMap<SessionId, SessionEntry>,
     next_conn_id: u64,
-    /// Server-wide Hello replay window (see [`HelloReplayCache`]).
+    /// Server-wide Hello replay window (see ``HelloReplayCache``).
     hello_replay: HelloReplayCache,
 }
 

@@ -18,7 +18,7 @@
 //! Panic containment, honest scope (C10): panics from any task spawned
 //! here stay inside the runtime. Every export additionally wraps its SAFE
 //! body — the logic call between the pointer reads and the buffer
-//! write-backs — in [`guarded`], which turns an ordinary unwinding panic
+//! write-backs — in `guarded`, which turns an ordinary unwinding panic
 //! into an `AK_ERR_INTERNAL` status plus message. That is the whole
 //! guarantee: the pointer adapters, the last-error TLS bookkeeping, and
 //! `ak_engine_free`'s destructor run OUTSIDE any catch, and no catch can
@@ -72,7 +72,7 @@ pub const AK_ERR_BUFFER: i32 = -3;
 pub const AK_ERR_NOT_FOUND: i32 = -4;
 /// Internal failure: lock poisoning, runtime build failure (C13: the
 /// runtime builder's OS reason travels in the last-error message), or an
-/// ordinary unwinding panic caught by [`guarded`] — fail-fast faults are
+/// ordinary unwinding panic caught by `guarded` — fail-fast faults are
 /// NOT catchable and kill the process instead of producing this code.
 pub const AK_ERR_INTERNAL: i32 = -5;
 
@@ -1186,7 +1186,7 @@ impl AkEngine {
     ///    `once_jobs = 1` receive is released deterministically, and the
     ///    task can never emit another progress event;
     /// 3. for `once_jobs > 1` receives the bound port is knocked (see
-    ///    [`Job::knock`]) so ak-engine's detached accept task drops its
+    ///    `Job::knock`) so ak-engine's detached accept task drops its
     ///    endpoint promptly instead of at its accept deadline;
     /// 4. the outcome is stamped `cancelled by caller` and a raced
     ///    trailing `done` event line for this job is removed, so a

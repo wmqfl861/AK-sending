@@ -792,7 +792,7 @@ pub enum EngineError {
     /// spec pins (wave 23, review P1-4). [`send_on_channel`] re-checks, as
     /// its very first step, the identity condition the legacy [`send`]
     /// establishes itself at connect time; a mismatched channel is closed
-    /// with [`PEER_MISMATCH_CLOSE_CODE`] before any protocol byte moves —
+    /// with ``PEER_MISMATCH_CLOSE_CODE`` before any protocol byte moves —
     /// not even the sources are scanned.
     #[error("channel peer {actual} is not the pinned fingerprint {expected}")]
     PeerMismatch {
@@ -1309,7 +1309,7 @@ fn validate_task_open(
 /// wave 23): read TaskOpen, refuse the wire-level sentinels and direction
 /// violations, hand the *complete* admission context ([`AdmissionRequest`]:
 /// code group + registry + pairing relation) to the caller's decider,
-/// answer `Admission` (a grant carries the bounded [`ADMISSION_LEASE_MS`]
+/// answer `Admission` (a grant carries the bounded ``ADMISSION_LEASE_MS``
 /// lease), and — only on grant — wait for AdmissionAck before the frozen
 /// receive body runs. Returns the task id that keys the receiver's per-task
 /// staging tree. A denial is answered on the wire and fails the call
@@ -2403,7 +2403,7 @@ pub async fn send(
 ///   equal `spec.pinned` — the identity condition the legacy [`send`]
 ///   establishes itself at connect time. A mismatch returns
 ///   [`EngineError::PeerMismatch`] and closes the connection with
-///   [`PEER_MISMATCH_CLOSE_CODE`] before any protocol byte moves (not even
+///   ``PEER_MISMATCH_CLOSE_CODE`` before any protocol byte moves (not even
 ///   the sources are scanned);
 /// * no endpoint bind/connect here (the runtime owns the connection);
 /// * the Hello advertises `CAP_SCHEDULER` and, when the peer does too
@@ -2949,7 +2949,7 @@ pub async fn receive_accepted_consent(
 /// `EngineError::Connect(ConnectError::Unauthorized)`, exactly what
 /// `receive_with_addr` returns for an unauthorized accept. Hello version
 /// mismatches fail with the same `PROTOCOL_UNSUPPORTED` peer error
-/// [`receive_on_channel`] produces ([`expect_hello`]).
+/// [`receive_on_channel`] produces (``expect_hello``).
 ///
 /// Wire behavior: our Hello always advertises `CAP_SCHEDULER` (this entry
 /// exists for the scheduler path), so the split is decided purely by the
@@ -3019,7 +3019,7 @@ pub async fn channel_scheduler_handshake(
 /// sender's `TaskOpen` through [`channel_scheduler_handshake`], validated
 /// the pairing relation against its store and obtained its scheduler's
 /// permit — this entry performs the wire half: answer the granted
-/// `Admission` (with the bounded [`ADMISSION_LEASE_MS`] lease), wait for
+/// `Admission` (with the bounded ``ADMISSION_LEASE_MS`` lease), wait for
 /// the sender's `AdmissionAck`, then run the exact frozen receive body of
 /// [`receive_on_channel`] (per-task staging tree keyed by the wire task
 /// id included).

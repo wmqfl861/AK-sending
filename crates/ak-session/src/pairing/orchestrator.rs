@@ -273,7 +273,7 @@ pub struct PairingOrchestrator {
 }
 
 /// Live lookup of one persisted invite code (see
-/// [`PairingOrchestrator::persisted_source`]): `None` = not held (never
+/// `PairingOrchestrator::persisted_source`): `None` = not held (never
 /// created here, expired, or revoked).
 pub type PersistedCodeSource =
     Arc<dyn Fn(&[u8; 16]) -> Option<(InviteCode, u64, u64)> + Send + Sync>;
@@ -301,7 +301,7 @@ impl PairingOrchestrator {
         })
     }
 
-    /// Install the live persisted-code source (see [`Self::persisted_source`]).
+    /// Install the live persisted-code source (see `Self::persisted_source`).
     pub fn set_persisted_code_source(&self, source: PersistedCodeSource) {
         *self.persisted_source.lock().expect("orchestrator lock") = Some(source);
     }
@@ -1037,7 +1037,7 @@ impl PairingOrchestrator {
     /// `lookup_digest` restores full MAC verification. Without a hint the
     /// recovery trusts only local evidence: the re-sent `PairCommit` must
     /// reproduce the record's pinned authenticated-transcript digest (see
-    /// [`PairingOrchestrator::remember_authenticated_transcript`])
+    /// `PairingOrchestrator::remember_authenticated_transcript`)
     /// byte-for-byte. An entry with neither a code hint nor a pin is
     /// refused with an explicit error — the server's self-reported
     /// `Committed`/`Ready` state is never accepted as the only evidence

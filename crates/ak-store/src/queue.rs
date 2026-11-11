@@ -391,7 +391,7 @@ impl TaskQueueStore {
         Ok(task)
     }
 
-    /// Restart view; see [`RecoveryPlan`]. Fail-closed like [`list`].
+    /// Restart view; see [`RecoveryPlan`]. Fail-closed like ``list``.
     pub fn recovery_plan(&self) -> io::Result<RecoveryPlan> {
         let mut plan = RecoveryPlan {
             resume: Vec::new(),

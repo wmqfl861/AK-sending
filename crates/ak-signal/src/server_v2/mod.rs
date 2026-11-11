@@ -10,17 +10,17 @@
 //!
 //! Module layout:
 //!
-//! - [`config`]: listen address, database path, every budget as a constant
+//! - [`crate::server_v2::config`]: listen address, database path, every budget as a constant
 //!   (redeem rate limits, invite quotas, session TTL, …).
-//! - [`framing`]: v2 frame I/O over any tokio stream (rejects v1 frames
+//! - [`crate::server_v2::framing`]: v2 frame I/O over any tokio stream (rejects v1 frames
 //!   before allocation).
-//! - [`ratelimit`]: token bucket + sliding-window counters shared with the
+//! - [`crate::server_v2::ratelimit`]: token bucket + sliding-window counters shared with the
 //!   brute-force defenses.
-//! - [`hello2`]: the frozen signature domains for Hello v2 (TLS-exporter
+//! - [`crate::server_v2::hello2`]: the frozen signature domains for Hello v2 (TLS-exporter
 //!   bound), redeem requests, and Prepared/Applied confirmations. These
 //!   byte layouts are the **client/server contract** — A3's dispatcher
 //!   signs exactly these messages, the server verifies exactly these.
-//! - [`tls`]: rustls 0.23 config pair with the ak-net discipline: a
+//! - [`crate::server_v2::tls`]: rustls 0.23 config pair with the ak-net discipline: a
 //!   self-signed Ed25519 certificate derived from the registry key
 //!   (`RegistryId` == the 32-byte public key), TLS 1.3 only, no webpki
 //!   roots, no hostname check; clients pin the registry key.
@@ -32,7 +32,7 @@
 //!   state machine (`InviteRedeem → PairChallenge → PairProof →
 //!   PairPrepared → PairCommit → PairApplied → PairReady`), the uniform
 //!   `PAIR_UNAVAILABLE` error policy, the anti-brute-force budgets, and
-//!   the [`run_v2`] entry point.
+//!   the `run_v2` entry point.
 //!
 //! Security boundary (unchanged from v1/ADR-001): the server forwards
 //! fixed, bounded, structured control messages only. It never sees file

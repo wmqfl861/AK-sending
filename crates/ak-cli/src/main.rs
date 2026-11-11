@@ -56,18 +56,34 @@ fn build_profile() -> &'static str {
     }
 }
 
+/// Build-time source revision stamped by `crates/ak-cli/build.rs`
+/// (CR-P2-09): the short git sha of the commit being built, suffixed
+/// `-dirty` when the working tree differs from HEAD, or `unknown` when
+/// the binary was built from a source export without git (the build
+/// script degrades instead of failing the build; CI may inject the value
+/// through the same-named environment variable).
+fn build_git_sha() -> &'static str {
+    env!("AK_GIT_SHA")
+}
+
 /// `--version` payload (clap prepends the program name itself): workspace
-/// version, wire protocol version with capability bits, and the compile
-/// profile -- enough for two machines to confirm they run compatible builds
-/// before debugging a transfer.
-fn version_line() -> String {
+/// version, wire protocol version with capability bits, the compile
+/// profile, and the source revision -- enough for two machines to confirm
+/// they run compatible builds before debugging a transfer, and for ops to
+/// pin what the production registry server runs (CR-P2-09).
+fn version_line_with(git_sha: &str) -> String {
     format!(
         "{} (wire v{}, caps 0x{WIRE_CAPS:04x} \
-         [resume|pause-resume|multistream], {} build)",
+         [resume|pause-resume|multistream], {} build, git {git_sha})",
         env!("CARGO_PKG_VERSION"),
         WIRE_VERSION,
         build_profile()
     )
+}
+
+/// The payload with the sha this binary was actually built from.
+fn version_line() -> String {
+    version_line_with(build_git_sha())
 }
 
 /// The same line as a `&'static str` for clap's `long_version`, which only
@@ -83,6 +99,9 @@ fn version_line_static() -> &'static str {
     name = "ak-cli",
     version,
     long_version = version_line_static(),
+    // CR-P2-09: every subcommand answers `--version` with the same payload
+    // (`ak-cli registry-server --version` pins what the server runs).
+    propagate_version = true,
     about = "AK-sending direct-only prototype",
     after_help = "Typical flow:\n  1. ak-cli pair code                 (on the receiving device)\n  2. ak-cli receive --port 7100       (accepts paired peers only)\n  3. ak-cli send <path> [more paths...] --to <ip:7100[,ip2:7100...]> --fp <fingerprint>\n\nFingerprints accept the full 64 hex characters or a unique 8-63 character\nprefix of a peer already in peers.book. Multiple send paths travel in one\njob; each keeps its own top-level name on the receiver (paths with the same\nname must be sent in separate runs). --to accepts comma-separated address\ncandidates (private/LAN addresses are tried first, each with a 3s connect\ntimeout before the next is attempted).\nAll transfers are direct device-to-device; no server ever carries file data."
 )]
@@ -3744,6 +3763,17 @@ async fn registry_server_command(
     bind: Option<BindArg>,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
+    // CR-P2-09 (version observability): the production server must be
+    // identifiable from its own output. Initialize logging (Info default,
+    // `RUST_LOG` overrides) so the engine's own info lines -- including
+    // the `v2 registry server listening` startup line -- reach the
+    // journal/stderr, then LOG the binary identity once at startup; the
+    // same payload answers `ak-cli registry-server --version`.
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .try_init();
+    log::info!("registry-server version: {}", version_line());
     let key_path = id.join("registry.key");
     let (registry, created) = DeviceKeyPair::load_or_create(&key_path)?;
     if created {
@@ -6581,7 +6611,51 @@ mod tests {
         } else {
             "release"
         };
-        assert!(line.ends_with(&format!("{profile} build)")));
+        // CR-P2-09: the source revision is part of the payload, and the
+        // stamped value is whatever build.rs decided (real sha, sha-dirty,
+        // or the hermetic "unknown") -- never empty.
+        assert!(!build_git_sha().is_empty());
+        assert!(line.contains(&format!("{profile} build, git ")));
+        assert!(line.ends_with(&format!("git {})", build_git_sha())));
+    }
+
+    #[test]
+    fn version_line_formats_an_injected_git_sha() {
+        // CR-P2-09: formatting is pure so it can be tested with an
+        // injected sha instead of the real one.
+        let line = version_line_with("abc1234");
+        assert!(line.starts_with(&format!("{} (", env!("CARGO_PKG_VERSION"))));
+        assert!(line.ends_with(", git abc1234)"));
+        // The hermetic fallback (source export without git) stays readable.
+        let unknown = version_line_with("unknown");
+        assert!(unknown.ends_with(", git unknown)"));
+        // A dirty stamp renders verbatim, suffix included.
+        assert!(version_line_with("abc1234-dirty").ends_with(", git abc1234-dirty)"));
+    }
+
+    #[test]
+    fn subcommands_answer_version_with_the_same_payload() {
+        use clap::CommandFactory;
+        // CR-P2-09: `ak-cli registry-server --version` (and every other
+        // subcommand) must answer with the same payload as the top level,
+        // so the ops runbook can pin the running server binary without
+        // remembering which flag position clap accepts.
+        let mut cmd = Cli::command();
+        cmd.build();
+        for name in ["registry-server", "signal-server", "task"] {
+            let sub = cmd
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("{name} subcommand must exist"));
+            let rendered = sub.render_long_version();
+            assert!(
+                rendered.contains(&version_line()),
+                "{name} --version must carry the full payload, got: {rendered}"
+            );
+            assert!(
+                rendered.contains(name),
+                "{name} --version must identify its own subcommand: {rendered}"
+            );
+        }
     }
 
     #[test]

@@ -518,7 +518,9 @@ void main() {
       final prefix = calls.calls.length;
       expect(prefix, greaterThanOrEqualTo(5),
           reason: 'start + the startup pump ran');
-      await tester.pump(const Duration(milliseconds: 200));
+      // CR-P2-05: the idle pump now ticks at 1 s (50 ms only with
+      // activity) — pump past one full idle period to see it live.
+      await tester.pump(const Duration(milliseconds: 1100));
       expect(calls.calls.length, greaterThan(prefix),
           reason: 'G is the production behavior: the periodic poll lives');
       expect(tester.takeException(), isNull);
@@ -536,7 +538,8 @@ void main() {
       expect(find.byKey(const ValueKey('app_startup_error')), findsNothing);
       final prefix = calls.calls.length;
       expect(prefix, greaterThanOrEqualTo(5));
-      await tester.pump(const Duration(milliseconds: 200));
+      // CR-P2-05: idle → the 1 s adaptive cadence; pump past one period.
+      await tester.pump(const Duration(milliseconds: 1100));
       expect(calls.calls.length, greaterThan(prefix));
       expect(tester.takeException(), isNull);
       result.service?.dispose(); // cancels the live pump timer

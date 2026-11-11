@@ -88,6 +88,29 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskRuntimeFfi,
         TaskFfi;
 
+/// CR-P2-05 (review 2026-11-11, item 1): the adaptive EVENT-poll cadence,
+/// in milliseconds, as a PURE function of observable activity — the
+/// decision [SimpleTransferService] re-makes on every activity transition
+/// (see [SimpleTransferService.hasActivity] and
+/// [SimpleTransferService.effectiveEventPollInterval]). Tests pin the two
+/// values directly; until the native-push rework lands, 50 ms while
+/// anything is in flight keeps event latency at the shipped behavior and
+/// 1000 ms idle cuts the resting wake-ups from 20/s to 1/s.
+int eventPollMs({required bool hasActivity}) => hasActivity
+    ? SimpleTransferService.activeEventPollMs
+    : SimpleTransferService.idleEventPollMs;
+
+/// CR-P2-05 (item 1): the adaptive OP-RESULT poll cadence, in
+/// milliseconds — the same pure decision for the `ak_pairing_op_result`
+/// waiters. A pending op is ITSELF activity (the waiters of
+/// [SimpleTransferService.createCode]/[join]/[sendFiles] run while
+/// [SimpleTransferService.hasActivity] is true), so the waiters always
+/// observe the ACTIVE value in practice; the idle value pins the
+/// symmetric decision for tests and any future always-on poller.
+int opPollMs({required bool hasActivity}) => hasActivity
+    ? SimpleTransferService.activeOpPollMs
+    : SimpleTransferService.idleOpPollMs;
+
 /// The role picked when generating a task code.
 enum SimpleTransferRole {
   /// This device will send files after the pairing.
@@ -323,11 +346,22 @@ final class ProgressDrainResult {
 ///   [engineHealth] fans the failure out to the UI the moment it trips,
 ///   and every entry/op ends promptly with the same failure through
 ///   [_ensureLive]'s latch gate.
+/// * CR-P2-05 (review 2026-11-11): the pump is ADAPTIVE — a
+///   self-rescheduling one-shot timer whose cadence
+///   ([effectiveEventPollInterval]) is re-decided by [_syncPump] on every
+///   activity transition: [eventPollInterval] while [hasActivity], the
+///   20x slower [idlePollInterval] when idle, and paused entirely while
+///   the app is backgrounded with nothing in flight
+///   ([setAppBackgrounded]). Activity flips re-arm IMMEDIATELY (a new op
+///   or pairing never waits out a slow tick); the C12 budget/latch rules
+///   above are unchanged in every mode.
 final class SimpleTransferService {
   SimpleTransferService({
     required this.calls,
-    this.eventPollInterval = const Duration(milliseconds: 50),
-    this.opPollInterval = const Duration(milliseconds: 200),
+    this.eventPollInterval =
+        const Duration(milliseconds: activeEventPollMs),
+    this.opPollInterval = const Duration(milliseconds: activeOpPollMs),
+    this.idlePollInterval = const Duration(milliseconds: idleEventPollMs),
     Future<void> Function(Duration)? delay,
   })  : _delay = delay ?? Future<void>.delayed;
 
@@ -341,15 +375,47 @@ final class SimpleTransferService {
   /// [SimpleTransferPhase.engineFailed] and stop the pump.
   static const int pollFailureThreshold = 10;
 
+  /// CR-P2-05: the ACTIVE event-poll cadence (ms) — the constructor
+  /// default of [eventPollInterval] and the `hasActivity: true` value of
+  /// [eventPollMs] (the shipped behavior while tasks run).
+  static const int activeEventPollMs = 50;
+
+  /// CR-P2-05: the IDLE event-poll cadence (ms) — the constructor default
+  /// of [idlePollInterval] and the `hasActivity: false` value of
+  /// [eventPollMs]. 20x slower than [activeEventPollMs]: a resting app
+  /// wakes the engine once per second instead of 20 times.
+  static const int idleEventPollMs = 1000;
+
+  /// CR-P2-05: the ACTIVE op-result poll cadence (ms) — the constructor
+  /// default of [opPollInterval] and the `hasActivity: true` value of
+  /// [opPollMs].
+  static const int activeOpPollMs = 200;
+
+  /// CR-P2-05: the IDLE op-result poll cadence (ms) — the
+  /// `hasActivity: false` value of [opPollMs]. Unreachable by the current
+  /// waiters (a pending op is itself activity); it pins the symmetric
+  /// decision for tests and future always-on pollers.
+  static const int idleOpPollMs = 1000;
+
   /// The task-plane call seam (FFI bindings or fake). Public read-only:
   /// the app shell wires `AkTaskFfiBindings` here; tests inject the fake.
   final AkTaskCalls calls;
 
-  /// How often the event pump polls `ak_pairing_poll_event`.
+  /// How often the event pump polls `ak_pairing_poll_event` — the ACTIVE
+  /// cadence (CR-P2-05: used whenever [hasActivity]; see
+  /// [effectiveEventPollInterval] for the full decision).
   final Duration eventPollInterval;
 
-  /// How often op waiters poll `ak_pairing_op_result`.
+  /// How often op waiters poll `ak_pairing_op_result` (the ACTIVE cadence
+  /// — a pending op is itself activity, so the waiters always run here).
   final Duration opPollInterval;
+
+  /// CR-P2-05: the IDLE event-poll cadence — the slow heartbeat of the
+  /// adaptive pump when nothing is in flight. It is a MINIMUM tick
+  /// distance, never a speed-up: a service configured with a longer
+  /// [eventPollInterval] (tests stretching it to `days:1` to pump
+  /// manually) stays that slow at idle too.
+  final Duration idlePollInterval;
 
   /// Injectable delay (tests drive the loops synchronously with a
   /// zero-delay stand-in).
@@ -367,7 +433,29 @@ final class SimpleTransferService {
   SimpleTransferPhase _phase = SimpleTransferPhase.idle;
   String? _failureReason;
 
+  /// CR-P2-05: the adaptive pump — a SELF-RESCHEDULING one-shot timer
+  /// (never `Timer.periodic`: the cadence is re-decided per tick).
+  /// [_pumpArmedFor] remembers the interval the pending tick was armed
+  /// with, so [_syncPump] can leave an on-cadence tick alone and re-arm
+  /// ONLY on a real cadence change. [_pumpGeneration] is the chain
+  /// identity: a halt (cadence switch / pause / dispose / latch) may land
+  /// AFTER a timer fired but BEFORE its callback ran — `Timer.cancel` is
+  /// too late for that callback, so it must recognize itself as stale and
+  /// do NOTHING (pumping on a dead cadence or nulling [_pump] would
+  /// clobber the newly armed timer's handle and fork a second tick chain).
   Timer? _pump;
+  Duration? _pumpArmedFor;
+  int _pumpGeneration = 0;
+
+  /// CR-P2-05: ops between entry and settle ([createCode]/[join]/
+  /// [sendFiles]) — each one is ACTIVITY (keeps the fast cadence even
+  /// before/after its phase transition lands).
+  int _inFlightOps = 0;
+
+  /// CR-P2-05: the app-lifecycle flag ([setAppBackgrounded]) — true while
+  /// the app is paused/hidden: the pump drops to the idle cadence even
+  /// with activity, and pauses entirely when idle.
+  bool _appBackgrounded = false;
   // The live connection-change fan-out. Per-subscriber SNAPSHOT replay is
   // implemented by [connections] (wave-29 P1-06, wave-30 completed): a
   // broadcast controller's onListen only fires on the 0→1 listener
@@ -468,7 +556,9 @@ final class SimpleTransferService {
     _runtime = runtime;
     _saveDir = saveDir;
     _setPhase(SimpleTransferPhase.idle);
-    _pump ??= Timer.periodic(eventPollInterval, (_) => _pumpOnce());
+    // CR-P2-05: the adaptive pump arms here (idle → the slow cadence) and
+    // re-arms itself on every activity transition (see [_syncPump]).
+    _syncPump();
     // Drain any events that queued before the pump armed, then learn the
     // engine's effective save folder (`<id_dir>/downloads` default).
     _pumpOnce();
@@ -497,8 +587,7 @@ final class SimpleTransferService {
     // (1) waiters / call channels.
     _disposed = true;
     // (2) the pump.
-    _pump?.cancel();
-    _pump = null;
+    _haltPump();
     // (3) streams (listeners get a done event; late pollers throw nothing).
     _connectionsController.close();
     _incomingController.close();
@@ -522,8 +611,9 @@ final class SimpleTransferService {
     Duration timeout = const Duration(seconds: 30),
   }) async {
     final runtime = _runtimeOrThrow();
-    _setPhase(SimpleTransferPhase.creating);
+    _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
     try {
+      _setPhase(SimpleTransferPhase.creating);
       final result = await runtime
           .createCode(AkTaskCreateCodeSpec(
             role: role._wire,
@@ -545,6 +635,8 @@ final class SimpleTransferService {
     } on Object catch (error) {
       _fail(error);
       rethrow;
+    } finally {
+      _endOp();
     }
   }
 
@@ -565,8 +657,9 @@ final class SimpleTransferService {
     Duration timeout = const Duration(seconds: 30),
   }) async {
     final runtime = _runtimeOrThrow();
-    _setPhase(SimpleTransferPhase.joining);
+    _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
     try {
+      _setPhase(SimpleTransferPhase.joining);
       final result = await runtime.join(AkTaskJoinSpec(
         code: code,
         role: role?._wire,
@@ -608,6 +701,8 @@ final class SimpleTransferService {
     } on Object catch (error) {
       _fail(error);
       rethrow;
+    } finally {
+      _endOp();
     }
   }
 
@@ -693,6 +788,7 @@ final class SimpleTransferService {
   }) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
+    _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
     final lastSeen = <String, int>{}; // THIS waiter's cross-poll ledger
     try {
       return await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
@@ -716,6 +812,8 @@ final class SimpleTransferService {
         '发送超时（${timeout.inSeconds} 秒无进展），已取消原生发送任务并断开该连接。',
         timeout,
       );
+    } finally {
+      _endOp();
     }
   }
 
@@ -943,7 +1041,147 @@ final class SimpleTransferService {
 
   bool get isDisposed => _disposed;
 
+  // -- CR-P2-05: adaptive pump cadence -------------------------------------
+
+  /// CR-P2-05: does anything need the FAST event cadence right now? True
+  /// while a pairing or connection is in flight (phase
+  /// `creating`/`joining`/`paired`/`connected` — `paired` includes the
+  /// creator waiting for the peer's join and probes still pending), while
+  /// an op waiter is polling ([createCode]/[join]/[sendFiles] between
+  /// entry and settle), or while any LIVE connection row exists
+  /// (`probing`/`connected`). A row already settled to `unreachable` is
+  /// NOT activity: the probe verdict is final, nothing can arrive for it
+  /// that one slow tick cannot deliver, and treating it as activity would
+  /// pin the pump at 50 ms forever.
+  bool get hasActivity =>
+      _inFlightOps > 0 ||
+      _phase == SimpleTransferPhase.creating ||
+      _phase == SimpleTransferPhase.joining ||
+      _phase == SimpleTransferPhase.paired ||
+      _phase == SimpleTransferPhase.connected ||
+      _connections.values
+          .any((row) => row.state == 'probing' || row.state == 'connected');
+
+  /// CR-P2-05: the cadence the NEXT pump tick is scheduled at — the
+  /// applied form of [eventPollMs] over this service's configuration:
+  /// [eventPollInterval] while in the foreground with [hasActivity],
+  /// else the idle cadence (the slower of [idlePollInterval] and
+  /// [eventPollInterval] — the configured interval is a MINIMUM tick
+  /// distance in every mode). Backgrounded apps ([setAppBackgrounded])
+  /// always drop to the idle cadence, activity or not.
+  Duration get effectiveEventPollInterval =>
+      !_appBackgrounded && hasActivity
+          ? eventPollInterval
+          : _idleEventPollInterval;
+
+  /// CR-P2-05: is a pump tick pending? False while the pump is paused
+  /// ([setAppBackgrounded] with no activity), after [dispose] and after
+  /// the C12 engine latch — the observable lifecycle tests assert on.
+  bool get isEventPumpArmed => _pump != null;
+
+  /// CR-P2-05 (item 2): the app-lifecycle lever, driven by the shell's
+  /// widgets-binding lifecycle observer on `paused`/`hidden` (`true`) and
+  /// `resumed`/`inactive` (`false`).
+  ///
+  /// Backgrounded: the pump drops to the IDLE cadence even while a task
+  /// runs — the data plane lives in the engine (Rust) and the op waiters
+  /// poll independently, so a once-per-second heartbeat keeps events
+  /// (consent offers, disconnects, `done`) visible without 20 wake-ups
+  /// per second behind a hidden window. Backgrounded AND idle: the pump
+  /// pauses entirely (no timer at all) — with no live row and no pairing
+  /// nothing can arrive, so waking a quiet engine is pure battery cost.
+  ///
+  /// Foreground again: the connection/task state refreshes IMMEDIATELY
+  /// (one synchronous drain of everything that queued while hidden),
+  /// then the pump re-arms at the activity-decided cadence.
+  void setAppBackgrounded(bool backgrounded) {
+    if (_disposed || _appBackgrounded == backgrounded) {
+      return;
+    }
+    _appBackgrounded = backgrounded;
+    if (!backgrounded) {
+      _pumpOnce(); // refresh first: drain what queued while hidden
+    }
+    _syncPump();
+  }
+
   // -- internals ----------------------------------------------------------
+
+  /// CR-P2-05: an op waiter entered ([createCode]/[join]/[sendFiles]) —
+  /// count it as activity and re-decide the cadence immediately.
+  void _beginOp() {
+    _inFlightOps++;
+    _syncPump();
+  }
+
+  /// CR-P2-05: an op waiter settled — drop its activity vote and let the
+  /// cadence fall back if this was the last one.
+  void _endOp() {
+    _inFlightOps--;
+    _syncPump();
+  }
+
+  /// CR-P2-05: the idle/background cadence — never FASTER than the
+  /// configured [eventPollInterval] (a test that stretches the active
+  /// interval to pump manually stays inert at idle too).
+  Duration get _idleEventPollInterval => idlePollInterval > eventPollInterval
+      ? idlePollInterval
+      : eventPollInterval;
+
+  /// CR-P2-05: the adaptive pump's (re)arm — the single authority over
+  /// [_pump]. Idempotent per cadence: a pending tick armed at the CURRENT
+  /// [effectiveEventPollInterval] is left alone (activity flapping never
+  /// starves the tick); any cadence CHANGE cancels the pending tick and
+  /// re-arms at the new interval, so activity starts/stops take effect
+  /// IMMEDIATELY instead of waiting out the previous (possibly slow)
+  /// tick. Also the pause point: backgrounded with no activity disarms
+  /// the pump entirely.
+  void _syncPump() {
+    if (_disposed || _engineFailed || _runtime == null) {
+      return;
+    }
+    if (_appBackgrounded && !hasActivity) {
+      _haltPump(); // hidden and quiet: no wake-ups at all
+      return;
+    }
+    final interval = effectiveEventPollInterval;
+    if (_pump != null && _pumpArmedFor == interval) {
+      return; // already armed at this cadence — keep the pending tick
+    }
+    _haltPump();
+    final generation = _pumpGeneration;
+    _pumpArmedFor = interval;
+    _pump = Timer(interval, () => _onPumpTick(generation));
+  }
+
+  /// CR-P2-05: cancel the pending tick (if any), forget its cadence and
+  /// retire its chain — a callback that already fired runs into a stale
+  /// generation and turns into a no-op ([_onPumpTick]).
+  void _haltPump() {
+    _pumpGeneration++;
+    _pump?.cancel();
+    _pump = null;
+    _pumpArmedFor = null;
+  }
+
+  /// CR-P2-05: one fired tick of chain [generation]. Stale fires (their
+  /// chain was halted between the timer firing and the callback running)
+  /// do NOTHING — they must not pump on a retired cadence nor clobber
+  /// the successor chain's [_pump] handle (which would fork concurrent
+  /// tick chains and storm the engine). A valid fire forgets the fired
+  /// timer FIRST (events routed by this tick may flip the cadence and
+  /// arm the next tick mid-tick — forgetting up front keeps exactly ONE
+  /// pending timer per chain), then pumps and lets the trailing
+  /// [_syncPump] re-decide from the post-tick state.
+  void _onPumpTick(int generation) {
+    if (generation != _pumpGeneration) {
+      return; // a halted chain's late fire — the successor owns the pump
+    }
+    _pump = null;
+    _pumpArmedFor = null;
+    _pumpOnce();
+    _syncPump();
+  }
 
   void _ensureLive() {
     if (_disposed) {
@@ -983,6 +1221,9 @@ final class SimpleTransferService {
         next != SimpleTransferPhase.engineFailed) {
       _failureReason = null;
     }
+    // CR-P2-05: a phase change can flip activity — re-decide the pump
+    // cadence NOW (never wait out a slow tick).
+    _syncPump();
   }
 
   void _fail(Object error) {
@@ -1028,8 +1269,7 @@ final class SimpleTransferService {
         : (detail is TimeoutException ? detail.message : detail.toString());
     _failureReason = '传输引擎故障：$what（$reason）。泵已停止，请重启应用恢复。';
     _setPhase(SimpleTransferPhase.engineFailed);
-    _pump?.cancel(); // C12: stop polling a broken engine
-    _pump = null;
+    _haltPump(); // C12: stop polling a broken engine
     if (!_healthController.isClosed) {
       _healthController.add(_currentHealth);
     }
@@ -1092,6 +1332,9 @@ final class SimpleTransferService {
       );
       _notifyConnections();
     }
+    // CR-P2-05: a row appearing/settling can flip activity — re-decide
+    // the cadence (a no-op when it did not).
+    _syncPump();
     if (_connections[connId]?.state == 'connected' &&
         (_phase == SimpleTransferPhase.paired ||
             _phase == SimpleTransferPhase.joining)) {
@@ -1135,6 +1378,9 @@ final class SimpleTransferService {
     if (!_connections.values.any((conn) => _stateRank(conn.state) < 2)) {
       _setPhase(SimpleTransferPhase.idle);
     }
+    // CR-P2-05: the row going terminal can end activity (the last live
+    // connection settled) — drop to the idle cadence NOW.
+    _syncPump();
   }
 
   /// P2-11: fire the expiry stream for every STILL-PENDING request of

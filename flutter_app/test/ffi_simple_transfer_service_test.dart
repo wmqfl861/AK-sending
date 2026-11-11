@@ -565,6 +565,12 @@ void main() {
     );
     senderService.start();
     final code = await senderService.createCode(TaskRole.send);
+    // CR-P2-05: the sender's role in this test ENDS at mint time — its
+    // still-running adaptive pump would keep draining the fake's
+    // ENGINE-WIDE progress queue and phase-lock the joiner's receive
+    // watchdog out of its renewal lines (a test-only artifact of two
+    // services sharing one fake; production is one service per engine).
+    senderService.dispose();
 
     // The device under test JOINS that code as the RECEIVER: this side
     // never minted the code, so no local code-id mapping exists — the

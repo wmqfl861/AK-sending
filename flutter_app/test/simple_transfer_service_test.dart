@@ -1197,6 +1197,10 @@ void main() {
         calls: fake,
         delay: immediate,
         eventPollInterval: const Duration(milliseconds: 50),
+        // CR-P2-05: the service starts IDLE, so pin the idle cadence to
+        // the same 50 ms — this test drives the timer pump, not the
+        // adaptive-cadence behavior (covered by the CR-P2-05 group).
+        idlePollInterval: const Duration(milliseconds: 50),
       );
       await service.start(
           registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/t');
@@ -1356,6 +1360,187 @@ void main() {
         throwsA(isA<StateError>().having(
             (e) => e.message, 'message', contains('传输引擎故障'))),
       );
+      service.dispose();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // CR-P2-05 (review 2026-11-11): adaptive event-poll cadence — idle drops
+  // to 1 s, activity returns to 50 ms IMMEDIATELY (never waiting out the
+  // slow tick), and the app-lifecycle lever slows/pauses the pump.
+  // -------------------------------------------------------------------------
+
+  group('CR-P2-05: adaptive event-poll cadence', () {
+    test('the cadence decision is a pure function of activity', () {
+      expect(eventPollMs(hasActivity: true), 50);
+      expect(eventPollMs(hasActivity: false), 1000);
+      expect(opPollMs(hasActivity: true), 200);
+      expect(opPollMs(hasActivity: false), 1000);
+      // The constructor defaults ARE the pure function's values.
+      final service = SimpleTransferService(calls: FakeAkTaskCalls());
+      expect(service.eventPollInterval,
+          Duration(milliseconds: eventPollMs(hasActivity: true)));
+      expect(service.opPollInterval,
+          Duration(milliseconds: opPollMs(hasActivity: true)));
+      expect(service.idlePollInterval,
+          Duration(milliseconds: eventPollMs(hasActivity: false)));
+      service.dispose();
+    });
+
+    test('a stretched active interval stays inert at idle (manual-pump '
+        'tests keep their contract)', () {
+      final service = SimpleTransferService(
+        calls: FakeAkTaskCalls(),
+        eventPollInterval: const Duration(days: 1),
+      );
+      expect(service.effectiveEventPollInterval, const Duration(days: 1),
+          reason: '空闲节奏不得快于配置的活动间隔（days:1 测试语义不变）');
+      service.dispose();
+    });
+
+    testWidgets('idle polls at 1 s; activity flips to 50 ms immediately; '
+        'everything quiet drops back immediately', (tester) async {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(calls: fake, delay: immediate);
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/cr2p5');
+      final pollsAtStart =
+          fake.pollEventCallCount; // start()'s own synchronous drain
+
+      // IDLE: the 1 s cadence — 500 ms of virtual time must NOT tick.
+      expect(service.hasActivity, isFalse);
+      expect(service.effectiveEventPollInterval, const Duration(seconds: 1));
+      expect(service.isEventPumpArmed, isTrue);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(fake.pollEventCallCount, pollsAtStart,
+          reason: '空闲 1s 节奏：500ms 内零轮询');
+
+      // IMMEDIATE-UP: an op entering flips the cadence NOW — the pending
+      // 1 s tick is abandoned, not waited out.
+      final codeFuture = service.createCode(SimpleTransferRole.sender);
+      expect(service.hasActivity, isTrue, reason: '进行中的操作本身就是活动');
+      expect(service.effectiveEventPollInterval,
+          const Duration(milliseconds: 50),
+          reason: '活动开始立即切快（不等慢拍）');
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(fake.pollEventCallCount, greaterThan(pollsAtStart),
+          reason: '快节奏已生效：150ms 内已有 tick');
+      final created = await codeFuture;
+      expect(service.hasActivity, isTrue,
+          reason: 'paired（等待对端加入）仍是活动');
+
+      // A live connection keeps the fast cadence…
+      final joined = await service.join(created.code);
+      service.pumpEvents(); // the probe flips the row to connected
+      expect(service.currentConnections.first.state, 'connected');
+      expect(service.effectiveEventPollInterval,
+          const Duration(milliseconds: 50));
+
+      // …and everything going quiet drops back IMMEDIATELY.
+      await service.disconnect(joined.connId);
+      service.pumpEvents(); // fold the disconnected event
+      expect(service.hasActivity, isFalse);
+      expect(service.effectiveEventPollInterval, const Duration(seconds: 1),
+          reason: '一切安静后立即降回慢节奏');
+      final pollsAtQuiet = fake.pollEventCallCount;
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(fake.pollEventCallCount, pollsAtQuiet,
+          reason: '降回后 500ms 内零 tick（旧快拍已被替换，而非等它到期）');
+      service.dispose();
+    });
+
+    testWidgets('backgrounded + idle: the pump pauses entirely; resume '
+        'refreshes immediately and re-arms', (tester) async {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(calls: fake, delay: immediate);
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/cr2p5b');
+      service.setAppBackgrounded(true);
+      expect(service.isEventPumpArmed, isFalse,
+          reason: '后台且无任务：泵完全暂停（零唤醒）');
+      final pollsAtPause = fake.pollEventCallCount;
+      await tester.pump(const Duration(seconds: 5));
+      expect(fake.pollEventCallCount, pollsAtPause, reason: '暂停期间零轮询');
+
+      // An event that queued while hidden stays queued…
+      final runtimeId = fake.runtimes.keys.first;
+      fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+        'event': 'runtime_ready',
+        'runtime': runtimeId,
+      });
+      await tester.pump(const Duration(seconds: 5));
+      expect(fake.runtimes[runtimeId]!.events, hasLength(1),
+          reason: '暂停期间不得 drain 隐藏期事件');
+
+      // …and is drained the MOMENT the app foregrounds.
+      service.setAppBackgrounded(false);
+      expect(fake.runtimes[runtimeId]!.events, isEmpty,
+          reason: '回前台立即刷新：排空隐藏期间排队的事件');
+      expect(fake.pollEventCallCount, greaterThan(pollsAtPause));
+      expect(service.isEventPumpArmed, isTrue);
+      expect(service.effectiveEventPollInterval, const Duration(seconds: 1),
+          reason: '空闲前台：恢复正常空闲节奏');
+      service.dispose();
+    });
+
+    testWidgets('backgrounded + active: a 1 s heartbeat survives; resume '
+        'restores 50 ms immediately', (tester) async {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(calls: fake, delay: immediate);
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/cr2p5c');
+      final created = await service.createCode(SimpleTransferRole.receiver);
+      expect(created.code.startsWith('AKI1-'), isTrue);
+      expect(service.effectiveEventPollInterval,
+          const Duration(milliseconds: 50));
+
+      service.setAppBackgrounded(true);
+      expect(service.effectiveEventPollInterval, const Duration(seconds: 1),
+          reason: '后台降频（仍有任务：保留 1s 心跳）');
+      expect(service.isEventPumpArmed, isTrue, reason: '有活动任务时不完全暂停');
+      final pollsAtHidden = fake.pollEventCallCount;
+      await tester.pump(const Duration(milliseconds: 900));
+      expect(fake.pollEventCallCount, pollsAtHidden,
+          reason: '1s 节奏：900ms 内零 tick');
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(fake.pollEventCallCount, greaterThan(pollsAtHidden),
+          reason: '1s 心跳仍在跳');
+      service.setAppBackgrounded(false);
+      expect(service.effectiveEventPollInterval,
+          const Duration(milliseconds: 50),
+          reason: '回前台立即恢复快节奏');
+      service.dispose();
+    });
+
+    // Real timers (not the fake clock — the interleave needs a timer that
+    // FIRED while its callback was still queued): every halt of a fired
+    // tick must retire its chain, never fork a second one. A mishandled
+    // late callback would clobber the successor's handle, duplicate the
+    // chain and storm the engine with ticks.
+    test('halting a fired-but-unrun tick never forks a second chain '
+        '(bounded steady-state rate)', () async {
+      final fake = FakeAkTaskCalls();
+      final service = SimpleTransferService(calls: fake, delay: immediate);
+      service.start(
+          registry: '127.0.0.1:7200', registryIdHex: regId, idDir: 'C:/ak/cr2p5d');
+      await service.createCode(SimpleTransferRole.receiver);
+      expect(service.hasActivity, isTrue); // paired — stable fast cadence
+
+      // Flap the background lever while ticks fire: every flip halts and
+      // re-arms the chain, sometimes AFTER a timer fired but BEFORE its
+      // callback ran — the exact raced interleave.
+      for (var i = 0; i < 30; i++) {
+        service.setAppBackgrounded(i.isEven);
+        await Future<void>.delayed(const Duration(milliseconds: 7));
+      }
+      service.setAppBackgrounded(false);
+
+      final before = fake.pollEventCallCount;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      final ticks = fake.pollEventCallCount - before;
+      expect(ticks, lessThanOrEqualTo(15),
+          reason: '500ms 稳态窗口内 tick 数受 50ms 节奏约束（10 拍＋粒度余量）；'
+              '双链风暴会数倍超标');
       service.dispose();
     });
   });

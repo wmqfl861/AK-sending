@@ -19,6 +19,10 @@ import 'dart:async' show unawaited;
 
 import 'package:flutter/material.dart';
 
+import '../services/ffi_simple_transfer_service.dart'
+    show FfiSimpleTransferService;
+import '../services/transfer_lifecycle_observer.dart'
+    show TransferServiceLifecycleObserver;
 import 'pages/home_page.dart';
 import 'pages/settings_page.dart';
 import 'service/file_pick_gateway.dart';
@@ -95,9 +99,24 @@ class _AppShellState extends State<AppShell> {
   /// visible engine-error card together with [AppShell.startupError].
   String? _startError;
 
+  /// CR-P2-05 (item 2): paces the engine service's event pump by the app
+  /// lifecycle (backgrounded → slow/paused, foreground → refresh + active
+  /// cadence). Null when the service is not the Ffi adapter (dev fake,
+  /// test doubles) — the frozen UI contract carries no lifecycle knob.
+  TransferServiceLifecycleObserver? _lifecycleObserver;
+
   @override
   void initState() {
     super.initState();
+    final engineService = switch (widget.service) {
+      FfiSimpleTransferService ffi => ffi.engine,
+      _ => null,
+    };
+    if (engineService != null) {
+      _lifecycleObserver =
+          TransferServiceLifecycleObserver(service: engineService);
+      WidgetsBinding.instance.addObserver(_lifecycleObserver!);
+    }
     // One-shot service init (listeners, identity, task runtime). A
     // failure (missing registry config, engine start error…) must be
     // VISIBLE, not swallowed: latch it for the error card (P1-01).
@@ -107,6 +126,15 @@ class _AppShellState extends State<AppShell> {
       }
     }));
     _restoreSaveDir();
+  }
+
+  @override
+  void dispose() {
+    final observer = _lifecycleObserver;
+    if (observer != null) {
+      WidgetsBinding.instance.removeObserver(observer);
+    }
+    super.dispose();
   }
 
   /// Re-applies the persisted default save folder to the service so

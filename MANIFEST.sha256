@@ -1,3 +1,5 @@
+# 已失效（2026-11-11 注，审核 CR-P2-07 改法 3）：对当前工作树 297 条中 131 条哈希不符、68 个受跟踪文件不在清单内；无任何脚本或 CI 校验本文件，它不构成任何完整性证据。
+# 是否删除待所有者决定（docs/REVIEW_2026-11-11.zh-CN.md 第 8 节 E4）。除本头注外内容未改动。
 aaeb3a08bbd46731307ed053874c7c1a8d1b92fd132352bdd551dcd3d84a3804 *.gitattributes
 8186055989af7440fc1ef2ec0fa4e8ce551bbc306349b7647e6404216c52a9f4 *.github/workflows/ci.yml
 0e4b00b7da2f259453a842bdd86e7166788ab34d50731062ea3564da3660b481 *.gitignore

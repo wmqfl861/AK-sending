@@ -6,32 +6,13 @@
 
 **v1 极简交互（wave-28 起，提交 `7458e9f`）**：一台设备生成一个随机任务码，另一台输入该码，即完成一次配对——**一个码＝一次传输任务、恰好双方、任一侧可发起**；码按需生成、自带创建方连接设置、断开即失效；接收方对每个入站请求**逐一同意**后才落盘。全程**零配置、零 IP、零端口、零指纹**：GUI 只剩"连接＋设置"两页，唯一的设置项是默认保存文件夹。
 
-目标仓库：`wmqfl861/AK-sending`。本包是 v0.1 项目初始化材料，不是五端可用软件。
+目标仓库：`wmqfl861/AK-sending`。
 
-## 当前真实状态
+## 当前状态
 
-- 已整理：需求、修订蓝图、ADR-001/ADR-002、协议草案、平台与存储方案、开发路线、验收规范和交接说明。
-- 2026-11-02：完成 [方案评审](docs/REVIEW_2026-11-02.zh-CN.md)；按所有者"继续本地开发"指示采纳其 D1/D5/D6 路线，见 [ADR-002](docs/adr/002-protocol-stack-and-order.zh-CN.md)。
-- 2026-11-02（第二阶段，分支 `dev/local-parallel`，未推送）：完成局域网 CLI 原型全栈——10 个 crate 并行开发 + 集成：
-  - 真实 QUIC 直连通道（quinn + rustls/ring，自签 Ed25519 证书双向钉扎，无任何 relay 路径）；
-  - 端到端文件协议引擎（Hello/Offer/Accept/ManifestPage/Chunk/ChunkAck/ResumeRequest/Finalize/FinalAck，确定性任务 ID，窗口化确认，检查点续传，完成标记严格晚于校验与落盘）；
-  - 协调面信令服务器/客户端 + 最小 STUN（封闭消息集、限频、会话 TTL，无文件路由，测试锁定）；
-  - 命令行（keygen/receive/send/discover/signal-server/probe，公网直连探测工具）。
-- 已实际执行并通过：workspace 242 项 Rust 测试、clippy `-D warnings`、仓库检查与 12 项 Python 测试；5 GiB 稀疏文件 release 环回传输（74 秒，u64 偏移）；真实双进程 CLI 环回传输逐字节一致。证据见 [开发验证记录](reports/dev-validation-2026-11-02.txt)。
-- 2026-11-03（第四轮，同分支）：ResumeRequest 多帧分页解除单任务条目上限（65,537 文件 release 实测）、SQLite 检查点可选后端（特性 sqlite，默认依赖图零泄漏）、连接统计 API（tx/rx 字节/帧数/丢包，无中继运行时旁证）、T06 身份替换与 T08 端口变更重钉扎续传场景自动化。第四轮后 workspace 338 项测试通过（含 sqlite 特性 +23）、clippy 双配置全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第四轮节。
-- 2026-11-03（第五轮，同分支）：DirectPolicy 策略闸门接入真实通道（`--no-internet`，非本地路径零字节进入协议）、`ak-cli doctor` 环境自检、发送端 14 错误码友好映射、块尺寸扫描基准（64KiB 最差 -23%）。第五轮后 workspace 364 项测试通过。
-- 2026-11-03（第六至八轮，同分支）：并发接收（`serve_concurrently` + `receive --jobs N`）、IPv6 双栈端点与 `probe --dual-stack`、长文件名 part 短名回退（NTFS 255 上限真实缺陷修复）、`probe --json` 与 `pair export`/`import`（AKPAIR1，无私钥）、信令对抗加固（TCP 模糊/STUN 洪泛/限频旁路全存活，Hello 设备名控制字符注入修复）、产品全流程 e2e 四幕（配对准入/中断续传/并发接收/信令关停后直传照常）、CLI `completions`/`jobs status`/`--bind`/`--stun-bind`。第八轮后 workspace 417 项测试通过（＋sqlite 特性 26）、clippy 全绿；逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第六/七、八轮节。
-- 2026-11-04（第十三轮，安卓移植波，同分支；承接第十至十二轮 ak-ffi/Dart 绑定/Flutter Windows 桌面端）：双 ABI 交叉编译脚本（llvm-nm 符号验证）＋flutter_app 安卓平台（INTERNET 权限/minSdk 24/tier-0 so 加载/身份目录异步/Download 输出链），flutter test 66/66；APK 构建成功（161MB debug、双 ABI so 在包内，装机待验）；Windows GUI 首启截图核验通过；AVD 装机与跨设备传输进行中（系统镜像重装中）。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 第十三轮节。
-- 2026-11-04（第十八至二十一波，同分支，邀请码配对）：ADR-004＋五份契约冻结（157 项与 Codex 计划逐字核对）→控制协议 v2（TLS 1.3、30 消息、独立端口 7200 不降级明文）→权威注册服务（rustls＋SQLite，ghost-pending 反枚举）→共享调度层 `ak-session`（两维并发/常驻 runtime/配对编排）→wire 任务准入＋staging→引擎 on-channel 拆分→CLI `invite`/`registry-server`；13 项真 TLS＋SQLite 配对 e2e，workspace 851 项测试通过；FFI/Dart 侧接线属后续波。逐项见 [实施清单](docs/BACKLOG.zh-CN.md) 邀请码配对节与 [ADR-004](docs/adr/004-invite-pairing.zh-CN.md)。
-- 2026-11-06（第二十八波，提交 `7458e9f`，v1 极简配对 UX）：用户冻结 v1 规格——一次性任务码（600s TTL、单次兑换）、endpoint 交换、接收同意、GUI 收敛为"连接＋设置"两页（零 IP/端口/指纹）。五层交付：协议/服务器（帧层 endpoint 扩展＋SQLite v1→v2 迁移）、会话/引擎（TaskPairing 生命周期＋TransferConsent）、FFI（`ak_task_*` 8 导出）、Dart（SimpleTransferService 桥）、UI（生码/输码/连接列表/详情页/入站横幅）。验证：workspace 1085/0＋clippy 干净＋契约 5/5；dart 128/128、flutter 86/86；升级后 v2 服务器跨设备向后兼容 6/6（W→L 4.3s、L→W 19.4s，SHA256 一致）。
-- 2026-11-06/07（第二十九至三十一波，已收口）：wave-28 终审 21 项（`reports/codex-review-2026-11-06-wave28.md`，P1×6/P2×15）经三轮修复全部关闭（`77d9559` wave-29、`5dade17` wave-30、`df7d4ee` wave-31），第三轮复核（`reports/codex-recheck3-2026-11-07-wave31.md`）总结论**通过**。收口验证：workspace 1123/0＋clippy 干净＋契约 5/5；dart 139/139、flutter 133/133；真机 E2E Windows 4/4、Android 模拟器 4P/2S/0F；跨设备向后兼容 6/6。
-- 2026-11-07（第三十二波，提交 `0cf1382`）：v1 一次性任务码模型接入 CLI（`ak-cli task code-send/code-recv/join-send/join-recv`，走 ak-session/ak-engine 公开 API，不依赖 ak-ffi）——v1 任务码不再是 GUI-only，Linux 的"GUI"即终端。
-- 2026-11-07（第三十三波，提交 `3eb931f`＋`bcf5de0`）：Codex crash-analysis C01–C14 全部 14 项关闭（`3eb931f` 关 C01-C06/C08-C11/C13/C14，`bcf5de0` 补关 C07 绑定租约＋C12 泵预算/故障闩）＋E4 分段诊断宿主；Windows GUI 启动崩溃修复。
-- 2026-11-09（第三十四波，提交 `8e5ba7e`）：RATE_LIMITED 友好文案＋claim 限额 6→**30 次/小时**（30/时限的是 claim 登记侧；redeem 是另一组预算：每连接 10 次/分钟＋全局 60 次/分钟，见 [SECURITY](docs/SECURITY.zh-CN.md)）。
-- 2026-11-09（第三十五波，提交 `e7fc1e0`＋`37a57c0`）：任务面 registry keeper——共享 registry 控制连接上 20 秒保活 ping＋Disconnected 自动重连（配对订阅跨重连保留），修复空闲 30 秒后 "unknown task code"；保活间隔必须落在服务器 30 秒 FRAME_IO_DEADLINE 静默断连预算之内。Android jniLibs `.so` 随 keeper 刷新（`37a57c0`）。
-- 2026-11-09（第三十六波，进行中，工作树未提交）：全项目终审（`reports/codex-full-review-2026-11-09.md`，13 项：P1×5/P2×8，基线 `37a57c0`）修复轮。
-- 跨设备实测（2026-11-05）：Windows↔Linux 跨公网邀请码配对双向传输已验证（`scripts/cross_device_test.sh`，部署服务器 122.51.121.24，双向 8 MiB SHA256 一致）；Android 模拟器↔Windows 宿主亦通。仍未完成（如实标注）：家宽/热点物理双机 NAT 穿透成功率、抓包级无中继证明（L3）、Linux Flutter GUI 构建、移动原生适配（mDNS/SAF 实机/后台）、真机验收。
-- 历史初始化记录见 [上传验收记录](reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)、[Rust 验证记录](reports/rust-validation-2026-11-02.txt) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
+**唯一来源：[docs/STATUS.zh-CN.md](docs/STATUS.zh-CN.md)**（2026-11-11）——审核修复阶段与批次进度、生产服务器形态、客户端交付状态、最新 CI 验证与已知边界。本 README 不再复述波次细节与逐轮验证计数。
+
+历史：里程碑见 [CHANGELOG](CHANGELOG.md)；逐轮任务与证据见 [实施清单](docs/BACKLOG.zh-CN.md)、[验证记录与审核报告](reports/) 和 [交接说明](docs/HANDOFF.zh-CN.md)。
 
 ## 产品原则
 
@@ -59,7 +40,8 @@
 | [安全模型](docs/SECURITY.zh-CN.md) | 配对、威胁模型与无中继证据 |
 | [验收计划](docs/TEST_PLAN.zh-CN.md) | 真机/网络/大文件/无中继测试 |
 | [技术选型](docs/TECH_SELECTION.zh-CN.md) | 候选方案和必须验证的风险 |
-| [交接说明](docs/HANDOFF.zh-CN.md) | 当前状态和下一执行节点 |
+| [项目状态](docs/STATUS.zh-CN.md) | 当前状态唯一来源（阶段/服务器/交付/CI） |
+| [交接说明](docs/HANDOFF.zh-CN.md) | 逐波交接记录与重启恢复手册 |
 | [方案评审 2026-11-02](docs/REVIEW_2026-11-02.zh-CN.md) | 对 v0.1 方案的评审意见与待确认决策 |
 
 ## 本地检查
@@ -81,11 +63,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 3. **收发**：配对成功后连接出现在列表中，进入详情用系统文件选择器挑文件或文件夹发送；接收方对每个入站请求先看到横幅，**点"接受"后才开始落盘**（拒绝则零写入）；
 4. **设置**：仅一项——默认保存文件夹。
 
-**注意（如实标注）**：v1 任务码模型目前**只接 GUI**（FFI `ak_task_*` → Dart → Flutter），`ak-cli` 未接任务码命令——CLI 仍走下述高级用法中的旧邀请码/配对簿模型。wave-29（进行中）正在收口终审发现（详见 [CHANGELOG](CHANGELOG.md) 第二十九波条目）。
+**两条产品路径（如实标注）**：v1 一次性任务码模型为 GUI 与 CLI 双入口——GUI 走 `ak_task_*` FFI（→Dart→Flutter），CLI 走 `ak-cli task` 命令族（第三十二波 `0cf1382` 起，不依赖 ak-ffi，Linux 的"GUI"即终端）；下述高级用法中的旧邀请码/配对簿多码模型保留为 CLI 高级能力，与 v1 并存。
 
 ## 高级 CLI 用法（旧邀请码/配对簿多码模型与运维工具）
 
-以下命令行能力全部保留，适用于自动化、服务器运维与高级场景；其中 `invite`/`daemon --pairing` 属旧"多码调度"模型（与 v1 一次性任务码并存的两条产品路径，CLI 侧未提供 v1 任务码入口）：
+以下命令行能力全部保留，适用于自动化、服务器运维与高级场景；其中 `invite`/`daemon --pairing` 属旧"多码调度"模型，与 v1 一次性任务码并存为两条产品路径（v1 的 CLI 入口是 `ak-cli task` 命令族，见上一节）：
 
 ```sh
 cargo run -p ak-cli -- keygen            # 生成本机密钥并显示 device id/指纹/配对码（fingerprint 子命令同输出）

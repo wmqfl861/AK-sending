@@ -863,9 +863,20 @@ impl DaemonChain {
     /// Launch one real `ak-cli send` from redeemer `index` to the owner
     /// (the redeemer's identity directory carries its Ready relation, so
     /// the send requests scheduler admission). Runs concurrently when
-    /// spawned on threads by the caller.
+    /// spawned on threads by the caller. `file_tag` names the source file:
+    /// concurrent sends from the SAME redeemer must pass distinct tags —
+    /// two threads rewriting one `matrix-src-N.bin` (truncate + rewrite)
+    /// race the running sender's chunk reads into
+    /// `Error: source changed during transfer` (observed on CI and loaded
+    /// hosts; the send CLI legitimately refuses a mid-transfer mutation).
     fn send_from(&self, index: usize, bytes: usize) -> RunOutcome {
-        let src = self.tmp.path().join(format!("matrix-src-{index}.bin"));
+        self.send_from_file(index, index, bytes)
+    }
+
+    /// `send_from` with an explicit source-file tag (redeemer index and
+    /// file tag are independent: `dual_policy` sends twice from redeemer 0).
+    fn send_from_file(&self, index: usize, file_tag: usize, bytes: usize) -> RunOutcome {
+        let src = self.tmp.path().join(format!("matrix-src-{file_tag}.bin"));
         std::fs::write(&src, payload(bytes)).expect("write matrix source");
         let id_dir = self.redeemer_dirs[index].clone();
         let to = format!("127.0.0.1:{}", self.owner_port);
@@ -1018,9 +1029,11 @@ async fn dual_policy_intersection_serializes_same_code_sends() {
         std::thread::spawn(move || {
             // Give the first send a moment to reach admission first; the
             // assertion is about the receiver serializing them, not about
-            // winning a connect race.
+            // winning a connect race. Distinct file tag: same redeemer,
+            // but rewriting the first send's source mid-transfer would
+            // (correctly) trip the sender's source-mutation check.
             std::thread::sleep(Duration::from_millis(300));
-            chain.send_from(0, 2 * 1024 * 1024)
+            chain.send_from_file(0, 1, 2 * 1024 * 1024)
         })
     };
     for (label, outcome) in [("send-1", first), ("send-2", second)] {

@@ -1156,10 +1156,19 @@ async fn per_connection_redeem_budget_is_enforced_immediately() {
 }
 
 #[tokio::test]
-async fn global_redeem_budget_is_enforced_across_connections() {
+async fn per_source_redeem_budget_is_enforced_across_connections() {
     let server = TestServer::spawn_memory().await;
-    // 7 connections x 9 attempts = 63 attempts against a global budget of
-    // 60 per minute: exactly the last 3 are RATE_LIMITED.
+    // 7 connections x 9 attempts = 63 attempts from the ONE loopback
+    // source, every connection its own identity (CR-P1-03): the shared
+    // redeem layer that spans connections is now the per-source window —
+    // exactly 30/min are admitted, the 33 beyond are RATE_LIMITED, while
+    // every per-connection (9 < 10) and per-identity (9 < 30) window
+    // still has room, proving the source layer is what fired. (This
+    // replaces the old `global_redeem_budget_is_enforced_across_connections`
+    // assertion of a flat 60/min global window — a budget ONE source
+    // could exhaust, denying every other source's redeems. The 600/min
+    // server-wide breaker that replaces it is deliberately out of
+    // practical test reach: tripping it takes ~20 fully-spent sources.)
     let mut clients = Vec::new();
     for _ in 0..7 {
         clients.push(Client::connect(&server, DeviceKeyPair::generate(), "g").await);
@@ -1184,8 +1193,11 @@ async fn global_redeem_budget_is_enforced_across_connections() {
             }
         }
     }
-    assert_eq!(pending, 60, "global budget admits exactly 60 per minute");
-    assert_eq!(limited, 3);
+    assert_eq!(
+        pending, 30,
+        "the per-source budget admits exactly 30 per minute across connections"
+    );
+    assert_eq!(limited, 33);
     server.stop().await;
 }
 

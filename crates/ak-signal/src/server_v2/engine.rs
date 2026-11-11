@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -48,7 +48,8 @@ use crate::protocol_v2::{
     REDEEM_EXHAUSTED, REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
 };
 use crate::server_v2::config::{
-    Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SWEEP_INTERVAL,
+    Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SOURCE_TABLE_IDLE_TTL,
+    SOURCE_TABLE_MAX_ENTRIES, SWEEP_INTERVAL,
 };
 use crate::server_v2::framing::{read_frame, write_frame, write_message};
 use crate::server_v2::ratelimit::{SlidingWindow, TokenBucket};
@@ -70,16 +71,27 @@ pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 
 type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
 
-// ---- resource bounds (P1-5) ---------------------------------------------------
+// ---- resource bounds (P1-5, CR-P1-03) ------------------------------------------
 //
 // Every number here is a hard bound on one dimension of connection
 // sprawl: a peer that opens sockets and never speaks, one that handshakes
 // and never says Hello, one that floods frames, and one that stalls a
 // read or write mid-frame each lose their task within the matching
 // budget instead of pinning memory and a Tokio task forever.
+//
+// CR-P1-03 adds the per-source dimension (IPv4 /32, IPv6 /64, the
+// constants and their rationale live in [`crate::server_v2::config`]):
+// one source can no longer occupy a globally meaningful share of these
+// budgets, so a single machine can neither pin the serving cap with
+// connect-only sockets nor drain the redeem budgets with self-generated
+// identities.
 
-/// Budget for one TLS handshake after the TCP accept.
-const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for one TLS handshake after the TCP accept. 10 s (CR-P1-03,
+/// shortened from 30 s): a connect-only socket now parks here at most
+/// 10 s per per-source handshaking slot, and 10 s is still orders of
+/// magnitude above a loopback/LAN TLS 1.3 handshake (milliseconds) —
+/// anything slower is hostile or broken, not slow.
+const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum simultaneously served TLS connections (accepted-and-counted,
 /// including handshakes in progress). Beyond it a connection may still
 /// complete the handshake and receive one `ServerError`, but those
@@ -172,23 +184,50 @@ pub async fn serve_v2(
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
-                    // Reserve a live-connection slot at accept time: the
-                    // cap must also bound half-open handshakes. The slot
-                    // is released by the task's RAII guard on EVERY exit
-                    // path (R36-P1-03): failed or timed-out TLS
-                    // handshake, ALPN mismatch, over-cap rejection,
-                    // cancellation (abort drops the future, running
-                    // `Drop`) and the normal connection-loop return.
-                    let admitted = shared
-                        .conn_count
-                        .fetch_add(1, Ordering::SeqCst)
-                        < MAX_LIVE_CONNECTIONS;
+                    // CR-P1-03: per-source admission FIRST, and it is the
+                    // cheapest rejection in the whole pipeline — the
+                    // check-and-reserve of both source counters happens
+                    // under one lock, and a source over either cap
+                    // (concurrent connections / handshakes in progress)
+                    // loses its socket right here: no task is spawned, no
+                    // handshake work is ever started for it. A
+                    // connect-only flood therefore parks at most
+                    // `MAX_HANDSHAKING_PER_SOURCE` accepts per source and
+                    // can never occupy a globally meaningful share of
+                    // MAX_LIVE_CONNECTIONS.
+                    let source = source_key(peer.ip());
+                    let source_admitted = {
+                        let mut inner = shared.lock();
+                        inner.source_admit(&shared.limits, source, Instant::now())
+                    };
+                    let admitted = if !source_admitted {
+                        log::warn!(
+                            "v2 per-source connection caps ({} concurrent, {} handshaking) \
+                             reached; dropping {peer}",
+                            shared.limits.max_conns_per_source,
+                            shared.limits.max_handshaking_per_source,
+                        );
+                        false
+                    } else {
+                        // Reserve a live-connection slot at accept time: the
+                        // cap must also bound half-open handshakes. The slot
+                        // is released by the task's RAII guard on EVERY exit
+                        // path (R36-P1-03): failed or timed-out TLS
+                        // handshake, ALPN mismatch, over-cap rejection,
+                        // cancellation (abort drops the future, running
+                        // `Drop`) and the normal connection-loop return.
+                        shared
+                            .conn_count
+                            .fetch_add(1, Ordering::SeqCst)
+                            < MAX_LIVE_CONNECTIONS
+                    };
                     if admitted {
                         let task_id = alloc_conn_task_id(&shared);
                         let conn_shared = Arc::clone(&shared);
-                        let slot = ConnSlotGuard::admitted(Arc::clone(&conn_shared), task_id);
+                        let slot =
+                            ConnSlotGuard::admitted(Arc::clone(&conn_shared), task_id, source);
                         let task = tokio::spawn(async move {
-                            let _slot = slot;
+                            let mut slot = slot;
                             // P1-5: the TLS handshake itself is bounded.
                             let stream = match tokio::time::timeout(
                                 TLS_ACCEPT_TIMEOUT,
@@ -209,6 +248,14 @@ pub async fn serve_v2(
                                     return;
                                 }
                             };
+                            // CR-P1-03: the handshake phase is over — this
+                            // connection's per-source handshaking slot goes
+                            // back immediately; the per-source live slot and
+                            // the global counters live until the task exits
+                            // (guard `Drop`). Failure paths above skip this
+                            // call; `Drop` then releases the handshaking
+                            // slot exactly once itself.
+                            slot.handshake_done();
                             if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
                                 log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
                                 return;
@@ -216,7 +263,15 @@ pub async fn serve_v2(
                             connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
                         });
                         register_conn_task(&shared, task_id, task);
-                    } else {
+                    } else if source_admitted {
+                        // Past the global cap but within the source caps:
+                        // give the just-reserved per-source slots back (the
+                        // polite rejection below deliberately holds NO
+                        // source slots — it is bounded globally by
+                        // MAX_REJECT_TASKS and carrying source counters in
+                        // a task that may outlive the source's own budget
+                        // accounting would only couple the two mechanisms).
+                        shared.lock().source_release(source, true, Instant::now());
                         shared.conn_count.fetch_sub(1, Ordering::SeqCst);
                         // Over the global cap. The polite rejection (one
                         // bounded ServerError) still needs a full TLS
@@ -349,7 +404,130 @@ struct Inner {
     conn_tasks: HashMap<u64, JoinHandle<()>>,
     next_conn_task_id: u64,
     hello_replay: HelloReplayCache,
+    /// CR-P1-03: per-source connection counters AND the per-source
+    /// redeem window in one entry (keyed by [`source_key`]), so a
+    /// source's redeem budget survives reconnects — a flooder that
+    /// cycles TCP connections keeps its history. Pruned by the sweeper
+    /// only after [`SOURCE_TABLE_IDLE_TTL`] with zero counters; bounded
+    /// by [`SOURCE_TABLE_MAX_ENTRIES`] via [`make_room`].
+    sources: HashMap<IpAddr, SourceEntry>,
+    /// CR-P1-03: per-identity redeem windows (keyed by the
+    /// Hello-authenticated device key), likewise shared across
+    /// reconnects and TTL/bounded-pruned.
+    identity_redeem: HashMap<DeviceId, IdentityRedeemEntry>,
+    /// The server-wide redeem circuit breaker (CR-P1-03; see
+    /// [`crate::server_v2::config::REDEEM_GLOBAL_BREAKER_PER_MIN`] for
+    /// why it is deliberately very high).
     global_redeem: Option<SlidingWindow>,
+}
+
+/// Per-source accounting (CR-P1-03): connection counters reserved at
+/// accept and released by the owning task's [`ConnSlotGuard`] (the same
+/// every-exit-path RAII discipline as the global counters), plus the
+/// source's shared redeem window.
+struct SourceEntry {
+    /// Connections this source currently holds against
+    /// `Limits::max_conns_per_source` (admitted at accept, live until
+    /// the task exits).
+    live: usize,
+    /// The subset still between TCP accept and the finished TLS
+    /// handshake (`Limits::max_handshaking_per_source`), released the
+    /// moment the handshake resolves or fails.
+    handshaking: usize,
+    redeem: SlidingWindow,
+    last_seen: Instant,
+}
+
+/// Per-identity redeem accounting (CR-P1-03).
+struct IdentityRedeemEntry {
+    redeem: SlidingWindow,
+    last_seen: Instant,
+}
+
+/// Normalize a peer address to its accounting source (CR-P1-03):
+/// a full IPv4 address (a /32 — one host) or the first 64 bits of an
+/// IPv6 address (a /64 — the LAN or mobile delegation a home device
+/// sits behind). IPv4-mapped IPv6 addresses collapse to the IPv4
+/// source so a dual-stack bind cannot double a host's budgets.
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let octets = v6.octets();
+                let mut prefix = [0u8; 16];
+                prefix[..8].copy_from_slice(&octets[..8]);
+                IpAddr::V6(Ipv6Addr::from(prefix))
+            }
+        },
+    }
+}
+
+/// Entries of the CR-P1-03 accounting tables that can be TTL-pruned or
+/// evicted: they expose their idle timestamp, and whether they still
+/// hold live resources (an entry owing counter decrements must never
+/// be evicted — its guards still reference it).
+trait IdleTracked {
+    fn last_seen(&self) -> Instant;
+    fn holds_live_counters(&self) -> bool;
+}
+
+impl IdleTracked for SourceEntry {
+    fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+    fn holds_live_counters(&self) -> bool {
+        self.live > 0 || self.handshaking > 0
+    }
+}
+
+impl IdleTracked for IdentityRedeemEntry {
+    fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
+    // Purely rate-window state — always evictable.
+    fn holds_live_counters(&self) -> bool {
+        false
+    }
+}
+
+/// Make room for one new accounting entry (CR-P1-03): at
+/// [`SOURCE_TABLE_MAX_ENTRIES`] first drop entries idle past
+/// [`SOURCE_TABLE_IDLE_TTL`] (their 60 s windows expired long before
+/// that), then evict the stalest idle entry. Entries holding live
+/// counters are never evicted — their guards still owe decrements. If
+/// every entry is live (unreachable for the source table in practice:
+/// a live entry implies a connection, and the serving cap is orders of
+/// magnitude below this cap) the caller treats the arrival as over
+/// budget rather than overrunning memory.
+fn make_room<K, V>(map: &mut HashMap<K, V>, now: Instant) -> bool
+where
+    K: Copy + Eq + std::hash::Hash,
+    V: IdleTracked,
+{
+    if map.len() < SOURCE_TABLE_MAX_ENTRIES {
+        return true;
+    }
+    map.retain(|_, entry| {
+        !(now.duration_since(entry.last_seen()) > SOURCE_TABLE_IDLE_TTL
+            && !entry.holds_live_counters())
+    });
+    if map.len() < SOURCE_TABLE_MAX_ENTRIES {
+        return true;
+    }
+    let victim = map
+        .iter()
+        .filter(|(_, entry)| !entry.holds_live_counters())
+        .max_by_key(|(_, entry)| now.duration_since(entry.last_seen()))
+        .map(|(key, _)| *key);
+    match victim {
+        Some(key) => {
+            map.remove(&key);
+            true
+        }
+        None => false,
+    }
 }
 
 /// One journaled redeem attempt for idempotent retries: the response is a
@@ -411,29 +589,65 @@ enum SlotKind {
 /// the tiny window before its handle is registered leaves a finished
 /// handle behind — harmless (abort on a finished task is a no-op) and
 /// swept at shutdown.
+///
+/// CR-P1-03 extends the same every-exit-path discipline to the
+/// per-source counters: a live guard holds one `live` and (until
+/// [`ConnSlotGuard::handshake_done`]) one `handshaking` slot against
+/// its normalized source.
 struct ConnSlotGuard {
     shared: Option<Arc<Shared>>,
     task_id: u64,
     kind: SlotKind,
+    /// CR-P1-03: the normalized source this task's per-source counters
+    /// were reserved against. `None` for reject tasks — they never take
+    /// source slots (see the accept path).
+    source: Option<IpAddr>,
+    /// Whether the handshake phase is still open as far as this guard
+    /// knows. Released exactly once — either by an explicit
+    /// [`ConnSlotGuard::handshake_done`] after a completed handshake or
+    /// by `Drop` on every path that never got there (failure, timeout,
+    /// ALPN mismatch, cancellation).
+    handshake_open: bool,
 }
 
 impl ConnSlotGuard {
-    /// Guard for a connection holding one live-connection slot.
-    fn admitted(shared: Arc<Shared>, task_id: u64) -> Self {
+    /// Guard for a connection holding one live-connection slot and one
+    /// per-source slot pair (live + handshaking) against `source`.
+    fn admitted(shared: Arc<Shared>, task_id: u64, source: IpAddr) -> Self {
         Self {
             shared: Some(shared),
             task_id,
             kind: SlotKind::Live,
+            source: Some(source),
+            handshake_open: true,
         }
     }
 
     /// Guard for an over-cap rejection task: tracked for shutdown abort,
-    /// but counted against [`MAX_REJECT_TASKS`], not the serving cap.
+    /// but counted against [`MAX_REJECT_TASKS`], not the serving cap and
+    /// not any per-source cap (CR-P1-03).
     fn reject(shared: Arc<Shared>, task_id: u64) -> Self {
         Self {
             shared: Some(shared),
             task_id,
             kind: SlotKind::Reject,
+            source: None,
+            handshake_open: false,
+        }
+    }
+
+    /// CR-P1-03: the TLS handshake resolved — hand the per-source
+    /// handshaking slot back right away instead of waiting for the
+    /// connection to end, so slow-or-silent sockets (the connect-only
+    /// flood shape) are the only ones that hold it. No-op when the
+    /// phase was already closed (or the guard holds no source).
+    fn handshake_done(&mut self) {
+        if !self.handshake_open {
+            return;
+        }
+        self.handshake_open = false;
+        if let (Some(shared), Some(source)) = (self.shared.as_ref(), self.source) {
+            shared.lock().source_handshake_done(source, Instant::now());
         }
     }
 }
@@ -441,6 +655,13 @@ impl ConnSlotGuard {
 impl Drop for ConnSlotGuard {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.take() {
+            {
+                let mut inner = shared.lock();
+                if let Some(source) = self.source {
+                    inner.source_release(source, self.handshake_open, Instant::now());
+                }
+                inner.conn_tasks.remove(&self.task_id);
+            }
             match self.kind {
                 SlotKind::Live => {
                     shared.conn_count.fetch_sub(1, Ordering::SeqCst);
@@ -449,7 +670,6 @@ impl Drop for ConnSlotGuard {
                     shared.reject_count.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            shared.lock().conn_tasks.remove(&self.task_id);
         }
     }
 }
@@ -468,6 +688,160 @@ fn register_conn_task(shared: &Shared, id: u64, task: JoinHandle<()>) {
     let mut inner = shared.lock();
     if !task.is_finished() {
         inner.conn_tasks.insert(id, task);
+    }
+}
+
+impl Inner {
+    /// CR-P1-03 per-source admission: check-and-reserve BOTH counters
+    /// (`live`, `handshaking`) under the one lock the caller already
+    /// holds for the decision, so concurrent accepts from the same
+    /// source can never overshoot the caps. Over either cap (or an
+    /// accounting table with no room left) the caller drops the socket
+    /// at accept time — nothing was reserved on failure.
+    fn source_admit(&mut self, limits: &Limits, source: IpAddr, now: Instant) -> bool {
+        if !make_room(&mut self.sources, now) {
+            return false;
+        }
+        let entry = self.sources.entry(source).or_insert_with(|| SourceEntry {
+            live: 0,
+            handshaking: 0,
+            redeem: SlidingWindow::new(limits.redeem_per_source_per_min, Duration::from_secs(60)),
+            last_seen: now,
+        });
+        entry.last_seen = now;
+        if entry.live >= limits.max_conns_per_source
+            || entry.handshaking >= limits.max_handshaking_per_source
+        {
+            return false;
+        }
+        entry.live += 1;
+        entry.handshaking += 1;
+        true
+    }
+
+    /// The TLS handshake phase of one admitted connection closed out
+    /// (success or failure — callers only invoke this on success;
+    /// failure paths leave the release to the guard's `Drop`).
+    fn source_handshake_done(&mut self, source: IpAddr, now: Instant) {
+        if let Some(entry) = self.sources.get_mut(&source) {
+            entry.handshaking = entry.handshaking.saturating_sub(1);
+            entry.last_seen = now;
+        }
+    }
+
+    /// Release one admitted connection's per-source slots. `handshaking`
+    /// is true when the handshake phase was never closed out before the
+    /// exit path (the guard's `Drop` passes its still-open flag).
+    fn source_release(&mut self, source: IpAddr, handshaking: bool, now: Instant) {
+        if let Some(entry) = self.sources.get_mut(&source) {
+            entry.live = entry.live.saturating_sub(1);
+            if handshaking {
+                entry.handshaking = entry.handshaking.saturating_sub(1);
+            }
+            entry.last_seen = now;
+        }
+    }
+
+    /// TTL-prune the CR-P1-03 accounting tables (called by the sweeper
+    /// every [`SWEEP_INTERVAL`]) so they cannot grow unboundedly: a
+    /// pruned source entry held zero counters (all its guards closed)
+    /// and has been idle for [`SOURCE_TABLE_IDLE_TTL`] — far past the
+    /// 60 s windows it carried, so pruning discards no live budget.
+    /// Identity entries are pure window state on the same idle rule.
+    fn prune_source_tables(&mut self, now: Instant) {
+        self.sources.retain(|_, entry| {
+            !(now.duration_since(entry.last_seen) > SOURCE_TABLE_IDLE_TTL
+                && entry.live == 0
+                && entry.handshaking == 0)
+        });
+        self.identity_redeem
+            .retain(|_, entry| now.duration_since(entry.last_seen) <= SOURCE_TABLE_IDLE_TTL);
+    }
+
+    /// CR-P1-03 redeem budgets, all three shared layers after the
+    /// per-connection window (which lives in `ConnState`): per source,
+    /// per device identity, then the server-wide breaker. Any failing
+    /// layer answers with the smallest retry hint among the failing
+    /// layers. Layers checked before a failing one have already
+    /// recorded the attempt — that is deliberate: the attempt really
+    /// happened at that layer, and an attacker must not be able to keep
+    /// one layer's window empty by exhausting another first. All
+    /// attempts count, regardless of outcome (the contract §11 freeze
+    /// of 2026-11-11: budgets bound total work, they do not punish
+    /// guessing — invite codes have 160 bits of entropy, there is no
+    /// enumeration to punish).
+    fn redeem_allows(
+        &mut self,
+        limits: &Limits,
+        source: IpAddr,
+        identity: &DeviceId,
+        now: Instant,
+    ) -> (bool, u32) {
+        let mut retry = u32::MAX;
+        // Layer 1 — the source table entry exists for any connection
+        // that got this far (created at accept); make_room is the
+        // memory backstop, not an expected event.
+        if !make_room(&mut self.sources, now) {
+            return (false, 0);
+        }
+        let source_ok = {
+            let entry = self.sources.entry(source).or_insert_with(|| SourceEntry {
+                live: 0,
+                handshaking: 0,
+                redeem: SlidingWindow::new(
+                    limits.redeem_per_source_per_min,
+                    Duration::from_secs(60),
+                ),
+                last_seen: now,
+            });
+            entry.last_seen = now;
+            let ok = entry.redeem.allow_at(now);
+            if !ok {
+                retry = retry.min(entry.redeem.retry_after_ms(now));
+            }
+            ok
+        };
+        if !source_ok {
+            return (false, retry);
+        }
+        // Layer 2 — the device identity, shared across reconnects.
+        if !make_room(&mut self.identity_redeem, now) {
+            return (false, 0);
+        }
+        let identity_ok = {
+            let entry =
+                self.identity_redeem
+                    .entry(*identity)
+                    .or_insert_with(|| IdentityRedeemEntry {
+                        redeem: SlidingWindow::new(
+                            limits.redeem_per_identity_per_min,
+                            Duration::from_secs(60),
+                        ),
+                        last_seen: now,
+                    });
+            entry.last_seen = now;
+            let ok = entry.redeem.allow_at(now);
+            if !ok {
+                retry = retry.min(entry.redeem.retry_after_ms(now));
+            }
+            ok
+        };
+        if !identity_ok {
+            return (false, retry);
+        }
+        // Layer 3 — the server-wide breaker (see the config constant for
+        // why it is deliberately very high).
+        let window = self.global_redeem.get_or_insert_with(|| {
+            SlidingWindow::new(
+                limits.redeem_global_breaker_per_min,
+                Duration::from_secs(60),
+            )
+        });
+        let ok = window.allow_at(now);
+        if !ok {
+            retry = retry.min(window.retry_after_ms(now));
+        }
+        (ok, if ok { 0 } else { retry })
     }
 }
 
@@ -496,12 +870,11 @@ impl Shared {
         }
     }
 
-    fn global_redeem_allows(&self, now: Instant) -> (bool, u32) {
+    /// CR-P1-03: the shared redeem budget layers (per source, per
+    /// identity, global breaker) under one lock acquisition.
+    fn redeem_allows(&self, source: IpAddr, identity: &DeviceId, now: Instant) -> (bool, u32) {
         let mut inner = self.lock();
-        let window = inner.global_redeem.get_or_insert_with(|| {
-            SlidingWindow::new(self.limits.redeem_global_per_min, Duration::from_secs(60))
-        });
-        (window.allow_at(now), window.retry_after_ms(now))
+        inner.redeem_allows(&self.limits, source, identity, now)
     }
 }
 
@@ -1449,7 +1822,12 @@ fn handle_redeem(
     redeemer_endpoint: Option<EndpointBlob>,
 ) -> Flow {
     let now_instant = Instant::now();
-    // Budget rejections run before the lookup and are immediate.
+    // Budget rejections run before the lookup and are immediate. The
+    // per-connection window first (tightest, no shared state), then the
+    // three shared CR-P1-03 layers: per source, per identity, global
+    // breaker — a flood from one source (even across self-generated
+    // identities or reconnects) exhausts only its own source window and
+    // can no longer flip every other source's redeem to RATE_LIMITED.
     if !state.redeem_window.allow_at(now_instant) {
         deliver_msg(
             out,
@@ -1463,8 +1841,8 @@ fn handle_redeem(
         );
         return Flow::Continue;
     }
-    let (global_ok, retry) = shared.global_redeem_allows(now_instant);
-    if !global_ok {
+    let (shared_ok, retry) = shared.redeem_allows(source_key(state.peer_ip), &me, now_instant);
+    if !shared_ok {
         deliver_msg(
             out,
             pair_error(
@@ -2426,6 +2804,9 @@ fn sweep(shared: &Shared) {
     let mut expired_ghosts: Vec<Ghost> = Vec::new();
     {
         let mut inner = shared.lock();
+        // CR-P1-03: idle accounting entries go back to nothing (see
+        // [`Inner::prune_source_tables`]).
+        inner.prune_source_tables(Instant::now());
         let due: Vec<PairingId> = inner
             .ghosts
             .iter()
@@ -2580,20 +2961,43 @@ mod tests {
     }
 
     async fn spawn_server() -> TestServer {
+        spawn_server_with(Limits::default()).await
+    }
+
+    /// A server with explicitly-injected budgets: the global-cap
+    /// regression tests isolate the GLOBAL admission semantics and must
+    /// not trip the (much smaller) per-source caps first — see
+    /// [`global_cap_isolation_limits`].
+    async fn spawn_server_with(limits: Limits) -> TestServer {
         let store = RegistryStore::open_in_memory().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let registry = DeviceKeyPair::generate();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let key = registry.clone();
-        let task = tokio::spawn(async move {
-            serve_v2(listener, &key, store, Limits::default(), shutdown_rx).await
-        });
+        let task =
+            tokio::spawn(async move { serve_v2(listener, &key, store, limits, shutdown_rx).await });
         TestServer {
             addr,
             registry,
             shutdown,
             task,
+        }
+    }
+
+    /// Default budgets EXCEPT the per-source caps raised past the global
+    /// serving cap AND the reject budget (CR-P1-03): lets the global-cap
+    /// tests below open MAX_LIVE_CONNECTIONS held sockets plus the
+    /// reject-budget pinning sockets from the single loopback source the
+    /// harness has. The per-source behavior itself is pinned by the
+    /// CR-P1-03 tests, which use the default limits and TWO sources
+    /// (127.0.0.1 and the 127.0.0.2 loopback alias — the whole 127/8 is
+    /// loopback, so no second interface or real address is involved).
+    fn global_cap_isolation_limits() -> Limits {
+        Limits {
+            max_conns_per_source: MAX_LIVE_CONNECTIONS + MAX_REJECT_TASKS + 1,
+            max_handshaking_per_source: MAX_LIVE_CONNECTIONS + MAX_REJECT_TASKS + 1,
+            ..Limits::default()
         }
     }
 
@@ -2623,7 +3027,39 @@ mod tests {
             key: DeviceKeyPair,
             name: &str,
         ) -> TestClient {
-            let mut stream = tls::connect_pinned(addr, registry_id)
+            TestClient::connect_at(None, addr, registry_id, key, name).await
+        }
+
+        /// [`TestClient::connect`], but the client socket is first bound
+        /// to `local` when given — CR-P1-03 tests exercise per-source
+        /// budgets from two distinct loopback sources on one host
+        /// (127.0.0.1 and the 127.0.0.2 alias). `TcpSocket` is the one
+        /// tokio API that binds a source address before connecting; no
+        /// extra dependency needed.
+        async fn connect_at(
+            local: Option<IpAddr>,
+            addr: SocketAddr,
+            registry_id: &RegistryId,
+            key: DeviceKeyPair,
+            name: &str,
+        ) -> TestClient {
+            let tcp = match local {
+                None => TcpStream::connect(addr).await.expect("tcp connect"),
+                Some(source) => {
+                    let socket = tokio::net::TcpSocket::new_v4().expect("v4 client socket");
+                    socket
+                        .bind(SocketAddr::new(source, 0))
+                        .expect("bind loopback source alias");
+                    socket.connect(addr).await.expect("tcp connect from source")
+                }
+            };
+            tcp.set_nodelay(true).expect("nodelay");
+            let connector = tls::client_config(registry_id).expect("pinned client config");
+            let mut stream = connector
+                .connect(
+                    rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
+                    tcp,
+                )
                 .await
                 .expect("pinned tls handshake");
             let bytes = read_frame(&mut stream)
@@ -2860,9 +3296,13 @@ mod tests {
 
     /// One connection beyond the global cap completes the TLS handshake
     /// and receives exactly one ServerError before the disconnect.
+    /// CR-P1-03: the server runs with the per-source caps raised to the
+    /// serving cap (the harness has one loopback source) — this test
+    /// isolates the GLOBAL path; the per-source caps have their own
+    /// tests below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn connections_beyond_the_global_cap_are_rejected_with_server_error() {
-        let server = spawn_server().await;
+        let server = spawn_server_with(global_cap_isolation_limits()).await;
         let registry_id = server.registry_id();
 
         // Hold the cap's worth of live connections (TLS up, challenge
@@ -2902,10 +3342,14 @@ mod tests {
     /// completes, or sends garbage into it) must return its admission
     /// slot. A full cap's worth of failures may not lock legal clients
     /// out until process restart — before the RAII guard the counter was
-    /// only released on the successful connection-loop path.
+    /// only released on the successful connection-loop path. CR-P1-03:
+    /// per-source caps raised to the serving cap for the same isolation
+    /// reason as the test above (the flood and the probe share the one
+    /// loopback source); the per-source release discipline is pinned by
+    /// `source_counters_admit_release_and_prune_by_ttl` below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn failed_handshakes_release_their_admission_quota() {
-        let server = spawn_server().await;
+        let server = spawn_server_with(global_cap_isolation_limits()).await;
         let registry_id = server.registry_id();
 
         // A full cap's worth of connections that close before the TLS
@@ -2973,12 +3417,15 @@ mod tests {
     /// further over-cap connections are dropped at accept time — no
     /// handshake task is spawned for them (the socket sees an immediate
     /// close instead of parking until the TLS timeout), and shutdown
-    /// still tracks and reaps everything.
+    /// still tracks and reaps everything. CR-P1-03: per-source caps
+    /// raised to the serving cap (single loopback source) — the
+    /// per-source equivalent of this drop-at-accept behavior is pinned
+    /// by `over_source_cap_sockets_are_dropped_at_accept_without_a_task`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn over_cap_flood_beyond_the_reject_budget_is_dropped_immediately() {
         use tokio::io::AsyncReadExt as _;
 
-        let server = spawn_server().await;
+        let server = spawn_server_with(global_cap_isolation_limits()).await;
         let registry_id = server.registry_id();
 
         // Hold the cap's worth of live connections (TLS up, challenge
@@ -3019,6 +3466,332 @@ mod tests {
         drop(silent);
         drop(extra);
         server.stop().await;
+    }
+
+    // ---- CR-P1-03 per-source budgets ---------------------------------------
+
+    /// The accounting key collapses what it must: a full IPv4 address
+    /// (one host), an IPv6 address to its /64 delegation, and
+    /// IPv4-mapped IPv6 to the IPv4 source (a dual-stack bind must not
+    /// double a host's budgets). Documentation-range addresses only.
+    #[test]
+    fn source_key_collapses_hosts_prefixes_and_mapped_v4() {
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(source_key(v4), v4, "IPv4 keys by the full address (/32)");
+        // Same /64, different host bits: one source.
+        let a: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert_eq!(source_key(a), source_key(b), "IPv6 keys by the /64 prefix");
+        assert_eq!(
+            source_key(a),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap(),
+            "the /64 key carries no host bits"
+        );
+        // A different /64 is a different source.
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(source_key(a), source_key(c));
+        // IPv4-mapped IPv6 collapses to the IPv4 source.
+        let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
+        assert_eq!(source_key(mapped), v4);
+    }
+
+    /// CR-P1-03 acceptance (1): one source opens a pile of TCP-only
+    /// connections (never starting the TLS handshake) — the flood pins
+    /// at most its OWN per-source handshaking budget, and a client from
+    /// a different source still completes the full TLS + Hello/Welcome
+    /// exchange within ~1 s. Before the per-source caps the same flood
+    /// occupied the whole global serving cap for the TLS timeout and
+    /// locked every source out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn tcp_only_flood_from_one_source_leaves_another_source_unharmed() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // Three times the per-source concurrent cap, connect-only.
+        let mut flood = Vec::new();
+        for _ in 0..(3 * crate::server_v2::config::MAX_CONNS_PER_SOURCE) {
+            flood.push(TcpStream::connect(server.addr).await.unwrap());
+        }
+        // Let the accept loop process the backlog before timing the
+        // victim, so the flood's effect is in force for the measurement.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = Instant::now();
+        let victim = TestClient::connect_at(
+            Some("127.0.0.2".parse().unwrap()),
+            server.addr,
+            &registry_id,
+            DeviceKeyPair::generate(),
+            "victim",
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "another source must complete Hello within ~1 s despite a \
+             connect-only flood (took {:?})",
+            started.elapsed()
+        );
+        drop(victim);
+        drop(flood);
+        server.stop().await;
+    }
+
+    /// CR-P1-03 acceptance (2): one source redeem-floods through six
+    /// self-generated identities — the exact shape that used to exhaust
+    /// the flat global 60/min window and RATE_LIMIT every other
+    /// source's join attempts. The flood saturates only its own
+    /// per-source window; a different source's legit redeem goes
+    /// through untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn identity_redeem_flood_from_one_source_leaves_other_sources_alone() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // 6 identities x 6 attempts = 36/min from 127.0.0.1: past the
+        // 30/min per-source budget while every identity stays under its
+        // own 30/min and every connection under its 10/min window (the
+        // old attack worked precisely because each bucket was per-something
+        // the attacker could multiply).
+        let mut rate_limited = 0usize;
+        let mut flood = Vec::new();
+        for index in 0..6u8 {
+            let mut client = TestClient::connect(
+                server.addr,
+                &registry_id,
+                DeviceKeyPair::generate(),
+                &format!("flood-{index}"),
+            )
+            .await;
+            for _ in 0..6 {
+                let redeem = signed_redeem(
+                    &client.key,
+                    &registry_id,
+                    [index; 32],
+                    random_id16(),
+                    now_ms() + 8_000,
+                );
+                client.send(&CtrlMessage::InviteRedeem(redeem)).await;
+                match client.recv().await {
+                    CtrlMessage::InviteRedeemPending { .. } => {}
+                    CtrlMessage::PairError { code, .. } => {
+                        // The ONLY legal rejection here is the flood
+                        // source's own budget — never a foreign code.
+                        assert_eq!(code, RATE_LIMITED);
+                        rate_limited += 1;
+                    }
+                    other => panic!("unexpected redeem answer: {other:?}"),
+                }
+            }
+            flood.push(client);
+        }
+        assert!(
+            rate_limited > 0,
+            "36 attempts/min from one source must exhaust that source's \
+             own 30/min window (got no RATE_LIMITED at all)"
+        );
+
+        // The other source's legit redeem (fresh source window, fresh
+        // identity, breaker far away): pending as usual, NOT the global
+        // RATE_LIMITED this flood used to cause for everyone.
+        let mut victim = TestClient::connect_at(
+            Some("127.0.0.2".parse().unwrap()),
+            server.addr,
+            &registry_id,
+            DeviceKeyPair::generate(),
+            "victim",
+        )
+        .await;
+        let redeem = signed_redeem(
+            &victim.key,
+            &registry_id,
+            [0x9E; 32],
+            random_id16(),
+            now_ms() + 8_000,
+        );
+        victim.send(&CtrlMessage::InviteRedeem(redeem)).await;
+        match victim.recv().await {
+            CtrlMessage::InviteRedeemPending { .. } => {}
+            CtrlMessage::PairError { code, .. } => {
+                panic!("another source's legit redeem must not be rate limited, got {code}")
+            }
+            other => panic!("unexpected victim redeem answer: {other:?}"),
+        }
+        drop(flood);
+        drop(victim);
+        server.stop().await;
+    }
+
+    /// CR-P1-03 acceptance (3): past the per-source handshaking cap the
+    /// socket is dropped AT ACCEPT — no task is spawned for it: the
+    /// client sees an immediate close instead of parking until the TLS
+    /// deadline, and a different source keeps being served (the drop is
+    /// the source's own cap, not the global one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn over_source_cap_sockets_are_dropped_at_accept_without_a_task() {
+        use tokio::io::AsyncReadExt as _;
+
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+
+        // Pin the source's handshaking budget with silent TCP sockets
+        // (each parks in acceptor.accept until the 10 s TLS deadline).
+        let mut silent = Vec::new();
+        for _ in 0..crate::server_v2::config::MAX_HANDSHAKING_PER_SOURCE {
+            silent.push(TcpStream::connect(server.addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The next socket from the same source is dropped at accept: an
+        // immediate close. A spawned handshake task would park it until
+        // the TLS deadline instead.
+        let mut extra = TcpStream::connect(server.addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("no bytes may be sent to a dropped over-cap socket"),
+            Err(_) => panic!("over-source-cap socket must be dropped immediately, not parked"),
+        }
+
+        // The per-source drop is not a global outage: another source
+        // completes the full exchange right away.
+        let victim = TestClient::connect_at(
+            Some("127.0.0.2".parse().unwrap()),
+            server.addr,
+            &registry_id,
+            DeviceKeyPair::generate(),
+            "victim",
+        )
+        .await;
+        drop(victim);
+        drop(silent);
+        drop(extra);
+        server.stop().await;
+    }
+
+    /// CR-P1-03: the shared redeem windows survive reconnects — cycling
+    /// TCP connections (a fresh per-connection bucket each time) must
+    /// not reset them. One identity from one source gets exactly the
+    /// shared budget no matter how many connections it spreads the
+    /// attempts over; the first attempt past it is RATE_LIMITED on a
+    /// connection whose own per-conn bucket is still empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn shared_redeem_windows_survive_reconnects() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let key = DeviceKeyPair::generate();
+
+        // 6 attempts per connection (under the 10/min per-conn window),
+        // reconnect between rounds. Both shared windows (source and
+        // identity) sit at 30/min for this single source and identity,
+        // so round 6 (attempt 31 overall) must be rejected although the
+        // 6th connection's per-conn bucket is fresh.
+        let mut admitted = 0usize;
+        'rounds: for round in 0..6u8 {
+            let mut client =
+                TestClient::connect(server.addr, &registry_id, key.clone(), "flooder").await;
+            for attempt in 0..6u8 {
+                let lookup = [round * 16 + attempt; 32];
+                let redeem = signed_redeem(
+                    &client.key,
+                    &registry_id,
+                    lookup,
+                    random_id16(),
+                    now_ms() + 8_000,
+                );
+                client.send(&CtrlMessage::InviteRedeem(redeem)).await;
+                match client.recv().await {
+                    CtrlMessage::InviteRedeemPending { .. } => admitted += 1,
+                    CtrlMessage::PairError {
+                        code,
+                        retry_after_ms,
+                        ..
+                    } => {
+                        assert_eq!(code, RATE_LIMITED);
+                        assert!(retry_after_ms > 0, "the limiter suggests a retry delay");
+                        assert_eq!(
+                            round, 5,
+                            "the shared budget holds exactly 30, not {admitted}"
+                        );
+                        break 'rounds;
+                    }
+                    other => panic!("unexpected redeem answer: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            admitted,
+            crate::server_v2::config::REDEEM_PER_SOURCE_PER_MIN as usize,
+            "exactly the shared per-source budget is admitted across reconnects"
+        );
+        server.stop().await;
+    }
+
+    /// CR-P1-03 unit level: the per-source counters admit up to both
+    /// caps, release on every close-out path, hand the handshaking slot
+    /// back as soon as the handshake resolves, and idle entries are
+    /// TTL-pruned while busy ones never are.
+    #[test]
+    fn source_counters_admit_release_and_prune_by_ttl() {
+        let limits = Limits::default();
+        let mut inner = Inner::default();
+        let t0 = Instant::now();
+        let src = "127.0.0.1".parse::<IpAddr>().unwrap();
+
+        // The handshaking cap fires before the concurrent cap (4 < 8).
+        for _ in 0..limits.max_handshaking_per_source {
+            assert!(inner.source_admit(&limits, src, t0));
+        }
+        assert!(
+            !inner.source_admit(&limits, src, t0),
+            "handshaking cap must reject while all four handshakes are open"
+        );
+
+        // Handshakes resolve: the handshaking budget reopens while the
+        // live budget keeps counting.
+        for _ in 0..limits.max_handshaking_per_source {
+            inner.source_handshake_done(src, t0);
+        }
+        for extra in 0..(limits.max_conns_per_source - limits.max_handshaking_per_source) {
+            assert!(
+                inner.source_admit(&limits, src, t0),
+                "live cap allows the {extra}-th additional served connection"
+            );
+        }
+        assert!(
+            !inner.source_admit(&limits, src, t0),
+            "concurrent-connection cap must reject the 9th connection"
+        );
+
+        // Release everything (half via handshake_done + release, half via
+        // the guard-Drop shape that releases a still-open handshake).
+        for _ in 0..limits.max_conns_per_source {
+            inner.source_handshake_done(src, t0);
+            inner.source_release(src, false, t0);
+        }
+        assert!(
+            inner.source_admit(&limits, src, t0),
+            "counters returned to zero"
+        );
+        inner.source_release(src, true, t0);
+
+        // A zero-counter entry survives inside the TTL and is pruned
+        // after it; a busy entry survives even past the TTL.
+        inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL);
+        assert!(
+            inner.sources.contains_key(&src),
+            "inside the TTL nothing is pruned"
+        );
+        inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL + Duration::from_secs(1));
+        assert!(
+            !inner.sources.contains_key(&src),
+            "an idle zero-counter entry is TTL-pruned"
+        );
+        assert!(inner.source_admit(&limits, src, t0));
+        inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL + Duration::from_secs(60));
+        assert!(
+            inner.sources.contains_key(&src),
+            "an entry holding counters is never pruned"
+        );
     }
 
     /// R36-P2-06: the per-owner hourly claim budget is exactly the

@@ -479,7 +479,7 @@ PeerBookStore::apply_pairing(
 |---|---|
 | 既有帧限频 | 保持每连接 32 帧/秒、突发 64 |
 | redeem 每设备 | 5 次/分钟，30 次/小时 |
-| redeem 每 IP / IPv6 前缀 | 60 次/分钟，另有全局限额 |
+| redeem 每 IP / IPv6 前缀 | （本行为历史设计稿；现行冻结值见 `docs/contracts/pairing-flow.md` §11：每来源 30 次/分钟＋每身份 30 次/分钟＋全局熔断 600，2026-11-11 CR-P1-03 修订） |
 | 同时 pending redeem | 每发起设备 4、每 owner 32、全局 4096 |
 | 邀请码创建 | 每 owner 6 次/小时 |
 | active 邀请码 | 每 owner 32 |

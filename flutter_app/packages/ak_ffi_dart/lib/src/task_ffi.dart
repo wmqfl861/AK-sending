@@ -118,6 +118,7 @@ class AkTaskStartSpec {
     required this.idDir,
     this.deviceName,
     this.saveDir,
+    this.stunAddr,
   });
 
   /// Coordination registry endpoint as a literal `ip:port`.
@@ -134,6 +135,12 @@ class AkTaskStartSpec {
 
   /// The one default save folder; null = engine default `<id_dir>/downloads`.
   final String? saveDir;
+
+  /// Optional STUN server (`ip:port`) for the receiver-side reflexive
+  /// candidate (CR-P1-02 C2): the Rust side queries it ON the QUIC socket
+  /// before binding (same-socket NAT mapping). null/empty = no query,
+  /// fail-open; must be `ip:port` when present (ffi-v2.md §8.1).
+  final String? stunAddr;
 
   Map<String, dynamic> toJson() {
     if (!isIpPortAddress(registry)) {
@@ -153,6 +160,10 @@ class AkTaskStartSpec {
     if (folder != null && folder.isEmpty) {
       throw const AkSpecException('字段 "save_dir" 为空或省略');
     }
+    final stun = stunAddr;
+    if (stun != null && stun.isNotEmpty && !isIpPortAddress(stun)) {
+      throw AkSpecException('字段 "stun_addr" 不是 ip:port 地址："$stun"');
+    }
     return <String, dynamic>{
       'spec_version': 1,
       'registry': registry,
@@ -160,6 +171,7 @@ class AkTaskStartSpec {
       'id_dir': idDir,
       if (name != null && name.isNotEmpty) 'device_name': name,
       if (folder != null && folder.isNotEmpty) 'save_dir': folder,
+      if (stun != null && stun.isNotEmpty) 'stun_addr': stun,
     };
   }
 

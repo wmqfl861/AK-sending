@@ -535,6 +535,7 @@ final class SimpleTransferService {
     required String idDir,
     String? deviceName,
     String? saveDir,
+    String? stunAddr,
   }) async {
     _ensureLive();
     if (_engineFailed) {
@@ -552,6 +553,7 @@ final class SimpleTransferService {
       idDir: idDir,
       deviceName: deviceName,
       saveDir: saveDir,
+      stunAddr: stunAddr,
     ));
     _runtime = runtime;
     _saveDir = saveDir;

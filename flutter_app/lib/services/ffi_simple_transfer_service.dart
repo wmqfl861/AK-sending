@@ -190,11 +190,18 @@ final class FfiSimpleTransferService implements SimpleTransferService {
           '（或编译期 --dart-define 注入）。');
     }
     final dir = idDir ?? _resolveIdentityDir(env);
+    // CR-P1-02 C2: the receiver-side STUN server for the reflexive
+    // candidate. Same precedence as the registry pins (env > --dart-define),
+    // defaulting to the production UDP STUN endpoint; an explicitly empty
+    // value opts out (the Rust side fails open without a reflexive
+    // candidate; ffi-v2.md §8.1).
+    final stun = _envOrCompiled(env, 'AK_STUN_ADDR') ?? _defaultStunAddr;
     await _engine.start(
       registry: address,
       registryIdHex: pin,
       idDir: dir,
       saveDir: _saveDirOverride,
+      stunAddr: stun.isEmpty ? null : stun,
     );
     // Remember each pending request's connection so the consent waiter
     // can watch the RIGHT receive's done event.
@@ -454,6 +461,12 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   /// Environment first, then the compiled `--dart-define` default (empty
   /// when the build passed none — the invite plane's precedence).
+    /// Production default for [AkTaskStartSpec.stunAddr] (docs/STATUS: the
+  /// coordination host's UDP STUN responder). Moves to a domain with
+  /// CR-P3-03. Override via AK_STUN_ADDR; set it to an empty string to
+  /// disable the reflexive candidate.
+  static const String _defaultStunAddr = '122.51.121.24:7101';
+
   static String? _envOrCompiled(Map<String, String> env, String key) {
     final fromEnv = env[key]?.trim();
     if (fromEnv != null && fromEnv.isNotEmpty) {
@@ -461,6 +474,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     }
     final compiled = switch (key) {
       'AK_REGISTRY_ADDR' => const String.fromEnvironment('AK_REGISTRY_ADDR'),
+      'AK_STUN_ADDR' => const String.fromEnvironment('AK_STUN_ADDR'),
       _ => const String.fromEnvironment('AK_REGISTRY_ID'),
     };
     final trimmed = compiled.trim();

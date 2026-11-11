@@ -20,6 +20,8 @@
 
 ## 交接入口
 
+> **本轮审核修复的完整交接**：[HANDOFF-REVIEW-FIXES-2026-11](HANDOFF-REVIEW-FIXES-2026-11.zh-CN.md)（33 提交、CI 证据链、逐项验证方法、待决清单）。
+
 - [HANDOFF](HANDOFF.zh-CN.md)：逐波交接记录、实现与验证边界、重启恢复手册（历史口径，其"当前/进行中"字样以本页为准）。
 - [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md)：本轮审核意见＋执行计划（第 5 节）＋状态表（第 7 节）＋待所有者决定清单（第 8 节）。
 - [AGENTS](../AGENTS.md) / [CONTRIBUTING](../CONTRIBUTING.md)：开发规则、红线与门槛。

@@ -33,6 +33,19 @@ fn v6_loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port))
 }
 
+/// Both L2 tests below bind QUIC endpoints on `[::1]:0`; hosts without an
+/// IPv6 loopback (some CI containers) must skip with the reason printed,
+/// not panic (CR-P3-01).
+fn ipv6_loopback_or_skip() -> bool {
+    match std::net::UdpSocket::bind(v6_loopback(0)) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("skipping: [::1] UDP bind unavailable (no IPv6 loopback on this host?): {e}");
+            false
+        }
+    }
+}
+
 /// L1 decision layer: loopback is local-direct by definition, with or without
 /// any interface knowledge; fe80::/10 link-local is local-direct too.
 #[test]
@@ -58,6 +71,9 @@ fn ipv6_loopback_and_link_local_classify_local_direct() {
 /// the path LocalDirect (loopback family, not a v4 fallback).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipv6_loopback_channel_handshake_pins_identity_and_reports_local_direct() {
+    if !ipv6_loopback_or_skip() {
+        return;
+    }
     let server_key = DeviceKeyPair::generate();
     let client_key = DeviceKeyPair::generate();
     let server_bundle = ak_identity::tls::make_self_signed(&server_key);
@@ -105,6 +121,9 @@ async fn ipv6_loopback_channel_handshake_pins_identity_and_reports_local_direct(
 /// address is an IPv6 loopback one — the whole data path rode ::1.
 #[tokio::test]
 async fn ipv6_loopback_engine_transfer_is_byte_identical() {
+    if !ipv6_loopback_or_skip() {
+        return;
+    }
     let base = tempfile::tempdir().unwrap();
     let src = base.path().join("t03-v6-src");
     write_file(

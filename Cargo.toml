@@ -44,7 +44,8 @@ rand = "0.8"
 rcgen = "0.13"
 # ADR-002 controlled addition: bundled C SQLite for the optional ak-store
 # `sqlite` checkpoint backend (BACKLOG P1-03); MSVC-compilable, no relay path.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# 0.41 required by RUSTSEC-2026-0459 (libsqlite3-sys >= 0.39, SQLite 3.54.0).
+rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 socket2 = "0.5"
 thiserror = "2"

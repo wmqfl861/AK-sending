@@ -42,6 +42,20 @@ jobs:
       - name: Validator unit tests
         run: python -m unittest discover -s scripts/tests -v
 
+  # Dependency vulnerability gate (CR-P2-01): scans Cargo.lock against the
+  # RustSec advisory database. deny.toml keeps the complementary
+  # licenses/bans view for local cargo-deny use.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock against RustSec advisories
+        run: cargo audit
+
   # Rust gate on both first-class platforms (Windows MSVC matters: the
   # optional ak-store `sqlite` backend bundles C SQLite).
   rust:

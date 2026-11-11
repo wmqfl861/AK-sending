@@ -66,6 +66,7 @@ library;
 import 'dart:async' show StreamController, Timer, TimeoutException;
 import 'dart:collection' show UnmodifiableListView;
 import 'dart:convert' show jsonDecode;
+import 'dart:typed_data' show Uint8List;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show
@@ -73,6 +74,8 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         AkStatus,
         AkTaskCalls,
         AkTaskCreateCodeSpec,
+        AkTaskDoorbell,
+        AkTaskDoorbellRegistrar,
         AkTaskJoinSpec,
         AkTaskRole,
         AkTaskSendSpec,
@@ -85,6 +88,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskIncomingRequestEvent,
         TaskProbeResultEvent,
         TaskRequestClosedEvent,
+        TaskEventDoorbell,
         TaskRuntimeFfi,
         TaskFfi;
 
@@ -110,6 +114,20 @@ int eventPollMs({required bool hasActivity}) => hasActivity
 int opPollMs({required bool hasActivity}) => hasActivity
     ? SimpleTransferService.activeOpPollMs
     : SimpleTransferService.idleOpPollMs;
+
+/// CR-P2-05 (item 1, native-push half — 2026-11-12): the SAFETY-NET
+/// active event-poll cadence while a native doorbell is registered, in
+/// milliseconds. The doorbell delivers task events the moment they
+/// queue, so the periodic tick only exists to catch a MISSED ring
+/// (never stall the UI): 250 ms active bounds the worst-case missed-
+/// doorbell latency at a quarter second while cutting the resting
+/// active-cadence wake-ups from 20/s to 4/s. An intentionally longer
+/// configured [SimpleTransferService.eventPollInterval] (manual-pump
+/// tests) still wins — the safety net never runs FASTER than what the
+/// service was configured with.
+int doorbellSafetyPollMs({required bool hasActivity}) => hasActivity
+    ? SimpleTransferService.doorbellSafetyActivePollMs
+    : SimpleTransferService.idleEventPollMs;
 
 /// The role picked when generating a task code.
 enum SimpleTransferRole {
@@ -355,6 +373,15 @@ final class ProgressDrainResult {
 ///   ([setAppBackgrounded]). Activity flips re-arm IMMEDIATELY (a new op
 ///   or pairing never waits out a slow tick); the C12 budget/latch rules
 ///   above are unchanged in every mode.
+/// * CR-P2-05, native-push half (2026-11-12): when the seam supports it,
+///   [start] registers a NATIVE EVENT DOORBELL (`ak_task_set_event_notify`,
+///   ffi-v2.md §8.6) — Rust rings it on the thread that queues each task
+///   event, [_onDoorbell] drains IMMEDIATELY, and the adaptive timer
+///   above degrades to a pure SAFETY NET ([doorbellSafetyActivePollMs]
+///   active / [idlePollInterval] idle): a missed ring can never stall
+///   the UI beyond one safety tick. Seams without the capability (test
+///   fakes, old DLLs, diagnostic gates) keep the exact D1 pure-polling
+///   behavior — [usesNativeEventPush] is the observable.
 final class SimpleTransferService {
   SimpleTransferService({
     required this.calls,
@@ -362,8 +389,10 @@ final class SimpleTransferService {
         const Duration(milliseconds: activeEventPollMs),
     this.opPollInterval = const Duration(milliseconds: activeOpPollMs),
     this.idlePollInterval = const Duration(milliseconds: idleEventPollMs),
+    AkTaskDoorbellRegistrar? doorbellRegistrar,
     Future<void> Function(Duration)? delay,
-  })  : _delay = delay ?? Future<void>.delayed;
+  })  : _doorbellRegistrar = doorbellRegistrar ?? _registerNativeDoorbell,
+        _delay = delay ?? Future<void>.delayed;
 
   /// C12: one pump tick handles at most this many events (and drains at
   /// most this many progress lines) — the per-tick budget that keeps a
@@ -397,6 +426,16 @@ final class SimpleTransferService {
   /// decision for tests and future always-on pollers.
   static const int idleOpPollMs = 1000;
 
+  /// CR-P2-05 (native-push half, 2026-11-12): the SAFETY-NET active
+  /// event-poll cadence (ms) while a native doorbell is registered (see
+  /// [doorbellSafetyPollMs]). The doorbell itself is IMMEDIATE — this
+  /// tick only bounds the worst case of a MISSED ring, so it is 5x
+  /// slower than [activeEventPollMs]; the idle cadence stays
+  /// [idleEventPollMs] either way. WITHOUT a doorbell the pump uses
+  /// [eventPollInterval]/[idlePollInterval] exactly as before (the D1
+  /// pure-polling behavior is bit-identical).
+  static const int doorbellSafetyActivePollMs = 250;
+
   /// The task-plane call seam (FFI bindings or fake). Public read-only:
   /// the app shell wires `AkTaskFfiBindings` here; tests inject the fake.
   final AkTaskCalls calls;
@@ -420,6 +459,16 @@ final class SimpleTransferService {
   /// Injectable delay (tests drive the loops synchronously with a
   /// zero-delay stand-in).
   final Future<void> Function(Duration) _delay;
+
+  /// CR-P2-05 (native-push half): the doorbell registrar — the native
+  /// attempt by default; tests inject a fake doorbell to drive the
+  /// ring/drain path without the DLL.
+  final AkTaskDoorbellRegistrar _doorbellRegistrar;
+
+  /// CR-P2-05: the registered native doorbell, or null while this
+  /// service runs on PURE POLLING (a seam without the capability — a
+  /// fake, an old DLL, a diagnostic gate — or before [start]).
+  AkTaskDoorbell? _doorbell;
 
   TaskRuntimeFfi? _runtime;
 
@@ -556,6 +605,14 @@ final class SimpleTransferService {
       stunAddr: stunAddr,
     ));
     _runtime = runtime;
+    // CR-P2-05 (native-push half, 2026-11-12): register the native event
+    // doorbell lazily HERE (the runtime id exists only now). Graceful
+    // fallback: a seam without the capability (a fake, an old DLL, a
+    // diagnostic gate) or a refused registration returns null and the
+    // service keeps the D1 pure-polling behavior bit-identical. Events
+    // that queued before the registration (the runtime_ready of start)
+    // are picked up by the synchronous drain below.
+    _doorbell = _doorbellRegistrar(calls, runtime.runtimeId, _onDoorbell);
     _saveDir = saveDir;
     _setPhase(SimpleTransferPhase.idle);
     // CR-P2-05: the adaptive pump arms here (idle → the slow cadence) and
@@ -588,6 +645,14 @@ final class SimpleTransferService {
     }
     // (1) waiters / call channels.
     _disposed = true;
+    // CR-P2-05 (native-push half): unregister the doorbell BEFORE the
+    // pump stops — `close()` first blocks native-side until an in-flight
+    // ring returned and clears the registration (the ffi-v2 §8.6
+    // lifetime guarantee), then releases the NativeCallable. The native
+    // engine handle itself is NOT touched here (this service borrows the
+    // seam; the owner releases it after every borrower disposed).
+    _doorbell?.close();
+    _doorbell = null;
     // (2) the pump.
     _haltPump();
     // (3) streams (listeners get a done event; late pollers throw nothing).
@@ -1066,15 +1131,35 @@ final class SimpleTransferService {
 
   /// CR-P2-05: the cadence the NEXT pump tick is scheduled at — the
   /// applied form of [eventPollMs] over this service's configuration:
-  /// [eventPollInterval] while in the foreground with [hasActivity],
-  /// else the idle cadence (the slower of [idlePollInterval] and
-  /// [eventPollInterval] — the configured interval is a MINIMUM tick
-  /// distance in every mode). Backgrounded apps ([setAppBackgrounded])
-  /// always drop to the idle cadence, activity or not.
+  /// the ACTIVE interval while in the foreground with [hasActivity],
+  /// else the idle cadence. The ACTIVE interval is [eventPollInterval]
+  /// — EXCEPT while a native doorbell is registered
+  /// ([usesNativeEventPush]): the doorbell delivers events immediately,
+  /// so the tick degrades to the pure SAFETY NET of
+  /// [doorbellSafetyActivePollMs] (never faster than the configured
+  /// [eventPollInterval]; see [doorbellSafetyPollMs]). Backgrounded apps
+  /// ([setAppBackgrounded]) always drop to the idle cadence, activity or
+  /// not.
   Duration get effectiveEventPollInterval =>
       !_appBackgrounded && hasActivity
-          ? eventPollInterval
+          ? _activeEventPollInterval
           : _idleEventPollInterval;
+
+  /// CR-P2-05: the ACTIVE tick distance in the current mode — D1's
+  /// [eventPollInterval] under pure polling (bit-identical fallback),
+  /// or the slower-of-both safety net while a doorbell is registered.
+  Duration get _activeEventPollInterval {
+    if (_doorbell == null) {
+      return eventPollInterval;
+    }
+    final safety = const Duration(milliseconds: doorbellSafetyActivePollMs);
+    return safety > eventPollInterval ? safety : eventPollInterval;
+  }
+
+  /// CR-P2-05 (native-push half): is the native event doorbell
+  /// registered? False = this service runs on PURE POLLING with the
+  /// exact D1 behavior (the observable the fallback tests pin).
+  bool get usesNativeEventPush => _doorbell != null;
 
   /// CR-P2-05: is a pump tick pending? False while the pump is paused
   /// ([setAppBackgrounded] with no activity), after [dispose] and after
@@ -1124,11 +1209,36 @@ final class SimpleTransferService {
   }
 
   /// CR-P2-05: the idle/background cadence — never FASTER than the
-  /// configured [eventPollInterval] (a test that stretches the active
-  /// interval to pump manually stays inert at idle too).
-  Duration get _idleEventPollInterval => idlePollInterval > eventPollInterval
-      ? idlePollInterval
-      : eventPollInterval;
+  /// active interval of the current mode (a test that stretches the
+  /// active interval to pump manually stays inert at idle too).
+  Duration get _idleEventPollInterval =>
+      idlePollInterval > _activeEventPollInterval
+          ? idlePollInterval
+          : _activeEventPollInterval;
+
+  /// CR-P2-05 (native-push half): the default doorbell registrar — the
+  /// native attempt over the call seam
+  /// ([TaskEventDoorbell.tryRegister]; [TaskRuntimeFfi
+  /// .registerEventDoorbell] is the same thing for callers that already
+  /// hold a runtime view), which returns null (pure polling) for every
+  /// unsupported seam or refused registration.
+  static AkTaskDoorbell? _registerNativeDoorbell(
+          AkTaskCalls calls, Uint8List runtimeId, void Function() onRing) =>
+      TaskEventDoorbell.tryRegister(calls, runtimeId, onRing);
+
+  /// CR-P2-05 (native-push half): a native ring arrived — drain NOW.
+  /// Runs as an event-loop message on this isolate (the NativeCallable
+  /// listener delivers here, never concurrently), so a burst of rings
+  /// serializes: the first drain empties the queue and the trailing
+  /// rings each find it empty (the poll is authoritative; extra rings
+  /// are harmless no-ops). Gated like a pump tick: a disposed,
+  /// engine-failed, or pre-start service ignores the ring.
+  void _onDoorbell() {
+    if (_disposed || _engineFailed || _runtime == null) {
+      return;
+    }
+    _pumpOnce();
+  }
 
   /// CR-P2-05: the adaptive pump's (re)arm — the single authority over
   /// [_pump]. Idempotent per cadence: a pending tick armed at the CURRENT

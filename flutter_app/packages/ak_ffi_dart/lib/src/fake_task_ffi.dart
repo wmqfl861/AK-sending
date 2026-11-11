@@ -63,8 +63,13 @@ final class FakeTaskOp {
   bool announced = false;
 }
 
-/// The fake seam (see the library doc).
-final class FakeAkTaskCalls implements AkTaskCalls {
+/// The fake seam (see the library doc). Extendable (not `final`) since
+/// the CR-P2-05 doorbell tests: a fake that ADDS the
+/// `AkTaskEventNotify` capability subclasses this and overrides nothing
+/// else — the plain fake stays capability-free on purpose (it models an
+/// engine/embedder without the doorbell export, exercising the
+/// pure-polling fallback).
+class FakeAkTaskCalls implements AkTaskCalls {
   FakeAkTaskCalls({this.autoCompleteOps = true, Random? random})
       : _random = random ?? Random(4711);
 

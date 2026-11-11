@@ -205,7 +205,7 @@ LLVM_NM="$NDK_BIN/llvm-nm.exe"
 # .so pass while silently missing the entire v1-task-code surface.
 # STRICT: every missing symbol is listed per .so and the run FAILs (no
 # WARNING fallback).
-REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list ak_pairing_start ak_sched_listen_start ak_task_start ak_task_create_code ak_task_join ak_task_send ak_task_list ak_task_disconnect ak_task_set_save_dir ak_task_consent"
+REQUIRED_SYMBOLS="ak_engine_new ak_identity_info ak_jobs_list ak_pairing_start ak_sched_listen_start ak_task_start ak_task_create_code ak_task_join ak_task_send ak_task_list ak_task_disconnect ak_task_set_save_dir ak_task_consent ak_task_set_event_notify"
 verify_symbols() { # $1 = .so path, $2 = label
   local missing=""
   for sym in $REQUIRED_SYMBOLS; do

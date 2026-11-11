@@ -1,6 +1,7 @@
 /// dart:ffi layer over the eight `ak_task_*` exports of the wave-28
 /// minimal-pairing task plane (signatures in the task-plane table of
-/// `docs/contracts/ffi-v2.md`):
+/// `docs/contracts/ffi-v2.md`), plus the CR-P2-05 (2026-11-12) doorbell
+/// registration export `ak_task_set_event_notify` (ffi-v2.md §8.6):
 ///
 /// ```text
 /// ak_task_start(engine, spec_json, runtime_id_out[16])
@@ -11,6 +12,7 @@
 /// ak_task_disconnect(engine, runtime_id, task_id[16])
 /// ak_task_set_save_dir(engine, runtime_id, path)
 /// ak_task_consent(engine, runtime_id, job_id[16], accept)
+/// ak_task_set_event_notify(engine, runtime_id, notify|NULL, ctx)  // 2026-11-12
 /// ```
 ///
 /// Op RESULTS and EVENTS add no symbols: they flow through the existing
@@ -431,6 +433,27 @@ typedef _ProgressBufC = Int32 Function(
 typedef _ProgressBufDart = int Function(
     Pointer<AkEngine>, Pointer<Uint8>, int);
 
+/// `ak_task_set_event_notify(engine, runtime_id, notify|NULL, ctx)` —
+/// the CR-P2-05 (2026-11-12) doorbell registration export (ffi-v2.md
+/// §8.6): `notify` non-NULL registers the callback Rust invokes (with
+/// `ctx` verbatim) on the thread that queues each subsequent task
+/// event; NULL clears it (returns only after an in-flight invocation
+/// completed — the caller may then destroy the callback).
+typedef _SetEventNotifyC = Int32 Function(
+    Pointer<AkEngine>,
+    Pointer<Uint8>,
+    Pointer<NativeFunction<Void Function(Pointer<Void>)>>,
+    Pointer<Void>);
+typedef _SetEventNotifyDart = int Function(
+    Pointer<AkEngine>,
+    Pointer<Uint8>,
+    Pointer<NativeFunction<Void Function(Pointer<Void>)>>,
+    Pointer<Void>);
+
+/// The native function-pointer type of the registered doorbell
+/// (`void (*)(void *ctx)` — ffi-v2.md §8.6).
+typedef AkTaskEventNotifyNative = Void Function(Pointer<Void> ctx);
+
 /// The eight `ak_task_*` exports plus the two shared-channel exports the
 /// task plane reads (probe set of [AkTaskFfiBindings.missingTaskExports]).
 const List<String> akTaskExportNames = <String>[
@@ -445,6 +468,133 @@ const List<String> akTaskExportNames = <String>[
   'ak_pairing_op_result',
   'ak_pairing_poll_event',
 ];
+
+/// The CR-P2-05 (2026-11-12) doorbell export — deliberately NOT in
+/// [akTaskExportNames]: an old DLL missing only this symbol still passes
+/// the frozen-export gate and the doorbell registrar falls back to pure
+/// polling (ffi-v2.md §8.6 "旧 DLL 明确退回纯轮询").
+const String akTaskEventNotifyExportName = 'ak_task_set_event_notify';
+
+// ---------------------------------------------------------------------------
+// CR-P2-05 (2026-11-12): the optional native event doorbell.
+// ---------------------------------------------------------------------------
+
+/// Optional capability of the task seam: the CR-P2-05 doorbell export.
+/// Implemented by [AkTaskFfiBindings] (real DLL); deliberately NOT by
+/// [FakeAkTaskCalls] or the lease/diag wrappers — a seam that does not
+/// expose it simply keeps the D1 pure-polling behavior, which is the
+/// documented fallback. `fn == null` clears the registration (that call
+/// returns only after an in-flight invocation completed, so the caller
+/// may destroy the callback afterwards — the NativeCallable close
+/// ordering [TaskEventDoorbell.close] relies on).
+abstract interface class AkTaskEventNotify {
+  /// `ak_task_set_event_notify(engine, runtime_id, fn|NULL, ctx)`:
+  /// registers (`fn != null`) or clears (`fn == null`) ONE task
+  /// runtime's doorbell. Returns the native status code ([AkStatus.ok],
+  /// [AkStatus.errNull], [AkStatus.errNotFound]).
+  int setEventNotify(Uint8List runtimeId,
+      Pointer<NativeFunction<AkTaskEventNotifyNative>>? fn, Pointer<Void> ctx);
+}
+
+/// A registered native-push doorbell (CR-P2-05 改法第 1 条后半): the
+/// Dart-side half of `ak_task_set_event_notify`. Holds the
+/// [NativeCallable.listener] alive (the callable MUST outlive every
+/// native call into its trampoline) and delivers each native ring to
+/// [onRing] on THIS isolate's event loop — the caller then drains the
+/// poll channel once; payloads never ride the doorbell (ffi-v2.md §8.6).
+///
+/// Design note (why NativeCallable.listener and not dart_api_dl's
+/// `Dart_PostCObject`): the listener needs no SDK source embedded in
+/// ak-ffi, no `Dart_InitializeApiDL` bootstrap, and no `Dart_CObject`
+/// marshalling of the frozen event shapes — the doorbell carries a
+/// single "something is queued" bit and the existing
+/// `ak_pairing_poll_event` stays the single authoritative channel. The
+/// native trampoline may be invoked from ANY thread (engine tokio
+/// workers or the FFI caller's own thread); it only posts a message to
+/// this isolate, so registration adds neither latency nor threads.
+abstract interface class AkTaskDoorbell {
+  /// Unregisters the native callback FIRST (blocking until any in-flight
+  /// fire completed — the §8.6 lifetime guarantee), then releases the
+  /// Dart-side callable. Safe to call after the engine died (the
+  /// unregister call is then best-effort and ignored: a freed engine can
+  /// no longer fire). Idempotent.
+  void close();
+}
+
+/// The registrar seam used by service layers: attempts the native
+/// doorbell registration over [calls]; returns null when the seam lacks
+/// the capability (a fake, an old DLL, a diagnostic gate) or the native
+/// side refused — callers treat null as "pure polling, unchanged".
+typedef AkTaskDoorbellRegistrar = AkTaskDoorbell? Function(
+    AkTaskCalls calls, Uint8List runtimeId, void Function() onRing);
+
+/// The real doorbell: a [NativeCallable.listener] registered through
+/// [AkTaskEventNotify]. Construct via [tryRegister] ONLY.
+final class TaskEventDoorbell implements AkTaskDoorbell {
+  TaskEventDoorbell._(this._notify, this._runtimeId, this._callable);
+
+  /// Best-effort registration; NEVER throws — every failure path (a seam
+  /// without the capability, a DLL predating the export, a non-OK native
+  /// status) returns null and the caller keeps pure polling. The
+  /// callable is closed before null returns, so a failed registration
+  /// leaves nothing behind.
+  static AkTaskDoorbell? tryRegister(
+      AkTaskCalls calls, Uint8List runtimeId, void Function() onRing) {
+    if (calls is! AkTaskEventNotify) {
+      return null; // fake/lease/diag seam: the documented pure-polling fallback
+    }
+    // Unrelated interfaces do not type-promote — the checked cast is
+    // total after the guard above.
+    final notify = calls as AkTaskEventNotify;
+    NativeCallable<AkTaskEventNotifyNative>? callable;
+    try {
+      callable = NativeCallable<AkTaskEventNotifyNative>.listener(
+          (Pointer<Void> ctx) => onRing());
+      // The ctx token is an opaque NULL here: the ring carries no
+      // payload, and one service owns one runtime per registration.
+      final code = notify.setEventNotify(
+          runtimeId, callable.nativeFunction, Pointer<Void>.fromAddress(0));
+      if (code != AkStatus.ok) {
+        callable.close();
+        return null;
+      }
+      return TaskEventDoorbell._(notify, runtimeId, callable);
+    } on Object {
+      // A DLL without the export (UnsupportedError) or any registration
+      // failure: release the callable and fall back to polling.
+      try {
+        callable?.close();
+      } on Object {
+        // already closed / never opened — nothing to release
+      }
+      return null;
+    }
+  }
+
+  final AkTaskEventNotify _notify;
+  final Uint8List _runtimeId;
+  final NativeCallable<AkTaskEventNotifyNative> _callable;
+  bool _closed = false;
+
+  @override
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    try {
+      // Unregister FIRST: the native side blocks until an in-flight fire
+      // returned (§8.6), so closing the callable below has no
+      // use-after-free window. If the engine already died (a revoked
+      // lease / freed handle), nothing can fire anymore either — the
+      // error is swallowed and the close still runs.
+      _notify.setEventNotify(_runtimeId, null, Pointer<Void>.fromAddress(0));
+    } on Object {
+      // engine gone or seam refused: no fire is possible after that
+    }
+    _callable.close();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // C07: the owner/lease liveness probe (crash-analysis 2026-11-07).
@@ -575,14 +725,20 @@ final class AkTaskLeaseGate implements AkTaskCalls {
 /// makes `DynamicLibrary.lookup` throw `ArgumentError` — callers surface
 /// that as the explicit "old DLL unsupported" case via
 /// [missingTaskExports] first.
-final class AkTaskFfiBindings implements AkTaskCalls {
+final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
   AkTaskFfiBindings(
       {required Pointer<AkEngine> engine,
       required DynamicLibrary library,
       AkTaskLeaseProbe? isAlive})
       : _engine = engine,
         _library = library,
-        _isAlive = isAlive {
+        _isAlive = isAlive,
+        // CR-P2-05: the doorbell export is resolved TOLERANTLY — an old
+        // DLL without it still satisfies the frozen task-plane gate; the
+        // seam then reports no notify capability (setEventNotify throws
+        // UnsupportedError, which [TaskEventDoorbell.tryRegister] turns
+        // into the pure-polling fallback).
+        _setEventNotify = _resolveEventNotify(library) {
     _start = _library.lookupFunction<_StartC, _StartDart>('ak_task_start');
     _createCode =
         _library.lookupFunction<_OpStartC, _OpStartDart>('ak_task_create_code');
@@ -604,6 +760,17 @@ final class AkTaskFfiBindings implements AkTaskCalls {
         EngineLastErrorDart>('ak_engine_last_error');
   }
 
+  /// The tolerant lookup of the optional doorbell export (null on a DLL
+  /// predating it — see the constructor).
+  static _SetEventNotifyDart? _resolveEventNotify(DynamicLibrary library) {
+    try {
+      return library.lookupFunction<_SetEventNotifyC, _SetEventNotifyDart>(
+          akTaskEventNotifyExportName);
+    } on ArgumentError {
+      return null;
+    }
+  }
+
   final Pointer<AkEngine> _engine;
   final DynamicLibrary _library;
 
@@ -622,6 +789,10 @@ final class AkTaskFfiBindings implements AkTaskCalls {
   late final _EventBufDart _pollEvent;
   late final _ProgressBufDart _pollProgress;
   late final EngineLastErrorDart _engineLastError;
+
+  /// CR-P2-05: null on a DLL predating the doorbell export (the
+  /// tolerated-missing symbol — see the constructor).
+  final _SetEventNotifyDart? _setEventNotify;
 
   /// The native detail captured right after the most recent failing call
   /// (null when the last call did not fail or carried no text).
@@ -647,6 +818,12 @@ final class AkTaskFfiBindings implements AkTaskCalls {
           if (!_hasSymbol(library, name)) name,
       ];
 
+  /// CR-P2-05: does [library] export the doorbell registration? (An old
+  /// DLL without it still passes [missingTaskExports] — the doorbell is
+  /// an optional capability, never a gate.)
+  static bool supportsEventNotify(DynamicLibrary library) =>
+      _hasSymbol(library, akTaskEventNotifyExportName);
+
   static bool _hasSymbol(DynamicLibrary library, String name) {
     try {
       library.lookup(name);
@@ -654,6 +831,29 @@ final class AkTaskFfiBindings implements AkTaskCalls {
     } on ArgumentError {
       return false;
     }
+  }
+
+  /// CR-P2-05: `ak_task_set_event_notify(engine, runtime_id, fn|NULL,
+  /// ctx)` (ffi-v2.md §8.6). `fn == null` CLEARS the registration —
+  /// that call returns only after an in-flight fire completed, so the
+  /// caller may destroy the callback right after ([TaskEventDoorbell]
+  /// relies on this ordering). Throws [UnsupportedError] on a DLL
+  /// predating the export (callers reach this only through
+  /// [TaskEventDoorbell.tryRegister], which turns every failure into the
+  /// pure-polling fallback).
+  @override
+  int setEventNotify(Uint8List runtimeId,
+      Pointer<NativeFunction<AkTaskEventNotifyNative>>? fn, Pointer<Void> ctx) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    final invoke = _setEventNotify;
+    if (invoke == null) {
+      throw UnsupportedError(
+          '此 ak_ffi 版本没有导出 $akTaskEventNotifyExportName（CR-P2-05 门铃）');
+    }
+    return using((arena) {
+      final runtime = _idIn(runtimeId, arena);
+      return _note(invoke(_engine, runtime, fn ?? nullptr, ctx));
+    }, processAllocator);
   }
 
   @override
@@ -1098,6 +1298,17 @@ final class TaskRuntimeFfi {
     }
     throw StateError('任务事件超过 $_maxBufferBytes 字节');
   }
+
+  /// CR-P2-05 (2026-11-12): register this runtime's native event
+  /// doorbell — a thin pass-through to [TaskEventDoorbell.tryRegister]
+  /// over the same seam, so the SERVICE layer needs no pointer types.
+  /// Returns null when the seam lacks the capability (a fake / an old
+  /// DLL / a diagnostic gate) or registration failed: callers then keep
+  /// the D1 pure-polling behavior unchanged. The returned doorbell must
+  /// be [AkTaskDoorbell.close]d BEFORE the engine handle dies
+  /// (dispose-order: unregister → engine release).
+  AkTaskDoorbell? registerEventDoorbell(void Function() onRing) =>
+      TaskEventDoorbell.tryRegister(_calls, runtimeId, onRing);
 
   /// Pops the oldest ENGINE-WIDE progress line (no runtime scoping — the
   /// `ak_poll_progress` queue is one per engine; correlate by the line's

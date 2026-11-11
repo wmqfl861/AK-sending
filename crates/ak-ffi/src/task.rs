@@ -589,6 +589,56 @@ impl TaskStack {
     }
 }
 
+/// CR-P2-05 (review 2026-11-11, 改法第 1 条后半): the registered native
+/// event doorbell of one task runtime — a plain C callback Rust invokes
+/// whenever a task-plane event line is QUEUED, so the embedder can stop
+/// polling at a fixed cadence and drain (`ak_pairing_poll_event`) only
+/// when something actually arrived.
+///
+/// Design choice (Option A of the review's two candidates, the one
+/// implemented): a plain `extern "C" fn(ctx)` registered through the new
+/// `ak_task_set_event_notify` export, paired with Dart's builtin
+/// `NativeCallable.listener` (dart:ffi, no new dependencies). The
+/// alternative — `Dart_PostCObject` via an embedded `dart_api_dl.c` —
+/// was rejected: it ships ~200 lines of Dart SDK source inside ak-ffi
+/// (licensing-sensitive), needs a `Dart_InitializeApiDL` bootstrap on the
+/// embedder, and marshals events as `Dart_CObject` values, which is
+/// exactly the frozen-shape/lifetime hazard the review warned about. The
+/// doorbell carries NO payload — the poll stays the single authoritative
+/// channel — so no frozen §8.2/§8.3 shape is touched, and an embedder
+/// that never registers observes byte-identical pure-polling behavior.
+///
+/// Thread/lifetime contract (mirrored in ffi-v2.md §8.6):
+///
+/// * The callback fires on WHATEVER thread queued the event — the
+///   engine's embedded tokio workers for async facts, or the FFI
+///   caller's own thread when an export queues an event synchronously
+///   (e.g. `ak_task_disconnect`). That is safe for
+///   `NativeCallable.listener` (its trampoline only POSTS to the owning
+///   isolate's event loop from any thread) and adds no latency and no
+///   notifier thread; a fire-and-forget C callback of another embedder
+///   must simply not block.
+/// * The call happens UNDER the slot lock. That is deliberate: the
+///   trampoline never blocks or re-enters this library, so contention is
+///   bounded, while the lock gives the hard lifetime guarantee
+///   `ak_task_set_notify(…, None, …)` (unregister) needs — it returns
+///   only after an in-flight fire completed, and no later fire can
+///   start, so the caller may then destroy the callback
+///   (`NativeCallable.close`) without a use-after-free window.
+/// * The wrapper itself cannot panic (a fn-pointer call with a usize —
+///   no allocation, no indexing), and an `extern "C"` callee that
+///   unwinds aborts the process by definition of the ABI, so nothing is
+///   caught around the call: no panic can cross this boundary.
+pub(crate) struct TaskEventNotify {
+    /// The registered callback (a plain non-unwinding C function).
+    func: extern "C" fn(ctx: *mut std::os::raw::c_void),
+    /// The caller's opaque context token, stored as an address so the
+    /// slot stays `Send` + `Sync` inside the shared runtime without a
+    /// raw pointer (this module is `forbid(unsafe_code)`). Rust never
+    /// dereferences it — it is passed back verbatim.
+    ctx_addr: usize,
+}
+
 /// One task runtime (the `ak_task_start` artefact), keyed by runtime id in
 /// the engine's [`crate::pairing::V2State`] task table.
 pub(crate) struct TaskRt {
@@ -661,6 +711,10 @@ pub(crate) struct TaskRt {
     codes: Arc<TaskCodeTable>,
     /// The engine-wide progress queue (`ak_poll_progress`).
     engine_progress: Arc<StdMutex<VecDeque<String>>>,
+    /// CR-P2-05: the optional native event doorbell ([`TaskEventNotify`]
+    /// has the full contract). `None` = pure polling, bit-identical to
+    /// the pre-doorbell behavior.
+    notify: StdMutex<Option<TaskEventNotify>>,
 }
 
 impl TaskRt {
@@ -671,6 +725,13 @@ impl TaskRt {
     /// no condvar to wake). Order matters for the same reason the
     /// wave-26 P1-05 Dart sequence does: waiters, then owners.
     pub(crate) fn teardown(&self, runtime: &tokio::runtime::Runtime) {
+        // CR-P2-05: silence the doorbell FIRST — a runtime being torn
+        // down (engine drop) must not fire the embedder's callback from
+        // inside `ak_engine_free`, and the decline/closure events queued
+        // below are for the poll channel only.
+        if let Ok(mut slot) = self.notify.lock() {
+            *slot = None;
+        }
         {
             let mut stopped = match self.stopped.lock() {
                 Ok(slot) => slot,
@@ -761,9 +822,37 @@ impl TaskRt {
     }
 
     fn push_event(&self, line: String) {
-        if let Ok(mut queue) = self.events.lock() {
+        let queued = if let Ok(mut queue) = self.events.lock() {
             if queue.len() < MAX_QUEUED_EVENTS {
                 queue.push_back(line);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // CR-P2-05: ring the doorbell only when a line actually landed —
+        // a queue at its cap (or a poisoned lock) has nothing to drain,
+        // and a dropped event must not wake the embedder for nothing.
+        // The `-3` pushback path (`task_push_event_front`) never rings:
+        // the event was already announced when it was first queued and
+        // the poller is actively draining it.
+        if queued {
+            self.ring_event_notify();
+        }
+    }
+
+    /// CR-P2-05: invoke the registered doorbell — the WHOLE native-push
+    /// mechanism. Fire-and-forget under the slot lock ([`TaskEventNotify`]
+    /// documents why the lock is held across the call and why the wrapper
+    /// can neither panic nor unwind); no fire happens when nothing is
+    /// registered, which keeps the pure-polling behavior bit-identical
+    /// for embedders that never call `ak_task_set_event_notify`.
+    fn ring_event_notify(&self) {
+        if let Ok(slot) = self.notify.lock() {
+            if let Some(notify) = slot.as_ref() {
+                (notify.func)(notify.ctx_addr as *mut std::os::raw::c_void);
             }
         }
     }
@@ -1284,6 +1373,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         conn_ops: StdMutex::new(HashMap::new()),
         codes,
         engine_progress,
+        notify: StdMutex::new(None),
     });
     {
         let mut v2 = engine
@@ -4134,9 +4224,33 @@ pub(crate) fn task_push_event_front(
     Ok(())
 }
 
+/// CR-P2-05 (review 2026-11-11, 改法第 1 条后半): `ak_task_set_event_notify`
+/// safe half — register or clear ONE task runtime's event doorbell.
+///
+/// `Some((func, ctx))` stores the callback (it fires on the thread that
+/// queues each subsequent task event; see [`TaskEventNotify`]); `None`
+/// CLEARS it and — because [`TaskRt::ring_event_notify`] fires under the
+/// slot lock — returns only after an in-flight invocation completed, so
+/// the caller can safely destroy the callback right after this call.
+/// An unknown runtime is the plane's usual `-4`. The context token is an
+/// opaque address Rust never dereferences; `0` (a NULL `void*`) is fine.
+pub fn task_set_event_notify(
+    engine: &AkEngine,
+    runtime_id: &[u8; 16],
+    notify: Option<(extern "C" fn(ctx: *mut std::os::raw::c_void), usize)>,
+) -> Result<(), FfiError> {
+    let rt = task_runtime_of(engine, runtime_id)?;
+    let mut slot = rt
+        .notify
+        .lock()
+        .map_err(|_| FfiError::internal("task notify slot lock poisoned"))?;
+    *slot = notify.map(|(func, ctx_addr)| TaskEventNotify { func, ctx_addr });
+    Ok(())
+}
+
 /// `ak_pairing_cancel_op` task-plane half: cancel a TASK op (abort +
-/// terminal "cancelled by caller"). Strict like the op read (C11): the
-/// caller routed on the plane, errors propagate as-is.
+/// terminal "cancelled by caller"). Strict like the op read (C11):
+/// the caller routed on the plane, errors propagate as-is.
 pub(crate) fn task_cancel_op(
     engine: &AkEngine,
     runtime_id: &[u8; 16],
@@ -4196,7 +4310,8 @@ mod task_tests {
     use crate::task_ext::testabi::{
         ak_engine_free, ak_engine_last_error, ak_engine_new, ak_pairing_op_result,
         ak_pairing_poll_event, ak_task_consent, ak_task_create_code, ak_task_disconnect,
-        ak_task_join, ak_task_list, ak_task_send, ak_task_set_save_dir, ak_task_start,
+        ak_task_join, ak_task_list, ak_task_send, ak_task_set_event_notify, ak_task_set_save_dir,
+        ak_task_start,
     };
     use std::ffi::CString;
     use std::os::raw::c_char;
@@ -7992,6 +8107,192 @@ mod task_tests {
         );
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
+    }
+
+    // -- CR-P2-05 (2026-11-12): the native event doorbell ----------------------
+    //
+    // Tests run in PARALLEL threads, so each test below owns its own
+    // callback + counters — no shared statics, no cross-test races.
+
+    /// Test A's callback: counts invocations and records the ctx token
+    /// of the last call (a sentinel address; never dereferenced).
+    static A_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static A_CTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn notify_a(ctx: *mut std::os::raw::c_void) {
+        A_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        A_CTX.store(ctx as usize, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test B's two callbacks (proving a re-registration REPLACES the
+    /// old callback rather than adding a second one).
+    static B1_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static B2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn notify_b1(_ctx: *mut std::os::raw::c_void) {
+        B1_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn notify_b2(_ctx: *mut std::os::raw::c_void) {
+        B2_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test C's callback (cross-thread producers).
+    static C_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn notify_c(_ctx: *mut std::os::raw::c_void) {
+        C_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Registered → every queued task event rings the doorbell with the
+    /// caller's ctx verbatim; cleared (`notify = None`) → zero rings and
+    /// the pure-polling queue behavior is unchanged (the doorbell never
+    /// consumes an event). Built on the SAFE layer with an owned engine
+    /// value, like the consent-teardown test above (no raw pointer is
+    /// ever dereferenced in this `forbid(unsafe_code)` module).
+    #[test]
+    fn event_notify_fires_on_queued_events_and_silences_after_clear() {
+        A_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = task_start(&engine, &spec_for(dir.path())).expect("runtime");
+        let rt = task_runtime_of(&engine, &runtime_id).expect("task runtime");
+        // The runtime_ready of task_start queued BEFORE the registration
+        // and must NOT have rung; the queue itself still holds it.
+        assert_eq!(A_HITS.load(Ordering::SeqCst), 0);
+        assert_eq!(rt.events.lock().expect("events").len(), 1);
+        let sentinel = 0xdead_beef_usize;
+        task_set_event_notify(&engine, &runtime_id, Some((notify_a, sentinel))).expect("register");
+        // Registering alone must not ring either (doorbell ≠ payload).
+        assert_eq!(A_HITS.load(Ordering::SeqCst), 0);
+        rt.push_event("{\"event\":\"probe_result\"}".to_string());
+        assert_eq!(A_HITS.load(Ordering::SeqCst), 1);
+        assert_eq!(A_CTX.load(Ordering::SeqCst), sentinel);
+        rt.push_event("{\"event\":\"done\"}".to_string());
+        assert_eq!(A_HITS.load(Ordering::SeqCst), 2, "one ring per event");
+        // Clearing: returns only after the last fire — no more rings.
+        task_set_event_notify(&engine, &runtime_id, None).expect("clear");
+        rt.push_event("{\"event\":\"disconnected\"}".to_string());
+        assert_eq!(
+            A_HITS.load(Ordering::SeqCst),
+            2,
+            "cleared doorbell never rings"
+        );
+        // Every queued line is still POLLABLE — the doorbell never
+        // consumed anything (poll stays authoritative): runtime_ready +
+        // the three pushes.
+        assert_eq!(rt.events.lock().expect("events").len(), 4);
+        // Teardown (engine drop) also silences a doorbell someone left
+        // registered: the Arc-cloned runtime outlives the engine value,
+        // and its later pushes must not ring a dead embedder callback.
+        task_set_event_notify(&engine, &runtime_id, Some((notify_a, 0)))
+            .expect("re-register before drop");
+        let survivor = Arc::clone(&rt);
+        drop(engine); // teardown clears the slot first
+        survivor.push_event("{}".to_string());
+        assert_eq!(
+            A_HITS.load(Ordering::SeqCst),
+            2,
+            "teardown silenced the doorbell (engine_free may not fire)"
+        );
+    }
+
+    /// A REPLACING registration swaps the callback; a NULL ctx with a
+    /// live fn is legal (opaque token); unknown runtime `-4`; NULL
+    /// runtime pointer `-1` — all through the C EXPORT adapter, with the
+    /// safe layer confirming the swap's effect. The engine VALUE backs
+    /// both views (the exports take `*mut AkEngine`; a shared-borrow
+    /// cast is sound because every export reads the handle as `&`).
+    #[test]
+    fn event_notify_export_validates_and_replaces() {
+        B1_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+        B2_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let engine = AkEngine::new().expect("engine");
+        let raw = &engine as *const AkEngine as *mut AkEngine;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = task_start(&engine, &spec_for(dir.path())).expect("runtime");
+        let rt = task_runtime_of(&engine, &runtime_id).expect("task runtime");
+        assert_eq!(
+            ak_task_set_event_notify(
+                raw,
+                [9u8; 16].as_ptr(),
+                Some(notify_b1),
+                std::ptr::null_mut()
+            ),
+            -4,
+            "unknown runtime id"
+        );
+        assert_eq!(
+            ak_task_set_event_notify(raw, std::ptr::null(), Some(notify_b1), std::ptr::null_mut()),
+            -1,
+            "null runtime pointer"
+        );
+        assert_eq!(
+            ak_task_set_event_notify(
+                raw,
+                runtime_id.as_ptr(),
+                Some(notify_b1),
+                std::ptr::null_mut()
+            ),
+            0,
+            "register via the export"
+        );
+        rt.push_event("{}".to_string());
+        assert_eq!(B1_HITS.load(Ordering::SeqCst), 1);
+        assert_eq!(B2_HITS.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ak_task_set_event_notify(
+                raw,
+                runtime_id.as_ptr(),
+                Some(notify_b2),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        rt.push_event("{}".to_string());
+        assert_eq!(B1_HITS.load(Ordering::SeqCst), 1, "replaced, not added");
+        assert_eq!(B2_HITS.load(Ordering::SeqCst), 1, "NULL ctx passes through");
+        assert_eq!(
+            ak_task_set_event_notify(raw, runtime_id.as_ptr(), None, std::ptr::null_mut()),
+            0,
+            "clear via the export"
+        );
+        rt.push_event("{}".to_string());
+        assert_eq!(B2_HITS.load(Ordering::SeqCst), 1, "cleared = silent");
+        drop(engine);
+    }
+
+    /// The fire happens on the PRODUCING thread and never blocks it into
+    /// a deadlock: a producer thread pushes 64 events (ringing on ITS
+    /// thread under the fire lock) while this thread clears — the clear
+    /// waits for the in-flight fire, and afterwards no ring may happen
+    /// even though the producer's Arc<TaskRt> still exists.
+    #[test]
+    fn event_notify_crosses_threads_and_clear_waits_for_inflight_fire() {
+        C_HITS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let engine = AkEngine::new().expect("engine");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = task_start(&engine, &spec_for(dir.path())).expect("runtime");
+        task_set_event_notify(&engine, &runtime_id, Some((notify_c, 0))).expect("register");
+        let rt = task_runtime_of(&engine, &runtime_id).expect("task runtime");
+        let producer = thread::spawn(move || {
+            for _ in 0..64 {
+                rt.push_event("{\"event\":\"chunk_sent\"}".to_string());
+            }
+        });
+        producer
+            .join()
+            .expect("producer must not deadlock under the fire lock");
+        assert_eq!(C_HITS.load(Ordering::SeqCst), 64);
+        task_set_event_notify(&engine, &runtime_id, None).expect("clear");
+        let survivor = task_runtime_of(&engine, &runtime_id).expect("task runtime");
+        survivor.push_event("{}".to_string());
+        assert_eq!(
+            C_HITS.load(Ordering::SeqCst),
+            64,
+            "no ring after the clear returned"
+        );
+        drop(engine);
     }
 
     // -- helpers --------------------------------------------------------------

@@ -111,6 +111,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         _engine = task_engine.SimpleTransferService(
           calls: calls,
           delay: delay,
+          // CR-P2-05: the PURE-POLLING active cadence (D1's 50 ms) — the
+          // engine service's native doorbell registration (2026-11-12
+          // 后半) slows the effective tick to its 250 ms safety net by
+          // itself when the seam supports `ak_task_set_event_notify`;
+          // fakes/old DLLs keep exactly this 50 ms behavior.
           eventPollInterval: const Duration(milliseconds: 50),
         ) {
     // Wave-29 P1-01: Android resolves the real identity directory from

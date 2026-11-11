@@ -19,6 +19,7 @@
 //! ak_task_send(engine, runtime_id, conn_id[16], paths_json, op_id_out[16])
 //! ak_task_set_save_dir(engine, runtime_id, path)
 //! ak_task_consent(engine, runtime_id, job_id[16], accept)
+//! ak_task_set_event_notify(engine, runtime_id, notify|NULL, ctx)  // 2026-11-12
 //! ```
 //!
 //! Op RESULTS and EVENTS do not add symbols: they flow through the
@@ -27,14 +28,19 @@
 //! table when the runtime id names a task runtime (one `runtime_plane`
 //! table pass decides which plane owns the id) — the wave-28 brief's
 //! "结果经 poll_event/op_result 取 / 接收提示断开事件走现有
-//! poll_event 通道扩展事件类型" ruling.
+//! poll_event 通道扩展事件类型" ruling. The one addition,
+//! `ak_task_set_event_notify` (CR-P2-05 改法第 1 条后半, 2026-11-12),
+//! adds NO event/result channel: it registers a DOORBELL — a plain C
+//! callback fired when a task event is queued — while the poll remains
+//! the single authoritative channel (`src/task.rs`'s `TaskEventNotify`
+//! documents the thread/lifetime contract; ffi-v2.md §8.6 the ABI).
 //!
 //! Nothing here returns a NOT_IMPLEMENTED code; the registry relay,
 //! real probes and remote-disconnect events are fully wired at the
 //! safe layer (`src/task.rs` — see the module docs for the final
 //! wave-28 shape).
 
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 
 use crate::core::{self, guarded, AkEngine, FfiError, AK_DONE, AK_ERR_BUFFER, AK_ERR_NULL, AK_OK};
 use crate::task;
@@ -531,6 +537,52 @@ pub unsafe extern "C" fn ak_task_consent(
     }
 }
 
+/// `ak_task_set_event_notify` (CR-P2-05 改法第 1 条后半, 2026-11-12):
+/// register or clear ONE task runtime's event DOORBELL. `notify` NULL =
+/// clear (returns only after an in-flight invocation completed — the
+/// caller may then destroy the callback); non-NULL = the callback Rust
+/// invokes (with `ctx` verbatim) on the thread that queues each
+/// subsequent task event. The poll (`ak_pairing_poll_event`) stays the
+/// single authoritative channel — the doorbell carries NO payload.
+/// `AK_OK`; `-1` null engine/runtime pointer; `-4` unknown runtime.
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id` non-null and readable for 16
+/// bytes. `notify` (when non-NULL) must point to a valid C function of
+/// the documented signature that does not unwind, does not block, and
+/// does not re-enter this library — Rust calls it from arbitrary engine
+/// threads while holding the runtime's notify slot (the unregister
+/// lifetime guarantee). `ctx` is opaque to Rust (never dereferenced;
+/// NULL allowed) and must stay valid — or at least stay a meaningful
+/// token — until the next `ak_task_set_event_notify` on this runtime or
+/// the engine's teardown. Engine handle as `ak_send_start`.
+#[no_mangle]
+pub unsafe extern "C" fn ak_task_set_event_notify(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    notify: Option<extern "C" fn(ctx: *mut c_void)>,
+    ctx: *mut c_void,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // SAFETY: read_id verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_id(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    let registration = notify.map(|func| (func, ctx as usize));
+    match guarded(|| task::task_set_event_notify(engine, &runtime_id, registration)) {
+        Ok(()) => AK_OK,
+        Err(error) => fail(error),
+    }
+}
+
 #[cfg(test)]
 mod abi_shape_tests {
     //! P0-01-style guard: pin every `ak_task_*` export's name AND full call
@@ -563,6 +615,15 @@ mod abi_shape_tests {
             ak_task_set_save_dir;
         let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *const u8, i32) -> i32 =
             ak_task_consent;
+        // CR-P2-05 (2026-11-12): the doorbell registration export — the
+        // one task-plane ADDITION (a nullable C fn pointer + an opaque
+        // context token; ffi-v2.md §8.6).
+        let _: unsafe extern "C" fn(
+            *mut AkEngine,
+            *const u8,
+            Option<extern "C" fn(*mut c_void)>,
+            *mut c_void,
+        ) -> i32 = ak_task_set_event_notify;
     }
 }
 
@@ -575,7 +636,7 @@ mod abi_shape_tests {
 /// nothing outside `#[cfg(test)]` can reach them.
 #[cfg(test)]
 pub(crate) mod testabi {
-    use std::os::raw::c_char;
+    use std::os::raw::{c_char, c_void};
 
     use crate::core::AkEngine;
     // The real exports, renamed so the same-name safe adapters below can
@@ -589,6 +650,7 @@ pub(crate) mod testabi {
         ak_task_consent as ffi_task_consent, ak_task_create_code as ffi_task_create_code,
         ak_task_disconnect as ffi_task_disconnect, ak_task_join as ffi_task_join,
         ak_task_list as ffi_task_list, ak_task_send as ffi_task_send,
+        ak_task_set_event_notify as ffi_task_set_event_notify,
         ak_task_set_save_dir as ffi_task_set_save_dir, ak_task_start as ffi_task_start,
     };
 
@@ -712,5 +774,18 @@ pub(crate) mod testabi {
     ) -> i32 {
         // SAFETY: both ids are the test's 16-byte arrays.
         unsafe { ffi_task_consent(engine, runtime_id, job_id, accept) }
+    }
+
+    pub(crate) fn ak_task_set_event_notify(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        notify: Option<extern "C" fn(ctx: *mut c_void)>,
+        ctx: *mut c_void,
+    ) -> i32 {
+        // SAFETY: the id is the test's 16-byte array; `notify` (when
+        // given) is the test's own well-formed counter fn; `ctx` is a
+        // sentinel address the counter records verbatim (never
+        // dereferenced).
+        unsafe { ffi_task_set_event_notify(engine, runtime_id, notify, ctx) }
     }
 }

@@ -4,7 +4,11 @@ version: 0.1.0
 publish_to: none
 
 environment:
-  sdk: ^3.0.0
+  # ^3.1.0 (was ^3.0.0): dart:ffi's NativeCallable — the CR-P2-05
+  # (2026-11-12) native event doorbell registers its listener through
+  # it — is @Since('3.1') in the SDK. The Flutter app already requires
+  # Dart ^3.13.7, so this raises no consumer's floor.
+  sdk: ^3.1.0
 
 dependencies:
   # C03 (codex-crash-analysis-2026-11-07): the ONE matched C heap pair used

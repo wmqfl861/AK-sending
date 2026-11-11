@@ -28,6 +28,9 @@ import 'package:test/test.dart';
 import 'package:ak_ffi_dart/src/bindings.dart';
 import 'package:ak_ffi_dart/src/engine.dart';
 import 'package:ak_ffi_dart/src/ffi_json.dart';
+import 'package:ak_ffi_dart/src/model/task_events.dart'
+    show TaskOpSettledEvent;
+import 'package:ak_ffi_dart/src/task_ffi.dart';
 
 void main() {
   tearDown(() {
@@ -1219,5 +1222,79 @@ test('expect spec: "book" is a valid value, near-misses are not', () {
   _expectSpecError(() => recv('bookk').toJsonString(), '"book"');
   _expectSpecError(() => recv('nope').toJsonString(), '"book"');
   _expectSpecError(() => recv('12345').toJsonString(), '6-digit');
+});
+
+// ---------------------------------------------------------------------------
+// CR-P2-05 (2026-11-12): the native event doorbell over the REAL DLL —
+// the full push path (export → Rust store → fire from an ENGINE thread →
+// NativeCallable.listener delivery on this isolate → the poll stays the
+// authoritative channel), plus the unregister lifetime ordering.
+// ---------------------------------------------------------------------------
+
+test('CR-P2-05: a native ring reaches the isolate and the poll stays '
+    'authoritative', () async {
+  final engine = AkEngineDart();
+  final task = AkTaskFfiBindings(
+      engine: engine.nativeHandle, library: engine.bindings.library);
+  try {
+    // The optional capability is exported by this build.
+    expect(AkTaskFfiBindings.supportsEventNotify(engine.bindings.library),
+        isTrue,
+        reason: '本构建必须导出 ak_task_set_event_notify');
+
+    // A task runtime against a DEAD loopback registry: `create_code` is
+    // accepted (op id minted synchronously), the connect is refused fast
+    // on loopback, and the op's failure becomes a REAL task event queued
+    // by an engine thread — exactly the async-producer shape the
+    // doorbell exists for.
+    final dir = _newTempDir('doorbell');
+    final runtime = TaskFfi(calls: task).start(AkTaskStartSpec(
+      registry: '127.0.0.1:7200',
+      registryIdHex: '11' * 32,
+      idDir: dir.path,
+    ));
+
+    var rings = 0;
+    final doorbell = runtime.registerEventDoorbell(() => rings++);
+    expect(doorbell, isNotNull, reason: '注册成功');
+    expect(rings, 0, reason: '注册本身不响铃（门铃不携带载荷）');
+
+    // Drain runtime_ready (queued by ak_task_start BEFORE the
+    // registration) so the only later events are the op's facts.
+    while (runtime.pollEvent() != null) {}
+
+    // Accepted synchronously (an op id was minted); its FAILURE arrives
+    // as an event on an engine thread — the ring's producer.
+    runtime.createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender));
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (rings == 0 && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(rings, greaterThan(0),
+        reason: '引擎线程入队事件后，原生门铃必须唤醒本 isolate');
+
+    // The poll is still the authoritative channel: the op's terminal
+    // EVENT is readable through ak_pairing_poll_event (the doorbell
+    // consumed nothing). Either verdict (done on a live registry /
+    // failed on this dead one) proves the channel.
+    var sawOpFact = false;
+    for (var drained = 0; drained < 64; drained++) {
+      final event = runtime.pollEvent();
+      if (event == null) {
+        break;
+      }
+      sawOpFact = sawOpFact || event is TaskOpSettledEvent;
+    }
+    expect(sawOpFact, isTrue, reason: 'op_done/op_failed 可经 poll 读回');
+
+    // Unregister: after close() returns no further ring may arrive (the
+    // §8.6 in-flight guarantee) — the drains below run silently.
+    final ringsAtClose = rings;
+    doorbell!.close();
+    while (runtime.pollEvent() != null) {}
+    expect(rings, ringsAtClose, reason: 'close 后不再响铃');
+  } finally {
+    engine.dispose();
+  }
 });
 }

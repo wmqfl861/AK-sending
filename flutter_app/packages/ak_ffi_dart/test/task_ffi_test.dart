@@ -7,6 +7,8 @@ library;
 
 import 'dart:async' show Timer, TimeoutException;
 
+import 'dart:ffi' show NativeFunction, Pointer, Void;
+
 import 'dart:typed_data' show Uint8List;
 
 import 'package:ak_ffi_dart/ak_ffi_dart.dart';
@@ -710,11 +712,103 @@ void main() {
           reason: 'a revoked lease refuses the exported calls');
     });
   });
+
+  group('CR-P2-05 (2026-11-12): the native event doorbell', () {
+    test('a seam without the capability falls back to pure polling '
+        '(null doorbell, nothing thrown)', () {
+      final fake = FakeAkTaskCalls();
+      expect(fake, isNot(isA<AkTaskEventNotify>()));
+      expect(TaskEventDoorbell.tryRegister(fake, Uint8List(16), () {}),
+          isNull,
+          reason: '无门铃能力的 seam 必须安静地退回纯轮询');
+    });
+
+    test('a capable seam registers a live doorbell; close() unregisters '
+        'BEFORE releasing the callable (the §8.6 ordering)', () {
+      final fake = NotifyFakeCalls();
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+        registry: '127.0.0.1:7200',
+        registryIdHex: regId64,
+        idDir: 'C:/ak/doorbell',
+      ));
+      final doorbell =
+          runtime.registerEventDoorbell(expectAsync0(() {}, count: 0));
+      expect(doorbell, isNotNull, reason: '注册成功返回门铃');
+      expect(fake.sets, 1);
+      expect(fake.registered, isNotNull);
+      // The runtime-level registrar is the seam-level one.
+      final direct = TaskEventDoorbell.tryRegister(
+          fake, runtime.runtimeId, () {});
+      expect(direct, isNotNull);
+      expect(fake.sets, 2, reason: '同一 seam 可为另一门铃再注册');
+      direct!.close();
+      expect(fake.clears, 1, reason: 'close 先注销（fn=NULL）');
+      doorbell!.close();
+      expect(fake.clears, 2);
+      expect(fake.registered, isNull);
+      doorbell.close(); // idempotent
+      expect(fake.clears, 2, reason: '重复 close 不再调用原生层');
+    });
+
+    test('a refused registration returns null and leaves nothing behind',
+        () {
+      final fake = NotifyFakeCalls()..nextSetStatus = AkStatus.errInvalid;
+      expect(
+          TaskEventDoorbell.tryRegister(fake, Uint8List(16), () {}), isNull,
+          reason: '原生拒绝（非 0 状态）= 纯轮询回退');
+      expect(fake.sets, 1);
+      expect(fake.registered, isNotNull, reason: 'fake 只记录；真实层已回滚');
+      // A direct CLEAR through the seam is the close() half verbatim.
+      expect(fake.setEventNotify(Uint8List(16), null, Pointer.fromAddress(0)),
+          AkStatus.ok);
+      expect(fake.clears, 1);
+      expect(fake.registered, isNull);
+    });
+
+    test('the export name is NOT part of the frozen task-plane gate',
+        () {
+      // The doorbell is an optional capability: a DLL missing ONLY this
+      // symbol still passes missingTaskExports (old-DLL tolerance).
+      expect(akTaskExportNames, isNot(contains(akTaskEventNotifyExportName)));
+      expect(akTaskEventNotifyExportName, 'ak_task_set_event_notify');
+    });
+  });
 }
 
 /// A zero-delay `Future.delayed` stand-in (the wait loops become
 /// synchronous drains under the fake).
 Future<void> immediateDelay(Duration d) async {}
+
+/// CR-P2-05 (2026-11-12): a fake seam that CAN register doorbells (the
+/// real one is [AkTaskFfiBindings]; [FakeAkTaskCalls] deliberately is
+/// not — fakes keep pure polling).
+final class NotifyFakeCalls extends FakeAkTaskCalls
+    implements AkTaskEventNotify {
+  /// The fn pointer of the live registration (null = cleared).
+  Pointer<NativeFunction<AkTaskEventNotifyNative>>? registered;
+
+  /// How many REGISTER calls arrived (fn != null).
+  int sets = 0;
+
+  /// How many CLEAR calls arrived (fn == null).
+  int clears = 0;
+
+  /// The status the NEXT set returns (clears always 0).
+  int nextSetStatus = 0;
+
+  @override
+  int setEventNotify(Uint8List runtimeId,
+      Pointer<NativeFunction<AkTaskEventNotifyNative>>? fn, Pointer<Void> ctx) {
+    if (fn == null) {
+      clears++;
+      registered = null;
+      return 0;
+    }
+    sets++;
+    registered = fn;
+    return nextSetStatus;
+  }
+}
 
 /// Pops events until one matches [test], returning it (null when the queue
 /// ran dry).

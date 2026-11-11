@@ -323,7 +323,7 @@ signal-server
 - 指针先检；`-3` 无副作用；异步请求；取消/释放；真实 DLL 双实例 e2e。
 - B7（CLI）侧另按 B.9 表验证：旧命令回归；两进程入队仍串行；同身份不重复登录；秘密不进输出日志。
 
-## 8. 任务面扩展：`ak_task_*` 八导出（wave-28 冻结，按 §1 裁决第 4 条新增符号）
+## 8. 任务面扩展：`ak_task_*` 八导出（wave-28 冻结，按 §1 裁决第 4 条新增符号；2026-11-12 增补第 9 个符号 `ak_task_set_event_notify`，见 §8.6）
 
 v1 极简配对的产品模型（用户冻结）：三动作——生成任务码（选角色）/ 输码加入 / 连接列表+断开；连接后发送方选文件发送，接收方收到请求可接受/拒绝；设置仅一个默认保存文件夹。**全程零 IP/端口/指纹进 UI。** 本节符号全部为新增，已发布签名的参数形状一字不动；除下表两个例外，状态码、`-3` 无损重试、`request_id` 幂等、`last_error` 全路径等纪律与 §2/§3 完全一致。
 
@@ -375,6 +375,14 @@ int32_t ak_task_consent(
     const uint8_t runtime_id[16],
     const uint8_t job_id[16],
     int32_t accept);
+
+/* 2026-11-12 增补（CR-P2-05 改法第 1 条后半，§8.6）：事件门铃注册。
+ * notify 为 NULL = 注销；ctx 为不透明回调令牌（NULL 合法）。 */
+int32_t ak_task_set_event_notify(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    void (*notify)(void *ctx),
+    void *ctx);
 ```
 
 **结果与事件通道不新增符号**（wave-28 裁决）：任务 op 结果经既有 `ak_pairing_op_result(engine, runtime_id, op_id, buf, cap)` 读取、事件经既有 `ak_pairing_poll_event(engine, runtime_id, buf, cap)` 读取、取消经 `ak_pairing_cancel_op`——`runtime_id` 指任务运行时即可；两平面表不相交，配对平面先查、未命中落任务面，`-4` 语义不变。
@@ -470,5 +478,15 @@ wave-31 实现边界（P2-06）：冻结语义原定"save_dir 在同意决定时
 wave-28 的并行占位槽位已全部落地为真实路径：任务码经 ak-session `TaskPairing` 在真实注册中心 claim/redeem（`max_redeems=1`，配对 transcript 至 `PairReady` 跨引擎/跨设备成立）；加入方钉扎的公钥来自中继的已验证对端指纹；`probe_result` 由真实 UDP 探测回答（echo responder 带 wave-29 防反射约束：应答携带全零 nonce 且永不回答应答本身，并有每来源应答预算）；接收侧身份准入与同意归属按 §8.4；空闲断开通知与码取消按 §8.4。已知诚实边界：纯发送侧设备空闲时无法被主动通知（无数据监听），其发现时机为其下一次发送失败；探测结论只证明候选端口的 UDP 可达性，不构成身份授权。
 
 **控制连接维护（wave-35 keeper，提交 `e7fc1e0`）**：每个任务运行时的共享 registry 控制连接由常驻 keeper 维护——每 **20 秒**一次保活 ping＋连接状态变 `Disconnected` 时自动 `reconnect()`（配对订阅跨重连保留，owner loop 在断连窗口后继续应答 redeem）。保活预算的依据是 registry v2 的 **30 秒 `FRAME_IO_DEADLINE` 静默断连**（完整入站帧静默 30 秒即断开，出站消息不刷新该期限；历史上 45 秒间隔已被实测切断）——**不是** 120 秒 SESSION_TTL（源码注释中该归因以 30 秒帧期限为准，2026-11-09 终审 R36-P1-01/P2-04 更正）。诚实边界（wave-36 `624b523` 后的口径）：R36-P1-01/P1-02 已修——keeper 统一为 `RegistryClient::spawn_connection_keeper` 公共组件（20s ping＋有界退避 0/1/2/4/8/30s＋连续 3 次 ping 超时的黑洞恢复），重连一批失败后发布可重试终态 `Disconnected`（不再停留 `Connecting`），FFI 与 CLI task 命令族、daemon 共用。残余边界：R36-P2-04 的同身份互斥在 CLI task 命令族与 daemon 间经连接锁生效；FFI（GUI）进程与其他进程的同身份互踢窗口仍存在（服务器无 replaced 区分，属后续演进）。
+
+### 8.6 原生推送门铃：`ak_task_set_event_notify`（2026-11-12 增补，CR-P2-05 改法第 1 条后半）
+
+评审 2026-11-11 CR-P2-05 的改法第 1 条后半：Dart 侧对 FFI 事件的定频轮询改为**原生推送唤醒**。实现取评审给出的第 1 候选（`NativeCallable.listener` + 纯 C 函数指针），未取 `Dart_PostCObject`/dart_api_dl——后者需在 ak-ffi 内嵌约 200 行 Dart SDK 源码（许可敏感）、要求嵌入方先跑 `Dart_InitializeApiDL`、且把事件编组为 `Dart_CObject`（正是冻结形状/生命周期风险所在）。本符号因此**只传递"有事可取"这一个比特**：
+
+- **门铃语义（doorbell-only）**：`notify` 非 NULL 时，Rust 在**每有一条任务面事件行入队**（`ak_pairing_poll_event` 读的那个队列）的线程上立即调用 `notify(ctx)`；调用方被唤醒后调用一次既有的 poll 排空。**事件载荷仍只经 poll 通道**——门铃不携带任何字段，§8.2/§8.3 冻结形状零改动；门铃也从不消费事件（漏铃/多铃都无害：排空以队列为空为准）。`-3` 回推（pushback）路径**不响铃**（该事件首次入队时已响过，且调用方正在排空）；`ak_poll_progress` 引擎级进度行**不响铃**（高频字节级事实仍由周期 tick 与等待方的自有排空节流——门铃只服务低频高重要性的任务事件）。
+- **未注册即纯轮询**：`notify` 从未注册、或已注销（NULL）的运行时，行为与本符号不存在时**逐位一致**（Android/Windows 未注册门铃的嵌入方完全不受影响）；每个任务运行时至多一个门铃，重复注册以最后一次为准。
+- **线程与生命周期契约**：回调在**任意引擎线程**上触发（异步事实在引擎内嵌 tokio worker 上；`ak_task_start`/`ak_task_disconnect` 等同步入队则在该 FFI 调用线程上——Dart 的 `NativeCallable.listener` 桩函数只向 isolate 事件循环投递消息、可在任意线程被调，故无需专用通知线程、零额外时延）。回调必须**不阻塞、不解退（unwind）、不重入本库**（尤其不得在该回调里调 `ak_task_set_event_notify`——会死锁在门铃槽锁上）。Rust 在持槽锁期间发起调用，因此**注销（`notify = NULL`）返回后保证没有任何在途回调、也不再会有新回调**——调用方随后销毁回调本体（如 `NativeCallable.close()`）无释放后使用窗口。引擎 teardown（`ak_engine_free`）最先清空门铃：释放过程中绝不触发回调。
+- **状态码**：`0` 成功注册/注销；`-1` engine 或 `runtime_id` 指针为空；`-4` 未知 runtime。`ctx` 为不透明令牌（NULL 合法），Rust 原样回传、永不解引用。
+- **Dart 侧配套**：绑定层以可选能力探测本符号（旧 DLL 缺失该导出 → 明确退回纯轮询，不落入 §2 "旧 DLL 不支持" 的硬失败路径，因为八个冻结导出仍齐全）；服务层门铃唤醒立即排空，D1 自适应泵降频为**安全网**（活动 250 ms / 空闲 1 s 的兜底 tick——漏铃永不卡死 UI）。
 
 **C07/C12 实现边界（wave-33b，提交 `bcf5de0`）**：C07＝FFI 绑定租约——facade 在 `engine_free` 之前把租约翻为 not-alive，借用句柄的后续调用得到显式 `StateError` 而非触达已释放指针（Dart 侧该租约撤销直接闩入 C12 故障态）。C12＝Dart 事件泵预算与故障闩——每 tick 最多 64 条事件＋64 条进度行；**连续 10 次**原生轮询失败（事件/进度轮询异常与坏进度行 alike，且自 2026-11-09 R36-P2-02 起只有**两通道当 tick 均成功**才清零计数）闩上终态 `engineFailed`：泵停止、服务拒绝一切后续操作；自 R36-P2-03 起该闩经可回放的 `engineHealth` 流送达 UI（主页故障卡），待处理操作与接收等待以同一故障及时结束。恢复＝仅重建服务（GUI 侧即重启应用）。

@@ -499,6 +499,25 @@
 //! `receive_with_addr_consent`), and `ak_task_send` runs REAL engine
 //! sends over LAN-first candidates under the split 10 s connect budget
 //! with automatic fallback (the wave-25/26 CLI driver, P1-01 shape).
+//!
+//! # CR-P2-05 (review 2026-11-11): native event push (`ak_task_set_event_notify`)
+//!
+//! The review's finding: Dart-side fixed-cadence polling for FFI events
+//! wastes wake-ups. D1 (same review, 改法第 1 条前半) already made the
+//! poll adaptive; this addition (后半) gives the embedder a native PUSH
+//! doorbell: `ak_task_set_event_notify(engine, runtime_id, fn, ctx)`
+//! registers a plain C callback per TASK runtime that Rust invokes on
+//! the thread that queues each task event line. The design picked a
+//! plain fn pointer + Dart's builtin `NativeCallable.listener`
+//! (`dart:ffi`, no new dependency, no embedded `dart_api_dl.c` — that
+//! alternative ships Dart SDK source and marshals event payloads, the
+//! frozen-shape hazard the review flagged). DOORBELL-ONLY: the poll
+//! (`ak_pairing_poll_event`) stays the single authoritative payload
+//! channel — no §8.2/§8.3 shape changed — and a runtime without a
+//! registered callback behaves bit-identically to the pure-polling
+//! status quo (Android/Windows embedders that never register are
+//! unaffected). Full thread/lifetime contract: `src/task.rs`
+//! (`TaskEventNotify`) and ffi-v2.md §8.6.
 
 mod core;
 mod pairing;
@@ -525,5 +544,5 @@ pub use crate::shim::{
 };
 pub use crate::task_ext::{
     ak_task_consent, ak_task_create_code, ak_task_disconnect, ak_task_join, ak_task_list,
-    ak_task_send, ak_task_set_save_dir, ak_task_start,
+    ak_task_send, ak_task_set_event_notify, ak_task_set_save_dir, ak_task_start,
 };

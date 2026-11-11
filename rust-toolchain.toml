@@ -1,0 +1,8 @@
+# Pinned toolchain (CR-P2-06): one source of truth for local dev and CI.
+# CI uses dtolnay/rust-toolchain without an explicit toolchain input, so it
+# installs whatever this file pins. Upgrades happen in their own dedicated
+# commit (fmt may shift, clippy/rustdoc lints evolve).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -150,6 +150,31 @@ impl LineLog {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Wait until at least `count` lines contain `needle`.
+    fn wait_count(&self, needle: &str, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let have = self
+                .snapshot()
+                .iter()
+                .filter(|line| line.contains(needle))
+                .count();
+            if have >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {have}/{count} lines containing {needle:?} within {timeout:?}; output so far:
+{}",
+                self.snapshot().join(
+                    "
+"
+                )
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// A resident CLI child process with captured stdout/stderr.
@@ -907,36 +932,26 @@ impl DaemonChain {
 /// the transfer started), `job_done(peer)` closing it (committed). Two
 /// tasks are serialized exactly when their intervals are disjoint, and
 /// overlapped exactly when both opens precede the other's close.
-fn task_intervals(owner: &Proc) -> Vec<(String, usize, usize)> {
-    let mut open: Vec<(String, usize)> = Vec::new();
-    let mut intervals: Vec<(String, usize, usize)> = Vec::new();
-    for (index, line) in owner.stdout.snapshot().iter().enumerate() {
+/// Max simultaneously-in-flight jobs and total started jobs, from the RAW
+/// event line order (+1 per job_started, -1 per job_done). Pairing-free by
+/// design: job_done.peer is optional and job_started carries no task id, so
+/// peer/id-based pairing is inherently ambiguous under parallel completion
+/// (CI runs 43029286253/43069873077/43077330860 each tripped a different
+/// ambiguity). Serial-vs-parallel semantics live in the ORDER alone.
+fn job_concurrency(owner: &Proc) -> (usize, usize) {
+    let mut in_flight = 0usize;
+    let mut max_in_flight = 0usize;
+    let mut started = 0usize;
+    for line in owner.stdout.snapshot() {
         if line.contains("\"type\":\"job_started\"") {
-            if let Some(peer) = json_field(line, "peer") {
-                open.push((peer, index));
-            }
+            started += 1;
+            in_flight += 1;
+            max_in_flight = max_in_flight.max(in_flight);
         } else if line.contains("\"type\":\"job_done\"") {
-            // job_done's peer is optional (null on completion paths that
-            // lost the peer context — observed on CI): pair those FIFO with
-            // the oldest unmatched job_started instead of dropping them
-            // (each test peer starts exactly one job).
-            let position = match json_field(line, "peer") {
-                Some(peer) => open.iter().position(|(p, _)| *p == peer),
-                // peer:null -> FIFO with the oldest unmatched start.
-                None if !open.is_empty() => Some(0),
-                _ => None,
-            };
-            if let Some(position) = position {
-                let (peer, start) = open.remove(position);
-                intervals.push((peer, start, index));
-            }
+            in_flight = in_flight.saturating_sub(1);
         }
     }
-    intervals
-}
-
-fn intervals_disjoint(a: &(String, usize, usize), b: &(String, usize, usize)) -> bool {
-    a.2 < b.1 || b.2 < a.1
+    (max_in_flight, started)
 }
 
 /// Test 4 — same-code serial: one owner code, two redeemers sending to
@@ -968,15 +983,12 @@ async fn same_code_serial_two_redeemers_never_overlap() {
 
     owner
         .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner
-        .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    let intervals = task_intervals(owner);
-    assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
+        .wait_count("\"type\":\"job_done\"", 2, Duration::from_secs(30));
+    let (max_in_flight, started) = job_concurrency(owner);
+    assert_eq!(started, 2, "two completed tasks");
     assert!(
-        intervals_disjoint(&intervals[0], &intervals[1]),
-        "same-code tasks must be serialized; intervals {intervals:?}"
+        max_in_flight <= 1,
+        "same-code tasks must be serialized (max in-flight {max_in_flight})"
     );
 }
 
@@ -1008,15 +1020,12 @@ async fn cross_code_parallel_two_redeemers_overlap() {
 
     owner
         .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner
-        .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    let intervals = task_intervals(owner);
-    assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
+        .wait_count("\"type\":\"job_done\"", 2, Duration::from_secs(30));
+    let (max_in_flight, started) = job_concurrency(owner);
+    assert_eq!(started, 2, "two completed tasks");
     assert!(
-        !intervals_disjoint(&intervals[0], &intervals[1]),
-        "cross-code tasks must run concurrently; intervals {intervals:?}"
+        max_in_flight >= 2,
+        "cross-code tasks must run concurrently (max in-flight {max_in_flight})"
     );
 }
 
@@ -1056,14 +1065,11 @@ async fn dual_policy_intersection_serializes_same_code_sends() {
 
     owner
         .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner
-        .stdout
-        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    let intervals = task_intervals(owner);
-    assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
+        .wait_count("\"type\":\"job_done\"", 2, Duration::from_secs(30));
+    let (max_in_flight, started) = job_concurrency(owner);
+    assert_eq!(started, 2, "two completed tasks");
     assert!(
-        intervals_disjoint(&intervals[0], &intervals[1]),
-        "the receiver's serial policy must win the intersection; intervals {intervals:?}"
+        max_in_flight <= 1,
+        "the receiver's serial policy must win the intersection (max in-flight {max_in_flight})"
     );
 }

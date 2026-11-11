@@ -25,9 +25,11 @@
 
 ```sh
 python scripts/check_repository.py                       # L0 仓库检查（含 Cargo.lock 禁 relay/TURN 扫描）
+cargo fmt --all -- --check                               # 格式化门槛（零 diff，与 CI 第一步一致）
 cargo test --workspace                                   # 全部单元/集成测试
 cargo clippy --workspace --all-targets -- -D warnings    # 静态检查零警告
 cargo test -p ak-store --features sqlite                 # 可选特性后端（默认依赖图不启用）
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps   # rustdoc 门槛（零警告；Windows PowerShell 用 $env:RUSTDOCFLAGS = "-D warnings"）
 ```
 
 可选特性：`sqlite`（rusqlite bundled 检查点后端）默认关闭，默认依赖图零泄漏；改动 ak-store 时两配置都要过。

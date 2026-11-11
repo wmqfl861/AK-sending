@@ -1,9 +1,7 @@
 # AK-sending continuous integration.
 #
-# Status: the repository has NOT been pushed to GitHub yet, so this workflow
-# has never actually executed on Actions runners; it is committed ahead of
-# time so it takes effect on the first push. The commands mirror the local
-# gate documented in CONTRIBUTING.md and docs/OPERATIONS.zh-CN.md.
+# The commands mirror the local gate documented in CONTRIBUTING.md and
+# docs/OPERATIONS.zh-CN.md.
 #
 # ADR-001 / ADR-002 (D6): the dependency ban (no relay/TURN/WebRTC/iroh in
 # the dependency graph) is enforced by scripts/check_repository.py scanning
@@ -108,8 +106,6 @@ jobs:
   # the two Android triples via the NDK, but linux-gnu/apple are blocked
   # there by the ring/blake3 C build scripts (no cross gcc / Apple SDK),
   # so those triples are checked here on native runners instead.
-  # 注释注明：本 job 镜像本地脚本；仓库尚未推送到 GitHub，故从未在 Actions
-  # runner 上实跑（与整个 workflow 同一状态）。
   # cargo check does not link; ak-store stays on its default file backend
   # (no C SQLite), so only rust-std + the platform C toolchain for
   # ring/blake3 build scripts are required.
@@ -132,9 +128,11 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-13
+          # macos-13 was retired by GitHub on 2025-12-04; arm64 checks run
+          # on macos-15 and x86_64 on the macos-15-intel pool (CR-P1-01).
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:

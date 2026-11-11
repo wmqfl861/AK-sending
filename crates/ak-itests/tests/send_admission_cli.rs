@@ -916,8 +916,17 @@ fn task_intervals(owner: &Proc) -> Vec<(String, usize, usize)> {
                 open.push((peer, index));
             }
         } else if line.contains("\"type\":\"job_done\"") {
-            let peer = json_field(line, "peer").unwrap_or_default();
-            if let Some(position) = open.iter().position(|(p, _)| *p == peer) {
+            // job_done's peer is optional (null on completion paths that
+            // lost the peer context — observed on CI): pair those FIFO with
+            // the oldest unmatched job_started instead of dropping them
+            // (each test peer starts exactly one job).
+            let position = match json_field(line, "peer") {
+                Some(peer) => open.iter().position(|(p, _)| *p == peer),
+                // peer:null -> FIFO with the oldest unmatched start.
+                None if !open.is_empty() => Some(0),
+                _ => None,
+            };
+            if let Some(position) = position {
                 let (peer, start) = open.remove(position);
                 intervals.push((peer, start, index));
             }

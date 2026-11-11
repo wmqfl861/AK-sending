@@ -1,12 +1,15 @@
 # AK-sending Windows packaging script (local packaging only; never uploads).
-# Compatible with Windows PowerShell 5.1. No network upload, no git operations.
+# Compatible with Windows PowerShell 5.1. No network upload; no git MUTATIONS
+# (one read-only `git log` provenance query was added by CR-P2-06 fix 5).
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -Profile debug
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -SkipFlutter:$false
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -IncludeAndroid
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -IncludeAndroid -AllowStaleAndroid
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -OutDir D:\tmp\ak-sending
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -ValidateParameters
 #
 # Parameters:
 #   -OutDir       Staging directory (wiped and recreated if it already exists).
@@ -27,17 +30,35 @@
 #                 When set, the script:
 #                   1. runs `bash scripts\build_android_ffi.sh` (Git Bash; builds
 #                      libak_ffi.so for x86_64 + aarch64 and stages both into
-#                      flutter_app\android\app\src\main\jniLibs\). Existence of the
-#                      script AND bash is probed first; a build failure is a WARNING,
-#                      never fatal - whatever .so files are then present are still
-#                      probed and packaged (so a pre-built tree works offline).
+#                      flutter_app\android\app\src\main\jniLibs\). CR-P2-06 fix 5:
+#                      a refresh that cannot run (script/bash missing) or fails
+#                      (non-zero exit) is FATAL unless -AllowStaleAndroid is
+#                      also passed - packaging a silently stale .so is exactly
+#                      the untraceable-binary problem the finding rejects.
 #                   2. copies every jniLibs\<abi>\libak_ffi.so into
 #                      <OutDir>\android\jniLibs\<abi>\libak_ffi.so (the layout an
 #                      Android app consumes directly);
 #                   3. if target\x86_64-linux-android\release\ak-cli exists (an ELF
 #                      the ffi build does NOT produce - cross-build ak-cli manually),
 #                      copies it as android\ak-cli-android-x86_64.
-#                 Everything staged lands in MANIFEST.txt automatically.
+#                 Everything staged lands in MANIFEST.txt automatically, plus an
+#                 android provenance block (fresh vs stale per .so, SHA256, and
+#                 the source revision when one exists - see -AllowStaleAndroid).
+#   -AllowStaleAndroid
+#                 Opt-in escape hatch for step 1 above: the ONLY way to package
+#                 when the android FFI refresh failed or could not run. The
+#                 staged .so files are then packaged as-is and MANIFEST.txt
+#                 records each one's provenance: SHA256 + size always; the last
+#                 git revision that touched the file when git knows one; since
+#                 CR-P2-06 fix 4 the jniLibs .so files are untracked, so the
+#                 normal record is mtime + size + SHA256 with an explicit
+#                 "no git revision (untracked)" warning. Never combine with
+#                 the expectation of fresh binaries - fix the NDK/SDK/bash
+#                 cause instead.
+#   -ValidateParameters
+#                 Dry-run: validate and print the effective configuration, then
+#                 exit 0 without building anything (CR-P2-06 fix 5 verification
+#                 hook for parameter parsing).
 #
 # Output:
 #   ak-cli.exe, ak_ffi.dll, README.md (+ LICENSE only if the repo ever gains one),
@@ -55,7 +76,9 @@ param(
     [ValidateSet('release', 'debug')]
     [string]$Profile = 'release',
     [object]$SkipFlutter = $true,
-    [switch]$IncludeAndroid
+    [switch]$IncludeAndroid,
+    [switch]$AllowStaleAndroid,
+    [switch]$ValidateParameters
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,8 +105,75 @@ function ConvertTo-BooleanFlag([object]$Value, [string]$Name) {
 # flexible boolean flags are normalized here rather than via parameter types.
 $SkipFlutter = ConvertTo-BooleanFlag -Value $SkipFlutter -Name 'SkipFlutter'
 
+# --- helpers for the android provenance block (CR-P2-06 fix 5) ------------
+
+# Read-only `git <args>` run from $RepoRoot. Returns stdout joined to one
+# string, or $null when git is absent / exits non-zero. Uses Start-Process
+# with plain Win32 handle redirection for the same reason as the bash call
+# below: PS 5.1 turns redirected native stderr into NativeCommandError
+# records, which would abort the script under $ErrorActionPreference='Stop'.
+function Invoke-GitQuery([string[]]$GitArgs) {
+    $gitExe = (Get-Command git -ErrorAction SilentlyContinue)
+    if (-not $gitExe) { return $null }
+    $out = Join-Path $env:TEMP ('ak_git_out_' + [Guid]::NewGuid().ToString('N') + '.log')
+    $err = Join-Path $env:TEMP ('ak_git_err_' + [Guid]::NewGuid().ToString('N') + '.log')
+    try {
+        $proc = Start-Process -FilePath $gitExe.Source -ArgumentList $GitArgs `
+            -WorkingDirectory $RepoRoot -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        if ($proc.ExitCode -ne 0) { return $null }
+        return ((Get-Content -LiteralPath $out -ErrorAction SilentlyContinue) -join '')
+    }
+    catch {
+        return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# One provenance line per packaged jniLibs .so for MANIFEST.txt: SHA256 +
+# size always, plus the last git revision that touched the file when git
+# knows one ($State = 'fresh' | 'stale'). The jniLibs .so files are UNTRACKED
+# since CR-P2-06 fix 4, so the expected fallback is mtime + size + hash and
+# an explicit "no git revision" warning - exactly what R36-P2-07 asked the
+# manifest to record when old libraries get reused.
+function Get-AndroidSoProvenanceLine([string]$Path, [string]$State) {
+    $item = Get-Item -LiteralPath $Path
+    $rel = $item.FullName.Substring($RepoRoot.Length + 1)
+    $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $revision = Invoke-GitQuery @('log', '-1', '--format=%H', '--', ($rel -replace '\\', '/'))
+    if ($revision) {
+        return ('  source {0}  [{1}]  sha256 {2}  {3} bytes  last git revision that touched the file {4}' -f `
+                $rel, $State, $hash, $item.Length, $revision.Trim())
+    }
+    return ('  source {0}  [{1}]  sha256 {2}  {3} bytes  no git revision (untracked since CR-P2-06 fix 4)  mtime {4}  WARNING: provenance is mtime/size/hash only' -f `
+            $rel, $State, $hash, $item.Length, $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Write-Host "==> repo root: $RepoRoot"
+
+# --- 0. parameter dry-run (-ValidateParameters) ---------------------------
+# Validate and echo the effective configuration, then exit 0 WITHOUT running
+# cargo/bash or touching any output directory. -Profile is already enforced
+# by [ValidateSet] at parameter-binding time (a bad value aborts with exit 1
+# before this point).
+if ($ValidateParameters) {
+    if ($OutDir) {
+        $checkFull = [System.IO.Path]::GetFullPath($OutDir)
+        if ($checkFull.TrimEnd('\') -eq $RepoRoot.TrimEnd('\')) {
+            Fail '-OutDir must not be the repository root (it gets wiped)'
+        }
+    }
+    Write-Host '==> parameter validation OK (dry run, nothing was built):'
+    Write-Host ("    OutDir           : {0}" -f $(if ($OutDir) { $OutDir } else { '<default: target\dist\ak-sending-<version>-windows-x64>' }))
+    Write-Host ("    Profile          : {0}" -f $Profile)
+    Write-Host ("    SkipFlutter      : {0}" -f $SkipFlutter)
+    Write-Host ("    IncludeAndroid   : {0}" -f $(if ($IncludeAndroid) { 'true' } else { 'false' }))
+    Write-Host ("    AllowStaleAndroid: {0}" -f $(if ($AllowStaleAndroid) { 'true (stale .so permitted; provenance recorded in MANIFEST.txt)' } else { 'false (an android FFI refresh failure is fatal)' }))
+    exit 0
+}
 
 try {
     # --- 1. read workspace version from the root Cargo.toml [workspace.package] ---
@@ -277,14 +367,17 @@ try {
 
     # --- 5. optional Android artifacts (-IncludeAndroid) ---
     $androidIncluded = 0
+    $androidProvenance = New-Object System.Collections.Generic.List[string]
     if (-not $IncludeAndroid) {
         Write-Host '==> android artifacts skipped (-IncludeAndroid not set)'
     }
     else {
         # 5a. refresh the cross-compiled .so via the Git Bash build script.
-        #     Existence probes + WARNING on failure: packaging must stay
-        #     usable on a box without the NDK (stale-but-present .so files
-        #     are still picked up below, and the manifest records them).
+        #     CR-P2-06 fix 5: in the normal path a refresh that cannot run
+        #     (script or bash missing) or fails (non-zero exit) FAILS the
+        #     whole packaging - a stale .so must never slip into a package
+        #     silently. -AllowStaleAndroid is the only way to proceed with
+        #     old libraries, and the manifest then records their provenance.
         $buildSh = Join-Path $RepoRoot 'scripts\build_android_ffi.sh'
         $bash = $null
         foreach ($candidate in @(
@@ -298,14 +391,15 @@ try {
             if ($bashCmd -and $bashCmd.Source -notlike '*\System32\bash.exe') { $bash = $bashCmd.Source }
         }
         $ffiBuilt = $false
+        $refreshFailure = $null
         if (-not (Test-Path -LiteralPath $buildSh -PathType Leaf)) {
-            Write-Warning "scripts\build_android_ffi.sh not found - skipping the android FFI build (probing staged .so files only)"
+            $refreshFailure = 'scripts\build_android_ffi.sh not found'
         }
         elseif (-not $bash) {
-            Write-Warning 'Git Bash (bash.exe) not found - skipping the android FFI build (probing staged .so files only)'
+            $refreshFailure = 'Git Bash (bash.exe) not found'
         }
         else {
-            Write-Host '==> bash scripts\build_android_ffi.sh (non-fatal on failure)'
+            Write-Host '==> bash scripts\build_android_ffi.sh'
             # PS 5.1 wraps redirected native stderr in NativeCommandError
             # records (the first one is displayed, and with
             # $ErrorActionPreference='Stop' it would even abort the script),
@@ -326,11 +420,20 @@ try {
             }
             $buildExit = $proc.ExitCode
             if ($buildExit -ne 0) {
-                Write-Warning "build_android_ffi.sh exited $buildExit - continuing with whatever .so files are staged (they may be stale)"
+                $refreshFailure = "build_android_ffi.sh exited $buildExit"
             }
             else {
                 $ffiBuilt = $true
             }
+        }
+        if ($refreshFailure) {
+            if (-not $AllowStaleAndroid) {
+                Fail ((("-IncludeAndroid: the android FFI refresh failed ({0}) - refusing to package possibly stale .so files. " +
+                        'Fix the cause (SDK/NDK/bash; see docs\ANDROID_BUILD.zh-CN.md) and rerun, or pass -AllowStaleAndroid to ' +
+                        'explicitly package the staged libraries with their provenance recorded in MANIFEST.txt (CR-P2-06 fix 5).')) -f $refreshFailure)
+            }
+            Write-Warning ((("android FFI refresh failed ({0}) - continuing with the staged (possibly stale) .so because " +
+                    '-AllowStaleAndroid was passed; MANIFEST.txt records their provenance')) -f $refreshFailure)
         }
 
         # 5b. stage jniLibs\<abi>\libak_ffi.so -> android\jniLibs\<abi>\libak_ffi.so
@@ -340,9 +443,15 @@ try {
             $soFiles = @(Get-ChildItem -LiteralPath $jniLibs -Filter 'libak_ffi.so' -Recurse -File -ErrorAction SilentlyContinue)
         }
         if ($soFiles.Count -eq 0) {
+            if (-not $AllowStaleAndroid) {
+                Fail ((("-IncludeAndroid: no libak_ffi.so under {0} after the refresh step - nothing traceable to package. " +
+                        'Run bash scripts\build_android_ffi.sh once to stage the libraries, or pass -AllowStaleAndroid for an ' +
+                        'android-section-less package (CR-P2-06 fix 5).')) -f $jniLibs)
+            }
             Write-Warning "no libak_ffi.so under $jniLibs - the android\ section of the package will be empty of .so files"
         }
         else {
+            $soState = $(if ($ffiBuilt) { 'fresh' } else { 'stale (-AllowStaleAndroid)' })
             $androidOut = Join-Path $OutDirFull 'android'
             New-Item -ItemType Directory -Path $androidOut -Force | Out-Null
             foreach ($so in $soFiles) {
@@ -352,9 +461,10 @@ try {
                 New-Item -ItemType Directory -Path $abiDir -Force | Out-Null
                 Copy-Item -LiteralPath $so.FullName -Destination $abiDir
                 $androidIncluded++
+                $androidProvenance.Add((Get-AndroidSoProvenanceLine -Path $so.FullName -State $soState))
             }
             Write-Host ("==> android: {0} libak_ffi.so staged into android\jniLibs\ (ffi build {1})" -f `
-                    $soFiles.Count, $(if ($ffiBuilt) { 'fresh' } else { 'pre-existing/not rebuilt' }))
+                    $soFiles.Count, $(if ($ffiBuilt) { 'fresh' } else { 'stale (packaged under -AllowStaleAndroid)' }))
         }
 
         # 5c. the android ak-cli ELF, if someone cross-built it manually
@@ -383,6 +493,15 @@ try {
     $manifest.Add("version : $Version")
     $manifest.Add("profile : $Profile")
     $manifest.Add('android : ' + $(if ($androidIncluded -gt 0) { "included ($androidIncluded file(s) under android\)" } else { 'not included' }))
+    # CR-P2-06 fix 5 (R36-P2-07 remainder): the packaged .so files must be
+    # traceable to a source state. Fresh builds record the last git revision
+    # that touched each file (empty for untracked regenerated artifacts);
+    # stale ones (only possible via -AllowStaleAndroid) are flagged with
+    # mtime/size/hash fallback and a warning when no revision exists.
+    if ($androidProvenance.Count -gt 0) {
+        $manifest.Add('          source binding of the packaged android .so (path = repo source, not the packaged copy):')
+        foreach ($line in $androidProvenance) { $manifest.Add($line) }
+    }
     $manifest.Add('registry: ak_sending_registry.db (empty SQLite template) + ak_sending_registry.db.README.txt + start-registry-server.bat')
     $manifest.Add("created : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') local time; local packaging only, not uploaded")
     $manifest.Add('format  : SHA256  bytes  relative-path (SHA256 via PowerShell Get-FileHash)')

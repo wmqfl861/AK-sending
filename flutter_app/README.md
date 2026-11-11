@@ -41,7 +41,9 @@ crates/ak-engine（内嵌 tokio 运行时，句柄式 C ABI，契约见 docs/adr
 
 ## 构建（Windows）
 
-前置：Flutter stable、VS BuildTools（C++ 桌面开发）、Rust 工具链。
+前置：Flutter **3.47.9**（版本钉在仓库根 `.fvmrc`，CI 同源固定，见
+`.github/workflows/ci.yml`；升级时三处同步）、VS BuildTools（C++ 桌面开发）、
+Rust 工具链（`rust-toolchain.toml` 固定 1.99.1）。
 
 ```bash
 # 1. 先产出引擎 DLL（仓库根执行）
@@ -78,8 +80,10 @@ flutter build windows --release
 组对齐）、`INTERNET` 权限（LAN 直传必需，release 只从 main manifest 获得）。
 
 ```bash
-# 0. 引擎 so：交叉编译后放入 jniLibs（本波由集成者侧产出）
-#    android/app/src/main/jniLibs/<abi>/libak_ffi.so   （arm64-v8a / armeabi-v7a / x86_64）
+# 0. 引擎 so：本地用脚本交叉编译并放入 jniLibs（CR-P2-06 后不入库，
+#    .gitignore 忽略，每次从源码重建；CI 的 android 任务同源构建）
+#      bash scripts/build_android_ffi.sh        （仓库根执行，Git Bash；需 NDK）
+#    产物：android/app/src/main/jniLibs/<abi>/libak_ffi.so（arm64-v8a / x86_64）
 
 # 1. 构建（工作目录 flutter_app）
 flutter build apk --debug

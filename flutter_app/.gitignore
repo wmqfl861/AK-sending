@@ -54,3 +54,14 @@ key.properties
 *.keystore
 *.jks
 upload-keystore*
+
+# Android FFI native libraries (CR-P2-06 fix 4): never tracked -- each ~9 MiB
+# and rebuildable from source. Regenerate locally from the repo root (Git
+# Bash, needs the Android SDK + NDK; see docs/ANDROID_BUILD.zh-CN.md):
+#   bash scripts/build_android_ffi.sh
+# which cross-compiles both ABIs, stages them here and runs the frozen-ABI
+# symbol check. CI rebuilds them the same way on every push (the `android`
+# job in .github/workflows/ci.yml). History already carries old copies; they
+# are left untouched (no rewrite).
+android/app/src/main/jniLibs/arm64-v8a/libak_ffi.so
+android/app/src/main/jniLibs/x86_64/libak_ffi.so

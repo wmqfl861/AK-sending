@@ -6,8 +6,24 @@
 # ADR-001 / ADR-002 (D6): the dependency ban (no relay/TURN/WebRTC/iroh in
 # the dependency graph) is enforced by scripts/check_repository.py scanning
 # Cargo.lock in the `checks` job; deny.toml provides the complementary
-# cargo-deny view (licenses, advisories, duplicate versions) for optional
-# use -- see the header of deny.toml.
+# cargo-deny view (licenses, advisories, duplicate versions) run by the
+# `deny` job -- see the header of deny.toml.
+#
+# Toolchain pinning (CR-P2-06): Rust is pinned by rust-toolchain.toml
+# (mirrored in the dtolnay/rust-toolchain@<version> refs below); Flutter is
+# pinned to 3.47.9 in .fvmrc at the repo root (FVM convention file,
+# {"flutter": "3.47.9"}) and mirrored in the flutter-version inputs of the
+# `flutter` and `android` jobs plus the toolchain note in flutter_app/README.md.
+# All three places must move together on an upgrade.
+#
+# Third-party action pinning policy (CR-P2-06 fix 2): actions OUTSIDE the
+# github-owned actions/ org are pinned by commit SHA with the release tag in
+# a trailing comment (subosito/flutter-action, android-actions/setup-android,
+# EmbarkStudios/cargo-deny-action, and actions/upload-artifact which carries
+# user artifacts). The github-owned actions/checkout, actions/setup-python
+# and actions/setup-java stay on major-version tags per the pre-existing
+# convention; Swatinem/rust-cache and dtolnay/rust-toolchain predate this
+# policy and are not changed by the CR-P2-06 batch.
 
 name: CI
 
@@ -56,6 +72,24 @@ jobs:
       - name: Audit Cargo.lock against RustSec advisories
         run: cargo audit
 
+  # Complementary dependency gate (CR-P3-04): the deny.toml view -- license
+  # allow-list, exact-name relay/TURN/WebRTC bans and duplicate-version
+  # reporting (multiple-versions = "warn") plus the RustSec advisories pass
+  # through cargo-deny itself. The three dependency gates together:
+  # `checks` = Cargo.lock ban scan (ADR-001), `audit` = cargo-audit
+  # advisories, `deny` = deny.toml licenses/bans/advisories. deny.toml has
+  # no [sources] section, so the sources check is not requested.
+  deny:
+    name: cargo deny (licenses, bans, advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned by commit SHA (CR-P2-06 fix 2 policy);
+      # 3c6349835b2b7b196a839186cb8b78e02f7b5f25 = v2.1.1 tag.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          command-arguments: advisories bans licenses
+
   # Rust gate on both first-class platforms (Windows MSVC matters: the
   # optional ak-store `sqlite` backend bundles C SQLite).
   rust:
@@ -95,6 +129,137 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked --workspace --no-deps
 
+  # Flutter gate (CR-P2-06 fix 2): the 173+ widget/service tests and the
+  # analyzer that previously ran only on the owner's machine. The SDK
+  # version comes from .fvmrc at the repo root ({"flutter": "3.47.9"}),
+  # mirrored in the flutter-version input below and in flutter_app/README.md;
+  # move all three together on an upgrade.
+  flutter:
+    name: Flutter gate (analyze + tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Host build of the ak-ffi cdylib: parts of both test suites exercise
+      # the real library at <repo>/target/release/libak_ffi.so -- the
+      # pure-Dart bindings package by its relative default (packages/
+      # ak_ffi_dart -> ../../../target/release/), the app suite through
+      # lib/services/dll_path.dart tier 3 (../target/release from
+      # flutter_app/). Those real-DLL tests do NOT skip when the file is
+      # missing (only the loopback smoke does), so this build is required.
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: flutter-gate
+      - name: Build host ak-ffi cdylib (release)
+        run: cargo build --locked -p ak-ffi --release
+      # Pinned by commit SHA (CR-P2-06 fix 2 policy);
+      # 1a449444c387b1966244ae4d4f8c696479add0b2 = v2.23.0 tag.
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: 3.47.9
+          cache: true
+      - name: flutter pub get
+        run: flutter pub get
+        working-directory: flutter_app
+      - name: flutter analyze
+        run: flutter analyze
+        working-directory: flutter_app
+      - name: flutter test (app suite)
+        run: flutter test
+        working-directory: flutter_app
+      # Pure-Dart bindings package (flutter_app/packages/ak_ffi_dart): a
+      # package:test suite that `flutter test` in flutter_app/ does NOT
+      # collect -- its own `dart test` run is the only thing executing the
+      # 161 Dart tests (CR-P2-06 evidence; all other tests in the repo run
+      # under `flutter test`).
+      - name: dart test (pure-Dart ak_ffi_dart package)
+        run: |
+          dart pub get
+          dart test
+        working-directory: flutter_app/packages/ak_ffi_dart
+
+  # Android gate (CR-P2-06 fix 3): cross-compile libak_ffi.so from source
+  # for both ABIs with the frozen-ABI symbol check, then assemble a debug
+  # APK (debug only: the release signing config fail-fasts without the
+  # owner's key.properties, which CI never has). Since this job exists the
+  # jniLibs .so files are untracked (CR-P2-06 fix 4) and rebuilt from source
+  # everywhere -- locally via the same script.
+  android:
+    name: Android FFI + debug APK
+    runs-on: ubuntu-latest
+    # First run is slow: NDK download + rust android targets + cold cargo
+    # release cross-build + gradle 9.3.1/AGP download.
+    timeout-minutes: 40
+    env:
+      # build_android_ffi.sh locates the SDK via $ANDROID_SDK_ROOT (runner
+      # default /usr/local/lib/android/sdk, ensured by setup-android).
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-ffi
+      # Java 17 for gradle (same major as the local toolchain; the Kotlin
+      # sources target JVM 17 in android/app/build.gradle.kts).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # SDK tools + license acceptance; the NDK is installed explicitly so
+      # the cross toolchain is reproducible. 28.2.13676358 = the newest NDK
+      # on the owner's dev box (the version scripts/build_android_ffi.sh
+      # auto-picks locally). Pinned by commit SHA (CR-P2-06 fix 2 policy);
+      # be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd = v4.0.4 tag.
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: 'ndk;28.2.13676358'
+      - name: Install Flutter 3.47.9
+        # Pinned by commit SHA (CR-P2-06 fix 2 policy);
+        # 1a449444c387b1966244ae4d4f8c696479add0b2 = v2.23.0 tag.
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: 3.47.9
+          cache: true
+      - name: Cross-build libak_ffi.so (both ABIs) + frozen-ABI symbol check
+        # Same script as local dev (scripts/build_android_ffi.sh): NDK clang
+        # linkers via env vars, cargo build -p ak-ffi -p ak-session for
+        # x86_64-linux-android + aarch64-linux-android, staging into
+        # jniLibs, then the strict symbol check (frozen ABI + v2 contract +
+        # all 8 ak_task_* exports) -- any missing symbol fails the job.
+        run: bash scripts/build_android_ffi.sh --ndk "$ANDROID_SDK_ROOT/ndk/28.2.13676358" --api 24
+      - name: Build provenance + ak_task_* export list
+        # CR-P2-06 fix 3: the log must carry the source SHA, Cargo.lock
+        # digest, toolchain version and the exported ak_task_* symbols so a
+        # shipped .so can be traced back to a commit.
+        run: |
+          set -euo pipefail
+          echo "source commit : ${GITHUB_SHA}"
+          echo "Cargo.lock    : sha256 $(sha256sum Cargo.lock | awk '{print $1}')"
+          echo "rustc         : $(rustc --version)"
+          NDK_NM="$ANDROID_SDK_ROOT/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          for abi in x86_64 arm64-v8a; do
+            so="flutter_app/android/app/src/main/jniLibs/${abi}/libak_ffi.so"
+            echo "ak_task_* exports (${abi}, sha256 $(sha256sum "$so" | awk '{print $1}')):"
+            "$NDK_NM" -D --defined-only "$so" | awk '{print $NF}' | grep '^ak_task_' | sort
+          done
+      - name: flutter build apk --debug
+        run: flutter build apk --debug
+        working-directory: flutter_app
+      # Pinned by commit SHA (CR-P2-06 fix 2/3 policy);
+      # ea165f8d65b6e75b540449e92b4886f43607fa02 = v4.6.2 tag (last v4
+      # release; v5+ only bump the Node runtime).
+      - name: Upload debug APK (build artifact)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: app-debug-apk
+          path: flutter_app/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
   # Manual deep test: the release-only #[ignore] suite. Wall time is on the
   # order of minutes (the unit suite is seconds): ak-engine 5 GiB sparse
   # transfer, ak-itests 20,000/65,537-file many-files runs, 512 MiB x2
@@ -128,14 +293,15 @@ jobs:
   #
   # ak-session (wave 21) is part of the package list below on every triple.
   # Its ANDROID targets (x86_64-linux-android / aarch64-linux-android) are
-  # NOT checked here: Actions runners have no NDK. They are verified on the
-  # local Windows+NDK host instead, via scripts/check_targets.sh (matrix
-  # includes both android triples when an NDK is found) and
-  # scripts/build_android_ffi.sh (full cross BUILD of -p ak-ffi -p
-  # ak-session for both ABIs plus the frozen-ABI symbol check). ak-session
-  # itself is pure Rust on default features (tokio/blake3/thiserror/log +
-  # workspace crates; the rusqlite `server-persistence` backend is
-  # dev/test-only and never linked), so no android-specific code exists.
+  # NOT in this matrix: until the `android` job above landed (CR-P2-06 fix
+  # 3), no CI runner had an NDK -- they were verified only on the local
+  # Windows+NDK host via scripts/check_targets.sh and
+  # scripts/build_android_ffi.sh. That job now cross-BUILDS -p ak-ffi -p
+  # ak-session for both ABIs plus the frozen-ABI symbol check in CI on every
+  # push, which supersedes a cargo-check-only entry here. ak-session itself
+  # is pure Rust on default features (tokio/blake3/thiserror/log + workspace
+  # crates; the rusqlite `server-persistence` backend is dev/test-only and
+  # never linked), so no android-specific code exists.
   portability:
     name: Portability check (${{ matrix.target }})
     strategy:

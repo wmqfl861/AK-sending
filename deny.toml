@@ -1,11 +1,10 @@
 # cargo-deny configuration for AK-sending.
 #
-# Status: the local development machine does NOT have cargo-deny installed,
-# so this file has never been executed locally (configuration only, staged
-# for later use). Ways to run it:
-#   * CI: add an optional job/step using EmbarkStudios/cargo-deny-action@v2
-#     (not part of the default gate in .github/workflows/ci.yml);
-#   * developers: `cargo install cargo-deny --locked`, then `cargo deny check`.
+# Status (CR-P3-04): wired into CI as the `deny` job
+# (.github/workflows/ci.yml) and verified locally with cargo-deny 0.20.2
+# (`cargo install cargo-deny --locked`, then `cargo deny check`). The
+# CI job runs `cargo deny check advisories bans licenses` via the SHA-pinned
+# EmbarkStudios/cargo-deny-action; developers run the same locally.
 #
 # Relationship to scripts/check_repository.py: the Python script scans
 # Cargo.lock for banned relay/TURN/WebRTC/iroh crates (ADR-001 / ADR-002 D6)
@@ -48,12 +47,31 @@ allow = [
     "Zlib",
     "BSL-1.0",
     "CC0-1.0",
+    # webpki-root-certs (rustls' bundled CA root store, reached via
+    # quinn/rustls): the certificate DATA is CDLA-Permissive-2.0, a
+    # permissive license that is not OSI-approved but is routinely
+    # allowlisted for exactly this crate by rustls consumers.
+    "CDLA-Permissive-2.0",
 ]
+
+[licenses.private]
+# The workspace's own crates carry no `license` field yet (repository-wide
+# license choice pending, package_windows.ps1 picks nothing up either). They
+# are all `publish = false` (enforced by scripts/check_repository.py), so
+# this exemption skips ONLY them -- every third-party dependency is still
+# license-checked against the allow list above. Flip to false once the owner
+# picks a license and adds the field to the workspace members.
+ignore = true
 
 [advisories]
 # cargo-deny fetches the RustSec advisory database (default URL:
 # https://github.com/rustsec/advisory-db) on each run. Vulnerable crates are
-# denied by default; unmaintained and yanked crates only warn so a transitive
-# notice does not block the build.
-unmaintained = "warn"
+# denied by default. Keys below use the cargo-deny >=0.20 schema (the file
+# originally carried 0.15-era `unmaintained = "warn"`, which 0.20 rejects);
+# intent preserved: a transitive unmaintained or yanked notice never blocks
+# the build.
+#   unmaintained: "none" = unmaintained advisories never fail the check
+#   (the old warn level no longer exists; "all" is the new default).
+unmaintained = "none"
+#   yanked: "warn" = note yanked versions without failing.
 yanked = "warn"

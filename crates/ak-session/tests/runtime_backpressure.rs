@@ -130,10 +130,7 @@ async fn slow_consumer_lags_without_blocking_the_actor() {
     assert!(
         snap.tasks.iter().any(|view| view.task == fresh),
         "the post-lag submission is listed: {:?}",
-        snap.tasks
-            .iter()
-            .map(|view| view.task)
-            .collect::<Vec<_>>()
+        snap.tasks.iter().map(|view| view.task).collect::<Vec<_>>()
     );
 }
 

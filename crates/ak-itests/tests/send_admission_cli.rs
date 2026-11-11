@@ -439,11 +439,7 @@ async fn cli_send_with_ready_relation_falls_back_to_legacy_receiver() {
     let device_key = daemon_dir.join("device.key");
     let (key, _) = ak_identity::DeviceKeyPair::load_or_create(&device_key)
         .expect("the daemon wrote its device key");
-    let identity = sender_identity_with_relation(
-        tmp.path(),
-        "legacy",
-        &key.public_key(),
-    );
+    let identity = sender_identity_with_relation(tmp.path(), "legacy", &key.public_key());
     // Cross-check: the pinned digest the send will use matches the key.
     assert_eq!(key.fingerprint().to_hex(), daemon_fp.to_ascii_lowercase());
 
@@ -460,8 +456,7 @@ async fn cli_send_with_ready_relation_falls_back_to_legacy_receiver() {
     assert!(
         sent.success,
         "send failed:\nstdout:\n{}\nstderr:\n{}",
-        sent.stdout,
-        sent.stderr
+        sent.stdout, sent.stderr
     );
     // The fallback is explicit, never a silent path choice.
     assert!(
@@ -491,12 +486,7 @@ async fn cli_send_with_ready_relation_falls_back_to_legacy_receiver() {
 }
 
 /// Run the real `ak-cli send` subprocess against `addr`, pining `fp`.
-fn run_send(
-    id_dir: &Path,
-    src: &Path,
-    addr: SocketAddr,
-    fp: &Fingerprint,
-) -> RunOutcome {
+fn run_send(id_dir: &Path, src: &Path, addr: SocketAddr, fp: &Fingerprint) -> RunOutcome {
     let dir_text = id_dir.to_string_lossy().into_owned();
     let src_text = src.to_string_lossy().into_owned();
     let addr_text = addr.to_string();
@@ -539,8 +529,7 @@ async fn cli_send_with_ready_relation_runs_admission_and_completes() {
 
     let receiver =
         spawn_on_channel_receiver(out.clone(), Arc::new(|_| AdmissionDecision::Admit)).await;
-    let identity =
-        sender_identity_with_relation(tmp.path(), "granted", &receiver.peer_public_key);
+    let identity = sender_identity_with_relation(tmp.path(), "granted", &receiver.peer_public_key);
 
     let src = tmp.path().join("admission-src.bin");
     let bytes = payload(128 * 1024);
@@ -550,8 +539,7 @@ async fn cli_send_with_ready_relation_runs_admission_and_completes() {
     assert!(
         sent.success,
         "send failed:\nstdout:\n{}\nstderr:\n{}",
-        sent.stdout,
-        sent.stderr
+        sent.stdout, sent.stderr
     );
     // The send announced the relation-driven path before connecting.
     assert!(
@@ -610,8 +598,7 @@ async fn cli_send_admission_denied_reports_busy_without_silent_retry() {
             Arc::new(move |_| AdmissionDecision::Deny(reason)),
         )
         .await;
-        let identity =
-            sender_identity_with_relation(tmp.path(), tag, &receiver.peer_public_key);
+        let identity = sender_identity_with_relation(tmp.path(), tag, &receiver.peer_public_key);
 
         let src = tmp.path().join("busy-src.bin");
         std::fs::write(&src, payload(16 * 1024)).expect("write source file");
@@ -691,9 +678,10 @@ impl RegistryProc {
             &id_text,
         ];
         let proc = Proc::spawn(tag, &args);
-        let line = proc
-            .stdout
-            .wait_for("registry id (pin with --registry-fp): ", Duration::from_secs(30));
+        let line = proc.stdout.wait_for(
+            "registry id (pin with --registry-fp): ",
+            Duration::from_secs(30),
+        );
         let fp_hex = line
             .rsplit(' ')
             .next()
@@ -807,9 +795,10 @@ impl DaemonChain {
                 &fp,
             ],
         );
-        owner
-            .stderr
-            .wait_for("pairing service: answering redeems", Duration::from_secs(30));
+        owner.stderr.wait_for(
+            "pairing service: answering redeems",
+            Duration::from_secs(30),
+        );
         let listening = owner
             .stdout
             .wait_for("\"type\":\"listening\"", Duration::from_secs(30));
@@ -876,10 +865,7 @@ impl DaemonChain {
     /// the send requests scheduler admission). Runs concurrently when
     /// spawned on threads by the caller.
     fn send_from(&self, index: usize, bytes: usize) -> RunOutcome {
-        let src = self
-            .tmp
-            .path()
-            .join(format!("matrix-src-{index}.bin"));
+        let src = self.tmp.path().join(format!("matrix-src-{index}.bin"));
         std::fs::write(&src, payload(bytes)).expect("write matrix source");
         let id_dir = self.redeemer_dirs[index].clone();
         let to = format!("127.0.0.1:{}", self.owner_port);
@@ -956,13 +942,16 @@ async fn same_code_serial_two_redeemers_never_overlap() {
         assert!(
             sent.success,
             "{label} send failed:\n{}\n{}",
-            sent.stdout,
-            sent.stderr
+            sent.stdout, sent.stderr
         );
     }
 
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
     let intervals = task_intervals(owner);
     assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
     assert!(
@@ -993,13 +982,16 @@ async fn cross_code_parallel_two_redeemers_overlap() {
         assert!(
             sent.success,
             "{label} send failed:\n{}\n{}",
-            sent.stdout,
-            sent.stderr
+            sent.stdout, sent.stderr
         );
     }
 
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
     let intervals = task_intervals(owner);
     assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
     assert!(
@@ -1036,13 +1028,16 @@ async fn dual_policy_intersection_serializes_same_code_sends() {
         assert!(
             sent.success,
             "{label} failed:\n{}\n{}",
-            sent.stdout,
-            sent.stderr
+            sent.stdout, sent.stderr
         );
     }
 
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
-    owner.stdout.wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
+    owner
+        .stdout
+        .wait_for("\"type\":\"job_done\"", Duration::from_secs(30));
     let intervals = task_intervals(owner);
     assert_eq!(intervals.len(), 2, "two completed tasks: {intervals:?}");
     assert!(

@@ -149,7 +149,12 @@ impl CtrlFrame {
     /// truncated or wrapped.
     pub fn try_encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut payload = Vec::new();
-        message::encode_payload(&self.message, self.endpoint.as_ref(), self.max_redeems, &mut payload)?;
+        message::encode_payload(
+            &self.message,
+            self.endpoint.as_ref(),
+            self.max_redeems,
+            &mut payload,
+        )?;
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(EncodeError::PayloadTooLarge {
                 len: payload.len(),
@@ -211,7 +216,8 @@ impl CtrlFrame {
         if bytes.len() > end {
             return Err(DecodeError::Trailing(bytes.len() - end));
         }
-        let (message, endpoint, max_redeems) = message::decode_payload(ty, &bytes[HEADER_LEN..end])?;
+        let (message, endpoint, max_redeems) =
+            message::decode_payload(ty, &bytes[HEADER_LEN..end])?;
         Ok(CtrlFrame {
             message,
             endpoint,

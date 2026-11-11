@@ -64,9 +64,9 @@ pub use orchestrator::{
     PersistedCodeSource, RedeemOffer, RedeemOfferGate, TaskRedeem, BOOK_NAME, JOURNAL_SUBDIR,
 };
 pub use task::{
-    decode_endpoint_blob, encode_endpoint_blob, order_candidates_lan_first, probe_peer,
-    ActiveTask, CandidateFailure, PeerEndpoint, ProbeOptions, ProbeOutcome, TaskCode,
-    TaskDirection, TaskDisconnectReason, TaskError, TaskEvent, TaskPairing, TaskPairingConfig,
-    TaskPaired, ENDPOINT_BLOB_MAX_BYTES, ENDPOINT_BLOB_MAX_CANDIDATES, TASK_CODE_TTL_SECS,
+    decode_endpoint_blob, encode_endpoint_blob, order_candidates_lan_first, probe_peer, ActiveTask,
+    CandidateFailure, PeerEndpoint, ProbeOptions, ProbeOutcome, TaskCode, TaskDirection,
+    TaskDisconnectReason, TaskError, TaskEvent, TaskPaired, TaskPairing, TaskPairingConfig,
+    ENDPOINT_BLOB_MAX_BYTES, ENDPOINT_BLOB_MAX_CANDIDATES, TASK_CODE_TTL_SECS,
 };
 pub use transport::RealTransport;

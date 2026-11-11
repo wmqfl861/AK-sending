@@ -45,7 +45,9 @@ impl Drop for TestRegistry {
 
 async fn spawn_registry() -> TestRegistry {
     let registry_key = DeviceKeyPair::generate();
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind v2 port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind v2 port");
     let addr = listener.local_addr().expect("local addr");
     let store = RegistryStore::open_in_memory().expect("open registry store");
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -136,7 +138,11 @@ async fn task_pairing_delivers_endpoints_both_ways_over_the_real_registry() {
     let joiner_candidates = vec![localhost(52011)];
     let paired = joiner
         .pairing
-        .join_task_code(&code.invite.display, &joiner_candidates, TaskDirection::Recv)
+        .join_task_code(
+            &code.invite.display,
+            &joiner_candidates,
+            TaskDirection::Recv,
+        )
         .await
         .expect("join task code");
     assert_eq!(paired.peer.name, "alice");
@@ -188,7 +194,11 @@ async fn max_redeems_one_refuses_the_second_join() {
     owner.pairing.spawn_owner_loop();
     joiner
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Recv)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52011)],
+            TaskDirection::Recv,
+        )
         .await
         .expect("first join pairs");
 
@@ -196,7 +206,11 @@ async fn max_redeems_one_refuses_the_second_join() {
     // is exhausted. The second join is refused immediately.
     let second = stranger
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52021)], TaskDirection::Recv)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52021)],
+            TaskDirection::Recv,
+        )
         .await;
     match second {
         Err(TaskError::Flow(err)) => {
@@ -205,7 +219,10 @@ async fn max_redeems_one_refuses_the_second_join() {
                 ak_session::pairing::PairFlowError::Unavailable { code } => *code,
                 other => panic!("expected the redeem-exhausted refusal, got {other:?}"),
             };
-            assert_eq!(code_err, REDEEM_EXHAUSTED, "the dedicated code, got 0x{code_err:04x}");
+            assert_eq!(
+                code_err, REDEEM_EXHAUSTED,
+                "the dedicated code, got 0x{code_err:04x}"
+            );
         }
         other => panic!("second join must be refused, got {other:?}"),
     }
@@ -252,7 +269,11 @@ async fn receiver_generated_code_paired_by_a_cross_device_sender() {
     // The joiner is the sender: its own declaration, not a local default.
     let paired = joiner
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52011)],
+            TaskDirection::Send,
+        )
         .await
         .expect("the cross-device sender joins the receiver's code");
     assert_eq!(paired.direction, TaskDirection::Send);
@@ -301,7 +322,11 @@ async fn same_direction_join_is_refused_before_commit_and_keeps_the_code_usable(
     // (and with it the server's commit) never starts.
     let refused = wrong
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52011)],
+            TaskDirection::Send,
+        )
         .await;
     match &refused {
         Err(TaskError::Flow(ak_session::pairing::PairFlowError::Unavailable { .. })) => {}
@@ -315,12 +340,18 @@ async fn same_direction_join_is_refused_before_commit_and_keeps_the_code_usable(
         journal_artifacts(wrong.dir.path()).is_empty(),
         "the refused joiner journaled nothing"
     );
-    assert!(!has_trust_book(wrong.dir.path()), "no trust book on the joiner");
+    assert!(
+        !has_trust_book(wrong.dir.path()),
+        "no trust book on the joiner"
+    );
     assert!(
         journal_artifacts(owner.dir.path()).is_empty(),
         "the owner journaled nothing for the aborted attempt"
     );
-    assert!(!has_trust_book(owner.dir.path()), "no trust book on the owner");
+    assert!(
+        !has_trust_book(owner.dir.path()),
+        "no trust book on the owner"
+    );
     assert!(wrong.pairing.active_tasks().is_empty());
     assert!(
         owner.pairing.active_tasks()[0].pairing.is_none(),
@@ -332,7 +363,11 @@ async fn same_direction_join_is_refused_before_commit_and_keeps_the_code_usable(
     // REDEEM_EXHAUSTED).
     let paired = right
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52021)], TaskDirection::Recv)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52021)],
+            TaskDirection::Recv,
+        )
         .await
         .expect("the code must still pair with the correct direction");
     assert_eq!(paired.direction, TaskDirection::Recv);
@@ -386,7 +421,11 @@ async fn legacy_joiner_without_an_endpoint_blob_is_refused_before_commit() {
     // The abort did not consume the redeem budget.
     modern
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52021)], TaskDirection::Recv)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52021)],
+            TaskDirection::Recv,
+        )
         .await
         .expect("the code still pairs with a wave-29 joiner");
 }
@@ -411,10 +450,17 @@ async fn direction_conflict_against_a_gateless_owner_still_refuses_at_completion
     owner.pairing.orchestrator().spawn_owner_loop();
     let err = joiner
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52011)],
+            TaskDirection::Send,
+        )
         .await
         .expect_err("both sides declaring Send must refuse");
-    assert!(matches!(err, TaskError::DirectionConflict { .. }), "{err:?}");
+    assert!(
+        matches!(err, TaskError::DirectionConflict { .. }),
+        "{err:?}"
+    );
 }
 
 /// Disconnect ends the task locally: the code is revoked server-side (the
@@ -447,7 +493,11 @@ async fn disconnect_revokes_the_code_and_emits_local() {
     let joiner = task_device(&registry, "bob").await;
     let refused = joiner
         .pairing
-        .join_task_code(&code.invite.display, &[localhost(52011)], TaskDirection::Send)
+        .join_task_code(
+            &code.invite.display,
+            &[localhost(52011)],
+            TaskDirection::Send,
+        )
         .await;
     match refused {
         Err(TaskError::Flow(ak_session::pairing::PairFlowError::Unavailable { .. })) => {}
@@ -528,9 +578,10 @@ async fn concurrent_joins_the_loser_fails_promptly_with_redeem_exhausted() {
     let bob_join =
         bob.pairing
             .join_task_code(&code.invite.display, &bob_candidates, TaskDirection::Recv);
-    let carol_join = carol
-        .pairing
-        .join_task_code(&code.invite.display, &carol_candidates, TaskDirection::Recv);
+    let carol_join =
+        carol
+            .pairing
+            .join_task_code(&code.invite.display, &carol_candidates, TaskDirection::Recv);
     let started = std::time::Instant::now();
     let (bob_res, carol_res) = tokio::join!(bob_join, carol_join);
 
@@ -589,10 +640,7 @@ async fn data_plane_loss_maps_by_source() {
     // second event for it.
     owner.pairing.report_connection_lost(code.invite.code_id);
     let stale = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
-    assert!(
-        stale.is_err(),
-        "one end event per task, got {stale:?}"
-    );
+    assert!(stale.is_err(), "one end event per task, got {stale:?}");
 
     // A fresh task maps an idle-timeout report to Network.
     let code2 = owner
@@ -616,11 +664,7 @@ async fn data_plane_loss_maps_by_source() {
 async fn client_state_watcher_reports_disconnected() {
     let registry = spawn_registry().await;
     let device = task_device(&registry, "alice").await;
-    let mut state = device
-        .pairing
-        .orchestrator()
-        .client()
-        .state_watcher();
+    let mut state = device.pairing.orchestrator().client().state_watcher();
     device
         .pairing
         .orchestrator()

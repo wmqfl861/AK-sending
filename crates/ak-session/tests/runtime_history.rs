@@ -5,9 +5,7 @@
 //! many receives completed, were refused, timed out or errored.
 mod common;
 
-use ak_session::runtime::{
-    FakeScript, MAX_TERMINAL_HISTORY, SessionError, SnapshotQuery,
-};
+use ak_session::runtime::{FakeScript, SessionError, SnapshotQuery, MAX_TERMINAL_HISTORY};
 use ak_session::scheduler::{CrossCodeMode, SameCodeMode, TaskState};
 use common::{all_terminal, env_with, group, policy, run_until, send_spec};
 
@@ -27,11 +25,10 @@ async fn terminal_history_stays_bounded_after_many_completions() {
     .await;
     // 10 fake ms per attempt keeps the whole run (384 tasks) well inside
     // the fake-clock budget without changing any lifecycle semantics.
-    env.executor
-        .set_default_script(FakeScript::Complete {
-            scan_ms: 5,
-            transfer_ms: 5,
-        });
+    env.executor.set_default_script(FakeScript::Complete {
+        scan_ms: 5,
+        transfer_ms: 5,
+    });
 
     let batches = 6;
     let per_batch = 64;
@@ -69,7 +66,10 @@ async fn terminal_history_stays_bounded_after_many_completions() {
     // (eviction is oldest-first).
     for view in &snap.tasks {
         assert_eq!(view.state, TaskState::Completed);
-        assert!(view.finished_at_ms.is_some(), "terminal records are timestamped");
+        assert!(
+            view.finished_at_ms.is_some(),
+            "terminal records are timestamped"
+        );
         assert_eq!(view.last_error, None);
     }
     let last_batch_start = (batches - 1) * per_batch + 1;

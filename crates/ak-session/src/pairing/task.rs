@@ -215,9 +215,7 @@ pub fn encode_endpoint_blob(endpoint: &PeerEndpoint) -> Result<Vec<u8>, TaskErro
     out.push_str("\"}");
     let bytes = out.into_bytes();
     if bytes.len() > ENDPOINT_BLOB_MAX_BYTES {
-        return Err(TaskError::BlobTooLarge {
-            size: bytes.len(),
-        });
+        return Err(TaskError::BlobTooLarge { size: bytes.len() });
     }
     Ok(bytes)
 }
@@ -271,9 +269,10 @@ pub fn decode_endpoint_blob(bytes: &[u8]) -> Result<PeerEndpoint, TaskError> {
                     return Err(TaskError::BadEndpoint("duplicate dir key"));
                 }
                 let tag = parser.parse_string(8, "dir tag too long")?;
-                direction = Some(TaskDirection::from_wire_tag(&tag).ok_or(
-                    TaskError::BadEndpoint("dir is not send/recv"),
-                )?);
+                direction = Some(
+                    TaskDirection::from_wire_tag(&tag)
+                        .ok_or(TaskError::BadEndpoint("dir is not send/recv"))?,
+                );
             }
             _ => return Err(TaskError::BadEndpoint("unknown key")),
         }
@@ -336,7 +335,10 @@ impl BlobParser<'_> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        while matches!(
+            self.peek(),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
             self.pos += 1;
         }
     }
@@ -568,7 +570,9 @@ pub async fn probe_peer(endpoint: &PeerEndpoint, options: ProbeOptions) -> Probe
         .ok();
     let probe = match std_socket {
         Some(std_socket) => match tokio::net::UdpSocket::from_std(std_socket) {
-            Ok(socket) => holepunch::probe(&socket, &ordered, options.interval, options.window).await,
+            Ok(socket) => {
+                holepunch::probe(&socket, &ordered, options.interval, options.window).await
+            }
             Err(_) => Err(std::io::Error::other("from_std")),
         },
         None => Err(std::io::Error::other("bind")),
@@ -584,9 +588,7 @@ pub async fn probe_peer(endpoint: &PeerEndpoint, options: ProbeOptions) -> Probe
         .iter()
         .find(|candidate| report.reachable.contains(candidate))
     {
-        return ProbeOutcome::Success {
-            address: *hit,
-        };
+        return ProbeOutcome::Success { address: *hit };
     }
     if let Some(observed) = report.peer_observed_from {
         return ProbeOutcome::Success {
@@ -603,10 +605,11 @@ fn all_failed(
     reason: &'static str,
     mut failures: Vec<CandidateFailure>,
 ) -> ProbeOutcome {
-    failures.extend(ordered.into_iter().map(|candidate| CandidateFailure {
-        candidate,
-        reason,
-    }));
+    failures.extend(
+        ordered
+            .into_iter()
+            .map(|candidate| CandidateFailure { candidate, reason }),
+    );
     ProbeOutcome::AllFailed { failures }
 }
 
@@ -694,7 +697,10 @@ impl std::fmt::Debug for TaskCode {
         f.debug_struct("TaskCode")
             .field("invite", &self.invite)
             .field("direction", &self.direction)
-            .field("endpoint_blob", &format!("{} bytes", self.endpoint_blob.len()))
+            .field(
+                "endpoint_blob",
+                &format!("{} bytes", self.endpoint_blob.len()),
+            )
             .finish()
     }
 }
@@ -983,12 +989,12 @@ impl TaskPairing {
         let Some(mine) = my_direction else {
             return Ok(());
         };
-        let blob = offer.redeemer_endpoint.as_deref().ok_or_else(|| {
-            PairFlowError::Local("task redeem without an endpoint blob".into())
-        })?;
-        let peer = decode_endpoint_blob(blob).map_err(|err| {
-            PairFlowError::Local(format!("task redeem endpoint rejected: {err}"))
-        })?;
+        let blob = offer
+            .redeemer_endpoint
+            .as_deref()
+            .ok_or_else(|| PairFlowError::Local("task redeem without an endpoint blob".into()))?;
+        let peer = decode_endpoint_blob(blob)
+            .map_err(|err| PairFlowError::Local(format!("task redeem endpoint rejected: {err}")))?;
         if peer.direction == mine {
             return Err(PairFlowError::Local(format!(
                 "task direction conflict: initiator {mine:?} vs joiner {:?}",
@@ -1021,30 +1027,34 @@ impl TaskPairing {
     pub fn spawn_owner_loop(&self) -> JoinHandle<()> {
         let pairing = self.clone();
         self.install_redeem_offer_gate();
-        self.orch.spawn_owner_loop_verified(Some(Arc::new(move |verified| {
-            let code_id = verified.record().transcript.code_id;
-            let my_direction = pairing
-                .tasks
-                .lock()
-                .expect("task pairing lock")
-                .get(&code_id)
-                .map(|task| task.direction);
-            match my_direction {
-                Some(direction) => {
-                    if let Err(err) = pairing.complete_owner_pairing(&verified, direction) {
-                        log::warn!("task pairing completion failed ({}): {err}", hex16(&code_id));
+        self.orch
+            .spawn_owner_loop_verified(Some(Arc::new(move |verified| {
+                let code_id = verified.record().transcript.code_id;
+                let my_direction = pairing
+                    .tasks
+                    .lock()
+                    .expect("task pairing lock")
+                    .get(&code_id)
+                    .map(|task| task.direction);
+                match my_direction {
+                    Some(direction) => {
+                        if let Err(err) = pairing.complete_owner_pairing(&verified, direction) {
+                            log::warn!(
+                                "task pairing completion failed ({}): {err}",
+                                hex16(&code_id)
+                            );
+                        }
+                    }
+                    None => {
+                        // Not one of this TaskPairing's task codes (a plain
+                        // invite redeemed): the pairing itself stands.
+                        log::debug!(
+                            "task pairing: pairing {} is not a task code of this session",
+                            hex16(&code_id)
+                        );
                     }
                 }
-                None => {
-                    // Not one of this TaskPairing's task codes (a plain
-                    // invite redeemed): the pairing itself stands.
-                    log::debug!(
-                        "task pairing: pairing {} is not a task code of this session",
-                        hex16(&code_id)
-                    );
-                }
-            }
-        })))
+            })))
     }
 
     // Wave 30 (review 2026-11-07, P2-08): the former registry-connection
@@ -1086,7 +1096,8 @@ fn hex16(id: &[u8; 16]) -> String {
 
 /// Validate a caller-supplied candidate list: non-empty, no unspecified
 /// addresses, order preserved.
-fn validated_candidates(candidates: &[SocketAddr]) -> Result<Vec<SocketAddr>, TaskError> {    if candidates.is_empty() {
+fn validated_candidates(candidates: &[SocketAddr]) -> Result<Vec<SocketAddr>, TaskError> {
+    if candidates.is_empty() {
         return Err(TaskError::NoCandidates);
     }
     if candidates.len() > ENDPOINT_BLOB_MAX_CANDIDATES {
@@ -1317,8 +1328,7 @@ mod tests {
         // Internet candidates first in the input: the LAN ones must move
         // ahead, keeping their relative input order; loopback classifies
         // local regardless of `nets`.
-        let ordered =
-            order_candidates_lan_first(&[net_a, lan_b, loopback, net_b, lan_a], &nets);
+        let ordered = order_candidates_lan_first(&[net_a, lan_b, loopback, net_b, lan_a], &nets);
         assert_eq!(
             ordered,
             vec![lan_b, loopback, lan_a, net_a, net_b],
@@ -1347,7 +1357,9 @@ mod tests {
                     let nonce = ak_identity::pairing_txn::random_nonce32();
                     let mut tag = [0u8; 16];
                     tag.copy_from_slice(&nonce[..16]);
-                    let _ = peer_socket.send_to(&holepunch::probe_packet(&tag), source).await;
+                    let _ = peer_socket
+                        .send_to(&holepunch::probe_packet(&tag), source)
+                        .await;
                 }
             }
         });
@@ -1454,8 +1466,7 @@ mod tests {
             .await
             .expect("bind registry port");
         let addr = listener.local_addr().expect("registry addr");
-        let store =
-            ak_signal::server_v2::store::RegistryStore::open_in_memory().expect("store");
+        let store = ak_signal::server_v2::store::RegistryStore::open_in_memory().expect("store");
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let server_key = registry_key.clone();
         let server = tokio::spawn(async move {
@@ -1471,12 +1482,12 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("id dir");
         let key = ak_identity::DeviceKeyPair::generate();
-        let client =
-            RegistryClient::connect(addr, registry_key.public_key(), &key, "lifecycle")
-                .await
-                .expect("connect");
-        let orch = PairingOrchestrator::open(client, key, dir.path(), OrchestratorConfig::default())
-            .expect("orchestrator");
+        let client = RegistryClient::connect(addr, registry_key.public_key(), &key, "lifecycle")
+            .await
+            .expect("connect");
+        let orch =
+            PairingOrchestrator::open(client, key, dir.path(), OrchestratorConfig::default())
+                .expect("orchestrator");
         let pairing = TaskPairing::with_defaults(orch);
         let tasks_weak = Arc::downgrade(&pairing.tasks);
         pairing.install_redeem_offer_gate();

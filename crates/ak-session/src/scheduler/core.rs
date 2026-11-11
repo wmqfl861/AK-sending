@@ -748,7 +748,8 @@ impl SchedulerCore {
     /// (its denials defer it to the back of the ready ring — see
     /// [`SchedulerCore::pump`]).
     fn holds_live_batch(&self, group: &CodeGroupKey) -> bool {
-        self.cross_serial_batch.is_some_and(|batch| batch.group == *group)
+        self.cross_serial_batch
+            .is_some_and(|batch| batch.group == *group)
     }
 }
 

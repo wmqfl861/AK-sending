@@ -1527,9 +1527,7 @@ impl ProgressLine {
     }
 }
 
-pub(crate) fn progress_printer(
-    direction: &'static str,
-) -> Arc<dyn Fn(Progress) + Send + Sync> {
+pub(crate) fn progress_printer(direction: &'static str) -> Arc<dyn Fn(Progress) + Send + Sync> {
     let line = Arc::new(ProgressLine::new(direction));
     Arc::new(move |progress: Progress| {
         if std::env::var_os("AK_QUIET").is_none() {
@@ -2316,7 +2314,10 @@ pub(crate) fn candidates_from_nets(
                 if v4.is_loopback() || v4.is_link_local() {
                     continue;
                 }
-                if out.iter().any(|candidate| candidate.addr.ip() == IpAddr::V4(v4)) {
+                if out
+                    .iter()
+                    .any(|candidate| candidate.addr.ip() == IpAddr::V4(v4))
+                {
                     continue;
                 }
                 out.push(AddressCandidate {
@@ -2339,7 +2340,10 @@ pub(crate) fn candidates_from_nets(
                 if v6.is_loopback() || ak_net::classify::is_ipv6_link_local(v6) {
                     continue;
                 }
-                if out.iter().any(|candidate| candidate.addr.ip() == IpAddr::V6(v6)) {
+                if out
+                    .iter()
+                    .any(|candidate| candidate.addr.ip() == IpAddr::V6(v6))
+                {
                     continue;
                 }
                 out.push(AddressCandidate {
@@ -2787,10 +2791,7 @@ where
     match tokio::time::timeout_at(connect_started + budget, send.as_mut()).await {
         Ok(done) => Ok(done),
         Err(_deadline_elapsed) => {
-            if marks
-                .connected
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if marks.connected.load(std::sync::atomic::Ordering::Relaxed) {
                 // Connected inside the deadline; from here the transfer is
                 // governed by its own idle budget, not the connect deadline.
                 Ok(send.await)
@@ -2834,9 +2835,7 @@ async fn attempt_send_to(
         Ok(result) => result,
         Err(()) => return Err(AttemptFailure::connect_timeout(addr)),
     };
-    let after_connect = marks
-        .connected
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let after_connect = marks.connected.load(std::sync::atomic::Ordering::Relaxed);
     result.map_err(|err| AttemptFailure {
         addr,
         reason: one_line_reason(&err),
@@ -3018,7 +3017,9 @@ fn pinned_registry_id(id: &Path) -> Result<Option<[u8; 32]>> {
                 .registry_id,
         )),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(anyhow::Error::new(err).context(format!("cannot read {}", pin_path.display()))),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("cannot read {}", pin_path.display())))
+        }
     }
 }
 
@@ -3034,7 +3035,9 @@ fn code_revoked_locally(id: &Path, code_id: &[u8; 16]) -> bool {
         return false;
     };
     let prefix = format!("AKINV1 {}", hex_of(code_id));
-    !text.lines().any(|line| line.trim_start().starts_with(&prefix))
+    !text
+        .lines()
+        .any(|line| line.trim_start().starts_with(&prefix))
 }
 
 /// Find the Ready pairing relation of this identity directory that matches
@@ -3063,8 +3066,12 @@ fn ready_relation_for(id: &Path, pinned: &Fingerprint) -> Result<Option<ReadyRel
     let Some(registry_id) = pinned_registry_id(id)? else {
         return Ok(None);
     };
-    let journal = ak_store::PairingJournal::open(&journal_dir)
-        .with_context(|| format!("cannot open the pairing journal at {}", journal_dir.display()))?;
+    let journal = ak_store::PairingJournal::open(&journal_dir).with_context(|| {
+        format!(
+            "cannot open the pairing journal at {}",
+            journal_dir.display()
+        )
+    })?;
     let records = journal
         .load_all()
         .context("the pairing journal is corrupt; fix it before sending (fail closed)")?;
@@ -3099,17 +3106,22 @@ fn ready_relation_for(id: &Path, pinned: &Fingerprint) -> Result<Option<ReadyRel
 fn admission_denied_hint(reason: ak_wire::AdmissionReason) -> String {
     use ak_wire::AdmissionReason;
     match reason {
-        AdmissionReason::SerialWait => "对端忙（BUSY）：同一邀请码下已有任务在传输（serial_wait）。\
+        AdmissionReason::SerialWait => {
+            "对端忙（BUSY）：同一邀请码下已有任务在传输（serial_wait）。\
             本次未发送任何数据；请等对端当前任务结束后重跑同一命令重试"
-            .to_owned(),
+                .to_owned()
+        }
         AdmissionReason::Capacity => "对端忙（BUSY）：对端的准入队列或并发上限已满（capacity）。\
             本次未发送任何数据；请稍后重跑同一命令重试"
             .to_owned(),
-        AdmissionReason::StalePermit => "对端忙（BUSY）：准入许可反复过期（stale_permit，已按有界预算重试）。\
+        AdmissionReason::StalePermit => {
+            "对端忙（BUSY）：准入许可反复过期（stale_permit，已按有界预算重试）。\
             本次未发送任何数据；请稍后重跑同一命令重试"
-            .to_owned(),
-        AdmissionReason::Ok => "对端忙（BUSY）：准入被拒。本次未发送任何数据；请稍后重跑同一命令重试"
-            .to_owned(),
+                .to_owned()
+        }
+        AdmissionReason::Ok => {
+            "对端忙（BUSY）：准入被拒。本次未发送任何数据；请稍后重跑同一命令重试".to_owned()
+        }
     }
 }
 
@@ -3213,10 +3225,7 @@ async fn attempt_send_admission_to(
             let hint = admission_denied_hint(reason);
             AdmissionAttempt::Failed(AttemptFailure {
                 addr,
-                reason: format!(
-                    "remote admission denied ({:?}); nothing was sent",
-                    reason
-                ),
+                reason: format!("remote admission denied ({:?}); nothing was sent", reason),
                 err: EngineError::AdmissionDenied { reason },
                 after_connect: true,
                 hint: Some(Box::from(hint)),
@@ -4650,12 +4659,13 @@ mod tests {
     fn ready_relation_without_journal_or_pin_keeps_legacy_none() {
         // Fresh identity dir: nothing exists at all.
         let fresh = TempDir::new("ready-fresh");
-        assert!(
-            ready_relation_for(fresh.path(), &random_fp())
-                .expect("lookup succeeds")
-                .is_none()
-        );
-        assert!(!fresh.path().join(ak_session::pairing::JOURNAL_SUBDIR).exists());
+        assert!(ready_relation_for(fresh.path(), &random_fp())
+            .expect("lookup succeeds")
+            .is_none());
+        assert!(!fresh
+            .path()
+            .join(ak_session::pairing::JOURNAL_SUBDIR)
+            .exists());
 
         // Journal with a Ready relation but no registry pin: no valid
         // AdmissionCtx is possible (group_registry must name the real
@@ -4670,11 +4680,9 @@ mod tests {
             "applied",
             1_000,
         );
-        assert!(
-            ready_relation_for(dir.path(), &peer.fingerprint())
-                .expect("lookup succeeds")
-                .is_none()
-        );
+        assert!(ready_relation_for(dir.path(), &peer.fingerprint())
+            .expect("lookup succeeds")
+            .is_none());
     }
 
     #[test]
@@ -5212,20 +5220,11 @@ mod tests {
             send_bind_for(addr("192.168.1.5:7000"), 7300),
             addr("0.0.0.0:7300")
         );
-        assert_eq!(
-            send_bind_for(addr("127.0.0.1:7000"), 0),
-            addr("0.0.0.0:0")
-        );
+        assert_eq!(send_bind_for(addr("127.0.0.1:7000"), 0), addr("0.0.0.0:0"));
         // IPv6 candidates get the same-family [::] wildcard (review P2-01:
         // 0.0.0.0 made every v6 candidate fail the family fast-fail).
-        assert_eq!(
-            send_bind_for(addr("[::1]:7000"), 7300),
-            addr("[::]:7300")
-        );
-        assert_eq!(
-            send_bind_for(addr("[2001:db8::1]:7000"), 0),
-            addr("[::]:0")
-        );
+        assert_eq!(send_bind_for(addr("[::1]:7000"), 7300), addr("[::]:7300"));
+        assert_eq!(send_bind_for(addr("[2001:db8::1]:7000"), 0), addr("[::]:0"));
     }
 
     #[test]
@@ -5431,9 +5430,10 @@ mod tests {
             .expect_err("all dead");
         assert_eq!(failures.iter().map(|f| f.addr).collect::<Vec<_>>(), targets);
         assert!(
-            failures.iter().all(|f| f
-                .reason
-                .starts_with(&format!("timeout after {}s", SEND_CONNECT_TIMEOUT.as_secs()))),
+            failures.iter().all(|f| f.reason.starts_with(&format!(
+                "timeout after {}s",
+                SEND_CONNECT_TIMEOUT.as_secs()
+            ))),
             "every reason names the deadline: {failures:?}"
         );
     }
@@ -5755,9 +5755,10 @@ mod tests {
         recv_spec.authorize = Box::new(|_| true);
         recv_spec.checkpoint_dir = dir.path().join("recv-checkpoints");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-        let receiver = tokio::spawn(async move {
-            ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await
-        });
+        let receiver =
+            tokio::spawn(
+                async move { ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await },
+            );
         let live = match addr_rx.await {
             Ok(addr) => addr,
             Err(_) => {
@@ -5776,8 +5777,7 @@ mod tests {
         let checkpoints = dir.path().join("send-checkpoints");
         let printer: &(dyn Fn(Progress) + Send + Sync) = &|_| {};
         let spec_for = |bind: SocketAddr| {
-            let mut spec =
-                SendSpec::new(src.clone(), live, receiver_fp, sender_bundle.clone());
+            let mut spec = SendSpec::new(src.clone(), live, receiver_fp, sender_bundle.clone());
             spec.bind = bind;
             spec.idle_timeout = Duration::from_secs(20);
             spec.checkpoint_dir = checkpoints.clone();
@@ -5844,9 +5844,10 @@ mod tests {
         recv_spec.authorize = Box::new(|_| true);
         recv_spec.checkpoint_dir = dir.path().join("recv-checkpoints");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-        let receiver = tokio::spawn(async move {
-            ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await
-        });
+        let receiver =
+            tokio::spawn(
+                async move { ak_engine::receive_with_addr(recv_spec, &|_| {}, addr_tx).await },
+            );
         let live = match addr_rx.await {
             Ok(addr) => addr,
             Err(_) => {
@@ -5864,11 +5865,8 @@ mod tests {
         assert_eq!(targets, vec![dead, live], "loopback tier keeps order");
 
         let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
-        let (root, checkpoints, sender_bundle) = (
-            &src,
-            &dir.path().join("send-checkpoints"),
-            &sender_bundle,
-        );
+        let (root, checkpoints, sender_bundle) =
+            (&src, &dir.path().join("send-checkpoints"), &sender_bundle);
         let printer: &(dyn Fn(Progress) + Send + Sync) = &|_| {};
         let started = Instant::now();
         let attempt = |addr: SocketAddr| async move {

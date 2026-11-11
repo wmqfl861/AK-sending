@@ -369,11 +369,8 @@ async fn start_wired_runtime(
 /// the exit beyond two seconds here.
 async fn stop_wired_runtime(handle: &ak_session::runtime::SessionHandle) {
     use ak_session::runtime::ShutdownMode;
-    let _ = tokio::time::timeout(
-        Duration::from_secs(2),
-        handle.shutdown(ShutdownMode::Drain),
-    )
-    .await;
+    let _ =
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown(ShutdownMode::Drain)).await;
 }
 
 /// How one receive task failed (mirrors the direct loop's error matching
@@ -505,9 +502,7 @@ enum WiredHandshake {
     /// Scheduler-capable sender: `open` is its `TaskOpen` admission
     /// context (claimed group + registry + pairing relation) with the
     /// live Hello-exchanged protocol stream retained inside.
-    Scheduler {
-        open: ak_engine::TaskOpenAdmission,
-    },
+    Scheduler { open: ak_engine::TaskOpenAdmission },
 }
 
 /// Run the scheduler handshake split on one accepted channel (wave-27
@@ -735,8 +730,13 @@ impl ak_session::runtime::TransferExecutor for LegacyChannelExecutor {
         let work = tokio::spawn(async move {
             use ak_session::scheduler::state::{FinishOutcome, TaskPhase};
             task_sink.phase(task, TaskPhase::Scanning).await;
-            let mut engine_fut =
-                Box::pin(wired_legacy_body(channel, engine_spec, hello, peer_caps, &progress));
+            let mut engine_fut = Box::pin(wired_legacy_body(
+                channel,
+                engine_spec,
+                hello,
+                peer_caps,
+                &progress,
+            ));
             let mut transferring_reported = false;
             let result = loop {
                 tokio::select! {
@@ -844,7 +844,10 @@ impl ak_session::runtime::TransferExecutor for LegacyChannelExecutor {
     }
 
     fn cancel(&self, task: &ak_session::scheduler::key::TaskHandle) {
-        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(running) = state.running.get(&task.task_id()) {
             let _ = running.cancel.send(true);
         }
@@ -1037,7 +1040,10 @@ async fn wired_connection_handler(connection: WiredConnection) {
                 open,
                 Some(printer),
             );
-            let (claim, channel_peer) = match (channel_executor.claim(), channel_executor.peer_fingerprint()) {
+            let (claim, channel_peer) = match (
+                channel_executor.claim(),
+                channel_executor.peer_fingerprint(),
+            ) {
                 (Some(claim), Some(channel_peer)) => (claim, channel_peer),
                 _ => {
                     // Cannot happen for a freshly built executor; fail
@@ -1127,8 +1133,7 @@ async fn wired_connection_handler(connection: WiredConnection) {
             out.text("task cancelled (daemon stopping)");
         }
         Err(JobFailure::AddrInUse) => {
-            let message =
-                "bind failed: address already in use (retry budget exhausted)".to_owned();
+            let message = "bind failed: address already in use (retry budget exhausted)".to_owned();
             out.event(&DaemonEvent::Error { message: &message });
             out.text(&format!("{message}; still listening (Ctrl-C stops)"));
         }
@@ -1237,7 +1242,8 @@ impl WiredDaemon {
             let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
         }
         self.out.event(&DaemonEvent::Stopped { reason: "shutdown" });
-        self.out.text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
+        self.out
+            .text("daemon stopped (mDNS announcement withdrawn; partial files stay resumable)");
         Ok(())
     }
 
@@ -1284,7 +1290,8 @@ impl WiredDaemon {
         for line in crate::address_candidates_lines(&self.candidate_addrs) {
             self.out.text(&line);
         }
-        self.out.text(&crate::fingerprint_lines("fingerprint", &self.fingerprint));
+        self.out
+            .text(&crate::fingerprint_lines("fingerprint", &self.fingerprint));
         self.out.text(&format!(
             "pairing code: {}",
             ak_identity::pairing_code(&self.fingerprint)
@@ -1359,8 +1366,7 @@ pub(crate) async fn daemon_core(
         // the handle, the file cleans itself in Drop.
         let _lock = crate::task_cli::acquire_connection_lock(id)
             .context("cannot claim the identity's control-connection lock")?;
-        let _lock_heartbeat =
-            crate::task_cli::spawn_connection_lock_heartbeat(&_lock);
+        let _lock_heartbeat = crate::task_cli::spawn_connection_lock_heartbeat(&_lock);
         let settings = match registry.as_ref() {
             Some(settings) => *settings,
             None => crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?,
@@ -1405,11 +1411,8 @@ pub(crate) async fn daemon_core(
         // created in earlier runs live in `<id-dir>/invites.store`; the
         // orchestrator's secret slots open empty, so every LIVE persisted
         // code is adopted back before the loop starts answering.
-        let orchestrator = ak_session::pairing::PairingOrchestrator::with_defaults(
-            client,
-            key.clone(),
-            &id_dir,
-        )?;
+        let orchestrator =
+            ak_session::pairing::PairingOrchestrator::with_defaults(client, key.clone(), &id_dir)?;
         let now_ms = crate::now_unix_ms();
         for held in crate::invite::InviteStore::open(&id_dir).load()? {
             if !held.live(now_ms) {
@@ -1417,12 +1420,7 @@ pub(crate) async fn daemon_core(
                           // old loop applied per offer)
             }
             let code = held.code()?;
-            orchestrator.adopt_persisted_code(
-                &code,
-                held.code_id,
-                held.revision,
-                held.expires_ms,
-            );
+            orchestrator.adopt_persisted_code(&code, held.code_id, held.revision, held.expires_ms);
         }
         // Codes created (or revoked) by OTHER processes while this daemon
         // runs: a LIVE per-offer backfill over the persisted store — the
@@ -1520,8 +1518,7 @@ pub(crate) async fn daemon_core(
             .expect("wired mode implies the shared registry connection")
             .2
             .clone();
-        let wired =
-            start_wired_runtime(shared_client, settings, policy, default_executor).await?;
+        let wired = start_wired_runtime(shared_client, settings, policy, default_executor).await?;
         let switch = wired
             .handle
             .set_policy(policy)
@@ -2495,17 +2492,19 @@ mod tests {
                 )
                 .expect("validator opens over the daemon journal"),
             );
-            let template = WiredJobTemplate::of(&ReceiveLoopConfig::resolve(
-                &self.daemon_dir,
-                self.out_dir.clone(),
-                SocketAddr::from(([127, 0, 0, 1], 0)),
-                Some("any"),
-                "error",
-                false,
-                30,
-                "wired-test".to_owned(),
-            )
-            .expect("template config resolves"));
+            let template = WiredJobTemplate::of(
+                &ReceiveLoopConfig::resolve(
+                    &self.daemon_dir,
+                    self.out_dir.clone(),
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    Some("any"),
+                    "error",
+                    false,
+                    30,
+                    "wired-test".to_owned(),
+                )
+                .expect("template config resolves"),
+            );
             WiredScaffold {
                 registry_id: wired.registry_id,
                 handle: wired.handle,
@@ -2562,10 +2561,7 @@ mod tests {
             // handler holds a receiver clone.
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             for _ in 0..connections {
-                if let Ok(channel) = endpoint
-                    .accept(&|_: &ak_identity::Fingerprint| true)
-                    .await
-                {
+                if let Ok(channel) = endpoint.accept(&|_: &ak_identity::Fingerprint| true).await {
                     tokio::spawn(wired_connection_handler(WiredConnection {
                         handle: handle.clone(),
                         validator: Arc::clone(&validator),
@@ -2613,12 +2609,10 @@ mod tests {
         let join = tokio::spawn(async move {
             let (key, _) = crate::load_identity(&sender_dir).unwrap();
             let identity = ak_identity::tls::make_self_signed(&key);
-            let endpoint = ak_net::DirectEndpoint::bind(
-                SocketAddr::from(([127, 0, 0, 1], 0)),
-                &identity,
-            )
-            .await
-            .unwrap();
+            let endpoint =
+                ak_net::DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &identity)
+                    .await
+                    .unwrap();
             let channel = endpoint
                 .connect(daemon_addr, &daemon_fp)
                 .await
@@ -2639,16 +2633,14 @@ mod tests {
             .expect("a structurally valid admission context");
             let mut spec = ak_engine::SendSpec::new(src, daemon_addr, daemon_fp, identity);
             spec.idle_timeout = Duration::from_secs(30);
-            ak_engine::send_on_channel(channel, spec, ctx, &move |progress| {
-                match progress {
-                    ak_engine::Progress::Offered { .. } => {
-                        *progress_watch.offered.lock().unwrap() = Some(Instant::now());
-                    }
-                    ak_engine::Progress::Done => {
-                        *progress_watch.done.lock().unwrap() = Some(Instant::now());
-                    }
-                    _ => {}
+            ak_engine::send_on_channel(channel, spec, ctx, &move |progress| match progress {
+                ak_engine::Progress::Offered { .. } => {
+                    *progress_watch.offered.lock().unwrap() = Some(Instant::now());
                 }
+                ak_engine::Progress::Done => {
+                    *progress_watch.done.lock().unwrap() = Some(Instant::now());
+                }
+                _ => {}
             })
             .await
         });
@@ -2983,13 +2975,10 @@ mod tests {
         let src = payload_dir(scaffold.tmp.path(), "src-legacy", 512 * 1024);
         let mut spec = ak_engine::SendSpec::new(src, addr, scaffold.daemon_fp, identity);
         spec.idle_timeout = Duration::from_secs(30);
-        let report = tokio::time::timeout(
-            Duration::from_secs(60),
-            ak_engine::send(spec, &|_| {}),
-        )
-        .await
-        .expect("the legacy send settles")
-        .expect("the legacy send succeeds");
+        let report = tokio::time::timeout(Duration::from_secs(60), ak_engine::send(spec, &|_| {}))
+            .await
+            .expect("the legacy send settles")
+            .expect("the legacy send succeeds");
         assert_eq!(report.files, 1);
         assert_eq!(report.bytes, 512 * 1024_u64);
         assert!(

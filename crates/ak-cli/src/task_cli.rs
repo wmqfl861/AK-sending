@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use ak_engine::{
-    send, receive_accepted_consent, ConsentAnswer, ConsentInfo, EngineError, Progress, ReceiveSpec,
+    receive_accepted_consent, send, ConsentAnswer, ConsentInfo, EngineError, Progress, ReceiveSpec,
     Report, SendSpec, TransferConsent, DECLINED_WIRE_CODE,
 };
 use ak_identity::pairing_txn::random_id16;
@@ -51,7 +51,7 @@ use ak_identity::{DeviceKeyPair, Fingerprint};
 use ak_session::pairing::{
     ClientConfig, OrchestratorConfig, PairFlowError, PairingOrchestrator, PeerEndpoint,
     ProbeOptions, ProbeOutcome, RegistryClient, TaskDirection, TaskDisconnectReason, TaskError,
-    TaskEvent, TaskPairing, TaskPairingConfig, TaskPaired, TASK_CODE_TTL_SECS,
+    TaskEvent, TaskPaired, TaskPairing, TaskPairingConfig, TASK_CODE_TTL_SECS,
 };
 use ak_wire::{Frame, Message};
 
@@ -600,11 +600,10 @@ async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
     // stays online for the whole code TTL. The common ak-session
     // component — the same implementation the daemon uses.
     let (keeper_stop, keeper_stop_rx) = tokio::sync::watch::channel(false);
-    let keeper =
-        pairing
-            .orchestrator()
-            .client()
-            .spawn_connection_keeper(keeper_stop_rx);
+    let keeper = pairing
+        .orchestrator()
+        .client()
+        .spawn_connection_keeper(keeper_stop_rx);
     let lock_heartbeat = spawn_connection_lock_heartbeat(&lock);
     let mut owner_handle = None;
     if owner {
@@ -673,8 +672,8 @@ impl Session {
     /// Bind the probe echo responder (derived candidates append its port
     /// last; see `blob_candidates`).
     fn bind_echo_responder(&mut self) -> Result<SocketAddr> {
-        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("cannot bind the probe responder")?;
+        let std_socket =
+            std::net::UdpSocket::bind("0.0.0.0:0").context("cannot bind the probe responder")?;
         std_socket
             .set_nonblocking(true)
             .context("cannot arm the probe responder")?;
@@ -795,7 +794,10 @@ pub(crate) fn parse_lock_holder(text: &str) -> Option<LockHolder> {
 }
 
 pub(crate) fn write_lock_file(path: &Path) {
-    let _ = std::fs::write(path, format!("{}\n{}\n", std::process::id(), crate::now_unix_ms()));
+    let _ = std::fs::write(
+        path,
+        format!("{}\n{}\n", std::process::id(), crate::now_unix_ms()),
+    );
 }
 
 /// The run's hold on the identity's control connection: acquired before
@@ -819,9 +821,7 @@ pub(crate) fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Some(holder) = parse_lock_holder(&text) {
             let age = crate::now_unix_ms().saturating_sub(holder.beat_ms);
-            if holder.pid != std::process::id()
-                && age < CONNECTION_LOCK_STALE.as_millis() as u64
-            {
+            if holder.pid != std::process::id() && age < CONNECTION_LOCK_STALE.as_millis() as u64 {
                 bail!(
                     "this identity is already holding a control connection (process {}); \
                      reuse that process or pass a different --id-dir",
@@ -838,7 +838,9 @@ pub(crate) fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
 /// Keep the heartbeat fresh while the session lives, so a later run on
 /// the same id-dir sees a LIVE holder (a crashed process stops
 /// refreshing and its lock goes stale).
-pub(crate) fn spawn_connection_lock_heartbeat(lock: &ConnectionLock) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_connection_lock_heartbeat(
+    lock: &ConnectionLock,
+) -> tokio::task::JoinHandle<()> {
     let path = lock.path.clone();
     tokio::spawn(async move {
         loop {
@@ -893,15 +895,11 @@ async fn run_task_receiver(
     events: tokio::sync::mpsc::Sender<ReceiverEvent>,
 ) {
     let identity = make_self_signed(&ctx.key);
-    let endpoint = match ak_net::DirectEndpoint::bind(
-        SocketAddr::from(([0, 0, 0, 0], 0)),
-        &identity,
-    )
-    .await
-    {
-        Ok(endpoint) => endpoint,
-        Err(_) => return, // the dropped oneshot fails the bind wait
-    };
+    let endpoint =
+        match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await {
+            Ok(endpoint) => endpoint,
+            Err(_) => return, // the dropped oneshot fails the bind wait
+        };
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
@@ -1000,10 +998,11 @@ async fn run_task_receiver(
             }
             Err(EngineError::PeerError { message, .. }) if message == TASK_CLOSE_MESSAGE => {
                 ctx.pairing.report_peer_disconnect(current_code());
-                let _ = events.send(ReceiverEvent::PeerGone(
-                    "the peer disconnected (task closed by the peer)",
-                ))
-                .await;
+                let _ = events
+                    .send(ReceiverEvent::PeerGone(
+                        "the peer disconnected (task closed by the peer)",
+                    ))
+                    .await;
                 return;
             }
             Err(_) => {
@@ -1058,10 +1057,7 @@ impl StdinLine {
                 if !complete {
                     return false; // no real newline was ever read
                 }
-                matches!(
-                    text.trim().to_ascii_lowercase().as_str(),
-                    "" | "y" | "yes"
-                )
+                matches!(text.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
             }
         }
     }
@@ -1190,15 +1186,10 @@ impl TerminalInput {
                     } => {
                         println!("[task] input ended without Enter: declined");
                     }
-                    StdinLine::Line { text, .. } if !matches!(
-                        text.trim().to_ascii_lowercase().as_str(),
-                        "n" | "no"
-                    ) =>
+                    StdinLine::Line { text, .. }
+                        if !matches!(text.trim().to_ascii_lowercase().as_str(), "n" | "no") =>
                     {
-                        println!(
-                            "[task] unrecognized answer {:?}: declined",
-                            text.trim()
-                        );
+                        println!("[task] unrecognized answer {:?}: declined", text.trim());
                     }
                     _ => {} // an explicit n/no declines silently
                 }
@@ -1312,10 +1303,7 @@ async fn echo_responder_loop(socket: tokio::net::UdpSocket) {
                 };
                 if allowed {
                     let _ = socket
-                        .send_to(
-                            &ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE),
-                            source,
-                        )
+                        .send_to(&ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE), source)
                         .await;
                 }
             }
@@ -1373,7 +1361,11 @@ fn order_candidates(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// and shrunk until the blob fits the wire bound.
 /// Prepend the operator's `--advertise` IPs (paired with `port`) to a
 /// built blob, deduped (wave-32: NAT escape hatch — see TaskRunConfig).
-fn with_advertised(blob: Vec<SocketAddr>, advertise: &[std::net::IpAddr], port: u16) -> Vec<SocketAddr> {
+fn with_advertised(
+    blob: Vec<SocketAddr>,
+    advertise: &[std::net::IpAddr],
+    port: u16,
+) -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = Vec::with_capacity(blob.len() + advertise.len());
     for ip in advertise {
         let addr = SocketAddr::new(*ip, port);
@@ -1468,7 +1460,11 @@ async fn probe_and_print(pairing: &TaskPairing, link: &TaskLink) {
     let outcome = probe_with_retry(pairing, &link.peer).await;
     match &outcome {
         ProbeOutcome::Success { address } => {
-            let lan = if prefers_lan(address) { "lan" } else { "internet" };
+            let lan = if prefers_lan(address) {
+                "lan"
+            } else {
+                "internet"
+            };
             println!("[probe] peer reachable via {address} ({lan})");
         }
         ProbeOutcome::AllFailed { failures } => {
@@ -1577,12 +1573,7 @@ async fn attempt_send(
     paths: &[PathBuf],
     printer: &Arc<dyn Fn(Progress) + Send + Sync>,
 ) -> Attempt {
-    let mut spec = SendSpec::new(
-        paths[0].clone(),
-        addr,
-        pinned,
-        make_self_signed(key),
-    );
+    let mut spec = SendSpec::new(paths[0].clone(), addr, pinned, make_self_signed(key));
     for extra in &paths[1..] {
         spec.add_root(extra.clone());
     }
@@ -1902,7 +1893,10 @@ fn print_paired(link: &TaskLink) {
         .first()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "no endpoint".to_string());
-    println!("[task] paired; peer {endpoint} (task {})", hex_of(&link.code_id));
+    println!(
+        "[task] paired; peer {endpoint} (task {})",
+        hex_of(&link.code_id)
+    );
 }
 
 fn hex_of(bytes: &[u8]) -> String {
@@ -1990,10 +1984,7 @@ async fn send_phase(
 }
 /// it, wait for the joiner, probe, then serve receives behind the consent
 /// prompt until one transfer completes (or the peer departs).
-pub(crate) async fn run_code_recv(
-    cfg: TaskRunConfig,
-    mut hooks: TaskHooks,
-) -> Result<TaskOutcome> {
+pub(crate) async fn run_code_recv(cfg: TaskRunConfig, mut hooks: TaskHooks) -> Result<TaskOutcome> {
     let started = Instant::now();
     let mut session = open_session(&cfg, true).await?;
     let flow = async {
@@ -2226,11 +2217,7 @@ mod tests {
         }
     }
 
-    fn sender_cfg(
-        id: &tempfile::TempDir,
-        registry: &TestRegistry,
-        ttl: u32,
-    ) -> TaskRunConfig {
+    fn sender_cfg(id: &tempfile::TempDir, registry: &TestRegistry, ttl: u32) -> TaskRunConfig {
         TaskRunConfig::new(id.path().to_path_buf(), registry_settings(registry), ttl)
     }
 
@@ -2386,17 +2373,19 @@ mod tests {
         let code = code_rx.await.expect("code is displayed");
 
         let cfg_join = sender_cfg(&id_b, &registry, 600);
-        let sent =
-            run_join_send(cfg_join, hooks(None, None, &no_cancel()), code, vec![src])
-                .await
-                .expect("join-send completes");
+        let sent = run_join_send(cfg_join, hooks(None, None, &no_cancel()), code, vec![src])
+            .await
+            .expect("join-send completes");
         assert_eq!(sent.files, 1);
         assert_eq!(sent.bytes, 256_000);
 
         let received = owner.await.expect("owner task").expect("code-recv ok");
         assert_eq!(received.files, 1);
         assert_eq!(received.bytes, 256_000);
-        assert_eq!(blake3::hash(&std::fs::read(out_a.path().join("only.txt")).unwrap()), hash);
+        assert_eq!(
+            blake3::hash(&std::fs::read(out_a.path().join("only.txt")).unwrap()),
+            hash
+        );
     }
 
     // ---- 3. the n branch: zero files land, the sender errors clearly ---
@@ -2426,14 +2415,9 @@ mod tests {
         let code = code_rx.await.expect("code is displayed");
 
         let cfg_join = sender_cfg(&id_b, &registry, 600);
-        let error = run_join_send(
-            cfg_join,
-            hooks(None, None, &no_cancel()),
-            code,
-            vec![src],
-        )
-        .await
-        .expect_err("a declined offer fails the sender");
+        let error = run_join_send(cfg_join, hooks(None, None, &no_cancel()), code, vec![src])
+            .await
+            .expect_err("a declined offer fails the sender");
         assert!(
             error.to_string().contains("declined"),
             "the sender sees the declination: {error}"
@@ -2475,14 +2459,9 @@ mod tests {
         let code = code_rx.await.expect("code is displayed");
 
         let cfg_join = sender_cfg(&id_b, &registry, 600);
-        let error = run_join_send(
-            cfg_join,
-            hooks(None, None, &no_cancel()),
-            code,
-            vec![src],
-        )
-        .await
-        .expect_err("an expired window declines");
+        let error = run_join_send(cfg_join, hooks(None, None, &no_cancel()), code, vec![src])
+            .await
+            .expect_err("an expired window declines");
         assert!(
             error.to_string().contains("declined"),
             "declined by the window: {error}"
@@ -2550,7 +2529,10 @@ mod tests {
         assert_eq!(received.files, 1);
         assert_eq!(received.bytes, 120_000);
         let owner_result = owner.await.expect("owner task");
-        assert!(owner_result.is_ok(), "the owner's send completes: {owner_result:?}");
+        assert!(
+            owner_result.is_ok(),
+            "the owner's send completes: {owner_result:?}"
+        );
         assert_eq!(
             blake3::hash(&std::fs::read(out_b.path().join("owner.bin")).expect("landed")),
             owner_hash,

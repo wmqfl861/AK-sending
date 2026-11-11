@@ -220,7 +220,8 @@ impl ClientInner {
                 if blobs
                     .entry(pairing_id)
                     .or_insert_with(|| blob.clone())
-                    .len() == blob.len()
+                    .len()
+                    == blob.len()
                     && !dispatch.endpoint_blob_order.contains(&pairing_id)
                 {
                     dispatch.endpoint_blob_order.push_back(pairing_id);
@@ -236,11 +237,9 @@ impl ClientInner {
         // aborted/failed flows never take it, so recycle eagerly.
         {
             let terminal_id = match &message {
-                CtrlMessage::PairError { scope, object_id, .. }
-                    if *scope == ErrorScope::Pairing =>
-                {
-                    Some(*object_id)
-                }
+                CtrlMessage::PairError {
+                    scope, object_id, ..
+                } if *scope == ErrorScope::Pairing => Some(*object_id),
                 _ => None,
             };
             if let Some(pairing_id) = terminal_id {
@@ -1557,7 +1556,10 @@ mod tests {
         // silence (FRAME_IO_DEADLINE); the keepalive must sit well inside
         // that budget, and the black-hole detector trips on 3 timeouts.
         assert_eq!(KEEPER_PING_INTERVAL, Duration::from_secs(20));
-        assert_eq!(ConnectionKeeperConfig::default().ping_interval, KEEPER_PING_INTERVAL);
+        assert_eq!(
+            ConnectionKeeperConfig::default().ping_interval,
+            KEEPER_PING_INTERVAL
+        );
         assert_eq!(KEEPER_PING_TIMEOUT_LIMIT, 3);
     }
 
@@ -1660,14 +1662,10 @@ mod tests {
     async fn keeper_recovers_a_dropped_connection() {
         let registry = registry::spawn().await;
         let key = DeviceKeyPair::generate();
-        let client = RegistryClient::connect(
-            registry.addr,
-            registry.registry_id,
-            &key,
-            "keeper-recovery",
-        )
-        .await
-        .expect("connect to the live registry");
+        let client =
+            RegistryClient::connect(registry.addr, registry.registry_id, &key, "keeper-recovery")
+                .await
+                .expect("connect to the live registry");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let keeper = client.spawn_connection_keeper_with(
             ConnectionKeeperConfig {

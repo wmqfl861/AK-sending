@@ -728,15 +728,17 @@ impl RegistryStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        Ok(row.and_then(|(code, owner, revision, owner_endpoint, max_redeems)| {
-            Some(ActiveCode {
-                code_id: blob::<16>(Some(code))?,
-                owner: blob::<32>(Some(owner))?,
-                revision: revision.max(0) as u64,
-                owner_endpoint,
-                max_redeems: max_redeems.max(0) as u32,
-            })
-        }))
+        Ok(
+            row.and_then(|(code, owner, revision, owner_endpoint, max_redeems)| {
+                Some(ActiveCode {
+                    code_id: blob::<16>(Some(code))?,
+                    owner: blob::<32>(Some(owner))?,
+                    revision: revision.max(0) as u64,
+                    owner_endpoint,
+                    max_redeems: max_redeems.max(0) as u32,
+                })
+            }),
+        )
     }
 
     // -- pairing_transactions ------------------------------------------------
@@ -1914,22 +1916,36 @@ mod tests {
     fn ttl_out_of_contract_range_never_persists() {
         let store = RegistryStore::open_in_memory().unwrap();
         assert_eq!(
-            store.claim(&owner(1), &[1; 16], &lookup(1), 59, 0, None, 1).unwrap(),
+            store
+                .claim(&owner(1), &[1; 16], &lookup(1), 59, 0, None, 1)
+                .unwrap(),
             ClaimOutcome::RequestConflict
         );
         assert_eq!(
             store
-                .claim(&owner(1), &[1; 16], &lookup(1), INVITE_TTL_MAX_SECS + 1, 0, None, 1)
+                .claim(
+                    &owner(1),
+                    &[1; 16],
+                    &lookup(1),
+                    INVITE_TTL_MAX_SECS + 1,
+                    0,
+                    None,
+                    1
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
         // 60 s is the minimum legal TTL; long-lived is 0.
         assert!(matches!(
-            store.claim(&owner(1), &[2; 16], &lookup(2), 60, 0, None, 1).unwrap(),
+            store
+                .claim(&owner(1), &[2; 16], &lookup(2), 60, 0, None, 1)
+                .unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
         assert!(matches!(
-            store.claim(&owner(1), &[3; 16], &lookup(3), 0, 0, None, 1).unwrap(),
+            store
+                .claim(&owner(1), &[3; 16], &lookup(3), 0, 0, None, 1)
+                .unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
     }
@@ -2031,7 +2047,15 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3u8 {
             let ClaimOutcome::Claimed { code_id, .. } = store
-                .claim(&owner(1), &[i + 1; 16], &lookup(i), 0, 0, None, now + i as u64)
+                .claim(
+                    &owner(1),
+                    &[i + 1; 16],
+                    &lookup(i),
+                    0,
+                    0,
+                    None,
+                    now + i as u64,
+                )
                 .unwrap()
             else {
                 unreachable!()
@@ -2481,19 +2505,43 @@ mod tests {
         // Same request + same content: replay (idempotency carries the
         // new fields in the body).
         let retry = store
-            .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, Some(&endpoint), now + 10)
+            .claim(
+                &owner(1),
+                &[7; 16],
+                &lookup(1),
+                0,
+                1,
+                Some(&endpoint),
+                now + 10,
+            )
             .unwrap();
         assert!(matches!(retry, ClaimOutcome::Replay(_)));
         // Same request, different endpoint or cap: REQUEST_CONFLICT.
         assert_eq!(
             store
-                .claim(&owner(1), &[7; 16], &lookup(1), 0, 1, Some(&[0x00; 8]), now + 20)
+                .claim(
+                    &owner(1),
+                    &[7; 16],
+                    &lookup(1),
+                    0,
+                    1,
+                    Some(&[0x00; 8]),
+                    now + 20
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
         assert_eq!(
             store
-                .claim(&owner(1), &[7; 16], &lookup(1), 0, 2, Some(&endpoint), now + 30)
+                .claim(
+                    &owner(1),
+                    &[7; 16],
+                    &lookup(1),
+                    0,
+                    2,
+                    Some(&endpoint),
+                    now + 30
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
@@ -2523,7 +2571,15 @@ mod tests {
         let ClaimOutcome::Claimed {
             code_id, revision, ..
         } = store
-            .claim(&owner(1), &[1; 16], &lookup(1), 0, 0, Some(&owner_blob), now)
+            .claim(
+                &owner(1),
+                &[1; 16],
+                &lookup(1),
+                0,
+                0,
+                Some(&owner_blob),
+                now,
+            )
             .unwrap()
         else {
             unreachable!()
@@ -2547,18 +2603,31 @@ mod tests {
         let pairing_id = [0x9E; 16];
         assert_eq!(
             store
-                .begin_pairing(&pairing_id, &owner(2), &redeem, &code, Some(&redeemer_blob), now)
+                .begin_pairing(
+                    &pairing_id,
+                    &owner(2),
+                    &redeem,
+                    &code,
+                    Some(&redeemer_blob),
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
         // The offer served back to the owner carries the redeemer blob.
         let offers = store.pending_offers_for_owner(&owner(1)).unwrap();
         assert_eq!(offers.len(), 1);
-        assert_eq!(offers[0].redeemer_endpoint.as_deref(), Some(&redeemer_blob[..]));
+        assert_eq!(
+            offers[0].redeemer_endpoint.as_deref(),
+            Some(&redeemer_blob[..])
+        );
         // The snapshot carries both sides for the commit path.
         let snapshot = store.pairing_snapshot(&pairing_id).unwrap().unwrap();
         assert_eq!(snapshot.owner_endpoint.as_deref(), Some(&owner_blob[..]));
-        assert_eq!(snapshot.redeemer_endpoint.as_deref(), Some(&redeemer_blob[..]));
+        assert_eq!(
+            snapshot.redeemer_endpoint.as_deref(),
+            Some(&redeemer_blob[..])
+        );
     }
 
     #[test]
@@ -2593,7 +2662,14 @@ mod tests {
         // First redeemer begins: allowed.
         assert_eq!(
             store
-                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_a,
+                    &owner(2),
+                    &redeem(2, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2601,7 +2677,14 @@ mod tests {
         // committed pairings count).
         assert_eq!(
             store
-                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_b,
+                    &owner(3),
+                    &redeem(6, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2615,7 +2698,10 @@ mod tests {
                 &owner(1),
                 &transcript,
                 &digest,
-                &PairProof { mac: [6; 32], signature: [7; 64] },
+                &PairProof {
+                    mac: [6; 32],
+                    signature: [7; 64]
+                },
                 now
             )
             .unwrap());
@@ -2624,7 +2710,10 @@ mod tests {
                 &pairing_a,
                 &owner(2),
                 &digest,
-                &PairProof { mac: [8; 32], signature: [9; 64] },
+                &PairProof {
+                    mac: [8; 32],
+                    signature: [9; 64]
+                },
                 now
             )
             .unwrap());
@@ -2640,7 +2729,14 @@ mod tests {
         // Cap reached: a new redeemer is refused up front.
         assert_eq!(
             store
-                .begin_pairing(&[0xCC; 16], &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &[0xCC; 16],
+                    &owner(4),
+                    &redeem(10, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::RedeemExhausted
         );
@@ -2737,13 +2833,27 @@ mod tests {
         let pairing_b = [0xDB; 16];
         assert_eq!(
             store
-                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_a,
+                    &owner(2),
+                    &redeem(2, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
         assert_eq!(
             store
-                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_b,
+                    &owner(3),
+                    &redeem(6, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2770,7 +2880,14 @@ mod tests {
         // redeemer is refused up front.
         assert_eq!(
             store
-                .begin_pairing(&[0xDC; 16], &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &[0xDC; 16],
+                    &owner(4),
+                    &redeem(10, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::RedeemExhausted
         );
@@ -2883,13 +3000,27 @@ mod tests {
         let pairing_c = [0xF3; 16];
         assert_eq!(
             store
-                .begin_pairing(&pairing_a, &owner(2), &redeem(2, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_a,
+                    &owner(2),
+                    &redeem(2, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
         assert_eq!(
             store
-                .begin_pairing(&pairing_b, &owner(3), &redeem(6, now + 1_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_b,
+                    &owner(3),
+                    &redeem(6, now + 1_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2906,7 +3037,14 @@ mod tests {
         // C is admitted: A and B consumed nothing.
         assert_eq!(
             store
-                .begin_pairing(&pairing_c, &owner(4), &redeem(10, now + 120_000), &code, None, now)
+                .begin_pairing(
+                    &pairing_c,
+                    &owner(4),
+                    &redeem(10, now + 120_000),
+                    &code,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2938,7 +3076,14 @@ mod tests {
         let pairing_d = [0xF4; 16];
         assert_eq!(
             store
-                .begin_pairing(&pairing_d, &owner(6), &redeem(20, now + 120_000), &code2, None, now)
+                .begin_pairing(
+                    &pairing_d,
+                    &owner(6),
+                    &redeem(20, now + 120_000),
+                    &code2,
+                    None,
+                    now
+                )
                 .unwrap(),
             BeginRedeem::Begun
         );
@@ -2976,7 +3121,9 @@ mod tests {
             PreparedDecision::WaitingOther
         );
         assert!(matches!(
-            store.revoke(&owner(5), &[3; 16], &code_id2, 1, now + 1).unwrap(),
+            store
+                .revoke(&owner(5), &[3; 16], &code_id2, 1, now + 1)
+                .unwrap(),
             RevokeOutcome::Revoked { .. }
         ));
         assert_eq!(
@@ -3188,7 +3335,15 @@ mod tests {
         // The migrated tables accept wave-28 writes.
         assert!(matches!(
             store
-                .claim(&owner(1), &[1; 16], &lookup(9), 0, 1, Some(&[0x0F; 32]), 2_000)
+                .claim(
+                    &owner(1),
+                    &[1; 16],
+                    &lookup(9),
+                    0,
+                    1,
+                    Some(&[0x0F; 32]),
+                    2_000
+                )
                 .unwrap(),
             ClaimOutcome::Claimed { .. }
         ));
@@ -3328,7 +3483,15 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim(&owner(2), &[0x77; 16], &lookup(7), 600, 0, Some(&[0x0E; 32]), 9_004)
+                .claim(
+                    &owner(2),
+                    &[0x77; 16],
+                    &lookup(7),
+                    600,
+                    0,
+                    Some(&[0x0E; 32]),
+                    9_004
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
@@ -3422,13 +3585,29 @@ mod tests {
         // ttl / cap / endpoint / lookup differences still refuse.
         assert_eq!(
             store
-                .claim(&owner(5), &[0x50; 16], &lookup(5), 900, 1, Some(&[0x0F; 16]), now + 30)
+                .claim(
+                    &owner(5),
+                    &[0x50; 16],
+                    &lookup(5),
+                    900,
+                    1,
+                    Some(&[0x0F; 16]),
+                    now + 30
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
         assert_eq!(
             store
-                .claim(&owner(5), &[0x50; 16], &lookup(5), 600, 0, Some(&[0x0F; 16]), now + 31)
+                .claim(
+                    &owner(5),
+                    &[0x50; 16],
+                    &lookup(5),
+                    600,
+                    0,
+                    Some(&[0x0F; 16]),
+                    now + 31
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
@@ -3440,7 +3619,15 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim(&owner(5), &[0x50; 16], &lookup(6), 600, 1, Some(&[0x0F; 16]), now + 33)
+                .claim(
+                    &owner(5),
+                    &[0x50; 16],
+                    &lookup(6),
+                    600,
+                    1,
+                    Some(&[0x0F; 16]),
+                    now + 33
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );
@@ -3460,7 +3647,15 @@ mod tests {
             assert!(
                 matches!(
                     store
-                        .claim(&owner(9), &request, &lookup(40 + index as u8), 0, 0, None, now)
+                        .claim(
+                            &owner(9),
+                            &request,
+                            &lookup(40 + index as u8),
+                            0,
+                            0,
+                            None,
+                            now
+                        )
                         .unwrap(),
                     ClaimOutcome::Claimed { .. }
                 ),
@@ -3597,7 +3792,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(body.is_some(), "fresh claims persist the canonical body");
-            assert!(response.is_some(), "fresh claims persist the response bytes");
+            assert!(
+                response.is_some(),
+                "fresh claims persist the response bytes"
+            );
         }
     }
 
@@ -3687,11 +3885,7 @@ mod tests {
             conn.execute(
                 "UPDATE request_journal SET request_body=?3
                  WHERE owner_device_id=?1 AND request_id=?2",
-                params![
-                    owner(3).as_slice(),
-                    &[0x33u8; 16].as_slice(),
-                    &wave28_body
-                ],
+                params![owner(3).as_slice(), &[0x33u8; 16].as_slice(), &wave28_body],
             )
             .unwrap();
             let response: Vec<u8> = conn
@@ -3739,7 +3933,15 @@ mod tests {
         // digest.
         assert_eq!(
             store
-                .claim(&owner(3), &[0x33; 16], &lookup(3), 600, 0, Some(&[0x0D; 32]), now + 3)
+                .claim(
+                    &owner(3),
+                    &[0x33; 16],
+                    &lookup(3),
+                    600,
+                    0,
+                    Some(&[0x0D; 32]),
+                    now + 3
+                )
                 .unwrap(),
             ClaimOutcome::RequestConflict
         );

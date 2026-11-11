@@ -740,8 +740,7 @@ fn budget_table_locked() {
         ),
         (
             0x10,
-            CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x10)))
-                .with_endpoint(blob.clone()),
+            CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x10))).with_endpoint(blob.clone()),
         ),
         (
             0x12,
@@ -1701,7 +1700,10 @@ fn err_endpoint_blob_budget() {
             CtrlFrame::new(message.clone())
                 .with_endpoint(over.clone())
                 .try_encode(&mut Vec::new()),
-            Err(EncodeError::EndpointBlobSize { len: 513, limit: 512 })
+            Err(EncodeError::EndpointBlobSize {
+                len: 513,
+                limit: 512
+            })
         ));
     }
     // Empty blob is not a legal field either.
@@ -1727,9 +1729,7 @@ fn err_endpoint_blob_budget() {
     }
     // Exactly-full 512-byte blob passes.
     let full = sample_blob(0x62, ENDPOINT_BLOB_MAX_BYTES);
-    roundtrip_frame(
-        CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x42))).with_endpoint(full),
-    );
+    roundtrip_frame(CtrlFrame::new(CtrlMessage::InviteRedeem(redeem(0x42))).with_endpoint(full));
 }
 
 #[test]

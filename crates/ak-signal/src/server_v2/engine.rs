@@ -764,11 +764,8 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
                 None => break,
             },
         };
-        let sent = tokio::time::timeout(
-            write_budget,
-            write_frame(&mut write, &frame, Role::Server),
-        )
-        .await;
+        let sent =
+            tokio::time::timeout(write_budget, write_frame(&mut write, &frame, Role::Server)).await;
         if !matches!(sent, Ok(Ok(()))) {
             log::debug!("v2 outbound write stalled or failed; closing connection");
             // Tell the handler this connection is dead (best-effort: it
@@ -1238,8 +1235,7 @@ fn handle_claim(
         max_redeems,
         owner_endpoint.as_ref().map(|blob| blob.0.as_slice()),
         now,
-    )
-    {
+    ) {
         Ok(ClaimOutcome::Claimed {
             code_id,
             created_ms,
@@ -2966,8 +2962,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         // Full end-to-end proof: Hello/Welcome still served.
-        let client = TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "c")
-            .await;
+        let client =
+            TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "c").await;
         drop(client);
         server.stop().await;
     }
@@ -3036,8 +3032,7 @@ mod tests {
         let server = spawn_server().await;
         let registry_id = server.registry_id();
         let key = DeviceKeyPair::generate();
-        let mut owner =
-            TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
+        let mut owner = TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
 
         // The first 30 claims of the hour succeed (distinct requests and
         // lookups under one owner).
@@ -3058,9 +3053,9 @@ mod tests {
                         first_code = Some(code_id);
                     }
                 }
-                other => panic!(
-                    "claim {index} inside the 30/hour budget must succeed, got {other:?}"
-                ),
+                other => {
+                    panic!("claim {index} inside the 30/hour budget must succeed, got {other:?}")
+                }
             }
         }
         // The 31st NEW claim of the hour: RATE_LIMITED.
@@ -3079,8 +3074,7 @@ mod tests {
         // A reconnect (fresh control connection, same owner identity)
         // does not reset the hour window.
         drop(owner);
-        let mut owner2 =
-            TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
+        let mut owner2 = TestClient::connect(server.addr, &registry_id, key.clone(), "o").await;
         owner2
             .send(&CtrlMessage::InviteClaim {
                 request_id: random_id16(),
@@ -3299,9 +3293,11 @@ mod tests {
         let bytes = transcript.to_bytes();
         let owner_proof = PairProof {
             mac: [0x11; 32],
-            signature: owner
-                .key
-                .sign(&hello2::proof_signed_message(OWNER_PROOF_DOMAIN, &bytes, &[0x11; 32])),
+            signature: owner.key.sign(&hello2::proof_signed_message(
+                OWNER_PROOF_DOMAIN,
+                &bytes,
+                &[0x11; 32],
+            )),
         };
         owner
             .send(&CtrlMessage::PairChallenge {
@@ -3322,9 +3318,11 @@ mod tests {
         let digest = hello2::transcript_digest(&bytes);
         let redeemer_proof = PairProof {
             mac: [0x22; 32],
-            signature: redeemer
-                .key
-                .sign(&hello2::proof_signed_message(REDEEMER_PROOF_DOMAIN, &bytes, &[0x22; 32])),
+            signature: redeemer.key.sign(&hello2::proof_signed_message(
+                REDEEMER_PROOF_DOMAIN,
+                &bytes,
+                &[0x22; 32],
+            )),
         };
         redeemer
             .send(&CtrlMessage::PairProof {
@@ -3348,14 +3346,18 @@ mod tests {
             .send(&CtrlMessage::PairPrepared {
                 pairing_id,
                 transcript_digest: digest,
-                signature: owner.key.sign(&hello2::prepared_message(&pairing_id, &digest)),
+                signature: owner
+                    .key
+                    .sign(&hello2::prepared_message(&pairing_id, &digest)),
             })
             .await;
         redeemer
             .send(&CtrlMessage::PairPrepared {
                 pairing_id,
                 transcript_digest: digest,
-                signature: redeemer.key.sign(&hello2::prepared_message(&pairing_id, &digest)),
+                signature: redeemer
+                    .key
+                    .sign(&hello2::prepared_message(&pairing_id, &digest)),
             })
             .await;
         (bytes, digest)
@@ -3459,7 +3461,10 @@ mod tests {
         // The owner's own commit copy also carries its blob (same fixed
         // frame to both participants; no third party is involved).
         let owner_commit = owner.recv_frame().await;
-        assert!(matches!(owner_commit.message, CtrlMessage::PairCommit { .. }));
+        assert!(matches!(
+            owner_commit.message,
+            CtrlMessage::PairCommit { .. }
+        ));
         assert_eq!(owner_commit.endpoint, Some(owner_blob.clone()));
         server.stop().await;
     }
@@ -3500,9 +3505,7 @@ mod tests {
         let redeem = signed_redeem(&first.key, &registry_id, lookup, random_id16(), deadline);
         let request_id = redeem.request_id;
         let redeemer_nonce = redeem.redeemer_nonce;
-        first
-            .send(&CtrlMessage::InviteRedeem(redeem))
-            .await;
+        first.send(&CtrlMessage::InviteRedeem(redeem)).await;
         let pairing_id = match first.recv().await {
             CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
             other => panic!("expected InviteRedeemPending, got {other:?}"),
@@ -3535,9 +3538,7 @@ mod tests {
             second_deadline,
         );
         let second_request = second_redeem.request_id;
-        second
-            .send(&CtrlMessage::InviteRedeem(second_redeem))
-            .await;
+        second.send(&CtrlMessage::InviteRedeem(second_redeem)).await;
         match second.recv().await {
             CtrlMessage::PairError {
                 request_id,
@@ -3610,9 +3611,7 @@ mod tests {
 
         // Same request id retry after the cap is in force: the original
         // result replays, not a fresh REDEEM_EXHAUSTED.
-        redeemer
-            .send(&CtrlMessage::InviteRedeem(redeem))
-            .await;
+        redeemer.send(&CtrlMessage::InviteRedeem(redeem)).await;
         match redeemer.recv().await {
             CtrlMessage::InviteRedeemPending {
                 pairing_id: replayed,
@@ -3663,7 +3662,9 @@ mod tests {
         let redeem_a = signed_redeem(&first.key, &registry_id, lookup, random_id16(), deadline);
         let request_a = redeem_a.request_id;
         let nonce_a = redeem_a.redeemer_nonce;
-        first.send(&CtrlMessage::InviteRedeem(redeem_a.clone())).await;
+        first
+            .send(&CtrlMessage::InviteRedeem(redeem_a.clone()))
+            .await;
         let pairing_a = match first.recv().await {
             CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
             other => panic!("first redeem must begin, got {other:?}"),
@@ -3671,7 +3672,9 @@ mod tests {
         let _offer_a = owner.recv_frame().await; // push to the owner
 
         let redeem_b = signed_redeem(&second.key, &registry_id, lookup, random_id16(), deadline);
-        second.send(&CtrlMessage::InviteRedeem(redeem_b.clone())).await;
+        second
+            .send(&CtrlMessage::InviteRedeem(redeem_b.clone()))
+            .await;
         let pairing_b = match second.recv().await {
             CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
             other => panic!("second redeem must begin, got {other:?}"),
@@ -3709,7 +3712,10 @@ mod tests {
             deadline,
         )
         .await;
-        for (who, frame) in [("redeemer", second.recv().await), ("owner", owner.recv().await)] {
+        for (who, frame) in [
+            ("redeemer", second.recv().await),
+            ("owner", owner.recv().await),
+        ] {
             match frame {
                 CtrlMessage::PairError {
                     scope,
@@ -3747,9 +3753,7 @@ mod tests {
         // The losing redeemer retrying its own request id still replays
         // the original pending answer — the cap never breaks redeem
         // idempotency.
-        second
-            .send(&CtrlMessage::InviteRedeem(redeem_b))
-            .await;
+        second.send(&CtrlMessage::InviteRedeem(redeem_b)).await;
         match second.recv().await {
             CtrlMessage::InviteRedeemPending {
                 pairing_id: replayed,

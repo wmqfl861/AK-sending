@@ -595,14 +595,14 @@ impl SchedulerActor {
                     };
                     *last_error = Some(error);
                     *cancel_requested
-                } || self.core.task_state(task) == Some(TaskState::CancelRequested);
+                } || self.core.task_state(task)
+                    == Some(TaskState::CancelRequested);
                 if cancel_requested {
                     self.cancel_terminal(task);
                     return;
                 }
                 let attempts = {
-                    let Some(TaskEntry::Active { attempts, .. }) = self.entries.get_mut(&id)
-                    else {
+                    let Some(TaskEntry::Active { attempts, .. }) = self.entries.get_mut(&id) else {
                         return;
                     };
                     *attempts += 1;
@@ -1360,8 +1360,7 @@ mod tests {
                 as Arc<dyn PairingTransport>,
             // The default executor is unrelated (listener off); only the
             // task spec below owns the DroppingExecutor.
-            Arc::new(FakeTransferExecutor::new(Arc::clone(&clock)))
-                as Arc<dyn TransferExecutor>,
+            Arc::new(FakeTransferExecutor::new(Arc::clone(&clock))) as Arc<dyn TransferExecutor>,
             RegistryId::from_bytes([0x11; 32]),
         );
         config.listener_enabled = false;

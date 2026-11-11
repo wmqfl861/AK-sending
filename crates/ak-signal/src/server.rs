@@ -380,7 +380,11 @@ impl Shared {
 
 /// Remove sessions by id and produce Cancel notifications for the other
 /// endpoints. `except` skips one device (e.g. the cancelling endpoint).
-fn remove_sessions(inner: &mut Inner, ids: &[SessionId], except: Option<&DeviceId>) -> Vec<Outbound> {
+fn remove_sessions(
+    inner: &mut Inner,
+    ids: &[SessionId],
+    except: Option<&DeviceId>,
+) -> Vec<Outbound> {
     let mut outbound = Vec::new();
     for id in ids {
         let Some(entry) = inner.sessions.remove(id) else {
@@ -391,7 +395,11 @@ fn remove_sessions(inner: &mut Inner, ids: &[SessionId], except: Option<&DeviceI
                 continue;
             }
             if let Some(device) = inner.devices.get(&endpoint) {
-                outbound.push((endpoint, device.out.clone(), CtrlMessage::Cancel { session: *id }));
+                outbound.push((
+                    endpoint,
+                    device.out.clone(),
+                    CtrlMessage::Cancel { session: *id },
+                ));
             }
         }
     }
@@ -882,7 +890,12 @@ fn announce_session(
     }
 }
 
-fn handle_connect(shared: &Shared, out: &mpsc::Sender<CtrlMessage>, me: DeviceId, target: DeviceId) {
+fn handle_connect(
+    shared: &Shared,
+    out: &mpsc::Sender<CtrlMessage>,
+    me: DeviceId,
+    target: DeviceId,
+) {
     let mut outbound: Vec<Outbound> = Vec::new();
     let mut error: Option<u16> = None;
     {
@@ -975,7 +988,11 @@ fn handle_signal(
                 };
                 if let Some(device) = inner.devices.get(&other) {
                     // Verbatim relay of one bounded, structured signal.
-                    outbound.push((other, device.out.clone(), CtrlMessage::Signal { session, signal }));
+                    outbound.push((
+                        other,
+                        device.out.clone(),
+                        CtrlMessage::Signal { session, signal },
+                    ));
                 }
             }
             // Unknown session id, or one this device is not part of. Both
@@ -2116,7 +2133,9 @@ mod tests {
         let device_id = client_support::device(&key);
         let timestamp = util::now_unix_ms();
         let signature = key
-            .sign(&codec::hello_signing_bytes(1, &device_id, "silent", timestamp))
+            .sign(&codec::hello_signing_bytes(
+                1, &device_id, "silent", timestamp,
+            ))
             .to_bytes();
         let mut hello = Vec::new();
         CtrlFrame {
@@ -2197,7 +2216,9 @@ mod tests {
             // never trips the Hello replay window.
             let timestamp = util::fresh_now_unix_ms();
             let signature = key
-                .sign(&codec::hello_signing_bytes(1, &device_id, "late", timestamp))
+                .sign(&codec::hello_signing_bytes(
+                    1, &device_id, "late", timestamp,
+                ))
                 .to_bytes();
             let hello = CtrlMessage::Hello {
                 version: 1,
@@ -2265,12 +2286,20 @@ mod tests {
         // Fill the 16-deep outbox of the forged entry.
         for index in 0..16u8 {
             sender
-                .try_send(CtrlMessage::Cancel { session: [index; 16] })
+                .try_send(CtrlMessage::Cancel {
+                    session: [index; 16],
+                })
                 .unwrap();
         }
         flush(
             &shared,
-            vec![(me, sender, CtrlMessage::Cancel { session: [0xAA; 16] })],
+            vec![(
+                me,
+                sender,
+                CtrlMessage::Cancel {
+                    session: [0xAA; 16],
+                },
+            )],
         );
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -2281,6 +2310,9 @@ mod tests {
             _ = close.notified() => true,
             _ = tokio::time::sleep(Duration::from_secs(5)) => false,
         };
-        assert!(signaled, "a full outbox must actively close the slow consumer");
+        assert!(
+            signaled,
+            "a full outbox must actively close the slow consumer"
+        );
     }
 }

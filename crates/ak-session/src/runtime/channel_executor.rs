@@ -192,7 +192,8 @@ impl ChannelReceiveExecutor {
     /// The pairing id the held `TaskOpen` claims (convenience for building
     /// `PairingPlan::Ready` alongside a resolved group).
     pub fn claimed_pairing_id(&self) -> Option<PairingId> {
-        self.claim().map(|claim| PairingId::from_bytes(claim.pairing_id))
+        self.claim()
+            .map(|claim| PairingId::from_bytes(claim.pairing_id))
     }
 
     /// The outcome of the task's attempt, once it finished. `None` while
@@ -311,10 +312,8 @@ impl TransferExecutor for ChannelReceiveExecutor {
             let mut cancel_rx = cancel_rx;
             task_sink.phase(task, TaskPhase::Scanning).await;
             let mut engine_fut = Box::pin(async move {
-                ak_engine::receive_on_channel_preadmitted(
-                    channel, engine_spec, open, &progress,
-                )
-                .await
+                ak_engine::receive_on_channel_preadmitted(channel, engine_spec, open, &progress)
+                    .await
             });
             let mut transferring_reported = false;
             let result = loop {
@@ -440,10 +439,13 @@ impl TransferExecutor for ChannelReceiveExecutor {
             .lock()
             .expect("channel executor lock")
             .running
-            .insert(id, RunningTask {
-                cancel: cancel_tx,
-                join: engine_task,
-            });
+            .insert(
+                id,
+                RunningTask {
+                    cancel: cancel_tx,
+                    join: engine_task,
+                },
+            );
         Ok(())
     }
 
@@ -569,8 +571,13 @@ mod tests {
         let addr = endpoint.local_addr().expect("local addr");
         let sender_key = DeviceKeyPair::generate();
         let registry = [0x11; 32];
-        let validator =
-            seeded_validator(tmp.path(), registry, pairing_id, code_id, &sender_key.public_key());
+        let validator = seeded_validator(
+            tmp.path(),
+            registry,
+            pairing_id,
+            code_id,
+            &sender_key.public_key(),
+        );
         LoopbackFixture {
             tmp,
             validator,
@@ -600,12 +607,8 @@ mod tests {
             task_id: [u8; 16],
         ) -> tokio::task::JoinHandle<Result<ak_engine::Report, ak_engine::EngineError>> {
             let identity = ak_identity::tls::make_self_signed(&self.sender_key);
-            let mut send_spec = ak_engine::SendSpec::new(
-                src,
-                self.addr,
-                self.receiver_key.fingerprint(),
-                identity,
-            );
+            let mut send_spec =
+                ak_engine::SendSpec::new(src, self.addr, self.receiver_key.fingerprint(), identity);
             send_spec.idle_timeout = Duration::from_secs(20);
             let admission = ak_engine::AdmissionCtx::new(
                 task_id,
@@ -635,7 +638,11 @@ mod tests {
         /// on purpose (see the fixture docs).
         async fn accept_and_admit(
             &self,
-        ) -> (Arc<ChannelReceiveExecutor>, ResolvedAdmission, PeerFingerprint) {
+        ) -> (
+            Arc<ChannelReceiveExecutor>,
+            ResolvedAdmission,
+            PeerFingerprint,
+        ) {
             self.accept_and_admit_observed(None).await
         }
 
@@ -645,7 +652,11 @@ mod tests {
         async fn accept_and_admit_observed(
             &self,
             observer: Option<Arc<dyn Fn(ak_engine::Progress) + Send + Sync>>,
-        ) -> (Arc<ChannelReceiveExecutor>, ResolvedAdmission, PeerFingerprint) {
+        ) -> (
+            Arc<ChannelReceiveExecutor>,
+            ResolvedAdmission,
+            PeerFingerprint,
+        ) {
             let spec = self.recv_spec();
             let mut channel = self.endpoint.accept(&|_| true).await.expect("accept");
             let open = match scheduler_handshake(&mut channel, &spec)
@@ -660,7 +671,10 @@ mod tests {
             let executor = Arc::new(ChannelReceiveExecutor::new(channel, spec, open, observer));
             let claim = executor.claim().expect("claim before enqueue");
             let peer = executor.peer_fingerprint().expect("peer before enqueue");
-            let resolved = self.validator.resolve(&peer, &claim).expect("relation admits");
+            let resolved = self
+                .validator
+                .resolve(&peer, &claim)
+                .expect("relation admits");
             (executor, resolved, peer)
         }
     }
@@ -728,9 +742,7 @@ mod tests {
         let observed = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    Command::Report(ExecutorReport::Phase { phase, .. }) => {
-                        seen_phases.push(phase)
-                    }
+                    Command::Report(ExecutorReport::Phase { phase, .. }) => seen_phases.push(phase),
                     Command::Report(ExecutorReport::Finished { outcome, .. }) => {
                         finished = Some(outcome);
                         break;

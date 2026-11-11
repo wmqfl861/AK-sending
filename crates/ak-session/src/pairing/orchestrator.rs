@@ -220,8 +220,7 @@ pub struct RedeemOffer {
 /// Pre-commit veto over one redeem offer (see [`RedeemOffer`]). `Err`
 /// aborts the pairing server-side before the owner flow (and therefore
 /// before the server's commit) starts.
-pub type RedeemOfferGate =
-    Arc<dyn Fn(&RedeemOffer) -> Result<(), PairFlowError> + Send + Sync>;
+pub type RedeemOfferGate = Arc<dyn Fn(&RedeemOffer) -> Result<(), PairFlowError> + Send + Sync>;
 
 /// In-memory invite registry: `secret_ref → code` plus `code_id` metadata.
 #[derive(Debug, Default)]
@@ -304,10 +303,7 @@ impl PairingOrchestrator {
 
     /// Install the live persisted-code source (see [`Self::persisted_source`]).
     pub fn set_persisted_code_source(&self, source: PersistedCodeSource) {
-        *self
-            .persisted_source
-            .lock()
-            .expect("orchestrator lock") = Some(source);
+        *self.persisted_source.lock().expect("orchestrator lock") = Some(source);
     }
 
     /// Install the pre-commit redeem-offer gate (wave 29, review
@@ -535,7 +531,14 @@ impl PairingOrchestrator {
             .send_pair_applied(pairing_id, digest, committed.commit_revision, signature)
             .await
             .map_err(map_client)?;
-        wait_ready(&self.client, plane, pairing_id, digest, self.config.ready_wait_ms).await?;
+        wait_ready(
+            &self.client,
+            plane,
+            pairing_id,
+            digest,
+            self.config.ready_wait_ms,
+        )
+        .await?;
         self.journal.mark_applied(&pairing_id)?;
         Ok(committed.verified)
     }
@@ -588,15 +591,18 @@ impl PairingOrchestrator {
         let pairing_id = ack.pairing_id;
 
         // ← PairChallenge (relayed owner transcript + owner proof).
-        let (transcript, owner_proof) =
-            match wait_frame(&self.client, plane, pairing_id, deadline.saturating_add(5_000), |frame| {
-                pairing_challenge_of(frame, pairing_id)
-            })
-            .await?
-            {
-                Some(pair) => pair,
-                None => return Err(PairFlowError::Timeout),
-            };
+        let (transcript, owner_proof) = match wait_frame(
+            &self.client,
+            plane,
+            pairing_id,
+            deadline.saturating_add(5_000),
+            |frame| pairing_challenge_of(frame, pairing_id),
+        )
+        .await?
+        {
+            Some(pair) => pair,
+            None => return Err(PairFlowError::Timeout),
+        };
         let transcript = PairTranscript::from_bytes(&transcript);
         let bindings_ok = transcript.pairing_id == pairing_id
             && transcript.lookup_digest == code.lookup_digest()
@@ -796,9 +802,7 @@ impl PairingOrchestrator {
                             code_revision,
                             pairing_id,
                             redeemer_device_id,
-                            redeemer_endpoint: orchestrator
-                                .client
-                                .peek_endpoint_blob(pairing_id),
+                            redeemer_endpoint: orchestrator.client.peek_endpoint_blob(pairing_id),
                         };
                         if let Err(err) = gate(&offer) {
                             log::warn!(
@@ -811,9 +815,7 @@ impl PairingOrchestrator {
                                 // server can never commit it; the redeemer
                                 // observes the unified `PAIR_UNAVAILABLE`
                                 // before any of its local writes.
-                                let _ = client
-                                    .pair_abort(pairing_id, AbortReason::Protocol)
-                                    .await;
+                                let _ = client.pair_abort(pairing_id, AbortReason::Protocol).await;
                             });
                             continue;
                         }

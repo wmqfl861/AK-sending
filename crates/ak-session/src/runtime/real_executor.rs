@@ -151,9 +151,7 @@ impl std::fmt::Debug for RealTransferExecutor {
 /// `pub(crate)` since wave 27: the on-channel receive executor
 /// (`channel_executor`) classifies the same engine error taxonomy for
 /// already-accepted direct channels.
-pub(crate) fn stable_code(
-    err: &ak_engine::EngineError,
-) -> (ErrorCode, Option<std::io::ErrorKind>) {
+pub(crate) fn stable_code(err: &ak_engine::EngineError) -> (ErrorCode, Option<std::io::ErrorKind>) {
     use ak_engine::EngineError;
     match err {
         EngineError::Connect(ak_net::ConnectError::Unauthorized) => (ErrorCode::AuthFailed, None),
@@ -304,8 +302,11 @@ impl TransferExecutor for RealTransferExecutor {
         let engine_task = tokio::spawn(async move {
             let mut cancel_rx = cancel_rx;
             task_sink.phase(task, TaskPhase::Scanning).await;
-            let mut engine_fut =
-                Box::pin(ak_engine::receive_with_addr(engine_spec, &progress, addr_tx));
+            let mut engine_fut = Box::pin(ak_engine::receive_with_addr(
+                engine_spec,
+                &progress,
+                addr_tx,
+            ));
             let mut transferring_reported = false;
             let result = loop {
                 tokio::select! {
@@ -418,10 +419,13 @@ impl TransferExecutor for RealTransferExecutor {
             .lock()
             .expect("real executor lock")
             .running
-            .insert(id, RunningTask {
-                cancel: cancel_tx,
-                join: engine_task,
-            });
+            .insert(
+                id,
+                RunningTask {
+                    cancel: cancel_tx,
+                    join: engine_task,
+                },
+            );
         Ok(())
     }
 
@@ -535,8 +539,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let out = tmp.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let (handle, executor, task, bound) =
-            real_receive_runtime(&out, 400).await;
+        let (handle, executor, task, bound) = real_receive_runtime(&out, 400).await;
 
         let summary = tokio::time::timeout(
             Duration::from_secs(15),
@@ -654,7 +657,10 @@ mod tests {
         let (handle, executor, task, bound) = real_receive_runtime(&out, 10_000).await;
 
         let receipt = handle.cancel(task).await.expect("cancel the task");
-        assert_eq!(receipt, crate::runtime::CancelReceipt::RunningCancellationRequested);
+        assert_eq!(
+            receipt,
+            crate::runtime::CancelReceipt::RunningCancellationRequested
+        );
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -750,13 +756,11 @@ mod tests {
         let identity_a = ak_identity::tls::make_self_signed(&key_a);
         let mut send_spec = ak_engine::SendSpec::new(src, bound, pinned, identity_a);
         send_spec.idle_timeout = Duration::from_secs(20);
-        let report = tokio::time::timeout(
-            Duration::from_secs(30),
-            ak_engine::send(send_spec, &|_| {}),
-        )
-        .await
-        .expect("send finishes")
-        .expect("send succeeds");
+        let report =
+            tokio::time::timeout(Duration::from_secs(30), ak_engine::send(send_spec, &|_| {}))
+                .await
+                .expect("send finishes")
+                .expect("send succeeds");
         assert_eq!(report.files, 1);
 
         // The cancellation fired mid-completion; the persisted completion

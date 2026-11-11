@@ -3331,9 +3331,15 @@ async fn receive_job(
     let store = FileCheckpointStore::open(&spec.checkpoint_dir).map_err(EngineError::Checkpoint)?;
     let (mut tx, mut rx, peer_caps) =
         receive_hello_exchange(&channel, spec, admission.is_some(), progress).await?;
-    let staged_task =
-        receive_admission_stage(&mut tx, &mut rx, &limits, spec.idle_timeout, admission, peer_caps)
-            .await?;
+    let staged_task = receive_admission_stage(
+        &mut tx,
+        &mut rx,
+        &limits,
+        spec.idle_timeout,
+        admission,
+        peer_caps,
+    )
+    .await?;
     receive_frozen_body(
         channel,
         tx,
@@ -8983,9 +8989,13 @@ mod tests {
     /// checkpoint record).
     #[tokio::test]
     async fn consent_decline_sends_declined_error_and_writes_nothing() {
-        let harness =
-            consent_harness(Some(Arc::new(|_: &ConsentInfo| ConsentAnswer::Now(false))), 2, 4096, true)
-                .await;
+        let harness = consent_harness(
+            Some(Arc::new(|_: &ConsentInfo| ConsentAnswer::Now(false))),
+            2,
+            4096,
+            true,
+        )
+        .await;
 
         // The wire answer, observed by the early reader: exactly one
         // DECLINED error frame and then the connection ends.
@@ -9077,9 +9087,11 @@ mod tests {
         let (decide_tx, decide_rx) = tokio::sync::oneshot::channel::<bool>();
         let parked = std::sync::Mutex::new(Some(decide_rx));
         let mut harness = consent_harness(
-            Some(Arc::new(move |_: &ConsentInfo| match parked.lock().unwrap().take() {
-                Some(pending) => ConsentAnswer::Pending(pending),
-                None => ConsentAnswer::Now(false),
+            Some(Arc::new(move |_: &ConsentInfo| {
+                match parked.lock().unwrap().take() {
+                    Some(pending) => ConsentAnswer::Pending(pending),
+                    None => ConsentAnswer::Now(false),
+                }
             })),
             1,
             10,
@@ -9098,9 +9110,11 @@ mod tests {
         drop(gone_tx);
         let vanished = std::sync::Mutex::new(Some(gone_rx));
         let harness = consent_harness(
-            Some(Arc::new(move |_: &ConsentInfo| match vanished.lock().unwrap().take() {
-                Some(pending) => ConsentAnswer::Pending(pending),
-                None => ConsentAnswer::Now(false),
+            Some(Arc::new(move |_: &ConsentInfo| {
+                match vanished.lock().unwrap().take() {
+                    Some(pending) => ConsentAnswer::Pending(pending),
+                    None => ConsentAnswer::Now(false),
+                }
             })),
             1,
             10,
@@ -9211,9 +9225,7 @@ mod tests {
     fn spawn_daemon_handshake(
         endpoint: DirectEndpoint,
         spec: ReceiveSpec,
-    ) -> tokio::task::JoinHandle<
-        Result<(SchedulerHandshake, DirectChannel), EngineError>,
-    > {
+    ) -> tokio::task::JoinHandle<Result<(SchedulerHandshake, DirectChannel), EngineError>> {
         tokio::spawn(async move {
             let mut channel = endpoint.accept(&|_| true).await.unwrap();
             let handshake = channel_scheduler_handshake(&mut channel, &spec).await?;
@@ -9363,10 +9375,9 @@ mod tests {
         // connection is closed under the peer right after).
         let sender_key = DeviceKeyPair::generate();
         let sender_identity = ak_identity::tls::make_self_signed(&sender_key);
-        let dialer =
-            DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_identity)
-                .await
-                .unwrap();
+        let dialer = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_identity)
+            .await
+            .unwrap();
         let _channel = dialer
             .connect(addr, &receiver_key.fingerprint())
             .await
@@ -9408,12 +9419,15 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         let pinned = receiver_key.fingerprint();
         let recv_spec = on_channel_recv_spec(dst.path(), receiver_identity);
-        let seen: Arc<std::sync::Mutex<Vec<Progress>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen: Arc<std::sync::Mutex<Vec<Progress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let events = Arc::clone(&seen);
 
         let receiver = tokio::spawn(async move {
             let mut channel = endpoint.accept(&|_| true).await.unwrap();
-            let open = match channel_scheduler_handshake(&mut channel, &recv_spec).await.unwrap()
+            let open = match channel_scheduler_handshake(&mut channel, &recv_spec)
+                .await
+                .unwrap()
             {
                 SchedulerHandshake::Scheduler { open } => open,
                 SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
@@ -9433,10 +9447,12 @@ mod tests {
         });
 
         let task_id: [u8; 16] = [0xD1; 16];
-        let sender =
-            spawn_on_channel_sender(src.path().to_path_buf(), addr, pinned, task_id);
+        let sender = spawn_on_channel_sender(src.path().to_path_buf(), addr, pinned, task_id);
 
-        let recv_report = receiver.await.unwrap().expect("preadmitted receive completes");
+        let recv_report = receiver
+            .await
+            .unwrap()
+            .expect("preadmitted receive completes");
         let send_report = sender.await.unwrap().expect("send completes");
         assert_eq!(send_report.files, 1);
         assert_eq!(send_report.bytes, payload.len() as u64);
@@ -9495,18 +9511,17 @@ mod tests {
         let mut spec_a = on_channel_recv_spec(dst.path(), receiver_identity.clone());
         spec_a.idle_timeout = Duration::from_secs(5);
         let receiver_a = tokio::spawn(async move {
-            let mut channel = endpoint
-                .accept(&|_| true)
+            let mut channel = endpoint.accept(&|_| true).await.expect("task A connects");
+            let open = match channel_scheduler_handshake(&mut channel, &spec_a)
                 .await
-                .expect("task A connects");
-            let open = match channel_scheduler_handshake(&mut channel, &spec_a).await.unwrap() {
+                .unwrap()
+            {
                 SchedulerHandshake::Scheduler { open } => open,
                 SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
             };
             receive_on_channel_preadmitted(channel, spec_a, open, &noop).await
         });
-        let mut fake_a =
-            fake_sender_side(addr, pinned, CAP_RESUME | CAP_SCHEDULER).await;
+        let mut fake_a = fake_sender_side(addr, pinned, CAP_RESUME | CAP_SCHEDULER).await;
         fake_a
             .tx
             .send_frame(&wire(Message::TaskOpen {
@@ -9527,7 +9542,10 @@ mod tests {
         assert_eq!(granted_permit, [2; 16]);
         assert!(granted);
         assert_eq!(reason, AdmissionReason::Ok);
-        assert_eq!(lease_ms, ADMISSION_LEASE_MS, "grant carries the bounded lease");
+        assert_eq!(
+            lease_ms, ADMISSION_LEASE_MS,
+            "grant carries the bounded lease"
+        );
         fake_a
             .tx
             .send_frame(&wire(Message::AdmissionAck {
@@ -9628,11 +9646,11 @@ mod tests {
         let sender_b = spawn_on_channel_sender(src_b.path().to_path_buf(), addr_b, pinned, task_b);
         let spec_b = on_channel_recv_spec(dst.path(), receiver_identity);
         let receiver_b = tokio::spawn(async move {
-            let mut channel = endpoint_b
-                .accept(&|_| true)
+            let mut channel = endpoint_b.accept(&|_| true).await.expect("task B connects");
+            let open = match channel_scheduler_handshake(&mut channel, &spec_b)
                 .await
-                .expect("task B connects");
-            let open = match channel_scheduler_handshake(&mut channel, &spec_b).await.unwrap() {
+                .unwrap()
+            {
                 SchedulerHandshake::Scheduler { open } => open,
                 SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
             };
@@ -9676,7 +9694,10 @@ mod tests {
 
         let receiver = tokio::spawn(async move {
             let mut channel = endpoint.accept(&|_| true).await.unwrap();
-            let open = match channel_scheduler_handshake(&mut channel, &spec).await.unwrap() {
+            let open = match channel_scheduler_handshake(&mut channel, &spec)
+                .await
+                .unwrap()
+            {
                 SchedulerHandshake::Scheduler { open } => open,
                 SchedulerHandshake::Legacy { .. } => panic!("scheduler peer took the Legacy arm"),
             };

@@ -1301,8 +1301,7 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         // abort_tasks() also aborts the handle on teardown, so the poll
         // is a cooperative fast path, not the only exit.
         let stop_rt = Arc::clone(rt);
-        let (keeper_stop_tx, keeper_stop_rx) =
-            tokio::sync::watch::channel(false);
+        let (keeper_stop_tx, keeper_stop_rx) = tokio::sync::watch::channel(false);
         let _watcher = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {

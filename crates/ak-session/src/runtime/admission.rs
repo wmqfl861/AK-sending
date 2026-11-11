@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn resolve_accepts_an_applied_relation_and_rebuilds_the_group() {
-        let (_dir, validator, pairing_id, code_id, peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, pairing_id, code_id, peer_fp) = applied_validator_with_relation();
         let claim = matching_claim(pairing_id, code_id, [0x11; 32]);
         let resolved = validator
             .resolve(&peer_fp, &claim)
@@ -367,7 +366,10 @@ mod tests {
         // same bytes here, but the source is the relation.
         assert_eq!(
             resolved.group,
-            CodeGroupKey::new(RegistryId::from_bytes([0x11; 32]), CodeId::from_bytes(code_id))
+            CodeGroupKey::new(
+                RegistryId::from_bytes([0x11; 32]),
+                CodeId::from_bytes(code_id)
+            )
         );
         assert_eq!(resolved.pairing_id, PairingId::from_bytes(pairing_id));
         assert_eq!(resolved.peer, peer_fp);
@@ -375,8 +377,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_every_zero_identity_field() {
-        let (_dir, validator, pairing_id, code_id, peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, pairing_id, code_id, peer_fp) = applied_validator_with_relation();
         let base = matching_claim(pairing_id, code_id, [0x11; 32]);
         for (claim, field) in [
             (
@@ -426,8 +427,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_an_unknown_relation() {
-        let (_dir, validator, _pairing_id, code_id, peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, _pairing_id, code_id, peer_fp) = applied_validator_with_relation();
         // A pairing id with no record at all.
         let claim = matching_claim([0x99; 16], code_id, [0x11; 32]);
         assert_eq!(
@@ -462,8 +462,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_peer_the_relation_never_pinned() {
-        let (_dir, validator, pairing_id, code_id, _peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, pairing_id, code_id, _peer_fp) = applied_validator_with_relation();
         // A different device's channel using the stolen pairing id.
         let other = ak_identity::DeviceKeyPair::generate();
         let other_fp = PeerFingerprint::from_bytes(*other.fingerprint().as_bytes());
@@ -480,8 +479,7 @@ mod tests {
     /// refused without ever yielding a group key.
     #[test]
     fn resolve_rejects_a_stranger_code_group() {
-        let (_dir, validator, pairing_id, _code_id, peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, pairing_id, _code_id, peer_fp) = applied_validator_with_relation();
         let stranger_code = [0x77; 16];
         let claim = matching_claim(pairing_id, stranger_code, [0x11; 32]);
         assert_eq!(
@@ -492,8 +490,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_foreign_registry() {
-        let (_dir, validator, pairing_id, code_id, peer_fp) =
-            applied_validator_with_relation();
+        let (_dir, validator, pairing_id, code_id, peer_fp) = applied_validator_with_relation();
         let claim = matching_claim(pairing_id, code_id, [0x22; 32]);
         assert_eq!(
             validator.resolve(&peer_fp, &claim).unwrap_err(),
@@ -538,8 +535,11 @@ mod tests {
         let journal_dir = dir.path().join(crate::pairing::JOURNAL_SUBDIR);
         std::fs::create_dir_all(&journal_dir).expect("journal dir");
         // A file where the record would live, but with junk content.
-        std::fs::write(journal_dir.join("01010101010101010101010101010101.akpair"), b"junk")
-            .expect("seed junk record");
+        std::fs::write(
+            journal_dir.join("01010101010101010101010101010101.akpair"),
+            b"junk",
+        )
+        .expect("seed junk record");
         let validator = AdmissionValidator::over_journal(
             PairingJournal::open(&journal_dir).expect("journal opens"),
             RegistryId::from_bytes(registry),

@@ -46,8 +46,8 @@ pub use message::{
     AbortReason, CodeId, ConnectionId, CtrlMessage, DeviceId, Digest32, EndpointBlob, ErrorScope,
     InviteState, InviteSummary, Mac32, Nonce32, PairProof, PairingId, PairingState, RedeemRequest,
     RegistryId, RequestId, SessionId, Signature64, StateFilter, Transcript256, CURSOR_END,
-    CURSOR_START, ENDPOINT_BLOB_MAX_BYTES, EXT_FLAGS_KNOWN, EXT_MAX_REDEEMS_FLAG,
-    EXT_ENDPOINT_FLAG,
+    CURSOR_START, ENDPOINT_BLOB_MAX_BYTES, EXT_ENDPOINT_FLAG, EXT_FLAGS_KNOWN,
+    EXT_MAX_REDEEMS_FLAG,
 };
 pub use peer_signal::PeerSignal;
 

@@ -1,6 +1,6 @@
 # 变更日志
 
-本文件记录用户可感知的主要里程碑，按时间线组织；逐轮测试证据见 `reports/dev-validation-2026-11-02.txt`，任务级完成状态见 [docs/BACKLOG.zh-CN.md](docs/BACKLOG.zh-CN.md)，平台支持范围见 [docs/SUPPORT_MATRIX.zh-CN.md](docs/SUPPORT_MATRIX.zh-CN.md)。格式参照 Keep a Changelog；版本号语义为预发布（0.x）。
+本文件记录用户可感知的主要里程碑，按时间线组织；逐轮测试证据见 `reports/archive/dev-validation-2026-11-02.txt`，任务级完成状态见 [docs/BACKLOG.zh-CN.md](docs/BACKLOG.zh-CN.md)，平台支持范围见 [docs/SUPPORT_MATRIX.zh-CN.md](docs/SUPPORT_MATRIX.zh-CN.md)。格式参照 Keep a Changelog；版本号语义为预发布（0.x）。
 
 ## [未发布] - 2026-11-07：第三十二波——v1 任务码模型接入 CLI（`ak-cli task` 命令族，"GUI 功能 CLI 化"）
 
@@ -13,7 +13,7 @@ v1 极简任务码模型（wave-28~31：一个随机码=一次任务、恰好双
 
 ## [未发布] - 2026-11-06：第二十九波（进行中）——wave-28 终审 21 项发现修复轮（P1×6 / P2×15）
 
-Codex 终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`，P0×0 / P1×6 / P2×15）。本波进行中：修复落在未提交工作树，按"已完成 / 在途"如实区分；全量 workspace 测试尚未复跑。
+Codex 终审报告 `reports/archive/codex-review-2026-11-06-wave28.md`（评审区间 `5a5dac1..7458e9f`，P0×0 / P1×6 / P2×15）。本波进行中：修复落在未提交工作树，按"已完成 / 在途"如实区分；全量 workspace 测试尚未复跑。
 
 **已完成（工作树，待提交）**：
 
@@ -67,7 +67,7 @@ Codex 终审报告 `reports/codex-review-2026-11-06-wave28.md`（评审区间 `5
 - wave-29（`77d9559`）：wave-28 终审 21 项发现全部修复（6 P1+15 P2）。
 - wave-30（`5dade17`）：第一轮复核修复（2 未关 P1 生产接线 + 13 部分残项 + 5 新 P2）。
 - wave-31（`df7d4ee`）：第二轮复核修复（dispose 悬空指针 P1 + 两条续期路径 + 终态/迟到事件竞态 + 契约形状）。
-- 第三轮复核（`reports/codex-recheck3-2026-11-07-wave31.md`）：**总结论——通过**。历史 31 项 26 关闭/5 部分（均为文档化边界）/0 未关闭；剩余 2 项 P3（done.saveDir 的 Dart typed 边界丢字段、竞态测试断言过窄）当轮已顺手修复。
+- 第三轮复核（`reports/archive/codex-recheck3-2026-11-07-wave31.md`）：**总结论——通过**。历史 31 项 26 关闭/5 部分（均为文档化边界）/0 未关闭；剩余 2 项 P3（done.saveDir 的 Dart typed 边界丢字段、竞态测试断言过窄）当轮已顺手修复。
 - 最终验证：workspace **1123/0** + clippy 干净 + 契约 5/5；dart **139/139**、flutter **133/133**；Windows/Android 产物重建；真机 E2E（Windows 4/4、Android 模拟器 4P/2S/0F）；跨设备向后兼容 6/6（v2 服务器）。
 
 ## [v0.1.0] - 2026-11-05

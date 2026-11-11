@@ -15,7 +15,7 @@
 - **已完成（2026-11-07/09，第三十二至三十五波 `0cf1382`/`3eb931f`＋`bcf5de0`/`8e5ba7e`/`e7fc1e0`）**：v1 任务码接入 CLI（`0cf1382`）；Codex crash-analysis C01–C14 全部 14 项关闭＋E4 分段诊断（`3eb931f`＋`bcf5de0`）；claim 限额 6→30 次/小时（`8e5ba7e`；redeem 为另一组预算：每连接 10 次/分钟＋全局 60 次/分钟）；任务面 registry keeper——20 秒保活 ping（落在服务器 30 秒 FRAME_IO_DEADLINE 静默断连预算内）＋Disconnected 重连（`e7fc1e0`，Android jniLibs 随 `37a57c0` 刷新）。
 - **进行中（2026-11-09，第三十六波，修复在未提交工作树）：全项目终审修复**（`reports/codex-full-review-2026-11-09.md`，P0×0/P1×5/P2×8，基线 `37a57c0`）。最直接阻断：CLI 任务码等待链无保活（P1-01，registry v2 入站帧静默 30 秒断连）与 FFI 重连耗尽后停留 Connecting（P1-02）。
 
-工程形态：13 个 Rust crate＋ak_ffi_dart 纯 Dart 包＋Flutter 桌面/移动应用；测试基线（分波次，见 reports/）：第二十三波 workspace 918/0、第二十四波 955/0（`ac6b23b` 时点）、第二十八波 1085/0（`7458e9f` 时点）；第二十九波修复后全量待复跑，当前以实际运行为准。Android 模拟器↔Windows 宿主双向真实 QUIC 传输逐字节一致；Windows↔Linux 跨公网双向 8 MiB SHA256 一致（2026-11-05）；v2 升级服务器上旧客户端向后兼容 6/6（2026-11-06，`7458e9f`）。验证形态与逐项证据见 [开发验证记录](../reports/dev-validation-2026-11-02.txt) 与 [BACKLOG](BACKLOG.zh-CN.md)；平台支持范围见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)；里程碑时间线见 [CHANGELOG](../CHANGELOG.md)。本地可执行范围已尽，余项需外部网络、物理双机与部署批准等外部资源。
+工程形态：13 个 Rust crate＋ak_ffi_dart 纯 Dart 包＋Flutter 桌面/移动应用；测试基线（分波次，见 reports/）：第二十三波 workspace 918/0、第二十四波 955/0（`ac6b23b` 时点）、第二十八波 1085/0（`7458e9f` 时点）；第二十九波修复后全量待复跑，当前以实际运行为准。Android 模拟器↔Windows 宿主双向真实 QUIC 传输逐字节一致；Windows↔Linux 跨公网双向 8 MiB SHA256 一致（2026-11-05）；v2 升级服务器上旧客户端向后兼容 6/6（2026-11-06，`7458e9f`）。验证形态与逐项证据见 [开发验证记录](../reports/archive/dev-validation-2026-11-02.txt) 与 [BACKLOG](BACKLOG.zh-CN.md)；平台支持范围见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)；里程碑时间线见 [CHANGELOG](../CHANGELOG.md)。本地可执行范围已尽，余项需外部网络、物理双机与部署批准等外部资源。
 
 不将文档齐全或原型代码存在计作 P0 通过；下列工期是 3–4 名全职成员的原始工作量参考，需据实重估，不是自动执行承诺。
 

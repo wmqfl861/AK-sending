@@ -7,7 +7,7 @@
 
 评审 4.5 确认 UI 路线为 Flutter + Rust 核心：LocalSend 已用 Flutter 覆盖五端，证明该路线可行；Tauri 2 桌面包体更小，但移动端原生能力（SAF、后台任务、Bonjour）生态较弱，对本项目不划算。推进顺序中 Flutter 界面是第三步，前两步（局域网 CLI 原型、公网直连探测）的 Rust 侧核心已就位，UI 需要一个绑定层才能消费 `ak-engine`。
 
-本文写作时（2026-11-03）Flutter SDK 尚未安装、UI 工程尚未启动，按 ADR-002 确立的"接口契约先冻结再并行开发"模式，Rust 侧先把对外契约冻结为 C ABI，FFI 实现与后续 Flutter 工程并行推进、互不阻塞。该模式已按计划走完：`ak-ffi` 实现于第十轮落地（9 个导出函数，全部经 C ABI 测试）；Flutter Windows 端已于第十一至十三轮发布——`flutter_app` 五页 GUI（`flutter build windows --release` 产物 43.9 MB 打包、真实窗口 integration test 全绿）＋`packages/ak_ffi_dart` 绑定（85 项 Dart 测试，含真实 DLL 环回）；Android 壳已构建实测（APK 内 x86_64/arm64 双 ABI `libak_ffi.so`），`ak-cli` 交叉编译至 Android 并在模拟器实跑完成跨设备真实 QUIC 传输（取证见 [dev-validation-2026-11-02](../../reports/dev-validation-2026-11-02.txt) 第十一至十六轮节）。同时，FFI 是 `unsafe` 的天然来源，也是内存安全审计面从"Rust 内部"扩大到"任意语言调用方"的位置，边界形状需要一次性收窄、集中可审。
+本文写作时（2026-11-03）Flutter SDK 尚未安装、UI 工程尚未启动，按 ADR-002 确立的"接口契约先冻结再并行开发"模式，Rust 侧先把对外契约冻结为 C ABI，FFI 实现与后续 Flutter 工程并行推进、互不阻塞。该模式已按计划走完：`ak-ffi` 实现于第十轮落地（9 个导出函数，全部经 C ABI 测试）；Flutter Windows 端已于第十一至十三轮发布——`flutter_app` 五页 GUI（`flutter build windows --release` 产物 43.9 MB 打包、真实窗口 integration test 全绿）＋`packages/ak_ffi_dart` 绑定（85 项 Dart 测试，含真实 DLL 环回）；Android 壳已构建实测（APK 内 x86_64/arm64 双 ABI `libak_ffi.so`），`ak-cli` 交叉编译至 Android 并在模拟器实跑完成跨设备真实 QUIC 传输（取证见 [dev-validation-2026-11-02](../../reports/archive/dev-validation-2026-11-02.txt) 第十一至十六轮节）。同时，FFI 是 `unsafe` 的天然来源，也是内存安全审计面从"Rust 内部"扩大到"任意语言调用方"的位置，边界形状需要一次性收窄、集中可审。
 
 ## 决策
 
@@ -21,7 +21,7 @@
 
 ## 修复波落地中的契约增补（2026-11-04，第十七波）
 
-2026-11-04 Codex 只读审核（[codex-review-2026-11-04](../../reports/codex-review-2026-11-04.md)）立项第十七波修复，6 个修复代理并行改 crate，其中以下变化触及本 FFI 契约。各项均为**修复波落地中**——落地前以 `crates/ak-ffi` 当前实现为准，落地后由集成者补执行证据并回填本节与 SECURITY"FFI 边界"：
+2026-11-04 Codex 只读审核（[codex-review-2026-11-04](../../reports/archive/codex-review-2026-11-04.md)）立项第十七波修复，6 个修复代理并行改 crate，其中以下变化触及本 FFI 契约。各项均为**修复波落地中**——落地前以 `crates/ak-ffi` 当前实现为准，落地后由集成者补执行证据并回填本节与 SECURITY"FFI 边界"：
 
 - **`expect` 必填**（准入收窄）：receive spec 的 `expect` 字段由"可选、缺省 `any`"改为必填——来者不拒不再是隐式默认，调用方必须显式声明准入策略（`any`/`book`/64 位指纹/6 位配对码）；缺省或未知值以 `AK_ERR_INVALID` 拒绝。
 - **摘要算法未知显式拒绝**（F1）：spec 与清单携带的摘要算法标识必须为已知枚举值（当前仅 BLAKE3），未知值显式报错，不再静默按 BLAKE3 处理（审核第 7 条：原实现经 `ak-core::FileEntry::new` 丢字段写死 BLAKE3）。

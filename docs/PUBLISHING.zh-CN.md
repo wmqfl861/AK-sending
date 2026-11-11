@@ -1,6 +1,6 @@
 # 上传与验证
 
-仓库已完成初始化，原始 38 个文件已上传并核验；详见 [上传验收记录](../reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。此前 403 属于已解决的历史权限问题。
+仓库已完成初始化，原始 38 个文件已上传并核验；详见 [上传验收记录](../reports/archive/GITHUB_PUBLISH_VERIFICATION.zh-CN.md)。此前 403 属于已解决的历史权限问题。
 当前仓库已非空，不要再次运行仅供空仓库使用的 `scripts/publish.ps1`。
 
 ## 权限

@@ -7,14 +7,14 @@
 - [x] 将纯直连决策固化为 ADR-001。
 - [x] 整理需求、架构、路线、协议和验收文档。
 - [x] 创建 Rust 策略/分块/任务状态模型与测试源码。
-- [x] Rust 工具链实编译、测试和 clippy（2026-11-02，rustc 1.97.0；修复 1 处 clippy 报错）；证据见 reports/rust-validation-2026-11-02.txt。
-- [x] 取得目标仓库可写权限并验证远端提交；证据见 reports/GITHUB_PUBLISH_VERIFICATION.zh-CN.md。
+- [x] Rust 工具链实编译、测试和 clippy（2026-11-02，rustc 1.97.0；修复 1 处 clippy 报错）；证据见 reports/archive/rust-validation-2026-11-02.txt。
+- [x] 取得目标仓库可写权限并验证远端提交；证据见 reports/archive/GITHUB_PUBLISH_VERIFICATION.zh-CN.md。
 - [x] 方案评审；见 docs/REVIEW_2026-11-02.zh-CN.md。
 - [x] 所有者指示"继续本地开发"后按评审建议路线推进，固化为 ADR-002（2026-11-02，本地分支）；D2/D3 的产品文案与端口映射默认值仍待所有者确认。
 
 ## 局域网原型（ADR-002 / 评审第五节第 1 步，2026-11-02/03，分支 dev/local-parallel）
 
-- [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli/ak-itests 十一 crate（两轮并行子代理开发）；workspace 281 项测试、clippy `-D warnings` 全绿；证据见 reports/dev-validation-2026-11-02.txt。
+- [x] 模块化实现：ak-identity/ak-wire/ak-storage/ak-net/ak-discovery/ak-store/ak-signal/ak-engine/ak-cli/ak-itests 十一 crate（两轮并行子代理开发）；workspace 281 项测试、clippy `-D warnings` 全绿；证据见 reports/archive/dev-validation-2026-11-02.txt。
 - [x] 真实身份认证最小实现（P0-03 部分）：Ed25519 设备密钥、指纹、配对码、自签证书钉扎（含常量时间比较与严格 DER 校验）；错误钉扎/未授权路径发送前拒绝（T06 自动化，engine 测试）。
 - [x] QUIC 直连数据面（P0-02 部分）：quinn + rustls/ring，双向自签证书验证，`DirectChannel` 无公开构造（D6 类型约束）。
 - [x] 文件清单/目录分页扫描/源版本检测（P1-01）：LocalSource 扫描 + BLAKE3 全量/分块摘要 + mtime 版本 + SOURCE_CHANGED 检测；迭代式深目录扫描（200 层实测）。
@@ -32,7 +32,7 @@
 - [x] 方案评审第 6 节代码建议：job.rs 增加等待接收方确认状态；生产路径身份由类型保证。
 - [x] 文档对照：TEST_PLAN 自动化映射、ARCHITECTURE 模块现状、SECURITY 已实现机制与已知限制、TECH_SELECTION 状态更新。
 
-第三轮（2026-11-03，提交 `5ac6f2a`，4 个并行子代理＋集成者修复；证据见 reports/dev-validation-2026-11-02.txt"第三轮并行开发验证"节）：
+第三轮（2026-11-03，提交 `5ac6f2a`，4 个并行子代理＋集成者修复；证据见 reports/archive/dev-validation-2026-11-02.txt"第三轮并行开发验证"节）：
 
 - [x] 存储满预检（T09 相关）：`ak-engine::check_headroom` 纯决策函数（余量未知→放行、恰好放行、不足→`EngineError::StorageFull` 携真实数字）；接收端在应答 ResumeRequest 前实测目的目录余量并经协议 `ErrorCode::StorageFull` 告知对端；耗尽仍由真实写错误兜底，不伪造成功。
 - [x] 多根合并发送：`SendSpec::extra_roots`/`SourceSet` 将多个文件/目录合并为一个清单（每根条目加 `<根名>/` 前缀），根名重复在建立连接前拒绝；无额外根时单根行为字节级不变；`Report.roots` 记录各根名；CLI `send` 直接接受多路径。
@@ -44,7 +44,7 @@
 - [x] connect 族缺陷修复（场景测试发现→集成者修复→回归钉死）：IPv4 socket 拨 IPv6 对端原本会无限悬挂于 QUIC 重试（IPv6 场景测试发现）→ `connect_bounded` 地址族不匹配快速失败（InvalidInput）＋连接期空闲预算包裹，回归测试 `connect_family_mismatch_fails_fast_instead_of_hanging` 钉死。
 - [x] CLI 第三轮：`--timeout` 空闲预算透传（send/receive，默认 30s，非总运行时长）、单行刷新进度渲染（`\r` 刷新＋79 列裁剪，AK_QUIET 静默）；第三轮后 workspace 308 项测试通过（第二轮后为 281 项）、clippy `-D warnings` 全绿、5 GiB release 回归 84.3s。
 
-第四轮（2026-11-03，7 个并行子代理；证据见 reports/dev-validation-2026-11-02.txt"第四轮并行开发验证"节）：
+第四轮（2026-11-03，7 个并行子代理；证据见 reports/archive/dev-validation-2026-11-02.txt"第四轮并行开发验证"节）：
 
 - [x] ResumeRequest 多帧分页（协议演进）：每帧携带 more 标志，接收端分片发送、发送端逐帧累积并校验 job_id；单任务条目数不再受单帧 65,535 上限约束；100,000 条目分片单元验证（2 片 65,535+34,465 全量按序到达），65,537 文件 release 边界实测（t13 ignored 变体）；PROTOCOL 文档已对齐。
 - [x] SQLite 检查点后端（P1-03 正式项）：`SqliteCheckpointStore`（可选特性 sqlite，rusqlite bundled，默认依赖图零泄漏）；事务原子性、双连接 WAL 并发、与文件后端语义等价（ak-store 默认 10 + 特性 23 测试）。
@@ -56,7 +56,7 @@
 - [x] 发现模块第四轮：候选携带设备名（TXT 清洗：控制字符替换、UTF-8 边界截断 64B）、browse_with 实时回调（addr+fp 去重）、watch 持续发现模式；本机真实组播回环验证。
 - [x] 第四轮后 workspace 338 项测试通过（含 sqlite 特性 +23）、clippy 双配置全绿。
 
-第五轮（2026-11-03，4 个并行子代理＋集成者接线；证据见 reports/dev-validation-2026-11-02.txt"第五轮并行开发验证"节）：
+第五轮（2026-11-03，4 个并行子代理＋集成者接线；证据见 reports/archive/dev-validation-2026-11-02.txt"第五轮并行开发验证"节）：
 
 - [x] 策略模型接入真实通道（架构闭环）：`authorize_path` 闸门在 send/receive 拿到 DirectChannel 后、任何协议帧之前执行——LocalDirect 恒过、InternetDirect 按 `DirectPolicy::allow_internet`、Relay/Unknown 防御性拒绝（`EngineError::RouteForbidden`，连接以专用码关闭）；Observation 布尔的等价物由类型保证（DirectChannel=已认证直连），不重复填写；CLI `send/receive --no-internet` 旗标接线，LAN-only 环回冒烟通过。
 - [x] `ak-cli doctor` 环境自检：身份/配对簿、本地网络（v4/v6 分列）、双栈 UDP 绑定、mDNS 尽力探测（本机回环 ok）、可选 STUN（--stun）、磁盘余量；每项 ok/warn/skip＋结论建议（防火墙弹窗/AP 隔离指引）；--json。
@@ -65,7 +65,7 @@
 - [x] 文档现状化：README 快速上手全旗标核对、UX"CLI 已实现交互"现状节（配对三形态/接收循环/进度渲染，与原文分歧以现状注记对冲）、OPERATIONS 协调服务器运维节（限额默认、无文件路由三层验证、SameEgress 误报场景、日志边界）。
 - [x] 第五轮后 workspace 364 项测试通过、clippy 全绿、5 GiB release 回归 111.49s。
 
-第六/七轮（2026-11-03，3+3 个并行子代理＋集成者；证据见 reports/dev-validation-2026-11-02.txt"第六/七轮并行开发验证"节）：
+第六/七轮（2026-11-03，3+3 个并行子代理＋集成者；证据见 reports/archive/dev-validation-2026-11-02.txt"第六/七轮并行开发验证"节）：
 
 - [x] 并发接收：`ak_engine::serve_concurrently`（一次 bind、每连接独立任务/检查点、失败任务不拖垮他者、accept 非取消安全处理）；CLI `receive --jobs N`；真实双发送端冒烟 2/2 字节一致。
 - [x] 双栈端点（评审 4.1 IPv6 优先深化）：`bind_dual_stack`（V6ONLY=0）、v4-mapped classify 展开、`local_addr_display` 候选 API、`holepunch::bind_dual_stack_udp`、CLI `probe --dual-stack`；本机实测可用（含 socket2 `only_v6` Windows 坑与间歇 WSAENETUNREACH 如实记录）。
@@ -77,14 +77,14 @@
 - [x] 信令对抗加固：500 帧 TCP 模糊、STUN 畸形包洪泛、限频旁路全部存活；发现并修复 Hello 设备名控制字符注入（codec 层拒绝 C0/DEL/C1），ak-wire 显示字符串同规则修复（测试锁定）。
 - [x] 六/七轮后 workspace 404 项测试（＋sqlite 特性 26）全绿、clippy 干净。
 
-第八轮（2026-11-03，3 个并行子代理＋集成者；证据见 reports/dev-validation-2026-11-02.txt"第八轮并行开发验证"节）：
+第八轮（2026-11-03，3 个并行子代理＋集成者；证据见 reports/archive/dev-validation-2026-11-02.txt"第八轮并行开发验证"节）：
 
 - [x] 产品全流程 e2e（ak-itests e2e_product_flow.rs 四幕）：配对簿准入+未配对第三方零字节拒绝；16MiB/256 块中断→part 存活→同 job_id 续传→检查点 state==completed 且全量已验证前缀；serve_concurrently(2) 多根+单根并发（Report.roots 单/多根两种落盘语义如实断言）；信令会话建立→服务器死亡证明→直传照常。首个业务里程碑的单机可执行子集闭环。
 - [x] CLI：completions（bash/zsh/fish/powershell）、jobs status <id>（每文件 verified 前缀视图）、receive --bind 与 signal-server --bind/--stun-bind（IPv6 监听实测 [::1]）。
 - [x] 文档：SECURITY（并发隔离论证/双层注入防护/对抗加固/长名 part 回退，+7 条）、ARCHITECTURE（模块现状 5 行更新+接口 2 行，FileTransferEngine 过期行修正）。
 - [x] 第八轮后 workspace 417 项测试全绿、clippy 干净。
 
-第十轮（2026-11-03，2 个并行子代理；证据见 reports/dev-validation-2026-11-02.txt"第十轮并行开发验证"节）：
+第十轮（2026-11-03，2 个并行子代理；证据见 reports/archive/dev-validation-2026-11-02.txt"第十轮并行开发验证"节）：
 
 - [x] ak-ffi C ABI 绑定层（ADR-003 契约先行）：9 个导出函数（句柄式/内嵌运行时/轮询进度 JSON/调用方缓冲区/spec JSON 未知字段忽略+控制字符拒绝）、错误码 0/1/2/-1..-5、catch_unwind 全入口；unsafe 20 块全部隔离于 shim 层逐块 SAFETY 注释（core 层 forbid(unsafe_code) 零 unsafe）；cdylib 产出 ak_ffi.dll 供前端动态加载。6 项测试全部经 C ABI 端到端：真实环回传输、20+ 坏 spec 反例、取消无假完成、双引擎无串扰、serve_concurrently 聚合。
 - [x] ADR-003（FFI 边界决策与备选取舍：bridge 代码生成/JSON-RPC 子进程/CLI 管道）；SECURITY 增 FFI 边界节（契约层防护与已知限制）。
@@ -99,7 +99,7 @@
 - [x] ak_ffi_dart 接 identityInfo/jobsList/book（真实 DLL 76/76：簿准入 e2e 接受配对端、空簿 "pair first"、指纹互 pin 环回即证一致性）。
 - [x] Flutter 接线：身份卡真数据（created 提示/已配对设备数）、book 准入直达引擎（错误透传）、历史页真实列表（peer 短式+root）；Facade 切换真实调用；flutter test 59/59 + build windows 成功 + 打包含 UI。剩余如实：发送侧前缀→簿补全仍本地拒绝（后绪项）。
 
-第十三轮（2026-11-04，安卓移植波，提交 `834f42a`＋`6ea65f0` 证据记录；证据见 reports/dev-validation-2026-11-02.txt"第十三轮进行中证据"节与 docs/ANDROID_BUILD.zh-CN.md）：
+第十三轮（2026-11-04，安卓移植波，提交 `834f42a`＋`6ea65f0` 证据记录；证据见 reports/archive/dev-validation-2026-11-02.txt"第十三轮进行中证据"节与 docs/ANDROID_BUILD.zh-CN.md）：
 
 - [x] 双 ABI 交叉编译脚本＋符号验证（安卓构建侧前置）：`scripts/build_android_ffi.sh` 纯环境变量 linker 方案（不新增 `.cargo/config.toml`），一次构建 x86_64-linux-android＋aarch64-linux-android（NDK 28.2，Windows 主机），产物复制进 jniLibs 并以 NDK `llvm-nm -D --defined-only` 抽查冻结符号（ak_engine_new/ak_identity_info/ak_jobs_list）、target 与 jniLibs 两处 SHA-256 一致。产物哈希：x86_64 5,664,296 字节 `6d92792e546fb6f085723d42883e5ea599ee1c0fde8d3e5c4003d54cc392e7a2`；arm64-v8a 5,557,928 字节 `c7f1eaa04bbeb9b55e288af0b502e26d78bf8e6a91914c0dd29168c5026a58cb`。符号验证属静态产物检查，不等价真机运行验证（ANDROID_BUILD 文档标记约定）。
 - [x] flutter_app 安卓平台（P1-04 安卓首端；P0-06 代码侧）：INTERNET 权限（LAN 直传必需，release 只从 main manifest 获得）、minSdk 24（与 NDK clang 的 android24 目标三元组对齐）、tier-0 `libak_ffi.so` 加载（System.loadLibrary 语义，桌面三级 DLL 探测全部跳过）、path_provider 身份目录异步解析（`<应用支持目录>/.ak-sending`，首次引擎读取前等待解析完成）、应用专属 Download 输出链（getDownloadsDirectory → getExternalStorageDirectory+`Download/` → 文档目录+`Download/`；公共 Downloads 导出留待 SAF/MediaStore 后续波次）；flutter test 66/66、analyze 零告警。
@@ -110,7 +110,7 @@
 - [x] 跨设备实测（模拟器↔主机部分）：见下"跨设备里程碑"节；两台真实机器（物理双机）仍未执行（P0/P3 余项）。
 - [ ] 安卓 mDNS 发现、公共目录导出选择器走查、后台/生命周期适配（P0-06 剩余部分）：SAF 存储通道代码已落地（第十五轮，Kotlin `dev.ak/storage` 四方法含 SAF 写闭环探针，APK 179MB 重建）；模拟器端 SAF 选择器走查待 GUI 路线恢复后执行。
 
-跨设备里程碑（2026-11-04，Android 模拟器→Windows 宿主真实 QUIC 传输，CLI 路线；提交 `b4fb427` 证据记录，reports/dev-validation-2026-11-02.txt"跨设备里程碑"节）：
+跨设备里程碑（2026-11-04，Android 模拟器→Windows 宿主真实 QUIC 传输，CLI 路线；提交 `b4fb427` 证据记录，reports/archive/dev-validation-2026-11-02.txt"跨设备里程碑"节）：
 
 - [x] 首个跨设备传输组合：`ak-cli` 交叉编译 x86_64-linux-android（8,904,736B；ring/rustls 的 C 构建沿用 build_android_ffi.sh 的每目标 `CC_x86_64_linux_android`/`AR_x86_64_linux_android` 指向 NDK clang/llvm-ar）→ adb push 至模拟器 `/data/local/tmp` → Android 端 `ak-cli --version` 实跑确认（wire v1、caps 0x0007、release）→ Windows 宿主 receiver（`--expect any`，端口 17900）↔ Android 发送端经 `10.0.2.2`（模拟器→宿主 NAT 环回别名）。job `afe43780da634ea94e8e7e6ec97da314` 双端 complete 且同 job id：2 条目 5.00 MiB（5,242,880B 随机 payload.bin＋中文文件名"说明.txt"）；`cmp` 逐字节一致（payload.bin/note.txt 均 IDENTICAL）；QUIC＋TLS 指纹钉扎握手跨设备真实成立；Android 端 TOFU 记录宿主指纹 499f62ba，keygen/peers.book/device.key 全功能。层级如实：真实双进程＋跨网络栈（模拟器 NAT 10.0.2.2），非进程内环回；**仍非物理双机**（模拟器与宿主同机），真实 NAT/公网（P0-05）与抓包（P0-07）未执行。宿主侧配套脚本 `scripts/smoke_android_host.sh`（提交 `1e6a8ab`；`--self-test` 为无设备门槛；Android→宿主方向经 `--fp` 钉扎＋配对码目视核对的安全取舍脚本内如实声明）。
 
@@ -129,7 +129,7 @@
 
 ## 邀请码配对功能（第十八至二十一波，2026-11-04）
 
-前置：Codex（gpt-6-astra/max）只读产出两批开发计划（`docs/plans/pairing-code-plan-draft.md`＋`pairing-code-plan-part2.md`，提交 `a07d8c1`/`7a5f50e`）。按 AGENTS.md 并行开发规则第 3 条（公共 API 契约先行冻结再并行），第十八波先把全部跨模块接口冻结为 ADR-004＋`docs/contracts/` 契约，第十九至二十一波按冻结契约多代理并行实现。决策与备选取舍见 [ADR-004](adr/004-invite-pairing.zh-CN.md)；证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"第十八/十九波""第二十波""第二十一波"三节；提交链：`1e8b276`（第十八/十九波，5 并行代理）→ `18f2aae`（第二十波，4 并行代理）→ `bfc74d7`（第二十一波，2 并行代理＋集成者修复）。
+前置：Codex（gpt-6-astra/max）只读产出两批开发计划（`docs/plans/pairing-code-plan-draft.md`＋`pairing-code-plan-part2.md`，提交 `a07d8c1`/`7a5f50e`）。按 AGENTS.md 并行开发规则第 3 条（公共 API 契约先行冻结再并行），第十八波先把全部跨模块接口冻结为 ADR-004＋`docs/contracts/` 契约，第十九至二十一波按冻结契约多代理并行实现。决策与备选取舍见 [ADR-004](adr/004-invite-pairing.zh-CN.md)；证据见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt)"第十八/十九波""第二十波""第二十一波"三节；提交链：`1e8b276`（第十八/十九波，5 并行代理）→ `18f2aae`（第二十波，4 并行代理）→ `bfc74d7`（第二十一波，2 并行代理＋集成者修复）。
 
 - [x] A0 契约冻结（第十八波）：ADR-004 与 `docs/contracts/` 五份契约（protocol-v2/pairing-flow/scheduler/ffi-v2/storage-schema，合计六份冻结文档）共 157 项与 Codex 计划逐字核对通过；修改任一契约需集成者核准并同步 ADR-004。
 - [x] A1 控制协议 v2 codec（第十九波，`crates/ak-signal/src/protocol_v2/`）：30 个 `CtrlMessage` 变体、逐类型 payload 预算锁定、方向表穷举、封闭 tag 集、尾随字节/超长/截断拒绝——47 项测试与契约零出入。
@@ -150,7 +150,7 @@
 
 ### 终审发现（2026-11-05）
 
-Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex-review-2026-11-05](../reports/codex-review-2026-11-05.md)，归档提交 `4e1bfb9`）产出 5 项 P1；第二十三波（提交 `acbaf27`，5 并行修复代理）已修复 P1-1/P1-2/P1-3/P1-5，P1-4 的引擎准入侧与 FFI 契约差额亦已修复、生产 executor 接线由第二十四波进行中。2026-11-05 集成者已对照代码逐项复核勾选。仍开放的 P1-4 生产接线事实不得在对外表述中省略：
+Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex-review-2026-11-05](../reports/archive/codex-review-2026-11-05.md)，归档提交 `4e1bfb9`）产出 5 项 P1；第二十三波（提交 `acbaf27`，5 并行修复代理）已修复 P1-1/P1-2/P1-3/P1-5，P1-4 的引擎准入侧与 FFI 契约差额亦已修复、生产 executor 接线由第二十四波进行中。2026-11-05 集成者已对照代码逐项复核勾选。仍开放的 P1-4 生产接线事实不得在对外表述中省略：
 
 - [x] P1-1 恶意 registry 恢复攻击面（已修复，第二十三波 `acbaf27`）：恢复路径 digest sidecar 钉死——本机认证过的 transcript 落 `<pairing hex>.akdgm` sidecar（`crates/ak-session/src/pairing/orchestrator.rs`，pending 日志项之前写入），恢复时重发 `PairCommit` 必须逐字节复现钉死 transcript（256 字节规范形 BLAKE3 摘要相等）＋transcript 所命名的双方 Ed25519 签名，恶意 registry 换钥重签无法通过；无 code hint 且无 pin 的日志项直接拒绝（服务端自报 `Committed`/`Ready` 不再是唯一证据）；A/B 杀灭测试 `verify_commit_pinned_accepts_authentic_and_rejects_swapped_keys`、`crashed_redeemer_recovers_without_code_via_the_pinned_transcript`、`recovery_without_code_or_pin_is_refused_not_degraded`。准入上下文：`AdmissionCtx` 私有化＋唯一校验构造器 `AdmissionCtx::new`（绑定 `permit_id`/`pairing_id`，零值拒绝，`crates/ak-engine/src/lib.rs`）；wire `TaskOpen`/`TaskAdmission` 增 `pairing_id`/`direction`/lease 字段（`crates/ak-wire`）；`send_on_channel` 首步即校验通道对端指纹==`spec.pinned`（不符以专用码关闭，`EngineError::ChannelPeerMismatch`）；接收端对未宣告 `CAP_SCHEDULER` 的对端不再回退旧 Offer 流程（`PROTOCOL_UNSUPPORTED`，fail-closed）。
 - [x] P1-2 接收目录符号链接 TOCTOU 与 staging 清理越界（已修复至收窄形态，第二十三波 `acbaf27`，`crates/ak-storage/src/lib.rs`）：逐步重检——每次路径型动作（打开 part、mtime 盖章、hard-link claim、unlink）前重跑 `symlink_metadata` no-follow 检查（`ensure_not_symlink`），检查-使用窗口收窄至单操作；父目录检查——`ensure_real_dirs` 逐级 `create_dir`＋`AlreadyExists` 时以 `symlink_metadata` 分类（链接即拒），`discard_staging` 校验 `.ak-staging` 父目录非链接后才递归清理（测试 `discard_staging_refuses_a_symlinked_staging_parent`）；命名空间保留见 P1-3。如实残余（相对修复方向"受限目录句柄贯穿"）：Windows/跨平台 std 无 `openat2`/fd 相对 mtime/link 原语，最终检查之后的单操作替换窗口仍存在，已在 `ak-storage` 模块文档头声明并保持防御纵深。
@@ -158,7 +158,7 @@ Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex
 - [x] P1-4 生产双端调度未接线（已修复，第二十四波 `ac6b23b`）：CLI daemon `--same-code/--cross-code` 自第二十四波起走真实链路——`RealTransport`（钉住 v2 registry client）＋`SessionRuntime`＋`RealTransferExecutor`（真实引擎接收内核），全链测试 `wired_enqueue_completes_a_real_transfer_through_the_session`（`crates/ak-cli/src/daemon.rs:1381`）证明 enqueue→调度准入→真实传输→完成；第二十五波（`3bc75e0`）真机跨设备复核：`scripts/cross_device_test.sh` 在部署服务器 122.51.121.24 上 6/6 PASS（邀请码配对＋W↔L 双向 8 MiB SHA256 一致）。准入加固（P1-1 同源）全部落地（AdmissionCtx 私有化、wire 字段、指纹复核、fail-closed）；FFI 契约差额已关闭——实际导出 19 个 vs 冻结契约 18 名称（`ak_sched_start` 作为兼容名与契约名 `ak_sched_listen_start` 并存，双 ABI 符号验证通过）。FFI 侧如实残余（设计裁剪非缺口）：常驻调度监听器关停（`listener_enabled:false`）、FFI wire 准入握手列入后续（`crates/ak-ffi/src/pairing.rs` 后续节）——GUI 传输走引擎 FFI 真路径，托管式调度在 CLI daemon。
 - [x] P1-5 同目标同内容并发提交竞争（已修复，第二十三波 `acbaf27`，`crates/ak-storage/src/lib.rs` `finish()`）：`AlreadyExists` 分支不再直接走冲突策略——`staged_target_matches` 以 no-follow 打开重读已存在目标并比对 whole digest，同内容即复用（丢弃本任务 part、幂等成功，"一次提交、一次复用"），异内容保持 `Fail`/`Rename` 策略（Rename 附 4,096 次上限防循环）；受控 `Barrier` 双任务并发测试断言并发原子提交下目标数与复用结果。
 
-终审另有 P2 项与已知边界（on-channel 准入前提前扫描源、引擎检查点仍用 AKREC1 record id 实例隔离未入 AKREC2；FAT/exFAT 无 hard-link 时 rename 回退可覆盖他任务刚创建目标——既有已披露边界）与证据链一致性更正（见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"终审更正"节，共 6 条）。
+终审另有 P2 项与已知边界（on-channel 准入前提前扫描源、引擎检查点仍用 AKREC1 record id 实例隔离未入 AKREC2；FAT/exFAT 无 hard-link 时 rename 回退可覆盖他任务刚创建目标——既有已披露边界）与证据链一致性更正（见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt)"终审更正"节，共 6 条）。
 
 ## P0
 

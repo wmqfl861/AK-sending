@@ -1,6 +1,6 @@
 # 开发总结（面向项目所有者）
 
-生成于 2026-11-03（第九轮，`dev/local-parallel` 分支，未推送）。本文所有数字与结论逐一来自 [开发验证记录](dev-validation-2026-11-02.txt)、[BACKLOG](../docs/BACKLOG.zh-CN.md) 与 [HANDOFF](../docs/HANDOFF.zh-CN.md)，2026-11-03 本轮对关键计数做了复测；本文不引入未经记录的新事实。2026-11-04 补记：第十至十六轮简表与最新状态一览见文末"第 10-16 轮补章"（Rust 计数于 2026-11-04 本机实测，Dart/Flutter 取集成轮报告值并标注统计口径；正文历史段落保持 2026-11-03 原貌）。
+生成于 2026-11-03（第九轮，`dev/local-parallel` 分支，未推送）。本文所有数字与结论逐一来自 [开发验证记录](archive/dev-validation-2026-11-02.txt)、[BACKLOG](../docs/BACKLOG.zh-CN.md) 与 [HANDOFF](../docs/HANDOFF.zh-CN.md)，2026-11-03 本轮对关键计数做了复测；本文不引入未经记录的新事实。2026-11-04 补记：第十至十六轮简表与最新状态一览见文末"第 10-16 轮补章"（Rust 计数于 2026-11-04 本机实测，Dart/Flutter 取集成轮报告值并标注统计口径；正文历史段落保持 2026-11-03 原貌）。
 
 ## 目标（ADR-002 路线）
 
@@ -128,4 +128,4 @@
 - 跨设备：Android 模拟器→Windows 宿主 CLI 组合 1 项，逐字节一致（模拟器 NAT 形态）；GUI 路线受阻于模拟器 System UI ANR（应用进程存活），物理双机/真实 NAT/抓包未执行。
 - 仓库检查（L0）：`python scripts/check_repository.py` 本轮（2026-11-04）通过（banned_dependency_scan=clean、errors=[]）；clippy/doc 本轮未复跑（上一轮全绿记录见第九轮节，第十四/十五轮集成轮未见复跑记录）。
 
-补章事实源：[BACKLOG](../docs/BACKLOG.zh-CN.md) 第十三至十五轮节与跨设备里程碑节、[HANDOFF](../docs/HANDOFF.zh-CN.md) 第十四/十五轮段、[TEST_PLAN](../docs/TEST_PLAN.zh-CN.md) 映射表、[开发验证记录](dev-validation-2026-11-02.txt) 第十二轮验证/第十三轮进行中证据/跨设备里程碑节，及集成提交 `f82ff77` 说明。
+补章事实源：[BACKLOG](../docs/BACKLOG.zh-CN.md) 第十三至十五轮节与跨设备里程碑节、[HANDOFF](../docs/HANDOFF.zh-CN.md) 第十四/十五轮段、[TEST_PLAN](../docs/TEST_PLAN.zh-CN.md) 映射表、[开发验证记录](archive/dev-validation-2026-11-02.txt) 第十二轮验证/第十三轮进行中证据/跨设备里程碑节，及集成提交 `f82ff77` 说明。

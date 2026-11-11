@@ -24,7 +24,7 @@
 
 ## 已实现的安全机制（截至 2026-11-03）
 
-以下机制已落在代码并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)，含第三轮与第六/七轮验证节）：
+以下机制已落在代码并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt)，含第三轮与第六/七轮验证节）：
 
 - Ed25519 设备密钥与指纹（`ak-identity`）：公钥即设备身份，指纹＝公钥 BLAKE3 摘要前 32 字节；配对码由指纹派生（`123-456` 形式）供人工核对；私钥种子 32 字节原子落盘，不进入任何协调面消息。
 - 自签证书钉扎（`ak-identity::tls`＋`ak-net`）：DER 解析为最小结构化子集，实际规则为——TLV 长度拒绝前导零与越界；证书顶层必须恰为 TBS SEQUENCE／算法 SEQUENCE／64 字节签名 BIT STRING 三元素、无尾随元素；SPKI 以"Ed25519 OID＋32 字节 BIT STRING"结构匹配提取（issuer/subject/validity/extensions 无法遮蔽）；提取公钥与 pin 常量时间比较（自实现，无 `subtle` 依赖），`verify_strict` 校验自签名。这不是完整 X.509 模式校验（有效期等字段不检查，见已知限制）；第十七波 F4 正在收敛解析规则与文档口径（修复进行中，落地证据由集成者补）。rustls 验证器无 webpki 根、无主机名校验，端点级默认客户端配置拒绝一切对端，仅 `connect(peer, pinned)` 可建立通道，握手后还会从已建立连接重导出指纹复核。
@@ -62,7 +62,7 @@
 
 ## 邀请码配对安全机制（2026-11-04，第十八至二十一波）
 
-决策与契约见 [ADR-004](adr/004-invite-pairing.zh-CN.md) 与 `docs/contracts/`（pairing-flow/protocol-v2/storage-schema）；以下机制均已落地并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"第十八/十九波"至"第二十一波"节）。
+决策与契约见 [ADR-004](adr/004-invite-pairing.zh-CN.md) 与 `docs/contracts/`（pairing-flow/protocol-v2/storage-schema）；以下机制均已落地并有测试锁定（执行证据见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt)"第十八/十九波"至"第二十一波"节）。
 
 ### 码格式与生成
 
@@ -73,7 +73,7 @@
 
 ### 反枚举与防暴力
 
-- ghost-pending 反枚举：兑换不存在/错误/过期/撤销的码，服务端先返回与真码相同字段形状的 `InviteRedeemPending` 并在内存登记 ghost，到期限统一返回 `PAIR_UNAVAILABLE`——兑换方在等待期与失败期均无法区分"码不存在"与"码存在但不可用"（无存在性预言机）；配额拒绝在 lookup 查询前执行；owner 查询自己的列表可见真实状态。（终审更正 2026-11-05：上述统一仅覆盖兑换首响应，"无存在性预言机"以此收窄——status 查询与终态响应存在可区分性（终审发现，修复中，见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt)"终审更正"节第 1 条）。）
+- ghost-pending 反枚举：兑换不存在/错误/过期/撤销的码，服务端先返回与真码相同字段形状的 `InviteRedeemPending` 并在内存登记 ghost，到期限统一返回 `PAIR_UNAVAILABLE`——兑换方在等待期与失败期均无法区分"码不存在"与"码存在但不可用"（无存在性预言机）；配额拒绝在 lookup 查询前执行；owner 查询自己的列表可见真实状态。（终审更正 2026-11-05：上述统一仅覆盖兑换首响应，"无存在性预言机"以此收窄——status 查询与终态响应存在可区分性（终审发现，修复中，见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt)"终审更正"节第 1 条）。）
 - 防暴力限速（四层桶，2026-11-11 CR-P1-03 修订）：redeem **每连接 10 次/分钟＋每来源 30 次/分钟＋每设备身份 30 次/分钟＋全局熔断 600 次/分钟**滑动窗口（替换原"每连接 10＋全局 60"双桶——旧全局 60 次/分钟可被单一来源用约 6 个自生成身份打满，使**其他来源**的全部合法兑换被 `RATE_LIMITED`，一台普通机器即可令所有新任务无法建立）。来源按 IPv4 /32、IPv6 /64 归一；每来源与每身份窗口为服务端共享表，跨连接、跨重连计数（重连只获得新的每连接桶，不能重置其余三层），表项带 TTL 空闲回收与容量上限；所有尝试无论成败一律计数，不设"查无此码"单独惩罚窗（码 160 bit 熵，在线枚举不可行，预算限制总工作量而非惩罚猜测）；每身份窗口之上永远叠加每来源窗口，批量生成身份无法放大单一来源预算。叠加 owner 维度预算（每 owner 32 个 active 码、**claim 30 次/小时**（2026-11-09 wave-34 `8e5ba7e` 从 6 次/小时上调：6/时对正常使用过紧；按 owner 持久计数、含已撤销的行，重连与撤码不重置）、32 个并发 pending 兑换）与全局 pending 4096 上限；既有帧限频（32 帧/秒、突发 64）保留。**claim 与 redeem 是两组独立预算**：30 次/小时限的是 claim（码登记），redeem 走上面的四层桶。设备密钥可批量生成，设备级限速不单独承担防暴力，必须叠加来源与全局资源预算。
 - 按来源连接准入（2026-11-11 CR-P1-03）：v2 服务端在 accept 时按来源（IPv4 /32、IPv6 /64）限制**并发连接 8、其中握手中 4**，超限直接断开该 socket、不 spawn 任务——只建 TCP 不完成 TLS 握手的连接最多占住单一来源自己的配额，无法再占满全局名额拖垮其他来源；TLS 握手期限 10 秒（从 30 秒缩短），首帧期限 15 秒；来源计数在连接结束（含握手失败/超时/中止）即释放，空闲表项带 TTL 回收，无泄漏（R36-P1-03 的 RAII 释放语义沿用并扩展到来源维度）。
 - 防中间人（换钥/换码/nonce 检测）：256 字节 `PairTranscript` 绑定双方设备公钥、`code_id`/`lookup_digest`/`code_revision`、双 nonce 与期限；owner/redeemer 各自构造 `MAC(auth_key, 角色域 || transcript)`＋Ed25519 签名（覆盖 `角色域 || transcript || mac`），MAC 验证恒定时间。被入侵的协调服务替换任一侧公钥→签名验证失败（换钥检测）；交换、替换或重放其他码的 transcript/证明→MAC 验证失败（换码检测，`auth_key` 仅由码秘密派生）；nonce 重放与过期证明为独立错误变体拒绝；对已有信任，服务端返回新公钥不能静默替换本地簿记录。仅有 TLS 不足以防被入侵协调服务替换首次配对公钥，故 TLS 之上叠加该双端证明。
@@ -88,7 +88,7 @@
 
 ## FFI 边界（2026-11-03 契约冻结；实现已落地经 C ABI 测试；2026-11-04 第十七波修复带来契约增补、落地中）
 
-`crates/ak-ffi` 以句柄式 C ABI 向 UI 暴露引擎（决策与备选方案见 [ADR-003](adr/003-ffi-boundary.zh-CN.md)）。本节登记边界防护；实现已于第十至十二轮落地并由 C ABI 端到端测试锁定（版本/环回传输/坏 spec 反例/取消/双引擎/并发接收，见 [dev-validation-2026-11-02](../reports/dev-validation-2026-11-02.txt) 相应节）。第十七波修复代理带来契约增补（receive spec `expect` 必填、摘要算法未知显式拒绝、任务/检查点身份分离、冲突原子 no-replace、禁用 QUIC active migration、spec 边界校验收窄——逐项状态见 ADR-003"修复波落地中的契约增补"节，均标注修复波落地中），落地前实际语义以 `crates/ak-ffi` 当前实现为准。
+`crates/ak-ffi` 以句柄式 C ABI 向 UI 暴露引擎（决策与备选方案见 [ADR-003](adr/003-ffi-boundary.zh-CN.md)）。本节登记边界防护；实现已于第十至十二轮落地并由 C ABI 端到端测试锁定（版本/环回传输/坏 spec 反例/取消/双引擎/并发接收，见 [dev-validation-2026-11-02](../reports/archive/dev-validation-2026-11-02.txt) 相应节）。第十七波修复代理带来契约增补（receive spec `expect` 必填、摘要算法未知显式拒绝、任务/检查点身份分离、冲突原子 no-replace、禁用 QUIC active migration、spec 边界校验收窄——逐项状态见 ADR-003"修复波落地中的契约增补"节，均标注修复波落地中），落地前实际语义以 `crates/ak-ffi` 当前实现为准。
 
 ### 已设计防护（契约层）
 

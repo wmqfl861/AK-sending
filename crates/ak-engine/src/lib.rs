@@ -886,6 +886,27 @@ pub fn record_id_for(
     id
 }
 
+/// Pure Windows-savability decision for the receive side (CR-P3-02,
+/// manifest leg): the first manifest entry whose `rel_path` contains a
+/// component Windows cannot save, rendered as `<path>: <issue>` for the
+/// refusal message. `None` = every entry is fine. A non-UTF-8 component is
+/// itself unsavable (the checker cannot even name it). Pure — the same
+/// decision runs on every platform in tests; only the receive path arms it
+/// on Windows.
+pub fn windows_unsavable_entry(entries: &[FileEntry]) -> Option<String> {
+    entries.iter().find_map(|entry| {
+        entry.rel_path.components().find_map(|component| {
+            let issue = match component.as_os_str().to_str() {
+                Some(name) => {
+                    ak_core::manifest::windows_incompatible(name).map(|issue| issue.to_string())
+                }
+                None => Some("path component is not valid Unicode".to_owned()),
+            };
+            issue.map(|issue| format!("{}: {issue}", entry.rel_path.display()))
+        })
+    })
+}
+
 /// Pure storage-headroom decision for the receive side. Unknown capacity
 /// (`None`: the platform cannot report free space) passes — exhaustion is
 /// still caught later by real write errors, never faked here. An exact fit
@@ -3662,6 +3683,37 @@ async fn receive_frozen_body(
             .collect(),
     };
 
+    // CR-P3-02 (manifest leg): on Windows, refuse the whole job when any
+    // manifest entry carries a path component Windows cannot save (the
+    // `< > " | ? *` chars or a reserved stem — the Offer's root name was
+    // already checked at the consent gate; this is the full per-entry
+    // sweep). Still BEFORE any sink/part file is created: the peer is told
+    // ProtocolUnsupported with the offending path, the checkpoint records
+    // "failed_name_rejected", and the local verdict carries the readable
+    // reason. Non-Windows receivers never take this branch (Linux->Linux
+    // transfers with these characters stay legal).
+    #[cfg(windows)]
+    if let Some(problem) = windows_unsavable_entry(&job.manifest.entries) {
+        let _ = tx
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Error {
+                    code: ErrorCode::ProtocolUnsupported,
+                    message: format!(
+                        "receiver cannot save a manifest entry on this platform: {problem}"
+                    ),
+                },
+            })
+            .await;
+        record.state = "failed_name_rejected".into();
+        record.updated_unix_ms = now_ms();
+        store.save(&record).map_err(EngineError::Checkpoint)?;
+        return Err(EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("manifest entry unsavable on Windows: {problem}"),
+        )));
+    }
+
     // Storage-full precheck: refuse the job before any part file is created.
     // Unknown capacity passes (see [`check_headroom`]); a shortage is told to
     // the peer over the wire, checkpointed as "failed_storage_full", and
@@ -5000,6 +5052,54 @@ mod tests {
     // ------------------------------------------------------------------
     // Storage-full precheck (pure decision)
     // ------------------------------------------------------------------
+
+    /// Minimal FileEntry for the name-gate decision tests (only rel_path
+    /// matters to [`windows_unsavable_entry`]).
+    fn name_entry(rel: &str) -> FileEntry {
+        FileEntry {
+            rel_path: std::path::PathBuf::from(rel),
+            is_dir: false,
+            size: 1,
+            mtime_unix_ms: 0,
+            digest_alg: ak_core::manifest::DIGEST_ALG_BLAKE3,
+            whole_digest: [0u8; 32],
+            chunk_digests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn windows_unsavable_entry_flags_each_rule_at_any_depth() {
+        for rel in [
+            "what?now.bin",
+            "a<b.txt",
+            "dir>n/x.txt",
+            "CONIN$.log",
+            "COM¹.bin",
+        ] {
+            assert!(
+                windows_unsavable_entry(&[name_entry(rel)]).is_some(),
+                "{rel} must be flagged"
+            );
+        }
+        // The offending path and a readable reason ride the message.
+        let flagged = windows_unsavable_entry(&[name_entry("docs/what?now.bin")]).unwrap();
+        assert!(flagged.contains("docs/what?now.bin"), "{flagged}");
+        assert!(flagged.contains('?'), "{flagged}");
+    }
+
+    #[test]
+    fn windows_unsavable_entry_passes_clean_manifests_and_finds_offenders() {
+        assert!(windows_unsavable_entry(&[]).is_none());
+        // Clean names, including cases near the reserved-set boundaries.
+        assert!(windows_unsavable_entry(&[
+            name_entry("报告-最终.txt"),
+            name_entry("myconin$/note.txt"), // substring, not a reserved stem
+            name_entry("COM10/serial.log"),  // past the COM1-9 range
+        ])
+        .is_none());
+        // Reserved stems are caught at any depth, with any extension.
+        assert!(windows_unsavable_entry(&[name_entry("sub/CON.txt.ok")]).is_some());
+    }
 
     #[test]
     fn check_headroom_passes_unknown_available() {

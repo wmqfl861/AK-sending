@@ -8,6 +8,7 @@
 //! fallback verifier, TLS 1.3 only.
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ak_identity::tls::TlsBundle;
 use ak_identity::Fingerprint;
@@ -207,10 +208,102 @@ fn private_key(bundle: &TlsBundle) -> PrivateKeyDer<'static> {
 /// `Connection::remote_address()` and closes defensively on change.
 pub(crate) const MIGRATION_DISABLED: bool = true;
 
+// ---------------------------------------------------------------------------
+// CR-P2-04: explicit QUIC transport tuning — one constant table, both roles
+// ---------------------------------------------------------------------------
+//
+// quinn-proto 0.11.19 defaults (`src/config/transport.rs`,
+// `impl Default for TransportConfig`) are: `max_idle_timeout = 30 s`
+// (RFC 9308 § 3.2), `keep_alive_interval = None`, per-stream receive window
+// 1.25 MB (sized for 12.5 MB/s at 100 ms RTT), connection `receive_window =
+// VarInt::MAX`, `send_window = 10 MB`. The 30 s idle default collides exactly
+// with the 30 s accept-confirmation window in ak-ffi (`task.rs`) and ak-cli
+// (`task_cli.rs`): while the receiving user is still deciding, no packet
+// flows, and the transport dies at the same moment the confirmation window
+// closes — the sender's 120 s idle budget is unreachable and the window
+// length cannot be raised (finding E2) until the connection outlives it.
+// Every constant below exists to break that collision; the window length
+// itself stays an owner decision (review § 8, E2).
+
+/// CR-P2-04: while established, send a QUIC PING whenever no packet has been
+/// *received* for this long. PINGs are ack-eliciting and quinn resets the
+/// idle timer on every authenticated packet received (quinn-proto 0.11.19
+/// `on_packet_authenticated` → `reset_idle_timeout`), so each probe refreshes
+/// the peer's timer and the returning ACK refreshes ours — a fully idle
+/// connection (no streams, no data, both sides silent) stays up indefinitely
+/// instead of counting down to [`MAX_IDLE_TIMEOUT`]. 10 s fits five retries
+/// into the 60 s idle budget (five consecutive probe losses tolerated) while
+/// costing two PING datagrams plus their ACKs every 10 s — a few dozen bytes
+/// per second on an otherwise dead-silent link.
+pub(crate) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// CR-P2-04: maximum inactivity before the transport gives up on the
+/// connection (quinn default: 30 s). 60 s doubles the headroom over the 30 s
+/// accept-confirmation flow and, with [`KEEP_ALIVE_INTERVAL`], is never
+/// reached in practice — it is the fallback for a peer that stopped
+/// responding entirely. Negotiation note (RFC 9000 § 10.1): the effective
+/// idle timeout is `min` of the two endpoints' advertised values
+/// (quinn-proto `negotiate_max_idle_timeout`), so BOTH roles must advertise
+/// 60 s — which is why [`transport_config`] is the one table fed into both
+/// [`quinn_server_config`] and [`quinn_client_config`]; a default-configured
+/// peer would cap the negotiation at 30 s.
+pub(crate) const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// CR-P2-04: per-stream flow-control receive window in bytes (quinn default:
+/// 1.25 MB). Bandwidth-delay-product sizing: a stream can only have this many
+/// bytes in flight, so at 100 ms RTT the default caps one stream at
+/// 12.5 MB/s (~100 Mbps; ~25 MB/s at 50 ms) — the review's measured complaint
+/// for single-stream public-internet transfers. 8 MiB / 100 ms ≈ 84 MB/s
+/// (~670 Mbps) with headroom over the 100–500 Mbps WAN paths this app targets.
+pub(crate) const STREAM_RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+
+/// CR-P2-04: connection-wide flow-control receive window in bytes (quinn
+/// default: `VarInt::MAX`). Explicitly bounded instead: it is the hard cap on
+/// how much data a peer may park in our buffers across all streams, so the
+/// default is a memory-exhaustion gift to a malicious or buggy peer once
+/// [`STREAM_RECEIVE_WINDOW_BYTES`] is raised. Equal to the per-stream window
+/// on purpose — this app opens 1–2 streams per transfer, so one transfer may
+/// use the whole connection window; `receive_window ≥ stream_receive_window`
+/// keeps multi-stream traffic unstarved.
+pub(crate) const RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+
+/// CR-P2-04: connection-wide send window in bytes — the cap on unacknowledged
+/// application writes we retain for retransmission (quinn default: 10 MB).
+/// Kept comparable to the receive windows (8 MiB) so a fast sender on a fast
+/// path is not throttled below the receiver's advertised window. Worst-case
+/// transport memory per connection is thereby bounded at
+/// [`RECEIVE_WINDOW_BYTES`] + [`SEND_WINDOW_BYTES`] = 16 MiB.
+pub(crate) const SEND_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Build the [`quinn::TransportConfig`] shared by every server and client
+/// config this module produces, from the CR-P2-04 constant table above.
+///
+/// Everything not in the table stays at the quinn default (Cubic congestion
+/// control, MTU discovery, 100 concurrent bidi/uni streams, 16 KiB crypto
+/// buffer): no field data justifies touching those yet — the netem throughput
+/// benchmark proposed in the review's fix plan is the follow-up that would.
+///
+/// Window constants are `u32` so `VarInt::from_u32` is infallible here; the
+/// QUIC VarInt ceiling (2^62-1) is never a constraint for windows this small.
+pub(crate) fn transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    config
+        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
+        .max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT)
+                .expect("60 s idle timeout fits the QUIC VarInt bound"),
+        ))
+        .stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW_BYTES))
+        .receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW_BYTES))
+        .send_window(u64::from(SEND_WINDOW_BYTES));
+    config
+}
+
 /// Build the QUIC server config: our certificate, mandatory client
 /// certificates verified as self-signed Ed25519, ALPN `ak/1`, and QUIC active
 /// migration disabled at the transport-parameter level (INV-004; see
-/// [`MIGRATION_DISABLED`]).
+/// [`MIGRATION_DISABLED`]). CR-P2-04: carries the shared transport tuning
+/// table via [`transport_config`].
 pub(crate) fn quinn_server_config(identity: &TlsBundle) -> io::Result<quinn::ServerConfig> {
     let verifier = Arc::new(SelfSignedClientCertVerifier {
         schemes: provider().signature_verification_algorithms,
@@ -230,6 +323,8 @@ pub(crate) fn quinn_server_config(identity: &TlsBundle) -> io::Result<quinn::Ser
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
     // INV-004: reject connection migration at the handshake-parameter level.
     server_config.migration(!MIGRATION_DISABLED);
+    // CR-P2-04: explicit transport tuning (idle/keep-alive/flow-control).
+    server_config.transport_config(Arc::new(transport_config()));
     Ok(server_config)
 }
 
@@ -244,6 +339,11 @@ pub(crate) fn quinn_server_config(identity: &TlsBundle) -> io::Result<quinn::Ser
 /// `disable_active_migration` parameter binds this client. `DirectChannel`
 /// still watches `remote_address()` defensively
 /// (`DirectChannel::ensure_path_stable`).
+///
+/// CR-P2-04: carries the same transport tuning table as the server config
+/// (via [`transport_config`]) — the negotiated idle timeout is the minimum of
+/// both endpoints' advertised values, so the client role must advertise it
+/// too or the server-side 60 s is silently cut back down.
 pub(crate) fn quinn_client_config(
     identity: &TlsBundle,
     pinned: Option<&Fingerprint>,
@@ -269,5 +369,8 @@ pub(crate) fn quinn_client_config(
     config.alpn_protocols = alpn_protocols();
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(config))
         .map_err(|e| config_io_err("building QUIC client config", e))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic));
+    // CR-P2-04: explicit transport tuning (idle/keep-alive/flow-control).
+    client_config.transport_config(Arc::new(transport_config()));
+    Ok(client_config)
 }

@@ -1859,6 +1859,173 @@ mod tests {
         assert!(tail.is_empty());
     }
 
+    // ------------------------------------------------------------------
+    // CR-P2-04 transport tuning (tls constant table + idle behavior)
+    // ------------------------------------------------------------------
+
+    /// Assert one rendered `quinn::ServerConfig`/`ClientConfig` Debug dump
+    /// carries every CR-P2-04 table value in its embedded `TransportConfig`.
+    fn assert_transport_tuning(rendered: &str) {
+        // quinn renders the windows as bare VarInt/u64 integers and the
+        // durations as `Some(10s)` / `Some(60000)` (milliseconds).
+        for fragment in [
+            format!("keep_alive_interval: Some({:?})", tls::KEEP_ALIVE_INTERVAL),
+            format!(
+                "max_idle_timeout: Some({})",
+                tls::MAX_IDLE_TIMEOUT.as_millis()
+            ),
+            format!(
+                "stream_receive_window: {}",
+                tls::STREAM_RECEIVE_WINDOW_BYTES
+            ),
+            format!("receive_window: {}", tls::RECEIVE_WINDOW_BYTES),
+            format!("send_window: {}", tls::SEND_WINDOW_BYTES),
+        ] {
+            assert!(
+                rendered.contains(&fragment),
+                "transport tuning {fragment:?} missing from config: {rendered}"
+            );
+        }
+    }
+
+    /// CR-P2-04 lock test. quinn 0.11 exposes no getters for these knobs
+    /// (`TransportConfig` fields are `pub(crate)` in quinn-proto 0.11.19 and
+    /// `ServerConfig`/`ClientConfig` only accept the config), but both
+    /// configs' `Debug` impls render the embedded `TransportConfig` in full,
+    /// so the lock asserts quinn's own rendering of the BUILT server and
+    /// client configs against the constant table — and the table against
+    /// independent literals, so a table edit cannot drag the lock along.
+    #[test]
+    fn transport_tuning_is_embedded_in_both_configs() {
+        let (bundle, _) = test_identity();
+        let server = tls::quinn_server_config(&bundle).expect("server config builds");
+        let client = tls::quinn_client_config(&bundle, None).expect("client config builds");
+        assert_transport_tuning(&format!("{server:?}"));
+        assert_transport_tuning(&format!("{client:?}"));
+
+        // The table itself, pinned to the review's numbers (quinn defaults
+        // it replaces: idle 30 s, keep-alive None, 1.25 MB stream window).
+        assert_eq!(tls::KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(tls::MAX_IDLE_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(tls::STREAM_RECEIVE_WINDOW_BYTES, 8 * 1024 * 1024);
+        assert_eq!(tls::RECEIVE_WINDOW_BYTES, 8 * 1024 * 1024);
+        assert_eq!(tls::SEND_WINDOW_BYTES, 8 * 1024 * 1024);
+
+        // Negative control: the assertions above can actually fail — the
+        // untuned default renders None/30 s/1.25 MB, not our table.
+        let default = format!("{:?}", quinn::TransportConfig::default());
+        assert!(default.contains("keep_alive_interval: None"));
+        assert!(default.contains("max_idle_timeout: Some(30000)"));
+        assert_transport_tuning_not_present(&default);
+    }
+
+    /// Mirror of [`assert_transport_tuning`] for the negative control: none
+    /// of the table values may appear in a default (untuned) render.
+    fn assert_transport_tuning_not_present(rendered: &str) {
+        for fragment in [
+            format!("keep_alive_interval: Some({:?})", tls::KEEP_ALIVE_INTERVAL),
+            format!(
+                "max_idle_timeout: Some({})",
+                tls::MAX_IDLE_TIMEOUT.as_millis()
+            ),
+            format!(
+                "stream_receive_window: {}",
+                tls::STREAM_RECEIVE_WINDOW_BYTES
+            ),
+            format!("receive_window: {}", tls::RECEIVE_WINDOW_BYTES),
+            format!("send_window: {}", tls::SEND_WINDOW_BYTES),
+        ] {
+            assert!(
+                !rendered.contains(&fragment),
+                "default config unexpectedly carries tuning {fragment:?}"
+            );
+        }
+    }
+
+    /// CR-P2-04 behavior: a connection with nothing to send — exactly the
+    /// accept-confirmation wait, no streams and no data in either direction —
+    /// must outlive quinn's 30 s default idle timeout AND the table's own
+    /// 60 s value, and still carry data afterwards.
+    ///
+    /// Determinism: quinn 0.11.12 runs every timer on `tokio::time::Sleep`
+    /// (quinn `src/runtime/tokio.rs`), so this test freezes the tokio clock
+    /// (`tokio::time::pause`, current-thread runtime required) and advances
+    /// it as virtual time. Keep-alive PINGs, their ACKs, and both idle
+    /// timers all fire on the virtual timeline while the loopback UDP I/O
+    /// runs for real between auto-advances (tokio polls the I/O driver with
+    /// a zero timeout on each advance), so 65 "seconds" of idle cost
+    /// milliseconds of wall clock and cannot flake on a loaded CI runner.
+    ///
+    /// The 65 s checkpoint is also the keep-alive proof: the idle timer
+    /// counts from the last packet *received*, so a connection still healthy
+    /// at 65 s of two-sided silence means the 10 s PINGs (ack-eliciting, so
+    /// answered by ACK-only packets) really did refresh the idle timers on
+    /// both endpoints — without keep-alive, both close at exactly 60 s.
+    #[tokio::test] // current_thread flavor: tokio::time::pause requires it
+    async fn connection_survives_idle_beyond_timeouts_and_still_transfers() {
+        tokio::time::pause();
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let client = DirectEndpoint::bind(loopback_addr(), &client_id)
+            .await
+            .expect("client bind");
+        let server_addr = server.local_addr().expect("server addr");
+
+        let server_task = tokio::spawn(async move { server.accept(&|_| true).await });
+        let client_channel = client
+            .connect(server_addr, &server_id.fingerprint)
+            .await
+            .expect("client connect");
+        let server_channel = server_task.await.expect("join").expect("server accept");
+        assert!(client_channel.healthy() && server_channel.healthy());
+
+        // 32 s of total silence: past quinn's old 30 s default, which would
+        // have closed both endpoints before the user could accept.
+        tokio::time::sleep(Duration::from_secs(32)).await;
+        assert!(
+            client_channel.healthy() && server_channel.healthy(),
+            "connection died inside the old 30 s default idle timeout"
+        );
+
+        // 65 s total: past OUR 60 s table value too; from here on only the
+        // keep-alive PING/ACK exchange keeps the idle timers refreshed.
+        tokio::time::sleep(Duration::from_secs(33)).await;
+        assert!(
+            client_channel.healthy() && server_channel.healthy(),
+            "keep-alive failed to refresh the 60 s idle timers"
+        );
+
+        // Data still flows after the long idle period, in both directions.
+        let mut cstream = client_channel.open_bi().await.expect("open_bi after idle");
+        cstream
+            .send_bytes(b"after idle")
+            .await
+            .expect("client send after idle");
+        let mut sstream = server_channel
+            .accept_bi()
+            .await
+            .expect("accept_bi after idle");
+        let mut buf = [0u8; 10];
+        sstream
+            .recv_exact(&mut buf)
+            .await
+            .expect("server recv after idle");
+        assert_eq!(&buf, b"after idle");
+        sstream
+            .send_bytes(b"ok")
+            .await
+            .expect("server send after idle");
+        let mut echo = [0u8; 2];
+        cstream
+            .recv_exact(&mut echo)
+            .await
+            .expect("client recv after idle");
+        assert_eq!(&echo, b"ok");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_pin_fails_closed() {
         let (client_id, _) = test_identity();

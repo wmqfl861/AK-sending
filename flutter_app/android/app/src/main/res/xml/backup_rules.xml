@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Full-backup-content rules, consulted on API 23-30 (API 31+ uses
+     data_extraction_rules.xml instead). Every backup domain is excluded:
+     the identity private keys under files/.ak-sending must never leave the
+     device via system backups (CR-P1-04), and the app has nothing worth
+     restoring anyway. allowBackup="false" in the manifest is the primary
+     opt-out; this file keeps the exclusion explicit for OEM paths that
+     ignore it. -->
+<full-backup-content>
+    <exclude domain="root" path="."/>
+    <exclude domain="file" path="."/>
+    <exclude domain="database" path="."/>
+    <exclude domain="sharedpref" path="."/>
+    <exclude domain="external" path="."/>
+</full-backup-content>

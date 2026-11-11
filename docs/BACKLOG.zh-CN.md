@@ -187,6 +187,7 @@ Codex 终审（gpt-6-astra/reasoning=max，只读静态审计，原文见 [codex
 - [ ] P3-02 大文件、海量文件、长时间恢复、目录撤权。
 - [ ] P4-01 安装签名、升级兼容、许可证选择、发布材料。
 - [ ] P4-02 外部安全审查和正式无中继证据报告。
+- [ ] Android targetSdk 升至 37（Android 17）前必须先落地本地网络权限流程（评审 2026-11-11 CR-P2-03；targetSdk 已显式固定为 36，见 flutter_app/android/app/build.gradle.kts）：清单声明 ACCESS_LOCAL_NETWORK（NEARBY_DEVICES 权限组）、首次局域网操作前运行时请求、拒绝或撤销时提示并降级为公网直连候选（不是中继，ADR-001）、在 API 37 模拟器上测试。
 
 ## 后续
 

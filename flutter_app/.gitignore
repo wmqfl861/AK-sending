@@ -46,3 +46,11 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Release signing (CR-P2-02): key material must never enter the repository.
+# key.properties points at the release keystore and carries its passwords;
+# matched at any depth so android/key.properties is covered too.
+key.properties
+*.keystore
+*.jks
+upload-keystore*

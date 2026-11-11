@@ -4,7 +4,22 @@
          addresses (release builds get it ONLY from this manifest; the
          debug/profile manifests add it for the Flutter tooling). -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Backup exclusion (CR-P1-04): the identity private keys live in the
+         app's files/ dir (getApplicationSupportDirectory()/.ak-sending). A
+         cloud backup or a device-to-device migration would copy one identity
+         onto two phones — same-key mutual kicks (R36-P2-04 class) and garbled
+         pairing state — violating the "private keys never leave the device"
+         invariant (docs/ARCHITECTURE.zh-CN.md). allowBackup="false" opts out
+         of Auto Backup, but on some OEM builds with target API 31+ it only
+         stops cloud backup, NOT device transfer; the two rule files below
+         exclude every backup domain in BOTH <cloud-backup> and
+         <device-transfer> as the belt-and-suspenders layer. The app also has
+         nothing worth restoring: transfers are point-to-point and re-pairing
+         after a reinstall is cheap. -->
     <application
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="ak_sending_app"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">

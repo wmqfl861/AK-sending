@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Data extraction rules, consulted on API 31+ (API 23-30 uses
+     backup_rules.xml instead). BOTH sections exclude every domain: on some
+     OEM builds allowBackup="false" only stops cloud backup, NOT
+     device-to-device migration, so <device-transfer> must exclude explicitly
+     too — the identity private keys under files/.ak-sending must never be
+     cloned onto a new phone (CR-P1-04). Nothing here is worth restoring:
+     transfers are point-to-point and re-pairing after a reinstall is cheap. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="."/>
+        <exclude domain="file" path="."/>
+        <exclude domain="database" path="."/>
+        <exclude domain="sharedpref" path="."/>
+        <exclude domain="external" path="."/>
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="."/>
+        <exclude domain="file" path="."/>
+        <exclude domain="database" path="."/>
+        <exclude domain="sharedpref" path="."/>
+        <exclude domain="external" path="."/>
+    </device-transfer>
+</data-extraction-rules>

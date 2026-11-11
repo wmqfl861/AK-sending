@@ -931,3 +931,293 @@ fn dead_stun_server_fails_open_within_the_budget() {
         "the failure line is bounded diagnostics, not a crash: {failure}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CR-P1-02 改法第 3 条 (REVIEW §4.1): the send-time simultaneous-probe leg
+// on the REAL product path. The sender's connect phase now opens with one
+// probe round (one dual-stack socket, 1 s window) fired at EVERY advertised
+// candidate; an observed answering address leads the QUIC dial order under
+// a bounded 2 s first-attempt budget, and the static LAN-first order is
+// the always-available fallback. Two assertion layers over real
+// `registry-server` + `task code-recv` + `task join-send` subprocesses:
+//
+// 1. Fallback: the candidate list carries an address that ANSWERS PROBES
+//    but holds NO QUIC listener (a probe-echoing fake, injected through
+//    the unchanged `--stun` reflexive slot by a test STUN responder that
+//    reflects the fake's fixed address). The sender's probe round must
+//    observe it and dial it FIRST; the bounded attempt must fail over to
+//    the REAL receiver and the transfer must complete with "connected
+//    via" naming the receiver's own bound port.
+// 2. Honest observation: in the plain derived chain the probe round
+//    observes one of the receiver's REAL advertised candidates (the echo
+//    responder's port — the only advertised socket that speaks the probe
+//    protocol; the QUIC socket does not, an honest boundary of today's
+//    product path: no single advertised address both answers probes and
+//    accepts QUIC, so "connected via <observed>" is structurally
+//    unreachable on this path — see the C3 report's ak-net proposal).
+//
+// Same-host loopback is not a NAT traversal claim — no NAT sits on the
+// path — that boundary stays the file header's.
+// ---------------------------------------------------------------------------
+
+/// One UDP socket that answers ak-net hole-punch probe packets (any
+/// nonce, with the all-zero reply nonce) and swallows everything else:
+/// an advertised candidate that answers probes but holds NO QUIC
+/// listener.
+struct ProbeEchoFake {
+    addr: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProbeEchoFake {
+    fn spawn() -> ProbeEchoFake {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the probe-echo fake");
+        let addr = socket.local_addr().expect("fake local addr");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("t03-probe-echo-fake".to_string())
+            .spawn(move || {
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .expect("fake read timeout");
+                let mut buffer = [0u8; 1500];
+                loop {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let (len, from) = match socket.recv_from(&mut buffer) {
+                        Ok(received) => received,
+                        Err(_) => continue, // timeout tick: re-check the flag
+                    };
+                    if ak_net::holepunch::is_probe_packet(&buffer[..len]) {
+                        // Echo with the all-zero nonce (the echo
+                        // responder's reply shape — still a probe packet
+                        // the sender's round counts as an observation).
+                        let reply = ak_net::holepunch::probe_packet(&[0u8; 16]);
+                        let _ = socket.send_to(&reply, from);
+                    }
+                    // Everything else (QUIC handshakes included) is
+                    // dropped: this address never accepts QUIC.
+                }
+            })
+            .expect("spawn the probe-echo fake thread");
+        ProbeEchoFake { addr, stop }
+    }
+}
+
+impl Drop for ProbeEchoFake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The "[task] connected via <ip:port>" winner of one sender run.
+fn connected_via_addr(sender_log: &str) -> SocketAddr {
+    let line = sender_log
+        .lines()
+        .find(|line| line.contains("[task] connected via "))
+        .unwrap_or_else(|| panic!("no connected-via line in the sender log:\n{sender_log}"));
+    line.split("[task] connected via ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse().ok())
+        .unwrap_or_else(|| panic!("connected-via address in the line: {line}"))
+}
+
+/// The port the receiver's "receiver bound [::]:<port>" line reports.
+fn receiver_bound_port(bound_line: &str) -> u16 {
+    bound_line
+        .split("receiver bound ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|| panic!("bound addr token in the line: {bound_line}"))
+}
+
+/// The address the sender's probe-round line observed (the observed head
+/// that led the dial order).
+fn probe_observed_addr(sender_log: &str) -> SocketAddr {
+    let line = sender_log
+        .lines()
+        .find(|line| line.contains("[task] probe round observed ") && !line.contains("nothing"))
+        .unwrap_or_else(|| {
+            panic!("no probe-round observation line in the sender log:\n{sender_log}")
+        });
+    line.split("[task] probe round observed ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse().ok())
+        .unwrap_or_else(|| panic!("observed address in the line: {line}"))
+}
+
+/// Fallback layer: the advertised list carries a probe-answering fake
+/// (injected as the receiver's STUN-reflexive candidate by a responder
+/// that reflects the fake's fixed address). The sender's probe round
+/// observes the fake and dials it FIRST; the bounded attempt fails (no
+/// QUIC listener there) and the dial falls through to the REAL receiver
+/// — the transfer completes and names the receiver's own bound port.
+#[test]
+fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
+    // The fake probe-echo endpoint, plus the STUN responder that reflects
+    // its fixed address into the receiver's candidate list.
+    let fake = ProbeEchoFake::spawn();
+    let stun = StunResponder::spawn(Some(fake.addr));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-punch",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let mut recv = spawn_recv_with_stun(
+        "t03-punch-recv",
+        &registry,
+        tmp.path(),
+        &stun.addr.to_string(),
+    );
+    let bound = recv
+        .stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+    let real_port = receiver_bound_port(&bound);
+    // The fake genuinely rides the advertised blob (the reflexive slot):
+    // the sender's probe round probed it because it was advertised.
+    let advertised = recv
+        .stdout
+        .wait_for("[task] advertising", std::time::Duration::from_secs(10));
+    let fake_text = fake.addr.to_string();
+    assert!(
+        advertised.contains(&fake_text),
+        "the probe-echo fake must ride the advertised candidates: {advertised}"
+    );
+
+    // The real transfer chain against that receiver.
+    let code_line = recv
+        .stdout
+        .wait_for("AKI1-", std::time::Duration::from_secs(60));
+    let code = code_line
+        .trim()
+        .strip_prefix("AKI1-")
+        .map(|rest| format!("AKI1-{rest}"))
+        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+    let src = tmp.path().join("t03-punch-src");
+    std::fs::create_dir_all(&src).expect("src dir");
+    write_file(
+        &src.join("payload.bin"),
+        &common::Lcg::new(0x9999_0000_0000_0001).bytes(256 * 1024),
+    );
+    let send_args: Vec<String> = [
+        "--id-dir".to_string(),
+        tmp.path()
+            .join("t03-punch-id-send")
+            .to_string_lossy()
+            .into_owned(),
+        "task".to_string(),
+        "join-send".to_string(),
+        code,
+        src.to_string_lossy().into_owned(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .to_vec();
+    let mut sender = Proc::spawn("t03-punch-send", &send_args);
+    recv.stdout.wait_for(
+        "the peer wants to send",
+        std::time::Duration::from_secs(120),
+    );
+    recv.consent_yes(
+        &["[recv]", "task complete", "declined"],
+        std::time::Duration::from_secs(40),
+    );
+    sender.wait_exit_ok(std::time::Duration::from_secs(180));
+    recv.wait_exit_ok(std::time::Duration::from_secs(60));
+    let sender_log = sender.stdout.snapshot().join("\n");
+
+    // (1) The probe round ran and observed the FAKE (a candidate that
+    // answers probes but no QUIC) as the dial-leading head.
+    let observed = probe_observed_addr(&sender_log);
+    assert_eq!(
+        observed, fake.addr,
+        "the probe round must observe the probe-answering fake first: {sender_log}"
+    );
+
+    // (2) The observed-first attempt cannot carry QUIC; the fallback
+    // completes the transfer via the REAL receiver's bound port.
+    let winner = connected_via_addr(&sender_log);
+    assert_ne!(
+        winner.port(),
+        fake.addr.port(),
+        "the fake holds no QUIC listener — it must not carry the task: {sender_log}"
+    );
+    assert_eq!(
+        winner.port(),
+        real_port,
+        "the fallback must land on the receiver's real bound port: {sender_log}"
+    );
+    assert!(
+        sender_log.contains("[task] done:"),
+        "the task-code transfer must complete through the fallback: {sender_log}"
+    );
+
+    // (3) The payload is byte-identical through the observed-first path.
+    let landed = std::fs::read(tmp.path().join("t03-punch-recv-out").join("payload.bin"))
+        .expect("received payload through the probe-fallback chain");
+    assert_eq!(
+        landed,
+        std::fs::read(src.join("payload.bin")).expect("source payload"),
+        "payload bytes differ through the probe-fallback chain"
+    );
+}
+
+/// Honest-observation layer (the plain derived chain): the probe round
+/// observes one of the receiver's REAL advertised candidates — the echo
+/// responder's port, the only advertised socket that speaks the probe
+/// protocol (the QUIC socket does not) — the observed-first attempt
+/// fails over within its bounded budget, and the transfer names the
+/// receiver's bound port. This pins that the send-time round genuinely
+/// runs against the real product path's own candidates.
+#[test]
+fn probe_round_observes_the_real_advertised_candidates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-obs",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let (bound, advertised, _recv_log, sender_log) =
+        run_task_code_chain("t03-obs", &registry, tmp.path(), &[]);
+    let real_port = receiver_bound_port(&bound);
+
+    // The observed head is one of the receiver's genuinely ADVERTISED
+    // addresses (it appears in the advertising line), and it is the echo
+    // responder's port — not the QUIC port (the honest boundary: no
+    // advertised address both answers probes and accepts QUIC today).
+    let observed = probe_observed_addr(&sender_log);
+    let observed_text = observed.to_string();
+    assert!(
+        advertised
+            .split_whitespace()
+            .any(|token| token == observed_text),
+        "the probe round must observe a genuinely advertised candidate: {observed_text} not in {advertised}"
+    );
+    assert_ne!(
+        observed.port(),
+        real_port,
+        "the probe-answering candidate is the echo responder's port, never the QUIC port: {sender_log}"
+    );
+
+    // The observed-first attempt fails over to the real receiver.
+    let winner = connected_via_addr(&sender_log);
+    assert_eq!(
+        winner.port(),
+        real_port,
+        "the transfer must ride the receiver's real bound port: {sender_log}"
+    );
+    assert!(
+        sender_log.contains("[task] done:"),
+        "the plain chain still completes: {sender_log}"
+    );
+}

@@ -121,6 +121,17 @@
 //! derived list verbatim (caller-knows-better), and then neither the
 //! reflexive candidate nor an echo port is appended — the probe reports
 //! exactly what the caller advertised.
+//! Since CR-P1-02 改法第 3 条 the SENDER's connect phase opens with one
+//! simultaneous-probe round (`probe_dial_round`): a dedicated dual-stack
+//! socket fires `holepunch::probe` packets at every dial candidate for a
+//! bounded 1 s window, and when the round observes an answering address
+//! (the receiver's echo responder reply, or a still-overlapping peer
+//! probe round's source) that observed address leads the QUIC dial order
+//! under a reduced first-attempt budget — strictly additive, with the
+//! static LAN-first order as the always-available fallback. The receiver
+//! side consumes its own observations (the echo responder's most recent
+//! observed probe source) only for its one outbound dial role, the
+//! idle-close notify; the QUIC accept is socket-bound and needs no dial.
 //!
 //! The engine-shared code table stays as a CACHE ONLY: same-engine
 //! joins use it to mirror the code's declared role onto the joiner (the
@@ -256,6 +267,36 @@ const ATTEMPT_PAUSE: Duration = Duration::from_millis(150);
 /// exactly the pairing's verified fingerprint.
 const TASK_CONNECT_PASSES: usize = 3;
 const TASK_SETTLE_PAUSE: Duration = Duration::from_millis(300);
+
+/// Tunables of the send-time simultaneous-probe round (CR-P1-02 改法第 3
+/// 条): ONE dual-stack UDP socket fires `holepunch::probe` packets at
+/// every dial candidate every [`PROBE_DIAL_INTERVAL`] for one
+/// [`PROBE_DIAL_WINDOW`] before the first QUIC dial attempt. The window
+/// IS the pre-dial latency budget (cap ~1-2 s per the fix brief): the
+/// receiver's echo responder — and, while the pairing-time rounds still
+/// overlap, the peer's own `probe_peer` — answers within the first
+/// 150 ms burst on a live path, but `holepunch::probe` only reports at
+/// window end, so the round blocks the full second even then (an
+/// early-exit hook on the ak-net probe is the recorded API wish). The
+/// round runs OUTSIDE the per-attempt connect budgets and pass counting:
+/// [`TASK_CONNECT_BUDGET`] × [`TASK_CONNECT_PASSES`] behave exactly as
+/// before, so the worst-case total connect phase grows by at most
+/// window + [`OBSERVED_DIAL_BUDGET`] ≈ 3 s.
+const PROBE_DIAL_INTERVAL: Duration = Duration::from_millis(150);
+const PROBE_DIAL_WINDOW: Duration = Duration::from_secs(1);
+
+/// Connect budget of the FIRST dial attempt when it targets the probe
+/// round's OBSERVED address (CR-P1-02 改法第 3 条). An observation names
+/// a route that ANSWERED PROBES, not a socket that necessarily accepts
+/// QUIC — today's echo responder (and any probe-echoing endpoint a
+/// reflexive candidate can name) answers probes but holds no QUIC
+/// listener, so the observed-first attempt must not cost the static
+/// order's full [`TASK_CONNECT_BUDGET`] before the fallback continues. A
+/// genuinely hot mapping completes its QUIC+TLS handshake well inside
+/// 2 s (the cross-VPN handshakes that motivated the 10 s budget are not
+/// hot mappings); an observed address that is also a real candidate
+/// keeps its static slot and the full budget there.
+const OBSERVED_DIAL_BUDGET: Duration = Duration::from_secs(2);
 
 /// Bound for the resident receiver's first bind (surfaced as the code's
 /// candidates). Binding a wildcard UDP socket is fast; the bound exists so
@@ -586,6 +627,21 @@ pub(crate) struct TaskRt {
     /// assigns the real one). One code owns SEVERAL tasks — the receiver
     /// and the echo responder — so each key holds its handles as a set.
     spawned: StdMutex<HashMap<[u8; 16], Vec<JoinHandle<()>>>>,
+    /// Most recent probe source OBSERVED by this runtime's echo
+    /// responder (CR-P1-02 改法第 3 条), in normalized plain-family form.
+    /// A single-slot, most-recent-wins cache on purpose (bounded): the
+    /// only consumer is [`close_notify_peer`] — the receiver side's one
+    /// outbound dial role — which reads it opportunistically and dials
+    /// the observed source ahead of the static candidates. Honest
+    /// scoping: the slot is per RUNTIME, not per pairing, so with
+    /// several codes over one runtime's life a stale observation from
+    /// another pairing can lead that best-effort dial; the cost is one
+    /// bounded failed attempt before the advertised list (the close
+    /// notify is fire-and-forget, never a correctness gate). The task
+    /// event set is contract-frozen (§8.3), so the FFI surface exposes
+    /// no `probe_observed` event — see the C3 report's contract
+    /// proposal.
+    echo_observed: Arc<StdMutex<Option<SocketAddr>>>,
     /// Flipped by teardown; every consent gate checks it first.
     stopped: StdMutex<bool>,
     /// request_id idempotency: request id → (op id, canonical spec).
@@ -1167,6 +1223,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         conns: StdMutex::new(HashMap::new()),
         pending: StdMutex::new(HashMap::new()),
         spawned: StdMutex::new(HashMap::new()),
+        echo_observed: Arc::new(StdMutex::new(None)),
         stopped: StdMutex::new(false),
         request_ids: StdMutex::new(HashMap::new()),
         stack: StdMutex::new(None),
@@ -1365,6 +1422,58 @@ pub(crate) fn order_candidates(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
     }
     ordered.sort_by_key(|addr| !prefers_lan(addr));
     ordered
+}
+
+/// Which observed address leads the dial order after one simultaneous
+/// probe round (CR-P1-02 改法第 3 条) — pure on purpose (tests pin the
+/// rule without any socket). Rules, in order:
+///
+/// 1. The FIRST candidate of the static LAN-first order that the round
+///    saw answering (`report.reachable`): the route to that candidate is
+///    confirmed bidirectional and the local NAT mapping toward it is hot
+///    — the "dial the observed reply source first" leg. Reachable
+///    entries outside the static list are ignored here (they name the
+///    peer's ephemeral probe socket, not an advertised endpoint) and
+///    fall through to rule 2 verbatim.
+/// 2. The raw first source a PEER PROBE was observed from
+///    (`report.peer_observed_from` — on the pairing overlap this is the
+///    peer's own probe round arriving from an address the candidate list
+///    never named, e.g. its NAT mapping), normalized from `::ffff:`
+///    mapped form; an unspecified observation (a broken reflection) is
+///    dropped.
+///
+/// `None` when the round observed nothing — the dial loop keeps the
+/// static order exactly as before (strictly additive fallback).
+fn observed_dial_head(
+    ordered: &[SocketAddr],
+    report: &ak_net::holepunch::PunchReport,
+) -> Option<SocketAddr> {
+    if let Some(hit) = ordered
+        .iter()
+        .find(|candidate| report.reachable.contains(candidate))
+    {
+        return Some(*hit);
+    }
+    report
+        .peer_observed_from
+        .map(ak_net::classify::expand_mapped)
+        .filter(|addr| !addr.ip().is_unspecified())
+}
+
+/// Prepend one observed address to a dial order, deduped — the shared
+/// merge of the sender's probe-informed dialing ([`run_send`]) and the
+/// receiver side's observed-source close notify ([`close_notify_peer`]):
+/// the observation leads, every static entry survives in its existing
+/// order, `None` changes nothing.
+fn observed_first_order(ordered: Vec<SocketAddr>, observed: Option<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(observed) = observed else {
+        return ordered;
+    };
+    let observed = ak_net::classify::expand_mapped(observed);
+    let mut out = Vec::with_capacity(ordered.len() + 1);
+    out.push(observed);
+    out.extend(ordered.into_iter().filter(|addr| *addr != observed));
+    out
 }
 
 /// Parse the optional `candidates` field: an array of `ip:port` strings.
@@ -1819,12 +1928,41 @@ fn task_error_message(error: TaskError) -> String {
     }
 }
 
+/// Errors that only mean "this one datagram is gone", not "the responder
+/// must stop" (the same set ak-net's probe tolerates; its helper is
+/// private). On Windows, SIO_UDP_CONNRESET turns a late ICMP
+/// port-unreachable for one of our REPLIES into ConnectionReset on the
+/// NEXT recv — and a probe socket closes the moment its window ends
+/// (`probe_with_retry`, 改法第 3 条's `probe_dial_round`), so a reply
+/// racing that close dooms the next recv. Returning there would kill the
+/// responder between the pairing-time probe round and the send-time one
+/// — the send-time round then honestly observes nothing — so the loop
+/// skips these and keeps serving.
+fn responder_error_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Bind the probe echo responder: a small UDP socket that answers
 /// ak-net hole-punch probe packets from any of this device's advertised
 /// addresses, so the peer's `probe_peer` genuinely confirms two-way
 /// reachability (the QUIC receiver itself never speaks the probe
 /// exchange). Registered under `key` in the spawned table (teardown /
 /// disconnect abort it).
+///
+/// Since CR-P1-02 改法第 3 条 the responder also OBSERVES: every genuine
+/// probe's source lands in [`TaskRt::echo_observed`] (most-recent, one
+/// slot, normalized to plain-family form) — the receiver side's raw
+/// hole-punch observation, consumed by [`close_notify_peer`] for its
+/// one outbound dial role. The QUIC accept itself is already bound to
+/// the receiver's own socket and needs no dial, so the observation is
+/// deliberately NOT plumbed into the accept path — see the struct's
+/// honest-scoping note.
 ///
 /// Anti-reflection (wave-29 review P2-12): replies carry the fixed
 /// all-zero nonce and a reply is NEVER itself answered, so two reachable
@@ -1852,6 +1990,8 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
         .map_err(|error| format!("probe responder bind address: {error}"))?;
     let socket = tokio::net::UdpSocket::from_std(std_socket)
         .map_err(|error| format!("cannot register the probe responder: {error}"))?;
+    // 改法第 3 条: the shared observation slot this responder writes.
+    let observed_slot = Arc::clone(&rt.echo_observed);
     let task = tokio::spawn(async move {
         let mut buffer = [0u8; 1500];
         let mut budgets: HashMap<SocketAddr, (std::time::Instant, u32)> = HashMap::new();
@@ -1866,6 +2006,12 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
                     // time/counter-derived and cannot be all-zero.
                     if buffer[8..len] == ECHO_REPLY_NONCE {
                         continue;
+                    }
+                    // 改法第 3 条: remember the OBSERVED source (one
+                    // bounded store; poisoned locks lose the observation,
+                    // never the reply).
+                    if let Ok(mut slot) = observed_slot.lock() {
+                        *slot = Some(ak_net::classify::expand_mapped(source));
                     }
                     let now = std::time::Instant::now();
                     let allowed = match budgets.get_mut(&source) {
@@ -1894,6 +2040,13 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
                             .await;
                     }
                 }
+                // Transient datagram loss (Windows turns a late ICMP
+                // port-unreachable for one of our REPLIES — the probe
+                // socket closed at its window end — into ConnectionReset
+                // on the NEXT recv; ak-net's probe tolerates the same
+                // set) keeps the responder alive for the NEXT probe
+                // round; only a hard socket error ends the loop.
+                Err(error) if responder_error_is_transient(&error) => continue,
                 Err(_) => return,
             }
         }
@@ -2633,12 +2786,28 @@ fn cancel_unjoined_code(
 /// peer's resident receiver recognizes the marker, ends its pairing
 /// ByPeer and stops; an unreachable peer is an honest miss (its next
 /// send fails to connect), never a failed disconnect.
+///
+/// CR-P1-02 改法第 3 条, the RECEIVER side's consumption of its observed
+/// probe sources: this dial is the receiver's one outbound role, and the
+/// most recent address its echo responder OBSERVED a peer probe from
+/// leads the order ([`TaskRt::echo_observed`]) — the raw hole-punch
+/// observation (a NAT-mapped source the advertised list never named) is
+/// exactly the address an idle close behind a NAT should try first. The
+/// notification is best-effort, so a stale observation costs one bounded
+/// failed attempt before the static list, nothing more.
 async fn close_notify_peer(rt: &Arc<TaskRt>, conn: &TaskConn) {
     let Some(pinned) = conn.peer_fp else {
         return;
     };
     let identity = make_self_signed(&rt.key);
     let candidates = order_candidates(conn.candidates.clone());
+    let observed = rt
+        .echo_observed
+        .lock()
+        .map(|slot| *slot)
+        .unwrap_or_else(|poisoned| *poisoned.into_inner())
+        .filter(|addr| !addr.ip().is_unspecified());
+    let candidates = observed_first_order(candidates, observed);
     let mut remaining = TASK_CLOSE_TOTAL_BUDGET;
     for addr in candidates {
         if remaining.is_zero() {
@@ -3472,12 +3641,89 @@ async fn run_join(
     ))
 }
 
+/// The send-time simultaneous-probe round's outcome for the dial loop
+/// (CR-P1-02 改法第 3 条).
+struct ProbeDialOrder {
+    /// The full dial order: the observed head (when any) first, then the
+    /// static LAN-first order, deduped ([`observed_first_order`]).
+    order: Vec<SocketAddr>,
+    /// The observed address leading `order` (always its first entry when
+    /// present) — dialed under [`OBSERVED_DIAL_BUDGET`] instead of
+    /// [`TASK_CONNECT_BUDGET`] (see the constant's rationale).
+    head: Option<SocketAddr>,
+}
+
+/// One simultaneous-probe round (CR-P1-02 改法第 3 条) at the START of
+/// the sender's connect phase: ONE dual-stack UDP socket
+/// (`bind_dual_stack_udp`, v4 wildcard fallback for hosts without a
+/// clearable V6ONLY) fires `holepunch::probe` packets at EVERY dial
+/// candidate for [`PROBE_DIAL_WINDOW`]. The paired receiver's echo
+/// responder answers on its bound socket (its reply IS a probe packet,
+/// so the round observes the answering candidate), and a peer probe
+/// round still overlapping from the pairing lands here as an observed
+/// source the candidate list never named. The dial plan then puts the
+/// observed address first ([`observed_dial_head`]); the socket itself is
+/// dropped afterwards — the engine's `SendSpec` cannot adopt a
+/// pre-bound socket (the recorded ak-net/ak-engine API wish), so the
+/// probe socket's NAT mapping does NOT carry into the QUIC dial and the
+/// observed-first leg buys its reachability proof, not port reuse.
+///
+/// Strictly additive and fail-open: a bind or probe error (and an empty
+/// observation) returns the static order untouched — never worse than
+/// the pre-C3 dialing.
+async fn probe_dial_round(ordered: Vec<SocketAddr>) -> ProbeDialOrder {
+    let std_socket = match ak_net::holepunch::bind_dual_stack_udp(0) {
+        Ok(socket) => socket,
+        Err(_) => match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))) {
+            Ok(socket) => socket,
+            Err(_) => {
+                return ProbeDialOrder {
+                    order: ordered,
+                    head: None,
+                }
+            }
+        },
+    };
+    if std_socket.set_nonblocking(true).is_err() {
+        return ProbeDialOrder {
+            order: ordered,
+            head: None,
+        };
+    }
+    let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) else {
+        return ProbeDialOrder {
+            order: ordered,
+            head: None,
+        };
+    };
+    let report =
+        match ak_net::holepunch::probe(&socket, &ordered, PROBE_DIAL_INTERVAL, PROBE_DIAL_WINDOW)
+            .await
+        {
+            Ok(report) => report,
+            Err(_) => {
+                return ProbeDialOrder {
+                    order: ordered,
+                    head: None,
+                }
+            }
+        };
+    let head = observed_dial_head(&ordered, &report);
+    let order = observed_first_order(ordered, head);
+    ProbeDialOrder { order, head }
+}
+
 /// One send op: iterate the connection's candidates LAN-first under the
 /// split connect budget; a post-connect failure fails the op (another
 /// address cannot fix it); success emits `done` and completes the op.
 /// Purely connect-level failure of the WHOLE list gets
 /// [`TASK_CONNECT_PASSES`] passes (the just-paired peer's admission
 /// bookkeeping can trail the joiner by a beat — see the constant).
+/// Since CR-P1-02 改法第 3 条 the connect phase OPENS with one
+/// simultaneous-probe round ([`probe_dial_round`]): when it observes an
+/// answering address, that address leads the dial order under the
+/// bounded [`OBSERVED_DIAL_BUDGET`]; with no observation the round is
+/// invisible and the static order dials exactly as before.
 async fn run_send(
     rt: &Arc<TaskRt>,
     conn_id: [u8; 16],
@@ -3499,13 +3745,16 @@ async fn run_send(
     let pinned = conn.peer_fp.ok_or_else(|| {
         "the peer key is unresolved (ak-session PeerEndpoint pending)".to_string()
     })?;
-    let ordered = order_candidates(conn.candidates.clone());
-    if ordered.is_empty() {
+    let static_order = order_candidates(conn.candidates.clone());
+    if static_order.is_empty() {
         return Err(format!(
             "connection {} carries no dial candidates",
             core::hex_encode(&conn_id)
         ));
     }
+    // 改法第 3 条: probe round first (≤ PROBE_DIAL_WINDOW before the
+    // first dial attempt), observed address leads when any.
+    let dial = probe_dial_round(static_order).await;
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
         if pass > 0 {
@@ -3525,11 +3774,20 @@ async fn run_send(
             tokio::time::sleep(TASK_SETTLE_PAUSE).await;
             failures.clear();
         }
-        for (index, addr) in ordered.iter().enumerate() {
+        for (index, addr) in dial.order.iter().enumerate() {
             if index > 0 {
                 tokio::time::sleep(ATTEMPT_PAUSE).await;
             }
-            match attempt_task_send(rt, &conn, *addr, &paths, pinned).await {
+            // The observed head (always index 0 when present) dials under
+            // the bounded probe-informed budget; every static candidate —
+            // including an observed address's own static slot — keeps the
+            // full budget.
+            let budget = if index == 0 && dial.head.is_some() {
+                OBSERVED_DIAL_BUDGET
+            } else {
+                TASK_CONNECT_BUDGET
+            };
+            match attempt_task_send(rt, &conn, *addr, &paths, pinned, budget).await {
                 AttemptOutcome::Done(report) => {
                     rt.push_event(format!(
                         "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
@@ -3593,7 +3851,9 @@ enum AttemptOutcome {
 
 /// One candidate attempt under the split connect budget (the wave-25/26
 /// CLI driver, P1-01 shape): no deadline before the engine's
-/// `Connecting` report, [`TASK_CONNECT_BUDGET`] from it, no deadline once
+/// `Connecting` report, the caller's `connect_budget` from it (normally
+/// [`TASK_CONNECT_BUDGET`]; the probe round's observed head dials under
+/// [`OBSERVED_DIAL_BUDGET`]), no deadline once
 /// connected. Post-connect failures are distinguishable so the fallback
 /// loop stops instead of retrying a protocol error on another address.
 async fn attempt_task_send(
@@ -3602,6 +3862,7 @@ async fn attempt_task_send(
     addr: SocketAddr,
     paths: &[String],
     pinned: Fingerprint,
+    connect_budget: Duration,
 ) -> AttemptOutcome {
     let mut spec = SendSpec::new(
         PathBuf::from(&paths[0]),
@@ -3641,12 +3902,15 @@ async fn attempt_task_send(
     };
     let send = send(spec, &progress);
     tokio::pin!(send);
-    let result = match drive_with_connect_budget(&marks, send.as_mut(), TASK_CONNECT_BUDGET).await {
+    // The caller's budget: [`TASK_CONNECT_BUDGET`] for static candidates,
+    // [`OBSERVED_DIAL_BUDGET`] for the probe round's observed head (改法
+    // 第 3 条 — see the constant).
+    let result = match drive_with_connect_budget(&marks, send.as_mut(), connect_budget).await {
         Ok(result) => result,
         Err(()) => {
             return AttemptOutcome::ConnectFailed(format!(
                 "timeout after {}s (no QUIC handshake)",
-                TASK_CONNECT_BUDGET.as_secs(),
+                connect_budget.as_secs(),
             ))
         }
     };
@@ -5169,6 +5433,107 @@ mod task_tests {
             insert_reflexive_candidate(derived, Some("[::]:7000".parse().unwrap())),
             addrs(&["192.168.1.5:7000", "127.0.0.1:7000"])
         );
+    }
+
+    // -- observed-address dial order (CR-P1-02 改法第 3 条) -----------------
+
+    fn punch_report(
+        reachable: &[&str],
+        peer_observed_from: Option<&str>,
+    ) -> ak_net::holepunch::PunchReport {
+        ak_net::holepunch::PunchReport {
+            reachable: addrs(reachable),
+            peer_observed_from: peer_observed_from.map(|text| text.parse().expect("observed")),
+            packets_sent: 0,
+            packets_received: 0,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Rule (i): the observed head is the FIRST candidate of the static
+    /// LAN-first order that answered the probe — arrival order in the
+    /// report does not reorder the dial.
+    #[test]
+    fn observed_head_is_the_first_static_candidate_that_answered() {
+        let ordered = addrs(&[
+            "192.168.1.5:7000",
+            "203.0.113.7:7000",
+            "127.0.0.1:7000",
+            "[::1]:7000",
+        ]);
+        // The later static candidate answered FIRST (arrival order) — the
+        // head is still the earlier static entry that also answered.
+        assert_eq!(
+            observed_dial_head(
+                &ordered,
+                &punch_report(&["127.0.0.1:7000", "203.0.113.7:7000"], None)
+            ),
+            Some("203.0.113.7:7000".parse().unwrap())
+        );
+        // Reachable entries outside the static list (the peer's ephemeral
+        // probe socket) never become the head by rule (i).
+        assert_eq!(
+            observed_dial_head(&ordered, &punch_report(&["198.51.100.9:40123"], None)),
+            None
+        );
+    }
+
+    /// Rule (ii): with no reachable candidate, the raw first peer-probe
+    /// source leads — normalized from `::ffff:` mapped form (how a v4
+    /// peer appears on the dual-stack probe socket); an unspecified
+    /// observation is dropped (nothing observed).
+    #[test]
+    fn observed_head_falls_back_to_the_raw_peer_observation() {
+        let ordered = addrs(&["192.168.1.5:7000", "127.0.0.1:7000"]);
+        assert_eq!(
+            observed_dial_head(
+                &ordered,
+                &punch_report(&[], Some("[::ffff:203.0.113.7]:41000"))
+            ),
+            Some("203.0.113.7:41000".parse().unwrap())
+        );
+        assert_eq!(
+            observed_dial_head(&ordered, &punch_report(&[], Some("0.0.0.0:41000"))),
+            None
+        );
+        assert_eq!(observed_dial_head(&ordered, &punch_report(&[], None)), None);
+    }
+
+    /// The merge: the observation leads the order, every static entry
+    /// survives in its existing order, dedup keeps one occurrence, and
+    /// `None` changes nothing (the strictly-additive fallback shape).
+    #[test]
+    fn observed_first_order_prepends_dedupes_and_preserves_the_static_order() {
+        let ordered = addrs(&["192.168.1.5:7000", "127.0.0.1:7000", "[::1]:7000"]);
+        assert_eq!(
+            observed_first_order(ordered.clone(), Some("203.0.113.7:41000".parse().unwrap())),
+            addrs(&[
+                "203.0.113.7:41000",
+                "192.168.1.5:7000",
+                "127.0.0.1:7000",
+                "[::1]:7000",
+            ])
+        );
+        // An observation that IS a static entry moves to the front — one
+        // occurrence, the rest keep their order.
+        assert_eq!(
+            observed_first_order(ordered.clone(), Some("127.0.0.1:7000".parse().unwrap())),
+            addrs(&["127.0.0.1:7000", "192.168.1.5:7000", "[::1]:7000"])
+        );
+        // v4-mapped observation normalizes before the merge.
+        assert_eq!(
+            observed_first_order(
+                ordered.clone(),
+                Some("[::ffff:203.0.113.7]:41000".parse().unwrap())
+            ),
+            addrs(&[
+                "203.0.113.7:41000",
+                "192.168.1.5:7000",
+                "127.0.0.1:7000",
+                "[::1]:7000",
+            ])
+        );
+        assert_eq!(observed_first_order(ordered.clone(), None), ordered);
     }
 
     // -- CR-P1-02 改法第 2 条: the STUN reflexive leg, product path ---------

@@ -132,8 +132,9 @@ fn fast_orchestrator(
         key,
         dir,
         OrchestratorConfig {
-            redeem_window_ms: 1_500,
-            ready_wait_ms: 5_000,
+            // Same slow-runner headroom as task_pairing (was 1.5s/5s).
+            redeem_window_ms: 10_000,
+            ready_wait_ms: 30_000,
             claim_conflict_retries: 8,
         },
     )

@@ -85,8 +85,12 @@ async fn task_device(registry: &TestRegistry, name: &str) -> TaskDevice {
         key,
         dir.path(),
         OrchestratorConfig {
-            redeem_window_ms: 1_500,
-            ready_wait_ms: 5_000,
+            // Generous for slow/loaded CI runners (product default is
+            // 90s/60s; the old 1.5s/5s could not fit the pairing
+            // transcript when 11 TLS servers share 4 cores —
+            // windows-latest run 43057578762).
+            redeem_window_ms: 10_000,
+            ready_wait_ms: 30_000,
             claim_conflict_retries: 8,
         },
     )

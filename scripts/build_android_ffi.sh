@@ -30,7 +30,7 @@
 # Usage:
 #   bash scripts/build_android_ffi.sh [OPTIONS]
 # Options:
-#   --sdk <path>   Android SDK root (default: $USERPROFILE/android-toolchain/sdk
+#   --sdk <path>   Android SDK root (default: $ANDROID_SDK_ROOT / $ANDROID_HOME,
 #                  or $ANDROID_SDK_ROOT if set)
 #   --ndk <path>   NDK root, overriding the sdk/ndk/<ver> autodiscovery
 #                  ($ANDROID_NDK_HOME / $NDK_HOME also honored)
@@ -49,7 +49,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-SDK_DEFAULT="${ANDROID_SDK_ROOT:-$USERPROFILE/android-toolchain/sdk}"
+# Portable home: git-bash sets USERPROFILE, Linux CI does not.
+HOMEISH="${USERPROFILE:-$HOME}"
+SDK_DEFAULT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOMEISH/android-toolchain/sdk}}"
 SDK="$SDK_DEFAULT"
 NDK="${ANDROID_NDK_HOME:-${NDK_HOME:-}}"
 API=24
@@ -71,14 +73,14 @@ done
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # cargo/rustup live in ~/.cargo/bin; prepend it when present (idempotent).
-if [ -d "$USERPROFILE/.cargo/bin" ]; then
+if [ -d "$HOMEISH/.cargo/bin" ]; then
   case ":$PATH:" in
-    *":$USERPROFILE/.cargo/bin:"*) ;;
-    *) export PATH="$USERPROFILE/.cargo/bin:$PATH" ;;
+    *":$HOMEISH/.cargo/bin:"*) ;;
+    *) export PATH="$HOMEISH/.cargo/bin:$PATH" ;;
   esac
 fi
 command -v cargo >/dev/null 2>&1 \
-  || die "cargo not found on PATH — install Rust or run: export PATH=\"\$USERPROFILE/.cargo/bin:\$PATH\""
+  || die "cargo not found on PATH — install Rust or run: export PATH=\"\$HOME/.cargo/bin:\$PATH\""
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JNILIBS="$ROOT/flutter_app/android/app/src/main/jniLibs"

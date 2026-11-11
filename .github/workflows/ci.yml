@@ -162,6 +162,12 @@ jobs:
       - name: flutter pub get
         run: flutter pub get
         working-directory: flutter_app
+      # Nested pure-Dart package needs its own resolution, or the analyzer
+      # cannot see package:test from the app root's pub get alone (the
+      # first CI run failed on exactly that).
+      - name: dart pub get (nested ak_ffi_dart package)
+        run: dart pub get
+        working-directory: flutter_app/packages/ak_ffi_dart
       - name: flutter analyze
         run: flutter analyze
         working-directory: flutter_app

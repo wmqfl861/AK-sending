@@ -2116,7 +2116,12 @@ mod cancel_tests {
     use ak_session::runtime::{SnapshotQuery, TaskState};
     use std::time::{Duration as StdDuration, Instant};
 
-    const WAIT: StdDuration = StdDuration::from_secs(15);
+    // Patience ceiling for state probes, not assertion strength: the cancel
+    // itself must still happen (the probe would never see Cancelled
+    // otherwise). 15s was too tight on cold/loaded CI runners (observed on
+    // windows-latest, run 43046223828, after a fresh no-cache build); a
+    // healthy run still settles in ~1-2s.
+    const WAIT: StdDuration = StdDuration::from_secs(60);
     const POLL: StdDuration = StdDuration::from_millis(10);
 
     async fn wait_until<F, Fut>(what: &str, mut probe: F)

@@ -100,10 +100,17 @@
 //! appended last (a small responder that answers ak-net hole-punch probe
 //! packets from any advertised address; the data-plane dial candidates
 //! keep precedence, and the probe genuinely confirms bidirectional UDP
-//! reachability of the peer host). Explicit `candidates` in the spec
-//! replace the derived list verbatim (caller-knows-better), and then no
-//! echo port is appended — the probe reports exactly what the caller
-//! advertised.
+//! reachability of the peer host). Since CR-P1-02 改法第 1 条 the derived
+//! list carries BOTH families — every interface IPv4, then the
+//! globally-routable interface IPv6 (link-local excluded; see
+//! `filter_and_order_candidates` for the full selection rule) — and the
+//! resident receiver and echo responder bind DUAL-STACK ([::] with
+//! V6ONLY cleared), so a v6 candidate is genuinely served and two NAT'd
+//! IPv6-capable peers get a NAT-free path (a host without IPv6 falls
+//! back to the historical v4-only binds, logged via `receiver_bind`).
+//! Explicit `candidates` in the spec replace the derived list verbatim
+//! (caller-knows-better), and then no echo port is appended — the probe
+//! reports exactly what the caller advertised.
 //!
 //! The engine-shared code table stays as a CACHE ONLY: same-engine
 //! joins use it to mirror the code's declared role onto the joiner (the
@@ -273,8 +280,18 @@ const TASK_PROBE_RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// Upper bounds of the endpoint blob's candidate list (the wire bound is
 /// 16 candidates / 512 bytes; the plane stays well under both so the
 /// shrink loop below is a belt-and-braces guard, never the common path).
+/// The dial cap truncates from the tail: IPv4 candidates lead (the
+/// documented family order), so only a v4-heavy host (5+ interface
+/// addresses) can crowd IPv6 out — the common laptop set (v4 + loopback +
+/// ≤3 global v6 + ::1) fits whole.
 const MAX_DIAL_CANDIDATES: usize = 8;
 const MAX_ECHO_CANDIDATES: usize = 4;
+/// Cap of globally-routable IPv6 interface addresses in the derived
+/// candidate list (CR-P1-02 改法第 1 条): at most one address per distinct
+/// /64 prefix first (a NIC's stable + privacy-temporary GUAs collapse to
+/// one entry), at most this many overall, so a GUA-heavy host cannot
+/// crowd the v4 candidates or push the blob at the 512-byte wire bound.
+const MAX_V6_IFACE_CANDIDATES: usize = 3;
 
 /// Wire marker of the task-plane close notification (wave-29 P2-03): a
 /// disconnecting side that has no live transfer (whose QUIC drop the peer
@@ -1129,27 +1146,99 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
 // ---------------------------------------------------------------------------
 
 /// Dialable local candidates for a wildcard bind: every interface IPv4
-/// with the bound port, plus an explicit loopback entry (the CLI drops
+/// with the bound port, then the v4 loopback, then the globally-routable
+/// interface IPv6 addresses, then the v6 loopback (the CLI drops
 /// loopback because same-host sends pass an explicit `--to`; the
 /// zero-address task plane keeps it so a same-host join always has a
-/// working candidate — `is_ipv4_private` counts loopback as private, so
-/// it rides WITHIN the LAN group, insertion-ordered after the interface
-/// addresses).
+/// working candidate of each family — `is_ipv4_private` counts loopback
+/// as private and `Ipv6Addr::is_loopback` likewise, so both ride WITHIN
+/// the LAN group, insertion-ordered after the interface addresses).
+/// Selection and order are [`filter_and_order_candidates`]'s documented
+/// rule (CR-P1-02 改法第 1 条: with the receiver now dual-stack-bound,
+/// two NAT'd IPv6-capable peers get a NAT-free v6 path).
 fn local_candidates(bound: SocketAddr) -> Vec<SocketAddr> {
     let port = bound.port();
-    let mut out = Vec::new();
-    if let Ok(nets) = ak_net::classify::local_nets() {
-        for net in nets {
-            if let std::net::IpAddr::V4(v4) = net.addr {
-                out.push(SocketAddr::from((v4, port)));
-            }
+    let raw = match ak_net::classify::local_nets() {
+        Ok(nets) => nets.into_iter().map(|net| net.addr).collect(),
+        Err(_) => Vec::new(),
+    };
+    filter_and_order_candidates(raw)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+/// Candidate selection over raw interface addresses — pure on purpose (no
+/// NIC reads; tests pin the rule without host dependence). Rule:
+///
+/// * v4-mapped IPv6 input (`::ffff:a.b.c.d`) normalizes to plain IPv4
+///   (same normalization as [`order_candidates`]);
+/// * every plain IPv4 interface address is kept, deduped, input order
+///   preserved — byte-identical to the pre-IPv6 list;
+/// * IPv6 keeps ONLY globally-routable unicast addresses: link-local
+///   `fe80::/10` is excluded (it needs a scope index the `ip:port`
+///   candidate form cannot carry), and ULA `fc00::/7`, multicast,
+///   documentation and other non-global ranges drop out with it. Kept
+///   entries dedupe, collapse to at most one per distinct /64 prefix
+///   (one interface = one candidate), and cap at
+///   [`MAX_V6_IFACE_CANDIDATES`];
+/// * `127.0.0.1` and `::1` are appended when absent (same-host joins
+///   always keep a working candidate per family);
+/// * family order is v4 first, then v6 — the consumer
+///   ([`order_candidates`]) re-sorts LAN-first with this order stable
+///   within each group, so a v4-only peer's dial sequence is unchanged.
+fn filter_and_order_candidates(raw: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let mut v4: Vec<IpAddr> = Vec::with_capacity(raw.len());
+    let mut v6: Vec<IpAddr> = Vec::new();
+    let mut v6_prefixes: Vec<u64> = Vec::new();
+    for addr in raw {
+        let addr = match addr {
+            IpAddr::V6(v6_addr) => match v6_addr.to_ipv4_mapped() {
+                Some(v4_addr) => IpAddr::V4(v4_addr),
+                None => {
+                    let prefix = (u128::from(v6_addr) >> 64) as u64;
+                    if is_global_unicast_v6(v6_addr)
+                        && v6.len() < MAX_V6_IFACE_CANDIDATES
+                        && !v6_prefixes.contains(&prefix)
+                    {
+                        v6_prefixes.push(prefix);
+                        v6.push(IpAddr::V6(v6_addr));
+                    }
+                    continue;
+                }
+            },
+            v4_addr => v4_addr,
+        };
+        if !v4.contains(&addr) {
+            v4.push(addr);
         }
     }
-    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
-    if !out.contains(&loopback) {
-        out.push(loopback);
+    let v4_loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if !v4.contains(&v4_loopback) {
+        v4.push(v4_loopback);
     }
-    out
+    let v6_loopback = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    if !v6.contains(&v6_loopback) {
+        v6.push(v6_loopback);
+    }
+    v4.extend(v6);
+    v4
+}
+
+/// Globally-routable IPv6 unicast (the IANA 2000::/3 block, with the
+/// documentation `2001:db8::/32` and benchmarking `2001:2::/48` sub-ranges
+/// carved out) — the stable-toolchain equivalent of std's unstable
+/// `Ipv6Addr::is_unicast_global` for the ranges that can plausibly sit on
+/// an interface. Everything a NAT-free peer path needs (GUAs) passes;
+/// link-local `fe80::/10`, ULA `fc00::/7`, multicast and loopback sit
+/// outside 2000::/3 and fail.
+fn is_global_unicast_v6(addr: std::net::Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    let global_block = (segments[0] & 0xe000) == 0x2000;
+    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
+    global_block && !documentation && !benchmarking
 }
 
 /// LAN preference for one candidate (RFC1918 private IPv4 — loopback
@@ -1644,8 +1733,15 @@ fn task_error_message(error: TaskError) -> String {
 /// the source table is hard-capped, so even a spoofed flood cannot
 /// sustain unbounded reply traffic or memory growth.
 fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, String> {
-    let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")
-        .map_err(|error| format!("cannot bind the probe responder: {error}"))?;
+    // Dual-stack first (CR-P1-02 改法第 1 条): the responder must answer
+    // probes aimed at the ADVERTISED IPv6 candidates too, and
+    // `bind_dual_stack_udp` already arms non-blocking mode. Hosts without
+    // a clearable V6ONLY fall back to the historical v4 wildcard socket.
+    let std_socket = match ak_net::holepunch::bind_dual_stack_udp(0) {
+        Ok(socket) => socket,
+        Err(_) => std::net::UdpSocket::bind("0.0.0.0:0")
+            .map_err(|error| format!("cannot bind the probe responder: {error}"))?,
+    };
     std_socket
         .set_nonblocking(true)
         .map_err(|error| format!("cannot arm the probe responder: {error}"))?;
@@ -2752,16 +2848,37 @@ async fn run_resident_receiver(
             .unwrap_or_else(|poisoned| *poisoned.into_inner())
     };
     let identity = make_self_signed(&rt.key);
-    let endpoint =
-        match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await {
-            Ok(endpoint) => endpoint,
-            Err(_) => return, // the dropped oneshot fails the create/join op
-        };
+    // CR-P1-02 改法第 1 条: bind dual-stack FIRST — one [::] socket with
+    // V6ONLY cleared serves native IPv6 peers AND v4-mapped IPv4 peers, so
+    // the advertised IPv6 candidates are genuinely reachable. A host with
+    // no IPv6 stack (bind_dual_stack reports `Unsupported`) falls back to
+    // the historical IPv4-only wildcard bind; the fallback is logged as a
+    // bounded `receiver_bind` event so the capability is observable.
+    let mut fallback_reason: Option<String> = None;
+    let endpoint = match ak_net::DirectEndpoint::bind_dual_stack(0, &identity).await {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            fallback_reason = Some(reason.to_string());
+            match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await
+            {
+                Ok(endpoint) => endpoint,
+                Err(_) => return, // the dropped oneshot fails the create/join op
+            }
+        }
+    };
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
     };
     let _ = first_addr.send(bound);
+    rt.push_event(format!(
+        "{{\"event\":\"receiver_bind\",\"addr\":{},\"dual_stack\":{},\"fallback_reason\":{}}}",
+        quoted(&bound.to_string()),
+        endpoint.is_dual_stack(),
+        fallback_reason
+            .as_deref()
+            .map_or_else(|| "null".to_string(), quoted),
+    ));
     // Progress lines ride under the CONNECTION id (wave-31 R30-P2-02):
     // the pairing transaction's id is the ONE correlation key both sides
     // of a pairing hold — the sender's rows already use it, and a joiner
@@ -4550,6 +4667,100 @@ mod task_tests {
         // LAN group (stable within equals: registration order).
         let ordered = order_candidates(vec![public, loopback, lan, lan]);
         assert_eq!(ordered, vec![loopback, lan, public]);
+    }
+
+    // -- candidate enumeration (CR-P1-02 改法第 1 条) -------------------------
+
+    fn ips(texts: &[&str]) -> Vec<std::net::IpAddr> {
+        texts
+            .iter()
+            .map(|text| text.parse().expect("test address"))
+            .collect()
+    }
+
+    /// The documented selection order: v4 interface addresses first (input
+    /// order, deduped), then 127.0.0.1, then global-unicast v6 (input
+    /// order), then ::1. fe80::/10 drops out (undialable without a scope
+    /// index), v4-mapped input normalizes into the v4 group, and a raw ::1
+    /// never leaks into the middle of the v6 group.
+    #[test]
+    fn candidate_selection_keeps_both_families_in_documented_order() {
+        let raw = ips(&[
+            "2606:4700:4000::a",  // global v6, first interface
+            "fe80::1",            // link-local: excluded
+            "192.168.1.5",        // v4 interface
+            "2606:4700:4000::b",  // same /64: collapsed away
+            "::ffff:192.168.1.5", // v4-mapped: dedups with the v4
+            "10.0.0.7",           // second v4 interface
+            "2a00:1450:4001::81", // global v6, second prefix
+            "::1",                // raw loopback: appended at tail
+            "2001:db8::1",        // documentation range: excluded
+            "fd00::42",           // ULA: excluded (not global)
+            "ff02::1",            // multicast: excluded
+        ]);
+        assert_eq!(
+            filter_and_order_candidates(raw),
+            ips(&[
+                "192.168.1.5",
+                "10.0.0.7",
+                "127.0.0.1",
+                "2606:4700:4000::a",
+                "2a00:1450:4001::81",
+                "::1",
+            ])
+        );
+    }
+
+    /// One v6 candidate per /64 prefix (a NIC's stable + temporary GUAs
+    /// collapse) and at most [`MAX_V6_IFACE_CANDIDATES`] overall — the
+    /// blob stays comfortably under the wire bound on GUA-heavy hosts.
+    #[test]
+    fn candidate_selection_collapses_per_prefix_and_caps_global_v6() {
+        let raw = ips(&[
+            "2606:4700:4000::a",
+            "2606:4700:4000::dead:beef", // same /64 as above
+            "2a00:1450:4001::81",
+            "2408:847a:11:2200::1",
+            "2600:1f16:1a1:100::2",
+            "2a01:4f8:1c17:77::3",
+        ]);
+        assert_eq!(
+            filter_and_order_candidates(raw),
+            ips(&[
+                "127.0.0.1",
+                "2606:4700:4000::a",
+                "2a00:1450:4001::81",
+                "2408:847a:11:2200::1",
+                "::1",
+            ])
+        );
+    }
+
+    /// No interfaces at all: both loopbacks still give a same-host join a
+    /// working candidate of each family (parity with the v4-only era,
+    /// which always appended 127.0.0.1).
+    #[test]
+    fn candidate_selection_with_no_interfaces_keeps_both_loopbacks() {
+        assert_eq!(
+            filter_and_order_candidates(Vec::new()),
+            ips(&["127.0.0.1", "::1"])
+        );
+    }
+
+    /// The port mapping of the derived list: every candidate carries the
+    /// bound port and both loopback families are present regardless of
+    /// the host's interface set (v6 loopback is data, not a bind).
+    #[test]
+    fn local_candidates_map_ports_and_keep_both_loopbacks() {
+        let locals = local_candidates(SocketAddr::from(([0, 0, 0, 0], 7100)));
+        assert!(locals.contains(&"127.0.0.1:7100".parse::<SocketAddr>().unwrap()));
+        assert!(locals.contains(&"[::1]:7100".parse::<SocketAddr>().unwrap()));
+        assert!(locals.iter().all(|addr| addr.port() == 7100));
+        assert!(
+            locals.iter().all(|addr| addr.ip()
+                != std::net::IpAddr::V6("fe80::1".parse::<std::net::Ipv6Addr>().unwrap())),
+            "link-local never rides the candidate list"
+        );
     }
 
     // -- the registry relay (the three formerly-#[ignore] contracts) ---------

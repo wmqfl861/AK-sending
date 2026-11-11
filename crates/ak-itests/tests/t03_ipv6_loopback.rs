@@ -167,3 +167,440 @@ async fn ipv6_loopback_engine_transfer_is_byte_identical() {
     assert_trees_identical(&src, dst.path());
     assert_no_part_files(dst.path());
 }
+
+// ---------------------------------------------------------------------------
+// CR-P1-02 改法第 1 条 (REVIEW §4.1): the v1 TASK-CODE path over a
+// dual-stack receiver with IPv6 candidates. Everything above drives the
+// engine layer directly; the addition below drives the real product path
+// — `ak-cli registry-server` + `ak-cli task code-recv` + `ak-cli task
+// join-send` subprocesses — and proves (1) the receiver binds dual-stack
+// and its DERIVED advertisement carries the IPv6 loopback (fe80 never
+// rides), (2) a full task transfer completes through that path, and
+// (3) with [::1] leading the candidate list (`--advertise ::1`, the
+// unchanged manual-advertise escape hatch) the QUIC transfer genuinely
+// rides the IPv6 leg ("connected via [::1]"). Same-host IPv6 loopback is
+// still ::1, not a cross-network IPv6 claim — that boundary is the file
+// header's.
+// ---------------------------------------------------------------------------
+
+use std::io::{BufRead, BufReader, Read, Write as IoWrite};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/ak-itests has a workspace root two levels up")
+        .to_path_buf()
+}
+
+fn cargo_bin() -> PathBuf {
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        return PathBuf::from(cargo);
+    }
+    std::env::var_os("USERPROFILE")
+        .map(|home| {
+            PathBuf::from(home).join(".cargo").join(if cfg!(windows) {
+                "bin\\cargo.exe"
+            } else {
+                "bin/cargo"
+            })
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("cargo"))
+}
+
+/// Path of the `ak-cli` executable (which also provides the
+/// `registry-server` subcommand), building it once if needed.
+fn cli_exe() -> PathBuf {
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    EXE.get_or_init(|| {
+        let root = workspace_root();
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
+        let exe = target_dir.join("debug").join(if cfg!(windows) {
+            "ak-cli.exe"
+        } else {
+            "ak-cli"
+        });
+        let output = Command::new(cargo_bin())
+            .args(["build", "-p", "ak-cli"])
+            .current_dir(&root)
+            .output()
+            .unwrap_or_else(|err| panic!("cannot run cargo build -p ak-cli: {err}"));
+        assert!(
+            output.status.success(),
+            "cargo build -p ak-cli failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(exe.exists(), "cargo build produced no {}", exe.display());
+        exe
+    })
+    .clone()
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind to pick a free port")
+        .local_addr()
+        .expect("free port")
+        .port()
+}
+
+/// Lines a piped stream produced so far (fed by a reader thread so a full
+/// pipe can never block the child).
+#[derive(Clone, Default)]
+struct LineLog(Arc<Mutex<Vec<String>>>);
+
+impl LineLog {
+    fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
+        let log = LineLog::default();
+        let sink = Arc::clone(&log.0);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines() {
+                match line {
+                    Ok(text) => {
+                        let mut lines = sink.lock().unwrap_or_else(|p| p.into_inner());
+                        lines.push(text);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        log
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// First line containing `needle`, polling until it appears.
+    fn wait_for(&self, needle: &str, timeout: std::time::Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for line in self.snapshot() {
+                if line.contains(needle) {
+                    return line;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
+                self.snapshot().join("\n")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// A resident CLI child with captured stdout/stderr and a WRITABLE stdin
+/// (the receive consent prompt reads real terminal input).
+struct Proc {
+    child: Child,
+    stdout: LineLog,
+    stderr: LineLog,
+    stdin: Option<ChildStdin>,
+}
+
+impl Proc {
+    fn spawn(tag: &str, args: &[String]) -> Proc {
+        let cli = cli_exe();
+        let mut child = Command::new(&cli)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {tag} ({:?} {:?}): {err}", cli, args));
+        let stdout = LineLog::spawn_reader(child.stdout.take().expect("stdout piped"));
+        let stderr = LineLog::spawn_reader(child.stderr.take().expect("stderr piped"));
+        let stdin = child.stdin.take();
+        Proc {
+            child,
+            stdout,
+            stderr,
+            stdin,
+        }
+    }
+
+    fn report(&self) -> String {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            self.stdout.snapshot().join("\n"),
+            self.stderr.snapshot().join("\n")
+        )
+    }
+
+    /// Answer the consent prompt. The prompt itself is a `print!` without
+    /// a newline (so it never forms a readable line) and the CLI DISCARDS
+    /// input older than the question — so feed a fresh `y` every 100 ms
+    /// from the moment the (newline-terminated) offer line appeared until
+    /// the receiver moves on; a `y` that lands after the question started
+    /// is genuinely fresh and accepts.
+    fn consent_yes(&mut self, done_needles: &[&str], budget: std::time::Duration) {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if let Some(stdin) = self.stdin.as_mut() {
+                if writeln!(stdin, "y").and_then(|_| stdin.flush()).is_err() {
+                    break; // the child is gone
+                }
+            }
+            let log = self.stdout.snapshot().join("\n");
+            if done_needles.iter().any(|needle| log.contains(needle)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn wait_exit_ok(&mut self, timeout: std::time::Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait().expect("try wait on cli child") {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "cli child exited with {status}; {}",
+                        self.report()
+                    );
+                    return;
+                }
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "cli child did not exit within {timeout:?}; {}",
+                        self.report()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The real v2 registry as a subprocess (`ak-cli registry-server`), same
+/// shape as the invite-pairing itests.
+struct RegistryProc {
+    /// Owning the process keeps the registry alive (killed on drop).
+    #[allow(dead_code)]
+    proc: Proc,
+    addr: SocketAddr,
+    fp_hex: String,
+}
+
+impl RegistryProc {
+    fn spawn(tag: &str, server_dir: &std::path::Path, db: &std::path::Path) -> RegistryProc {
+        let port = free_port().to_string();
+        let args: Vec<String> = [
+            "registry-server",
+            "--port",
+            &port,
+            "--db-path",
+            &db.to_string_lossy(),
+            "--id-dir",
+            &server_dir.to_string_lossy(),
+        ]
+        .iter()
+        .map(|text| text.to_string())
+        .collect();
+        let proc = Proc::spawn(tag, &args);
+        let line = proc.stdout.wait_for(
+            "registry id (pin with --registry-fp): ",
+            std::time::Duration::from_secs(60),
+        );
+        let fp_hex = line
+            .rsplit(' ')
+            .next()
+            .expect("hex id is the last token")
+            .to_ascii_lowercase();
+        assert_eq!(fp_hex.len(), 64, "registry id line: {line}");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("registry addr");
+        RegistryProc { proc, addr, fp_hex }
+    }
+}
+
+/// One end-to-end task-code chain: a `task code-recv` process (optionally
+/// with extra `--advertise` IPs) plus a `task join-send` run, through one
+/// shared registry. Returns the receiver's `receiver bound` and
+/// `advertising` lines, both sides' captured stdout, for the caller's
+/// assertions.
+fn run_task_code_chain(
+    tag: &str,
+    registry: &RegistryProc,
+    root: &std::path::Path,
+    advertise: &[&str],
+) -> (String, String, String, String) {
+    let id_recv = root.join(format!("{tag}-id-recv"));
+    let id_send = root.join(format!("{tag}-id-send"));
+    let out = root.join(format!("{tag}-out"));
+    let src = root.join(format!("{tag}-src"));
+    for dir in [&id_recv, &id_send, &out, &src] {
+        std::fs::create_dir_all(dir).expect("create chain dir");
+    }
+    common::write_file(
+        &src.join("payload.bin"),
+        &common::Lcg::new(0xC0DE_0000_0000_0001).bytes(256 * 1024),
+    );
+
+    let mut recv_args: Vec<String> = vec![
+        "--id-dir".into(),
+        id_recv.to_string_lossy().into_owned(),
+        "task".into(),
+        "code-recv".into(),
+        "--out".into(),
+        out.to_string_lossy().into_owned(),
+        "--server".into(),
+        registry.addr.to_string(),
+        "--registry-fp".into(),
+        registry.fp_hex.clone(),
+    ];
+    for ip in advertise {
+        recv_args.push("--advertise".into());
+        recv_args.push((*ip).into());
+    }
+    let mut recv = Proc::spawn(&format!("{tag}-recv"), &recv_args);
+    let advertised = recv
+        .stdout
+        .wait_for("advertising", std::time::Duration::from_secs(60));
+    let bound = recv
+        .stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+
+    let code_line = recv
+        .stdout
+        .wait_for("AKI1-", std::time::Duration::from_secs(60));
+    let code = code_line
+        .trim()
+        .strip_prefix("AKI1-")
+        .map(|rest| format!("AKI1-{rest}"))
+        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+
+    let send_args: Vec<String> = [
+        "--id-dir".to_string(),
+        id_send.to_string_lossy().into_owned(),
+        "task".to_string(),
+        "join-send".to_string(),
+        code,
+        src.to_string_lossy().into_owned(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .iter()
+    .map(|text| text.to_string())
+    .collect();
+    let mut sender = Proc::spawn(&format!("{tag}-send"), &send_args);
+
+    // The receiver announces the offer (a newline-terminated line), THEN
+    // asks the consent question; keep feeding a fresh `y` until the
+    // transfer visibly moves on.
+    recv.stdout.wait_for(
+        "the peer wants to send",
+        std::time::Duration::from_secs(120),
+    );
+    recv.consent_yes(
+        &["[recv]", "task complete", "declined"],
+        std::time::Duration::from_secs(40),
+    );
+
+    sender.wait_exit_ok(std::time::Duration::from_secs(180));
+    recv.wait_exit_ok(std::time::Duration::from_secs(60));
+    let sender_lines = sender.stdout.snapshot().join("\n");
+    let recv_lines = recv.stdout.snapshot().join("\n");
+
+    // The payload landed byte-identical through the task-code path.
+    let landed = std::fs::read(out.join("payload.bin")).expect("received payload");
+    let expected = std::fs::read(src.join("payload.bin")).expect("source payload");
+    assert_eq!(landed, expected, "payload bytes differ ({tag})");
+    (bound, advertised, recv_lines, sender_lines)
+}
+
+/// The v1 task-code path over the dual-stack receiver (CR-P1-02 改法第 1
+/// 条): derived candidates carry [::1] (never fe80::/10), the receiver
+/// binds [::] dual-stack, a full registry-paired transfer completes — and
+/// with [::1] leading the list the transfer names the IPv6 leg as the
+/// path that carried it. Skips with a printed reason where IPv6 (or a
+/// clearable V6ONLY) is unavailable.
+#[test]
+fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
+    if !ipv6_loopback_or_skip() {
+        return;
+    }
+    // The receiver must be ABLE to bind dual-stack ([::] with V6ONLY
+    // cleared); [::1] alone is not proof of that (some stacks accept the
+    // loopback bind but refuse the flag).
+    let probe = match ak_net::holepunch::bind_dual_stack_udp(0) {
+        Ok(socket) => socket,
+        Err(reason) => {
+            eprintln!("skipping: dual-stack UDP bind unavailable ({reason})");
+            return;
+        }
+    };
+    drop(probe);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-task",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+
+    // Chain 1 — derived advertisement: both loopback families present,
+    // no link-local, dual-stack bind reported, full transfer completes.
+    let (bound, advertised, _recv_log, sender_log) =
+        run_task_code_chain("t03-derived", &registry, tmp.path(), &[]);
+    assert!(
+        bound.contains("[::]"),
+        "the receiver must report the dual-stack wildcard bind: {bound}"
+    );
+    assert!(
+        bound.contains("dual-stack"),
+        "the receiver must name the bind dual-stack: {bound}"
+    );
+    assert!(
+        advertised.contains("[::1]") && advertised.contains("127.0.0.1"),
+        "the derived candidates must carry both loopback families: {advertised}"
+    );
+    assert!(
+        !advertised.contains("fe80"),
+        "link-local IPv6 must never ride the candidate list: {advertised}"
+    );
+    assert!(
+        sender_log.contains("[task] done:"),
+        "the task-code transfer must complete: {sender_log}"
+    );
+
+    // Chain 2 — the IPv6 leg carries the payload: `--advertise ::1`
+    // (the unchanged manual escape hatch) leads the list, so the winning
+    // candidate is named and it is the v6 loopback.
+    let (_bound2, _advertised2, _recv_log2, sender_log2) =
+        run_task_code_chain("t03-v6lead", &registry, tmp.path(), &["::1"]);
+    assert!(
+        sender_log2.contains("[task] connected via [::1]:"),
+        "the transfer must name the IPv6 loopback as the carrying path: {sender_log2}"
+    );
+    assert!(
+        sender_log2.contains("[task] done:"),
+        "the v6-led task-code transfer must complete: {sender_log2}"
+    );
+}

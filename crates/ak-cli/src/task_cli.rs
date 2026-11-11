@@ -103,8 +103,16 @@ const ATTEMPT_PAUSE: Duration = Duration::from_millis(150);
 
 /// Upper bounds of the endpoint blob's candidate list (the wire bound is
 /// 16 candidates / 512 bytes; the caps keep the blob well under both).
+/// The dial cap truncates from the tail and IPv4 leads the documented
+/// family order, so only a v4-heavy host (5+ interface addresses) can
+/// crowd IPv6 out — the common laptop set fits whole.
 const MAX_DIAL_CANDIDATES: usize = 8;
 const MAX_ECHO_CANDIDATES: usize = 4;
+/// Cap of globally-routable IPv6 interface addresses in the derived
+/// candidate list (CR-P1-02 改法第 1 条): at most one address per distinct
+/// /64 prefix (a NIC's stable + privacy-temporary GUAs collapse to one),
+/// at most this many overall.
+const MAX_V6_IFACE_CANDIDATES: usize = 3;
 
 /// Wire marker of the idle close notification: a disconnecting side with no
 /// live transfer dials the peer's data endpoint and hands it exactly one
@@ -670,10 +678,17 @@ impl Session {
 
 impl Session {
     /// Bind the probe echo responder (derived candidates append its port
-    /// last; see `blob_candidates`).
+    /// last; see `blob_candidates`). Dual-stack first (CR-P1-02 改法第 1
+    /// 条): the responder must answer probes aimed at the advertised IPv6
+    /// candidates too; hosts without a clearable V6ONLY fall back to the
+    /// historical v4 wildcard socket.
     fn bind_echo_responder(&mut self) -> Result<SocketAddr> {
-        let std_socket =
-            std::net::UdpSocket::bind("0.0.0.0:0").context("cannot bind the probe responder")?;
+        let std_socket = match ak_net::holepunch::bind_dual_stack_udp(0) {
+            Ok(socket) => socket,
+            Err(_) => {
+                std::net::UdpSocket::bind("0.0.0.0:0").context("cannot bind the probe responder")?
+            }
+        };
         std_socket
             .set_nonblocking(true)
             .context("cannot arm the probe responder")?;
@@ -895,16 +910,39 @@ async fn run_task_receiver(
     events: tokio::sync::mpsc::Sender<ReceiverEvent>,
 ) {
     let identity = make_self_signed(&ctx.key);
-    let endpoint =
-        match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await {
-            Ok(endpoint) => endpoint,
-            Err(_) => return, // the dropped oneshot fails the bind wait
-        };
+    // CR-P1-02 改法第 1 条: dual-stack bind first — one [::] socket with
+    // V6ONLY cleared serves native IPv6 AND v4-mapped peers, so the
+    // advertised IPv6 candidates are genuinely reachable. A host without
+    // an IPv6 stack falls back to the historical IPv4-only wildcard bind
+    // and says so on stdout.
+    let endpoint = match ak_net::DirectEndpoint::bind_dual_stack(0, &identity).await {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            println!(
+                "[task] dual-stack bind unavailable ({reason}); \
+                 falling back to the IPv4-only bind"
+            );
+            match ak_net::DirectEndpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)), &identity).await
+            {
+                Ok(endpoint) => endpoint,
+                Err(_) => return, // the dropped oneshot fails the bind wait
+            }
+        }
+    };
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
     };
     let _ = first_addr.send(bound);
+    println!(
+        "[task] receiver bound {} ({})",
+        bound,
+        if endpoint.is_dual_stack() {
+            "dual-stack: IPv6 and IPv4 peers"
+        } else {
+            "IPv4-only"
+        }
+    );
     let printer = crate::progress_printer("recv");
     // The session's ONE managed terminal input source (R36-P2-01): a
     // single detached reader thread serves every consent prompt of this
@@ -1316,22 +1354,89 @@ async fn echo_responder_loop(socket: tokio::net::UdpSocket) {
 // Candidates (the ak-ffi shapes, verbatim semantics)
 // ---------------------------------------------------------------------------
 
-/// Every local interface address (v4) with `bound`'s port, loopback last.
+/// Every local interface address (v4, then globally-routable v6) with
+/// `bound`'s port, loopbacks last in each family — the ak-ffi shape,
+/// verbatim semantics (selection rule: `filter_and_order_candidates`).
 fn local_candidates(bound: SocketAddr) -> Vec<SocketAddr> {
     let port = bound.port();
-    let mut out = Vec::new();
-    if let Ok(nets) = ak_net::classify::local_nets() {
-        for net in nets {
-            if let std::net::IpAddr::V4(v4) = net.addr {
-                out.push(SocketAddr::from((v4, port)));
-            }
+    let raw = match ak_net::classify::local_nets() {
+        Ok(nets) => nets.into_iter().map(|net| net.addr).collect(),
+        Err(_) => Vec::new(),
+    };
+    filter_and_order_candidates(raw)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+/// Candidate selection over raw interface addresses — pure on purpose (no
+/// NIC reads; tests pin the rule without host dependence). Mirrors
+/// ak-ffi's `filter_and_order_candidates` verbatim (kept as a second copy
+/// because the CLI duplicates the task plane's helpers by design; the
+/// `candidate_helpers_match_the_ffi_shape` test pins the shared shape).
+/// Rule (CR-P1-02 改法第 1 条):
+///
+/// * v4-mapped IPv6 input (`::ffff:a.b.c.d`) normalizes to plain IPv4;
+/// * every plain IPv4 interface address is kept, deduped, input order
+///   preserved — byte-identical to the pre-IPv6 list;
+/// * IPv6 keeps ONLY globally-routable unicast addresses — link-local
+///   `fe80::/10` (needs a scope index the `ip:port` candidate form
+///   cannot carry), ULA `fc00::/7`, multicast and other non-global
+///   ranges are excluded — deduped, at most one per distinct /64 prefix,
+///   capped at [`MAX_V6_IFACE_CANDIDATES`];
+/// * `127.0.0.1` and `::1` are appended when absent;
+/// * family order is v4 first, then v6; the consumer
+///   ([`order_candidates`]) re-sorts LAN-first with this order stable
+///   within each group, so a v4-only peer's dial sequence is unchanged.
+fn filter_and_order_candidates(raw: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let mut v4: Vec<IpAddr> = Vec::with_capacity(raw.len());
+    let mut v6: Vec<IpAddr> = Vec::new();
+    let mut v6_prefixes: Vec<u64> = Vec::new();
+    for addr in raw {
+        let addr = match addr {
+            IpAddr::V6(v6_addr) => match v6_addr.to_ipv4_mapped() {
+                Some(v4_addr) => IpAddr::V4(v4_addr),
+                None => {
+                    let prefix = (u128::from(v6_addr) >> 64) as u64;
+                    if is_global_unicast_v6(v6_addr)
+                        && v6.len() < MAX_V6_IFACE_CANDIDATES
+                        && !v6_prefixes.contains(&prefix)
+                    {
+                        v6_prefixes.push(prefix);
+                        v6.push(IpAddr::V6(v6_addr));
+                    }
+                    continue;
+                }
+            },
+            v4_addr => v4_addr,
+        };
+        if !v4.contains(&addr) {
+            v4.push(addr);
         }
     }
-    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
-    if !out.contains(&loopback) {
-        out.push(loopback);
+    let v4_loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if !v4.contains(&v4_loopback) {
+        v4.push(v4_loopback);
     }
-    out
+    let v6_loopback = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    if !v6.contains(&v6_loopback) {
+        v6.push(v6_loopback);
+    }
+    v4.extend(v6);
+    v4
+}
+
+/// Globally-routable IPv6 unicast (IANA 2000::/3 minus the documentation
+/// `2001:db8::/32` and benchmarking `2001:2::/48` sub-ranges) — the
+/// stable-toolchain equivalent of std's unstable `Ipv6Addr::
+/// is_unicast_global`, mirroring ak-ffi's copy verbatim.
+fn is_global_unicast_v6(addr: std::net::Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    let global_block = (segments[0] & 0xe000) == 0x2000;
+    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
+    global_block && !documentation && !benchmarking
 }
 
 /// LAN preference (RFC1918 private IPv4, loopback v6): a routing hint,
@@ -1379,6 +1484,21 @@ fn with_advertised(
         }
     }
     out.truncate(ak_session::pairing::ENDPOINT_BLOB_MAX_CANDIDATES);
+    // The prepended entries can push a v6-heavy list over the 512-byte
+    // wire bound (CR-P1-02 leg 1 grew realistic blob sizes): shrink until
+    // it fits — the same belt-and-braces loop as `blob_candidates`, and
+    // the caps keep it off the common path.
+    while out.len() > 1 {
+        let endpoint = PeerEndpoint {
+            candidates: out.clone(),
+            name: String::new(),
+            direction: TaskDirection::Send,
+        };
+        if ak_session::pairing::encode_endpoint_blob(&endpoint).is_ok() {
+            break;
+        }
+        out.pop();
+    }
     out
 }
 
@@ -1530,7 +1650,15 @@ async fn drive_task_send(
                 tokio::time::sleep(ATTEMPT_PAUSE).await;
             }
             match attempt_send(key, id_dir, *addr, link.peer_fp, paths, &printer).await {
-                Attempt::Done(report) => return Ok(report),
+                Attempt::Done(report) => {
+                    // Which candidate actually carried the task (the FFI
+                    // result carries the same fact as its `peer` field) —
+                    // with IPv6 in the mix (CR-P1-02 leg 1) the family of
+                    // the winning path is exactly what an operator needs
+                    // to see.
+                    println!("[task] connected via {addr}");
+                    return Ok(report);
+                }
                 Attempt::Declined => {
                     bail!("the receiving side declined the transfer")
                 }
@@ -1903,6 +2031,18 @@ fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Name what this RECEIVER-side run advertises (CR-P1-02 改法第 1 条: with
+/// IPv6 in the candidate list the family mix must be visible when
+/// diagnosing cross-NAT reachability — one bounded line, nothing hidden).
+fn print_advertised(blob: &[SocketAddr]) {
+    let list = blob
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("[task] advertising {} candidate(s): {list}", blob.len());
+}
+
 /// `task code-send`: claim a sender-side code, print it, wait for the
 /// joiner, probe, send the paths, report, disconnect.
 pub(crate) async fn run_code_send(
@@ -1998,6 +2138,7 @@ pub(crate) async fn run_code_recv(cfg: TaskRunConfig, mut hooks: TaskHooks) -> R
         if blob.is_empty() {
             bail!("no dialable candidate to advertise");
         }
+        print_advertised(&blob);
         let code = session
             .stack
             .pairing
@@ -2103,6 +2244,7 @@ pub(crate) async fn run_join_recv(
         if blob.is_empty() {
             bail!("no dialable candidate to advertise");
         }
+        print_advertised(&blob);
         println!("[task] joining the task code at the registry...");
         let paired = session
             .stack
@@ -2602,6 +2744,133 @@ mod tests {
         assert_eq!(resolve_ttl(Some(600)).unwrap(), 600);
         assert!(resolve_ttl(Some(59)).is_err());
         assert!(resolve_ttl(Some(2_592_001)).is_err());
+    }
+
+    // ---- candidate enumeration (CR-P1-02 改法第 1 条, ak-ffi shape) -----
+
+    fn ips(texts: &[&str]) -> Vec<std::net::IpAddr> {
+        texts
+            .iter()
+            .map(|text| text.parse().expect("test address"))
+            .collect()
+    }
+
+    /// Same rule as ak-ffi's `filter_and_order_candidates`: v4 interface
+    /// addresses first (input order, deduped), 127.0.0.1, then global-
+    /// unicast v6, then ::1; fe80::/10, ULA, documentation and multicast
+    /// ranges drop out; v4-mapped input normalizes into the v4 group.
+    #[test]
+    fn candidate_selection_keeps_both_families_in_documented_order() {
+        let raw = ips(&[
+            "2606:4700:4000::a",  // global v6, first interface
+            "fe80::1",            // link-local: excluded
+            "192.168.1.5",        // v4 interface
+            "2606:4700:4000::b",  // same /64: collapsed away
+            "::ffff:192.168.1.5", // v4-mapped: dedups with the v4
+            "10.0.0.7",           // second v4 interface
+            "2a00:1450:4001::81", // global v6, second prefix
+            "::1",                // raw loopback: appended at tail
+            "2001:db8::1",        // documentation range: excluded
+            "fd00::42",           // ULA: excluded (not global)
+            "ff02::1",            // multicast: excluded
+        ]);
+        assert_eq!(
+            filter_and_order_candidates(raw),
+            ips(&[
+                "192.168.1.5",
+                "10.0.0.7",
+                "127.0.0.1",
+                "2606:4700:4000::a",
+                "2a00:1450:4001::81",
+                "::1",
+            ])
+        );
+    }
+
+    /// One v6 candidate per /64 prefix and at most
+    /// [`MAX_V6_IFACE_CANDIDATES`] overall (GUA-heavy hosts cannot crowd
+    /// the v4 candidates or the 512-byte wire bound).
+    #[test]
+    fn candidate_selection_collapses_per_prefix_and_caps_global_v6() {
+        let raw = ips(&[
+            "2606:4700:4000::a",
+            "2606:4700:4000::dead:beef", // same /64 as above
+            "2a00:1450:4001::81",
+            "2408:847a:11:2200::1",
+            "2600:1f16:1a1:100::2",
+            "2a01:4f8:1c17:77::3",
+        ]);
+        assert_eq!(
+            filter_and_order_candidates(raw),
+            ips(&[
+                "127.0.0.1",
+                "2606:4700:4000::a",
+                "2a00:1450:4001::81",
+                "2408:847a:11:2200::1",
+                "::1",
+            ])
+        );
+    }
+
+    /// No interfaces at all: both loopbacks survive (a same-host join
+    /// keeps a working candidate of each family).
+    #[test]
+    fn candidate_selection_with_no_interfaces_keeps_both_loopbacks() {
+        assert_eq!(
+            filter_and_order_candidates(Vec::new()),
+            ips(&["127.0.0.1", "::1"])
+        );
+    }
+
+    /// `--advertise` entries lead the blob, and a v6-heavy mix still fits
+    /// the 512-byte wire bound after the shrink loop (the loop pops the
+    /// tail: the advertised head survives, the least-significant derived
+    /// entry gives way).
+    #[test]
+    fn advertised_blobs_shrink_to_the_wire_bound() {
+        // A dial list that alone fits the bound: eight full-length global
+        // v6 candidates (~49 bytes each encoded).
+        let dial: Vec<SocketAddr> = (1..=8u16)
+            .map(|i| {
+                let v6 = std::net::Ipv6Addr::from([0x2606, 0x4700 + i, i, i, i, i, i, i]);
+                SocketAddr::new(std::net::IpAddr::V6(v6), 40_000 + i)
+            })
+            .collect();
+        assert_eq!(dial.len(), MAX_DIAL_CANDIDATES);
+        // Nine more advertised full-length v6 entries push the combined
+        // list past 16 candidates AND past 512 bytes — the shrink must
+        // keep the head (the operator's explicit addresses lead) and pop
+        // the tail until the blob encodes.
+        let advertise: Vec<std::net::IpAddr> = (1..=9u16)
+            .map(|i| {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from([
+                    0x2a00,
+                    0x1450 + i,
+                    i,
+                    i,
+                    i,
+                    i,
+                    i,
+                    i,
+                ]))
+            })
+            .collect();
+        let out = with_advertised(blob_candidates(dial, Vec::new()), &advertise, 41_000);
+        assert!(
+            out.len() > 1 && out.len() < 16,
+            "the shrink kept a bounded tail: {out:?}"
+        );
+        assert_eq!(
+            out[0],
+            SocketAddr::new(advertise[0], 41_000),
+            "the operator's advertised head survives the shrink"
+        );
+        let endpoint = PeerEndpoint {
+            candidates: out,
+            name: String::new(),
+            direction: TaskDirection::Send,
+        };
+        assert!(ak_session::pairing::encode_endpoint_blob(&endpoint).is_ok());
     }
 
     #[test]

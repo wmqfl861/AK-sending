@@ -27,11 +27,26 @@
 //!   SAME SOCKET (bounded by [`task_net::STUN_QUERY_BUDGET`], fail-open), and the
 //!   socket handed back for `DirectEndpoint::bind_with_socket` so the
 //!   query's NAT mapping survives into the QUIC listener;
+//! * the sender socket lifecycle (CR-P1-05, review 2026-11-11 §4.5) —
+//!   [`task_net::SenderSocket`] / [`task_net::bind_sender_socket`], the exact
+//!   mirror of the receiver bind for the DIAL side: the reflexive address
+//!   rides the sender's OWN endpoint blob and the socket is adopted by
+//!   the engine (`ak_engine::SendSpec::adopt_socket` +
+//!   `DirectEndpoint::dial_with_socket`) so the QUIC Initial leaves from
+//!   the very port the STUN query mapped;
+//! * the receiver-side hole punch (CR-P1-05) — [`task_net::punch_candidates`]
+//!   with the [`task_net::PUNCH_INTERVAL`] / [`task_net::PUNCH_WINDOW`] /
+//!   [`task_net::PUNCH_MAX_TARGETS`] tunables: send-only probe-shaped packets
+//!   from a `try_clone` of the QUIC listener socket to every advertised
+//!   sender candidate, concurrently with the sender's dial, stopped
+//!   early by the first successful data-plane connection;
 //! * the probe echo responder — [`task_net::bind_echo_responder_socket`] +
 //!   [`task_net::echo_responder_loop`] (anti-reflection, per-source reply budgets,
 //!   the CR-P1-02 leg-3 observation slot) and the transient-error
 //!   tolerance helper [`task_net::responder_error_is_transient`];
-//! * the send-time simultaneous-probe round — [`task_net::probe_dial_round`] with
+//! * the send-time simultaneous-probe round — [`task_net::probe_dial_round`]
+//!   (throwaway socket, the C3 shape) and [`task_net::probe_dial_round_on`]
+//!   (CR-P1-05: the round ON the adopted sender socket's clone) with
 //!   [`task_net::observed_dial_head`] / [`task_net::observed_first_order`] and the
 //!   [`task_net::PROBE_DIAL_INTERVAL`] / [`task_net::PROBE_DIAL_WINDOW`] /
 //!   [`task_net::OBSERVED_DIAL_BUDGET`] tunables;
@@ -49,7 +64,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -128,6 +143,31 @@ pub const PROBE_DIAL_WINDOW: Duration = Duration::from_secs(1);
 /// hot mappings); an observed address that is also a real candidate
 /// keeps its static slot and the full budget there.
 pub const OBSERVED_DIAL_BUDGET: Duration = Duration::from_secs(2);
+
+/// Cadence of the RECEIVER-side hole punch (CR-P1-05, 改法第 3 条's
+/// receiver mirror: the receiver's QUIC socket must SEND to the paired
+/// sender, so a port-restricted-cone NAT on the receiver side admits the
+/// sender's QUIC Initial). The review's suggested 100–200 ms band; 150 ms
+/// matches [`PROBE_DIAL_INTERVAL`] so the punch reads as a probe round
+/// in packet captures. The punch packet IS an `holepunch::probe` packet
+/// (time-derived nonce): the sender's echo responder answers it — the
+/// reply opens the SENDER's inbound filter toward the receiver's QUIC
+/// mapping, the mirror direction for free — and the sender's QUIC stack
+/// (once the socket is adopted) silently discards what it cannot parse.
+pub const PUNCH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Wall-clock window of the receiver-side hole punch (the review's
+/// suggested 3–5 s band; 4 s comfortably covers the sender's probe round
+/// (1 s) plus the observed-first dial budget (2 s) while staying inside
+/// one connect pass). Bounded by design: the loop is spawned beside the
+/// accept path and never blocks it; the first successful data-plane
+/// connection (or the task's end) stops it early via the shared flag.
+pub const PUNCH_WINDOW: Duration = Duration::from_secs(4);
+
+/// Per-tick target cap of the punch loop (the endpoint blob's wire bound
+/// is 16 candidates; the derived lists stay ≤ 8 dial + 4 echo — this cap
+/// bounds one tick's sends even against a hostile/buggy blob).
+pub const PUNCH_MAX_TARGETS: usize = 8;
 
 /// Bound for the resident receiver's first bind (surfaced as the code's
 /// candidates). Binding a wildcard UDP socket is fast; the bound exists so
@@ -550,7 +590,9 @@ pub fn one_line_reason(error: &EngineError) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The receiver's pre-QUIC socket lifecycle (CR-P1-02 改法第 1/2 条).
+// The receiver's pre-QUIC socket lifecycle (CR-P1-02 改法第 1/2 条) and the
+// sender's mirror (CR-P1-05, review 2026-11-11 §4.5: both sides probe on
+// THE socket that will carry QUIC).
 // ---------------------------------------------------------------------------
 
 /// The receiver's pre-QUIC bind outcome (CR-P1-02 改法第 2 条): the UDP
@@ -579,34 +621,53 @@ pub struct ReceiverSocket {
     pub stun_error: Option<String>,
 }
 
-/// Create the receiver's UDP socket and — when a STUN server is
-/// configured — query its server-reflexive address ON THAT SAME SOCKET
-/// before the socket is handed to QUIC (CR-P1-02 改法第 2 条: the mapping
-/// the query opens on the NAT is exactly the mapping the QUIC listener
-/// needs, so the query must not run on a throwaway socket).
-///
-/// Socket lifecycle, in order:
-///
-/// 1. `holepunch::bind_dual_stack_udp(0)` — C1's dual-stack `[::]`
-///    wildcard (V6ONLY cleared, non-blocking armed). A host without IPv6
-///    (or an unclearable V6ONLY) falls back to the historical v4
-///    wildcard bind — C1's fallback chain, preserved verbatim.
-/// 2. Optional STUN: the std socket is wrapped in a tokio `UdpSocket`
-///    (same OS socket, so no new mapping), a v4 server address is sent
-///    in `::ffff:` mapped form from the v6-family socket (the honest
-///    form an AF_INET6 socket can dial; the NAT mapping this creates is
-///    the one THIS socket keeps — a symmetric NAT may still map
-///    destination-dependently, the known 改法第 4 条 residual),
-///    `ak_signal::stun::query_on` runs under [`STUN_QUERY_BUDGET`], and
-///    the std socket is recovered with `into_std` for QUIC.
-/// 3. The caller adopts the socket with
-///    `DirectEndpoint::bind_with_socket` (which re-arms non-blocking —
-///    tokio round-trips never leave it in a state QUIC rejects).
-///
-/// Fail-open by design: a STUN failure (unreachable, silent, malformed)
-/// costs at most [`STUN_QUERY_BUDGET`] and leaves the socket + local
-/// candidates fully working; the bounded reason rides the diagnostics.
-pub async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSocket, String> {
+/// The SENDER's pre-QUIC bind outcome (CR-P1-05): the exact mirror shape
+/// of [`ReceiverSocket`] — same lifecycle (dual-stack bind, optional
+/// same-socket STUN under [`STUN_QUERY_BUDGET`], fail-open), different
+/// consumer: the reflexive address rides the sender's OWN endpoint blob
+/// (so the paired receiver's punch loop has a dialable target), and the
+/// socket is handed to the engine's
+/// [`ak_engine::SendSpec::adopt_socket`] /
+/// `DirectEndpoint::dial_with_socket` so the QUIC Initial leaves from the
+/// very port the STUN query and the send-time probe round mapped.
+pub struct SenderSocket {
+    /// The bound socket — the future-QUIC dial socket. The caller keeps
+    /// it for the send phase (per-attempt `try_clone` hands each engine
+    /// attempt its own handle of the SAME OS socket: same local port,
+    /// same NAT mapping).
+    pub socket: std::net::UdpSocket,
+    /// The STUN server-reflexive address observed ON `socket`, or `None`
+    /// when no server was configured or the query failed (fail-open).
+    pub reflexive: Option<SocketAddr>,
+    /// Whether `socket` is the dual-stack `[::]` bind (see
+    /// [`ReceiverSocket::dual_stack`] — the flag is tracked, not queried).
+    pub dual_stack: bool,
+    /// Bounded reason the dual-stack bind fell back to v4.
+    pub bind_fallback: Option<String>,
+    /// Bounded reason the STUN query failed (`None` on success or when
+    /// no server was configured).
+    pub stun_error: Option<String>,
+}
+
+/// The shared socket lifecycle core of [`bind_receiver_socket`] and
+/// [`bind_sender_socket`]: dual-stack `[::]` wildcard bind (v4 fallback),
+/// the optional same-socket STUN reflexive query under
+/// [`STUN_QUERY_BUDGET`], fail-open throughout. One core because the two
+/// sides' lifecycles are byte-identical up to the consumer — the CR-P1-05
+/// rule (both sides probe on THE socket that will carry QUIC) is exactly
+/// this symmetry.
+async fn bind_and_stun_socket(
+    stun: Option<SocketAddr>,
+) -> Result<
+    (
+        std::net::UdpSocket,
+        Option<SocketAddr>,
+        bool,
+        Option<String>,
+        Option<String>,
+    ),
+    String,
+> {
     // Step 1 — C1's chain: dual-stack first, historical v4 fallback.
     let (mut socket, dual_stack, bind_fallback) = match ak_net::holepunch::bind_dual_stack_udp(0) {
         Ok(socket) => (socket, true, None),
@@ -625,34 +686,22 @@ pub async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSo
     // QUIC is about to own.
     let Some(server) = stun else {
         // Not configured: no query, fail-open.
-        return Ok(ReceiverSocket {
-            socket,
-            reflexive: None,
-            dual_stack,
-            bind_fallback,
-            stun_error: None,
-        });
+        return Ok((socket, None, dual_stack, bind_fallback, None));
     };
     if server.ip().is_unspecified() {
         // A configured-but-meaningless server (0.0.0.0): treat as absent.
-        return Ok(ReceiverSocket {
-            socket,
-            reflexive: None,
-            dual_stack,
-            bind_fallback,
-            stun_error: None,
-        });
+        return Ok((socket, None, dual_stack, bind_fallback, None));
     }
     if let Err(error) = socket.set_nonblocking(true) {
         // The dual-stack path already armed this; only the v4 fallback
         // could refuse. Fail-open with the bounded reason.
-        return Ok(ReceiverSocket {
+        return Ok((
             socket,
-            reflexive: None,
+            None,
             dual_stack,
             bind_fallback,
-            stun_error: Some(format!("socket not queryable: {error}")),
-        });
+            Some(format!("socket not queryable: {error}")),
+        ));
     }
     let tokio_socket = tokio::net::UdpSocket::from_std(socket)
         .map_err(|error| format!("receiver socket registration failed: {error}"))?;
@@ -677,7 +726,75 @@ pub async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSo
         // does).
         Err(error) => (None, Some(error.to_string())),
     };
+    Ok((socket, reflexive, dual_stack, bind_fallback, stun_error))
+}
+
+/// Create the receiver's UDP socket and — when a STUN server is
+/// configured — query its server-reflexive address ON THAT SAME SOCKET
+/// before the socket is handed to QUIC (CR-P1-02 改法第 2 条: the mapping
+/// the query opens on the NAT is exactly the mapping the QUIC listener
+/// needs, so the query must not run on a throwaway socket).
+///
+/// Socket lifecycle (the shared private core both binds share):
+///
+/// 1. `holepunch::bind_dual_stack_udp(0)` — C1's dual-stack `[::]`
+///    wildcard (V6ONLY cleared, non-blocking armed). A host without IPv6
+///    (or an unclearable V6ONLY) falls back to the historical v4
+///    wildcard bind — C1's fallback chain, preserved verbatim.
+/// 2. Optional STUN: the std socket is wrapped in a tokio `UdpSocket`
+///    (same OS socket, so no new mapping), a v4 server address is sent
+///    to in `::ffff:` mapped form from the v6-family socket (the honest
+///    form an AF_INET6 socket can dial; the NAT mapping this creates is
+///    the one THIS socket keeps — a symmetric NAT may still map
+///    destination-dependently, the known 改法第 4 条 residual),
+///    `ak_signal::stun::query_on` runs under [`STUN_QUERY_BUDGET`], and
+///    the std socket is recovered with `into_std` for QUIC.
+/// 3. The caller adopts the socket with
+///    `DirectEndpoint::bind_with_socket` (which re-arms non-blocking —
+///    tokio round-trips never leave it in a state QUIC rejects).
+///
+/// Fail-open by design: a STUN failure (unreachable, silent, malformed)
+/// costs at most [`STUN_QUERY_BUDGET`] and leaves the socket + local
+/// candidates fully working; the bounded reason rides the diagnostics.
+pub async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSocket, String> {
+    let (socket, reflexive, dual_stack, bind_fallback, stun_error) =
+        bind_and_stun_socket(stun).await?;
     Ok(ReceiverSocket {
+        socket,
+        reflexive,
+        dual_stack,
+        bind_fallback,
+        stun_error,
+    })
+}
+
+/// Bind the SENDER's future-QUIC socket and — when a STUN server is
+/// configured — query its server-reflexive address ON THAT SAME SOCKET
+/// (CR-P1-05, review 2026-11-11 §4.5 改法第 2 条: the sender's mapping
+/// must be established on the dial socket BEFORE the redeem, because the
+/// endpoint blob the redeem registers carries the reflexive address —
+/// the paired receiver's punch loop then aims at a mapping the QUIC
+/// Initial will actually leave from).
+///
+/// Same lifecycle as [`bind_receiver_socket`] (the shared core); the
+/// differences are all in the consumer:
+///
+/// * the caller inserts `reflexive` into its OWN derived candidate list
+///   via [`insert_reflexive_candidate`] before registering the blob;
+/// * the caller keeps `socket` until the send phase: the send-time probe
+///   round runs on a `try_clone` of it ([`probe_dial_round_on`]) and
+///   every engine dial attempt adopts a `try_clone` of it
+///   ([`ak_engine::SendSpec::adopt_socket`]) — one OS socket, one NAT
+///   mapping, both probing and QUIC.
+///
+/// Fail-open by design (identical budget and reasons): a host without a
+/// STUN server, or with an unreachable one, still gets the bound socket
+/// and local candidates — the Windows/dev-host behavior without STUN is
+/// byte-identical to the pre-CR path.
+pub async fn bind_sender_socket(stun: Option<SocketAddr>) -> Result<SenderSocket, String> {
+    let (socket, reflexive, dual_stack, bind_fallback, stun_error) =
+        bind_and_stun_socket(stun).await?;
+    Ok(SenderSocket {
         socket,
         reflexive,
         dual_stack,
@@ -837,19 +954,21 @@ pub struct ProbeDialOrder {
 }
 
 /// One simultaneous-probe round (CR-P1-02 改法第 3 条) at the START of
-/// the sender's connect phase: ONE dual-stack UDP socket
-/// (`bind_dual_stack_udp`, v4 wildcard fallback for hosts without a
-/// clearable V6ONLY) fires `holepunch::probe` packets at EVERY dial
-/// candidate for [`PROBE_DIAL_WINDOW`]. The paired receiver's echo
-/// responder answers on its bound socket (its reply IS a probe packet,
-/// so the round observes the answering candidate), and a peer probe
-/// round still overlapping from the pairing lands here as an observed
-/// source the candidate list never named. The dial plan then puts the
-/// observed address first ([`observed_dial_head`]); the socket itself is
-/// dropped afterwards — the engine's `SendSpec` cannot adopt a
-/// pre-bound socket (the recorded ak-net/ak-engine API wish), so the
-/// probe socket's NAT mapping does NOT carry into the QUIC dial and the
-/// observed-first leg buys its reachability proof, not port reuse.
+/// the sender's connect phase, on a THROWAWAY socket — the legacy C3
+/// shape, kept for callers with no adopted socket. The paired receiver's
+/// echo responder answers on its bound socket (its reply IS a probe
+/// packet, so the round observes the answering candidate), and a peer
+/// probe round still overlapping from the pairing lands here as an
+/// observed source the candidate list never named; the dial plan puts
+/// the observed address first ([`observed_dial_head`]).
+///
+/// Callers that bound the future-QUIC sender socket (CR-P1-05) pass its
+/// `try_clone` to [`probe_dial_round_on`] instead, so the round's
+/// packets leave from the port the QUIC dial will leave from — the
+/// throwaway socket's mapping does NOT carry into the dial, which is
+/// exactly the one-way-punching defect this module's CR-P1-05 work
+/// removed from the sender path (the engine adoption entry is
+/// `ak_engine::SendSpec::adopt_socket`).
 ///
 /// `observe` fires once with the round's outcome — `(head, report,
 /// probed)` — so the adapter can report what the round saw (the CLI
@@ -875,13 +994,39 @@ where
             }
         },
     };
-    if std_socket.set_nonblocking(true).is_err() {
+    probe_dial_round_on(std_socket, probed, ordered, observe).await
+}
+
+/// The unified probe round (CR-P1-05, review 2026-11-11 §4.5): same
+/// packets, same window, same observation rules as
+/// [`probe_dial_round`], but the round runs ON the CALLER-OWNED socket —
+/// a `try_clone` of the adopted sender socket (a duplicate HANDLE of the
+/// same OS socket: same local port, same NAT mapping), so the packets
+/// the receiver's echo responder answers left from the exact port the
+/// subsequent QUIC dial adopts. This is the sender half of the review's
+/// core acceptance rule (审核改法第 4 条: both sides' probing must happen
+/// on THE socket that will carry QUIC).
+///
+/// `socket` is consumed — the clone's handle closes when the round ends,
+/// while the caller's original keeps the shared OS socket alive.
+/// A registration failure of the clone fails open to the static order
+/// exactly like the throwaway round's bind failure.
+pub async fn probe_dial_round_on<F>(
+    socket: std::net::UdpSocket,
+    probed: usize,
+    ordered: Vec<SocketAddr>,
+    observe: F,
+) -> ProbeDialOrder
+where
+    F: FnOnce(Option<SocketAddr>, &ak_net::holepunch::PunchReport, usize),
+{
+    if socket.set_nonblocking(true).is_err() {
         return ProbeDialOrder {
             order: ordered,
             head: None,
         };
     }
-    let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) else {
+    let Ok(socket) = tokio::net::UdpSocket::from_std(socket) else {
         return ProbeDialOrder {
             order: ordered,
             head: None,
@@ -957,6 +1102,180 @@ pub fn observed_first_order(
     out.push(observed);
     out.extend(ordered.into_iter().filter(|addr| *addr != observed));
     out
+}
+
+// ---------------------------------------------------------------------------
+// The receiver-side hole punch (CR-P1-05, review 2026-11-11 §4.5 改法第 3
+// 条's receiver half: the QUIC socket itself must SEND to the sender).
+// ---------------------------------------------------------------------------
+
+/// The outcome snapshot of one [`punch_candidates`] run — a bounded
+/// report for the adapters' diagnostics (event line / stdout line) and
+/// the unit pins of cadence, window and early stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchReport {
+    /// Probe-shaped punch packets actually sent (sum over all targets and
+    /// ticks; per-datagram send errors do not count).
+    pub packets_sent: usize,
+    /// Tick rounds that fired (≈ `window / interval`, fewer on early
+    /// stop).
+    pub ticks: usize,
+    /// Whether the loop ended via the shared stop flag before the window
+    /// elapsed (the early-stop path — set by the accept side on the
+    /// first successful data-plane connection, or by task teardown).
+    pub stopped_early: bool,
+}
+
+/// The RECEIVER-side hole punch (CR-P1-05): from `socket` — a
+/// `try_clone` of the QUIC listener's socket taken BEFORE the socket was
+/// handed to `DirectEndpoint::bind_with_socket` (same OS socket, same
+/// local port, a duplicate HANDLE only) — send one small probe-shaped
+/// packet to every advertised candidate of the paired SENDER, every
+/// [`PUNCH_INTERVAL`] for at most [`PUNCH_WINDOW`], concurrently with
+/// the sender's QUIC dial.
+///
+/// Why this direction matters: until CR-P1-05 the receiver's QUIC socket
+/// never sent a byte to the peer (only the STUN query ever left it), so
+/// a port-restricted-cone NAT on the receiver side filtered the sender's
+/// QUIC Initial out. The punch's outbound packets open the receiver's
+/// own mapping toward the sender's advertised (reflexive) addresses —
+/// exactly the mapping the Initial then rides. The packet payload is an
+/// `holepunch::probe` packet with a time-derived nonce: the sender's
+/// echo responder answers it (opening the sender-side filter toward the
+/// receiver's QUIC mapping — the mirror direction), and neither QUIC
+/// stack ever reads it (the clone below NEVER receives: receiving on a
+/// duplicated handle would compete with quinn for the socket's queue —
+/// this loop is send-only by construction).
+///
+/// Bounded and never blocking: family-undialable candidates are skipped
+/// (a v4 socket cannot send to v6; a v6-family socket dials plain-v4
+/// candidates in `::ffff:` mapped form, the same bridge
+/// `DirectEndpoint::connect` uses), per-datagram send errors are
+/// skipped (a dead candidate costs nothing), at most
+/// [`PUNCH_MAX_TARGETS`] candidates per tick, and the loop ends at the
+/// FIRST of: the shared `stop` flag (set by the accept path on the first
+/// successful data-plane connection — the review's early-stop rule — or
+/// by teardown), or the window's deadline.
+///
+/// `report` fires once with the final [`PunchReport`] so the adapter can
+/// log its bounded line (the CLI prints there; the FFI passes a no-op —
+/// the frozen §8.3 event set gains no new event).
+pub async fn punch_candidates<F>(
+    socket: std::net::UdpSocket,
+    candidates: &[SocketAddr],
+    stop: &AtomicBool,
+    report: F,
+) where
+    F: FnOnce(PunchReport),
+{
+    // The family bridge: the QUIC socket (and thus its clone) is the
+    // dual-stack [::] bind or the v4 fallback; normalize each target to
+    // the form this socket can actually send to.
+    let local = match socket.local_addr() {
+        Ok(local) => local,
+        Err(_) => {
+            report(PunchReport {
+                packets_sent: 0,
+                ticks: 0,
+                stopped_early: false,
+            });
+            return;
+        }
+    };
+    let targets = punch_targets(local, candidates);
+    // One packet for the whole run: same time-derived nonce (the reply,
+    // if any, lands in quinn's queue and is discarded — the loop never
+    // reads it back).
+    let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+    let mut packets_sent = 0usize;
+    let mut ticks = 0usize;
+    let deadline = tokio::time::Instant::now() + PUNCH_WINDOW;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        ticks += 1;
+        for target in &targets {
+            // Non-blocking UDP send_to: success is best-effort delivery;
+            // per-datagram errors (unreachable, WSAECONNRESET-shaped)
+            // cost nothing and never end the loop.
+            if socket.send_to(&packet, target).is_ok() {
+                packets_sent += 1;
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now + PUNCH_INTERVAL >= deadline {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(now + PUNCH_INTERVAL) => {},
+            _ = tokio::time::sleep_until(deadline) => {
+                // The window ends during this sleep; the deadline arm
+                // wins (whichever fires first) and the loop exits on
+                // the elapsed check below only via this break.
+                break;
+            }
+        }
+    }
+    let stopped_early = stop.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline;
+    report(PunchReport {
+        packets_sent,
+        ticks,
+        stopped_early,
+    });
+}
+
+/// Time/counter-derived nonce of the punch packet — never all-zero (the
+/// echo responder's anti-reflection rule treats the all-zero nonce as a
+/// REPLY and never answers it, which would waste the sender-side filter
+/// opening).
+fn punch_nonce() -> [u8; 16] {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&nanos.to_le_bytes());
+    nonce[8..].copy_from_slice(&count.wrapping_add(nanos.rotate_left(17)).to_le_bytes());
+    nonce
+}
+
+/// The punch target selection over raw advertised candidates — pure on
+/// purpose (tests pin the rule without any socket). Rules:
+///
+/// * at most [`PUNCH_MAX_TARGETS`] candidates are considered (a
+///   hostile/buggy blob cannot blow up one tick's send count);
+/// * unspecified addresses and port 0 (the sender-role "no listener"
+///   marker of the pre-CR-P1-05 blobs) are not dialable — skipped;
+/// * the same family bridge `DirectEndpoint::connect` uses: a v6-family
+///   punch socket (the dual-stack `[::]` bind) dials plain-v4 candidates
+///   in `::ffff:` mapped form, a v4 socket expands mapped candidates
+///   back to plain v4;
+/// * a genuinely undialable family (v4 socket, v6 candidate) is skipped;
+/// * the result dedupes (normalized form), preserving order.
+pub fn punch_targets(local: SocketAddr, candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut targets: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
+    for candidate in candidates.iter().take(PUNCH_MAX_TARGETS) {
+        if candidate.ip().is_unspecified() || candidate.port() == 0 {
+            continue;
+        }
+        let target = if local.is_ipv6() && candidate.is_ipv4() {
+            ak_net::classify::to_mapped(*candidate)
+        } else if local.is_ipv4() {
+            ak_net::classify::expand_mapped(*candidate)
+        } else {
+            *candidate
+        };
+        if target.is_ipv6() != local.is_ipv6() {
+            continue;
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,5 +2073,263 @@ mod tests {
         let outcome =
             drive_with_connect_budget(&marks, send.as_mut(), Duration::from_millis(20)).await;
         assert!(outcome.is_err(), "the budget deadline is enforced");
+    }
+
+    // -- CR-P1-05 (review 2026-11-11 §4.5): the sender socket lifecycle,
+    //    the unified probe round and the receiver punch loop ---------------
+
+    /// One loopback STUN binding responder thread (the t03 product-test
+    /// harness shape): answers every parseable binding request with the
+    /// OBSERVED source (truthful reflection).
+    fn spawn_test_stun_responder() -> (SocketAddr, std::sync::Arc<AtomicBool>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("responder bind");
+        let addr = socket.local_addr().expect("responder addr");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("responder timeout");
+            let mut buffer = [0u8; 128];
+            while !flag.load(Ordering::Relaxed) {
+                if let Ok((len, from)) = socket.recv_from(&mut buffer) {
+                    if let Ok(transaction) = ak_signal::stun::parse_binding_request(&buffer[..len])
+                    {
+                        let _ = socket
+                            .send_to(&ak_signal::stun::binding_response(transaction, from), from);
+                    }
+                }
+            }
+        });
+        (addr, stop)
+    }
+
+    /// CR-P1-05, the sender lifecycle's same-socket proof at unit level:
+    /// a TRUTHFUL responder reflects the sender socket's own address —
+    /// the reflexive port MUST equal the bound port (a throwaway query
+    /// socket would reflect its own ephemeral port), and the socket is
+    /// genuinely bound (the send phase adopts exactly this handle).
+    #[tokio::test]
+    async fn bind_sender_socket_queries_stun_on_the_same_socket() {
+        let (server, stop) = spawn_test_stun_responder();
+        let started = Instant::now();
+        let sock = bind_sender_socket(Some(server))
+            .await
+            .expect("sender socket binds");
+        stop.store(true, Ordering::Relaxed);
+        let bound = sock.socket.local_addr().expect("sender socket bound addr");
+        let reflexive = sock.reflexive.expect("truthful responder reflects");
+        assert_eq!(
+            reflexive.port(),
+            bound.port(),
+            "the STUN query must run on the socket the dial adopts: {reflexive} vs {bound}"
+        );
+        assert_eq!(
+            reflexive.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "the truthful loopback responder reflects the local source: {reflexive}"
+        );
+        assert!(sock.stun_error.is_none(), "no failure on success");
+        assert!(
+            started.elapsed() < STUN_QUERY_BUDGET + Duration::from_millis(500),
+            "the query stays inside its fail-open budget"
+        );
+    }
+
+    /// The no-server fail-open path of the sender bind (the Windows /
+    /// dev-host default when STUN is absent): bound socket, no reflexive
+    /// address, no failure — byte-identical to the receiver mirror.
+    #[tokio::test]
+    async fn bind_sender_socket_without_a_server_skips_the_query() {
+        let sock = bind_sender_socket(None).await.expect("binds");
+        assert!(sock.reflexive.is_none(), "no server, no reflexive");
+        assert!(sock.stun_error.is_none(), "no server, no failure");
+        assert!(
+            sock.socket.local_addr().is_ok(),
+            "the dial socket is genuinely bound"
+        );
+    }
+
+    /// The unified probe round leaves from the CALLER-OWNED socket: a
+    /// silent bound "candidate" observes the round's probe packets, and
+    /// their SOURCE PORT is the adopted socket's port (the review's core
+    /// rule — the round and the QUIC dial share one OS socket).
+    #[tokio::test]
+    async fn probe_round_on_leaves_from_the_caller_owned_port() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent bind");
+        silent
+            .set_read_timeout(Some(Duration::from_millis(2_500)))
+            .expect("read timeout");
+        let candidate = SocketAddr::from((
+            [127, 0, 0, 1],
+            silent.local_addr().expect("silent addr").port(),
+        ));
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("probe socket bind");
+        let adopted_port = adopted.local_addr().expect("adopted addr").port();
+        let round_socket = adopted.try_clone().expect("round clone");
+        let ordered = vec![candidate];
+        let plan =
+            probe_dial_round_on(round_socket, ordered.len(), ordered.clone(), |_, _, _| {}).await;
+        assert_eq!(plan.head, None, "a silent candidate observes nothing");
+        assert_eq!(plan.order, ordered, "fail-open keeps the static order");
+        // The buffered probe packet: probe-shaped, small, from the
+        // adopted port.
+        let mut buffer = [0u8; 1500];
+        let (len, from) = silent
+            .recv_from(&mut buffer)
+            .expect("a probe packet arrived");
+        assert!(
+            ak_net::holepunch::is_probe_packet(&buffer[..len]),
+            "the punch-side packet is probe-shaped"
+        );
+        assert!(len <= 64, "the packet is small: {len} bytes");
+        assert_eq!(
+            from.port(),
+            adopted_port,
+            "the round left from the adopted port"
+        );
+    }
+
+    /// The punch loop's happy path: every dialable candidate is punched
+    /// with a small probe-shaped packet (never the all-zero reply nonce —
+    /// the echo responder would not answer it), cadence-bounded within
+    /// the window, and the report counts what was sent.
+    #[tokio::test]
+    async fn punch_candidates_punches_every_candidate_with_bounded_packets() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let puncher = std::net::UdpSocket::bind("127.0.0.1:0").expect("puncher bind");
+        let puncher_port = puncher.local_addr().expect("puncher addr").port();
+        let started = Instant::now();
+        let stop = AtomicBool::new(false);
+        // Same-family mock candidates: a real one plus undialable ones
+        // (unspecified / port 0) that must be skipped (the pure
+        // `punch_targets` test pins the selection rule itself).
+        let candidates = vec![
+            SocketAddr::from(([0, 0, 0, 0], 7000)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            target_addr,
+        ];
+        punch_candidates(puncher, &candidates, &stop, |_| {}).await;
+        target
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("target timeout");
+        let mut punches = 0usize;
+        loop {
+            let mut buffer = [0u8; 1500];
+            match target.recv_from(&mut buffer) {
+                Ok((len, from)) => {
+                    assert!(
+                        ak_net::holepunch::is_probe_packet(&buffer[..len]),
+                        "the punch packet is probe-shaped"
+                    );
+                    assert!(len <= 64, "the punch packet is small: {len} bytes");
+                    assert_ne!(
+                        &buffer[8..len],
+                        &[0u8; 16][..],
+                        "a punch never carries the all-zero reply nonce"
+                    );
+                    assert_eq!(from.port(), puncher_port, "the punch left the given socket");
+                    punches += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(punches >= 1, "at least one punch reached the candidate");
+        assert!(
+            punches <= (PUNCH_WINDOW.as_millis() / PUNCH_INTERVAL.as_millis()) as usize + 1,
+            "the punch count is cadence-bounded: {punches}"
+        );
+        assert!(
+            started.elapsed() >= PUNCH_WINDOW - Duration::from_millis(250),
+            "the loop ran its window: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < PUNCH_WINDOW + Duration::from_secs(1),
+            "the loop never overruns its window: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The punch loop's early stop: the shared flag (set by the accept
+    /// path on the first successful data-plane connection) ends the loop
+    /// well inside the window. (Multi-thread runtime: the test thread
+    /// blocks on the target socket while the punch task must keep
+    /// running.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn punch_candidates_stops_early_on_the_flag() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let puncher = std::net::UdpSocket::bind("127.0.0.1:0").expect("puncher bind");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let task = tokio::spawn(async move {
+            let mut report = None;
+            punch_candidates(puncher, &[target_addr], &flag, |r| report = Some(r)).await;
+            report
+        });
+        // Wait for the first punch, then flip the early-stop flag.
+        target
+            .set_read_timeout(Some(Duration::from_millis(2_000)))
+            .expect("target timeout");
+        let mut buffer = [0u8; 1500];
+        target
+            .recv_from(&mut buffer)
+            .expect("the first punch arrives");
+        stop.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let report = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the loop ends promptly after the flag")
+            .expect("join")
+            .expect("report");
+        assert!(report.stopped_early, "the report names the early stop");
+        assert!(
+            started.elapsed() < PUNCH_WINDOW,
+            "the early stop beat the window"
+        );
+    }
+
+    /// The punch target selection rule, pure: undialable entries (port 0
+    /// of the pre-CR sender blobs, unspecified) drop out, the v4 socket
+    /// skips v6 candidates, the v6-family (dual-stack) socket maps v4
+    /// candidates, dedupe preserves order, and the per-tick cap holds.
+    #[test]
+    fn punch_targets_filter_bridge_and_cap() {
+        let v4_local: SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        // Port-0 and unspecified entries drop; the v6 candidate drops (a
+        // v4 socket cannot dial it); the mapped v4 normalizes.
+        assert_eq!(
+            punch_targets(
+                v4_local,
+                &addrs(&[
+                    "0.0.0.0:7000",
+                    "203.0.113.7:0",
+                    "[2001:db8::1]:7000",
+                    "[::ffff:198.51.100.9]:7100",
+                    "198.51.100.9:7100",
+                ])
+            ),
+            addrs(&["198.51.100.9:7100"])
+        );
+        let v6_local: SocketAddr = "[::]:9000".parse().unwrap();
+        // The dual-stack socket bridges plain v4 into mapped form and
+        // keeps native v6 candidates.
+        assert_eq!(
+            punch_targets(
+                v6_local,
+                &addrs(&["203.0.113.7:7000", "[2001:db8::1]:7000"])
+            ),
+            addrs(&["[::ffff:203.0.113.7]:7000", "[2001:db8::1]:7000"])
+        );
+        // The per-tick cap: only the first PUNCH_MAX_TARGETS entries are
+        // even considered.
+        let many: Vec<SocketAddr> = (1..=PUNCH_MAX_TARGETS + 4)
+            .map(|i| SocketAddr::from(([192, 0, 2, 1], 30_000 + i as u16)))
+            .collect();
+        assert_eq!(punch_targets(v4_local, &many).len(), PUNCH_MAX_TARGETS);
     }
 }

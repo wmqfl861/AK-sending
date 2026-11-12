@@ -132,6 +132,23 @@
 //! side consumes its own observations (the echo responder's most recent
 //! observed probe source) only for its one outbound dial role, the
 //! idle-close notify; the QUIC accept is socket-bound and needs no dial.
+//! CR-P1-05 (review 2026-11-11 §4.5) completes the second direction on
+//! THE socket that carries QUIC, both ways: the joining/creating SENDER
+//! binds its future-QUIC dial socket before the redeem/claim
+//! (`bind_sender_socket` — same lifecycle and fail-open budget as the
+//! receiver bind; the `sender_bind` event mirrors `receiver_bind`), the
+//! reflexive address rides the sender's OWN endpoint blob (the paired
+//! receiver's punch target), the send-time probe round runs on a
+//! `try_clone` of that socket (`probe_dial_round_on`), and every dial
+//! attempt adopts it (`SendSpec::adopt_socket` +
+//! `DirectEndpoint::dial_with_socket`) so the QUIC Initial leaves from
+//! the port the STUN query mapped. The RECEIVER punches back: a
+//! send-only `try_clone` of the QUIC listener socket (stashed under the
+//! code id) feeds `punch_candidates` — probe-shaped packets to every
+//! advertised sender candidate, every 150 ms for ≤4 s, concurrent with
+//! the sender's dial, stopped by the first accepted connection — so a
+//! port-restricted-cone NAT on the receiver side admits the Initial
+//! (the one-way-punching defect the review closed).
 //!
 //! The engine-shared code table stays as a CACHE ONLY: same-engine
 //! joins use it to mirror the code's declared role onto the joiner (the
@@ -233,13 +250,13 @@ use ak_session::pairing::{
 // events instead of stdout lines, the task runtime's state. The shared
 // names are imported directly so the moved call sites read unchanged.
 use ak_session::pairing::task_net::{
-    bind_receiver_socket, blob_candidates, deliver_close_notify, drive_with_connect_budget,
-    handshake_failure_word, insert_reflexive_candidate, local_candidates, one_line_reason,
-    order_candidates, probe_dial_round, probe_with_retry, task_error_message,
-    windows_root_name_refusal, ConnectMarks, ATTEMPT_PAUSE, OBSERVED_DIAL_BUDGET,
-    RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_BUDGET,
-    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
-    TASK_SETTLE_PAUSE,
+    bind_receiver_socket, bind_sender_socket, blob_candidates, deliver_close_notify,
+    drive_with_connect_budget, handshake_failure_word, insert_reflexive_candidate,
+    local_candidates, one_line_reason, order_candidates, probe_dial_round, probe_dial_round_on,
+    probe_with_retry, task_error_message, windows_root_name_refusal, ConnectMarks, ATTEMPT_PAUSE,
+    OBSERVED_DIAL_BUDGET, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE,
+    TASK_CONNECT_BUDGET, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS,
+    TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -594,6 +611,30 @@ pub(crate) struct TaskRt {
     /// has the full contract). `None` = pure polling, bit-identical to
     /// the pre-doorbell behavior.
     notify: StdMutex<Option<TaskEventNotify>>,
+    /// CR-P1-05 (review 2026-11-11 §4.5): the per-code UDP hole sockets,
+    /// keyed by registry code id (a local placeholder id until the
+    /// claim/redeem assigns the real one — [`rekey_spawned`] re-keys
+    /// this table with the spawned table). Sender side: the ADOPTED
+    /// future-QUIC dial socket ([`bind_sender_socket`]'s outcome), read
+    /// by the send op so the probe round AND every dial attempt use the
+    /// mapping the same-socket STUN query opened. Receiver side: a
+    /// send-only `try_clone` of the QUIC listener socket, read by the
+    /// punch spawn so the receiver's own NAT admits the sender's QUIC
+    /// Initial ([`punch_candidates`]). Entries are removed on disconnect
+    /// / cancel; teardown drops the runtime (and the sockets) wholesale.
+    hole_sockets: StdMutex<HashMap<[u8; 16], HoleSocket>>,
+}
+
+/// CR-P1-05: one code's hole socket plus the shared early-stop flag of
+/// its punch loop (the accept path sets the flag on the FIRST successful
+/// data-plane connection — see [`punch_candidates`]; a sender-side entry
+/// simply never has its flag set).
+pub(crate) struct HoleSocket {
+    /// Sender: the adopted dial socket. Receiver: the send-only clone of
+    /// the QUIC listener socket.
+    pub(crate) socket: std::net::UdpSocket,
+    /// Early-stop of the receiver punch loop (see the field docs above).
+    pub(crate) punch_stop: Arc<AtomicBool>,
 }
 
 impl TaskRt {
@@ -1229,6 +1270,7 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         codes,
         engine_progress,
         notify: StdMutex::new(None),
+        hole_sockets: StdMutex::new(HashMap::new()),
     });
     {
         let mut v2 = engine
@@ -1574,6 +1616,14 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
 /// a fake `connected`).
 async fn owner_side_probe(rt: &Arc<TaskRt>, stack: &Arc<TaskStack>, paired: TaskPaired) {
     let conn_id = paired.pairing_id;
+    // CR-P1-05, receiver half (the create-code entry point): the pairing
+    // just completed and the SENDER's advertised candidates are known —
+    // punch them from the resident receiver's QUIC-socket clone,
+    // concurrently with the sender's dial. Owners of sender-role codes
+    // have no punch role (their peer is the receiver).
+    if TaskRole::of_direction(paired.direction) == TaskRole::Receiver {
+        spawn_receiver_punch(rt, paired.code_id, &paired.peer.candidates);
+    }
     let endpoint_probe = PeerEndpoint {
         candidates: paired.peer.candidates.clone(),
         name: paired.peer.name.clone(),
@@ -1688,17 +1738,26 @@ fn spawn_echo_responder(rt: &Arc<TaskRt>, key: [u8; 16]) -> Result<SocketAddr, S
 
 /// Abort and forget the resident tasks registered under `from` and
 /// re-register them under the registry-assigned `code_id` (the bind
-/// happens before the claim, under a local placeholder id).
+/// happens before the claim, under a local placeholder id). CR-P1-05:
+/// the code's hole socket (stashed under the placeholder by the resident
+/// receiver) re-keys with them.
 fn rekey_spawned(rt: &TaskRt, from: [u8; 16], code_id: [u8; 16]) {
     if let Ok(mut spawned) = rt.spawned.lock() {
         if let Some(tasks) = spawned.remove(&from) {
             spawned.entry(code_id).or_default().extend(tasks);
         }
     }
+    if let Ok(mut holes) = rt.hole_sockets.lock() {
+        if let Some(socket) = holes.remove(&from) {
+            holes.insert(code_id, socket);
+        }
+    }
 }
 
 /// Abort the resident tasks registered under a placeholder id (the op
-/// failed after binding — nothing may leak past the failed op).
+/// failed after binding — nothing may leak past the failed op). CR-P1-05:
+/// the placeholder's hole socket goes with them (its punch stop flips so
+/// a spawned punch loop ends too).
 fn abort_spawned(rt: &TaskRt, key: [u8; 16]) {
     if let Ok(mut spawned) = rt.spawned.lock() {
         if let Some(tasks) = spawned.remove(&key) {
@@ -1707,6 +1766,57 @@ fn abort_spawned(rt: &TaskRt, key: [u8; 16]) {
             }
         }
     }
+    drop_hole_socket(rt, &key);
+}
+
+/// CR-P1-05: remove one code's hole socket (disconnect / cancel / failed
+/// op) and stop its punch loop. Idempotent.
+fn drop_hole_socket(rt: &TaskRt, code_id: &[u8; 16]) {
+    if let Ok(mut holes) = rt.hole_sockets.lock() {
+        if let Some(socket) = holes.remove(code_id) {
+            socket.punch_stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// CR-P1-05: stash one code's hole socket (sender: the adopted dial
+/// socket; receiver: the send-only QUIC-socket clone).
+fn stash_hole_socket(rt: &TaskRt, code_id: [u8; 16], socket: std::net::UdpSocket) {
+    if let Ok(mut holes) = rt.hole_sockets.lock() {
+        holes.insert(
+            code_id,
+            HoleSocket {
+                socket,
+                punch_stop: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+}
+
+/// CR-P1-05, receiver half: spawn the punch loop toward the paired
+/// SENDER's advertised candidates from the receiver's stashed QUIC-socket
+/// clone. Called the moment the pairing completes (both entry points —
+/// the owner-loop completion and the joiner's redeem return) so the
+/// punches overlap the sender's dial. No clone stashed (e.g. an older
+/// receiver bind path) is an honest no-op; the loop itself is bounded by
+/// [`PUNCH_WINDOW`] and stopped early by the accept path's flag.
+fn spawn_receiver_punch(rt: &Arc<TaskRt>, code_id: [u8; 16], sender_candidates: &[SocketAddr]) {
+    let (socket, stop) = {
+        let Ok(holes) = rt.hole_sockets.lock() else {
+            return;
+        };
+        let Some(entry) = holes.get(&code_id) else {
+            return;
+        };
+        match entry.socket.try_clone() {
+            Ok(clone) => (clone, Arc::clone(&entry.punch_stop)),
+            Err(_) => return,
+        }
+    };
+    let candidates = sender_candidates.to_vec();
+    tokio::spawn(async move {
+        ak_session::pairing::task_net::punch_candidates(socket, &candidates, &stop, |_| {}).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2250,6 +2360,9 @@ pub fn task_disconnect(
             }
         }
     }
+    // CR-P1-05: release the code's hole socket (the sender's adopted
+    // dial socket / the receiver's punch clone) and stop its punch loop.
+    drop_hole_socket(&rt, &code_id);
     // Same-engine instant notify through the cache (the registry path
     // below is the cross-device one).
     let stack = rt.stack.lock().ok().and_then(|slot| slot.clone());
@@ -2339,6 +2452,8 @@ fn cancel_unjoined_code(
             }
         }
     }
+    // CR-P1-05: the cancelled code's hole socket goes with the listeners.
+    drop_hole_socket(rt, code_id);
     if let Some(stack) = stack {
         let pairing = stack.pairing.clone();
         let revoke_id = *code_id;
@@ -2473,6 +2588,39 @@ async fn run_create_code(
     let mut dial = extras;
     let mut echo: Vec<SocketAddr> = Vec::new();
     let mut code_slot: Option<ReceiverCodeSlot> = None;
+    // CR-P1-05 (review 2026-11-11 §4.5 改法第 2 条, sender half): a
+    // sender-role code binds THE future-QUIC dial socket now — before
+    // the claim, because the registered blob carries the reflexive
+    // address — STUN-queries ON IT (same fail-open 2 s budget), and the
+    // socket is stashed for the send op (probe round + every dial
+    // attempt leave from this port). Without a STUN server the behavior
+    // is byte-identical to the old port-0 advertisement plus a bound
+    // socket for the dial.
+    let mut sender_sock: Option<(std::net::UdpSocket, Option<SocketAddr>)> = None;
+    if role == TaskRole::Sender {
+        match bind_sender_socket(rt.stun_addr).await {
+            Ok(sock) => {
+                rt.push_event(format!(
+                    "{{\"event\":\"sender_bind\",\"addr\":{},\"dual_stack\":{},\"fallback_reason\":{},\"reflexive\":{},\"stun_error\":{}}}",
+                    quoted(&sock.socket.local_addr().map(|addr| addr.to_string()).unwrap_or_default()),
+                    sock.dual_stack,
+                    sock.bind_fallback.as_deref().map_or_else(|| "null".to_string(), quoted),
+                    sock.reflexive.as_ref().map_or_else(|| "null".to_string(), |addr| quoted(&addr.to_string())),
+                    sock.stun_error.as_deref().map_or_else(|| "null".to_string(), quoted),
+                ));
+                sender_sock = Some((sock.socket, sock.reflexive));
+            }
+            Err(message) => {
+                // Fail-open: the send path falls back to the engine's
+                // own bind (the old behavior) — the bounded reason rides
+                // the sender_bind event's shape.
+                rt.push_event(format!(
+                    "{{\"event\":\"sender_bind\",\"addr\":\"null\",\"dual_stack\":false,\"fallback_reason\":{},\"reflexive\":\"null\",\"stun_error\":\"null\"}}",
+                    quoted(&message),
+                ));
+            }
+        }
+    }
     if !explicit {
         let derived = if role == TaskRole::Receiver {
             let ((bound, reflexive), slot) = match bind_resident_receiver(rt, placeholder).await {
@@ -2488,11 +2636,22 @@ async fn run_create_code(
             // right after the v4 interface block — see the helper).
             insert_reflexive_candidate(local_candidates(bound), reflexive)
         } else {
-            // A sender-role code still advertises the creator's endpoints
-            // (informational for v1 — the reverse direction's dial targets
-            // arrive with the joiner's registration; port 0 marks "no
-            // listener", which the probe skips as undialable).
-            local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)))
+            // CR-P1-05: the sender-role blob carries the DIAL socket's
+            // real port (the paired receiver's punch loop needs a
+            // dialable target — port-0 "no listener" markers defeat it)
+            // plus the socket's reflexive address when STUN answered.
+            let (socket, reflexive) = sender_sock
+                .as_ref()
+                .map(|(socket, reflexive)| {
+                    (
+                        socket
+                            .local_addr()
+                            .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+                        *reflexive,
+                    )
+                })
+                .unwrap_or((SocketAddr::from(([0, 0, 0, 0], 0)), None));
+            insert_reflexive_candidate(local_candidates(socket), reflexive)
         };
         dial = derived;
         let responder = match spawn_echo_responder(rt, placeholder) {
@@ -2534,6 +2693,11 @@ async fn run_create_code(
             task_error_message(&error)
         })?;
     rekey_spawned(rt, placeholder, code.invite.code_id);
+    // CR-P1-05: the sender's adopted dial socket lands under the REAL
+    // code id (the send op looks it up by the connection's code id).
+    if let Some((socket, _)) = sender_sock {
+        stash_hole_socket(rt, code.invite.code_id, socket);
+    }
     if let Some(slot) = code_slot {
         if let Ok(mut value) = slot.lock() {
             *value = code.invite.code_id;
@@ -2669,10 +2833,24 @@ async fn run_resident_receiver(
         Ok(sock) => sock,
         Err(_) => return, // the dropped oneshot fails the create/join op
     };
+    // CR-P1-05 (review 2026-11-11 §4.5 改法第 3 条): keep a SEND-ONLY
+    // `try_clone` of the very socket QUIC is about to adopt (duplicate
+    // handle, same local port) for the receiver-side hole punch — the
+    // punch task spawned at pairing completion sends the peer-opening
+    // packets FROM the QUIC socket's port, so a port-restricted-cone NAT
+    // on this side admits the sender's QUIC Initial. The clone NEVER
+    // receives (it would compete with quinn for the socket queue).
+    // Stashed under the CURRENT code id — the placeholder until the
+    // claim/redeem fills the slot; [`rekey_spawned`] moves it with the
+    // resident tasks.
+    let punch_clone = sock.socket.try_clone().ok();
     let endpoint = match ak_net::DirectEndpoint::bind_with_socket(sock.socket, &identity).await {
         Ok(endpoint) => endpoint,
         Err(_) => return, // the dropped oneshot fails the create/join op
     };
+    if let Some(clone) = punch_clone {
+        stash_hole_socket(&rt, current_code(), clone);
+    }
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
@@ -2783,6 +2961,14 @@ async fn run_resident_receiver(
                 continue;
             }
         };
+        // CR-P1-05: the FIRST successful data-plane connection stops the
+        // receiver punch loop early (the review's early-stop rule) —
+        // from here on the QUIC connection itself keeps the mapping hot.
+        if let Ok(holes) = rt.hole_sockets.lock() {
+            if let Some(entry) = holes.get(&code_id) {
+                entry.punch_stop.store(true, Ordering::Relaxed);
+            }
+        }
         // P2-06 (wave-31): the save folder is resolved ONCE per transfer
         // start — the moment this connection is accepted — and that ONE
         // binding is what the engine's ReceiveSpec writes into, what the
@@ -2912,6 +3098,34 @@ async fn run_join(
     let mut dial = extras;
     let mut echo: Vec<SocketAddr> = Vec::new();
     let mut code_slot: Option<ReceiverCodeSlot> = None;
+    // CR-P1-05 (review 2026-11-11 §4.5 改法第 2 条, sender half): the
+    // joining SENDER binds THE future-QUIC dial socket BEFORE the redeem
+    // — the blob the redeem registers must carry the reflexive address
+    // (the paired receiver's punch loop aims at it) and the socket's
+    // real port. STUN runs ON IT under the same fail-open budget; the
+    // socket is stashed under the code id once the redeem returns.
+    let mut sender_sock: Option<(std::net::UdpSocket, Option<SocketAddr>)> = None;
+    if my_role == TaskRole::Sender {
+        match bind_sender_socket(rt.stun_addr).await {
+            Ok(sock) => {
+                rt.push_event(format!(
+                    "{{\"event\":\"sender_bind\",\"addr\":{},\"dual_stack\":{},\"fallback_reason\":{},\"reflexive\":{},\"stun_error\":{}}}",
+                    quoted(&sock.socket.local_addr().map(|addr| addr.to_string()).unwrap_or_default()),
+                    sock.dual_stack,
+                    sock.bind_fallback.as_deref().map_or_else(|| "null".to_string(), quoted),
+                    sock.reflexive.as_ref().map_or_else(|| "null".to_string(), |addr| quoted(&addr.to_string())),
+                    sock.stun_error.as_deref().map_or_else(|| "null".to_string(), quoted),
+                ));
+                sender_sock = Some((sock.socket, sock.reflexive));
+            }
+            Err(message) => {
+                rt.push_event(format!(
+                    "{{\"event\":\"sender_bind\",\"addr\":\"null\",\"dual_stack\":false,\"fallback_reason\":{},\"reflexive\":\"null\",\"stun_error\":\"null\"}}",
+                    quoted(&message),
+                ));
+            }
+        }
+    }
     if !explicit {
         dial = if my_role == TaskRole::Receiver {
             match bind_resident_receiver(rt, placeholder).await {
@@ -2928,7 +3142,21 @@ async fn run_join(
                 }
             }
         } else {
-            local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)))
+            // CR-P1-05: the joining sender's blob carries the dial
+            // socket's real port + reflexive address (same shape as the
+            // create-side sender path above).
+            let (socket, reflexive) = sender_sock
+                .as_ref()
+                .map(|(socket, reflexive)| {
+                    (
+                        socket
+                            .local_addr()
+                            .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+                        *reflexive,
+                    )
+                })
+                .unwrap_or((SocketAddr::from(([0, 0, 0, 0], 0)), None));
+            insert_reflexive_candidate(local_candidates(socket), reflexive)
         };
         let responder = match spawn_echo_responder(rt, placeholder) {
             Ok(responder) => responder,
@@ -2960,6 +3188,17 @@ async fn run_join(
     let dial_candidates = paired.peer.candidates.clone();
     let peer_fp = paired.verified.owner_fingerprint();
     rekey_spawned(rt, placeholder, code_id);
+    // CR-P1-05: the joining sender's adopted dial socket lands under the
+    // real code id (the send op adopts it); the joining RECEIVER punches
+    // toward the paired sender's advertised candidates from its stashed
+    // QUIC-socket clone — concurrent with the sender's dial, bounded by
+    // PUNCH_WINDOW, stopped by the accept path's flag.
+    if let Some((socket, _)) = sender_sock {
+        stash_hole_socket(rt, code_id, socket);
+    }
+    if my_role == TaskRole::Receiver {
+        spawn_receiver_punch(rt, code_id, &dial_candidates);
+    }
     if let Some(slot) = code_slot {
         if let Ok(mut value) = slot.lock() {
             *value = code_id;
@@ -3070,9 +3309,24 @@ async fn run_send(
             core::hex_encode(&conn_id)
         ));
     }
-    // 改法第 3 条: probe round first (≤ PROBE_DIAL_WINDOW before the
-    // first dial attempt), observed address leads when any.
-    let dial = probe_dial_round(static_order, |_, _, _| {}).await;
+    // CR-P1-05: when this sender stashed an adopted dial socket at
+    // join/create time, the probe round runs ON a `try_clone` of IT (a
+    // duplicate handle of the same OS socket — same local port, same NAT
+    // mapping) and every dial attempt below adopts the same socket; the
+    // review's core rule (审核改法第 4 条: the probing AND the QUIC dial
+    // ride one socket). No stash (bind failed, or an old runtime): the
+    // legacy throwaway round, byte-identical to the pre-CR path.
+    let adopted = rt.hole_sockets.lock().ok().and_then(|holes| {
+        holes
+            .get(&conn.code_id)
+            .and_then(|e| e.socket.try_clone().ok())
+    });
+    let dial = match adopted.as_ref().map(|socket| socket.try_clone().ok()) {
+        Some(Some(round_socket)) => {
+            probe_dial_round_on(round_socket, static_order.len(), static_order, |_, _, _| {}).await
+        }
+        _ => probe_dial_round(static_order, |_, _, _| {}).await,
+    };
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
         if pass > 0 {
@@ -3105,7 +3359,9 @@ async fn run_send(
             } else {
                 TASK_CONNECT_BUDGET
             };
-            match attempt_task_send(rt, &conn, *addr, &paths, pinned, budget).await {
+            match attempt_task_send(rt, &conn, *addr, &paths, pinned, budget, adopted.as_ref())
+                .await
+            {
                 AttemptOutcome::Done(report) => {
                     rt.push_event(format!(
                         "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
@@ -3174,6 +3430,11 @@ enum AttemptOutcome {
 /// [`OBSERVED_DIAL_BUDGET`]), no deadline once
 /// connected. Post-connect failures are distinguishable so the fallback
 /// loop stops instead of retrying a protocol error on another address.
+///
+/// CR-P1-05: `adopted` (the sender's stashed dial socket, when any) is
+/// adopted into the spec — the QUIC Initial leaves from the socket the
+/// same-socket STUN query and probe round mapped. The bind fallback
+/// stays family-matched for the no-adoption path.
 async fn attempt_task_send(
     rt: &Arc<TaskRt>,
     conn: &TaskConn,
@@ -3181,6 +3442,7 @@ async fn attempt_task_send(
     paths: &[String],
     pinned: Fingerprint,
     connect_budget: Duration,
+    adopted: Option<&std::net::UdpSocket>,
 ) -> AttemptOutcome {
     let mut spec = SendSpec::new(
         PathBuf::from(&paths[0]),
@@ -3191,12 +3453,18 @@ async fn attempt_task_send(
     for extra in &paths[1..] {
         spec.add_root(PathBuf::from(extra));
     }
-    // Family-matched wildcard bind (the engine fast-fails mismatches).
+    // Family-matched wildcard bind (the engine fast-fails mismatches);
+    // ignored when the adopted socket carries the dial.
     spec.bind = if addr.is_ipv6() {
         SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
     } else {
         SocketAddr::from(([0, 0, 0, 0], 0))
     };
+    if let Some(socket) = adopted {
+        if let Ok(handle) = socket.try_clone() {
+            spec.adopt_socket(handle);
+        }
+    }
     spec.checkpoint_dir = rt.id_dir.join("checkpoints");
     spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
     spec.idle_timeout = TASK_SEND_IDLE;

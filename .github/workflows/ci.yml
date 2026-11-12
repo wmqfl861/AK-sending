@@ -350,3 +350,28 @@ jobs:
           cargo check --locked -p ak-core -p ak-wire -p ak-identity -p ak-storage
           -p ak-store -p ak-engine -p ak-signal -p ak-net -p ak-session
           -p ak-cli -p ak-ffi --target ${{ matrix.target }}
+
+  # CR-P1-05 (review 2026-11-11 §4.5 fix 5): the NAT matrix. Linux network
+  # namespaces + veth + a two-router topology with iptables MASQUERADE /
+  # --random-fully / static DNAT / ip6tables stateful rules simulate the
+  # four acceptance NAT combinations against the REAL product CLIs (a
+  # registry-server + stun-server pair runs inside the topology). HONESTY:
+  # this is a repeatable SIMULATION for catching logic gaps, not real-device
+  # verification (真机验证 remains the owner's C4 run). Passwordless sudo on
+  # ubuntu runners provides the CAP_NET_ADMIN the namespaces need; the
+  # script itself SKIPs (exit 0, with reasons) anywhere it cannot run.
+  # No new third-party actions (CR-P3-07 convention).
+  nat-matrix:
+    name: NAT matrix (netns simulation, CR-P1-05)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: nat-matrix
+      - name: Build ak-cli (runner user; root has no rustup)
+        run: cargo build -p ak-cli --locked
+      - name: Run the NAT matrix under sudo
+        run: sudo bash scripts/nat_matrix_test.sh --skip-build

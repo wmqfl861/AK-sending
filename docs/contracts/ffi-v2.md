@@ -415,6 +415,8 @@ int32_t ak_task_set_event_notify(
 
 `stun_addr`（可选，2026-11-11 CR-P1-02 改法第 2 条新增）：STUN 服务器 `ip:port`，"与注册中心一起配置"——Dart 层按 registry 同一优先级解析（`AK_STUN_ADDR` 环境变量，随后 `--dart-define` 编译默认，生产端点 `122.51.121.24:7101`）后随 spec 传入。接收端在**QUIC 将要使用的同一个 UDP socket**上做 STUN 查询（有界 2 秒，内部 1s/2s 重传受该总额约束），再把该 socket 交给 QUIC，反射地址（server-reflexive 候选）插入派生候选表的 v4 网卡块之后、loopback 之前（与既有条目去重；无 NAT 时跳过）。省略/空字符串 = 不查询（fail-open，仅本地候选）；非 ip:port 的非空值在校验期拒绝（-2）。查询失败（不可达/超时）同样 fail-open：接收端照常绑定并广播本地候选，失败原因进入 `receiver_bind` 事件新增的 `reflexive`/`stun_error` 字段。对称 NAT 下的残余限制见评审 4.1 改法第 4 条。
 
+`sender_bind` 事件（新增，2026-11-12 CR-P1-05）：发送端（create-code 发送角色与 join-send）与接收端对称的生命周期事件——携带 `addr`/`dual_stack`/`fallback_reason`/`reflexive`/`stun_error` 字段，形状沿用 `receiver_bind` 先例：发送端先绑定将来承载 QUIC 的双栈 socket，在同一 socket 上做有界 STUN 查询（同上 fail-open 语义），反射地址进入发送端自身 endpoint blob，随后该 socket 被 QUIC 拨号收养（端口等式由测试钉死）。§8.3 的 JSON 事件块不逐事件枚举——未知事件名必须被 Dart 解析器容忍（既有约定），此处仅作散文登记。
+
 ### 8.2 op 结果 JSON（经 ak_pairing_op_result）
 
 ```json

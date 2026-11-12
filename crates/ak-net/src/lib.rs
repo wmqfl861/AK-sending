@@ -376,6 +376,34 @@ impl DirectEndpoint {
         Self::bind_inner(socket, identity, false).await
     }
 
+    /// Adopt a caller-owned UDP socket for the CLIENT (dial) role — the
+    /// sender-side mirror of [`Self::bind_with_socket`] (CR-P1-05, review
+    /// 2026-11-11 §4.5: both sides' probing/punching must happen on THE
+    /// socket that will carry QUIC, so the sender's dial must leave from
+    /// the very socket its STUN query and probe round ran on — a mapping
+    /// opened on a throwaway socket never carries into the QUIC Initial).
+    ///
+    /// Construction is identical to [`Self::bind_with_socket`] — one
+    /// quinn `Endpoint` over the adopted socket with both server and
+    /// client configs armed — because the endpoint shape is role-neutral;
+    /// this constructor only NAMES the dial-side adoption so the sender
+    /// lifecycle has its documented entry. The socket must be bound and
+    /// must not be shared afterwards (a `try_clone` of the OS socket is
+    /// the caller's way to keep a send-only handle for probing).
+    ///
+    /// [`Self::connect`] keys its `::ffff:` family bridging off the
+    /// socket family, so a dual-stack adopted socket (`[::]` bind) dials
+    /// plain-v4 peers transparently; [`Self::is_dual_stack`] still
+    /// reports false (see [`Self::bind_with_socket`] for why the flag is
+    /// not portably queryable), so callers fast-failing on family
+    /// mismatch should consult the socket family instead.
+    pub async fn dial_with_socket(
+        socket: std::net::UdpSocket,
+        identity: &ak_identity::tls::TlsBundle,
+    ) -> io::Result<Self> {
+        Self::bind_inner(socket, identity, false).await
+    }
+
     /// Shared constructor behind `bind` / `bind_with_socket` /
     /// `bind_dual_stack`.
     async fn bind_inner(
@@ -1734,6 +1762,55 @@ mod tests {
         // The v4 inside the mapped form is what classifies.
         assert_eq!(channel.path(), PathKind::LocalDirect);
         assert_eq!(server_channel.path(), PathKind::LocalDirect);
+    }
+
+    /// CR-P1-05 (review 2026-11-11 §4.5), the sender-side adoption proof:
+    /// `dial_with_socket` builds the QUIC client on the CALLER-OWNED socket,
+    /// so the dial leaves from the very port the caller's STUN query /
+    /// probe round mapped — the port equation (endpoint local port ==
+    /// adopted socket port) is the whole point, and the channel genuinely
+    /// carries data. The adopted dual-stack socket dials the plain-v4
+    /// peer through the `::ffff:` bridge (same as `bind_dual_stack`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_with_socket_dials_from_the_adopted_port() {
+        let (client_id, _) = test_identity();
+        let (server_id, _) = test_identity();
+        let server = DirectEndpoint::bind(loopback_addr(), &server_id)
+            .await
+            .expect("server bind");
+        let adopted = match holepunch::bind_dual_stack_udp(0) {
+            Ok(socket) => socket,
+            Err(e) => {
+                eprintln!("skipping (best-effort): dual-stack bind unavailable here: {e}");
+                return;
+            }
+        };
+        let adopted_port = adopted.local_addr().expect("adopted local addr").port();
+        let client = DirectEndpoint::dial_with_socket(adopted, &client_id)
+            .await
+            .expect("dial-side adoption");
+        assert!(
+            !client.is_dual_stack(),
+            "adopted sockets never claim the flag"
+        );
+        assert_eq!(
+            client.local_addr().expect("endpoint local addr").port(),
+            adopted_port,
+            "the QUIC dial must leave from the adopted socket's port"
+        );
+
+        let server_addr = server.local_addr().expect("server addr");
+        let server_task = tokio::spawn(accept_eventually(server));
+        // The channel genuinely completes on the adopted socket's port
+        // (best-effort per the dual-stack skip rule).
+        if let Some(channel) =
+            connect_best_effort(&client, server_addr, &server_id.fingerprint).await
+        {
+            assert_eq!(channel.peer_fingerprint(), &server_id.fingerprint);
+            let server_channel = server_task.await.expect("join");
+            channel.close(0, b"done");
+            server_channel.close(0, b"done");
+        }
     }
 
     /// Best-effort: same skip rule as `bind_dual_stack_availability`.

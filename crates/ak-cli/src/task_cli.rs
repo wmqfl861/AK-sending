@@ -22,6 +22,19 @@
 //! * `task join-recv <CODE> [--out DIR]` — join as the receiver: redeem,
 //!   probe, serve with the consent prompt, disconnect after one task.
 //!
+//! CR-P1-05 (review 2026-11-11 §4.5): both connectivity directions ride
+//! THE socket that carries QUIC. The sender verbs (`code-send`,
+//! `join-send`) carry `--stun` (production default, `""` disables): the
+//! future-QUIC dial socket is bound and same-socket STUN-queried BEFORE
+//! the claim/redeem, the reflexive address rides this side's endpoint
+//! blob, and the send phase probes AND dials from that exact socket
+//! (`probe_dial_round_on` + `SendSpec::adopt_socket`). The receiver verbs
+//! additionally PUNCH: a send-only `try_clone` of the QUIC listener
+//! socket sends probe-shaped packets to every advertised sender
+//! candidate (150 ms cadence, ≤4 s window, stopped by the first accepted
+//! connection) so a port-restricted-cone NAT on the receiver side
+//! admits the sender's QUIC Initial.
+//!
 //! Registry resolution follows the `invite` family exactly
 //! (`--server`/`--registry-fp` persisted into `<id-dir>/registry.pin`,
 //! later invocations reuse the pin). Progress reuses the engine progress
@@ -62,11 +75,15 @@ use ak_session::pairing::task_net::{
     bind_echo_responder_socket, bind_receiver_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, echo_responder_loop, handshake_failure_word,
     insert_reflexive_candidate, local_candidates, order_candidates, prefers_lan, probe_dial_round,
-    probe_with_retry, windows_root_name_refusal, ConnectMarks, ATTEMPT_PAUSE, OBSERVED_DIAL_BUDGET,
+    probe_dial_round_on, probe_with_retry, punch_candidates, windows_root_name_refusal,
+    ConnectMarks, ATTEMPT_PAUSE, OBSERVED_DIAL_BUDGET, PUNCH_INTERVAL, PUNCH_WINDOW,
     RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_BUDGET,
     TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
     TASK_SETTLE_PAUSE,
 };
+// CR-P1-05: the shared sender-socket bind (aliased — the Session method
+// of the same role wraps it with this adapter's stdout lines).
+use ak_session::pairing::task_net::bind_sender_socket as task_net_bind_sender_socket;
 
 use crate::invite::RegistrySettings;
 
@@ -87,14 +104,15 @@ pub(crate) const CONSENT_WINDOW: Duration = Duration::from_secs(30);
 /// this often, so spoofed source churn cannot flood stdout.
 const ECHO_OBSERVE_LOG_WINDOW: Duration = Duration::from_secs(5);
 
-/// Default STUN server of the receiver verbs' `--stun` (CR-P1-02 改法第 2
-/// 条, "STUN 地址与注册中心一起配置"): the production coordination
-/// server's UDP STUN endpoint (docs/STATUS: registry 7200 TLS + legacy
-/// signal 7100/7101 on 122.51.121.24). Active by default so a NAT'd
-/// receiver publishes its reflexive candidate with zero flags; `--stun ""`
-/// explicitly disables the query (fail-open). MUST move to a domain name
-/// when CR-P3-03 (single hostname for the coordination server) lands — a
-/// hard-coded IP cannot survive a server migration.
+/// Default STUN server of the `--stun` verbs (CR-P1-02 改法第 2 条 for
+/// the receiver, CR-P1-05 for the sender — "STUN 地址与注册中心一起配置"):
+/// the production coordination server's UDP STUN endpoint (docs/STATUS:
+/// registry 7200 TLS + legacy signal 7100/7101 on 122.51.121.24). Active
+/// by default so a NAT'd receiver publishes its reflexive candidate and a
+/// NAT'd sender's dial socket gets its mapping with zero flags;
+/// `--stun ""` explicitly disables the query (fail-open). MUST move to a
+/// domain name when CR-P3-03 (single hostname for the coordination
+/// server) lands — a hard-coded IP cannot survive a server migration.
 const DEFAULT_STUN_ADDR: &str = "122.51.121.24:7101";
 
 // ---------------------------------------------------------------------------
@@ -122,6 +140,15 @@ pub(crate) enum TaskCommand {
         /// a cloud VM). Paired with this run's data/echo port.
         #[arg(long = "advertise")]
         advertise: Vec<std::net::IpAddr>,
+        /// STUN server ip:port for the SENDER's server-reflexive candidate
+        /// (CR-P1-05): queried ON the future-QUIC dial socket before the
+        /// code is claimed (the socket's NAT mapping survives into the
+        /// QUIC dial, and the reflected public address rides this side's
+        /// endpoint blob so the paired receiver can punch it). Default:
+        /// the production coordination server; pass an EMPTY value ("")
+        /// to disable the query.
+        #[arg(long, default_value = DEFAULT_STUN_ADDR)]
+        stun: String,
         /// Registry endpoint ip:port (with --registry-fp; persisted).
         #[arg(long, requires = "registry_fp")]
         server: Option<SocketAddr>,
@@ -171,6 +198,15 @@ pub(crate) enum TaskCommand {
         /// a cloud VM). Paired with this run's data/echo port.
         #[arg(long = "advertise")]
         advertise: Vec<std::net::IpAddr>,
+        /// STUN server ip:port for the SENDER's server-reflexive candidate
+        /// (CR-P1-05): queried ON the future-QUIC dial socket BEFORE the
+        /// redeem (the blob the redeem registers carries the reflexive
+        /// address; the socket's NAT mapping survives into the QUIC dial
+        /// — the probe round and every dial attempt leave from it).
+        /// Default: the production coordination server; pass an EMPTY
+        /// value ("") to disable the query.
+        #[arg(long, default_value = DEFAULT_STUN_ADDR)]
+        stun: String,
         #[arg(long, requires = "registry_fp")]
         server: Option<SocketAddr>,
         #[arg(long, requires = "server")]
@@ -227,6 +263,7 @@ pub(crate) async fn task_command(id: &Path, cmd: TaskCommand) -> Result<()> {
             paths,
             ttl_secs,
             advertise,
+            stun,
             server,
             registry_fp,
         } => {
@@ -234,6 +271,7 @@ pub(crate) async fn task_command(id: &Path, cmd: TaskCommand) -> Result<()> {
             let registry = crate::invite::resolve_registry(id, server, registry_fp)?;
             let mut cfg = TaskRunConfig::new(id.to_path_buf(), registry, ttl);
             cfg.advertise = advertise;
+            cfg.stun = resolve_stun(&stun)?;
             check_send_paths(&paths)?;
             run_and_report(run_code_send(cfg, TaskHooks::production(), paths)).await
         }
@@ -257,12 +295,14 @@ pub(crate) async fn task_command(id: &Path, cmd: TaskCommand) -> Result<()> {
             code,
             paths,
             advertise,
+            stun,
             server,
             registry_fp,
         } => {
             let registry = crate::invite::resolve_registry(id, server, registry_fp)?;
             let mut cfg = TaskRunConfig::new(id.to_path_buf(), registry, TASK_CODE_TTL_SECS);
             cfg.advertise = advertise;
+            cfg.stun = resolve_stun(&stun)?;
             check_send_paths(&paths)?;
             run_and_report(run_join_send(cfg, TaskHooks::production(), code, paths)).await
         }
@@ -329,7 +369,8 @@ fn resolve_ttl(secs: Option<u32>) -> Result<u32> {
     Ok(raw)
 }
 
-/// `--stun` resolution of the receiver verbs (CR-P1-02 改法第 2 条): the
+/// `--stun` resolution of the verbs that carry it (CR-P1-02 改法第 2 条
+/// receiver side; CR-P1-05 sender side): the
 /// clap default already carries the production endpoint, so the common
 /// path is a valid address; an explicit EMPTY value is the operator's
 /// opt-out (no query, fail-open — the same absent/empty semantics as the
@@ -399,10 +440,12 @@ pub(crate) struct TaskRunConfig {
     /// STUN server of the receiver verbs' `--stun` (CR-P1-02 改法第 2
     /// 条): queried ON the receiver's own UDP socket, so the reflected
     /// address rides the advertised candidates and the NAT mapping
-    /// survives into the QUIC listener. `None` = no query, fail-open —
-    /// the DEFAULT of embedded tests and sender verbs (they own no
-    /// inbound data socket; the sender-side leg is CR-P1-02 改法第 3
-    /// 条's business).
+    /// survives into the QUIC listener. CR-P1-05 (review 2026-11-11
+    /// §4.5): the SENDER verbs carry it too — queried ON the future-QUIC
+    /// dial socket before the claim/redeem, so the reflexive address
+    /// rides the sender's own blob and the dial leaves from the mapped
+    /// port. `None` = no query, fail-open — the DEFAULT of embedded
+    /// tests (production verbs resolve `--stun`, empty string disables).
     pub(crate) stun: Option<SocketAddr>,
 }
 
@@ -568,6 +611,14 @@ struct Session {
     lock: Option<ConnectionLock>,
     code_id: Option<[u8; 16]>,
     link: Option<TaskLink>,
+    /// CR-P1-05 (review 2026-11-11 §4.5): the SENDER flow's adopted
+    /// future-QUIC dial socket — bound (and same-socket STUN-queried)
+    /// BEFORE the claim/redeem, kept here until the send phase: the
+    /// probe round runs on a `try_clone` of it and every engine dial
+    /// attempt adopts it, so the NAT mapping the STUN query opened
+    /// carries into the QUIC Initial. `None` on receiver flows and when
+    /// the bind failed (fail-open: the engine self-binds as before).
+    sender_socket: Option<std::net::UdpSocket>,
     /// The pairing-completion publisher (the owner loop holds a clone; the
     /// joiner flows publish through [`Session::set_link`]).
     link_tx: tokio::sync::watch::Sender<Option<TaskLink>>,
@@ -682,6 +733,7 @@ async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
         lock: Some(lock),
         code_id: None,
         link: None,
+        sender_socket: None,
         link_tx,
     })
 }
@@ -698,6 +750,55 @@ impl Session {
 }
 
 impl Session {
+    /// CR-P1-05 (review 2026-11-11 §4.5 改法第 2 条, sender half): bind
+    /// the SENDER flow's future-QUIC dial socket — dual-stack first, the
+    /// optional STUN reflexive query ON THAT SAME SOCKET (same 2 s
+    /// fail-open budget as the receiver) — stash it for the send phase
+    /// ([`Session::sender_socket`]) and return `(bound, reflexive)`.
+    /// The caller MUST insert the reflexive address into its derived
+    /// candidate list BEFORE the claim/redeem (the registered blob is
+    /// the paired receiver's punch target). A bind failure fails open
+    /// to the historical port-0 advertisement + engine self-bind (the
+    /// bounded reason prints; the sender, unlike the receiver, does not
+    /// NEED a pre-bound socket to function).
+    async fn bind_sender_socket(
+        &mut self,
+        stun: Option<SocketAddr>,
+    ) -> Result<(SocketAddr, Option<SocketAddr>)> {
+        let sock = match task_net_bind_sender_socket(stun).await {
+            Ok(sock) => sock,
+            Err(reason) => {
+                println!("[task] sender socket bind failed ({reason}); dialing without adoption");
+                return Ok((SocketAddr::from(([0, 0, 0, 0], 0)), None));
+            }
+        };
+        if let Some(reason) = &sock.bind_fallback {
+            println!(
+                "[task] dual-stack bind unavailable ({reason}); \
+                 falling back to the IPv4-only bind"
+            );
+        }
+        match sock.reflexive {
+            Some(reflexive) => println!(
+                "[task] stun reflexive {reflexive} (queried on the sender socket; \
+                 the QUIC dial adopts this socket)"
+            ),
+            None if sock.stun_error.is_some() => println!(
+                // Deliberately avoids the word "advertising" (the itests
+                // grep for it to find the candidate list lines).
+                "[task] stun query failed ({}); local candidates only",
+                sock.stun_error.as_deref().unwrap_or_default()
+            ),
+            None => {} // no server configured: nothing to report
+        }
+        let bound = sock
+            .socket
+            .local_addr()
+            .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
+        self.sender_socket = Some(sock.socket);
+        Ok((bound, sock.reflexive))
+    }
+
     /// Bind the probe echo responder (derived candidates append its port
     /// last; see `blob_candidates`): the shared socket bind + loop live in
     /// `task_net` (dual-stack first, CR-P1-02 改法第 1 条 — the responder
@@ -987,10 +1088,49 @@ async fn run_task_receiver(
         ),
         None => {} // no server configured: nothing to report
     }
+    // CR-P1-05 (review 2026-11-11 §4.5 改法第 3 条, receiver half): keep a
+    // SEND-ONLY `try_clone` of the QUIC socket (duplicate handle, same
+    // local port) BEFORE it moves into the endpoint — the punch task
+    // below sends the peer-opening packets FROM the QUIC socket's port,
+    // so a port-restricted-cone NAT on this side admits the sender's
+    // QUIC Initial. The clone never receives (it would compete with
+    // quinn for the socket queue).
+    let punch_clone = sock.socket.try_clone().ok();
     let endpoint = match ak_net::DirectEndpoint::bind_with_socket(sock.socket, &identity).await {
         Ok(endpoint) => endpoint,
         Err(_) => return, // the dropped oneshot fails the bind wait
     };
+    // The punch task: waits for THIS side's pairing (the session's link
+    // watch flips when `set_link` runs), then fires bounded punches at
+    // the SENDER's advertised candidates — concurrently with the
+    // sender's dial, every PUNCH_INTERVAL for at most PUNCH_WINDOW,
+    // stopped early by the first accepted data-plane connection (the
+    // flag below). Bounded and detached: it never blocks the accept
+    // loop, and the window ends it even if nothing else does.
+    let punch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(punch_socket) = punch_clone {
+        let mut punch_link_rx = ctx.link_rx.clone();
+        let punch_stop_loop = Arc::clone(&punch_stop);
+        tokio::spawn(async move {
+            loop {
+                let link_now = punch_link_rx.borrow_and_update().clone();
+                if let Some(link) = link_now {
+                    let candidates = link.peer.candidates.clone();
+                    println!(
+                        "[task] punching {} advertised sender candidate(s) every {} ms for up to {} s",
+                        candidates.len(),
+                        PUNCH_INTERVAL.as_millis(),
+                        PUNCH_WINDOW.as_secs(),
+                    );
+                    punch_candidates(punch_socket, &candidates, &punch_stop_loop, |_| {}).await;
+                    return;
+                }
+                if punch_link_rx.changed().await.is_err() {
+                    return; // the session's link publisher is gone
+                }
+            }
+        });
+    }
     let bound = match endpoint.local_addr() {
         Ok(addr) => addr,
         Err(_) => return,
@@ -1052,6 +1192,10 @@ async fn run_task_receiver(
                 continue;
             }
         };
+        // CR-P1-05: the FIRST successful data-plane connection stops the
+        // punch loop early — from here on the QUIC connection itself
+        // keeps the mapping hot.
+        punch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let out_dir = ctx.out_dir.clone();
         let _ = std::fs::create_dir_all(&out_dir);
         let mut spec = ReceiveSpec::new(out_dir.clone(), identity.clone());
@@ -1480,28 +1624,37 @@ enum Attempt {
 /// connect-level failure of the whole list gets [`TASK_CONNECT_PASSES`]
 /// passes (the just-paired peer's admission bookkeeping can trail the
 /// pairing by a beat). Since CR-P1-02 改法第 3 条 the connect phase OPENS
-/// with one simultaneous-probe round ([`probe_dial_round`]): when it
-/// observes an answering address, that address leads the dial order
-/// under the bounded [`OBSERVED_DIAL_BUDGET`]; with no observation the
-/// round is invisible and the static order dials exactly as before.
+/// with one simultaneous-probe round: when it observes an answering
+/// address, that address leads the dial order under the bounded
+/// [`OBSERVED_DIAL_BUDGET`]; with no observation the round is invisible
+/// and the static order dials exactly as before. CR-P1-05: when the
+/// sender flow stashed an ADOPTED dial socket, the round runs on a
+/// `try_clone` of IT ([`probe_dial_round_on`]) and every dial attempt
+/// adopts the same socket — the review's core rule (审核改法第 4 条:
+/// probing AND QUIC on one socket); the legacy throwaway round covers
+/// the no-stash fallback byte for byte.
 async fn drive_task_send(
     pairing: &TaskPairing,
     key: &DeviceKeyPair,
     id_dir: &Path,
     link: &TaskLink,
     paths: &[PathBuf],
+    adopted: Option<&std::net::UdpSocket>,
 ) -> Result<Report> {
     let static_order = order_candidates(link.peer.candidates.clone());
     if static_order.is_empty() {
         bail!("the paired peer advertised no dial candidates");
     }
-    // 改法第 3 条: probe round first (≤ the shared PROBE_DIAL_WINDOW
-    // before the first dial attempt), observed address leads when any.
-    // The CLI-side stdout line rides the shared round's observation
-    // callback (deliberately avoids the words "advertising" and
-    // "connected via" — the itests grep those for the candidate list and
-    // the transfer verdict).
-    let dial = probe_dial_round(static_order, |head, report, probe_count| match head {
+    // 改法第 3 条 + CR-P1-05: probe round first (≤ the shared
+    // PROBE_DIAL_WINDOW before the first dial attempt), observed address
+    // leads when any. The CLI-side stdout line rides the shared round's
+    // observation callback (deliberately avoids the words "advertising"
+    // and "connected via" — the itests grep those for the candidate list
+    // and the transfer verdict).
+    let probe_observe = |head: Option<SocketAddr>,
+                         report: &ak_net::holepunch::PunchReport,
+                         probe_count: usize| {
+        match head {
         Some(head) => println!(
             "[task] probe round observed {head} ({} of {probe_count} candidate(s) answered, {} peer probe packet(s) in); dialing the observed address first",
             report.reachable.len(),
@@ -1511,8 +1664,20 @@ async fn drive_task_send(
             "[task] probe round observed nothing ({probe_count} candidate(s) probed in {} ms); dialing the advertised order",
             report.elapsed.as_millis(),
         ),
-    })
-    .await;
+    }
+    };
+    let dial = match adopted.map(|socket| socket.try_clone().ok()) {
+        Some(Some(round_socket)) => {
+            probe_dial_round_on(
+                round_socket,
+                static_order.len(),
+                static_order,
+                probe_observe,
+            )
+            .await
+        }
+        _ => probe_dial_round(static_order, probe_observe).await,
+    };
     let printer = crate::progress_printer("send");
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
@@ -1533,7 +1698,12 @@ async fn drive_task_send(
             } else {
                 TASK_CONNECT_BUDGET
             };
-            match attempt_send(key, id_dir, *addr, link.peer_fp, paths, &printer, budget).await {
+            let send_ctx = SendCtx {
+                key,
+                id_dir,
+                adopted,
+            };
+            match attempt_send(&send_ctx, *addr, link.peer_fp, paths, &printer, budget).await {
                 Attempt::Done(report) => {
                     // Which candidate actually carried the task (the FFI
                     // result carries the same fact as its `peer` field) —
@@ -1574,19 +1744,29 @@ async fn drive_task_send(
     bail!("no candidate accepted the connection ({detail})")
 }
 
+/// The per-send context shared by every candidate attempt of one task
+/// send (CR-P1-05 grouping): the device key + checkpoint dir of the run,
+/// plus the sender's ADOPTED dial socket when the flow stashed one (the
+/// QUIC Initial then leaves from the socket the same-socket STUN query
+/// and probe round mapped).
+struct SendCtx<'a> {
+    key: &'a DeviceKeyPair,
+    id_dir: &'a Path,
+    adopted: Option<&'a std::net::UdpSocket>,
+}
+
 /// One candidate attempt: build the send spec (family-matched bind, task
 /// idle budget covering the consent window), drive it under the connect
 /// budget, and classify the outcome.
 async fn attempt_send(
-    key: &DeviceKeyPair,
-    id_dir: &Path,
+    ctx: &SendCtx<'_>,
     addr: SocketAddr,
     pinned: Fingerprint,
     paths: &[PathBuf],
     printer: &Arc<dyn Fn(Progress) + Send + Sync>,
     connect_budget: Duration,
 ) -> Attempt {
-    let mut spec = SendSpec::new(paths[0].clone(), addr, pinned, make_self_signed(key));
+    let mut spec = SendSpec::new(paths[0].clone(), addr, pinned, make_self_signed(ctx.key));
     for extra in &paths[1..] {
         spec.add_root(extra.clone());
     }
@@ -1595,8 +1775,13 @@ async fn attempt_send(
     } else {
         SocketAddr::from(([0, 0, 0, 0], 0))
     };
-    spec.checkpoint_dir = id_dir.join("checkpoints");
-    spec.device_name = format!("ak-task-{}", key.fingerprint().short_id());
+    if let Some(socket) = ctx.adopted {
+        if let Ok(handle) = socket.try_clone() {
+            spec.adopt_socket(handle);
+        }
+    }
+    spec.checkpoint_dir = ctx.id_dir.join("checkpoints");
+    spec.device_name = format!("ak-task-{}", ctx.key.fingerprint().short_id());
     spec.idle_timeout = TASK_SEND_IDLE;
 
     let marks = Arc::new(ConnectMarks::new());
@@ -1833,15 +2018,17 @@ pub(crate) async fn run_code_send(
     let started = Instant::now();
     let mut session = open_session(&cfg, true).await?;
     let flow = async {
+        // CR-P1-05: same as join-send — the sender-role code binds the
+        // future-QUIC dial socket first (same-socket STUN), the blob
+        // carries the reflexive address + the dial socket's real port,
+        // and the send phase dials from this exact socket.
+        let (sender_bound, sender_reflexive) = session.bind_sender_socket(cfg.stun).await?;
         let echo_addr = session.bind_echo_responder()?;
-        // A sender-role code still advertises the creator's endpoints
-        // (port 0 marks "no listener", which a probe skips as undialable);
-        // the echo port appended last is the genuinely reachable one.
-        let dial = local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)));
+        let dial = insert_reflexive_candidate(local_candidates(sender_bound), sender_reflexive);
         let blob = with_advertised(
             blob_candidates(dial, Vec::new(), local_candidates(echo_addr), ""),
             &cfg.advertise,
-            echo_addr.port(),
+            sender_bound.port(),
         );
         if blob.is_empty() {
             bail!("no dialable candidate to advertise");
@@ -1895,7 +2082,17 @@ async fn send_phase(
 ) -> Result<Result<Report>> {
     let flow = async {
         probe_and_print(&session.stack.pairing, link).await;
-        drive_task_send(&session.stack.pairing, &session.key, id_dir, link, paths).await
+        drive_task_send(
+            &session.stack.pairing,
+            &session.key,
+            id_dir,
+            link,
+            paths,
+            // CR-P1-05: the sender flow's adopted dial socket (None on
+            // receiver flows and bind failure — the legacy path).
+            session.sender_socket.as_ref(),
+        )
+        .await
     };
     Ok(tokio::select! {
         report = flow => report,
@@ -1976,12 +2173,19 @@ pub(crate) async fn run_join_send(
     let started = Instant::now();
     let mut session = open_session(&cfg, false).await?;
     let flow = async {
+        // CR-P1-05 (review 2026-11-11 §4.5 改法第 2 条, sender half): the
+        // future-QUIC dial socket is bound and same-socket STUN-queried
+        // BEFORE the redeem — the blob the redeem registers carries the
+        // reflexive address and the socket's real port (the paired
+        // receiver's punch target), and the send phase below dials FROM
+        // this exact socket.
+        let (sender_bound, sender_reflexive) = session.bind_sender_socket(cfg.stun).await?;
         let echo_addr = session.bind_echo_responder()?;
-        let dial = local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)));
+        let dial = insert_reflexive_candidate(local_candidates(sender_bound), sender_reflexive);
         let blob = with_advertised(
             blob_candidates(dial, Vec::new(), local_candidates(echo_addr), ""),
             &cfg.advertise,
-            echo_addr.port(),
+            sender_bound.port(),
         );
         if blob.is_empty() {
             bail!("no dialable candidate to advertise");

@@ -230,6 +230,16 @@ pub struct SendSpec {
     /// `DirectPolicy::default()` (`allow_internet = true`,
     /// `allow_cellular = false`). A `LocalDirect` path always passes.
     pub policy: DirectPolicy,
+    /// Adopted pre-bound UDP socket for the dial (CR-P1-05, review
+    /// 2026-11-11 §4.5: both sides' probing/punching must happen on THE
+    /// socket that will carry QUIC). Crate-private by design — the ONLY
+    /// way in is the validating [`SendSpec::adopt_socket`] — so an
+    /// external builder cannot leave `bind` and the adopted socket
+    /// disagreeing. Shared behind an `Arc` so the derived `Clone` of the
+    /// spec (retry passes re-build specs) keeps ONE OS socket; `None`
+    /// (the default) keeps the historical self-bind of
+    /// [`SendSpec::bind`] byte for byte.
+    adopted_socket: Option<std::sync::Arc<std::net::UdpSocket>>,
 }
 
 impl SendSpec {
@@ -256,6 +266,7 @@ impl SendSpec {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             multistream: false,
             policy: DirectPolicy::default(),
+            adopted_socket: None,
         }
     }
 
@@ -263,6 +274,24 @@ impl SendSpec {
     /// Root names must be unique across the job; see [`SendSpec::extra_roots`].
     pub fn add_root(&mut self, path: PathBuf) {
         self.extra_roots.push(path);
+    }
+
+    /// Adopt a caller-owned, already-bound UDP socket for the QUIC dial
+    /// (CR-P1-05, review 2026-11-11 §4.5): when set, [`send`] builds its
+    /// endpoint on THIS socket via [`ak_net::DirectEndpoint::dial_with_socket`]
+    /// instead of binding [`SendSpec::bind`], so a NAT mapping the caller
+    /// opened on it (a same-socket STUN query, a probe round) survives
+    /// into the QUIC Initial. The socket is shared behind an `Arc` (a
+    /// cloned spec — retry passes rebuild them — dials from the same OS
+    /// socket; each actual [`send`] hands quinn a `try_clone` of it, a
+    /// duplicate handle with the same local port). `None` (never called)
+    /// keeps the self-bind path and its wire behavior byte-identical.
+    ///
+    /// The adopted socket dials both families when it is the dual-stack
+    /// `[::]` bind (quinn maps plain-v4 peers to `::ffff:` form
+    /// internally); a v4-only socket must be given v4 peers as usual.
+    pub fn adopt_socket(&mut self, socket: std::net::UdpSocket) {
+        self.adopted_socket = Some(std::sync::Arc::new(socket));
     }
 }
 
@@ -1401,9 +1430,18 @@ async fn admission_handshake_receiver(
 }
 
 /// Connect with a fast family check and a hard deadline. A v4 socket dialing
-/// a v6 peer (or vice versa) would otherwise hang in QUIC's retry loop with
-/// no error (found by the IPv6 scenario tests); the idle budget bounds every
-/// other unreachable-peer case too.
+/// a v6 peer would otherwise hang in QUIC's retry loop with no error (found
+/// by the IPv6 scenario tests); the idle budget bounds every other
+/// unreachable-peer case too.
+///
+/// CR-P1-05: the family check bridges BEFORE failing, exactly the way
+/// `DirectEndpoint::connect` bridges the dial itself — an IPv6 local socket
+/// (the adopted dual-stack sender socket, or a `[::]` bind) dials a plain-v4
+/// peer in `::ffff:` mapped form, and an IPv4 local socket expands a mapped
+/// peer back to plain v4 — so only a genuinely undialable combination
+/// (v4 local, v6 peer) fast-fails. Callers that always matched families
+/// before (the historical task-plane per-candidate binds) observe identical
+/// outcomes.
 async fn connect_bounded(
     endpoint: &DirectEndpoint,
     peer: SocketAddr,
@@ -1411,6 +1449,11 @@ async fn connect_bounded(
     idle: Duration,
 ) -> Result<DirectChannel, EngineError> {
     let local = endpoint.local_addr()?;
+    let peer = match local {
+        local if local.is_ipv6() && peer.is_ipv4() => ak_net::classify::to_mapped(peer),
+        local if local.is_ipv4() => ak_net::classify::expand_mapped(peer),
+        _ => peer,
+    };
     if local.is_ipv4() != peer.is_ipv4() {
         return Err(EngineError::Connect(ak_net::ConnectError::Io(
             std::io::Error::new(
@@ -2404,7 +2447,18 @@ pub async fn send(
     let started = Instant::now();
     let prepared = prepare_send(&spec)?;
     progress(Progress::Connecting);
-    let endpoint = DirectEndpoint::bind(spec.bind, &spec.identity).await?;
+    // CR-P1-05: an adopted socket (same-socket STUN/probe lifecycle, see
+    // [`SendSpec::adopt_socket`]) carries the caller's NAT mapping into
+    // the QUIC dial; no adoption keeps the historical self-bind. The Arc
+    // keeps the OS socket alive across retry passes; this send hands
+    // quinn one duplicated handle of it (same local port).
+    let endpoint = match &spec.adopted_socket {
+        Some(socket) => {
+            let handle = socket.try_clone().map_err(EngineError::from)?;
+            DirectEndpoint::dial_with_socket(handle, &spec.identity).await?
+        }
+        None => DirectEndpoint::bind(spec.bind, &spec.identity).await?,
+    };
     let channel = connect_bounded(&endpoint, spec.peer, &spec.pinned, spec.idle_timeout).await?;
     // Policy gate (protocol step 0): a refused path closes the connection
     // before any stream is opened or frame sent.
@@ -4840,6 +4894,42 @@ mod tests {
         let (files, bytes) = count_entries(dst.path());
         assert_eq!((files, bytes), (2, 8 + 50_000));
         assert!(report.duration.as_nanos() > 0);
+    }
+
+    /// CR-P1-05 (review 2026-11-11 §4.5): a send whose spec ADOPTED a
+    /// pre-bound dual-stack socket dials through it — the plain-v4 peer
+    /// rides the `::ffff:` bridge of `connect_bounded` (the pre-adoption
+    /// fast-fail would have rejected this family combination), and the
+    /// full Offer→FinalAck path completes byte-identically. The port
+    /// equation (dial leaves from the adopted socket's port) is proven at
+    /// the ak-net transport layer; this test pins the ENGINE wiring.
+    #[tokio::test]
+    async fn adopted_socket_send_completes_through_the_dual_stack_dial() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(&src.path().join("adopted.bin"), b"same-socket dial");
+        let (mut send_spec, recv, _) = specs(src.path(), dst.path(), 16);
+        let adopted = match ak_net::holepunch::bind_dual_stack_udp(0) {
+            Ok(socket) => socket,
+            Err(reason) => {
+                eprintln!("skipping: dual-stack UDP bind unavailable ({reason})");
+                return;
+            }
+        };
+        send_spec.adopt_socket(adopted);
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+        send_spec.peer = addr_rx.await.unwrap();
+        assert!(send_spec.peer.is_ipv4(), "the receiver binds v4 loopback");
+        let report = send(send_spec, &noop)
+            .await
+            .expect("adopted send completes");
+        receiver.await.unwrap().expect("receive completes");
+        assert_eq!(report.files, 1);
+        assert_eq!(
+            fs::read(dst.path().join("adopted.bin")).unwrap(),
+            b"same-socket dial"
+        );
     }
 
     #[tokio::test]

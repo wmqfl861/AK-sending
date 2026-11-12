@@ -1136,12 +1136,24 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
     recv.wait_exit_ok(std::time::Duration::from_secs(60));
     let sender_log = sender.stdout.snapshot().join("\n");
 
-    // (1) The probe round ran and observed the FAKE (a candidate that
-    // answers probes but no QUIC) as the dial-leading head.
+    // (1) The probe round ran and observed a dial-leading head. CR-P1-05
+    // changed which candidate that is: the receiver's punch loop now
+    // sends probe-shaped packets FROM the receiver's own QUIC socket, so
+    // the receiver's QUIC-port candidate genuinely "answers" the round
+    // and — preceding the fake in the static LAN-first order — leads the
+    // dial (straight to the right socket). A head on the fake remains
+    // legal (the pre-punch shape, or a punch that missed the window);
+    // both must be ADVERTISED addresses.
     let observed = probe_observed_addr(&sender_log);
-    assert_eq!(
-        observed, fake.addr,
-        "the probe round must observe the probe-answering fake first: {sender_log}"
+    let observed_text = observed.to_string();
+    assert!(
+        advertised.split_whitespace().any(|token| token == observed_text),
+        "the observed head must be a genuinely advertised candidate: {observed_text} not in {advertised}"
+    );
+    assert!(
+        observed == fake.addr || observed.port() == real_port,
+        "the head is the probe-answering fake or the punch-revealed QUIC candidate: {observed} (fake {}, real port {real_port}): {sender_log}",
+        fake.addr
     );
 
     // (2) The observed-first attempt cannot carry QUIC; the fallback
@@ -1192,9 +1204,12 @@ fn probe_round_observes_the_real_advertised_candidates() {
     let real_port = receiver_bound_port(&bound);
 
     // The observed head is one of the receiver's genuinely ADVERTISED
-    // addresses (it appears in the advertising line), and it is the echo
-    // responder's port — not the QUIC port (the honest boundary: no
-    // advertised address both answers probes and accepts QUIC today).
+    // addresses (it appears in the advertising line). CR-P1-05 supersedes
+    // the old boundary note ("the probe-answering candidate is the echo
+    // responder's port, never the QUIC port"): the receiver's punch loop
+    // now sends probe-shaped packets FROM the QUIC socket, so the QUIC
+    // candidate answers too — and when it leads, the observed-first dial
+    // connects straight to the right socket (the winner check below).
     let observed = probe_observed_addr(&sender_log);
     let observed_text = observed.to_string();
     assert!(
@@ -1202,11 +1217,6 @@ fn probe_round_observes_the_real_advertised_candidates() {
             .split_whitespace()
             .any(|token| token == observed_text),
         "the probe round must observe a genuinely advertised candidate: {observed_text} not in {advertised}"
-    );
-    assert_ne!(
-        observed.port(),
-        real_port,
-        "the probe-answering candidate is the echo responder's port, never the QUIC port: {sender_log}"
     );
 
     // The observed-first attempt fails over to the real receiver.
@@ -1219,5 +1229,314 @@ fn probe_round_observes_the_real_advertised_candidates() {
     assert!(
         sender_log.contains("[task] done:"),
         "the plain chain still completes: {sender_log}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CR-P1-05 (review 2026-11-11 §4.5): the SENDER's same-socket lifecycle and
+// the RECEIVER's hole punch, over the REAL product path. Two proofs:
+//
+// 1. Same-socket (sender): a truthful responder reflects the join-sender's
+//    reflexive address, and the receiver's "paired; peer" line names the
+//    ADVERTISED blob's port — the two ports must be EQUAL: the STUN query
+//    ran on the very socket whose port the blob advertises and the
+//    engine's dial adopts (a throwaway query socket would reflect its own
+//    ephemeral port, and the blob would carry a different one).
+// 2. Punch (receiver): a DISTINCT responder reflects a fixed address whose
+//    port is a PLAIN UdpSocket this test owns; that address rides the
+//    join-sender's advertised blob, and the RECEIVER's punch loop — fired
+//    from the QUIC socket's clone — puts probe-shaped packets into the
+//    test socket FROM the receiver's bound QUIC port. Same-host loopback
+//    is not a NAT traversal claim (no NAT sits on the path); these tests
+//    pin the wiring, not the traversal.
+// ---------------------------------------------------------------------------
+
+/// Extract the address of the sender's "stun reflexive …" line (the
+/// join-sender's own reflection).
+fn sender_stun_reflexive_addr(sender_log: &str) -> SocketAddr {
+    let line = sender_log
+        .lines()
+        .find(|line| line.contains("[task] stun reflexive "))
+        .unwrap_or_else(|| panic!("no stun reflexive line in the sender log:\n{sender_log}"));
+    line.split("[task] stun reflexive ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse().ok())
+        .unwrap_or_else(|| panic!("reflexive address in the line: {line}"))
+}
+
+/// One `task code-recv` child with STUN disabled (the receiver side is a
+/// bystander in the CR-P1-05 sender tests).
+fn spawn_recv_quiet_stun(tag: &str, registry: &RegistryProc, root: &std::path::Path) -> Proc {
+    let id_recv = root.join(format!("{tag}-id-recv"));
+    let out = root.join(format!("{tag}-out"));
+    for dir in [&id_recv, &out] {
+        std::fs::create_dir_all(dir).expect("create recv dir");
+    }
+    let args: Vec<String> = [
+        "--id-dir".to_string(),
+        id_recv.to_string_lossy().into_owned(),
+        "task".to_string(),
+        "code-recv".to_string(),
+        "--out".to_string(),
+        out.to_string_lossy().into_owned(),
+        "--stun".to_string(),
+        String::new(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .to_vec();
+    Proc::spawn(tag, &args)
+}
+
+/// The join-send child with an explicit `--stun` (CR-P1-05: the sender
+/// verbs carry the flag now) plus a payload directory of `tag`'s own.
+fn spawn_join_send_with_stun(
+    tag: &str,
+    registry: &RegistryProc,
+    root: &std::path::Path,
+    code: &str,
+    stun: &str,
+) -> (Proc, PathBuf) {
+    let id_send = root.join(format!("{tag}-id-send"));
+    let src = root.join(format!("{tag}-src"));
+    std::fs::create_dir_all(&id_send).expect("sender id dir");
+    std::fs::create_dir_all(&src).expect("sender src dir");
+    write_file(
+        &src.join("payload.bin"),
+        &common::Lcg::new(0xC5C5_0000_0000_0005).bytes(256 * 1024),
+    );
+    let args: Vec<String> = [
+        "--id-dir".to_string(),
+        id_send.to_string_lossy().into_owned(),
+        "task".to_string(),
+        "join-send".to_string(),
+        code.to_string(),
+        src.to_string_lossy().into_owned(),
+        "--stun".to_string(),
+        stun.to_string(),
+        "--server".to_string(),
+        registry.addr.to_string(),
+        "--registry-fp".to_string(),
+        registry.fp_hex.clone(),
+    ]
+    .to_vec();
+    (Proc::spawn(tag, &args), src)
+}
+
+/// Proof 1: the sender's STUN query runs on THE socket the engine dial
+/// adopts — the truthful reflection's port equals the port the sender's
+/// ADVERTISED blob carries (the receiver's "paired; peer" line).
+#[test]
+fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
+    // Loopback UDP must be bindable for the responder and both children.
+    match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(probe) => drop(probe),
+        Err(error) => {
+            eprintln!("skipping: 127.0.0.1 UDP bind unavailable: {error}");
+            return;
+        }
+    }
+    let responder = StunResponder::spawn(None); // truthful echo of the source
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-cr5a",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let mut recv = spawn_recv_quiet_stun("t03-cr5a-recv", &registry, tmp.path());
+    recv.stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+    let code_line = recv
+        .stdout
+        .wait_for("AKI1-", std::time::Duration::from_secs(60));
+    let code = code_line
+        .trim()
+        .strip_prefix("AKI1-")
+        .map(|rest| format!("AKI1-{rest}"))
+        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+
+    let (mut sender, src) = spawn_join_send_with_stun(
+        "t03-cr5a-send",
+        &registry,
+        tmp.path(),
+        &code,
+        &responder.addr.to_string(),
+    );
+    let reflexive_line = sender
+        .stdout
+        .wait_for("stun reflexive", std::time::Duration::from_secs(10));
+    let reflexive = sender_stun_reflexive_addr(&reflexive_line);
+    assert_eq!(
+        reflexive.ip(),
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "the truthful responder reflects the sender's own source: {reflexive_line}"
+    );
+
+    // Drive the transfer to completion (offer + consent + done).
+    recv.stdout.wait_for(
+        "the peer wants to send",
+        std::time::Duration::from_secs(120),
+    );
+    recv.consent_yes(
+        &["[recv]", "task complete", "declined"],
+        std::time::Duration::from_secs(40),
+    );
+    sender.wait_exit_ok(std::time::Duration::from_secs(180));
+    recv.wait_exit_ok(std::time::Duration::from_secs(60));
+
+    // THE same-socket proof, wire shape: the sender's ADVERTISED blob
+    // (what the receiver's "paired; peer …" line names) carries the very
+    // port the truthful STUN reflection reported — the query ran on the
+    // socket whose port the blob advertises and the engine dial adopts
+    // (a throwaway query socket would reflect its own ephemeral port,
+    // and the blob would carry a different one). The unit suite pins
+    // the probe-round leg of the same rule
+    // (`probe_round_on_leaves_from_the_caller_owned_port`).
+    let recv_log = recv.stdout.snapshot().join("\n");
+    let paired_line = recv_log
+        .lines()
+        .find(|line| line.contains("[task] paired; peer "))
+        .unwrap_or_else(|| panic!("no paired line in the receiver log:\n{recv_log}"));
+    let advertised_port = paired_line
+        .split("[task] paired; peer ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|| panic!("peer endpoint token in the line: {paired_line}"));
+    assert_eq!(
+        reflexive.port(),
+        advertised_port,
+        "the STUN query must run on the socket the blob advertises (and the dial adopts): {reflexive_line} vs {paired_line}"
+    );
+    let sender_log = sender.stdout.snapshot().join("\n");
+    assert!(
+        sender_log.contains("[task] done:"),
+        "the transfer completes through the adopted dial socket: {sender_log}"
+    );
+    let landed = std::fs::read(tmp.path().join("t03-cr5a-recv-out").join("payload.bin"))
+        .expect("received payload");
+    assert_eq!(
+        landed,
+        std::fs::read(src.join("payload.bin")).expect("source payload"),
+        "payload bytes differ through the adopted dial socket"
+    );
+}
+
+/// Proof 2: the receiver's punch loop sends from the QUIC socket's port to
+/// the sender's ADVERTISED candidates — observable as probe-shaped packets
+/// arriving at a test-owned socket bound at the sender's reflected
+/// (distinct) address, sourced from the receiver's bound QUIC port.
+#[test]
+fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
+    // The test-owned socket at a LOOPBACK address no interface enumerates
+    // (127.0.0.9 is not 127.0.0.1, so the reflection never dedups away) —
+    // the stand-in for the sender's NAT-mapped public endpoint.
+    let punch_target = match std::net::UdpSocket::bind("127.0.0.9:0") {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("skipping: 127.0.0.9 UDP bind unavailable: {error}");
+            return;
+        }
+    };
+    let punch_addr = punch_target.local_addr().expect("punch target addr");
+    let responder = StunResponder::spawn(Some(punch_addr)); // fixed distinct reflection
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-cr5b",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+    let mut recv = spawn_recv_quiet_stun("t03-cr5b-recv", &registry, tmp.path());
+    let bound = recv
+        .stdout
+        .wait_for("receiver bound", std::time::Duration::from_secs(10));
+    let quic_port = receiver_bound_port(&bound);
+    let code_line = recv
+        .stdout
+        .wait_for("AKI1-", std::time::Duration::from_secs(60));
+    let code = code_line
+        .trim()
+        .strip_prefix("AKI1-")
+        .map(|rest| format!("AKI1-{rest}"))
+        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+
+    let (mut sender, src) = spawn_join_send_with_stun(
+        "t03-cr5b-send",
+        &registry,
+        tmp.path(),
+        &code,
+        &responder.addr.to_string(),
+    );
+    // The distinct reflection rides the sender's own reflexive line (and
+    // with it, the advertised blob).
+    sender.stdout.wait_for(
+        &format!("stun reflexive {punch_addr}"),
+        std::time::Duration::from_secs(10),
+    );
+
+    // THE punch observable: a probe-shaped packet from the receiver's
+    // bound QUIC port arrives at the advertised address within the punch
+    // window (the loop fires at pairing completion, concurrently with the
+    // sender's dial — read while the transfer runs).
+    punch_target
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .expect("punch target timeout");
+    // Pairing + punch window + transfer slack.
+    let punch_deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let mut punch_from_quic_port = false;
+    let mut buffer = [0u8; 1500];
+    while Instant::now() < punch_deadline {
+        match punch_target.recv_from(&mut buffer) {
+            Ok((len, from)) => {
+                assert!(
+                    ak_net::holepunch::is_probe_packet(&buffer[..len]),
+                    "the punch packet is probe-shaped: {len} bytes"
+                );
+                assert!(len <= 64, "the punch packet is small: {len} bytes");
+                if from.port() == quic_port {
+                    punch_from_quic_port = true;
+                    break;
+                }
+                // The pairing-time probe (ak-session's throwaway socket)
+                // also lands here; keep reading until the QUIC-socket
+                // punch shows up.
+            }
+            Err(_) => continue, // timeout tick: re-check the deadline
+        }
+    }
+    assert!(
+        punch_from_quic_port,
+        "the receiver's punch must arrive from its bound QUIC port {quic_port}"
+    );
+
+    // The transfer still completes (the junk candidate costs the sender
+    // nothing — it dials the RECEIVER's list, not its own).
+    recv.stdout.wait_for(
+        "the peer wants to send",
+        std::time::Duration::from_secs(120),
+    );
+    recv.consent_yes(
+        &["[recv]", "task complete", "declined"],
+        std::time::Duration::from_secs(40),
+    );
+    sender.wait_exit_ok(std::time::Duration::from_secs(180));
+    recv.wait_exit_ok(std::time::Duration::from_secs(60));
+    let recv_log = recv.stdout.snapshot().join("\n");
+    assert!(
+        recv_log.contains("[task] punching"),
+        "the receiver must report its punch loop: {recv_log}"
+    );
+    let landed = std::fs::read(tmp.path().join("t03-cr5b-recv-out").join("payload.bin"))
+        .expect("received payload");
+    assert_eq!(
+        landed,
+        std::fs::read(src.join("payload.bin")).expect("source payload"),
+        "payload bytes differ through the punched path"
     );
 }

@@ -88,6 +88,19 @@ impl SlidingWindow {
         true
     }
 
+    /// Events still inside the window as of `now`, without mutating (the
+    /// events deque may still carry stale entries until the next
+    /// `allow_at`; they are skipped, not dropped). CR-P2-10: the
+    /// fair-share layers read a source's in-window tally to decide who is
+    /// over their share without recording anything.
+    pub fn count_in_window(&self, now: Instant) -> usize {
+        self.events
+            .iter()
+            .rev()
+            .take_while(|&&event| now.duration_since(event) <= self.window)
+            .count()
+    }
+
     /// Milliseconds until the oldest recorded event leaves the window
     /// (a retry-after hint for rejected callers). Zero when empty.
     pub fn retry_after_ms(&self, now: Instant) -> u32 {
@@ -163,5 +176,27 @@ mod tests {
         let hint = window.retry_after_ms(t0 + Duration::from_secs(10));
         // The event at t0 leaves at t0+60s: ~50s remain.
         assert!((49_000..=50_000).contains(&hint), "hint was {hint}");
+    }
+
+    #[test]
+    fn window_counts_only_fresh_events_without_mutating() {
+        let mut window = SlidingWindow::new(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            window.allow_at(t0);
+        }
+        assert_eq!(window.count_in_window(t0), 3);
+        // Forty seconds later the same three are still fresh...
+        let mid = t0 + Duration::from_secs(40);
+        assert_eq!(window.count_in_window(mid), 3);
+        // ...and after they expire the tally drops to zero even though
+        // no `allow_at` has run to physically drop them.
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(window.count_in_window(later), 0);
+        // A rejected attempt records nothing, so the tally is unchanged.
+        let mut full = SlidingWindow::new(1, Duration::from_secs(60));
+        assert!(full.allow_at(t0));
+        assert!(!full.allow_at(t0));
+        assert_eq!(full.count_in_window(t0), 1);
     }
 }

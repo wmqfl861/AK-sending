@@ -2,7 +2,8 @@
 //! constant (`docs/contracts/pairing-flow.md` §8, §11 — numbers frozen
 //! there; the redeem budgets are the A2 task freeze, re-frozen 2026-11-11
 //! by CR-P1-03 into the four redeem layers plus the per-source connection
-//! caps).
+//! caps, and extended 2026-11-12 by CR-P2-10 with the hierarchical IPv6
+//! prefix aggregates and the fair-share semantics of the global layers).
 //!
 //! v2 listens on its own port; the v1 plaintext server keeps its own.
 //! There is no shared socket and no downgrade path between them.
@@ -33,16 +34,48 @@ pub const REDEEM_PER_SOURCE_PER_MIN: u32 = 30;
 /// [`REDEEM_PER_SOURCE_PER_MIN`]. Also shared-table state, so
 /// reconnecting with the same identity does not reset it.
 pub const REDEEM_PER_IDENTITY_PER_MIN: u32 = 30;
+/// Aggregate redeem attempts per minute over ALL /64 sources inside one
+/// IPv6 /56 prefix (contract §11, CR-P2-10 2026-11-12). A /56 is the
+/// common home-broadband delegation and holds 256 /64s; the aggregate is
+/// [`PREFIX_56_SHARE_MULTIPLIER`] × the per-/64 limit, so rotating
+/// subnets inside one household amplifies its redeem budget by at most
+/// 4× instead of 256× — a legitimate multi-subnet home never approaches
+/// it. Checked between the per-/64 and per-identity layers; stacks under
+/// the /48 aggregate and the global breaker.
+pub const REDEEM_PER_56_PER_MIN: u32 = PREFIX_56_SHARE_MULTIPLIER * REDEEM_PER_SOURCE_PER_MIN;
+/// Aggregate redeem attempts per minute over ALL /64 sources inside one
+/// IPv6 /48 prefix (contract §11, CR-P2-10 2026-11-12). A /48 is a
+/// site/LIR-scale allocation holding 65,536 /64s; the aggregate is
+/// [`PREFIX_48_SHARE_MULTIPLIER`] × the per-/64 limit, so site-scale
+/// prefix rotation is capped at 16× (three-plus orders of magnitude
+/// below full enumeration) while a campus/enterprise running a handful
+/// of busy subnets stays far under it. 480 < 600 deliberately: a single
+/// /48 cannot alone saturate the global fair-share breaker.
+pub const REDEEM_PER_48_PER_MIN: u32 = PREFIX_48_SHARE_MULTIPLIER * REDEEM_PER_SOURCE_PER_MIN;
+/// Aggregate multiplier of the per-source budgets granted to one IPv6
+/// /56 (contract §11, CR-P2-10): redeem AND concurrent-connection
+/// aggregates inside a /56 are capped at 4× one /64's budget.
+pub const PREFIX_56_SHARE_MULTIPLIER: u32 = 4;
+/// Aggregate multiplier of the per-source budgets granted to one IPv6
+/// /48 (contract §11, CR-P2-10): redeem AND concurrent-connection
+/// aggregates inside a /48 are capped at 16× one /64's budget.
+pub const PREFIX_48_SHARE_MULTIPLIER: u32 = 16;
 /// Server-wide redeem circuit breaker per minute (contract §11,
-/// CR-P1-03 2026-11-11). NOT an anti-enumeration bound — invite codes
-/// carry 160 bits of entropy, online guessing is infeasible — purely a
-/// last-resort cap on total per-minute redeem work (signature checks +
-/// store lookups) if many distinct sources misbehave at once, which no
-/// per-source budget can express. 600/min (10/s) is an order of
-/// magnitude above the aggregate redeem demand of this deployment
-/// class, so legitimate cross-source traffic never trips it; the old
-/// flat 60/min global window it replaces was low enough for ONE source
-/// to exhaust, denying every other source (CR-P1-03).
+/// CR-P1-03 2026-11-11; fair-share semantics CR-P2-10 2026-11-12). NOT
+/// an anti-enumeration bound — invite codes carry 160 bits of entropy,
+/// online guessing is infeasible — purely a last-resort bound on
+/// per-minute redeem work (signature checks + store lookups) if many
+/// distinct sources misbehave at once, which no per-source budget can
+/// express. FAIR SHARE: when the 600/min window is full the breaker no
+/// longer rejects everyone (the CR-P2-10 finding: ~20 IPv4 sources ×
+/// 30/min exhausted it and EVERY later source was refused) — it rejects
+/// only sources whose own in-window count has reached
+/// `REDEEM_GLOBAL_BREAKER_PER_MIN / active_sources` (floor:
+/// [`REDEEM_PER_SOURCE_PER_MIN`], so a normal source is never squeezed
+/// below its own budget). Below-share attempts are admitted and are NOT
+/// recorded in the (already full) global window, keeping its memory at
+/// 600 entries; the total-work bound becomes 30/min × active sources,
+/// with the per-/64 layer still tightening first.
 pub const REDEEM_GLOBAL_BREAKER_PER_MIN: u32 = 600;
 /// Concurrent v2 connections one source (IPv4 /32, IPv6 /64) may hold
 /// (contract §11, CR-P1-03 2026-11-11), checked at TCP accept. A real
@@ -51,6 +84,18 @@ pub const REDEEM_GLOBAL_BREAKER_PER_MIN: u32 = 600;
 /// IPv4 address while capping how many of the server-wide serving-cap
 /// slots (the engine's `MAX_LIVE_CONNECTIONS`) one source can pin.
 pub const MAX_CONNS_PER_SOURCE: usize = 8;
+/// Aggregate concurrent v2 connections over all /64 sources inside one
+/// IPv6 /56 (contract §11, CR-P2-10 2026-11-12) = 4 ×
+/// [`MAX_CONNS_PER_SOURCE`]; the handshaking subset is capped at 4 ×
+/// [`MAX_HANDSHAKING_PER_SOURCE`]. Same justification as
+/// [`REDEEM_PER_56_PER_MIN`]: prefix rotation inside one home
+/// delegation pins at most 4× one /64's serving footprint.
+pub const MAX_CONNS_PER_56: usize = PREFIX_56_SHARE_MULTIPLIER as usize * MAX_CONNS_PER_SOURCE;
+/// Aggregate concurrent v2 connections over all /64 sources inside one
+/// IPv6 /48 (contract §11, CR-P2-10 2026-11-12) = 16 ×
+/// [`MAX_CONNS_PER_SOURCE`]; the handshaking subset at 16 ×
+/// [`MAX_HANDSHAKING_PER_SOURCE`]. See [`REDEEM_PER_48_PER_MIN`].
+pub const MAX_CONNS_PER_48: usize = PREFIX_48_SHARE_MULTIPLIER as usize * MAX_CONNS_PER_SOURCE;
 /// Of a source's concurrent connections, at most this many may sit
 /// between the TCP accept and the finished TLS handshake (contract
 /// §11, CR-P1-03 2026-11-11), counted from accept — BEFORE any task is
@@ -132,10 +177,18 @@ pub struct Limits {
     pub frame_burst: u32,
     pub redeem_per_conn_per_min: u32,
     pub redeem_per_source_per_min: u32,
+    /// IPv6 /56 aggregate redeem window (see [`REDEEM_PER_56_PER_MIN`]).
+    pub redeem_per_56_per_min: u32,
+    /// IPv6 /48 aggregate redeem window (see [`REDEEM_PER_48_PER_MIN`]).
+    pub redeem_per_48_per_min: u32,
     pub redeem_per_identity_per_min: u32,
     /// Server-wide redeem breaker (see [`REDEEM_GLOBAL_BREAKER_PER_MIN`]).
     pub redeem_global_breaker_per_min: u32,
     pub max_conns_per_source: usize,
+    /// IPv6 /56 aggregate concurrent connections (see [`MAX_CONNS_PER_56`]).
+    pub max_conns_per_56: usize,
+    /// IPv6 /48 aggregate concurrent connections (see [`MAX_CONNS_PER_48`]).
+    pub max_conns_per_48: usize,
     pub max_handshaking_per_source: usize,
     pub max_active_invites_per_owner: usize,
     pub invite_claims_per_hour: u32,
@@ -154,9 +207,13 @@ impl Default for Limits {
             frame_burst: FRAME_BURST,
             redeem_per_conn_per_min: REDEEM_PER_CONN_PER_MIN,
             redeem_per_source_per_min: REDEEM_PER_SOURCE_PER_MIN,
+            redeem_per_56_per_min: REDEEM_PER_56_PER_MIN,
+            redeem_per_48_per_min: REDEEM_PER_48_PER_MIN,
             redeem_per_identity_per_min: REDEEM_PER_IDENTITY_PER_MIN,
             redeem_global_breaker_per_min: REDEEM_GLOBAL_BREAKER_PER_MIN,
             max_conns_per_source: MAX_CONNS_PER_SOURCE,
+            max_conns_per_56: MAX_CONNS_PER_56,
+            max_conns_per_48: MAX_CONNS_PER_48,
             max_handshaking_per_source: MAX_HANDSHAKING_PER_SOURCE,
             max_active_invites_per_owner: MAX_ACTIVE_INVITES_PER_OWNER,
             invite_claims_per_hour: INVITE_CLAIMS_PER_HOUR,
@@ -219,7 +276,11 @@ mod tests {
             limits.redeem_global_breaker_per_min,
             REDEEM_GLOBAL_BREAKER_PER_MIN
         );
+        assert_eq!(limits.redeem_per_56_per_min, REDEEM_PER_56_PER_MIN);
+        assert_eq!(limits.redeem_per_48_per_min, REDEEM_PER_48_PER_MIN);
         assert_eq!(limits.max_conns_per_source, MAX_CONNS_PER_SOURCE);
+        assert_eq!(limits.max_conns_per_56, MAX_CONNS_PER_56);
+        assert_eq!(limits.max_conns_per_48, MAX_CONNS_PER_48);
         assert_eq!(
             limits.max_handshaking_per_source,
             MAX_HANDSHAKING_PER_SOURCE
@@ -234,13 +295,22 @@ mod tests {
         // The frozen numbers themselves (contract §11; the redeem layers
         // and per-source connection caps were re-frozen 2026-11-11 by
         // CR-P1-03 — per-source/per-identity windows replace the flat
-        // 60/min global limiter, which one source could exhaust).
+        // 60/min global limiter, which one source could exhaust — and
+        // extended 2026-11-12 by CR-P2-10 with the hierarchical IPv6
+        // prefix aggregates: 4× per-source at /56, 16× at /48, both
+        // below the global breaker so one prefix cannot alone trip it).
         assert_eq!(REDEEM_PER_CONN_PER_MIN, 10);
         assert_eq!(REDEEM_PER_SOURCE_PER_MIN, 30);
         assert_eq!(REDEEM_PER_IDENTITY_PER_MIN, 30);
+        assert_eq!(REDEEM_PER_56_PER_MIN, 120);
+        assert_eq!(REDEEM_PER_48_PER_MIN, 480);
         assert_eq!(REDEEM_GLOBAL_BREAKER_PER_MIN, 600);
         assert_eq!(MAX_CONNS_PER_SOURCE, 8);
+        assert_eq!(MAX_CONNS_PER_56, 32);
+        assert_eq!(MAX_CONNS_PER_48, 128);
         assert_eq!(MAX_HANDSHAKING_PER_SOURCE, 4);
+        assert_eq!(PREFIX_56_SHARE_MULTIPLIER, 4);
+        assert_eq!(PREFIX_48_SHARE_MULTIPLIER, 16);
         // 2026-11-09: the contract raised the per-owner claim budget from
         // 6 to 30 per hour (pairing-flow.md §11/§12 note); the frozen
         // literal follows the contract (R36-P2-06).

@@ -25,7 +25,7 @@
 //! transcript-digest consistency across `PairProof`/`PairPrepared`/
 //! `PairApplied`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,8 +48,9 @@ use crate::protocol_v2::{
     REDEEM_EXHAUSTED, REQUEST_CONFLICT, RESOURCE_LIMIT, REVISION_CONFLICT, STORAGE_UNAVAILABLE,
 };
 use crate::server_v2::config::{
-    Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, REDEEM_MAX_WINDOW, SOURCE_TABLE_IDLE_TTL,
-    SOURCE_TABLE_MAX_ENTRIES, SWEEP_INTERVAL,
+    Config, Limits, JOURNAL_MAX_ROWS, OUTBOX_DEPTH, PREFIX_48_SHARE_MULTIPLIER,
+    PREFIX_56_SHARE_MULTIPLIER, REDEEM_MAX_WINDOW, SOURCE_TABLE_IDLE_TTL, SOURCE_TABLE_MAX_ENTRIES,
+    SWEEP_INTERVAL,
 };
 use crate::server_v2::framing::{read_frame, write_frame, write_message};
 use crate::server_v2::ratelimit::{SlidingWindow, TokenBucket};
@@ -85,6 +86,14 @@ type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
 // budgets, so a single machine can neither pin the serving cap with
 // connect-only sockets nor drain the redeem budgets with self-generated
 // identities.
+//
+// CR-P2-10 closes the remaining one-sided global levers: the redeem
+// breaker and the serving cap now shed traffic by per-source FAIR SHARE
+// instead of refusing everyone (a /64 source over its share is shed, a
+// below-share source is still admitted — 20 sources × 30/min or 32
+// sources × 8 connections can no longer lock every other source out),
+// and IPv6 sources stack hierarchical /56 and /48 aggregate caps on top
+// of the per-/64 caps (see [`v6_parents`]).
 
 /// Budget for one TLS handshake after the TCP accept. 10 s (CR-P1-03,
 /// shortened from 30 s): a connect-only socket now parks here at most
@@ -93,13 +102,37 @@ type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
 /// anything slower is hostile or broken, not slow.
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum simultaneously served TLS connections (accepted-and-counted,
-/// including handshakes in progress). Beyond it a connection may still
-/// complete the handshake and receive one `ServerError`, but those
-/// rejection tasks run under their own small budget
-/// ([`MAX_REJECT_TASKS`]) — past that budget the socket is dropped at
-/// accept time, so a flood of excess connections can never stack
-/// unbounded handshake work (R36-P1-03).
+/// including handshakes in progress) — the SOFT cap of the CR-P2-10
+/// fair-share policy. At or over it, admission continues for sources
+/// holding fewer than [`conn_fair_share`] connections (see that fn for
+/// the exact invariants) and everyone else is refused, so the ~32
+/// sources it takes to fill 256 slots cannot lock a newcomer out.
+/// Beyond it a refused connection may still complete the handshake and
+/// receive one `ServerError`, but those rejection tasks run under their
+/// own small budget ([`MAX_REJECT_TASKS`]) — past that budget the
+/// socket is dropped at accept time, so a flood of excess connections
+/// can never stack unbounded handshake work (R36-P1-03).
 const MAX_LIVE_CONNECTIONS: usize = 256;
+/// HARD cap on simultaneously served TLS connections (CR-P2-10): twice
+/// the soft cap. Fair-share admissions may overshoot
+/// [`MAX_LIVE_CONNECTIONS`] (every below-share source keeps being
+/// served while the soft cap is saturated), but never this bound — fds,
+/// tasks and memory stay bounded no matter how the load is distributed.
+/// 512 = 256 × 2 is coherent with [`FAIR_CONN_FLOOR`]: 256 sources can
+/// each hold their full floor (2 connections, a control connection plus
+/// the reconnect-overlap one) exactly at the hard cap.
+const MAX_LIVE_CONNECTIONS_HARD: usize = 2 * MAX_LIVE_CONNECTIONS;
+/// Floor of the per-source fair share of the serving cap (CR-P2-10):
+/// even with hundreds of active sources, a well-behaved source — one
+/// control connection, a second briefly during reconnect overlap (see
+/// [`crate::server_v2::config::MAX_CONNS_PER_SOURCE`]) — can always
+/// connect until the hard cap is reached. Below-share admission never
+/// refuses a source this small.
+const FAIR_CONN_FLOOR: usize = 2;
+/// The per-minute window shared by every redeem budget layer (contract
+/// §11; the constants in [`crate::server_v2::config`] are all per this
+/// window).
+const REDEEM_WINDOW: Duration = Duration::from_secs(60);
 /// Simultaneous over-cap rejection tasks (the polite one-`ServerError`
 /// answer). Small by design: it bounds CPU/sockets/tasks spent on
 /// connections that are already past the real serving cap.
@@ -184,150 +217,172 @@ pub async fn serve_v2(
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
-                    // CR-P1-03: per-source admission FIRST, and it is the
-                    // cheapest rejection in the whole pipeline — the
-                    // check-and-reserve of both source counters happens
-                    // under one lock, and a source over either cap
-                    // (concurrent connections / handshakes in progress)
-                    // loses its socket right here: no task is spawned, no
-                    // handshake work is ever started for it. A
-                    // connect-only flood therefore parks at most
-                    // `MAX_HANDSHAKING_PER_SOURCE` accepts per source and
+                    // CR-P1-03 + CR-P2-10 admission, all of it the
+                    // cheapest rejection in the whole pipeline: the
+                    // check-and-reserve of the per-source counters, the
+                    // IPv6 /56 and /48 aggregates, and the global
+                    // soft-cap fair share happens under one lock, and a
+                    // source over any of them loses its socket right
+                    // here: no task is spawned, no handshake work is
+                    // ever started for it. A connect-only flood
+                    // therefore parks at most
+                    // `MAX_HANDSHAKING_PER_SOURCE` accepts per source,
                     // can never occupy a globally meaningful share of
-                    // MAX_LIVE_CONNECTIONS.
+                    // the serving cap, and a prefix-rotation flood can
+                    // never exceed its delegation's aggregate.
+                    //
+                    // The live-connection slot is reserved atomically
+                    // BEFORE the lock: the fair-share decision needs the
+                    // pre-reservation count, and fetch-add-then-decide
+                    // keeps concurrent accepts from overshooting (each
+                    // sees its own reservation ordinal; a refused one
+                    // gives it straight back). The slot is released by
+                    // the task's RAII guard on EVERY exit path
+                    // (R36-P1-03): failed or timed-out TLS handshake,
+                    // ALPN mismatch, over-cap rejection, cancellation
+                    // (abort drops the future, running `Drop`) and the
+                    // normal connection-loop return.
                     let source = source_key(peer.ip());
-                    let source_admitted = {
+                    let reserved = shared.conn_count.fetch_add(1, Ordering::SeqCst);
+                    let admission = {
                         let mut inner = shared.lock();
-                        inner.source_admit(&shared.limits, source, Instant::now())
+                        inner.source_admit(&shared.limits, source, reserved, Instant::now())
                     };
-                    let admitted = if !source_admitted {
-                        log::warn!(
-                            "v2 per-source connection caps ({} concurrent, {} handshaking) \
-                             reached; dropping {peer}",
-                            shared.limits.max_conns_per_source,
-                            shared.limits.max_handshaking_per_source,
-                        );
-                        false
-                    } else {
-                        // Reserve a live-connection slot at accept time: the
-                        // cap must also bound half-open handshakes. The slot
-                        // is released by the task's RAII guard on EVERY exit
-                        // path (R36-P1-03): failed or timed-out TLS
-                        // handshake, ALPN mismatch, over-cap rejection,
-                        // cancellation (abort drops the future, running
-                        // `Drop`) and the normal connection-loop return.
-                        shared
-                            .conn_count
-                            .fetch_add(1, Ordering::SeqCst)
-                            < MAX_LIVE_CONNECTIONS
-                    };
-                    if admitted {
-                        let task_id = alloc_conn_task_id(&shared);
-                        let conn_shared = Arc::clone(&shared);
-                        let slot =
-                            ConnSlotGuard::admitted(Arc::clone(&conn_shared), task_id, source);
-                        let task = tokio::spawn(async move {
-                            let mut slot = slot;
-                            // P1-5: the TLS handshake itself is bounded.
-                            let stream = match tokio::time::timeout(
-                                TLS_ACCEPT_TIMEOUT,
-                                conn_shared.acceptor.accept(tcp),
-                            )
-                            .await
-                            {
-                                Ok(Ok(stream)) => stream,
-                                Ok(Err(e)) => {
-                                    log::debug!("v2 tls handshake with {peer} failed: {e}");
-                                    return;
-                                }
-                                Err(_) => {
-                                    log::debug!(
-                                        "v2 tls handshake with {peer} exceeded {:?}",
-                                        TLS_ACCEPT_TIMEOUT
-                                    );
-                                    return;
-                                }
-                            };
-                            // CR-P1-03: the handshake phase is over — this
-                            // connection's per-source handshaking slot goes
-                            // back immediately; the per-source live slot and
-                            // the global counters live until the task exits
-                            // (guard `Drop`). Failure paths above skip this
-                            // call; `Drop` then releases the handshaking
-                            // slot exactly once itself.
-                            slot.handshake_done();
-                            if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
-                                log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
-                                return;
-                            }
-                            connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
-                        });
-                        register_conn_task(&shared, task_id, task);
-                    } else if source_admitted {
-                        // Past the global cap but within the source caps:
-                        // give the just-reserved per-source slots back (the
-                        // polite rejection below deliberately holds NO
-                        // source slots — it is bounded globally by
-                        // MAX_REJECT_TASKS and carrying source counters in
-                        // a task that may outlive the source's own budget
-                        // accounting would only couple the two mechanisms).
-                        shared.lock().source_release(source, true, Instant::now());
-                        shared.conn_count.fetch_sub(1, Ordering::SeqCst);
-                        // Over the global cap. The polite rejection (one
-                        // bounded ServerError) still needs a full TLS
-                        // handshake, so it runs in its own task under a
-                        // SEPARATE small budget — never an unbounded
-                        // stack of handshakes past the real cap — and
-                        // every reject task is tracked like any other so
-                        // shutdown aborts it too. Past the reject budget
-                        // the socket is dropped at accept time.
-                        let budgeted = shared
-                            .reject_count
-                            .fetch_add(1, Ordering::SeqCst)
-                            < MAX_REJECT_TASKS;
-                        if budgeted {
+                    match admission {
+                        SourceAdmission::Admit => {
                             let task_id = alloc_conn_task_id(&shared);
                             let conn_shared = Arc::clone(&shared);
-                            let slot = ConnSlotGuard::reject(Arc::clone(&conn_shared), task_id);
+                            let slot = ConnSlotGuard::admitted(
+                                Arc::clone(&conn_shared),
+                                task_id,
+                                source,
+                            );
                             let task = tokio::spawn(async move {
-                                let _slot = slot;
-                                let mut stream = match tokio::time::timeout(
+                                let mut slot = slot;
+                                // P1-5: the TLS handshake itself is bounded.
+                                let stream = match tokio::time::timeout(
                                     TLS_ACCEPT_TIMEOUT,
                                     conn_shared.acceptor.accept(tcp),
                                 )
                                 .await
                                 {
                                     Ok(Ok(stream)) => stream,
-                                    Ok(Err(_)) | Err(_) => return,
+                                    Ok(Err(e)) => {
+                                        log::debug!("v2 tls handshake with {peer} failed: {e}");
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        log::debug!(
+                                            "v2 tls handshake with {peer} exceeded {:?}",
+                                            TLS_ACCEPT_TIMEOUT
+                                        );
+                                        return;
+                                    }
                                 };
+                                // CR-P1-03: the handshake phase is over — this
+                                // connection's per-source handshaking slot goes
+                                // back immediately; the per-source live slot and
+                                // the global counters live until the task exits
+                                // (guard `Drop`). Failure paths above skip this
+                                // call; `Drop` then releases the handshaking
+                                // slot exactly once itself.
+                                slot.handshake_done();
                                 if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err() {
+                                    log::debug!("v2 connection from {peer} without ALPN ak-signal/2");
                                     return;
                                 }
-                                log::warn!(
-                                    "v2 connection limit ({MAX_LIVE_CONNECTIONS}) reached; rejecting {peer}"
-                                );
-                                let reply =
-                                    server_error(ERR_SESSION_LIMIT, "connection limit reached");
-                                let sent = tokio::time::timeout(
-                                    FRAME_IO_DEADLINE,
-                                    write_message(&mut stream, &reply, Role::Server),
-                                )
-                                .await;
-                                if matches!(sent, Ok(Ok(()))) {
-                                    let _ = tokio::time::timeout(
-                                        TEARDOWN_GRACE,
-                                        stream.shutdown(),
-                                    )
-                                    .await;
-                                }
+                                connection_loop(stream, peer, Arc::clone(&conn_shared)).await;
                             });
                             register_conn_task(&shared, task_id, task);
-                        } else {
-                            shared.reject_count.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        SourceAdmission::OverSourceCaps => {
+                            // The source (or one of its IPv6 parent
+                            // prefixes) is over its own caps: return the
+                            // just-reserved global slot and drop the
+                            // socket at accept — no task, no handshake.
+                            shared.conn_count.fetch_sub(1, Ordering::SeqCst);
                             log::warn!(
-                                "v2 connection limit ({MAX_LIVE_CONNECTIONS}) reached and \
-                                 reject budget ({MAX_REJECT_TASKS}) exhausted; dropping {peer}"
+                                "v2 per-source/prefix connection caps (source {} concurrent \
+                                 / {} handshaking, /56 aggregate {}, /48 aggregate {}) reached; \
+                                 dropping {peer}",
+                                shared.limits.max_conns_per_source,
+                                shared.limits.max_handshaking_per_source,
+                                shared.limits.max_conns_per_56,
+                                shared.limits.max_conns_per_48,
                             );
+                        }
+                        SourceAdmission::OverGlobal => {
+                            // Past the serving cap on the global side (at
+                            // the soft cap with this source at/above its
+                            // fair share, or at the hard cap) but within
+                            // every source/prefix cap: give the reserved
+                            // global slot back. The polite rejection
+                            // (one bounded ServerError) below deliberately
+                            // holds NO source slots — it is bounded
+                            // globally by MAX_REJECT_TASKS and carrying
+                            // source counters in a task that may outlive
+                            // the source's own budget accounting would
+                            // only couple the two mechanisms.
+                            shared.conn_count.fetch_sub(1, Ordering::SeqCst);
+                            // The polite rejection still needs a full TLS
+                            // handshake, so it runs in its own task under a
+                            // SEPARATE small budget — never an unbounded
+                            // stack of handshakes past the real cap — and
+                            // every reject task is tracked like any other so
+                            // shutdown aborts it too. Past the reject budget
+                            // the socket is dropped at accept time.
+                            let budgeted = shared
+                                .reject_count
+                                .fetch_add(1, Ordering::SeqCst)
+                                < MAX_REJECT_TASKS;
+                            if budgeted {
+                                let task_id = alloc_conn_task_id(&shared);
+                                let conn_shared = Arc::clone(&shared);
+                                let slot =
+                                    ConnSlotGuard::reject(Arc::clone(&conn_shared), task_id);
+                                let task = tokio::spawn(async move {
+                                    let _slot = slot;
+                                    let mut stream = match tokio::time::timeout(
+                                        TLS_ACCEPT_TIMEOUT,
+                                        conn_shared.acceptor.accept(tcp),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(stream)) => stream,
+                                        Ok(Err(_)) | Err(_) => return,
+                                    };
+                                    if tls::check_alpn(stream.get_ref().1.alpn_protocol()).is_err()
+                                    {
+                                        return;
+                                    }
+                                    log::warn!(
+                                        "v2 connection limit ({MAX_LIVE_CONNECTIONS} soft, \
+                                         {MAX_LIVE_CONNECTIONS_HARD} hard) reached; rejecting {peer}"
+                                    );
+                                    let reply =
+                                        server_error(ERR_SESSION_LIMIT, "connection limit reached");
+                                    let sent = tokio::time::timeout(
+                                        FRAME_IO_DEADLINE,
+                                        write_message(&mut stream, &reply, Role::Server),
+                                    )
+                                    .await;
+                                    if matches!(sent, Ok(Ok(()))) {
+                                        let _ = tokio::time::timeout(
+                                            TEARDOWN_GRACE,
+                                            stream.shutdown(),
+                                        )
+                                        .await;
+                                    }
+                                });
+                                register_conn_task(&shared, task_id, task);
+                            } else {
+                                shared.reject_count.fetch_sub(1, Ordering::SeqCst);
+                                log::warn!(
+                                    "v2 connection limit ({MAX_LIVE_CONNECTIONS} soft, \
+                                     {MAX_LIVE_CONNECTIONS_HARD} hard) reached and reject budget \
+                                     ({MAX_REJECT_TASKS}) exhausted; dropping {peer}"
+                                );
+                            }
                         }
                     }
                 }
@@ -407,24 +462,48 @@ struct Inner {
     /// CR-P1-03: per-source connection counters AND the per-source
     /// redeem window in one entry (keyed by [`source_key`]), so a
     /// source's redeem budget survives reconnects — a flooder that
-    /// cycles TCP connections keeps its history. Pruned by the sweeper
-    /// only after [`SOURCE_TABLE_IDLE_TTL`] with zero counters; bounded
-    /// by [`SOURCE_TABLE_MAX_ENTRIES`] via [`make_room`].
-    sources: HashMap<IpAddr, SourceEntry>,
+    /// cycles TCP connections keeps its history. CR-P2-10 moves the
+    /// table into an [`IdleTable`] (O(log n) max-size eviction).
+    /// Pruned by the sweeper only after [`SOURCE_TABLE_IDLE_TTL`] with
+    /// zero counters; bounded by [`SOURCE_TABLE_MAX_ENTRIES`].
+    sources: IdleTable<IpAddr, SourceEntry>,
+    /// CR-P2-10: aggregate counters of all /64 sources inside one IPv6
+    /// /56 (see [`v6_parents`]); the caps are `Limits::max_conns_per_56`
+    /// / `Limits::redeem_per_56_per_min` (4× the per-source budgets).
+    prefixes56: IdleTable<IpAddr, SourceEntry>,
+    /// CR-P2-10: the same at /48 (`Limits::max_conns_per_48` /
+    /// `Limits::redeem_per_48_per_min`, 16×).
+    prefixes48: IdleTable<IpAddr, SourceEntry>,
     /// CR-P1-03: per-identity redeem windows (keyed by the
     /// Hello-authenticated device key), likewise shared across
     /// reconnects and TTL/bounded-pruned.
-    identity_redeem: HashMap<DeviceId, IdentityRedeemEntry>,
-    /// The server-wide redeem circuit breaker (CR-P1-03; see
-    /// [`crate::server_v2::config::REDEEM_GLOBAL_BREAKER_PER_MIN`] for
-    /// why it is deliberately very high).
+    identity_redeem: IdleTable<DeviceId, IdentityRedeemEntry>,
+    /// CR-P2-10: sources currently holding at least one live
+    /// connection — the divisor of [`conn_fair_share`]. Maintained
+    /// exactly and incrementally (0→live and live→0 transitions in
+    /// [`Inner::source_admit`] / [`Inner::source_release`]; entries
+    /// holding counters are never pruned or evicted, so it cannot
+    /// drift).
+    active_conn_sources: usize,
+    /// CR-P2-10: sources with at least one redeem attempt inside the
+    /// current 60 s window — the divisor of the fair-share redeem
+    /// breaker. Incremented on a source window's empty→non-empty
+    /// transition and recomputed exactly by the sweeper (events age
+    /// out lazily, so decrement points are not observable).
+    active_redeem_sources: usize,
+    /// The server-wide redeem circuit breaker (CR-P1-03, fair-share
+    /// semantics CR-P2-10; see
+    /// [`crate::server_v2::config::REDEEM_GLOBAL_BREAKER_PER_MIN`]).
     global_redeem: Option<SlidingWindow>,
 }
 
 /// Per-source accounting (CR-P1-03): connection counters reserved at
 /// accept and released by the owning task's [`ConnSlotGuard`] (the same
 /// every-exit-path RAII discipline as the global counters), plus the
-/// source's shared redeem window.
+/// source's shared redeem window. CR-P2-10 reuses the same shape for
+/// the IPv6 /56 and /48 aggregate tables ([`Inner::prefixes56`] /
+/// [`Inner::prefixes48`]): the fields count the whole prefix's
+/// connections, the caps come from the aggregate limits instead.
 struct SourceEntry {
     /// Connections this source currently holds against
     /// `Limits::max_conns_per_source` (admitted at accept, live until
@@ -464,18 +543,82 @@ fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The IPv6 prefix parents of a normalized source (CR-P2-10): `Some`
+/// with the (/56, /48) keys for a real IPv6 source (host bits already
+/// zero by /64 normalization, so only bytes 0..7 / 0..6 matter), `None`
+/// for IPv4 — a /32 IS its own source, it has no parent hierarchy.
+/// Production listens IPv4-only today; these tables future-proof the
+/// `[::]` listen by making /64 rotation inside one delegation
+/// (a /56 holds 256 /64s, a /48 holds 65,536) worthless before it
+/// opens: the aggregates cap at 4× / 16× one /64's budgets.
+fn v6_parents(source: IpAddr) -> Option<(IpAddr, IpAddr)> {
+    match source {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            let mut p56 = [0u8; 16];
+            p56[..7].copy_from_slice(&octets[..7]);
+            let mut p48 = [0u8; 16];
+            p48[..6].copy_from_slice(&octets[..6]);
+            Some((
+                IpAddr::V6(Ipv6Addr::from(p56)),
+                IpAddr::V6(Ipv6Addr::from(p48)),
+            ))
+        }
+    }
+}
+
+/// Per-source fair share of the serving cap at/over the soft cap
+/// (CR-P2-10): `ceil(MAX_LIVE_CONNECTIONS / active sources)`, floored
+/// at [`FAIR_CONN_FLOOR`]. Invariants it buys:
+///
+/// * a SMALL number of sources can never lock out everyone else —
+///   filling the soft cap takes ≥ 32 sources (8 conns each), and once
+///   it is full only sources already AT/ABOVE the share are refused,
+///   so any source below the share (every newcomer, by definition)
+///   still connects, overshooting the soft cap up to the hard cap;
+/// * a well-behaved source always gets its per-source minimum — the
+///   floor guarantees a control connection plus the reconnect-overlap
+///   one until [`MAX_LIVE_CONNECTIONS_HARD`] is reached.
+///
+/// `ceil` (not floor) so the shares of all active sources sum to at
+/// least the cap: rounding down could refuse a below-average source
+/// while capacity goes unused.
+fn conn_fair_share(active_conn_sources: usize) -> usize {
+    let active = active_conn_sources.max(1);
+    MAX_LIVE_CONNECTIONS.div_ceil(active).max(FAIR_CONN_FLOOR)
+}
+
+/// The outcome of [`Inner::source_admit`] — which accept-time rejection
+/// path (if any) the caller takes.
+enum SourceAdmission {
+    /// All caps passed and every counter (source, /56, /48) was
+    /// reserved under the lock: spawn the connection task.
+    Admit,
+    /// The source itself (or one of its IPv6 prefix parents) is over
+    /// its own caps — drop the socket at accept, no task at all.
+    OverSourceCaps,
+    /// The source/prefix caps passed but the GLOBAL side refuses (at
+    /// the soft cap with this source at/above [`conn_fair_share`], or
+    /// at [`MAX_LIVE_CONNECTIONS_HARD`]) — the bounded one-ServerError
+    /// rejection path.
+    OverGlobal,
+}
+
 /// Entries of the CR-P1-03 accounting tables that can be TTL-pruned or
-/// evicted: they expose their idle timestamp, and whether they still
-/// hold live resources (an entry owing counter decrements must never
-/// be evicted — its guards still reference it).
+/// evicted: they can move their idle timestamp (the table's recency
+/// index needs the previous one), and say whether they still hold live
+/// resources (an entry owing counter decrements must never be evicted —
+/// its guards still reference it).
 trait IdleTracked {
-    fn last_seen(&self) -> Instant;
+    /// Move the activity timestamp to `now`; returns the previous one.
+    fn touch(&mut self, now: Instant) -> Instant;
     fn holds_live_counters(&self) -> bool;
 }
 
 impl IdleTracked for SourceEntry {
-    fn last_seen(&self) -> Instant {
-        self.last_seen
+    fn touch(&mut self, now: Instant) -> Instant {
+        std::mem::replace(&mut self.last_seen, now)
     }
     fn holds_live_counters(&self) -> bool {
         self.live > 0 || self.handshaking > 0
@@ -483,8 +626,8 @@ impl IdleTracked for SourceEntry {
 }
 
 impl IdleTracked for IdentityRedeemEntry {
-    fn last_seen(&self) -> Instant {
-        self.last_seen
+    fn touch(&mut self, now: Instant) -> Instant {
+        std::mem::replace(&mut self.last_seen, now)
     }
     // Purely rate-window state — always evictable.
     fn holds_live_counters(&self) -> bool {
@@ -492,41 +635,181 @@ impl IdleTracked for IdentityRedeemEntry {
     }
 }
 
-/// Make room for one new accounting entry (CR-P1-03): at
-/// [`SOURCE_TABLE_MAX_ENTRIES`] first drop entries idle past
-/// [`SOURCE_TABLE_IDLE_TTL`] (their 60 s windows expired long before
-/// that), then evict the stalest idle entry. Entries holding live
-/// counters are never evicted — their guards still owe decrements. If
-/// every entry is live (unreachable for the source table in practice:
-/// a live entry implies a connection, and the serving cap is orders of
-/// magnitude below this cap) the caller treats the arrival as over
-/// budget rather than overrunning memory.
-fn make_room<K, V>(map: &mut HashMap<K, V>, now: Instant) -> bool
+/// A bounded idle-TTL accounting table with O(log n) max-size eviction
+/// (CR-P2-10, replacing the O(n) table scan of the old free-function
+/// `make_room`): entries live in a [`HashMap`], and a [`BTreeSet`] keyed
+/// by `(last_seen, key)` indexes them by recency so the stalest idle
+/// entry — the eviction victim — is the front of the ordered index, not
+/// the result of a scan. Every activity moves the entry's index slot
+/// (one remove + one insert, O(log n)); pruning and eviction skip
+/// entries that still hold live counters (their guards owe decrements).
+///
+/// The periodic TTL prune is NOT a scan in the common case either: the
+/// recency index is ordered by `last_seen`, so pruning walks it from
+/// the oldest end and stops at the first entry still inside the TTL —
+/// everything after it is fresher by construction.
+struct IdleTable<K, V> {
+    entries: HashMap<K, V>,
+    order: BTreeSet<(Instant, K)>,
+}
+
+impl<K, V> Default for IdleTable<K, V>
 where
-    K: Copy + Eq + std::hash::Hash,
+    K: Copy + Eq + std::hash::Hash + Ord,
     V: IdleTracked,
 {
-    if map.len() < SOURCE_TABLE_MAX_ENTRIES {
-        return true;
-    }
-    map.retain(|_, entry| {
-        !(now.duration_since(entry.last_seen()) > SOURCE_TABLE_IDLE_TTL
-            && !entry.holds_live_counters())
-    });
-    if map.len() < SOURCE_TABLE_MAX_ENTRIES {
-        return true;
-    }
-    let victim = map
-        .iter()
-        .filter(|(_, entry)| !entry.holds_live_counters())
-        .max_by_key(|(_, entry)| now.duration_since(entry.last_seen()))
-        .map(|(key, _)| *key);
-    match victim {
-        Some(key) => {
-            map.remove(&key);
-            true
+    fn default() -> Self {
+        IdleTable {
+            entries: HashMap::new(),
+            order: BTreeSet::new(),
         }
-        None => false,
+    }
+}
+
+impl<K, V> IdleTable<K, V>
+where
+    K: Copy + Eq + std::hash::Hash + Ord,
+    V: IdleTracked,
+{
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key)
+    }
+
+    /// Mutable entry access WITHOUT re-stamping activity — for the
+    /// counter mutators, which stamp explicitly via [`Self::note_activity`]
+    /// afterwards (so an index update only happens once per event).
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
+    /// The entry for `key` with its activity stamp moved to `now`
+    /// (inserted with `init` when absent), eviction index in step.
+    fn touch_entry(&mut self, key: K, now: Instant, init: impl FnOnce() -> V) -> &mut V {
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(key) {
+            Entry::Vacant(vacant) => {
+                self.order.insert((now, key));
+                vacant.insert(init())
+            }
+            Entry::Occupied(mut occupied) => {
+                let previous = occupied.get_mut().touch(now);
+                if previous != now {
+                    self.order.remove(&(previous, key));
+                    self.order.insert((now, key));
+                }
+                occupied.into_mut()
+            }
+        }
+    }
+
+    /// Move an existing entry's activity stamp to `now` (no insert);
+    /// a no-op for absent keys.
+    fn note_activity(&mut self, key: &K, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            let previous = entry.touch(now);
+            if previous != now {
+                self.order.remove(&(previous, *key));
+                self.order.insert((now, *key));
+            }
+        }
+    }
+
+    /// TTL prune (the sweeper, every [`SWEEP_INTERVAL`]): drop entries
+    /// idle past [`SOURCE_TABLE_IDLE_TTL`] that hold no live counters.
+    /// Walks the recency index from the oldest end and stops at the
+    /// first entry still inside the TTL — the ordered index makes the
+    /// happy path O(1) instead of a full-table `retain`.
+    fn prune_idle(&mut self, now: Instant) {
+        let mut stale = Vec::new();
+        for &(last_seen, key) in &self.order {
+            if now.duration_since(last_seen) <= SOURCE_TABLE_IDLE_TTL {
+                break;
+            }
+            if !self
+                .entries
+                .get(&key)
+                .map(|entry| entry.holds_live_counters())
+                .unwrap_or(false)
+            {
+                stale.push((last_seen, key));
+            }
+        }
+        for (last_seen, key) in stale {
+            self.order.remove(&(last_seen, key));
+            self.entries.remove(&key);
+        }
+    }
+
+    /// Entries touched within `window` before `now` — the fresh suffix
+    /// of the recency index, newest first. The sweeper's exact recompute
+    /// of the fair-share divisors walks only this suffix (an entry can
+    /// only carry fresh window events if its `last_seen` is fresh too,
+    /// because every attempt stamps it).
+    fn recent<'a>(
+        &'a self,
+        now: Instant,
+        window: Duration,
+    ) -> impl Iterator<Item = (&'a K, &'a V)> + 'a {
+        self.order
+            .iter()
+            .rev()
+            .take_while(move |&&(last_seen, _)| now.duration_since(last_seen) <= window)
+            .filter_map(move |&(_, key)| self.entries.get_key_value(&key))
+    }
+
+    /// Make room for one new entry at [`SOURCE_TABLE_MAX_ENTRIES`]
+    /// (CR-P1-03 bound; CR-P2-10 evicts in O(log n) via the recency
+    /// index instead of a linear scan for the stalest victim): walk the
+    /// index from the oldest end — idle-expired entries are dropped
+    /// outright (their 60 s windows expired long before the TTL), and
+    /// the first idle-but-fresh entry encountered is the stalest
+    /// evictable one and is evicted. Entries holding live counters are
+    /// never evicted (their guards still owe decrements); they are
+    /// skipped and bound the walk (a live entry implies a connection,
+    /// and the serving cap is orders of magnitude below this cap). No
+    /// evictable entry → the caller treats the arrival as over budget
+    /// rather than overrunning memory.
+    fn make_room(&mut self, now: Instant) -> bool {
+        if self.len() < SOURCE_TABLE_MAX_ENTRIES {
+            return true;
+        }
+        let mut expired = Vec::new();
+        let mut victim: Option<(Instant, K)> = None;
+        for &(last_seen, key) in &self.order {
+            if self
+                .entries
+                .get(&key)
+                .map(|entry| entry.holds_live_counters())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if now.duration_since(last_seen) > SOURCE_TABLE_IDLE_TTL {
+                expired.push((last_seen, key));
+                continue;
+            }
+            victim = Some((last_seen, key));
+            break;
+        }
+        if !expired.is_empty() {
+            for (last_seen, key) in expired {
+                self.order.remove(&(last_seen, key));
+                self.entries.remove(&key);
+            }
+            return true;
+        }
+        match victim {
+            Some((last_seen, key)) => {
+                self.order.remove(&(last_seen, key));
+                self.entries.remove(&key);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -692,84 +975,225 @@ fn register_conn_task(shared: &Shared, id: u64, task: JoinHandle<()>) {
 }
 
 impl Inner {
-    /// CR-P1-03 per-source admission: check-and-reserve BOTH counters
-    /// (`live`, `handshaking`) under the one lock the caller already
-    /// holds for the decision, so concurrent accepts from the same
-    /// source can never overshoot the caps. Over either cap (or an
+    /// CR-P1-03 per-source admission + CR-P2-10 extensions, all
+    /// check-and-reserve under the one lock the caller already holds
+    /// for the decision, so concurrent accepts can never overshoot any
+    /// cap: the source's own counters (`live`, `handshaking`), the IPv6
+    /// /56 and /48 aggregates, and — with `conn_count`, this accept's
+    /// pre-reservation global ordinal — the global soft cap with
+    /// [`conn_fair_share`] shedding. Over a source/prefix cap (or an
     /// accounting table with no room left) the caller drops the socket
-    /// at accept time — nothing was reserved on failure.
-    fn source_admit(&mut self, limits: &Limits, source: IpAddr, now: Instant) -> bool {
-        if !make_room(&mut self.sources, now) {
-            return false;
+    /// at accept time; over the global side it takes the bounded
+    /// one-ServerError rejection path. Nothing is reserved on failure.
+    fn source_admit(
+        &mut self,
+        limits: &Limits,
+        source: IpAddr,
+        conn_count: usize,
+        now: Instant,
+    ) -> SourceAdmission {
+        let parents = v6_parents(source);
+        let parent56 = parents.map(|(p56, _)| p56);
+        let parent48 = parents.map(|(_, p48)| p48);
+        // Memory backstops first; a refusal here reserved nothing.
+        if !self.sources.make_room(now) {
+            return SourceAdmission::OverSourceCaps;
         }
-        let entry = self.sources.entry(source).or_insert_with(|| SourceEntry {
-            live: 0,
-            handshaking: 0,
-            redeem: SlidingWindow::new(limits.redeem_per_source_per_min, Duration::from_secs(60)),
-            last_seen: now,
-        });
-        entry.last_seen = now;
-        if entry.live >= limits.max_conns_per_source
-            || entry.handshaking >= limits.max_handshaking_per_source
+        if parent56.is_some() && !self.prefixes56.make_room(now) {
+            return SourceAdmission::OverSourceCaps;
+        }
+        if parent48.is_some() && !self.prefixes48.make_room(now) {
+            return SourceAdmission::OverSourceCaps;
+        }
+        // The source's own caps (CR-P1-03, unchanged semantics).
+        let (live, handshaking) = {
+            let entry = self.sources.touch_entry(source, now, || SourceEntry {
+                live: 0,
+                handshaking: 0,
+                redeem: SlidingWindow::new(limits.redeem_per_source_per_min, REDEEM_WINDOW),
+                last_seen: now,
+            });
+            (entry.live, entry.handshaking)
+        };
+        if live >= limits.max_conns_per_source || handshaking >= limits.max_handshaking_per_source {
+            return SourceAdmission::OverSourceCaps;
+        }
+        // The IPv6 prefix aggregates (CR-P2-10): the /56 and /48 caps
+        // are the per-source caps scaled by the frozen multipliers, so
+        // rotating /64s inside one delegation cannot multiply a
+        // delegation's serving footprint (4× at /56, 16× at /48).
+        let handshaking_cap_56 = limits
+            .max_handshaking_per_source
+            .saturating_mul(PREFIX_56_SHARE_MULTIPLIER as usize);
+        let handshaking_cap_48 = limits
+            .max_handshaking_per_source
+            .saturating_mul(PREFIX_48_SHARE_MULTIPLIER as usize);
+        if let Some(p56) = parent56 {
+            let (prefix_live, prefix_handshaking) = {
+                let entry = self.prefixes56.touch_entry(p56, now, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(limits.redeem_per_56_per_min, REDEEM_WINDOW),
+                    last_seen: now,
+                });
+                (entry.live, entry.handshaking)
+            };
+            if prefix_live >= limits.max_conns_per_56 || prefix_handshaking >= handshaking_cap_56 {
+                return SourceAdmission::OverSourceCaps;
+            }
+        }
+        if let Some(p48) = parent48 {
+            let (prefix_live, prefix_handshaking) = {
+                let entry = self.prefixes48.touch_entry(p48, now, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(limits.redeem_per_48_per_min, REDEEM_WINDOW),
+                    last_seen: now,
+                });
+                (entry.live, entry.handshaking)
+            };
+            if prefix_live >= limits.max_conns_per_48 || prefix_handshaking >= handshaking_cap_48 {
+                return SourceAdmission::OverSourceCaps;
+            }
+        }
+        // The global side (CR-P2-10): below the soft cap, plain
+        // admission. At/over it, admit only sources still under their
+        // fair share — never past the hard cap.
+        if conn_count >= MAX_LIVE_CONNECTIONS {
+            let share = conn_fair_share(self.active_conn_sources);
+            if conn_count >= MAX_LIVE_CONNECTIONS_HARD || live >= share {
+                return SourceAdmission::OverGlobal;
+            }
+        }
+        // Reserve everything: the source first (its 0→live transition
+        // feeds the fair-share divisor), then both parents.
         {
-            return false;
+            let entry = self
+                .sources
+                .get_mut(&source)
+                .expect("source entry touched above");
+            entry.live += 1;
+            entry.handshaking += 1;
+            if entry.live == 1 {
+                self.active_conn_sources += 1;
+            }
         }
-        entry.live += 1;
-        entry.handshaking += 1;
-        true
+        if let Some(p56) = parent56 {
+            let entry = self.prefixes56.touch_entry(p56, now, || SourceEntry {
+                live: 0,
+                handshaking: 0,
+                redeem: SlidingWindow::new(limits.redeem_per_56_per_min, REDEEM_WINDOW),
+                last_seen: now,
+            });
+            entry.live += 1;
+            entry.handshaking += 1;
+        }
+        if let Some(p48) = parent48 {
+            let entry = self.prefixes48.touch_entry(p48, now, || SourceEntry {
+                live: 0,
+                handshaking: 0,
+                redeem: SlidingWindow::new(limits.redeem_per_48_per_min, REDEEM_WINDOW),
+                last_seen: now,
+            });
+            entry.live += 1;
+            entry.handshaking += 1;
+        }
+        SourceAdmission::Admit
     }
 
     /// The TLS handshake phase of one admitted connection closed out
     /// (success or failure — callers only invoke this on success;
-    /// failure paths leave the release to the guard's `Drop`).
+    /// failure paths leave the release to the guard's `Drop`). The
+    /// handshaking counters of the source AND its IPv6 parents go back.
     fn source_handshake_done(&mut self, source: IpAddr, now: Instant) {
         if let Some(entry) = self.sources.get_mut(&source) {
             entry.handshaking = entry.handshaking.saturating_sub(1);
-            entry.last_seen = now;
+        }
+        self.sources.note_activity(&source, now);
+        if let Some((p56, p48)) = v6_parents(source) {
+            if let Some(entry) = self.prefixes56.get_mut(&p56) {
+                entry.handshaking = entry.handshaking.saturating_sub(1);
+            }
+            self.prefixes56.note_activity(&p56, now);
+            if let Some(entry) = self.prefixes48.get_mut(&p48) {
+                entry.handshaking = entry.handshaking.saturating_sub(1);
+            }
+            self.prefixes48.note_activity(&p48, now);
         }
     }
 
-    /// Release one admitted connection's per-source slots. `handshaking`
-    /// is true when the handshake phase was never closed out before the
-    /// exit path (the guard's `Drop` passes its still-open flag).
+    /// Release one admitted connection's per-source slots — and the
+    /// matching aggregates of its IPv6 parents. `handshaking` is true
+    /// when the handshake phase was never closed out before the exit
+    /// path (the guard's `Drop` passes its still-open flag). The
+    /// source's live 1→0 transition keeps the fair-share divisor exact.
     fn source_release(&mut self, source: IpAddr, handshaking: bool, now: Instant) {
         if let Some(entry) = self.sources.get_mut(&source) {
+            // Decrement the divisor on the 1→0 transition only — a
+            // spurious extra release must not double-decrement it.
+            if entry.live == 1 {
+                self.active_conn_sources = self.active_conn_sources.saturating_sub(1);
+            }
             entry.live = entry.live.saturating_sub(1);
             if handshaking {
                 entry.handshaking = entry.handshaking.saturating_sub(1);
             }
-            entry.last_seen = now;
+        }
+        self.sources.note_activity(&source, now);
+        if let Some((p56, p48)) = v6_parents(source) {
+            if let Some(entry) = self.prefixes56.get_mut(&p56) {
+                entry.live = entry.live.saturating_sub(1);
+                if handshaking {
+                    entry.handshaking = entry.handshaking.saturating_sub(1);
+                }
+            }
+            self.prefixes56.note_activity(&p56, now);
+            if let Some(entry) = self.prefixes48.get_mut(&p48) {
+                entry.live = entry.live.saturating_sub(1);
+                if handshaking {
+                    entry.handshaking = entry.handshaking.saturating_sub(1);
+                }
+            }
+            self.prefixes48.note_activity(&p48, now);
         }
     }
 
-    /// TTL-prune the CR-P1-03 accounting tables (called by the sweeper
-    /// every [`SWEEP_INTERVAL`]) so they cannot grow unboundedly: a
-    /// pruned source entry held zero counters (all its guards closed)
-    /// and has been idle for [`SOURCE_TABLE_IDLE_TTL`] — far past the
-    /// 60 s windows it carried, so pruning discards no live budget.
-    /// Identity entries are pure window state on the same idle rule.
+    /// TTL-prune the CR-P1-03/CR-P2-10 accounting tables (called by the
+    /// sweeper every [`SWEEP_INTERVAL`]) so they cannot grow
+    /// unboundedly: a pruned source entry held zero counters (all its
+    /// guards closed) and has been idle for [`SOURCE_TABLE_IDLE_TTL`] —
+    /// far past the 60 s windows it carried, so pruning discards no
+    /// live budget. Identity entries are pure window state on the same
+    /// idle rule; prefix tables follow the source rule. Also recomputes
+    /// the fair-share redeem divisor exactly (see
+    /// [`IdleTable::recent`]).
     fn prune_source_tables(&mut self, now: Instant) {
-        self.sources.retain(|_, entry| {
-            !(now.duration_since(entry.last_seen) > SOURCE_TABLE_IDLE_TTL
-                && entry.live == 0
-                && entry.handshaking == 0)
-        });
-        self.identity_redeem
-            .retain(|_, entry| now.duration_since(entry.last_seen) <= SOURCE_TABLE_IDLE_TTL);
+        self.sources.prune_idle(now);
+        self.prefixes56.prune_idle(now);
+        self.prefixes48.prune_idle(now);
+        self.identity_redeem.prune_idle(now);
+        let mut active = 0usize;
+        for (_, entry) in self.sources.recent(now, REDEEM_WINDOW) {
+            if entry.redeem.count_in_window(now) > 0 {
+                active += 1;
+            }
+        }
+        self.active_redeem_sources = active;
     }
 
-    /// CR-P1-03 redeem budgets, all three shared layers after the
-    /// per-connection window (which lives in `ConnState`): per source,
-    /// per device identity, then the server-wide breaker. Any failing
-    /// layer answers with the smallest retry hint among the failing
-    /// layers. Layers checked before a failing one have already
-    /// recorded the attempt — that is deliberate: the attempt really
-    /// happened at that layer, and an attacker must not be able to keep
-    /// one layer's window empty by exhausting another first. All
-    /// attempts count, regardless of outcome (the contract §11 freeze
-    /// of 2026-11-11: budgets bound total work, they do not punish
-    /// guessing — invite codes have 160 bits of entropy, there is no
-    /// enumeration to punish).
+    /// CR-P1-03 redeem budgets (CR-P2-10: five shared layers now) after
+    /// the per-connection window (which lives in `ConnState`): per /64
+    /// source, the IPv6 /56 and /48 aggregates (no-ops for IPv4), per
+    /// device identity, then the server-wide breaker. Any failing layer
+    /// answers with the smallest retry hint among the failing layers.
+    /// Layers checked before a failing one have already recorded the
+    /// attempt — that is deliberate: the attempt really happened at that
+    /// layer, and an attacker must not be able to keep one layer's
+    /// window empty by exhausting another first. All attempts count,
+    /// regardless of outcome (the contract §11 freeze of 2026-11-11:
+    /// budgets bound total work, they do not punish guessing — invite
+    /// codes have 160 bits of entropy, there is no enumeration to
+    /// punish).
     fn redeem_allows(
         &mut self,
         limits: &Limits,
@@ -778,48 +1202,87 @@ impl Inner {
         now: Instant,
     ) -> (bool, u32) {
         let mut retry = u32::MAX;
-        // Layer 1 — the source table entry exists for any connection
-        // that got this far (created at accept); make_room is the
-        // memory backstop, not an expected event.
-        if !make_room(&mut self.sources, now) {
+        // Layer 1 — the per-/64 source table entry exists for any
+        // connection that got this far (created at accept); make_room is
+        // the memory backstop, not an expected event.
+        if !self.sources.make_room(now) {
             return (false, 0);
         }
-        let source_ok = {
-            let entry = self.sources.entry(source).or_insert_with(|| SourceEntry {
+        let (source_ok, was_active) = {
+            let entry = self.sources.touch_entry(source, now, || SourceEntry {
                 live: 0,
                 handshaking: 0,
-                redeem: SlidingWindow::new(
-                    limits.redeem_per_source_per_min,
-                    Duration::from_secs(60),
-                ),
+                redeem: SlidingWindow::new(limits.redeem_per_source_per_min, REDEEM_WINDOW),
                 last_seen: now,
             });
-            entry.last_seen = now;
+            // CR-P2-10: a source window going empty→non-empty is exactly
+            // a source becoming active for the fair-share divisor.
+            let was_active = entry.redeem.count_in_window(now) > 0;
             let ok = entry.redeem.allow_at(now);
             if !ok {
                 retry = retry.min(entry.redeem.retry_after_ms(now));
             }
-            ok
+            (ok, was_active)
         };
         if !source_ok {
             return (false, retry);
         }
+        if !was_active {
+            self.active_redeem_sources += 1;
+        }
+        // Layers 1a/1b — the IPv6 /56 and /48 aggregate windows
+        // (CR-P2-10): the same redeem budget question one delegation
+        // up, so 256 /64s inside one /56 share 4× (not 256×) one /64's
+        // budget and one /48's residents share 16×. IPv4 sources have
+        // no parents and skip both.
+        if let Some((p56, p48)) = v6_parents(source) {
+            if !self.prefixes56.make_room(now) || !self.prefixes48.make_room(now) {
+                return (false, 0);
+            }
+            let ok56 = {
+                let entry = self.prefixes56.touch_entry(p56, now, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(limits.redeem_per_56_per_min, REDEEM_WINDOW),
+                    last_seen: now,
+                });
+                let ok = entry.redeem.allow_at(now);
+                if !ok {
+                    retry = retry.min(entry.redeem.retry_after_ms(now));
+                }
+                ok
+            };
+            if !ok56 {
+                return (false, retry);
+            }
+            let ok48 = {
+                let entry = self.prefixes48.touch_entry(p48, now, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(limits.redeem_per_48_per_min, REDEEM_WINDOW),
+                    last_seen: now,
+                });
+                let ok = entry.redeem.allow_at(now);
+                if !ok {
+                    retry = retry.min(entry.redeem.retry_after_ms(now));
+                }
+                ok
+            };
+            if !ok48 {
+                return (false, retry);
+            }
+        }
         // Layer 2 — the device identity, shared across reconnects.
-        if !make_room(&mut self.identity_redeem, now) {
+        if !self.identity_redeem.make_room(now) {
             return (false, 0);
         }
         let identity_ok = {
-            let entry =
-                self.identity_redeem
-                    .entry(*identity)
-                    .or_insert_with(|| IdentityRedeemEntry {
-                        redeem: SlidingWindow::new(
-                            limits.redeem_per_identity_per_min,
-                            Duration::from_secs(60),
-                        ),
-                        last_seen: now,
-                    });
-            entry.last_seen = now;
+            let entry = self
+                .identity_redeem
+                .touch_entry(*identity, now, || IdentityRedeemEntry {
+                    redeem: SlidingWindow::new(limits.redeem_per_identity_per_min, REDEEM_WINDOW),
+                    last_seen: now,
+                });
             let ok = entry.redeem.allow_at(now);
             if !ok {
                 retry = retry.min(entry.redeem.retry_after_ms(now));
@@ -829,19 +1292,37 @@ impl Inner {
         if !identity_ok {
             return (false, retry);
         }
-        // Layer 3 — the server-wide breaker (see the config constant for
-        // why it is deliberately very high).
+        // Layer 3 — the server-wide breaker, FAIR SHARE under saturation
+        // (CR-P2-10). While the 600/min window has room, plain
+        // accounting. When it is full, do NOT reject everyone (the old
+        // flat breaker let ~20 sources × 30/min deny every later
+        // source's redeems): reject only sources whose own in-window
+        // count has reached the fair share `breaker / active_sources`
+        // (floor: the per-source limit, so a normal source is never
+        // squeezed below its own budget); below-share attempts are
+        // admitted and deliberately NOT recorded into the already-full
+        // window — its memory stays at 600 entries, and it drains on
+        // its own as the oldest recorded events age out. The total-work
+        // bound becomes 30/min × active sources, with the per-/64 layer
+        // still tightening first.
         let window = self.global_redeem.get_or_insert_with(|| {
-            SlidingWindow::new(
-                limits.redeem_global_breaker_per_min,
-                Duration::from_secs(60),
-            )
+            SlidingWindow::new(limits.redeem_global_breaker_per_min, REDEEM_WINDOW)
         });
-        let ok = window.allow_at(now);
-        if !ok {
-            retry = retry.min(window.retry_after_ms(now));
+        if window.allow_at(now) {
+            return (true, 0);
         }
-        (ok, if ok { 0 } else { retry })
+        let active = (self.active_redeem_sources as u32).max(1);
+        let fair_share =
+            (limits.redeem_global_breaker_per_min / active).max(limits.redeem_per_source_per_min);
+        let in_window = self
+            .sources
+            .get(&source)
+            .map(|entry| entry.redeem.count_in_window(now))
+            .unwrap_or(0);
+        if (in_window as u32) < fair_share {
+            return (true, 0);
+        }
+        (false, window.retry_after_ms(now))
     }
 }
 
@@ -1824,10 +2305,12 @@ fn handle_redeem(
     let now_instant = Instant::now();
     // Budget rejections run before the lookup and are immediate. The
     // per-connection window first (tightest, no shared state), then the
-    // three shared CR-P1-03 layers: per source, per identity, global
-    // breaker — a flood from one source (even across self-generated
-    // identities or reconnects) exhausts only its own source window and
-    // can no longer flip every other source's redeem to RATE_LIMITED.
+    // five shared layers (CR-P1-03 + CR-P2-10): per /64 source, the
+    // IPv6 /56 and /48 aggregates, per identity, and the global breaker
+    // with fair-share shedding — a flood from one source (even across
+    // self-generated identities, reconnects, or /64 rotation inside its
+    // delegation) exhausts only its own windows and can no longer flip
+    // every other source's redeem to RATE_LIMITED.
     if !state.redeem_window.allow_at(now_instant) {
         deliver_msg(
             out,
@@ -2869,6 +3352,7 @@ fn sweep(shared: &Shared) {
 mod tests {
     use super::*;
     use crate::server_v2::tls;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn hello_replay_cache_admits_once_per_window() {
@@ -3729,20 +4213,29 @@ mod tests {
     /// CR-P1-03 unit level: the per-source counters admit up to both
     /// caps, release on every close-out path, hand the handshaking slot
     /// back as soon as the handshake resolves, and idle entries are
-    /// TTL-pruned while busy ones never are.
+    /// TTL-pruned while busy ones never are. CR-P2-10: source_admit now
+    /// also takes the pre-reservation global count (0 throughout this
+    /// test — the global side has its own tests) and returns a
+    /// SourceAdmission.
     #[test]
     fn source_counters_admit_release_and_prune_by_ttl() {
         let limits = Limits::default();
         let mut inner = Inner::default();
         let t0 = Instant::now();
         let src = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let admit = |inner: &mut Inner, limits: &Limits, src: IpAddr, t0: Instant| {
+            matches!(
+                inner.source_admit(limits, src, 0, t0),
+                SourceAdmission::Admit
+            )
+        };
 
         // The handshaking cap fires before the concurrent cap (4 < 8).
         for _ in 0..limits.max_handshaking_per_source {
-            assert!(inner.source_admit(&limits, src, t0));
+            assert!(admit(&mut inner, &limits, src, t0));
         }
         assert!(
-            !inner.source_admit(&limits, src, t0),
+            !admit(&mut inner, &limits, src, t0),
             "handshaking cap must reject while all four handshakes are open"
         );
 
@@ -3753,12 +4246,12 @@ mod tests {
         }
         for extra in 0..(limits.max_conns_per_source - limits.max_handshaking_per_source) {
             assert!(
-                inner.source_admit(&limits, src, t0),
+                admit(&mut inner, &limits, src, t0),
                 "live cap allows the {extra}-th additional served connection"
             );
         }
         assert!(
-            !inner.source_admit(&limits, src, t0),
+            !admit(&mut inner, &limits, src, t0),
             "concurrent-connection cap must reject the 9th connection"
         );
 
@@ -3769,7 +4262,7 @@ mod tests {
             inner.source_release(src, false, t0);
         }
         assert!(
-            inner.source_admit(&limits, src, t0),
+            admit(&mut inner, &limits, src, t0),
             "counters returned to zero"
         );
         inner.source_release(src, true, t0);
@@ -3778,20 +4271,586 @@ mod tests {
         // after it; a busy entry survives even past the TTL.
         inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL);
         assert!(
-            inner.sources.contains_key(&src),
+            inner.sources.get(&src).is_some(),
             "inside the TTL nothing is pruned"
         );
         inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL + Duration::from_secs(1));
         assert!(
-            !inner.sources.contains_key(&src),
+            !inner.sources.get(&src).is_some(),
             "an idle zero-counter entry is TTL-pruned"
         );
-        assert!(inner.source_admit(&limits, src, t0));
+        assert!(admit(&mut inner, &limits, src, t0));
         inner.prune_source_tables(t0 + SOURCE_TABLE_IDLE_TTL + Duration::from_secs(60));
         assert!(
-            inner.sources.contains_key(&src),
+            inner.sources.get(&src).is_some(),
             "an entry holding counters is never pruned"
         );
+        // CR-P2-10: the live entry keeps the fair-share divisor exact.
+        assert_eq!(inner.active_conn_sources, 1);
+    }
+
+    // ---- CR-P2-10 fair share, prefix aggregates, O(log n) eviction ---------
+
+    /// CR-P2-10: the /56 and /48 parents of a normalized source, and
+    /// their collapse rules.
+    #[test]
+    fn v6_parents_carry_the_delegation_hierarchy() {
+        let v4: IpAddr = "192.0.2.9".parse().unwrap();
+        assert_eq!(v6_parents(v4), None, "a /32 is its own source");
+        let v6: IpAddr = "2001:db8:aaaa:bb07::1".parse().unwrap();
+        let (p56, p48) = v6_parents(source_key(v6)).unwrap();
+        assert_eq!(
+            p56,
+            "2001:db8:aaaa:bb00::".parse::<IpAddr>().unwrap(),
+            "the /56 keeps the first 56 bits"
+        );
+        assert_eq!(
+            p48,
+            "2001:db8:aaaa::".parse::<IpAddr>().unwrap(),
+            "the /48 keeps the first 48 bits"
+        );
+        // Any /64 inside one /56 shares its parents.
+        let other64: IpAddr = "2001:db8:aaaa:bbff::1".parse().unwrap();
+        assert_eq!(v6_parents(source_key(other64)).unwrap(), (p56, p48));
+        // A different /56 (byte 6 differs) shares only the /48.
+        let other56: IpAddr = "2001:db8:aaaa:bc00::1".parse().unwrap();
+        let (q56, q48) = v6_parents(source_key(other56)).unwrap();
+        assert_ne!(q56, p56);
+        assert_eq!(q48, p48);
+    }
+
+    /// CR-P2-10: the connection fair-share formula —
+    /// `ceil(SOFT_CAP / active)` floored at [`FAIR_CONN_FLOOR`].
+    #[test]
+    fn conn_fair_share_splits_the_cap_with_a_floor() {
+        assert_eq!(conn_fair_share(1), MAX_LIVE_CONNECTIONS);
+        assert_eq!(conn_fair_share(2), MAX_LIVE_CONNECTIONS / 2);
+        assert_eq!(conn_fair_share(3), 86, "ceil, not floor: 256/3 = 85.33");
+        assert_eq!(conn_fair_share(64), 4);
+        assert_eq!(conn_fair_share(128), 2);
+        assert_eq!(conn_fair_share(300), FAIR_CONN_FLOOR, "the floor binds");
+        assert_eq!(conn_fair_share(0), MAX_LIVE_CONNECTIONS, "defensive");
+    }
+
+    /// CR-P2-10 unit level, connections: at the soft cap a source at its
+    /// fair share is refused on the GLOBAL side (the polite rejection
+    /// path) while its own caps still have room; a below-share source —
+    /// every newcomer — is admitted PAST the soft cap; the hard cap
+    /// refuses everyone; releases keep the divisor exact.
+    #[test]
+    fn connection_fair_share_sheds_fat_sources_and_admits_newcomers() {
+        let limits = Limits::default();
+        let mut inner = Inner::default();
+        let t0 = Instant::now();
+        let src = |i: u16| IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8));
+        let admit = |inner: &mut Inner, i: u16, conn_count: &mut usize| {
+            let decision = inner.source_admit(&limits, src(i), *conn_count, t0);
+            if matches!(decision, SourceAdmission::Admit) {
+                inner.source_handshake_done(src(i), t0);
+                *conn_count += 1;
+            }
+            decision
+        };
+
+        // 64 sources × 4 live connections = the soft cap exactly.
+        let mut conn_count = 0usize;
+        for i in 0..64u16 {
+            for _ in 0..4 {
+                assert!(matches!(
+                    admit(&mut inner, i, &mut conn_count),
+                    SourceAdmission::Admit
+                ));
+            }
+        }
+        assert_eq!(conn_count, MAX_LIVE_CONNECTIONS);
+        assert_eq!(inner.active_conn_sources, 64);
+
+        // A 4-holder at the cap is AT its fair share (ceil(256/64) = 4)
+        // even though its own cap allows 8: the global side refuses.
+        assert!(matches!(
+            admit(&mut inner, 0, &mut conn_count),
+            SourceAdmission::OverGlobal
+        ));
+        assert_eq!(conn_count, MAX_LIVE_CONNECTIONS, "nothing was reserved");
+
+        // A newcomer (live 0 < share) is admitted past the soft cap —
+        // one connection at a time up to the hard cap.
+        let mut newcomers = 0usize;
+        let mut next = 100u16;
+        while conn_count < MAX_LIVE_CONNECTIONS_HARD {
+            assert!(
+                matches!(
+                    admit(&mut inner, next, &mut conn_count),
+                    SourceAdmission::Admit
+                ),
+                "below-share source {next} must be admitted at conn_count {conn_count}"
+            );
+            newcomers += 1;
+            next += 1;
+        }
+        assert_eq!(conn_count, MAX_LIVE_CONNECTIONS_HARD);
+        assert_eq!(
+            newcomers,
+            MAX_LIVE_CONNECTIONS_HARD - MAX_LIVE_CONNECTIONS,
+            "the overshoot is exactly the hard-minus-soft margin"
+        );
+
+        // At the hard cap even a brand-new source is refused.
+        assert!(matches!(
+            admit(&mut inner, next, &mut conn_count),
+            SourceAdmission::OverGlobal
+        ));
+
+        // Releases feed the divisor: after one newcomer fully
+        // disconnects, active_conn_sources drops with it.
+        let retired = 100u16;
+        inner.source_release(src(retired), false, t0);
+        assert_eq!(inner.active_conn_sources, 64 + newcomers - 1);
+    }
+
+    /// CR-P2-10 unit level, connections: the IPv6 /56 and /48
+    /// aggregates. 256 /64s share one /56 — their CONCURRENT aggregate
+    /// is capped at 4× the per-/64 cap (32), not 256×; the /48
+    /// aggregate at 16× (128); other prefixes are unaffected; IPv4 has
+    /// no parent hierarchy at all.
+    #[test]
+    fn prefix_aggregate_connection_caps_hold_at_56_and_48() {
+        let limits = Limits::default();
+        let t0 = Instant::now();
+        // One /64 per low byte of the 4th group: all inside 2001:db8:aaaa:bb00::/56.
+        let src56 = |sub: u16| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0x0db8,
+                0xaaaa,
+                0xbb00 + sub,
+                0,
+                0,
+                0,
+                1,
+            ))
+        };
+        // One /56 per high byte of the 4th group (bb..be), all inside 2001:db8:aaaa::/48.
+        let src48 = |block: u16, sub: u16| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0x0db8,
+                0xaaaa,
+                0xbb00 + block * 0x100 + sub,
+                0,
+                0,
+                0,
+                1,
+            ))
+        };
+        let admit = |inner: &mut Inner, src: IpAddr| {
+            let decision = inner.source_admit(&limits, src, 0, t0);
+            if matches!(decision, SourceAdmission::Admit) {
+                inner.source_handshake_done(src, t0);
+            }
+            decision
+        };
+
+        // /56: 32 held connections inside the delegation are fine, the
+        // 33rd /64 (each holding only 1 of its own 8) is dropped at
+        // accept by the AGGREGATE; a different /56 is unaffected.
+        let mut inner56 = Inner::default();
+        for sub in 0..limits.max_conns_per_56 as u16 {
+            assert!(
+                matches!(admit(&mut inner56, src56(sub)), SourceAdmission::Admit),
+                "sub {sub} inside the /56 aggregate"
+            );
+        }
+        assert!(
+            matches!(
+                admit(&mut inner56, src56(limits.max_conns_per_56 as u16)),
+                SourceAdmission::OverSourceCaps
+            ),
+            "the /56 aggregate (4x per-source) fires while every /64 holds 1"
+        );
+        assert!(matches!(
+            admit(&mut inner56, src48(1, 0)),
+            SourceAdmission::Admit
+        ));
+
+        // /48 (fresh accounting): four /56s x 32 = the 128 aggregate;
+        // the 129th — in a FIFTH /56 with room everywhere below — is
+        // the /48's to refuse; a different /48 starts fresh.
+        let mut inner48 = Inner::default();
+        for block in 0..4u16 {
+            for sub in 0..limits.max_conns_per_56 as u16 {
+                assert!(matches!(
+                    admit(&mut inner48, src48(block, sub)),
+                    SourceAdmission::Admit
+                ));
+            }
+        }
+        assert!(matches!(
+            admit(&mut inner48, src48(4, 0)),
+            SourceAdmission::OverSourceCaps
+        ));
+        let other48 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0xaaab, 1, 0, 0, 0, 1));
+        assert!(matches!(
+            admit(&mut inner48, other48),
+            SourceAdmission::Admit
+        ));
+
+        // IPv4: no parents — a plain /32 crowd never touches the tables.
+        let mut v4_inner = Inner::default();
+        for i in 0..64u16 {
+            assert!(matches!(
+                admit(&mut v4_inner, IpAddr::V4(Ipv4Addr::new(192, 0, 2, i as u8))),
+                SourceAdmission::Admit
+            ));
+        }
+        assert_eq!(v4_inner.prefixes56.len(), 0);
+        assert_eq!(v4_inner.prefixes48.len(), 0);
+    }
+
+    /// CR-P2-10 unit level, redeems: the /56 aggregate admits exactly
+    /// 4× the per-/64 budget spread over the delegation's /64s, the
+    /// /48 aggregate 16×, and neither touches foreign prefixes.
+    #[test]
+    fn prefix_aggregate_redeem_caps_hold_at_56_and_48() {
+        let limits = Limits::default();
+        let t0 = Instant::now();
+        // Four /64s x the full 30/min per-/64 budget = the /56 share.
+        let mut inner = Inner::default();
+        let identity = |i: u8| DeviceId::from([i; 32]);
+        let mut attempt = 0u8;
+        for sub in 0..4u16 {
+            let src = IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0x0db8,
+                0xaaaa,
+                0xbb00 + sub,
+                0,
+                0,
+                0,
+                1,
+            ));
+            for _ in 0..limits.redeem_per_source_per_min {
+                let (ok, _) = inner.redeem_allows(&limits, src, &identity(attempt), t0);
+                assert!(ok, "attempt {attempt} inside the /56 share");
+                attempt += 1;
+            }
+        }
+        assert_eq!(attempt, limits.redeem_per_56_per_min as u8);
+        // The 121st attempt in the same /56 — from a FRESH /64 with a
+        // fresh identity — is the aggregate's to refuse.
+        let fresh64 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0xaaaa, 0xbb10, 0, 0, 0, 1));
+        let (ok, retry) = inner.redeem_allows(&limits, fresh64, &identity(200), t0);
+        assert!(!ok, "the /56 aggregate (4x per-source) must fire");
+        assert!(retry > 0, "the limiter suggests a retry delay");
+        // A different /56 redeems as if nothing happened.
+        let other56 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0xaaab, 1, 0, 0, 0, 1));
+        let (ok, _) = inner.redeem_allows(&limits, other56, &identity(201), t0);
+        assert!(ok, "a foreign /56 is untouched");
+
+        // /48 (fresh accounting): sixteen /64s x 30 = the 480 share,
+        // spread over four /56s (each also capped at its own 120).
+        let mut inner = Inner::default();
+        let next_identity = |attempt: &mut u16| {
+            let mut identity = [0u8; 32];
+            identity[..2].copy_from_slice(&attempt.to_be_bytes());
+            *attempt += 1;
+            identity
+        };
+        let mut attempt = 0u16;
+        'outer: for block in 0..4u16 {
+            for sub in 0..4u16 {
+                let src = IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0xaaaa,
+                    0xbb00 + block * 0x100 + sub,
+                    0,
+                    0,
+                    0,
+                    1,
+                ));
+                for _ in 0..limits.redeem_per_source_per_min {
+                    let identity = next_identity(&mut attempt);
+                    let (ok, _) = inner.redeem_allows(&limits, src, &identity, t0);
+                    assert!(ok, "attempt {} inside the /48 share", attempt - 1);
+                    if attempt >= limits.redeem_per_48_per_min as u16 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert_eq!(attempt, limits.redeem_per_48_per_min as u16);
+        let fresh = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0xaaaa, 0xbe10, 0, 0, 0, 1));
+        let (ok, _) = inner.redeem_allows(&limits, fresh, &[0xFF; 32], t0);
+        assert!(!ok, "the /48 aggregate (16x per-source) must fire");
+    }
+
+    /// CR-P2-10 unit level: at [`SOURCE_TABLE_MAX_ENTRIES`] the table
+    /// evicts over the recency index in O(log n) — the victim is the
+    /// least-recently-ACTIVE idle entry, never a live one, never a
+    /// fresher one; idle-expired entries are dropped in preference; and
+    /// the all-live table refuses instead of overrunning memory.
+    #[test]
+    fn source_table_evicts_the_least_recently_active_entry_at_the_cap() {
+        let mut table: IdleTable<IpAddr, SourceEntry> = IdleTable::default();
+        let t0 = Instant::now();
+        let key =
+            |i: usize| IpAddr::V4(Ipv4Addr::new(10, (i >> 16) as u8, (i >> 8) as u8, i as u8));
+        // Fill to the cap with idle entries stamped in insertion order
+        // (i is also the recency rank).
+        for i in 0..SOURCE_TABLE_MAX_ENTRIES {
+            let stamp = t0 + Duration::from_nanos(i as u64 * 1_000);
+            table
+                .touch_entry(key(i), stamp, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(1, REDEEM_WINDOW),
+                    last_seen: stamp,
+                })
+                .last_seen = stamp;
+        }
+        assert_eq!(table.len(), SOURCE_TABLE_MAX_ENTRIES);
+        // The stalest entry holds a LIVE counter: never the victim.
+        table.get_mut(&key(0)).unwrap().live = 1;
+
+        let now = t0 + Duration::from_secs(1);
+        assert!(table.make_room(now), "an idle victim exists");
+        assert_eq!(table.len(), SOURCE_TABLE_MAX_ENTRIES - 1);
+        assert!(
+            table.get(&key(0)).is_some(),
+            "the live entry survives despite being the stalest"
+        );
+        assert!(
+            table.get(&key(1)).is_none(),
+            "the least-recently-active IDLE entry is the victim"
+        );
+        assert!(table.get(&key(2)).is_some(), "fresher entries survive");
+        assert!(
+            table.get(&key(SOURCE_TABLE_MAX_ENTRIES - 1)).is_some(),
+            "the newest entry survives"
+        );
+
+        // Refill to the cap, then the next eviction walks further down
+        // the same order (key 2 — the now-stalest idle entry).
+        table.touch_entry(key(700_000), now, || SourceEntry {
+            live: 0,
+            handshaking: 0,
+            redeem: SlidingWindow::new(1, REDEEM_WINDOW),
+            last_seen: now,
+        });
+        assert_eq!(table.len(), SOURCE_TABLE_MAX_ENTRIES);
+        assert!(table.make_room(now));
+        assert_eq!(table.len(), SOURCE_TABLE_MAX_ENTRIES - 1);
+        assert!(table.get(&key(2)).is_none());
+        assert!(table.get(&key(0)).is_some(), "still never the live entry");
+        assert!(
+            table.get(&key(700_000)).is_some(),
+            "the filler, stamped now, is newer than every original entry"
+        );
+
+        // Idle-EXPIRED entries are dropped in preference to evicting a
+        // fresh one: re-stamp every remaining idle entry fresh except
+        // key 3, which is left a full TTL (+ margin) in the past, and
+        // refill back to the cap so make_room actually walks.
+        let later = now + SOURCE_TABLE_IDLE_TTL + Duration::from_secs(2);
+        for i in 4..SOURCE_TABLE_MAX_ENTRIES {
+            table.note_activity(&key(i), later);
+        }
+        table.note_activity(&key(700_000), later);
+        table.touch_entry(key(800_000), later, || SourceEntry {
+            live: 0,
+            handshaking: 0,
+            redeem: SlidingWindow::new(1, REDEEM_WINDOW),
+            last_seen: later,
+        });
+        assert_eq!(table.len(), SOURCE_TABLE_MAX_ENTRIES);
+        assert!(table.make_room(later));
+        assert!(
+            table.get(&key(3)).is_none(),
+            "the idle-expired entry is dropped, not the freshest idle one"
+        );
+        assert!(
+            table.get(&key(4)).is_some(),
+            "fresh idle entries are not evicted while expired ones exist"
+        );
+
+        // All-live table at the cap: refuse rather than overrun.
+        let mut all_live: IdleTable<IpAddr, SourceEntry> = IdleTable::default();
+        for i in 0..SOURCE_TABLE_MAX_ENTRIES {
+            let stamp = t0 + Duration::from_nanos(i as u64 * 1_000);
+            all_live
+                .touch_entry(key(i), stamp, || SourceEntry {
+                    live: 1,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(1, REDEEM_WINDOW),
+                    last_seen: stamp,
+                })
+                .last_seen = stamp;
+        }
+        assert!(!all_live.make_room(now), "no evictable entry: over budget");
+
+        // And through Inner: a redeem from one more source finds room
+        // via the same path (the evicted entry is the oldest idle one,
+        // never the live one).
+        let limits = Limits::default();
+        let mut inner = Inner::default();
+        for i in 0..SOURCE_TABLE_MAX_ENTRIES {
+            let stamp = t0 + Duration::from_nanos(i as u64 * 1_000);
+            inner
+                .sources
+                .touch_entry(key(i), stamp, || SourceEntry {
+                    live: 0,
+                    handshaking: 0,
+                    redeem: SlidingWindow::new(limits.redeem_per_source_per_min, REDEEM_WINDOW),
+                    last_seen: stamp,
+                })
+                .last_seen = stamp;
+        }
+        inner.sources.get_mut(&key(0)).unwrap().live = 1;
+        let (ok, _) = inner.redeem_allows(&limits, key(900_000), &[9; 32], now);
+        assert!(ok, "the table made room for one more source");
+        assert!(inner.sources.get(&key(0)).is_some());
+        assert!(inner.sources.get(&key(1)).is_none());
+        assert!(inner.sources.get(&key(900_000)).is_some());
+    }
+
+    /// CR-P2-10 acceptance (a): 20 IPv4 sources spend their full
+    /// 30/min budgets — exactly the 600/min global breaker — and the
+    /// 21st source's legitimate redeem STILL succeeds. Before the
+    /// fair-share breaker the full window meant RATE_LIMITED for every
+    /// later source (the CR-P2-10 finding).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fair_share_breaker_admits_the_twenty_first_source() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let per_source = crate::server_v2::config::REDEEM_PER_SOURCE_PER_MIN as usize;
+        let sources = crate::server_v2::config::REDEEM_GLOBAL_BREAKER_PER_MIN as usize / per_source;
+        assert_eq!(sources, 20, "the scenario: 20 x 30 = exactly 600/min");
+
+        // Every source spends its exact per-source budget: three
+        // connections x the 10/min per-connection window, each
+        // connection its own identity (every CR-P1-03 layer stays under
+        // its cap, so the only near-exhaustion is the global breaker).
+        let mut flood = Vec::new();
+        let mut admitted = 0usize;
+        let mut lookup_counter = 0u32;
+        for host in 1..=sources as u8 {
+            let source = format!("127.0.0.{host}").parse::<IpAddr>().unwrap();
+            for round in 0..3u8 {
+                let mut client = TestClient::connect_at(
+                    Some(source),
+                    server.addr,
+                    &registry_id,
+                    DeviceKeyPair::generate(),
+                    &format!("flood-{host}-{round}"),
+                )
+                .await;
+                for _ in 0..(per_source / 3) {
+                    let mut lookup = [0u8; 32];
+                    lookup[..4].copy_from_slice(&lookup_counter.to_be_bytes());
+                    lookup_counter += 1;
+                    let redeem = signed_redeem(
+                        &client.key,
+                        &registry_id,
+                        lookup,
+                        random_id16(),
+                        now_ms() + 8_000,
+                    );
+                    client.send(&CtrlMessage::InviteRedeem(redeem)).await;
+                    match client.recv().await {
+                        CtrlMessage::InviteRedeemPending { .. } => admitted += 1,
+                        other => panic!("flood redeem must be pending, got {other:?}"),
+                    }
+                }
+                flood.push(client);
+            }
+        }
+        assert_eq!(
+            admitted,
+            crate::server_v2::config::REDEEM_GLOBAL_BREAKER_PER_MIN as usize,
+            "the breaker window is exactly full (600 admitted)"
+        );
+
+        // The 21st source's legitimate redeem: pending, NOT the global
+        // RATE_LIMITED this saturation used to mean for everyone.
+        let mut newcomer = TestClient::connect_at(
+            Some("127.0.0.21".parse().unwrap()),
+            server.addr,
+            &registry_id,
+            DeviceKeyPair::generate(),
+            "newcomer",
+        )
+        .await;
+        let redeem = signed_redeem(
+            &newcomer.key,
+            &registry_id,
+            [0x21; 32],
+            random_id16(),
+            now_ms() + 8_000,
+        );
+        newcomer.send(&CtrlMessage::InviteRedeem(redeem)).await;
+        match newcomer.recv().await {
+            CtrlMessage::InviteRedeemPending { .. } => {}
+            CtrlMessage::PairError { code, .. } => {
+                panic!("the 21st source's legit redeem must pass the saturated breaker, got {code}")
+            }
+            other => panic!("unexpected newcomer redeem answer: {other:?}"),
+        }
+        drop(flood);
+        drop(newcomer);
+        server.stop().await;
+    }
+
+    /// CR-P2-10 acceptance, end to end: 32 sources x 8 held connections
+    /// fill the 256 soft cap — the connection-side twin of the redeem
+    /// scenario — and a 33rd source still completes the full TLS +
+    /// Hello/Welcome exchange (admitted past the soft cap under its
+    /// fair share; the fat sources are the ones refused).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fair_share_serving_cap_admits_a_newcomer_past_the_soft_cap() {
+        let server = spawn_server().await;
+        let registry_id = server.registry_id();
+        let per_source = crate::server_v2::config::MAX_CONNS_PER_SOURCE;
+        let sources = MAX_LIVE_CONNECTIONS / per_source;
+        assert_eq!(sources, 32, "the scenario: 32 x 8 = exactly 256");
+
+        // Hold the soft cap's worth of live, authenticated connections.
+        let mut held = Vec::new();
+        for host in 1..=sources as u8 {
+            let source = format!("127.0.0.{host}").parse::<IpAddr>().unwrap();
+            for _ in 0..per_source {
+                held.push(
+                    TestClient::connect_at(
+                        Some(source),
+                        server.addr,
+                        &registry_id,
+                        DeviceKeyPair::generate(),
+                        &format!("holder-{host}"),
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // The 33rd source's full exchange completes within the normal
+        // envelope — before CR-P2-10 it was refused with ServerError.
+        let started = Instant::now();
+        let newcomer = TestClient::connect_at(
+            Some("127.0.0.33".parse().unwrap()),
+            server.addr,
+            &registry_id,
+            DeviceKeyPair::generate(),
+            "newcomer",
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the newcomer completes despite the saturated soft cap (took {:?})",
+            started.elapsed()
+        );
+        drop(newcomer);
+        drop(held);
+        server.stop().await;
     }
 
     /// R36-P2-06: the per-owner hourly claim budget is exactly the

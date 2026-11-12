@@ -76,7 +76,13 @@
 //!   peer's `rx_frames` once a connection has closed (see
 //!   [`ChannelStats`] docs).
 //!
-#![forbid(unsafe_code)]
+// Unsafe policy (CR-P1-06): `deny` instead of `forbid` — the Unix
+// per-packet-TTL `sendmsg` control message in this crate's holepunch
+// section is the ONE audited `unsafe` block (raw cmsg buffer layout),
+// individually `#[allow]`-ed with a SAFETY argument below. Everything
+// else in ak-net remains unsafe-free and a stray `unsafe` anywhere else
+// still fails the build.
+#![deny(unsafe_code)]
 
 mod tls;
 
@@ -1139,11 +1145,53 @@ pub mod holepunch {
     /// Transient socket errors that carry no reachability information (on
     /// Windows, probing a closed port makes a later `recv` fail with
     /// WSAECONNRESET) are skipped; only hard errors abort the probe.
+    ///
+    /// The window always runs to its deadline — see [`probe_with_early_exit`]
+    /// for the CR-P3-06 variant.
     pub async fn probe(
         socket: &tokio::net::UdpSocket,
         candidates: &[SocketAddr],
         interval: Duration,
         duration: Duration,
+    ) -> io::Result<PunchReport> {
+        probe_round(socket, candidates, interval, duration, false).await
+    }
+
+    /// [`probe`] with the CR-P3-06 early exit (review 2026-11-11 §4.5,
+    /// batchF G2): the round returns the moment the FIRST candidate of
+    /// the static order is echo-confirmed (a peer packet arrives from
+    /// exactly that candidate), instead of idling out the rest of the
+    /// window — a same-LAN send then pays one probe round-trip, not a
+    /// fixed extra second, and the latency is independent of how many
+    /// further candidates trail the confirmed head. Everything else
+    /// (packet shape, filtering, reporting, transient-error policy) is
+    /// byte-identical to [`probe`]:
+    ///
+    /// * only the head candidate arms the exit — a confirmation of any
+    ///   LATER candidate does NOT end the round (the round's job is
+    ///   ordering the dial list; the head confirming is the one outcome
+    ///   where further observation cannot change the order's leader);
+    /// * with no confirmation the window still runs to its deadline —
+    ///   callers that only learn reachability from the report keep the
+    ///   full-window semantics verbatim.
+    pub async fn probe_with_early_exit(
+        socket: &tokio::net::UdpSocket,
+        candidates: &[SocketAddr],
+        interval: Duration,
+        duration: Duration,
+    ) -> io::Result<PunchReport> {
+        probe_round(socket, candidates, interval, duration, true).await
+    }
+
+    /// The one probe-loop body both public entry points share
+    /// (`early_exit` = return once the first dialable candidate is
+    /// confirmed, see [`probe_with_early_exit`]).
+    async fn probe_round(
+        socket: &tokio::net::UdpSocket,
+        candidates: &[SocketAddr],
+        interval: Duration,
+        duration: Duration,
+        early_exit: bool,
     ) -> io::Result<PunchReport> {
         let start = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + duration;
@@ -1210,6 +1258,17 @@ pub mod holepunch {
                             if !report.reachable.contains(&hit.report) {
                                 report.reachable.push(hit.report);
                             }
+                        }
+                        // CR-P3-06 early exit: the static order's first
+                        // dialable candidate is now echo-confirmed — the
+                        // round cannot learn anything that changes the
+                        // dial order's leader, so stop paying the window.
+                        if early_exit
+                            && dialable
+                                .first()
+                                .is_some_and(|head| report.reachable.contains(&head.report))
+                        {
+                            break;
                         }
                     }
                 }
@@ -1280,7 +1339,16 @@ pub mod holepunch {
     /// while the IPv6 parser skips non-`SOL_IPV6` messages. Attaching
     /// `IP_TTL` for v4 targets (mapped or plain) is therefore the choice
     /// that takes effect on both socket families.
+    // SAFETY (the crate's single audited unsafe, see the crate-level
+    // policy note): the control buffer is a local `[usize; 4]` whose
+    // address/length we re-borrow as bytes for exactly `cmsg_space`
+    // (≤ the array's total size per the debug_assert above) — no aliasing
+    // (no other reference exists), no uninit read (every byte is either
+    // written below or within CMSG_SPACE padding the kernel ignores),
+    // and the lifetime ends before sendmsg returns. The layout constants
+    // follow the platform's CMSG_LEN/CMSG_SPACE rules stated above.
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     pub fn send_to_with_ttl(
         socket: &std::net::UdpSocket,
         packet: &[u8],
@@ -2938,6 +3006,149 @@ mod tests {
             "A not reachable: {b_report:?}"
         );
         assert!(a_report.elapsed >= Duration::from_millis(500));
+    }
+
+    /// CR-P3-06 (G2): `probe_with_early_exit` returns as soon as the
+    /// static order's first candidate is echo-confirmed — well inside the
+    /// window (the acceptance bound is "within 200 ms of the first
+    /// confirmation"; the receive-to-return path is synchronous, so the
+    /// whole round costs the first probe round-trip). The same scenario
+    /// through the default [`holepunch::probe`] still runs the window
+    /// (pinned by `holepunch_probe_reports_reachable_peer`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holepunch_probe_early_exit_returns_after_first_confirmation() {
+        let a = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind a");
+        let b = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind b");
+        let a_addr = a.local_addr().expect("addr a");
+        let b_addr = b.local_addr().expect("addr b");
+
+        // B's plain round (spawned FIRST so its opening probe burst is
+        // already in flight when A starts listening).
+        let b_task = tokio::spawn(async move {
+            holepunch::probe(
+                &b,
+                &[a_addr],
+                Duration::from_millis(25),
+                Duration::from_millis(2000),
+            )
+            .await
+        });
+        let window = Duration::from_millis(1500);
+        let a_report = holepunch::probe_with_early_exit(
+            &a,
+            &[b_addr],
+            Duration::from_millis(25),
+            window,
+        )
+        .await
+        .expect("probe a");
+        let b_report = b_task.await.expect("join").expect("probe b");
+
+        assert!(
+            a_report.reachable.contains(&b_addr),
+            "B not reachable: {a_report:?}"
+        );
+        assert!(
+            a_report.packets_received > 0,
+            "A received no peer probes: {a_report:?}"
+        );
+        assert!(
+            b_report.reachable.contains(&a_addr),
+            "A not reachable: {b_report:?}"
+        );
+        // The early exit: A must be back LONG before the window's
+        // deadline (B's first burst leaves at t≈0, so the confirmation
+        // lands within the first ticks even on a slow runner).
+        assert!(
+            a_report.elapsed + Duration::from_millis(500) < window,
+            "the early exit did not fire: {:?} of {window:?}",
+            a_report.elapsed
+        );
+    }
+
+    /// CR-P3-06 (G2), candidate-count independence: the early-exit round
+    /// with one live head plus a TRAILING pile of silent candidates costs
+    /// the same one round-trip as a single-candidate round — the trailing
+    /// candidates neither delay the exit nor extend it toward the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holepunch_probe_early_exit_is_independent_of_candidate_count() {
+        // The echo head: a plain probe round answers from its own bound
+        // address (spawned first, see the test above).
+        let echo = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind echo");
+        let probe_sock = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind probe");
+        let probe_addr = probe_sock.local_addr().expect("probe addr");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_task = tokio::spawn(async move {
+            holepunch::probe(
+                &echo,
+                &[probe_addr],
+                Duration::from_millis(25),
+                Duration::from_millis(2000),
+            )
+            .await
+        });
+
+        // Silent trailing candidates: bound-but-silent UDP sockets on
+        // loopback (deterministic on every OS — no ICMP games), plus
+        // TEST-NET-3 entries that are simply never answered. The sockets
+        // stay bound for the whole test (`_silent_keepalive`) so no port
+        // can be rebound mid-round.
+        let mut many_candidates = vec![echo_addr];
+        let mut silent_keepalive = Vec::new();
+        for _ in 0..4 {
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent bind");
+            many_candidates.push(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                silent.local_addr().expect("silent addr").port(),
+            ));
+            silent_keepalive.push(silent);
+        }
+        many_candidates.push(SocketAddr::from(([203, 0, 113, 77], 41234)));
+        let window = Duration::from_millis(1500);
+        let one = holepunch::probe_with_early_exit(
+            &probe_sock,
+            &[echo_addr],
+            Duration::from_millis(25),
+            window,
+        )
+        .await
+        .expect("one-candidate round");
+        let many = holepunch::probe_with_early_exit(
+            &probe_sock,
+            &many_candidates,
+            Duration::from_millis(25),
+            window,
+        )
+        .await
+        .expect("many-candidate round");
+        echo_task.abort();
+
+        assert!(
+            one.reachable.contains(&echo_addr) && many.reachable.contains(&echo_addr),
+            "the echo head must confirm in both rounds: {one:?} / {many:?}"
+        );
+        for report in [&one, &many] {
+            assert!(
+                report.elapsed + Duration::from_millis(500) < window,
+                "the early exit did not fire: {:?} of {window:?}",
+                report.elapsed
+            );
+        }
+        // Independence: the trailing pile must not make the round
+        // materially slower than the single-candidate round (one extra
+        // probe interval of slack covers scheduling jitter).
+        assert!(
+            many.elapsed <= one.elapsed + Duration::from_millis(150),
+            "trailing candidates stretched the round: {one:?} vs {many:?}"
+        );
     }
 
     /// One dual-stack probe round: A on a `[::]` V6ONLY=0 socket, a v4

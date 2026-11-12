@@ -332,17 +332,15 @@ impl Proc {
             // Fast-fail on a dead child (run 43312035496 diagnosis): a
             // daemon whose startup redeem fails exits via stderr and the
             // old loop burned the WHOLE ceiling waiting on a corpse.
-            if let Ok(status) = self.child.try_wait() {
-                if let Some(status) = status {
-                    panic!(
-                        "child exited before printing {needle:?} ({status});                          stdout so far:
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "child exited before printing {needle:?} ({status});                      stdout so far:
 {}
 stderr tail:
 {}",
-                        self.stdout_joined(),
-                        self.stderr_tail(15)
-                    );
-                }
+                    self.stdout_joined(),
+                    self.stderr_tail(15)
+                );
             }
             assert!(
                 Instant::now() < deadline,

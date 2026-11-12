@@ -1,8 +1,8 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
 //! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `daemon`, `send`,
-//! `discover`, `jobs`, `signal-server`, `probe`, `bench`, `doctor`,
-//! `completions`. The
+//! `discover`, `jobs`, `signal-server`, `stun-server`, `probe`, `bench`,
+//! `doctor`, `completions`. The
 //! binary never talks to any file-carrying server; servers started here are
 //! coordination-only (ADR-001).
 //!
@@ -352,6 +352,21 @@ enum Command {
         /// --bind (default 0.0.0.0 + --stun-port).
         #[arg(long, value_parser = bind_arg_parser)]
         stun_bind: Option<BindArg>,
+    },
+    /// Run a standalone STUN binding responder (RFC 5389 subset, UDP only;
+    /// no file routes, never relays anything). CR-P2-13: the same responder
+    /// loop the signal-server runs, as its own process, so retiring the old
+    /// signaling process does not silently disable STUN on UDP 7101.
+    StunServer {
+        /// UDP port to answer Binding requests on (default 7101, the port
+        /// clients and the old signal-server already use).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Listen address override: a bare IP (default 0.0.0.0; port comes
+        /// from --port) or a full `ip:port`/`[v6]:port` (`[::]:7101`; its
+        /// port wins over --port, with a notice).
+        #[arg(long, value_parser = bind_arg_parser)]
+        bind: Option<BindArg>,
     },
     /// Public direct-connect probe: register, exchange candidates, punch, QUIC.
     Probe {
@@ -3804,6 +3819,44 @@ async fn registry_server_command(
     Ok(())
 }
 
+/// `ak-cli stun-server` (CR-P2-13): a standalone UDP STUN binding responder
+/// — one process, one socket. It runs the same `ak_signal::stun::serve_stun`
+/// loop the old signal-server runs (zero drift between the two paths), so
+/// the old signaling process can be retired without silently disabling
+/// STUN, which fails open and would otherwise go unnoticed. Coordination
+/// only: it answers Binding requests with the sender's reflexive address
+/// and never relays any payload (ADR-001).
+async fn stun_server_command(port: Option<u16>, bind: Option<BindArg>) -> Result<()> {
+    // Same logging contract as registry-server (CR-P2-09): initialize
+    // env_logger (Info default, `RUST_LOG` overrides) so the responder's
+    // own `stun responder listening on udp …` startup line reaches the
+    // journal/stderr, and log the binary identity once at startup; the
+    // same payload answers `ak-cli stun-server --version`.
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .try_init();
+    log::info!("stun-server version: {}", version_line());
+    const DEFAULT_STUN_PORT: u16 = 7101;
+    let (addr, note) = resolve_listen_addr(bind, "--bind", port, "--port", DEFAULT_STUN_PORT);
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    let socket = tokio::net::UdpSocket::bind(addr)
+        .await
+        .with_context(|| format!("binding STUN udp {addr}"))?;
+    println!(
+        "stun responder on udp {}; no file routes exist",
+        socket.local_addr()?
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(ak_signal::stun::serve_stun(socket, shutdown_rx));
+    tokio::signal::ctrl_c().await.ok();
+    let _ = shutdown_tx.send(true);
+    server.await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -3959,6 +4012,7 @@ async fn main() -> Result<()> {
             server.await??;
             Ok(())
         }
+        Command::StunServer { port, bind } => stun_server_command(port, bind).await,
         Command::Probe {
             server,
             peer,
@@ -6642,7 +6696,7 @@ mod tests {
         // remembering which flag position clap accepts.
         let mut cmd = Cli::command();
         cmd.build();
-        for name in ["registry-server", "signal-server", "task"] {
+        for name in ["registry-server", "signal-server", "stun-server", "task"] {
             let sub = cmd
                 .find_subcommand_mut(name)
                 .unwrap_or_else(|| panic!("{name} subcommand must exist"));
@@ -7258,6 +7312,48 @@ mod tests {
             resolve_listen_addr(stun_bind, "--stun-bind", stun_port, "--stun-port", 7101);
         assert_eq!(stun_addr, "[::]:7201".parse().unwrap());
         assert_eq!(stun_note, None);
+    }
+
+    // CR-P2-13: the standalone STUN responder subcommand parses like its
+    // siblings (--port + --bind via the shared resolver, default 7101/udp).
+    #[test]
+    fn stun_server_bind_flags_parse_and_default_port_applies() {
+        let cli = cli_of(&["stun-server"]);
+        let Command::StunServer { port, bind } = cli.command else {
+            panic!("expected stun-server subcommand");
+        };
+        assert_eq!(port, None);
+        assert!(bind.is_none());
+        // No flags land on the documented default port.
+        let (addr, note) = resolve_listen_addr(None, "--bind", None, "--port", 7101);
+        assert_eq!(addr, "0.0.0.0:7101".parse().unwrap());
+        assert_eq!(note, None);
+
+        let cli = cli_of(&["stun-server", "--port", "7202", "--bind", "[::]:7101"]);
+        let Command::StunServer { port, bind } = cli.command else {
+            panic!("expected stun-server subcommand");
+        };
+        // The bind value carries a port that beats the differing --port.
+        let (addr, note) = resolve_listen_addr(bind, "--bind", port, "--port", 7101);
+        assert_eq!(addr, "[::]:7101".parse().unwrap());
+        let note = note.as_deref().unwrap_or_default();
+        assert!(note.contains("ignoring --port 7202"), "{note}");
+
+        // A bare v6 bind combines with --port silently.
+        let cli = cli_of(&["stun-server", "--bind", "::"]);
+        let Command::StunServer { port, bind } = cli.command else {
+            panic!("expected stun-server subcommand");
+        };
+        let (addr, note) = resolve_listen_addr(bind, "--bind", port, "--port", 7101);
+        assert_eq!(addr, "[::]:7101".parse().unwrap());
+        assert_eq!(note, None);
+
+        for bad in ["junk", "[::1]", "host:7101"] {
+            assert!(
+                Cli::try_parse_from(["ak-cli", "stun-server", "--bind", bad]).is_err(),
+                "unexpectedly accepted --bind {bad:?}"
+            );
+        }
     }
 
     // -- completions -----------------------------------------------------------

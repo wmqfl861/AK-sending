@@ -244,7 +244,7 @@ pub(crate) async fn serve(
         inner: Mutex::new(Inner::default()),
         conn_count: AtomicUsize::new(0),
     });
-    tokio::spawn(stun_responder(stun_socket, shutdown.clone()));
+    tokio::spawn(stun::serve_stun(stun_socket, shutdown.clone()));
     let sweep_every = shared
         .limits
         .session_ttl
@@ -292,32 +292,6 @@ pub(crate) async fn serve(
                 Err(e) => {
                     log::warn!("accept failed: {e}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            },
-        }
-    }
-}
-
-/// UDP STUN binding responder. Answers binding requests with the sender's
-/// observed address; ignores everything else. Never relays any payload.
-async fn stun_responder(socket: UdpSocket, mut shutdown: watch::Receiver<bool>) {
-    let mut buf = vec![0u8; 256];
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => return,
-            received = socket.recv_from(&mut buf) => match received {
-                Ok((len, peer)) => match stun::parse_binding_request(&buf[..len]) {
-                    Ok(txid) => {
-                        let reply = stun::binding_response(txid, peer);
-                        if let Err(e) = socket.send_to(&reply, peer).await {
-                            log::debug!("stun reply to {peer} failed: {e}");
-                        }
-                    }
-                    Err(e) => log::debug!("ignoring non-STUN datagram from {peer}: {e}"),
-                },
-                Err(e) => {
-                    log::warn!("stun recv failed: {e}");
-                    return;
                 }
             },
         }

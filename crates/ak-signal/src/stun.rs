@@ -1,8 +1,11 @@
 //! Minimal STUN (RFC 5389 subset): binding request/response over UDP.
 //!
 //! Purpose: let a device learn its public mapped address using its own
-//! transfer socket, and let the coordination server answer bindings. No
-//! TURN, no relaying — STUN here never touches file data.
+//! transfer socket (the client half, [`crate::stun::query_on`]), and
+//! answer bindings (the server half, [`crate::stun::serve_stun`]) — used
+//! by the legacy signaling server and by the standalone
+//! `ak-cli stun-server` (CR-P2-13). No TURN, no relaying — STUN here
+//! never touches file data.
 #![forbid(unsafe_code)]
 
 use std::io;
@@ -10,6 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 use crate::util::{put_u16, put_u32, unique_array};
 
@@ -298,6 +302,44 @@ pub async fn query(
     Ok((local, mapped))
 }
 
+/// UDP STUN binding responder: the server half of this module. Answers
+/// binding requests with the sender's observed (reflexive) address and
+/// ignores everything else — no relayed payload of any kind (ADR-001).
+/// Shared verbatim by the legacy signaling server (TCP + UDP in one
+/// process) and the standalone `ak-cli stun-server` (CR-P2-13), so
+/// retiring the legacy process does not silently disable STUN: both
+/// paths run this exact loop.
+///
+/// Runs until `shutdown` fires (graceful stop) or the socket fails; a
+/// failed reply or a malformed datagram is logged and skipped, never
+/// fatal, so garbage traffic cannot take the responder down.
+pub async fn serve_stun(socket: UdpSocket, mut shutdown: watch::Receiver<bool>) {
+    if let Ok(local) = socket.local_addr() {
+        log::info!("stun responder listening on udp {local}");
+    }
+    let mut buf = vec![0u8; 256];
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            received = socket.recv_from(&mut buf) => match received {
+                Ok((len, peer)) => match parse_binding_request(&buf[..len]) {
+                    Ok(txid) => {
+                        let reply = binding_response(txid, peer);
+                        if let Err(e) = socket.send_to(&reply, peer).await {
+                            log::debug!("stun reply to {peer} failed: {e}");
+                        }
+                    }
+                    Err(e) => log::debug!("ignoring non-STUN datagram from {peer}: {e}"),
+                },
+                Err(e) => {
+                    log::warn!("stun recv failed: {e}");
+                    return;
+                }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +568,117 @@ mod tests {
         assert_ne!(local.port(), 0);
         assert_eq!(mapped, fake_mapped);
         responder_task.await.unwrap();
+    }
+
+    // ---- serve_stun: the responder loop (CR-P2-13) --------------------------
+    //
+    // The legacy signal-server used to carry this loop inline; the same
+    // tests now pin the extracted function directly (the legacy path keeps
+    // its own end-to-end coverage in server.rs).
+
+    /// Bind an ephemeral UDP socket and run [`serve_stun`] on it; the
+    /// standalone `ak-cli stun-server` subcommand is exactly this plus
+    /// flag parsing and Ctrl-C handling.
+    async fn spawn_serve_stun() -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let join = tokio::spawn(serve_stun(socket, shutdown_rx));
+        (addr, shutdown_tx, join)
+    }
+
+    #[tokio::test]
+    async fn serve_stun_answers_binding_request_with_reflexive_address() {
+        let (server, shutdown, join) = spawn_serve_stun().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = client.local_addr().unwrap();
+        client.send_to(&binding_request(TX), server).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("responder timeout")
+            .unwrap();
+        assert_eq!(from, server, "reply must come from the responder socket");
+        // parse_binding_response verifies the transaction id and decodes
+        // the XOR-MAPPED-ADDRESS attribute, so equality proves the reflexive
+        // address was encoded correctly for this client.
+        assert_eq!(parse_binding_response(&buf[..len], TX).unwrap(), expected);
+        let _ = shutdown.send(true);
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_stun_ignores_malformed_input_and_keeps_answering() {
+        let (server, shutdown, join) = spawn_serve_stun().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = client.local_addr().unwrap();
+        // Every malformed shape the parser rejects: empty datagram,
+        // truncated header, response-type bytes, bad cookie, length field
+        // claiming absent attributes, and a max-size junk burst.
+        let mut wrong_type = binding_request(TX);
+        wrong_type[0] = 0x01; // 0x0101 is a response type, not a request
+        let mut bad_cookie = binding_request(TX);
+        bad_cookie[5] = 0x00;
+        let mut bad_len = binding_request(TX);
+        bad_len[3] = 4; // claims 4 attribute bytes that are not there
+        for bytes in [
+            &[][..],
+            &binding_request(TX)[..19],
+            &wrong_type,
+            &bad_cookie,
+            &bad_len,
+            &vec![0xffu8; 256],
+        ] {
+            client.send_to(bytes, server).await.unwrap();
+        }
+        // Nothing above may draw a reply (and nothing crashed).
+        let mut buf = [0u8; 128];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "malformed datagrams must be ignored, not answered"
+        );
+        // The responder is still alive and correct after the garbage.
+        client.send_to(&binding_request(TX), server).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("no response after malformed input")
+            .unwrap();
+        assert_eq!(parse_binding_response(&buf[..len], TX).unwrap(), expected);
+        let _ = shutdown.send(true);
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_stun_returns_on_shutdown() {
+        let (_addr, shutdown, join) = spawn_serve_stun().await;
+        let _ = shutdown.send(true);
+        tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .expect("responder must exit after shutdown")
+            .unwrap();
+    }
+
+    /// CR-P2-13 acceptance: with ONLY the standalone responder running (no
+    /// signaling process involved), the real client path — [`query_on`],
+    /// what transfers call on their own socket — still learns a correct
+    /// reflexive address. On loopback the reflexive address is the client's
+    /// own local address.
+    #[tokio::test]
+    async fn query_on_against_standalone_serve_stun_answers_reflexive() {
+        let (server, shutdown, join) = spawn_serve_stun().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = client.local_addr().unwrap();
+        let mapped = query_on(&client, server, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(mapped, expected);
+        let _ = shutdown.send(true);
+        join.await.unwrap();
     }
 }

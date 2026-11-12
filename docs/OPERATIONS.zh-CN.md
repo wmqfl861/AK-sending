@@ -13,7 +13,47 @@
 
 ## 生产 registry 服务器运维手册（CR-P2-09，2026-11-11）
 
-**现状与授权边界**：生产协调服务器＝122.51.121.24（腾讯云 Ubuntu 24.04，[SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)），2026-11-05 由所有者部署：registry 7200（TLS）＋旧 signal 7100/7101，systemd 常驻（[HANDOFF](HANDOFF.zh-CN.md) 第二十五波；unit 名、二进制与数据路径均未核实——仓库无部署脚本与 unit 文件）。**线上二进制版本未核实**（CR-P2-09 的直接动因）：本轮修复只改代码与文档，未访问服务器、未部署、未改防火墙；以下所有服务器侧步骤由所有者执行。服务器只做协调，绝不承载文件数据（[ADR-001](adr/001-direct-only.zh-CN.md)）。跨设备回归用 [scripts/cross_device_test.sh](../scripts/cross_device_test.sh)（6/6 为历史基线，2026-11-05；该脚本当前用 `--ssh-pass`，按 CR-P3-05 应改密钥登录，勿把密码写进工单）。
+**现状与授权边界**：生产协调服务器＝122.51.121.24（腾讯云 Ubuntu 24.04，[SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)），2026-11-05 由所有者部署：registry 7200（TLS）＋旧 signal 7100/7101，systemd 常驻（[HANDOFF](HANDOFF.zh-CN.md) 第二十五波；unit 名、二进制与数据路径均未核实——仓库无部署脚本与 unit 文件）。**线上二进制版本未核实**（CR-P2-09 的直接动因）：本轮修复只改代码与文档，未访问服务器、未部署、未改防火墙；以下所有服务器侧步骤由所有者执行。进程/端口对应关系与 STUN 独立化迁移（CR-P2-13）见 §0。服务器只做协调，绝不承载文件数据（[ADR-001](adr/001-direct-only.zh-CN.md)）。跨设备回归用 [scripts/cross_device_test.sh](../scripts/cross_device_test.sh)（6/6 为历史基线，2026-11-05；该脚本当前用 `--ssh-pass`，按 CR-P3-05 应改密钥登录，勿把密码写进工单）。
+
+### 0. 进程与端口对应关系（CR-P2-13，2026-11-12）
+
+审核 [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md) §4.5 CR-P2-13：此前 STUN（UDP 7101）只能由旧信令进程提供（`crates/ak-signal/src/server.rs` 的内置响应器），退役旧进程会**静默**断掉 STUN（按设计 fail-open，跨 NAT 能力悄悄下降）。本轮把该响应器抽为共享实现 `ak_signal::stun::serve_stun` 并新增独立子命令 `ak-cli stun-server`——旧 signal-server 内部改调同一函数，两条路径零漂移；验收测试证明"只运行 registry-server ＋独立 STUN 服务"时 v1 的 STUN 客户端路径照常拿到正确反射地址（`crates/ak-signal/src/stun.rs` 的 `query_on_against_standalone_serve_stun_answers_reflexive`）。
+
+| 端口 | 协议 | 进程（ak-cli 子命令） | 说明 |
+|---|---|---|---|
+| 7200 | TCP | `registry-server` | v2 配对注册（TLS＋SQLite）。已部署（2026-11-05）；线上版本未核实（§1） |
+| 7101 | UDP | `stun-server` | 独立 STUN 响应器（RFC 5389 Binding，无密钥无数据库无文件路由）。**本轮新增，线上尚未部署**（未核实） |
+| 7100 ＋ 7101 | TCP ＋ UDP | `signal-server`（遗留） | 单进程双套接字（TCP 信令＋内置 STUN）。现网 7101 目前由它提供；E1/E6 的退役对象 |
+
+迁移与退役顺序（所有者执行；agent 未访问服务器，现网 unit 名/进程形态未核实）：
+
+1. 按 §2 构建含 `stun-server` 的新版 ak-cli 并按 §3 上传（与 registry-server 同一二进制）。
+2. 维护窗口内切换 7101：先停旧 signal unit，再启动独立 STUN（`ak-cli stun-server --port 7101`，unit 模板见下）。同端口互斥，两进程不能并存。启动日志应见 `stun-server version: …` 与 `stun responder listening on udp 0.0.0.0:7101` 两行（env_logger 同 §1 约定，`RUST_LOG` 可覆盖）。
+3. 外网验证：另一台机器 `ak-cli doctor --stun <服务器IP>:7101` 显示"查询成功"（或跑一次跨网 CLI/GUI 传输冒烟）。失败回滚＝停 stun unit、重启旧 signal unit。
+4. 验证通过后，旧 `signal-server` 进程即可停止（E6"CR-P2-13 完成前不要停旧 signal 进程"的告诫自此解除）；TCP 7100 的防火墙关闭建议保持不变（§6）。
+
+客户端默认 STUN 地址仍写死为生产 IP 的 7101（本轮不动）；域名化与注册中心地址一起归 CR-P3-03（所有者）。
+
+stun unit 模板（草稿，非现存文件；无数据目录故无 ReadWritePaths）：
+
+```ini
+[Unit]
+Description=AK-sending standalone STUN responder (binding only, ADR-001)
+After=network-online.target
+
+[Service]
+User=akreg                      # 专用非 root 账号；现网实际用户未核实
+ExecStart=/opt/ak-sending/ak-cli stun-server --port 7101
+Environment=RUST_LOG=info
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ### 1. 版本可观测性（本轮已落地的代码部分）
 
@@ -41,7 +81,7 @@ target/release/ak-cli registry-server --version              # 记录输出进�
 1. **备份**（§5）：`registry.key` 与 `registry.db`（位置未核实；默认为运行用户 `$HOME/.ak-sending/` 下，即 `registry-server` 首次启动自动生成的布局——若 unit 显式传过 `--id-dir`/`--db-path` 以其为准）。
 2. 上传：`scp target/release/ak-cli <user>@122.51.121.24:/opt/ak-sending/ak-cli.new`（chmod 755，属主与现网一致）。
 3. 预检：`/opt/ak-sending/ak-cli.new registry-server --version` 记录进工单。
-4. 切换：`systemctl stop <unit>` → `mv ak-cli ak-cli.old-<日期>` → `mv ak-cli.new ak-cli` → `systemctl start <unit>`。旧 signal 7100/7101 是否同一 unit/进程未核实（HANDOFF 记载同机常驻）；若需同时升级，一并重启并记录。
+4. 切换：`systemctl stop <unit>` → `mv ak-cli ak-cli.old-<日期>` → `mv ak-cli.new ak-cli` → `systemctl start <unit>`。旧 signal 7100/7101 是否同一 unit/进程未核实（HANDOFF 记载同机常驻）；若需同时升级，一并重启并记录。独立 STUN（stun-server）的部署与 7101 切换顺序见 §0。
 5. 验证：`journalctl -u <unit> -n 50` 应见 `registry-server version: …` 与 `v2 registry server listening on tls 0.0.0.0:7200 (registry …)`；客户端侧跑 `scripts/cross_device_test.sh`（期望 6/6）或 GUI 配对一次冒烟。
 6. unit 文件模板（**草稿，非现存文件**；加固项按所有者安全基线取舍）：
 
@@ -88,12 +128,13 @@ WantedBy=multi-user.target
 
 ### 6. 防火墙姿态（所有者执行；agent 未访问服务器）
 
-- 现状（2026-11-05 部署形态，[STATUS](STATUS.zh-CN.md)）：公网开放 TCP 7200（registry TLS）、TCP 7100（旧明文 signal）、UDP 7101（STUN）。
-- 建议（CR-P2-09＋CR-P1-02 联动）：
+- 现状（2026-11-05 部署形态，[STATUS](STATUS.zh-CN.md)）：公网开放 TCP 7200（registry TLS）、TCP 7100（旧明文 signal）、UDP 7101（STUN）。进程与端口的对应关系见 §0（CR-P2-13）。
+- 建议（CR-P2-09＋CR-P2-13 联动）：
   1. **TCP 7200 必须保留**（GUI/CLI 主线路径唯一协调入口）。
-  2. **关闭公网 TCP 7100**：GUI 不经旧 signal（审核证据 `flutter_app/lib/services/ffi_simple_transfer_service.dart:186-189`）；旧 signal 的全局连接上限（CR-P1-03 第 6 点）继续暴露在公网无收益。若仍有旧 CLI 用户依赖 7100，先评估再关；关闭由所有者在云安全组/防火墙执行并记录日期。
-  3. **UDP 7101 的去留绑定 CR-P1-02**：v1 主线补 STUN 反射候选（批次 C）落地后保留 UDP 7101 供公网穿透；未落地期间它只服务旧 signal 探测，可随 TCP 7100 一并评估收敛。
-  4. SSH：收敛来源白名单、禁密码登录（CR-P3-05），密钥登录。
+  2. **关闭公网 TCP 7100**（建议不变）：GUI 不经旧 signal（审核证据 `flutter_app/lib/services/ffi_simple_transfer_service.dart:186-189`）；旧 signal 的全局连接上限（CR-P1-03 第 6 点）继续暴露在公网无收益。若仍有旧 CLI 用户依赖 7100，先评估再关；关闭由所有者在云安全组/防火墙执行并记录日期。
+  3. **UDP 7101 保留**：跨 NAT 穿透依赖 STUN（CR-P1-02 落地后是主线能力）。CR-P2-13 起 7101 改由独立 `ak-cli stun-server` 提供（§0），不再绑定旧 signal 进程的存亡。
+  4. **旧 signal 进程的退役条件（E6 告诫的 CR-P2-13 修订）**：E6 原文"CR-P2-13 完成前不要停旧 signal 进程"。现在 CR-P2-13 代码已落地，但**线上独立 STUN 尚未部署（未核实）**——§0 步骤 3 的外网验证通过之前仍不要停旧进程；验证通过后即可停止旧 signal-server（TCP 7100 照第 2 条关闭，UDP 7101 交给 stun-server）。
+  5. SSH：收敛来源白名单、禁密码登录（CR-P3-05），密钥登录。
 
 ### 7. 客户端可查询服务器版本——设计提案（未实施；v2 契约冻结）
 
@@ -106,13 +147,14 @@ WantedBy=multi-user.target
   - 安全注意：revision 是构建指纹，不含路径/主机名等敏感信息；应答限频并入现有每连接帧预算即可。
 - **实施顺序**：服务端先行（旧客户端无感知）→ 客户端随后按位启用；落地后本手册 §1 "客户端远程查询"由提案改为操作说明。
 
-## 协调服务器运维（signal-server，CLI 原型现状）
+## 协调服务器运维（signal-server 与 stun-server，CLI 原型现状）
 
-本节为 `ak-cli signal-server` 当前实现的运维事实；上文为部署设计边界，两者一致：只有协调，没有文件路由。
+本节为 `ak-cli signal-server` 与 `ak-cli stun-server` 当前实现的运维事实；上文为部署设计边界，两者一致：只有协调，没有文件路由。生产进程/端口的对应关系与迁移顺序见上文 §0（CR-P2-13）。
 
 ### 启动与端口
 
-- `ak-cli signal-server [--tcp-port 7100] [--stun-port 7101]`：单进程、双套接字——TCP 信令与 UDP STUN 响应器；Ctrl-C 优雅关停。
+- `ak-cli signal-server [--tcp-port 7100] [--stun-port 7101]`（遗留）：单进程、双套接字——TCP 信令与 UDP STUN 响应器；Ctrl-C 优雅关停。E1/E6 的退役对象：独立 STUN 部署验证（§0 步骤 3）后可停。
+- `ak-cli stun-server [--port 7101] [--bind 0.0.0.0]`（CR-P2-13）：独立 UDP STUN 响应器，与 signal-server 内置的同一份实现（`ak_signal::stun::serve_stun`）；单套接字、无密钥无数据库；启动日志带版本行（§1 同款），Ctrl-C 优雅关停。
 - 防火墙需放行 TCP 信令端口与 UDP STUN 端口各一个。`probe --server IP:7100` 隐含向 server 端口 +1 发 STUN 查询，规划端口时保持 TCP N / UDP N+1 的相邻约定即可。
 
 ### 限额默认（Limits，均为协调面资源上限，与任何文件配额无关）

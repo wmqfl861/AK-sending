@@ -112,5 +112,5 @@ NM="$USERPROFILE/android-toolchain/sdk/ndk/$(ls "$USERPROFILE/android-toolchain/
   追加 `strip = true` 或手工 `llvm-strip`。
 - Windows 主机走 `windows-x86_64` 的 NDK；脚本同时探测 `linux-x86_64` 以便同一脚本
   在 Linux CI 复用，但后者未在本机验证。
-- `MANIFEST.sha256` 与 `flutter_app/android/` 工程目录由集成者维护，脚本只创建
+- `MANIFEST.sha256` 已按 E4 决定删除（2026-11-12）；`flutter_app/android/` 工程目录由集成者维护，脚本只创建
   `jniLibs/<abi>/` 子目录。

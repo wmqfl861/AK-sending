@@ -4,19 +4,20 @@
 >
 > 逐项修复进度以 [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md) 第 7 节状态表为准，本页只记口径与结论。
 
-## 当前状态（2026-11-11）
+## 当前状态（2026-11-12）
 
-- **阶段＝审核修复阶段**。2026-11-11 全项目独立审核（[REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md)，审核对象 `main@88c77e0`，发现 P1×5/P2×9/P3×5＋2 项 wave-36 遗留）；修复在分支 `dev/review-fixes-20261111` 上按批次 **A 恢复门禁 → B 安全与可用性 → C 跨 NAT 直连 → D 移动端功耗与生命周期 → E 瘦身与文档** 推进。A 与 B 已完成（个别收尾项依赖所有者决定，见审核第 8 节），CI 全绿；**批次 C（跨 NAT 直连，CR-P1-02）进行中**；D1（自适应轮询＋生命周期观察者）已落地，D2/D3 与批次 E 待做。
-- **生产服务器**：122.51.121.24 常驻 registry 7200（TLS）＋旧 signal 7100/7101（2026-11-05 部署形态）。线上二进制版本未核实（审核 CR-P2-09）；本轮修复未访问、未部署、未改防火墙（部署与防火墙归所有者）。
-- **客户端交付**：Windows GUI（v1 极简 UI）与 CLI（`ak-cli`，v1 任务码 `task` 命令族＋旧邀请码两种模式）已交付并打包（`scripts/package_windows.ps1`）；Android debug APK 已构建并在模拟器装机（**非真机**，v1 UI 走查未执行）；Linux GUI 从未在 Linux 主机构建；macOS/iOS 由所有者明确排除。平台逐项状态见 [SUPPORT_MATRIX](SUPPORT_MATRIX.zh-CN.md)。
-- **v1 一次性任务码模型双入口**：GUI（`ak_task_*` FFI→Dart→Flutter）与 CLI（`ak-cli task`，不依赖 ak-ffi）均已接入（wave-28/wave-32）。
-- **已知最大缺口**：v1 主线尚不能跨 NAT 直连——候选地址只有本机 IPv4/回环，无 STUN 反射候选、无 IPv6，两端均处 NAT 后即无可拨地址（批次 C 处理中）；两台物理机（家宽/热点）NAT 穿透成功率与 L3 抓包级无中继证据未做。
+- **阶段＝审核修复轮已完成并通过独立验收复核（有条件）**。第一轮修复（`dev/review-fixes-20261111`，32 个提交，审核文档 [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md) 全部 19 项编号处置完毕）由 Claude 独立复核：**通过（条件＝本轮 F0 文档收尾，见 [REVIEW_2026-11-12-acceptance](REVIEW_2026-11-12-acceptance.zh-CN.md)）**；新发现 8 项（P1×1/P2×4/P3×3）已补入审核文档第 4.5/7 节。
+- **当前执行**：批次 F（验收文档第 8 节工作单）。**未关闭的 P1：CR-P1-05**——跨 NAT 打洞仍是单向（发送端不做 STUN/不复用映射 socket、接收端 QUIC socket 从不向对端发包），常见家用 NAT 组合预计失败；F2 完成前不建议真机 C4。
+- **E1-E4 已由验收方决定**（E1 冻结旧模型：删旧 Dart 层随时做、旧 Rust 特性隔离须在 F3 之后；E2 确认窗口 30s→120s；E3 暂不上 UPnP、对称 NAT 文案已定稿；E4 删除 MANIFEST.sha256）。E5/E6/E7（签名密钥/服务器部署防火墙/LICENSE）待所有者，见验收文档第 6 节。
+- **生产服务器**：122.51.121.24 常驻 registry 7200（TLS）＋旧 signal 7100/7101（2026-11-05 部署形态，线上二进制版本仍未核实）。本轮未访问、未部署、未改防火墙。**E6 注意：CR-P2-13（STUN 拆独立服务）完成前不得停旧进程，只能防火墙封 TCP 7100。**
+- **客户端交付**：Windows GUI/CLI 已交付打包；Android debug APK 已构建（模拟器装机，非真机）；Linux GUI 未构建；macOS/iOS 所有者排除。
+- **v1 任务码双入口**（GUI `ak_task_*` FFI + CLI `task` 命令族）均已接入；跨 NAT 直连能力＝接收端 IPv6 候选 + 同 socket STUN 反射 + 单向探测（完整双向打洞见 CR-P1-05/F2）。
 
 ## 最新验证（CI）
 
-- Run [43011364868](https://github.com/wmqfl861/AK-sending/actions/runs/43011364868)（批次 A 收口）：全绿——Rust ubuntu/windows、audit、portability×3、checks；release-deep-tests 为手动任务按设计 skipped。
-- Run [43031622309](https://github.com/wmqfl861/AK-sending/actions/runs/43031622309)（批次 B 时点）。
-- 本地门槛命令清单见审核文档第 6 节；本页只记 CI 结论，不复述本地测试计数。
+- Run [43121806432](https://github.com/wmqfl861/AK-sending/actions/runs/43121806432)（修复轮收官提交 `ae0b4e7`）：全绿——Rust ubuntu/windows、flutter（186+166）、android（双 ABI+符号校验+APK 上传）、audit、deny、checks、portability×3；release-deep-tests 手动任务按设计 skipped。
+- 独立验收复核另在 Linux 容器（rustc 1.97.0、无 IPv6、网卡 192.0.2.2/24）实跑全量门槛：1,203 通过 / 0 失败 / 7 忽略（验收文档第 2 节）。
+- 本地门槛命令清单见审核文档第 6 节；本页只记结论，不复述计数。
 
 ## 交接入口
 

@@ -87,7 +87,7 @@ C ABI 应保持 ADR-003：新增短时 start 导出产生 16B operation/session 
 
 **6. 现有证据与平台验收矩阵**
 
-- `reports/dev-validation-2026-11-02.txt:447` 起记录第十七波闭环：Rust **507/0**、Dart **85/85**、Flutter **84/84**、仓库检查通过；5GiB release 回归也有独立记录。本轮没有重跑。
+- `reports/archive/dev-validation-2026-11-02.txt:447` 起记录第十七波闭环：Rust **507/0**、Dart **85/85**、Flutter **84/84**、仓库检查通过；5GiB release 回归也有独立记录。本轮没有重跑。
 - Windows 已有 runner 和 DLL 随包配置：`flutter_app/windows/runner/CMakeLists.txt:44`。计划门槛应是 Rust release DLL/CLI＋`flutter build windows --release`＋真实窗口邀请码 e2e，确认加载的是当前构建 DLL。
 - Android 已有 `x86_64`、`arm64-v8a` so，`minSdk=24`：`android/app/build.gradle.kts:22`，主 manifest `INTERNET`：`:6`。现有脚本 `scripts/build_android_ffi.sh:184` 只抽查 `ak_engine_new ak_identity_info ak_jobs_list`，新计划必须把 `ak_peer_*` 与新 pair/scheduler exports 全纳入符号验收。
 - Android→宿主有模拟器跨网络栈 CLI 证据，不能算物理双机。反向经 UDP 垫片的记录已按 INV-008 重新归类，不能用来证明直连。

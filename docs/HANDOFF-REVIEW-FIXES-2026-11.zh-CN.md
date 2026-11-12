@@ -7,9 +7,9 @@
 
 ## 0. 一页结论
 
-- **分支**：`dev/review-fixes-20261111`（自 `origin/review/claude-20261111` 检出，33 个提交，全部已推送）
-- **最终验收**：CI run [43093828012](https://github.com/wmqfl861/AK-sending/actions/runs/43093828012) 全绿（Rust ubuntu/windows、flutter、android、audit、deny、checks、portability×3；release-deep-tests 为手动任务按设计 skipped）；收官补充提交后的 run 见 §4 末尾
-- **完成度**：审核 19 项编号中 **14 项已完成**、4 项"代码全部完成、余项被所有者决定阻塞"（P1-02 余真机实测、P2-02 余命名/密钥、P2-04 余 netem/窗口时长、P2-09 余部署/契约修订）、P2-08/P3-03/P3-05 待所有者
+- **分支**：`dev/review-fixes-20261111`（自 `origin/review/claude-20261111` 检出，32 个提交含本交接，全部已推送；验收复核更正）
+- **最终验收**：分支顶端最终 run 为 [43121806432](https://github.com/wmqfl861/AK-sending/actions/runs/43121806432) 全绿（含门铃测试补交；此前 D2 主提交的 run 43093828012 亦全绿）（Rust ubuntu/windows、flutter、android、audit、deny、checks、portability×3；release-deep-tests 为手动任务按设计 skipped）
+- **完成度**（验收复核更正后的口径）：审核 18 项编号中 **11 项已完成**、4 项部分完成（P1-02 余 CR-P1-05 双向打洞与 C4 真机、P2-02 余命名/密钥、P2-04 余 netem/E2、P2-07 余本 F0 收尾）、3 项待所有者（P2-08/P3-03/P3-05）；另有 R36-P2-04 剩余与 wave-36 N2 两项遗留未开始
 - **下一步阻塞点**：① C4 跨 NAT 真机实测（需所有者设备，§8）② 第 8 节 E1-E7 所有者决定（§7）
 - **红线遵守情况**：未引入 relay/TURN（服务器不经手文件数据，STUN 地址发现符合 ADR-001）；未访问/部署/修改生产服务器 122.51.121.24 及防火墙；未生成或入库任何签名密钥/SSH 凭证；冻结契约改动均先改文档后跑 `scripts/check_contracts.py`（本轮改动：pairing-flow.md §11、ffi-v2.md §8.1/§8.6/§1）；全程无"模拟器/同机双进程=真机验证"的表述；未合并 PR、未改 main、未强推
 

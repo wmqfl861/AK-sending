@@ -133,6 +133,7 @@ def check(root: Path) -> dict:
     markdowns = sorted(
         path for path in root.rglob("*.md")
         if "target" not in path.relative_to(root).parts
+        and "archive" not in path.relative_to(root).parts  # frozen history
     )
     for path in markdowns:
         text = path.read_text(encoding="utf-8")
@@ -143,6 +144,18 @@ def check(root: Path) -> dict:
             if not target.is_relative_to(root.resolve()) or not target.exists():
                 errors.append(f"broken/outside local link in {path.relative_to(root)}: {link}")
             checked_links += 1
+        # CR-P2-12: code-formatted repo paths (backticked, not markdown
+        # links) bypass the link checker — the reports/ archival left four
+        # stale ones. Validate backticked reports/... paths exist (an
+        # optional trailing :line/:col annotation is stripped).
+        for ref in re.findall(r"`(reports/[^`]+?)`", text):
+            if any(ch in ref for ch in "*?[…"):
+                continue  # glob/ellipsis prose, not a literal path
+            ref_path = ref.split(":", 1)[0] if not ref.endswith(":") else ref
+            if not (root / ref_path).exists():
+                errors.append(
+                    f"stale code-formatted reports/ path in {path.relative_to(root)}: {ref}"
+                )
     source_files = sorted((root / "crates").rglob("*.rs"))
     rust_tests = sum(p.read_text(encoding="utf-8").count("#[test]") for p in source_files)
     # Contract consistency vs the frozen docs/contracts (wave-24 advisory

@@ -193,6 +193,12 @@ struct ClientInner {
     connected: AtomicBool,
     closed: AtomicBool,
     replaced: AtomicBool,
+    /// The CURRENT disconnect was a replacement kick (set in
+    /// [`ClientInner::note_replaced`], cleared on the next successful
+    /// [`ClientState::Connected`]). Unlike `replaced` (sticky, surfaces
+    /// the event to the UI), this tells the connection keeper how to
+    /// pace its reclaim — see [`KEEPER_REPLACEMENT_PAUSE`].
+    replace_closed: AtomicBool,
     unmatched: AtomicU64,
     state_tx: watch::Sender<ClientState>,
 }
@@ -340,6 +346,7 @@ impl ClientInner {
     }
 
     fn note_replaced(&self) {
+        self.replace_closed.store(true, Ordering::Release);
         if !self.replaced.swap(true, Ordering::AcqRel) {
             log::warn!(
                 "pairing client: this control connection was replaced by a \
@@ -459,6 +466,7 @@ impl RegistryClient {
             connected: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             replaced: AtomicBool::new(false),
+            replace_closed: AtomicBool::new(false),
             unmatched: AtomicU64::new(0),
             state_tx,
         });
@@ -508,6 +516,14 @@ impl RegistryClient {
     /// Sticky: a newer connection of the same device id took over.
     pub fn is_replaced(&self) -> bool {
         self.inner.replaced.load(Ordering::Acquire)
+    }
+
+    /// Whether the CURRENT disconnect was caused by a replacement kick
+    /// (crate-private: the connection keeper's pacing input; cleared on
+    /// the next successful connection). Distinct from the sticky
+    /// [`RegistryClient::is_replaced`] event flag.
+    pub(crate) fn last_close_was_replacement(&self) -> bool {
+        self.inner.replace_closed.load(Ordering::Acquire)
     }
 
     /// Connection state changes.
@@ -1053,6 +1069,21 @@ impl RegistryClient {
         *self.inner.outbox.lock().expect("client outbox lock") = mpsc::channel(1).0;
     }
 
+    /// Simulate a replacement kick (tests and fault injection): deliver
+    /// the registry's `ERR_DEVICE_REPLACED` ServerError through the real
+    /// routing path (sets the sticky flag + the keeper's pacing signal,
+    /// fails one-shot waiters), then drop the connection exactly as the
+    /// server would after sending the kick.
+    #[cfg(test)]
+    pub(crate) async fn simulate_replacement_kick(&self) {
+        let frame = ak_signal::protocol_v2::CtrlMessage::ServerError {
+            code: ak_signal::client_v2::ERR_DEVICE_REPLACED,
+            message: "replaced (simulated)".to_owned(),
+        };
+        self.inner.route(frame.into());
+        self.simulate_connection_loss().await;
+    }
+
     /// Simulate an abrupt connection loss (tests and fault injection):
     /// [`RegistryClient::drop_connection`] — a subsequent
     /// [`RegistryClient::reconnect`] can bring the client back. The
@@ -1133,7 +1164,7 @@ impl RegistryClient {
                         ClientError::Replaced
                     } else {
                         ClientError::ConnectionLost
-                    })
+                    });
                 }
             }
         }
@@ -1209,6 +1240,18 @@ pub const KEEPER_RETRY_BACKOFF_STEPS: [Duration; 6] = [
     Duration::from_secs(30),
 ];
 
+/// Pause before the keeper RECLAIMS a replacement-kicked connection
+/// (CR fix, 2026-11-12): a same-identity one-shot (e.g. the legacy
+/// `ak-cli invite revoke`, which predates the connection lock) holds the
+/// registry's one-connection-per-device slot for its brief operation;
+/// the keeper's usual first-retry-is-immediate rule regrabbed the slot
+/// mid-operation and kicked it — on slow CI, `invite revoke` died with
+/// "connection lost while waiting for the reply" (runs 43029286253 and
+/// 43159698726). A replacement kick is not a network blip: wait out the
+/// full cap so any short borrower finishes, then reclaim (a well-behaved
+/// lock participant never collides at all — it refuses loudly).
+pub const KEEPER_REPLACEMENT_PAUSE: Duration = Duration::from_secs(30);
+
 /// The pause before reconnect batch `failed_batches + 1`
 /// ([`KEEPER_RETRY_BACKOFF_STEPS`], saturating at the cap).
 pub fn keeper_retry_pause(failed_batches: usize) -> Duration {
@@ -1220,12 +1263,16 @@ pub fn keeper_retry_pause(failed_batches: usize) -> Duration {
 pub struct ConnectionKeeperConfig {
     /// Keepalive ping cadence ([`KEEPER_PING_INTERVAL`] by default).
     pub ping_interval: Duration,
+    /// Reclaim pause after a replacement kick
+    /// ([`KEEPER_REPLACEMENT_PAUSE`] by default; tests inject a short one).
+    pub replacement_pause: Duration,
 }
 
 impl Default for ConnectionKeeperConfig {
     fn default() -> Self {
         ConnectionKeeperConfig {
             ping_interval: KEEPER_PING_INTERVAL,
+            replacement_pause: KEEPER_REPLACEMENT_PAUSE,
         }
     }
 }
@@ -1262,7 +1309,11 @@ async fn connection_keeper_loop(
             }
             ClientState::Connecting => {}
             ClientState::Disconnected => {
-                let pause = keeper_retry_pause(failed_batches);
+                let pause = if client.last_close_was_replacement() {
+                    config.replacement_pause
+                } else {
+                    keeper_retry_pause(failed_batches)
+                };
                 if !pause.is_zero() {
                     tokio::select! {
                         _ = tokio::time::sleep(pause) => {}
@@ -1386,7 +1437,7 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
                 return Err(ClientError::Protocol(format!(
                     "expected AuthChallenge, got type 0x{:02x}",
                     other.type_byte()
-                )))
+                )));
             }
         }
     }
@@ -1433,7 +1484,7 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
                 return Err(ClientError::Protocol(format!(
                     "expected Welcome, got type 0x{:02x}",
                     other.type_byte()
-                )))
+                )));
             }
         }
     }
@@ -1444,6 +1495,10 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
     let (tx, rx) = mpsc::channel(inner.config.outbox_capacity);
     *inner.outbox.lock().expect("client outbox lock") = tx;
     inner.connected.store(true, Ordering::Release);
+    // A fresh connection is by definition not replacement-kicked; the
+    // keeper's replacement pacing must not outlive the outage that
+    // caused it (the sticky `replaced` flag above is the UI-facing one).
+    inner.replace_closed.store(false, Ordering::Release);
     inner.state_tx.send_replace(ClientState::Connected(epoch));
     let reader_inner = Arc::clone(inner);
     let reader_epoch = epoch;
@@ -1670,6 +1725,7 @@ mod tests {
         let keeper = client.spawn_connection_keeper_with(
             ConnectionKeeperConfig {
                 ping_interval: Duration::from_millis(100),
+                replacement_pause: Duration::from_millis(100),
             },
             shutdown_rx,
         );
@@ -1689,6 +1745,78 @@ mod tests {
         shutdown_tx.send(true).expect("stop the keeper");
         let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;
         client.close().await;
+        drop(registry);
+    }
+
+    /// Replacement pacing (2026-11-12 fix): when a same-device-id second
+    /// connection takes over the registry slot, the keeper must NOT
+    /// regrab it immediately (the immediate first retry kicked the
+    /// short-lived borrower mid-operation — the `invite revoke` CI
+    /// failure). It waits out `replacement_pause`, then reclaims.
+    #[tokio::test]
+    async fn keeper_paces_a_replacement_kick_before_reclaiming() {
+        let registry = registry::spawn().await;
+        let key = DeviceKeyPair::generate(); // one device id, two connections
+        let a = RegistryClient::connect(registry.addr, registry.registry_id, &key, "pace-a")
+            .await
+            .expect("connect A");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let keeper = a.spawn_connection_keeper_with(
+            ConnectionKeeperConfig {
+                ping_interval: Duration::from_secs(3600), // pings off: only the kick matters
+                replacement_pause: Duration::from_millis(700),
+            },
+            shutdown_rx,
+        );
+        assert!(!a.last_close_was_replacement());
+
+        // The registry (the test fake does not implement same-id kicks)
+        // would deliver ERR_DEVICE_REPLACED and close; simulate exactly
+        // that through the real routing + teardown paths.
+        a.simulate_replacement_kick().await;
+        let mut state = a.state_watcher();
+        let kicked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ClientState::Disconnected) {
+                    return;
+                }
+                state.changed().await.expect("watcher alive");
+            }
+        })
+        .await;
+        assert!(kicked.is_ok(), "B's connect must kick A");
+        assert!(a.is_replaced(), "the sticky event flag is set");
+        assert!(a.last_close_was_replacement());
+
+        // Pacing: A must still be Disconnected well past a normal
+        // first-retry-is-immediate reclaim (which would have reconnected
+        // within ~a batch, i.e. milliseconds here).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(*state.borrow_and_update(), ClientState::Disconnected),
+            "the keeper must honor the replacement pause, not regrab instantly"
+        );
+
+        // ... and after the pause it does reclaim (B gets kicked in turn).
+        let reclaimed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ClientState::Connected(_)) {
+                    return;
+                }
+                state.changed().await.expect("watcher alive");
+            }
+        })
+        .await;
+        assert!(reclaimed.is_ok(), "the keeper reclaims after the pause");
+        assert!(
+            !a.last_close_was_replacement(),
+            "a fresh connection clears the pacing signal (sticky is_replaced stays)"
+        );
+        assert!(a.is_replaced(), "the sticky UI flag survives reconnects");
+
+        shutdown_tx.send(true).expect("stop the keeper");
+        let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;
+        a.close().await;
         drop(registry);
     }
 }

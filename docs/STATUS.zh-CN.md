@@ -7,7 +7,7 @@
 ## 当前状态（2026-11-12）
 
 - **阶段＝审核修复轮已完成并通过独立验收复核（有条件）**。第一轮修复（`dev/review-fixes-20261111`，32 个提交，审核文档 [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md) 全部 19 项编号处置完毕）由 Claude 独立复核：**通过（条件＝本轮 F0 文档收尾，见 [REVIEW_2026-11-12-acceptance](REVIEW_2026-11-12-acceptance.zh-CN.md)）**；新发现 8 项（P1×1/P2×4/P3×3）已补入审核文档第 4.5/7 节。
-- **当前执行**：批次 F（验收文档第 8 节工作单）。**未关闭的 P1：CR-P1-05**——跨 NAT 打洞仍是单向（发送端不做 STUN/不复用映射 socket、接收端 QUIC socket 从不向对端发包），常见家用 NAT 组合预计失败；F2 完成前不建议真机 C4。
+- **当前执行（2026-11-12 晚）**：批次 F 执行至 nat-matrix 三修停止点。F0/F9/F8/F3/F4/F1/F2 已完成（CR-P1-05 双向打洞落地，NAT 矩阵 **3/4 通过**，含 v4 反射地址端到端证据）；唯 symm↔symm 意外成功=对称 NAT 模拟保真度问题，三选项待所有者（见 [HANDOFF-BATCH-F-2026-11-12](HANDOFF-BATCH-F-2026-11-12.zh-CN.md) §2）。F5/F7/F10/F11/F6 未开始、无技术阻塞。nat-matrix job 在所有者表态前持续红（已知状态，非回归）；其余 11 job 全绿。
 - **E1-E4 已由验收方决定**（E1 冻结旧模型：删旧 Dart 层随时做、旧 Rust 特性隔离须在 F3 之后；E2 确认窗口 30s→120s；E3 暂不上 UPnP、对称 NAT 文案已定稿；E4 删除 MANIFEST.sha256）。E5/E6/E7（签名密钥/服务器部署防火墙/LICENSE）待所有者，见验收文档第 6 节。
 - **生产服务器**：122.51.121.24 常驻 registry 7200（TLS）＋旧 signal 7100/7101（2026-11-05 部署形态，线上二进制版本仍未核实）。本轮未访问、未部署、未改防火墙。**E6 注意：CR-P2-13（STUN 拆独立服务）完成前不得停旧进程，只能防火墙封 TCP 7100。**
 - **客户端交付**：Windows GUI/CLI 已交付打包；Android debug APK 已构建（模拟器装机，非真机）；Linux GUI 未构建；macOS/iOS 所有者排除。
@@ -21,7 +21,7 @@
 
 ## 交接入口
 
-> **本轮审核修复的完整交接**：[HANDOFF-REVIEW-FIXES-2026-11](HANDOFF-REVIEW-FIXES-2026-11.zh-CN.md)（33 提交、CI 证据链、逐项验证方法、待决清单）。
+> **交接文档**：第一轮修复 [HANDOFF-REVIEW-FIXES-2026-11](HANDOFF-REVIEW-FIXES-2026-11.zh-CN.md)；批次 F [HANDOFF-BATCH-F-2026-11-12](HANDOFF-BATCH-F-2026-11-12.zh-CN.md)（含 nat-matrix 三轮记录与待决三选项）。
 
 - [HANDOFF](HANDOFF.zh-CN.md)：逐波交接记录、实现与验证边界、重启恢复手册（历史口径，其"当前/进行中"字样以本页为准）。
 - [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md)：本轮审核意见＋执行计划（第 5 节）＋状态表（第 7 节）＋待所有者决定清单（第 8 节）。

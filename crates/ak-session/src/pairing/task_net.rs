@@ -1467,6 +1467,22 @@ pub fn punch_targets(local: SocketAddr, candidates: &[SocketAddr]) -> Vec<Socket
 /// throwaway socket's mapping would not carry into the dial, so there is
 /// nothing useful to open. Returns the packets actually sent (0 without
 /// an adopted socket or with no public candidates — diagnostics only).
+/// Target filter of [`sender_reflexive_opener`]: everything except
+/// loopback. RFC1918 stays IN (a reflexive address can itself be
+/// private — double NAT; the CI matrix's 10/8 routers model exactly
+/// that — and filtering it made the opener send zero packets, letting
+/// the CR-P1-06 tuple conflict replay: run 43304434327 diagnosis §1).
+/// Rust's native is_loopback semantics: `::ffff:127.0.0.1` is NOT
+/// Ipv6Addr::is_loopback, so mapped-loopback candidates pass — harmless
+/// (they are same-host; the opener packet lands locally, opens nothing).
+pub fn opener_targets(static_order: &[SocketAddr]) -> Vec<SocketAddr> {
+    static_order
+        .iter()
+        .copied()
+        .filter(|addr| !addr.ip().is_loopback())
+        .collect()
+}
+
 pub async fn sender_reflexive_opener(
     adopted: Option<&std::net::UdpSocket>,
     static_order: &[SocketAddr],
@@ -1475,17 +1491,24 @@ pub async fn sender_reflexive_opener(
     let Some(adopted) = adopted else {
         return 0;
     };
-    // The public (reflexive) targets only — LAN candidates cannot ride a
-    // NAT mapping and the opener is exactly a NAT-tuple opener. Selection
-    // shares the punch's family bridge and caps.
+    // Reflexive/public targets only — LAN candidates cannot ride a NAT
+    // mapping and the opener is exactly a NAT-tuple opener. "Public"
+    // here excludes LOOPBACK only, not RFC1918: a STUN reflexive address
+    // can itself be RFC1918 (double NAT: the outer NAT's inside
+    // interface is private; the CI matrix's routers model exactly this),
+    // and filtering by is_ipv4_private made the opener send ZERO packets
+    // whenever the peer's reflexive fell in 10/8 — the receiver's
+    // normal-TTL phase-2 punches then reached our NAT first and the
+    // original CR-P1-06 tuple conflict replayed in full (run
+    // 43304434327, packet-level diagnosis §1). The interface-derived
+    // candidates that share the socket's actual LAN are harmless
+    // opener targets (they simply get no mapping); the loopback
+    // exclusion keeps same-host noise out. Selection shares the punch's
+    // family bridge and caps.
     let Some(local) = adopted.local_addr().ok() else {
         return 0;
     };
-    let public: Vec<SocketAddr> = static_order
-        .iter()
-        .copied()
-        .filter(|addr| !prefers_lan(addr))
-        .collect();
+    let public = opener_targets(static_order);
     let targets = punch_targets(local, &public);
     let Some(clone) = adopted.try_clone().ok() else {
         return 0;
@@ -3222,6 +3245,29 @@ mod tests {
     /// socket's port (LAN candidates are skipped), and without an
     /// adopted socket it sends nothing (but still pauses — uniform
     /// adapter timing).
+    /// The run-43304434327 regression pin: RFC1918 reflexive targets
+    /// MUST pass the opener filter (double NAT makes them real), while
+    /// loopback (plain and native v6) stays out.
+    #[test]
+    fn opener_targets_keeps_rfc1918_and_drops_loopback() {
+        let kept = opener_targets(&[
+            "10.10.0.1:50684".parse().unwrap(),
+            "192.168.5.9:7000".parse().unwrap(),
+            "[2001:77:1::2]:57961".parse().unwrap(),
+            "[::ffff:10.0.0.1]:7000".parse().unwrap(),
+        ]);
+        assert_eq!(
+            kept.len(),
+            4,
+            "RFC1918 v4, global v6 and mapped v4 all stay"
+        );
+        let dropped = opener_targets(&[
+            "127.0.0.1:7000".parse().unwrap(),
+            "[::1]:7000".parse().unwrap(),
+        ]);
+        assert!(dropped.is_empty(), "plain loopback and ::1 are filtered");
+    }
+
     ///
     /// Routing note: the "public" target is a `::ffff:127.0.0.1` mapped
     /// loopback — `prefers_lan` sees the v6 variant (not v4-loopback,

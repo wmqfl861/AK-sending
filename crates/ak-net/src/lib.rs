@@ -1362,7 +1362,9 @@ pub mod holepunch {
         let word = std::mem::size_of::<usize>();
         let int_size = std::mem::size_of::<libc::c_int>();
         let cmsg_len = word + 2 * int_size + int_size;
-        let cmsg_space = (cmsg_len + word - 1) / word * word;
+        // div_ceil (stable 1.73): Linux clippy enforces manual_div_ceil on
+        // this cfg(unix)-only line — invisible to Windows-local clippy.
+        let cmsg_space = cmsg_len.div_ceil(word) * word;
         let mut control = [0usize; 4]; // 16/32 bytes ≥ CMSG_SPACE(one int) on 32/64-bit
         debug_assert!(control.len() * word >= cmsg_space);
         let bytes =

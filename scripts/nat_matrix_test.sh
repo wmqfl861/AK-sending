@@ -686,9 +686,9 @@ run_case() {
   local send_log="$case_dir/send.log" recv_log="$case_dir/recv.log"
   if [[ "$expect" == "pass-v4" || "$expect" == "pass-v6" ]]; then
     grep -q "\[task\] done:" "$send_log" \
-      || { log "FAIL [$case_name]: sender did not complete (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
+      || { fail_case "FAIL [$case_name]: sender did not complete (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
     grep -q "\[task\] received" "$recv_log" \
-      || { log "FAIL [$case_name]: receiver did not complete"; tail -5 "$recv_log" | sed 's/^/    /'; return 1; }
+      || { fail_case "FAIL [$case_name]: receiver did not complete"; tail -5 "$recv_log" | sed 's/^/    /'; return 1; }
     grep -q "\[task\] connected via " "$send_log" \
       || { log "FAIL [$case_name]: no connected-via line"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
     local via
@@ -777,12 +777,7 @@ start_services || exit 1
 # reflexive-first dial): pcone<->pcone over v4 must now connect via the
 # peer router's reflexive address — expectation flipped from strict xfail
 # to pass-v4.
-# CR-P1-06 strike 2 (run 43304434327): the low-TTL fix compiled but the
-# transfer still fails pure-v4 (probe round observes nothing; all dials
-# time out) — read-only diagnosis in flight before the third and final
-# repair attempt. The HONEST expectation until that fix lands is xfail
-# again: the code genuinely fails this case today.
-case_pass "pcone-pcone"    "port-restricted <-> port-restricted — xfail until the CR-P1-06 strike-3 fix lands" pcone pcone 0 xfail
+case_pass "pcone-pcone"    "port-restricted <-> port-restricted — v4 reflexive leg (CR-P1-06 strike-3 fix)" pcone pcone 0 pass-v4
 case_pass "pcone-fullcone" "port-restricted (alice) <-> full-cone DNAT (bob) — v4 reflexive leg" pcone fullcone 0 pass-v4
 if command -v ip6tables >/dev/null 2>&1; then
   case_pass "v6-stateful"  "IPv6 both sides behind stateful firewalls (v4 control-plane only)" control-only control-only 1 pass-v6

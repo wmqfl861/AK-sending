@@ -3364,7 +3364,13 @@ async fn run_send(
     // before the receiver's normal-TTL backup punches (phase 2, ≥1 s) can
     // arrive at the sender's NAT, or Linux-type SNAT rewrites the external
     // port (the conntrack tuple conflict this fix exists for).
-    sender_reflexive_opener(adopted.as_ref(), &static_order).await;
+    let opener_packets = sender_reflexive_opener(adopted.as_ref(), &static_order).await;
+    // Bounded one-shot diagnostic (run-43304434327 fingerprint: zero sent
+    // with an adopted socket + non-empty candidates = filter too strict).
+    // Unknown-event-tolerated on the Dart side, like sender_bind.
+    rt.push_event(format!(
+        "{{\"event\":\"reflexive_opener\",\"packets\":{opener_packets}}}"
+    ));
     // batchF G2: the round's observation rides one bounded
     // `probe_observed` event per send (the emission pattern of
     // `sender_bind` — a plain `push_event`, unknown-name-tolerated on

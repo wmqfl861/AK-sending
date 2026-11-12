@@ -2113,11 +2113,15 @@ async fn send_phase(
         // report would let the receiver's phase-2 normal-TTL punches reach
         // the sender's NAT first and re-create the conntrack tuple
         // conflict this fix removes.
-        sender_reflexive_opener(
+        let opened = sender_reflexive_opener(
             session.sender_socket.as_ref(),
             &order_candidates(link.peer.candidates.clone()),
         )
         .await;
+        // Zero sent with an adopted socket + non-empty candidates is the
+        // run-43304434327 failure fingerprint (filter too strict): make
+        // it visible, not a silent no-op.
+        println!("[task] reflexive opener sent {opened} packet(s)");
         probe_and_print(&session.stack.pairing, link).await;
         drive_task_send(
             &session.stack.pairing,

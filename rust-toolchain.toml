@@ -1,7 +1,9 @@
-# Pinned toolchain (CR-P2-06): one source of truth for local dev and CI.
-# CI uses dtolnay/rust-toolchain without an explicit toolchain input, so it
-# installs whatever this file pins. Upgrades happen in their own dedicated
-# commit (fmt may shift, clippy/rustdoc lints evolve).
+# Pinned toolchain (CR-P2-06; comment corrected by CR-P3-07): this file is
+# the pin for LOCAL development. CI does not go through this file: it pins
+# dtolnay/rust-toolchain in .github/workflows/ci.yml to the commit SHA of
+# the 1.99.1 rev (the action's own default toolchain is 1.99.1). Both
+# places must move in the same commit on an upgrade, which still happens
+# in its own dedicated commit (fmt may shift, clippy/rustdoc lints evolve).
 [toolchain]
 channel = "1.99.1"
 components = ["clippy", "rustfmt"]

@@ -231,6 +231,11 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                         ),
                       ),
                     ),
+                  if (connection?.state == TaskConnectionState.unreachable)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 12),
+                      child: DirectUnavailableGuidance(),
+                    ),
                 ],
               ),
             ),

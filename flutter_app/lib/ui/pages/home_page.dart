@@ -139,6 +139,9 @@ class _HomePageState extends State<HomePage> {
         if (_flow.active)
           _PairingFlowView(
             controller: _flow,
+            showDirectUnavailableGuidance: _connections.any((connection) =>
+                connection.id == _flow.connection?.id &&
+                connection.state == TaskConnectionState.unreachable),
             onJoinRetry: () => setState(() => _joinInputOpen = true),
           )
         else if (_joinInputOpen)
@@ -380,9 +383,14 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
 /// Renders the active flow phase (code display / waiting / probe /
 /// success / failure) driven by [PairingFlowController].
 class _PairingFlowView extends StatelessWidget {
-  const _PairingFlowView({required this.controller, required this.onJoinRetry});
+  const _PairingFlowView({
+    required this.controller,
+    required this.showDirectUnavailableGuidance,
+    required this.onJoinRetry,
+  });
 
   final PairingFlowController controller;
+  final bool showDirectUnavailableGuidance;
   final VoidCallback onJoinRetry;
 
   @override
@@ -405,7 +413,10 @@ class _PairingFlowView extends StatelessWidget {
                 key: ValueKey('flow_probing'), label: '正在测试连通性…'),
             PairingFlowPhase.success => _FlowSuccessView(controller: controller),
             PairingFlowPhase.failed || null => _FlowFailedView(
-                controller: controller, onJoinRetry: onJoinRetry),
+                controller: controller,
+                showDirectUnavailableGuidance: showDirectUnavailableGuidance,
+                onJoinRetry: onJoinRetry,
+              ),
           },
         ),
       ),
@@ -589,9 +600,14 @@ class _FlowSuccessView extends StatelessWidget {
 
 /// 失败态：可读原因 + 重试/重新输入.
 class _FlowFailedView extends StatelessWidget {
-  const _FlowFailedView({required this.controller, required this.onJoinRetry});
+  const _FlowFailedView({
+    required this.controller,
+    required this.showDirectUnavailableGuidance,
+    required this.onJoinRetry,
+  });
 
   final PairingFlowController controller;
+  final bool showDirectUnavailableGuidance;
   final VoidCallback onJoinRetry;
 
   @override
@@ -616,6 +632,10 @@ class _FlowFailedView extends StatelessWidget {
             ),
           ],
         ),
+        if (showDirectUnavailableGuidance) ...[
+          const SizedBox(height: 12),
+          const DirectUnavailableGuidance(),
+        ],
         const SizedBox(height: 16),
         FilledButton.icon(
           key: const ValueKey('flow_retry_button'),

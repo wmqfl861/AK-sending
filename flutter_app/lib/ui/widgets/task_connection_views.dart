@@ -61,6 +61,32 @@ class ConnectionStateChip extends StatelessWidget {
   }
 }
 
+/// Connectivity help for a failed probe, not a confirmed NAT diagnosis.
+class DirectUnavailableGuidance extends StatelessWidget {
+  const DirectUnavailableGuidance({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '连接帮助（尚未确认是否为以下网络限制）：',
+          style: theme.textTheme.bodySmall,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '无法建立直连：两台设备所在的网络都不允许外部直接连入（例如运营商级 NAT）。'
+          '可以让两台设备连接同一个 Wi-Fi，或让其中一台换用支持 IPv6 的网络。'
+          '本应用不会通过服务器中转文件。',
+          style: theme.textTheme.bodyMedium,
+        ),
+      ],
+    );
+  }
+}
+
 /// One live connection row of the home page's 「当前连接」 section:
 /// peer name + direction + state. Tapping opens the detail page.
 class ConnectionCard extends StatelessWidget {

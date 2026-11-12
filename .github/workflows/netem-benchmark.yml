@@ -1,0 +1,62 @@
+# G8 only. Do not fold this into CI/release-deep-tests or the NAT matrix.
+# A workflow that exists only on a dev branch cannot rely on workflow_dispatch
+# being available: GitHub requires its definition on the default branch. The
+# narrow push trigger bootstraps this job without changing main. Once a run
+# exists, an integrator can re-run that run for the SAME source revision.
+name: G8 netem benchmark
+
+on:
+  push:
+    branches: [dev/review-fixes-20261111]
+    paths:
+      - .github/workflows/netem-benchmark.yml
+      - scripts/run_netem_benchmark.sh
+      - scripts/tests/test_netem_benchmark.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No shared concurrency group or cancellation: this workflow cannot cancel
+# NAT/CI runs. A qualifying push may ALSO trigger the unchanged CI workflow;
+# its own concurrency policy still applies, so integrate when NAT is idle.
+
+jobs:
+  netem-benchmark:
+    name: Privileged Linux netem (loopback simulation, not real devices)
+    if: github.ref == 'refs/heads/dev/review-fixes-20261111'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TERM_COLOR: never
+      NETEM_OUTPUT_NAME: netem-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # ci.yml uses checkout@v4. This immutable SHA was resolved from that
+      # exact upstream ref via GitHub's read-only Git refs API (not guessed).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Reused verbatim from ci.yml; action itself pins Rust 1.99.1, matching
+      # rust-toolchain.toml. No floating toolchain override.
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3; ci.yml
+        with:
+          key: g8-netem-benchmark
+      - name: Syntax and isolated runner contract tests (not measurements)
+        run: |
+          bash -n scripts/run_netem_benchmark.sh
+          python3 -I -B -m unittest discover -s scripts/tests -p test_netem_benchmark.py -v
+      - name: Build as runner user, then measure inside a privileged namespace
+        # sudo lives ONLY inside this script; Cargo must remain the runner user.
+        # Missing iproute2/sch_netem/privilege is NOT-MEASURED + a failed job,
+        # never a silent skip or an installation on a production machine.
+        run: bash scripts/run_netem_benchmark.sh --output-dir "$RUNNER_TEMP/$NETEM_OUTPUT_NAME"
+      - name: Preserve evidence even on failure
+        if: always()
+        # Reused verbatim from ci.yml's debug APK upload, including retention.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: netem-benchmark-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/${{ env.NETEM_OUTPUT_NAME }}/
+          if-no-files-found: error
+          retention-days: 14

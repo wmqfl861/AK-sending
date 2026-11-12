@@ -348,7 +348,11 @@ wait_for_text() { # wait_for_text <file> <needle> <timeout-secs> -> 0/1
 }
 
 run_case() {
-  local case_name="$1" expect="$2" case_dir="$WORK/$case_name"
+  # NOTE: split declarations — under `set -u`, one `local` line expands
+  # ALL its words BEFORE assigning, so `case_dir="$WORK/$case_name"` on
+  # the same line would see $case_name unbound (the round-2 CI failure).
+  local case_name="$1" expect="$2"
+  local case_dir="$WORK/$case_name"
   mkdir -p "$case_dir/id-alice" "$case_dir/id-bob" "$case_dir/out" "$case_dir/src"
   dd if=/dev/urandom of="$case_dir/src/payload.bin" bs=1M count="$SIZE_MB" status=none
 

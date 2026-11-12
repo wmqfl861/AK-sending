@@ -767,11 +767,18 @@ async fn revoke_after_pairing_preserves_books_and_admits_further_sends() {
         "--registry-fp",
         &fp,
     ]);
-    let b_listening = b_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(60));
+    // Startup-chain wait ceiling (identity load -> registry TLS -> full
+    // redeem_and_pair transaction -> listening), not an assertion: 60s was
+    // exceeded once on a loaded windows runner (run 43273272597) — same
+    // slow-runner class as the harness-window fixes, so the ceiling rises
+    // without touching any semantic assertion.
+    let b_listening = b_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(180));
     let b_port =
         u16::try_from(json_number(&b_listening, "port").expect("b port")).expect("port fits u16");
     let b_fp = json_string(&b_listening, "fingerprint").expect("b fingerprint");
-    let a_listening = a_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(30));
+    // Same ceiling logic: the waiter returns instantly once the line is
+    // buffered, so this only matters on genuinely slow startups.
+    let a_listening = a_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(180));
     let a_fp = json_string(&a_listening, "fingerprint").expect("a fingerprint");
 
     // One real transfer through the paired chain.

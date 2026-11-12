@@ -1,8 +1,11 @@
 //! Command-line prototype for AK-sending (single binary, many verbs).
 //!
 //! Verbs: `keygen`, `fingerprint`, `pair`, `receive`, `daemon`, `send`,
-//! `discover`, `jobs`, `signal-server`, `stun-server`, `probe`, `bench`,
-//! `doctor`, `completions`. The
+//! `discover`, `jobs`, `stun-server`, `bench`, `doctor`, `completions`,
+//! `registry-server`, `invite`, `task` — plus the legacy plaintext
+//! `signal-server` and `probe`, which exist only in builds with the
+//! `legacy-plaintext-signal` feature (G5 / E1 frozen model; the default
+//! build compiles neither). The
 //! binary never talks to any file-carrying server; servers started here are
 //! coordination-only (ADR-001).
 //!
@@ -26,12 +29,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// G5 / E1: `Instant` is consumed only by the gated `probe` command at
+// crate level (the tests module imports its own).
+#[cfg(feature = "legacy-plaintext-signal")]
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use ak_core::handle::ConflictPolicy;
+// G5 / E1: consumed only by the gated `probe` command's path reporting.
+#[cfg(feature = "legacy-plaintext-signal")]
 use ak_core::policy::PathKind;
 use ak_engine::{EngineError, Progress, ReceiveSpec, Report, SendSpec};
 use ak_identity::tls::TlsBundle;
@@ -334,6 +343,12 @@ enum Command {
         json: bool,
     },
     /// Run the coordination server (signaling + STUN; no file routes).
+    ///
+    /// G5 / E1 (frozen legacy model): this subcommand — the old plaintext
+    /// TCP 7100 signaling server — is only compiled with the
+    /// `legacy-plaintext-signal` feature. The standalone STUN responder
+    /// (`stun-server`, CR-P2-13) covers UDP 7101 in every build.
+    #[cfg(feature = "legacy-plaintext-signal")]
     SignalServer {
         /// TCP signaling port (default 7100).
         #[arg(long)]
@@ -369,6 +384,12 @@ enum Command {
         bind: Option<BindArg>,
     },
     /// Public direct-connect probe: register, exchange candidates, punch, QUIC.
+    ///
+    /// G5 / E1 (frozen legacy model): `probe` is the client of the old
+    /// plaintext signal plane (Hello-authenticated TCP register/session
+    /// exchanges via `ak_signal::client`); it is only compiled with the
+    /// `legacy-plaintext-signal` feature, together with `signal-server`.
+    #[cfg(feature = "legacy-plaintext-signal")]
     Probe {
         #[arg(long)]
         server: SocketAddr,
@@ -1398,16 +1419,21 @@ fn source_name(source: ak_discovery::CandidateSource) -> &'static str {
 }
 
 /// The fixed text printed for the probe SameEgress hint.
+// G5 / E1: the probe (legacy plaintext signal client) is feature-gated;
+// its one-shot notice helper is gated with it.
+#[cfg(feature = "legacy-plaintext-signal")]
 const SAME_EGRESS_NOTICE: &str = "same egress detected: prefer LAN candidates first";
 
 /// One-shot guard for repeated events that should be announced exactly once:
 /// [`OnceNotice::take`] returns the notice text the first time and None for
 /// every later hit.
+#[cfg(feature = "legacy-plaintext-signal")]
 #[derive(Debug, Default)]
 struct OnceNotice {
     shown: bool,
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 impl OnceNotice {
     fn new() -> Self {
         OnceNotice { shown: false }
@@ -3970,6 +3996,9 @@ async fn main() -> Result<()> {
             mdns_seconds,
             json,
         } => doctor::doctor_command(&id, stun, mdns_seconds, json).await,
+        // G5 / E1: the legacy plaintext signal server; feature-gated with
+        // its Command variant (default builds have no such subcommand).
+        #[cfg(feature = "legacy-plaintext-signal")]
         Command::SignalServer {
             tcp_port,
             stun_port,
@@ -4013,6 +4042,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::StunServer { port, bind } => stun_server_command(port, bind).await,
+        // G5 / E1: the legacy signal-plane probe; gated with its variant.
+        #[cfg(feature = "legacy-plaintext-signal")]
         Command::Probe {
             server,
             peer,
@@ -4044,9 +4075,14 @@ pub(crate) fn whoami() -> String {
 
 // ---------------------------------------------------------------------------
 // probe: structured run record shared by text output and --json
+//
+// G5 / E1 (frozen legacy model): everything in this section belongs to the
+// legacy plaintext signal-plane probe and is compiled only with the
+// `legacy-plaintext-signal` feature.
 // ---------------------------------------------------------------------------
 
 /// STUN mapping query outcome for one probe run.
+#[cfg(feature = "legacy-plaintext-signal")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeStun {
     /// --no-stun was given.
@@ -4060,6 +4096,7 @@ enum ProbeStun {
 }
 
 /// One hole-punch round, mirroring ak_net::holepunch's PunchReport.
+#[cfg(feature = "legacy-plaintext-signal")]
 #[derive(Debug, Clone, Default)]
 struct ProbePunch {
     packets_sent: u64,
@@ -4069,6 +4106,7 @@ struct ProbePunch {
 }
 
 /// QUIC verification round after a successful punch.
+#[cfg(feature = "legacy-plaintext-signal")]
 #[derive(Debug, Clone, Default)]
 struct ProbeHandshake {
     attempted: bool,
@@ -4081,6 +4119,7 @@ struct ProbeHandshake {
 /// Everything one probe run learned, collected in BOTH output modes so
 /// `--json` can emit one stable object at the end. Field names are a
 /// script-facing contract: extend, never rename.
+#[cfg(feature = "legacy-plaintext-signal")]
 #[derive(Debug, Clone)]
 struct ProbeRun {
     server: String,
@@ -4100,6 +4139,7 @@ struct ProbeRun {
     conclusion: &'static str,
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 impl Default for ProbeRun {
     fn default() -> Self {
         ProbeRun {
@@ -4123,6 +4163,7 @@ impl Default for ProbeRun {
 }
 
 /// Stable JSON name for the engine's path classification.
+#[cfg(feature = "legacy-plaintext-signal")]
 fn path_kind_name(path: PathKind) -> &'static str {
     match path {
         PathKind::LocalDirect => "local-direct",
@@ -4145,6 +4186,7 @@ pub(crate) fn json_string_array(items: &[String]) -> String {
     format!("[{}]", inner.join(", "))
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 fn json_opt_string(value: &Option<String>) -> String {
     match value {
         Some(text) => format!("\"{}\"", json_escape(text)),
@@ -4154,6 +4196,7 @@ fn json_opt_string(value: &Option<String>) -> String {
 
 /// One probe run as a single JSON object (the only stdout content in --json
 /// mode). Shape mirrors ProbeRun; see that struct for the field contract.
+#[cfg(feature = "legacy-plaintext-signal")]
 fn probe_json(run: &ProbeRun) -> String {
     let stun = match &run.stun {
         ProbeStun::Skipped => {
@@ -4243,6 +4286,7 @@ fn probe_json(run: &ProbeRun) -> String {
 
 /// Probe progress goes to stdout in text mode and to stderr in --json mode,
 /// so JSON stdout carries exactly one object.
+#[cfg(feature = "legacy-plaintext-signal")]
 fn probe_emit(json: bool, line: &str) {
     if json {
         eprintln!("{line}");
@@ -4251,6 +4295,7 @@ fn probe_emit(json: bool, line: &str) {
     }
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 #[allow(clippy::too_many_arguments)]
 async fn probe_command(
     id: &Path,
@@ -4534,11 +4579,14 @@ fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // G5 / E1: the crate-level `Instant` import is probe-only (gated
+    // above); these default-build timing tests bring their own.
     use ak_identity::DeviceKeyPair;
     use ak_store::{
         CheckpointStore, Direction, FileCheckpoint, FileCheckpointStore,
         TaskRecord as StoredTaskRecord,
     };
+    use std::time::Instant;
 
     /// Unique temp directory helper (tests may use expect/unwrap).
     struct TempDir(PathBuf);
@@ -6004,7 +6052,8 @@ mod tests {
     }
 
     // -- probe same-egress notice ---------------------------------------------
-
+    // G5 / E1: probe-only tests compile only with the legacy feature.
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn same_egress_notice_fires_exactly_once() {
         let mut notice = OnceNotice::new();
@@ -6696,7 +6745,17 @@ mod tests {
         // remembering which flag position clap accepts.
         let mut cmd = Cli::command();
         cmd.build();
-        for name in ["registry-server", "signal-server", "stun-server", "task"] {
+        // G5 / E1: `signal-server` exists only in legacy-feature builds, so
+        // it joins the sweep when compiled and is skipped (not asserted
+        // absent) in the default build.
+        #[cfg(feature = "legacy-plaintext-signal")]
+        let legacy = ["signal-server"];
+        #[cfg(not(feature = "legacy-plaintext-signal"))]
+        let legacy = [];
+        for name in ["registry-server", "stun-server", "task"]
+            .into_iter()
+            .chain(legacy)
+        {
             let sub = cmd
                 .find_subcommand_mut(name)
                 .unwrap_or_else(|| panic!("{name} subcommand must exist"));
@@ -6961,7 +7020,8 @@ mod tests {
     }
 
     // -- probe --json -----------------------------------------------------------
-
+    // G5 / E1: probe-only tests compile only with the legacy feature.
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn probe_args_parse_json_flag() {
         let peer = "a".repeat(64);
@@ -6996,6 +7056,7 @@ mod tests {
         assert!(!json);
     }
 
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn probe_json_renders_full_run_shape() {
         let peer_hex = "aa".repeat(32);
@@ -7076,6 +7137,7 @@ mod tests {
         assert_eq!(json.matches('\n').count(), 15 + 1);
     }
 
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn probe_json_renders_minimal_run_with_nulls() {
         let json = probe_json(&ProbeRun::default());
@@ -7098,6 +7160,7 @@ mod tests {
         assert!(json.contains("\"conclusion\": \"no-peer-candidates\""));
     }
 
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn probe_json_covers_remaining_stun_states_and_escapes_errors() {
         let run = ProbeRun {
@@ -7262,6 +7325,10 @@ mod tests {
         }
     }
 
+    // G5 / E1: the signal-server subcommand exists only with the legacy
+    // feature; its parse test is gated with it. The stun-server sibling
+    // below stays in every build (CR-P2-13).
+    #[cfg(feature = "legacy-plaintext-signal")]
     #[test]
     fn signal_server_bind_flags_parse_and_default_ports_apply() {
         let cli = cli_of(&["signal-server"]);

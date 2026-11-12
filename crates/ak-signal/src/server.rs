@@ -41,7 +41,11 @@ pub const ERR_SESSION_NOT_FOUND: u16 = 5;
 
 /// Capacity of the Hello replay window (accepted-signature digests kept).
 /// Bounded memory: 256 entries x (32-byte digest + Instant) is a few KiB.
-pub const HELLO_REPLAY_CAPACITY: usize = 256;
+///
+/// G5 / E1: the constant lives in `util` (ungated) because the v2
+/// registry engine shares it; re-exported so this module's legacy public
+/// path is unchanged.
+pub use crate::util::HELLO_REPLAY_CAPACITY;
 
 // ---- resource bounds (R36-P1-05) --------------------------------------------
 //
@@ -808,12 +812,11 @@ fn process(
 /// Pure decision behind the SameEgress hint: both endpoints' recorded
 /// control-plane TCP peer IPs are known and identical. An unknown
 /// (`None`) address never matches, so the hint is never guessed.
-pub(crate) fn same_egress(ip_a: Option<IpAddr>, ip_b: Option<IpAddr>) -> bool {
-    match (ip_a, ip_b) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
+///
+/// G5 / E1: moved to `util` (ungated) — the v2 registry engine shares
+/// this decision; this module aliases it for its own call sites and
+/// tests.
+use crate::util::same_egress;
 
 /// Queue `SessionOpened` for both endpoints and, when both currently live
 /// behind the same observed TCP peer IP, a `SameEgress` hint to each after

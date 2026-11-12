@@ -28,3 +28,24 @@ ak-session = { path = "../ak-session" }
 # ak-session's own dev-dependencies: the library never links the
 # server-side SQLite).
 ak-signal = { workspace = true, features = ["server-persistence"] }
+
+[features]
+# G5 / E1 (docs/REVIEW_2026-11-12-acceptance.zh-CN.md §6, frozen model):
+# compiles the itests that exercise the old plaintext signal plane —
+# t04/t07 (whole binaries) and act 4 of e2e_product_flow — by forwarding
+# the feature to ak-signal. Never on by default and never via an
+# unconditional dev-dependency: `cargo test --workspace` must keep
+# proving the legacy plane stays OUT of the default graph. Run with
+# `cargo test -p ak-itests --features legacy-plaintext-signal`.
+legacy-plaintext-signal = ["ak-signal/legacy-plaintext-signal"]
+
+# G5 / E1: whole-file legacy signal itests; required-features filters
+# these targets out of the default build entirely (the legacy code and
+# its tests compile only opt-in).
+[[test]]
+name = "t04_signal_irrelevant_to_data"
+required-features = ["legacy-plaintext-signal"]
+
+[[test]]
+name = "t07_coordination_down"
+required-features = ["legacy-plaintext-signal"]

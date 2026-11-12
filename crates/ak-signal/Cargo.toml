@@ -34,6 +34,21 @@ tempfile = "3"
 # part 1). rusqlite stays at the workspace-locked bundled version.
 [features]
 server-persistence = ["dep:rusqlite"]
+# G5 / E1 (docs/REVIEW_2026-11-12-acceptance.zh-CN.md §6, frozen model):
+# the old PLAINTEXT v1 signal plane — `client` (SignalClient over raw TCP),
+# `server` (TCP signaling + bundled STUN responder) and the v1 wire `codec`
+# they share — leaves the default build. Default artifacts (workspace
+# default, ak-ffi/GUI chain, CI) compile none of it; the modules return only
+# when this feature is explicitly enabled (frozen legacy, no new features).
+# NOT behind this gate: `stun` (CR-P2-13 standalone service, v1 tasks and
+# nat-matrix depend on it), `protocol_v2`/`client_v2`/`server_v2` (the v2
+# registry plane), and every `util` helper except `read_frame` (the v1
+# TCP framing reader, gated with the codec constants it enforces). The v2
+# plane has its own independent codec (protocol_v2) and framing
+# (server_v2::framing); nothing in the default graph references the gated
+# modules (verified: the only cross reference is the prose comparison in
+# protocol_v2's module docs).
+legacy-plaintext-signal = []
 
 [dependencies.rusqlite]
 workspace = true

@@ -6,7 +6,8 @@
 //! byte `2` and the same 4096-byte hard cap; integers are big-endian and
 //! fixed arrays carry no length prefix.
 //!
-//! Discipline carried over from the v1 codec ([`crate::codec`]), applied to
+//! Discipline carried over from the v1 codec (the legacy `crate::codec`
+//! module, gated behind the `legacy-plaintext-signal` feature), applied to
 //! an independent module — v1 and its decoder stay untouched and v2 frames
 //! are never v1 frames with appended fields:
 //!

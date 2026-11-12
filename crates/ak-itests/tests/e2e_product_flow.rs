@@ -21,7 +21,9 @@
 //! - 第四幕 `coordination_assisted_then_independent`（T07 收尾形态）：进程内
 //!   真实 signal-server 完整会话建立并拿到候选 → 关停协调面（证明死亡、双端
 //!   客户端观察到断链）→ 直连传输照常完成。叙事收束：协调面只在建立期存在，
-//!   从未进入数据路径（ADR-001）。
+//!   从未进入数据路径（ADR-001）。G5 / E1：第四幕使用旧明文 signal 平面，
+//!   仅在 `legacy-plaintext-signal` 特性开启时编译（默认构建不含旧代码及其
+//!   测试；`cargo test -p ak-itests --features legacy-plaintext-signal` 运行）。
 //!
 //! 如实边界：单机环回（L2 形态）。里程碑中的 >4 GiB 规模项（T12）不在此处
 //! 重复（见其专属 u64/5 GiB 稀疏文件自动化）；Windows↔Android 真机、真实
@@ -32,11 +34,16 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+// G5 / E1: act-4-only imports, gated with the legacy signal plane.
+#[cfg(feature = "legacy-plaintext-signal")]
+use std::net::TcpListener as StdTcpListener;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "legacy-plaintext-signal")]
+use std::time::Instant;
 
 use ak_core::handle::ConflictPolicy;
 use ak_core::handle::SaveTarget;
@@ -49,10 +56,16 @@ use ak_identity::{
     pairing_code, verify_pairing_code, DeviceKeyPair, Fingerprint, PeerBook, PeerRecord,
 };
 use ak_net::ConnectError;
+// G5 / E1: the v1 plaintext signal plane is opt-in; act 4 below compiles
+// only with the crate's `legacy-plaintext-signal` feature.
+#[cfg(feature = "legacy-plaintext-signal")]
 use ak_signal::client::{SignalClient, SignalError};
+#[cfg(feature = "legacy-plaintext-signal")]
 use ak_signal::codec::{CtrlMessage, PeerSignal};
+#[cfg(feature = "legacy-plaintext-signal")]
 use ak_signal::server::{self, Config, Limits};
 use ak_store::{CheckpointStore, Direction, FileCheckpointStore};
+#[cfg(feature = "legacy-plaintext-signal")]
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
 
@@ -78,6 +91,8 @@ fn authorize_from_book(book_path: &Path) -> common::AuthorizeFn {
 }
 
 /// Reserve then release an ephemeral loopback TCP port（t07 手法）.
+/// G5 / E1: act-4-only helper, gated with the legacy signal plane.
+#[cfg(feature = "legacy-plaintext-signal")]
 fn free_loopback_tcp_port() -> u16 {
     StdTcpListener::bind(("127.0.0.1", 0))
         .expect("reserve tcp port")
@@ -650,9 +665,13 @@ async fn multistream_multiroot_concurrent_milestone() {
 
 // ---------------------------------------------------------------------------
 // 第四幕：协调面辅助建立 → 协调面死亡 → 直连独立完成（t07 手法）
+//
+// G5 / E1：第四幕全部内容属于旧明文 signal 平面，仅在
+// `legacy-plaintext-signal` 特性开启时编译；默认构建的三幕保持不变。
 // ---------------------------------------------------------------------------
 
 /// Read one server message or fail (bounded wait)，t07 手法。
+#[cfg(feature = "legacy-plaintext-signal")]
 async fn next_msg(client: &SignalClient) -> CtrlMessage {
     tokio::time::timeout(Duration::from_secs(5), client.next())
         .await
@@ -662,6 +681,7 @@ async fn next_msg(client: &SignalClient) -> CtrlMessage {
 
 /// Next relayed peer signal inside `session`, skipping the server's
 /// SameEgress hint (a server observation, not a peer signal)。
+#[cfg(feature = "legacy-plaintext-signal")]
 async fn next_peer_signal(client: &SignalClient, session: [u8; 16]) -> PeerSignal {
     loop {
         match next_msg(client).await {
@@ -678,12 +698,14 @@ async fn next_peer_signal(client: &SignalClient, session: [u8; 16]) -> PeerSigna
 }
 
 /// A real in-process signaling server on ephemeral loopback ports (t07).
+#[cfg(feature = "legacy-plaintext-signal")]
 struct SignalingPlane {
     tcp: SocketAddr,
     shutdown: watch::Sender<bool>,
     join: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 async fn start_signaling_plane() -> SignalingPlane {
     for _ in 0..16 {
         let config = Config {
@@ -719,6 +741,7 @@ async fn start_signaling_plane() -> SignalingPlane {
     panic!("could not start the signaling server on an ephemeral loopback port");
 }
 
+#[cfg(feature = "legacy-plaintext-signal")]
 impl SignalingPlane {
     /// Shut the coordination plane down and prove it is dead: clean task
     /// exit plus a fresh client can no longer complete Hello/Welcome.
@@ -749,6 +772,7 @@ impl SignalingPlane {
 
 /// The severed client must observe its coordination connection dying; any
 /// messages buffered from before the shutdown are drained first.
+#[cfg(feature = "legacy-plaintext-signal")]
 async fn assert_client_severed(client: &SignalClient) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -765,6 +789,7 @@ async fn assert_client_severed(client: &SignalClient) {
 
 /// Result of the full coordination-plane session: both live clients plus
 /// the candidate each side learned through the Signal relay.
+#[cfg(feature = "legacy-plaintext-signal")]
 struct Handshake {
     sender: SignalClient,
     receiver: SignalClient,
@@ -777,6 +802,7 @@ struct Handshake {
 /// candidates, ConnectRequest -> SessionOpened on both sides, candidate
 /// exchange and punch-timing exchange through the relay（t07 手法）. This is
 /// the "coordination plane genuinely worked during establishment" premise.
+#[cfg(feature = "legacy-plaintext-signal")]
 async fn full_signaling_handshake(
     server_tcp: SocketAddr,
     sender_key: &DeviceKeyPair,
@@ -866,6 +892,7 @@ async fn full_signaling_handshake(
 /// over signaling — with pairing-book admission active the whole time. The
 /// coordination plane exists only during establishment; it never sits in
 /// the data path (ADR-001).
+#[cfg(feature = "legacy-plaintext-signal")]
 #[tokio::test]
 async fn coordination_assisted_then_independent() {
     let base = tempfile::tempdir().unwrap();

@@ -39,5 +39,15 @@ tokio = { workspace = true }
 name = "ak-cli"
 path = "src/main.rs"
 
+[features]
+# G5 / E1 (docs/REVIEW_2026-11-12-acceptance.zh-CN.md §6, frozen model):
+# opt-in build of the legacy plaintext signal UX. `signal-server` (the old
+# TCP 7100 coordination server) and `probe` (its Hello-authenticated
+# client, which registers candidates with that server) exist only when
+# this feature is on; default builds compile neither. NOT gated:
+# `stun-server` (CR-P2-13 standalone STUN responder, nat-matrix depends
+# on it) and `registry-server` (the v2 registry; server-persistence).
+legacy-plaintext-signal = ["ak-signal/legacy-plaintext-signal"]
+
 [dev-dependencies]
 tempfile = "3"

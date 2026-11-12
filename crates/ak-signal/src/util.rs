@@ -3,13 +3,21 @@
 //! this touches file data; the coordination plane has no other payload.
 #![forbid(unsafe_code)]
 
+// G5 / E1: `io` is consumed only by the gated v1 `read_frame` below.
+#[cfg(feature = "legacy-plaintext-signal")]
 use std::io;
+#[cfg(any(feature = "legacy-plaintext-signal", feature = "server-persistence"))]
+use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncReadExt;
-use tokio::net::tcp::OwnedReadHalf;
-
+// G5 / E1: the v1 TCP framing reader is part of the frozen legacy
+// plaintext plane; its only callers are the gated v1 client/server.
+#[cfg(feature = "legacy-plaintext-signal")]
 use crate::codec;
+#[cfg(feature = "legacy-plaintext-signal")]
+use tokio::io::AsyncReadExt;
+#[cfg(feature = "legacy-plaintext-signal")]
+use tokio::net::tcp::OwnedReadHalf;
 
 /// Milliseconds since the Unix epoch. Consumed only by Hello freshness
 /// windows and id mixing; elapsed-time decisions use `Instant`.
@@ -40,6 +48,39 @@ pub(crate) fn fresh_now_unix_ms() -> u64 {
 
 pub(crate) fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
+}
+
+// ---- shared v1/v2 leaf helpers (G5 / E1) ---------------------------------
+//
+// These two symbols were born in the v1 plaintext server but are also
+// consumed by the v2 registry engine (`server_v2::engine`, behind
+// `server-persistence`). They are pure leaf logic with no v1 wire
+// dependency, so they live here UNGATED: the v2 registry must keep its
+// replay-window capacity and SameEgress hint whether or not the legacy
+// plane is compiled. The gated `server` module re-exports
+// `HELLO_REPLAY_CAPACITY` so its legacy public path is unchanged.
+
+/// Capacity of the Hello replay window (accepted-signature digests kept).
+/// Bounded memory: 256 entries x (32-byte digest + Instant) is a few KiB.
+///
+/// Shared by the v1 plaintext server and the v2 registry engine (both
+/// Hello flavors keep a sliding window of accepted signature digests);
+/// compiled when either consumer feature is on.
+#[cfg(any(feature = "legacy-plaintext-signal", feature = "server-persistence"))]
+pub const HELLO_REPLAY_CAPACITY: usize = 256;
+
+/// Pure decision behind the SameEgress hint: both endpoints' recorded
+/// control-plane TCP peer IPs are known and identical. An unknown
+/// (`None`) address never matches, so the hint is never guessed.
+///
+/// Shared by the v1 plaintext server and the v2 registry engine;
+/// compiled when either consumer feature is on.
+#[cfg(any(feature = "legacy-plaintext-signal", feature = "server-persistence"))]
+pub(crate) fn same_egress(ip_a: Option<IpAddr>, ip_b: Option<IpAddr>) -> bool {
+    match (ip_a, ip_b) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -90,6 +131,11 @@ pub(crate) fn unique_array<const N: usize>() -> [u8; N] {
 
 /// First `n` bytes as lowercase hex, for logs. Device ids are public keys,
 /// never secrets; names and other user data stay out of logs entirely.
+///
+/// Callers: the gated v1 plaintext server and the `server-persistence`
+/// registry engine — one of the two features must be on for this helper
+/// to exist.
+#[cfg(any(feature = "legacy-plaintext-signal", feature = "server-persistence"))]
 pub(crate) fn hex_prefix(bytes: &[u8], n: usize) -> String {
     let mut s = String::new();
     for b in bytes.iter().take(n) {
@@ -101,6 +147,11 @@ pub(crate) fn hex_prefix(bytes: &[u8], n: usize) -> String {
 /// Read one length-prefixed signaling frame from a TCP stream. `Ok(None)`
 /// means the peer closed cleanly. A declared length above the hard cap is
 /// an error so the caller drops the connection before allocating anything.
+///
+/// G5 / E1: gated with the v1 codec whose `HEADER_LEN`/`MAX_FRAME_BYTES`
+/// it enforces; only the legacy plaintext client/server read this frame
+/// shape (v2 has its own `server_v2::framing::read_frame`).
+#[cfg(feature = "legacy-plaintext-signal")]
 pub(crate) async fn read_frame(reader: &mut OwnedReadHalf) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; codec::HEADER_LEN];
     match reader.read_exact(&mut header).await {

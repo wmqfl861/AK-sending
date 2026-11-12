@@ -1986,8 +1986,8 @@ fn catchup_after_hello(shared: &Shared, me: &DeviceId) {
 
 /// 256-bit digest of (device_id || signature) for the Hello replay
 /// window — the same splitmix64-lane construction as the v1 server
-/// (no crypto dependency on this plane; see `crate::server` for the
-/// rationale).
+/// (no crypto dependency on this plane; the v1 original and its
+/// rationale live in the `legacy-plaintext-signal`-gated `crate::server`).
 fn hello_digest(device_id: &DeviceId, signature: &Signature64) -> [u8; 32] {
     let mut lanes = [
         0x243F_6A88_85A3_08D3u64,
@@ -2042,7 +2042,7 @@ impl HelloReplayCache {
         if self.seen.iter().any(|(seen, _)| *seen == digest) {
             return false;
         }
-        if self.seen.len() >= crate::server::HELLO_REPLAY_CAPACITY {
+        if self.seen.len() >= crate::util::HELLO_REPLAY_CAPACITY {
             self.seen.pop_front();
         }
         self.seen.push_back((digest, now));
@@ -3217,7 +3217,7 @@ fn announce_session(
     let me_ip = inner.conns.get(&me).map(|entry| entry.peer_ip);
     let target_ip = inner.conns.get(&target).map(|entry| entry.peer_ip);
     drop(inner);
-    if crate::server::same_egress(me_ip, target_ip) {
+    if crate::util::same_egress(me_ip, target_ip) {
         for device in [me, target] {
             shared.deliver(
                 &device,

@@ -5,8 +5,9 @@
 //! (never the v1 plaintext port) and speaks only version-2 frames over
 //! TLS 1.3 — there is no plaintext fallback and no version negotiation
 //! (contract `protocol-v2.md` §1: "新邀请码功能仅通过 TLS 控制协议 v2
-//! 使用，不自动降级明文"). The existing v1 [`crate::server`] stays
-//! untouched and keeps serving the legacy plane.
+//! 使用，不自动降级明文"). The existing v1 server (the
+//! `legacy-plaintext-signal`-gated `crate::server`) stays untouched and
+//! keeps serving the legacy plane when that feature is enabled.
 //!
 //! Module layout:
 //!

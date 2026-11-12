@@ -75,9 +75,9 @@ use ak_session::pairing::task_net::{
     bind_echo_responder_socket, bind_receiver_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, echo_responder_loop, handshake_failure_word,
     insert_reflexive_candidate, local_candidates, order_candidates, prefers_lan, probe_dial_round,
-    probe_dial_round_on, probe_with_retry, punch_candidates, windows_root_name_refusal,
-    ConnectMarks, ATTEMPT_PAUSE, OBSERVED_DIAL_BUDGET, PUNCH_INTERVAL, PUNCH_WINDOW,
-    RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_BUDGET,
+    probe_dial_round_on, probe_with_retry, punch_candidates, sender_reflexive_opener,
+    staggered_dial_pass, windows_root_name_refusal, AttemptVerdict, ConnectMarks, PUNCH_INTERVAL,
+    PUNCH_WINDOW, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE,
     TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
     TASK_SETTLE_PAUSE,
 };
@@ -1618,21 +1618,26 @@ enum Attempt {
     ConnectFailed(String),
 }
 
-/// One task send: iterate the peer's candidates LAN-first under the split
-/// connect budget; a post-connect failure fails the send (another address
-/// cannot fix it); a DECLINED answer is surfaced verbatim; purely
-/// connect-level failure of the whole list gets [`TASK_CONNECT_PASSES`]
-/// passes (the just-paired peer's admission bookkeeping can trail the
-/// pairing by a beat). Since CR-P1-02 改法第 3 条 the connect phase OPENS
-/// with one simultaneous-probe round: when it observes an answering
-/// address, that address leads the dial order under the bounded
-/// [`OBSERVED_DIAL_BUDGET`]; with no observation the round is invisible
-/// and the static order dials exactly as before. CR-P1-05: when the
-/// sender flow stashed an ADOPTED dial socket, the round runs on a
-/// `try_clone` of IT ([`probe_dial_round_on`]) and every dial attempt
-/// adopts the same socket — the review's core rule (审核改法第 4 条:
-/// probing AND QUIC on one socket); the legacy throwaway round covers
-/// the no-stash fallback byte for byte.
+/// One task send: run the shared candidate dial pass
+/// (`task_net::staggered_dial_pass`, CR-P3-09: reflexive/observed
+/// addresses strictly first — 保序私网候选在慢路径 — Happy-Eyeballs
+/// stagger on the self-bound path, strictly sequential on the adopted
+/// socket) under the split connect budget; a post-connect failure fails
+/// the send (another address cannot fix it); a DECLINED answer is
+/// surfaced verbatim; purely connect-level failure of the whole list
+/// gets [`TASK_CONNECT_PASSES`] passes (the just-paired peer's admission
+/// bookkeeping can trail the pairing by a beat). Since CR-P1-02 改法第 3
+/// 条 the connect phase OPENS with one simultaneous-probe round: when it
+/// observes an answering address, that address leads the dial order
+/// under the bounded observed-candidate budget; with no observation the
+/// round is invisible and the static order dials exactly as before.
+/// CR-P1-05: when the sender flow stashed an ADOPTED dial socket, the
+/// round runs on a `try_clone` of IT ([`probe_dial_round_on`]) and every
+/// dial attempt adopts the same socket — the review's core rule (审核改法
+/// 第 4 条: probing AND QUIC on one socket); the legacy throwaway round
+/// covers the no-stash fallback byte for byte. CR-P1-06 改法 2: the
+/// phase is PRECEDED by [`sender_reflexive_opener`] — see there (the
+/// caller's `send_phase`).
 async fn drive_task_send(
     pairing: &TaskPairing,
     key: &DeviceKeyPair,
@@ -1661,7 +1666,7 @@ async fn drive_task_send(
             report.packets_received,
         ),
         None => println!(
-            "[task] probe round observed nothing ({probe_count} candidate(s) probed in {} ms); dialing the advertised order",
+            "[task] probe round observed nothing ({probe_count} candidate(s) probed in {} ms); dialing the reflexive/public candidates first",
             report.elapsed.as_millis(),
         ),
     }
@@ -1679,62 +1684,75 @@ async fn drive_task_send(
         _ => probe_dial_round(static_order, probe_observe).await,
     };
     let printer = crate::progress_printer("send");
+    let send_ctx = SendCtx {
+        key,
+        id_dir,
+        adopted,
+    };
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
         if pass > 0 {
             tokio::time::sleep(TASK_SETTLE_PAUSE).await;
             failures.clear();
         }
-        for (index, addr) in dial.order.iter().enumerate() {
-            if index > 0 {
-                tokio::time::sleep(ATTEMPT_PAUSE).await;
-            }
-            // The observed head (always index 0 when present) dials under
-            // the bounded probe-informed budget; every static candidate —
-            // including an observed address's own static slot — keeps the
-            // full budget.
-            let budget = if index == 0 && dial.head.is_some() {
-                OBSERVED_DIAL_BUDGET
-            } else {
-                TASK_CONNECT_BUDGET
-            };
-            let send_ctx = SendCtx {
-                key,
-                id_dir,
-                adopted,
-            };
-            match attempt_send(&send_ctx, *addr, link.peer_fp, paths, &printer, budget).await {
-                Attempt::Done(report) => {
-                    // Which candidate actually carried the task (the FFI
-                    // result carries the same fact as its `peer` field) —
-                    // with IPv6 in the mix (CR-P1-02 leg 1) the family of
-                    // the winning path is exactly what an operator needs
-                    // to see.
-                    println!("[task] connected via {addr}");
-                    return Ok(report);
-                }
-                Attempt::Declined => {
-                    bail!("the receiving side declined the transfer")
-                }
+        let outcome = staggered_dial_pass(
+            &dial.order,
+            dial.head,
+            adopted.is_some(),
+            |addr, marks, budget| {
+                attempt_send(
+                    &send_ctx,
+                    addr,
+                    link.peer_fp,
+                    paths,
+                    &printer,
+                    budget,
+                    marks,
+                )
+            },
+            |outcome| match outcome {
+                Attempt::Done(_) => AttemptVerdict::Done,
+                Attempt::Declined => AttemptVerdict::Fatal,
+                // The peer's admission trailed the pairing (wave-29
+                // race): the connection died before any protocol byte —
+                // retryable like a connect failure.
                 Attempt::FailedAfterConnect {
+                    nothing_offered: true,
                     reason,
-                    peer_gone,
-                    nothing_offered,
-                } => {
-                    if nothing_offered {
-                        // The peer's admission trailed the pairing: retry
-                        // like a connect failure (a settle pause follows).
-                        failures.push((*addr, reason));
-                        continue;
-                    }
-                    if peer_gone {
-                        pairing.report_peer_disconnect(link.code_id);
-                    }
-                    bail!("transfer failed after connecting via {addr}: {reason}");
-                }
-                Attempt::ConnectFailed(reason) => failures.push((*addr, reason)),
-            }
+                    ..
+                } => AttemptVerdict::Retryable(reason.clone()),
+                Attempt::FailedAfterConnect { .. } => AttemptVerdict::Fatal,
+                Attempt::ConnectFailed(reason) => AttemptVerdict::Retryable(reason.clone()),
+            },
+        )
+        .await;
+        if let Some((addr, Attempt::Done(report))) = outcome.done {
+            // Which candidate actually carried the task (the FFI
+            // result carries the same fact as its `peer` field) —
+            // with IPv6 in the mix (CR-P1-02 leg 1) the family of
+            // the winning path is exactly what an operator needs
+            // to see.
+            println!("[task] connected via {addr}");
+            return Ok(report);
         }
+        match outcome.fatal {
+            Some((_, Attempt::Declined)) => {
+                bail!("the receiving side declined the transfer")
+            }
+            Some((
+                addr,
+                Attempt::FailedAfterConnect {
+                    reason, peer_gone, ..
+                },
+            )) => {
+                if peer_gone {
+                    pairing.report_peer_disconnect(link.code_id);
+                }
+                bail!("transfer failed after connecting via {addr}: {reason}");
+            }
+            _ => {}
+        }
+        failures = outcome.failures;
     }
     let detail = failures
         .iter()
@@ -1758,6 +1776,11 @@ struct SendCtx<'a> {
 /// One candidate attempt: build the send spec (family-matched bind, task
 /// idle budget covering the consent window), drive it under the connect
 /// budget, and classify the outcome.
+///
+/// CR-P3-09: `marks` is the CALLER's (the shared `staggered_dial_pass`'s)
+/// [`ConnectMarks`] for this attempt — the pass reads its `connected()`
+/// flag as the Happy-Eyeballs winner signal, so the marks cannot live
+/// inside this function.
 async fn attempt_send(
     ctx: &SendCtx<'_>,
     addr: SocketAddr,
@@ -1765,6 +1788,7 @@ async fn attempt_send(
     paths: &[PathBuf],
     printer: &Arc<dyn Fn(Progress) + Send + Sync>,
     connect_budget: Duration,
+    marks: Arc<ConnectMarks>,
 ) -> Attempt {
     let mut spec = SendSpec::new(paths[0].clone(), addr, pinned, make_self_signed(ctx.key));
     for extra in &paths[1..] {
@@ -1784,20 +1808,19 @@ async fn attempt_send(
     spec.device_name = format!("ak-task-{}", ctx.key.fingerprint().short_id());
     spec.idle_timeout = TASK_SEND_IDLE;
 
-    let marks = Arc::new(ConnectMarks::new());
     let progress = {
-        let marks = Arc::clone(&marks);
+        let send_marks = Arc::clone(&marks);
         let printer = Arc::clone(printer);
         move |event: Progress| {
-            marks.mark(&event);
+            send_marks.mark(&event);
             printer(event);
         }
     };
     let send = send(spec, &progress);
     tokio::pin!(send);
-    // The caller's budget: [`TASK_CONNECT_BUDGET`] for static candidates,
-    // [`OBSERVED_DIAL_BUDGET`] for the probe round's observed head (改法
-    // 第 3 条 — see the constant).
+    // The caller's budget: the full task budget for static candidates,
+    // the bounded observed-candidate budget for the leading
+    // observed/reflexive candidate (改法第 3 条 — see the constant).
     let result = match drive_with_connect_budget(&marks, send.as_mut(), connect_budget).await {
         Ok(result) => result,
         Err(()) => {
@@ -2081,6 +2104,20 @@ async fn send_phase(
     paths: &[PathBuf],
 ) -> Result<Result<Report>> {
     let flow = async {
+        // CR-P1-06 改法 2: the opener runs BEFORE the pairing-plane
+        // reachability report (which takes ≥ its 1.5 s probe window, up to
+        // ~3.3 s with the retry) — the review's "配对后短暂等待，然后立即
+        // 从收养 socket 向接收端反射地址发包" pins the adopted socket's
+        // first outbound to ~SENDER_DIAL_PAUSE after pairing, well inside
+        // the receiver's 1 s low-TTL punch phase; deferring it past the
+        // report would let the receiver's phase-2 normal-TTL punches reach
+        // the sender's NAT first and re-create the conntrack tuple
+        // conflict this fix removes.
+        sender_reflexive_opener(
+            session.sender_socket.as_ref(),
+            &order_candidates(link.peer.candidates.clone()),
+        )
+        .await;
         probe_and_print(&session.stack.pairing, link).await;
         drive_task_send(
             &session.stack.pairing,

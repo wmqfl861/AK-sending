@@ -1245,6 +1245,99 @@ pub mod holepunch {
                 | io::ErrorKind::HostUnreachable
         )
     }
+
+    /// Whether THIS host can honor `send_to_with_ttl` (CR-P1-06, review
+    /// 2026-11-11 §4.5 改法 1; the Unix-only sibling below — plain code
+    /// span here because the link target does not exist on Windows
+    /// builds). Unix-likes: yes, via the `sendmsg`
+    /// control-message path (Linux/Android/macOS all support per-packet
+    /// `IP_TTL` / `IPV6_HOPLIMIT`). Windows: no — `WSASendMsg` documents
+    /// ancillary `IPV6_HOPLIMIT`/`IPV6_TCLASS` only (no IPv4 `IP_TTL`
+    /// control data), and IPv6 needs no low TTL (no NAT), so a Windows
+    /// caller degrades to normal-TTL punching for the whole window — the
+    /// honest documented fallback the review prescribed for exactly this
+    /// case. The socket's OWN default TTL is never touched either way: the
+    /// limit rides per-packet control data, so other users of a shared
+    /// socket are unaffected.
+    pub fn per_packet_ttl_supported() -> bool {
+        cfg!(unix)
+    }
+
+    /// Send ONE datagram to `target` with a per-packet TTL / hop limit of
+    /// `ttl` (CR-P1-06, review 2026-11-11 §4.5 改法 1), without touching
+    /// the socket's own default TTL — the limit rides `sendmsg` control
+    /// data (`IP_TTL` for IPv4 destinations, `IPV6_HOPLIMIT` for IPv6),
+    /// so a shared QUIC socket keeps its normal hop limit for every other
+    /// send. Unix-likes only; Windows callers must consult
+    /// [`per_packet_ttl_supported`] first (the function does not exist
+    /// there).
+    ///
+    /// Family note (why the control message keys off the TARGET family,
+    /// expanded from `::ffff:` mapped form): a dual-stack `[::]` socket
+    /// dials plain-v4 candidates in mapped form, and on Linux
+    /// `udpv6_sendmsg` delegates v4-mapped destinations to the IPv4
+    /// `udp_sendmsg` path — which parses `SOL_IP`/`IP_TTL` control data,
+    /// while the IPv6 parser skips non-`SOL_IPV6` messages. Attaching
+    /// `IP_TTL` for v4 targets (mapped or plain) is therefore the choice
+    /// that takes effect on both socket families.
+    #[cfg(unix)]
+    pub fn send_to_with_ttl(
+        socket: &std::net::UdpSocket,
+        packet: &[u8],
+        target: SocketAddr,
+        ttl: u32,
+    ) -> io::Result<()> {
+        // One cmsg: [cmsg_len: usize][level: c_int][type: c_int][value: c_int]
+        // laid out per CMSG_LEN/CMSG_SPACE rules (header size = word + 2×int,
+        // data = 1×int, buffer padded to word alignment). The buffer rides a
+        // usize array so the cmsghdr alignment requirement holds.
+        let word = std::mem::size_of::<usize>();
+        let int_size = std::mem::size_of::<libc::c_int>();
+        let cmsg_len = word + 2 * int_size + int_size;
+        let cmsg_space = (cmsg_len + word - 1) / word * word;
+        let mut control = [0usize; 4]; // 16/32 bytes ≥ CMSG_SPACE(one int) on 32/64-bit
+        debug_assert!(control.len() * word >= cmsg_space);
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(control.as_mut_ptr() as *mut u8, cmsg_space) };
+        bytes[..word].copy_from_slice(&(cmsg_len as usize).to_ne_bytes());
+        bytes[word..word + int_size].copy_from_slice(&level_for(target).to_ne_bytes());
+        bytes[word + int_size..word + 2 * int_size]
+            .copy_from_slice(&cmsg_type_for(target).to_ne_bytes());
+        bytes[word + 2 * int_size..cmsg_len].copy_from_slice(&(ttl as libc::c_int).to_ne_bytes());
+
+        let addr = socket2::SockAddr::from(target);
+        let buffers = [std::io::IoSlice::new(packet)];
+        let message = socket2::MsgHdr::new()
+            .with_addr(&addr)
+            .with_buffers(&buffers)
+            .with_control(bytes);
+        socket2::SockRef::from(socket)
+            .sendmsg(&message, 0)
+            .map(|_| ())
+    }
+
+    /// `cmsg_level` of the per-packet TTL control message for one target
+    /// ([`send_to_with_ttl`]): `SOL_IP` for IPv4 destinations (plain or
+    /// `::ffff:` mapped — see the function doc for why), `SOL_IPV6` for
+    /// native IPv6.
+    #[cfg(unix)]
+    fn level_for(target: SocketAddr) -> libc::c_int {
+        if crate::classify::expand_mapped(target).is_ipv4() {
+            libc::IPPROTO_IP
+        } else {
+            libc::IPPROTO_IPV6
+        }
+    }
+
+    /// `cmsg_type` companion of [`level_for`]: `IP_TTL` / `IPV6_HOPLIMIT`.
+    #[cfg(unix)]
+    fn cmsg_type_for(target: SocketAddr) -> libc::c_int {
+        if crate::classify::expand_mapped(target).is_ipv4() {
+            libc::IP_TTL
+        } else {
+            libc::IPV6_HOPLIMIT
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2975,5 +3068,56 @@ mod tests {
         let mut wrong_tag = packet.clone();
         wrong_tag[0] = b'X';
         assert!(!holepunch::is_probe_packet(&wrong_tag));
+    }
+
+    /// The capability flag matches the platform (CR-P1-06): the sendmsg
+    /// TTL path exists exactly on the Unix-likes; Windows ships the
+    /// documented normal-TTL degradation.
+    #[test]
+    fn per_packet_ttl_capability_matches_the_platform() {
+        assert_eq!(holepunch::per_packet_ttl_supported(), cfg!(unix));
+    }
+
+    /// CR-P1-06: the per-packet TTL send succeeds through the control
+    /// message path and the datagram still leaves the given socket's port
+    /// (a malformed cmsghdr would fail the send with EINVAL). Honest
+    /// scope, pinned here because the review's suggested "loopback + TTL=1
+    /// ⇒ peer receives nothing" mechanism does NOT hold on mainstream
+    /// kernels: local delivery performs no forwarding hop, so neither the
+    /// TTL check nor a decrement happens (verified on Windows; Linux's
+    /// `ip_rcv` has no TTL gate and only `ip_forward` decrements). Real
+    /// hop expiry is exercised where hops exist — the NAT matrix's
+    /// akinet "public" namespace (added by CR-P2-14 改法 5 exactly for
+    /// this) and the C4 real-network runs.
+    #[cfg(unix)]
+    #[test]
+    fn send_to_with_ttl_sends_and_leaves_the_given_port() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender bind");
+        let sender_port = sender.local_addr().expect("sender addr").port();
+        let packet = holepunch::probe_packet(&[0x5Au8; 16]);
+        holepunch::send_to_with_ttl(&sender, &packet, target_addr, 1).expect("low-ttl send");
+        target
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let mut buffer = [0u8; 64];
+        let (len, from) = target
+            .recv_from(&mut buffer)
+            .expect("loopback delivers ttl=1");
+        assert_eq!(len, 24, "probe-shaped payload: {len}");
+        assert_eq!(from.port(), sender_port, "sent from the given socket");
+        // The mapped form of the same target behaves identically (the
+        // dual-stack socket's only v4 shape).
+        let mapped = crate::classify::to_mapped(target_addr);
+        let sender6 = holepunch::bind_dual_stack_udp(0).expect("dual-stack bind");
+        holepunch::send_to_with_ttl(&sender6, &packet, mapped, 1).expect("mapped low-ttl send");
+        let (len, from2) = target.recv_from(&mut buffer).expect("mapped send delivers");
+        assert_eq!(len, 24, "probe-shaped payload: {len}");
+        assert_eq!(
+            from2.port(),
+            sender6.local_addr().expect("dual-stack addr").port(),
+            "mapped send left the given dual-stack socket"
+        );
     }
 }

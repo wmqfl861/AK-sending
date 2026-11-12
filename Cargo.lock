@@ -123,6 +123,7 @@ dependencies = [
  "ak-identity",
  "ak-wire",
  "if-addrs",
+ "libc",
  "log",
  "quinn",
  "rcgen",

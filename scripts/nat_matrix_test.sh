@@ -773,9 +773,11 @@ case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect>
 build_core || { log "FAIL: core topology setup failed (kernel refusing namespaces/bridges?)"; exit 1; }
 start_services || exit 1
 
-# CR-P1-06 open: pcone<->pcone over v4 fails on Linux-type NATs (the
-# batchF review's conntrack evidence); strict xfail until it is fixed.
-case_pass "pcone-pcone"    "port-restricted <-> port-restricted — xfail while CR-P1-06 is open" pcone pcone 0 xfail
+# CR-P1-06 fixed (low-TTL first punch phase + sender reflexive opener +
+# reflexive-first dial): pcone<->pcone over v4 must now connect via the
+# peer router's reflexive address — expectation flipped from strict xfail
+# to pass-v4.
+case_pass "pcone-pcone"    "port-restricted <-> port-restricted — v4 reflexive leg (CR-P1-06 fixed)" pcone pcone 0 pass-v4
 case_pass "pcone-fullcone" "port-restricted (alice) <-> full-cone DNAT (bob) — v4 reflexive leg" pcone fullcone 0 pass-v4
 if command -v ip6tables >/dev/null 2>&1; then
   case_pass "v6-stateful"  "IPv6 both sides behind stateful firewalls (v4 control-plane only)" control-only control-only 1 pass-v6

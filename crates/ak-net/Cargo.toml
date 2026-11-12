@@ -17,6 +17,13 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+# CR-P1-06 (review 2026-11-11 §4.5 改法 1): the per-packet TTL sendmsg
+# control messages need the platform cmsg constants (IP_TTL /
+# IPV6_HOPLIMIT) and cmsghdr layout on the Unix-likes; Windows ships the
+# documented degradation instead (see `holepunch::per_packet_ttl_supported`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rcgen = { workspace = true }
 tokio = { version = "1", features = ["test-util"] }

@@ -253,10 +253,10 @@ use ak_session::pairing::task_net::{
     bind_receiver_socket, bind_sender_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, handshake_failure_word, insert_reflexive_candidate,
     local_candidates, one_line_reason, order_candidates, probe_dial_round, probe_dial_round_on,
-    probe_with_retry, task_error_message, windows_root_name_refusal, ConnectMarks, ATTEMPT_PAUSE,
-    OBSERVED_DIAL_BUDGET, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE,
-    TASK_CONNECT_BUDGET, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS,
-    TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
+    probe_with_retry, sender_reflexive_opener, staggered_dial_pass, task_error_message,
+    windows_root_name_refusal, AttemptVerdict, ConnectMarks, RECEIVER_BIND_TIMEOUT,
+    REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS,
+    TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -3270,17 +3270,23 @@ async fn run_join(
     ))
 }
 
-/// One send op: iterate the connection's candidates LAN-first under the
-/// split connect budget; a post-connect failure fails the op (another
-/// address cannot fix it); success emits `done` and completes the op.
-/// Purely connect-level failure of the WHOLE list gets
-/// [`TASK_CONNECT_PASSES`] passes (the just-paired peer's admission
-/// bookkeeping can trail the joiner by a beat — see the constant).
-/// Since CR-P1-02 改法第 3 条 the connect phase OPENS with one
-/// simultaneous-probe round ([`probe_dial_round`]): when it observes an
-/// answering address, that address leads the dial order under the
-/// bounded [`OBSERVED_DIAL_BUDGET`]; with no observation the round is
-/// invisible and the static order dials exactly as before.
+/// One send op: run the shared candidate dial pass
+/// (`task_net::staggered_dial_pass`, CR-P3-09: reflexive/observed
+/// addresses strictly first, Happy-Eyeballs stagger on the self-bound
+/// path, sequential on the adopted socket) under the split connect
+/// budget; a post-connect failure fails the op (another address cannot
+/// fix it); success emits `done` and completes the op. Purely
+/// connect-level failure of the WHOLE list gets [`TASK_CONNECT_PASSES`]
+/// passes (the just-paired peer's admission bookkeeping can trail the
+/// joiner by a beat — see the constant). Since CR-P1-02 改法第 3 条 the
+/// connect phase OPENS with one simultaneous-probe round
+/// ([`probe_dial_round`]): when it observes an answering address, that
+/// address leads the dial order under the bounded observed-candidate
+/// budget; with no observation the round is invisible and the static
+/// order dials exactly as before. Since CR-P1-06 改法 2 the phase is
+/// PRECEDED by `task_net::sender_reflexive_opener` — the post-pairing
+/// pause plus the adopted socket's first outbound packets toward the
+/// receiver's reflexive addresses.
 async fn run_send(
     rt: &Arc<TaskRt>,
     conn_id: [u8; 16],
@@ -3321,6 +3327,13 @@ async fn run_send(
             .get(&conn.code_id)
             .and_then(|e| e.socket.try_clone().ok())
     });
+    // CR-P1-06 改法 2 (packet half): the brief post-pairing pause, then the
+    // adopted socket's FIRST outbound packets toward the receiver's
+    // reflexive addresses — this socket's outbound NAT flow must exist
+    // before the receiver's normal-TTL backup punches (phase 2, ≥1 s) can
+    // arrive at the sender's NAT, or Linux-type SNAT rewrites the external
+    // port (the conntrack tuple conflict this fix exists for).
+    sender_reflexive_opener(adopted.as_ref(), &static_order).await;
     let dial = match adopted.as_ref().map(|socket| socket.try_clone().ok()) {
         Some(Some(round_socket)) => {
             probe_dial_round_on(round_socket, static_order.len(), static_order, |_, _, _| {}).await
@@ -3346,55 +3359,66 @@ async fn run_send(
             tokio::time::sleep(TASK_SETTLE_PAUSE).await;
             failures.clear();
         }
-        for (index, addr) in dial.order.iter().enumerate() {
-            if index > 0 {
-                tokio::time::sleep(ATTEMPT_PAUSE).await;
-            }
-            // The observed head (always index 0 when present) dials under
-            // the bounded probe-informed budget; every static candidate —
-            // including an observed address's own static slot — keeps the
-            // full budget.
-            let budget = if index == 0 && dial.head.is_some() {
-                OBSERVED_DIAL_BUDGET
-            } else {
-                TASK_CONNECT_BUDGET
-            };
-            match attempt_task_send(rt, &conn, *addr, &paths, pinned, budget, adopted.as_ref())
-                .await
-            {
-                AttemptOutcome::Done(report) => {
-                    rt.push_event(format!(
-                        "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
-                        core::hex_encode(&conn_id),
-                        report.files,
-                        report.bytes,
-                    ));
-                    // The single-transfer task is complete: converge BOTH
-                    // sides' entries (the receiver ends its loop and marks
-                    // the same terminal state; wave-29 P2-05 — the UI never
-                    // keeps offering a dead connection).
-                    rt.push_disconnected_once(&conn_id, "done");
-                    return Ok(format!(
-                        "{{\"op\":\"task_send\",\"conn\":\"{}\",\"files\":{},\"bytes\":{},\"peer\":{}}}",
-                        core::hex_encode(&conn_id),
-                        report.files,
-                        report.bytes,
-                        quoted(&addr.to_string()),
-                    ));
-                }
-                AttemptOutcome::FailedAfterConnect { reason, peer_gone } => {
-                    if peer_gone {
-                        report_peer_gone(rt, &conn);
-                    }
-                    return Err(format!(
-                        "transfer failed after connecting via {addr}: {reason}"
-                    ));
-                }
-                AttemptOutcome::ConnectFailed(reason) => {
-                    failures.push((*addr, reason));
-                }
-            }
+        // CR-P3-09: the per-candidate dial loop lives in the shared
+        // `staggered_dial_pass` (reflexive/observed first, Happy-Eyeballs
+        // stagger on the self-bound path, strictly sequential on the
+        // adopted socket — concurrent QUIC endpoints on handles of one OS
+        // socket would compete for its receive queue).
+        let outcome = staggered_dial_pass(
+            &dial.order,
+            dial.head,
+            adopted.is_some(),
+            |addr, marks, budget| {
+                attempt_task_send(
+                    rt,
+                    &conn,
+                    addr,
+                    &paths,
+                    pinned,
+                    budget,
+                    adopted.as_ref(),
+                    marks,
+                )
+            },
+            |outcome| match outcome {
+                AttemptOutcome::Done(_) => AttemptVerdict::Done,
+                AttemptOutcome::FailedAfterConnect { .. } => AttemptVerdict::Fatal,
+                AttemptOutcome::ConnectFailed(reason) => AttemptVerdict::Retryable(reason.clone()),
+            },
+        )
+        .await;
+        if let Some((addr, AttemptOutcome::Done(report))) = outcome.done {
+            rt.push_event(format!(
+                "{{\"event\":\"done\",\"conn\":\"{}\",\"files\":{},\"bytes\":{}}}",
+                core::hex_encode(&conn_id),
+                report.files,
+                report.bytes,
+            ));
+            // The single-transfer task is complete: converge BOTH
+            // sides' entries (the receiver ends its loop and marks
+            // the same terminal state; wave-29 P2-05 — the UI never
+            // keeps offering a dead connection).
+            rt.push_disconnected_once(&conn_id, "done");
+            return Ok(format!(
+                "{{\"op\":\"task_send\",\"conn\":\"{}\",\"files\":{},\"bytes\":{},\"peer\":{}}}",
+                core::hex_encode(&conn_id),
+                report.files,
+                report.bytes,
+                quoted(&addr.to_string()),
+            ));
         }
+        if let Some((addr, failure)) = outcome.fatal {
+            if let AttemptOutcome::FailedAfterConnect { reason, peer_gone } = failure {
+                if peer_gone {
+                    report_peer_gone(rt, &conn);
+                }
+                return Err(format!(
+                    "transfer failed after connecting via {addr}: {reason}"
+                ));
+            }
+            unreachable!("the FFI verdict maps only FailedAfterConnect to Fatal");
+        }
+        failures = outcome.failures;
     }
     let detail = failures
         .iter()
@@ -3426,8 +3450,9 @@ enum AttemptOutcome {
 /// One candidate attempt under the split connect budget (the wave-25/26
 /// CLI driver, P1-01 shape): no deadline before the engine's
 /// `Connecting` report, the caller's `connect_budget` from it (normally
-/// [`TASK_CONNECT_BUDGET`]; the probe round's observed head dials under
-/// [`OBSERVED_DIAL_BUDGET`]), no deadline once
+/// [`TASK_CONNECT_BUDGET`]; the leading observed/reflexive candidate
+/// dials under [`OBSERVED_DIAL_BUDGET`] — the shared pass's hot-mapping
+/// rule), no deadline once
 /// connected. Post-connect failures are distinguishable so the fallback
 /// loop stops instead of retrying a protocol error on another address.
 ///
@@ -3435,6 +3460,15 @@ enum AttemptOutcome {
 /// adopted into the spec — the QUIC Initial leaves from the socket the
 /// same-socket STUN query and probe round mapped. The bind fallback
 /// stays family-matched for the no-adoption path.
+///
+/// CR-P3-09: `marks` is the CALLER's (the shared `staggered_dial_pass`'s)
+/// [`ConnectMarks`] for this attempt — the pass reads its `connected()`
+/// flag as the Happy-Eyeballs winner signal, so the marks cannot live
+/// inside this function. (The extra argument pushes the count past
+/// clippy's default — bundling the borrow-only FFI context into a struct
+/// would be churn for one call site; the shape mirrors the CLI
+/// adapter's `SendCtx` grouping where it pays for itself.)
+#[allow(clippy::too_many_arguments)]
 async fn attempt_task_send(
     rt: &Arc<TaskRt>,
     conn: &TaskConn,
@@ -3443,6 +3477,7 @@ async fn attempt_task_send(
     pinned: Fingerprint,
     connect_budget: Duration,
     adopted: Option<&std::net::UdpSocket>,
+    marks: Arc<ConnectMarks>,
 ) -> AttemptOutcome {
     let mut spec = SendSpec::new(
         PathBuf::from(&paths[0]),
@@ -3469,7 +3504,6 @@ async fn attempt_task_send(
     spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
     spec.idle_timeout = TASK_SEND_IDLE;
 
-    let marks = Arc::new(ConnectMarks::new());
     let progress_queue = Arc::clone(&rt.engine_progress);
     let conn_hex = core::hex_encode(&conn.conn_id);
     let send_marks = Arc::clone(&marks);
@@ -3489,8 +3523,8 @@ async fn attempt_task_send(
     let send = send(spec, &progress);
     tokio::pin!(send);
     // The caller's budget: [`TASK_CONNECT_BUDGET`] for static candidates,
-    // [`OBSERVED_DIAL_BUDGET`] for the probe round's observed head (改法
-    // 第 3 条 — see the constant).
+    // [`OBSERVED_DIAL_BUDGET`] for the leading observed/reflexive
+    // candidate (see the constant).
     let result = match drive_with_connect_budget(&marks, send.as_mut(), connect_budget).await {
         Ok(result) => result,
         Err(()) => {

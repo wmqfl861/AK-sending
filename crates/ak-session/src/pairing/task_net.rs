@@ -39,7 +39,22 @@
 //!   [`task_net::PUNCH_MAX_TARGETS`] tunables: send-only probe-shaped packets
 //!   from a `try_clone` of the QUIC listener socket to every advertised
 //!   sender candidate, concurrently with the sender's dial, stopped
-//!   early by the first successful data-plane connection;
+//!   early by the first successful data-plane connection. Since CR-P1-06
+//!   (review 2026-11-11 §4.5 + the batchF conntrack evidence) the FIRST
+//!   phase of the punch sends its IPv4 datagrams with the low
+//!   [`task_net::PUNCH_LOW_TTL`] — per-packet via
+//!   `ak_net::holepunch::send_to_with_ttl`, never by touching the shared
+//!   socket's own TTL — so they open the local NAT mapping but expire
+//!   before the peer's NAT and leave no conflict record there;
+//! * the sender's post-pairing reflexive opener + the shared dial pass
+//!   (CR-P1-06 改法 2 + CR-P3-09) —
+//!   [`task_net::sender_reflexive_opener`] (brief pause after pairing, then
+//!   the adopted socket's first outbound packets toward the receiver's
+//!   reflexive addresses) and [`task_net::staggered_dial_pass`] /
+//!   [`task_net::reflexive_first_order`] (Happy-Eyeballs interleaved dialing
+//!   with reflexive/observed addresses strictly first; sequential on the
+//!   adopted socket, where concurrent QUIC endpoints on handles of one OS
+//!   socket would compete for its receive queue);
 //! * the probe echo responder — [`task_net::bind_echo_responder_socket`] +
 //!   [`task_net::echo_responder_loop`] (anti-reflection, per-source reply budgets,
 //!   the CR-P1-02 leg-3 observation slot) and the transient-error
@@ -168,6 +183,51 @@ pub const PUNCH_WINDOW: Duration = Duration::from_secs(4);
 /// is 16 candidates; the derived lists stay ≤ 8 dial + 4 echo — this cap
 /// bounds one tick's sends even against a hostile/buggy blob).
 pub const PUNCH_MAX_TARGETS: usize = 8;
+
+/// CR-P1-06 (review 2026-11-11 §4.5 改法 1): TTL of the receiver's
+/// FIRST-phase punch datagrams toward IPv4 candidates. The review band is
+/// 2–3; 2 is chosen deliberately: the datagram must traverse exactly the
+/// puncher's OWN NAT (which creates the mapping the sender's QUIC Initial
+/// then rides) and expire one hop further out, BEFORE the peer's NAT sees
+/// it — a value of 3 still reaches (and pollutes the conntrack of) a
+/// peer one intermediate routing hop away, which is exactly the matrix
+/// topology (r1 → akinet → r2) and not unusual behind a shared
+/// uplink. IPv4 only: IPv6 has no NAT and keeps the normal hop limit
+/// (改法 3). CONFIGURABLE CONSTANT, not policy: carrier-grade/double NAT
+/// needs a larger value so the punch clears BOTH local NATs — the real
+/// number comes from the C4 real-network runs.
+pub const PUNCH_LOW_TTL: u32 = 2;
+
+/// Wall-clock length of the punch's low-TTL first phase (CR-P1-06 改法 1:
+/// normal-TTL punching is retained as the backup for NATs that behave
+/// differently — 改法 3). The phase must cover the sender's post-pairing
+/// sequence — [`SENDER_DIAL_PAUSE`] (300 ms) plus the reflexive opener's
+/// sends — so the sender's adopted socket has opened its outbound NAT
+/// flow before any normal-TTL punch can arrive at the sender's NAT and
+/// re-create the inbound-only conntrack record the low TTL just avoided.
+/// 1 s = pause + 700 ms of skew margin for the two sides' pairing
+/// completion signals.
+pub const PUNCH_LOW_TTL_PHASE: Duration = Duration::from_secs(1);
+
+/// CR-P1-06 (改法 2): the sender's pause after pairing (the review band
+/// is 200–500 ms) before its FIRST outbound packet toward the receiver
+/// from the adopted socket ([`sender_reflexive_opener`]): the receiver's
+/// low-TTL punches must have left its socket first, so the punch datagrams
+/// (not the sender's QUIC Initial) are what opens the receiver's NAT
+/// mapping, and the sender's own outbound flow is established before the
+/// receiver's normal-TTL backup phase begins.
+pub const SENDER_DIAL_PAUSE: Duration = Duration::from_millis(300);
+
+/// CR-P3-09 (review 2026-11-11 §4.5): Happy-Eyeballs stagger — one
+/// connect attempt starts every 250 ms while the previous ones are still
+/// in flight, instead of the old serial loop whose per-candidate
+/// [`TASK_CONNECT_BUDGET`] (10 s) made connection time grow linearly with
+/// the candidate count (the review measured ~10 s wasted on unreachable
+/// private candidates before the reflexive address was ever dialed).
+/// With reflexive/observed addresses first
+/// ([`reflexive_first_order`]) a live reflexive leg connects in the first
+/// slot regardless of how many candidates follow.
+pub const DIAL_STAGGER: Duration = Duration::from_millis(250);
 
 /// Bound for the resident receiver's first bind (surfaced as the code's
 /// candidates). Binding a wildcard UDP socket is fast; the bound exists so
@@ -1117,6 +1177,11 @@ pub struct PunchReport {
     /// Probe-shaped punch packets actually sent (sum over all targets and
     /// ticks; per-datagram send errors do not count).
     pub packets_sent: usize,
+    /// CR-P1-06: punch packets sent with the low [`PUNCH_LOW_TTL`]
+    /// (first phase, IPv4 targets, hosts with per-packet TTL support).
+    /// Zero on Windows (documented normal-TTL degradation) and during a
+    /// window entirely covered by early stop.
+    pub low_ttl_packets: usize,
     /// Tick rounds that fired (≈ `window / interval`, fewer on early
     /// stop).
     pub ticks: usize,
@@ -1147,11 +1212,28 @@ pub struct PunchReport {
 /// duplicated handle would compete with quinn for the socket's queue —
 /// this loop is send-only by construction).
 ///
+/// CR-P1-06 two-phase TTL (review 2026-11-11 §4.5 改法 1/3, batchF
+/// conntrack evidence): the FIRST [`PUNCH_LOW_TTL_PHASE`] sends its
+/// IPv4 datagrams with the low per-packet [`PUNCH_LOW_TTL`] — they open
+/// THIS side's NAT mapping but expire before the sender's NAT, so they
+/// cannot leave the inbound-only conntrack record that made Linux-type
+/// SNAT rewrite the sender's external port (the pcone↔pcone failure).
+/// After the phase (and for IPv6 targets always — no NAT, normal hop
+/// limit) the punch continues at the socket's normal TTL: the backup
+/// behavior for NATs that need to actually see the peer's traffic. The
+/// low TTL rides per-packet `sendmsg` control messages
+/// (`ak_net::holepunch::send_to_with_ttl`) — the shared socket's own
+/// TTL is never modified; on hosts without per-packet TTL support
+/// (Windows: `WSASendMsg` documents no IPv4 `IP_TTL` control data) the
+/// whole window runs at normal TTL — the honest documented degradation.
+///
 /// Bounded and never blocking: family-undialable candidates are skipped
 /// (a v4 socket cannot send to v6; a v6-family socket dials plain-v4
 /// candidates in `::ffff:` mapped form, the same bridge
 /// `DirectEndpoint::connect` uses), per-datagram send errors are
-/// skipped (a dead candidate costs nothing), at most
+/// skipped (a dead candidate costs nothing — in the low phase a failed
+/// TTL send is NOT retried at normal TTL, that would re-create the very
+/// record the phase exists to avoid), at most
 /// [`PUNCH_MAX_TARGETS`] candidates per tick, and the loop ends at the
 /// FIRST of: the shared `stop` flag (set by the accept path on the first
 /// successful data-plane connection — the review's early-stop rule — or
@@ -1176,6 +1258,7 @@ pub async fn punch_candidates<F>(
         Err(_) => {
             report(PunchReport {
                 packets_sent: 0,
+                low_ttl_packets: 0,
                 ticks: 0,
                 stopped_early: false,
             });
@@ -1187,19 +1270,43 @@ pub async fn punch_candidates<F>(
     // if any, lands in quinn's queue and is discarded — the loop never
     // reads it back).
     let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+    let low_ttl_supported = ak_net::holepunch::per_packet_ttl_supported();
+    let started = tokio::time::Instant::now();
+    let low_phase_end = started + PUNCH_LOW_TTL_PHASE;
+    let deadline = started + PUNCH_WINDOW;
     let mut packets_sent = 0usize;
+    let mut low_ttl_packets = 0usize;
     let mut ticks = 0usize;
-    let deadline = tokio::time::Instant::now() + PUNCH_WINDOW;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         ticks += 1;
+        let low_phase = tokio::time::Instant::now() < low_phase_end;
         for target in &targets {
-            // Non-blocking UDP send_to: success is best-effort delivery;
-            // per-datagram errors (unreachable, WSAECONNRESET-shaped)
-            // cost nothing and never end the loop.
-            if socket.send_to(&packet, target).is_ok() {
+            // Per-datagram TTL decision (pure, unit-pinned below): low
+            // TTL only for IPv4 targets inside the first phase on hosts
+            // that can send it; everything else normal.
+            let sent = match punch_send_ttl(*target, low_phase, low_ttl_supported) {
+                // A refused/failed cmsg send is skipped, never retried
+                // at normal TTL inside the low phase (see the function
+                // doc — a normal-TTL fallback would re-create the very
+                // conntrack record the phase exists to avoid).
+                Some(ttl) => {
+                    if send_low_ttl_punch(&socket, &packet, *target, ttl) {
+                        low_ttl_packets += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // Non-blocking UDP send_to: success is best-effort
+                // delivery; per-datagram errors (unreachable,
+                // WSAECONNRESET-shaped) cost nothing and never end the
+                // loop.
+                None => socket.send_to(&packet, target).is_ok(),
+            };
+            if sent {
                 packets_sent += 1;
             }
         }
@@ -1220,9 +1327,56 @@ pub async fn punch_candidates<F>(
     let stopped_early = stop.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline;
     report(PunchReport {
         packets_sent,
+        low_ttl_packets,
         ticks,
         stopped_early,
     });
+}
+
+/// The per-datagram TTL decision of [`punch_candidates`] — pure on
+/// purpose (unit-pinned without any socket): `Some(PUNCH_LOW_TTL)` for an
+/// IPv4 target (plain or `::ffff:` mapped — the dual-stack socket's v4
+/// form; both the decision and the TTL control message key off the
+/// target's EXPANDED family, see
+/// `ak_net::holepunch::send_to_with_ttl`) inside the low-TTL first
+/// phase on a host with per-packet TTL support; `None` (normal socket
+/// TTL) for everything else — IPv6 targets (no NAT → normal hop limit,
+/// CR-P1-06 改法 3), the backup phase, and the Windows degradation.
+pub fn punch_send_ttl(target: SocketAddr, low_phase: bool, ttl_supported: bool) -> Option<u32> {
+    if low_phase && ttl_supported && ak_net::classify::expand_mapped(target).is_ipv4() {
+        Some(PUNCH_LOW_TTL)
+    } else {
+        None
+    }
+}
+
+/// One low-TTL punch datagram through the per-packet control-message
+/// path (Unix; see [`punch_send_ttl`]). `false` when the send was
+/// refused — the caller skips the datagram (no normal-TTL fallback
+/// inside the low phase).
+#[cfg(unix)]
+fn send_low_ttl_punch(
+    socket: &std::net::UdpSocket,
+    packet: &[u8],
+    target: SocketAddr,
+    ttl: u32,
+) -> bool {
+    ak_net::holepunch::send_to_with_ttl(socket, packet, target, ttl).is_ok()
+}
+
+/// Off-Unix the low phase never arms ([`punch_send_ttl`] returns `None`
+/// while `per_packet_ttl_supported()` is false), so this stub only keeps
+/// the loop compiling — the documented Windows degradation is "normal
+/// TTL for the whole window".
+#[cfg(not(unix))]
+fn send_low_ttl_punch(
+    socket: &std::net::UdpSocket,
+    packet: &[u8],
+    target: SocketAddr,
+    ttl: u32,
+) -> bool {
+    let _ = (socket, packet, target, ttl);
+    false
 }
 
 /// Time/counter-derived nonce of the punch packet — never all-zero (the
@@ -1279,8 +1433,355 @@ pub fn punch_targets(local: SocketAddr, candidates: &[SocketAddr]) -> Vec<Socket
 }
 
 // ---------------------------------------------------------------------------
-// The split connect budget (wave-25/26 P1-01 shape).
+// The sender's post-pairing reflexive opener + the shared interleaved dial
+// pass (CR-P1-06 改法 2 + CR-P3-09, review 2026-11-11 §4.5).
 // ---------------------------------------------------------------------------
+
+/// CR-P1-06 改法 2, the packet-send half: after the pairing completes,
+/// wait [`SENDER_DIAL_PAUSE`] (the review's 200–500 ms band — the
+/// receiver's low-TTL punch datagrams must have left its socket first),
+/// then send one probe-shaped packet from a SEND-ONLY `try_clone` of the
+/// ADOPTED sender socket to every PUBLIC (reflexive) candidate of the
+/// paired receiver — this is the adopted socket's first outbound packet
+/// toward the receiver, the flow that occupies the sender-NAT tuple
+/// BEFORE the receiver's normal-TTL backup punches (phase 2, ≥
+/// [`PUNCH_LOW_TTL_PHASE`]) can arrive there, and the mapping the QUIC
+/// Initial then rides. The packets are probe-shaped with a real nonce;
+/// at the receiver they land in quinn's queue and are silently discarded.
+///
+/// No adopted socket (bind failed / an older flow): the wait still runs
+/// (uniform, adapter-identical timing) but no packets are sent — a
+/// throwaway socket's mapping would not carry into the dial, so there is
+/// nothing useful to open. Returns the packets actually sent (0 without
+/// an adopted socket or with no public candidates — diagnostics only).
+pub async fn sender_reflexive_opener(
+    adopted: Option<&std::net::UdpSocket>,
+    static_order: &[SocketAddr],
+) -> usize {
+    tokio::time::sleep(SENDER_DIAL_PAUSE).await;
+    let Some(adopted) = adopted else {
+        return 0;
+    };
+    // The public (reflexive) targets only — LAN candidates cannot ride a
+    // NAT mapping and the opener is exactly a NAT-tuple opener. Selection
+    // shares the punch's family bridge and caps.
+    let Some(local) = adopted.local_addr().ok() else {
+        return 0;
+    };
+    let public: Vec<SocketAddr> = static_order
+        .iter()
+        .copied()
+        .filter(|addr| !prefers_lan(addr))
+        .collect();
+    let targets = punch_targets(local, &public);
+    let Some(clone) = adopted.try_clone().ok() else {
+        return 0;
+    };
+    let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+    let mut sent = 0usize;
+    for target in &targets {
+        if clone.send_to(&packet, target).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// CR-P3-09: reorder one static dial order so every PUBLIC (reflexive)
+/// candidate strictly PRECEDES the LAN candidates ("反射/观测地址严格排
+/// 最前，保序私网候选在慢路径") — the pair of the review's two accepted
+/// remedies, applied together with [`DIAL_STAGGER`]. Pure: stable
+/// partition on [`prefers_lan`], relative order preserved inside each
+/// group. The observed head is pinned FIRST by the caller
+/// ([`observed_first_order`]) after this partition, so a LAN observation
+/// still leads.
+pub fn reflexive_first_order(ordered: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(ordered.len());
+    out.extend(ordered.iter().copied().filter(|addr| !prefers_lan(addr)));
+    out.extend(ordered.into_iter().filter(prefers_lan));
+    out
+}
+
+/// One candidate attempt's verdict for [`staggered_dial_pass`] — the
+/// adapter classifies its own outcome type into this shared vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptVerdict {
+    /// The attempt fully succeeded (transfer completed): the pass returns
+    /// it, every other in-flight attempt is cancelled.
+    Done,
+    /// The attempt connected but the transfer failed, or the peer
+    /// declined: another address cannot fix it — the pass returns it and
+    /// the op fails (the adapter keeps its own message/state handling).
+    Fatal,
+    /// Purely connect-level failure (timeout, refused, or a
+    /// connection-died-before-anything-offered race the adapters retry):
+    /// recorded with its bounded reason, the remaining candidates carry
+    /// the pass.
+    Retryable(String),
+}
+
+/// The outcome of one [`staggered_dial_pass`] over a dial order.
+#[derive(Debug)]
+pub struct PassOutcome<A> {
+    /// First attempt classified [`AttemptVerdict::Done`], with its
+    /// address (the candidate that actually carried the task).
+    pub done: Option<(SocketAddr, A)>,
+    /// First attempt classified [`AttemptVerdict::Fatal`], with its
+    /// address (the op fails; the adapter renders its own bounded
+    /// message from `A`).
+    pub fatal: Option<(SocketAddr, A)>,
+    /// `(address, bounded reason)` of every [`AttemptVerdict::Retryable`]
+    /// failure, in dial order.
+    pub failures: Vec<(SocketAddr, String)>,
+}
+
+/// One in-flight candidate attempt of the interleaved pass.
+struct DialSlot<'a, A> {
+    addr: SocketAddr,
+    marks: Arc<ConnectMarks>,
+    fut: std::pin::Pin<Box<dyn Future<Output = A> + Send + 'a>>,
+}
+
+/// What the pass's poll sweep observed: an attempt finished (its adapter
+/// outcome is ready) or an attempt's engine reported `Connected` (its
+/// QUIC+TLS handshake is up — the Happy-Eyeballs winner signal).
+enum DialEvent<A> {
+    Completed(usize, A),
+    Connected(usize),
+}
+
+/// The shared ONE connect pass over a dial order (CR-P3-09, the loop the
+/// two adapters previously maintained twice). Behavior:
+///
+/// * The order is first re-sorted by [`reflexive_first_order`] with the
+///   probe round's observed head pinned first
+///   ([`observed_first_order`]) — public/reflexive/observed addresses
+///   strictly lead, LAN candidates keep their order on the slow path.
+/// * The FIRST entry dials under [`OBSERVED_DIAL_BUDGET`] when it is the
+///   observed head or a public (reflexive) candidate (the hot-mapping
+///   rule the adapters previously applied to the observed head alone);
+///   every other entry keeps the full [`TASK_CONNECT_BUDGET`].
+/// * `sequential == true` (the caller dialed with an ADOPTED socket):
+///   attempts run strictly one at a time, in order — concurrent QUIC
+///   endpoints on `try_clone` handles of ONE OS socket would compete for
+///   its receive queue (ak-net's adoption contract: "the socket must not
+///   be shared afterwards"), so interleaving is reserved for the
+///   self-bound path where every attempt owns its socket. The
+///   reflexive-first order still puts the reflexive leg in slot 0, which
+///   is what makes cross-NAT connection time independent of the private
+///   candidate count.
+/// * `sequential == false`: Happy-Eyeballs — candidate 0 starts
+///   immediately, candidate n starts at n × [`DIAL_STAGGER`]; all
+///   in-flight attempts are polled concurrently; the FIRST attempt whose
+///   marks report `Connected` becomes the winner (the others are dropped
+///   — dropping an engine send future mid-handshake cancels it cleanly,
+///   and a cancelled loser has sent no protocol byte), and the winner
+///   alone runs to completion. A `Done`/`Fatal` completion cancels the
+///   rest the same way.
+/// * A `Retryable` completion frees its slot (the stagger keeps its
+///   cadence); when every candidate has been started and every attempt
+///   finished retryable, the pass ends with the failure list — the
+///   caller's whole-list pass loop (settle pause, pass counting) stays
+///   in the adapter.
+///
+/// `attempt` builds one candidate's engine future: it receives the
+/// candidate address, a FRESH [`ConnectMarks`] to wire into the engine
+/// progress callback (the pass reads `connected()` as its winner signal),
+/// and the attempt's connect budget. `verdict` classifies the adapter's
+/// own outcome value.
+pub async fn staggered_dial_pass<'a, A, F, Fut, V>(
+    order: &[SocketAddr],
+    head: Option<SocketAddr>,
+    sequential: bool,
+    mut attempt: F,
+    mut verdict: V,
+) -> PassOutcome<A>
+where
+    F: FnMut(SocketAddr, Arc<ConnectMarks>, Duration) -> Fut,
+    Fut: Future<Output = A> + Send + 'a,
+    V: FnMut(&A) -> AttemptVerdict,
+{
+    // CR-P3-09 ordering: reflexive/public strictly first, then the
+    // observed head pinned before everything (a LAN observation still
+    // leads — it names a route that answered probes).
+    let order = observed_first_order(reflexive_first_order(order.to_vec()), head);
+    let mut failures: Vec<(SocketAddr, String)> = Vec::new();
+
+    if sequential {
+        for index in 0..order.len() {
+            let addr = order[index];
+            let marks = Arc::new(ConnectMarks::new());
+            let budget = dial_attempt_budget(index, &order, head);
+            let outcome = attempt(addr, marks, budget).await;
+            match verdict(&outcome) {
+                AttemptVerdict::Done => {
+                    return PassOutcome {
+                        done: Some((addr, outcome)),
+                        fatal: None,
+                        failures,
+                    }
+                }
+                AttemptVerdict::Fatal => {
+                    return PassOutcome {
+                        done: None,
+                        fatal: Some((addr, outcome)),
+                        failures,
+                    }
+                }
+                AttemptVerdict::Retryable(reason) => failures.push((addr, reason)),
+            }
+        }
+        return PassOutcome {
+            done: None,
+            fatal: None,
+            failures,
+        };
+    }
+
+    // Happy-Eyeballs: stagger the starts, poll everything in flight, take
+    // the first `Connected` as the winner.
+    let mut slots: Vec<DialSlot<'a, A>> = Vec::new();
+    let mut next_index = 0usize;
+    let mut next_start = tokio::time::Instant::now();
+    loop {
+        // Start every attempt whose stagger slot has arrived.
+        while next_index < order.len() && tokio::time::Instant::now() >= next_start {
+            let addr = order[next_index];
+            let marks = Arc::new(ConnectMarks::new());
+            let budget = dial_attempt_budget(next_index, &order, head);
+            let fut = attempt(addr, Arc::clone(&marks), budget);
+            slots.push(DialSlot {
+                addr,
+                marks,
+                fut: Box::pin(fut),
+            });
+            next_index += 1;
+            next_start += DIAL_STAGGER;
+        }
+        let more_to_start = next_index < order.len();
+        // One sweep polls every in-flight attempt for completion and
+        // re-checks the winner signal. The `Connected` flag flips inside
+        // the attempt's own poll (the engine progress callback is
+        // synchronous), so the re-check after each poll sees it without
+        // any extra notification plumbing.
+        let event = std::future::poll_fn(|cx| {
+            for (index, slot) in slots.iter_mut().enumerate() {
+                if let std::task::Poll::Ready(outcome) = slot.fut.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(DialEvent::Completed(index, outcome));
+                }
+                if slot.marks.connected() {
+                    return std::task::Poll::Ready(DialEvent::Connected(index));
+                }
+            }
+            std::task::Poll::Pending
+        });
+        tokio::select! {
+            // The stagger timer only fires while candidates remain; when
+            // it does, the loop head starts what is due.
+            _ = tokio::time::sleep_until(next_start), if more_to_start => {
+                if slots.is_empty() {
+                    // Nothing in flight (everything so far already failed
+                    // retryable): the next candidate starts NOW rather
+                    // than at its stagger deadline — the stagger exists
+                    // to interleave with LIVE attempts, not to idle.
+                    next_start = tokio::time::Instant::now();
+                }
+                continue;
+            }
+            event = event => match event {
+                DialEvent::Connected(index) => {
+                    // Winner: its QUIC handshake is up — cancel the
+                    // others (dropping their futures aborts the dial;
+                    // a loser has offered nothing) and finish on it
+                    // alone.
+                    let winner = slots.swap_remove(index);
+                    slots.clear();
+                    let addr = winner.addr;
+                    let outcome = winner.fut.await;
+                    return match verdict(&outcome) {
+                        AttemptVerdict::Done => PassOutcome {
+                            done: Some((addr, outcome)),
+                            fatal: None,
+                            failures,
+                        },
+                        AttemptVerdict::Fatal => PassOutcome {
+                            done: None,
+                            fatal: Some((addr, outcome)),
+                            failures,
+                        },
+                        // Connected but retryable (the wave-29
+                        // admission race: the connection died before
+                        // any protocol byte). The others were already
+                        // cancelled, so the pass ends here — the
+                        // adapter's settle pause and whole-list pass
+                        // retry is the recorded remedy for exactly this
+                        // race.
+                        AttemptVerdict::Retryable(reason) => {
+                            failures.push((addr, reason));
+                            PassOutcome {
+                                done: None,
+                                fatal: None,
+                                failures,
+                            }
+                        }
+                    };
+                }
+                DialEvent::Completed(index, outcome) => {
+                    let slot = slots.swap_remove(index);
+                    match verdict(&outcome) {
+                        AttemptVerdict::Done => {
+                            slots.clear();
+                            return PassOutcome {
+                                done: Some((slot.addr, outcome)),
+                                fatal: None,
+                                failures,
+                            };
+                        }
+                        AttemptVerdict::Fatal => {
+                            slots.clear();
+                            return PassOutcome {
+                                done: None,
+                                fatal: Some((slot.addr, outcome)),
+                                failures,
+                            };
+                        }
+                        AttemptVerdict::Retryable(reason) => {
+                            failures.push((slot.addr, reason));
+                            if slots.is_empty() {
+                                if next_index >= order.len() {
+                                    break; // every candidate tried, all retryable
+                                }
+                                // Nothing left in flight: the next
+                                // candidate starts immediately (the
+                                // stagger only spaces LIVE attempts).
+                                next_start = tokio::time::Instant::now();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    PassOutcome {
+        done: None,
+        fatal: None,
+        failures,
+    }
+}
+
+/// The connect budget of dial slot `index` (the shared hot-mapping rule):
+/// the FIRST entry dials under [`OBSERVED_DIAL_BUDGET`] when it is the
+/// probe round's observed head or a public (reflexive) candidate — both
+/// name a route that should complete a QUIC+TLS handshake well inside 2 s
+/// when live; every other candidate (and a LAN-first order with no public
+/// candidate at all) keeps the full [`TASK_CONNECT_BUDGET`].
+fn dial_attempt_budget(index: usize, order: &[SocketAddr], head: Option<SocketAddr>) -> Duration {
+    if index == 0 && (head.is_some() || order.first().is_some_and(|addr| !prefers_lan(addr))) {
+        OBSERVED_DIAL_BUDGET
+    } else {
+        TASK_CONNECT_BUDGET
+    }
+}
 
 /// Connect-phase bookkeeping: the engine invokes its progress callback
 /// synchronously inside the polled future, so the marks carry no
@@ -2195,7 +2696,12 @@ mod tests {
     /// The punch loop's happy path: every dialable candidate is punched
     /// with a small probe-shaped packet (never the all-zero reply nonce —
     /// the echo responder would not answer it), cadence-bounded within
-    /// the window, and the report counts what was sent.
+    /// the window, and the report counts what was sent. CR-P1-06: the
+    /// two-phase TTL split shows in the report — on a TTL-capable host
+    /// the first phase's IPv4 punches ride the low TTL (loopback delivers
+    /// them regardless — local delivery decrements nothing, the expiry is
+    /// the matrix's akinet hop's to prove) and the backup phase keeps
+    /// sending after it; on Windows the whole window runs normal TTL.
     #[tokio::test]
     async fn punch_candidates_punches_every_candidate_with_bounded_packets() {
         let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
@@ -2212,7 +2718,12 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             target_addr,
         ];
-        punch_candidates(puncher, &candidates, &stop, |_| {}).await;
+        let mut report = None;
+        {
+            let report_slot = &mut report;
+            punch_candidates(puncher, &candidates, &stop, |r| *report_slot = Some(r)).await;
+        }
+        let report = report.expect("the report fires at loop end");
         target
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("target timeout");
@@ -2252,6 +2763,32 @@ mod tests {
             "the loop never overruns its window: {:?}",
             started.elapsed()
         );
+        // The two-phase TTL split (CR-P1-06). One candidate per tick; the
+        // low phase covers ~PUNCH_LOW_TTL_PHASE/PUNCH_INTERVAL ticks.
+        let phase_ticks = (PUNCH_LOW_TTL_PHASE.as_millis() / PUNCH_INTERVAL.as_millis()) as usize;
+        if ak_net::holepunch::per_packet_ttl_supported() {
+            assert!(
+                report.low_ttl_packets > 0,
+                "the first phase punches ride the low TTL: {report:?}"
+            );
+            assert!(
+                report.low_ttl_packets <= phase_ticks + 1,
+                "the low-TTL phase is phase-bounded: {report:?}"
+            );
+            assert!(
+                report.packets_sent > report.low_ttl_packets,
+                "the normal-TTL backup phase keeps punching after the low phase: {report:?}"
+            );
+        } else {
+            assert_eq!(
+                report.low_ttl_packets, 0,
+                "the documented Windows degradation: normal TTL all window: {report:?}"
+            );
+            assert!(
+                report.packets_sent >= punches,
+                "every punch still went out at normal TTL: {report:?}"
+            );
+        }
     }
 
     /// The punch loop's early stop: the shared flag (set by the accept
@@ -2331,5 +2868,358 @@ mod tests {
             .map(|i| SocketAddr::from(([192, 0, 2, 1], 30_000 + i as u16)))
             .collect();
         assert_eq!(punch_targets(v4_local, &many).len(), PUNCH_MAX_TARGETS);
+    }
+
+    // -- CR-P1-06 + CR-P3-09 (review 2026-11-11 §4.5): the low-TTL punch
+    //    phase, the reflexive opener and the shared interleaved dial pass --
+
+    /// The per-datagram TTL decision matrix, pure: low TTL for IPv4
+    /// targets (plain AND `::ffff:` mapped — the dual-stack socket's v4
+    /// form) inside the first phase on a capable host; normal TTL for
+    /// IPv6 (no NAT), for the backup phase, and for the Windows
+    /// degradation. Plus the tunable sanity: the TTL sits in the review's
+    /// 2–3 band, and the low phase comfortably covers the sender's
+    /// post-pairing pause.
+    #[test]
+    fn punch_send_ttl_decision_and_constants() {
+        let v4: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let mapped_v4: SocketAddr = "[::ffff:203.0.113.7]:7000".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:7000".parse().unwrap();
+        assert_eq!(punch_send_ttl(v4, true, true), Some(PUNCH_LOW_TTL));
+        assert_eq!(punch_send_ttl(mapped_v4, true, true), Some(PUNCH_LOW_TTL));
+        // IPv6 never rides the low TTL (no NAT — normal hop limit).
+        assert_eq!(punch_send_ttl(v6, true, true), None);
+        // The backup phase and the unsupported-host degradation are
+        // normal TTL.
+        assert_eq!(punch_send_ttl(v4, false, true), None);
+        assert_eq!(punch_send_ttl(v4, true, false), None);
+        // The tunables: the review's 2–3 band, and the phase covers the
+        // sender's pause with skew margin.
+        assert!(
+            (2..=3).contains(&PUNCH_LOW_TTL),
+            "PUNCH_LOW_TTL sits in the review band: {PUNCH_LOW_TTL}"
+        );
+        assert!(
+            PUNCH_LOW_TTL_PHASE >= SENDER_DIAL_PAUSE + Duration::from_millis(400),
+            "the low phase must outlast the sender pause plus skew: {:?} vs {:?}",
+            PUNCH_LOW_TTL_PHASE,
+            SENDER_DIAL_PAUSE
+        );
+        assert!(DIAL_STAGGER >= Duration::from_millis(100));
+    }
+
+    /// CR-P3-09: the reflexive-first reorder — public candidates strictly
+    /// precede the LAN block, relative order stable inside each group.
+    #[test]
+    fn reflexive_first_order_leads_with_public_candidates() {
+        let ordered = addrs(&[
+            "192.168.1.5:7000",  // LAN
+            "203.0.113.7:7000",  // public (reflexive)
+            "127.0.0.1:7000",    // LAN (loopback is private)
+            "198.51.100.9:7000", // public
+            "10.0.0.7:7000",     // LAN
+        ]);
+        assert_eq!(
+            reflexive_first_order(ordered),
+            addrs(&[
+                "203.0.113.7:7000",
+                "198.51.100.9:7000",
+                "192.168.1.5:7000",
+                "127.0.0.1:7000",
+                "10.0.0.7:7000",
+            ])
+        );
+        // An all-LAN list (same-subnet transfer) is unchanged.
+        let lan_only = addrs(&["192.168.1.5:7000", "127.0.0.1:7000"]);
+        assert_eq!(reflexive_first_order(lan_only.clone()), lan_only);
+    }
+
+    /// A tiny attempt-outcome vocabulary for the pass tests below: the
+    /// marker IS the address that attempted, plus a class word.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MockOutcome {
+        Ok(SocketAddr),
+        Retry(SocketAddr),
+        Bad(SocketAddr),
+    }
+
+    fn mock_verdict(outcome: &MockOutcome) -> AttemptVerdict {
+        match outcome {
+            MockOutcome::Ok(_) => AttemptVerdict::Done,
+            MockOutcome::Retry(_) => AttemptVerdict::Retryable("mock retry".to_string()),
+            MockOutcome::Bad(_) => AttemptVerdict::Fatal,
+        }
+    }
+
+    /// CR-P3-09's acceptance shape, loopback: with unreachable private
+    /// candidates ahead in the STATIC order, a live reflexive candidate
+    /// still connects first — the pass reorders public-first and the
+    /// never-connecting private attempts (pending forever) do not block
+    /// the winner; total time is bounded by one stagger slot, not the
+    /// candidate count.
+    #[tokio::test(start_paused = true)]
+    async fn staggered_pass_connects_via_reflexive_without_waiting_for_privates() {
+        let reflexive: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let privates: Vec<SocketAddr> = (1..=6)
+            .map(|i| SocketAddr::from(([192, 168, 0, i], 7000)))
+            .collect();
+        // STATIC order: privates first (the pre-CR dial order), reflexive
+        // dead last — the pass's reorder must leapfrog it to the front.
+        let mut order = privates.clone();
+        order.push(reflexive);
+        let started = tokio::time::Instant::now();
+        let outcome = staggered_dial_pass(
+            &order,
+            None,
+            false, // self-bound path: Happy-Eyeballs stagger
+            |addr, marks, _budget| async move {
+                if addr == reflexive {
+                    // A live leg: handshake up quickly, transfer done.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    marks.mark(&Progress::Connected {
+                        peer: "mock".to_string(),
+                    });
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    MockOutcome::Ok(addr)
+                } else {
+                    // An unreachable private candidate: never connects
+                    // (the old serial loop burned its full budget here).
+                    std::future::pending::<()>().await;
+                    MockOutcome::Retry(addr)
+                }
+            },
+            mock_verdict,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome.done,
+            Some((reflexive, MockOutcome::Ok(reflexive))),
+            "the reflexive candidate carried the pass: {:?}",
+            outcome.done
+        );
+        assert!(
+            outcome.failures.is_empty(),
+            "the cancelled privates never recorded failures: {:?}",
+            outcome.failures
+        );
+        assert!(
+            elapsed < DIAL_STAGGER * 2,
+            "connection time is independent of the private candidate count: {elapsed:?}"
+        );
+    }
+
+    /// The pass's budget rule: the leading PUBLIC candidate (the
+    /// reflexive leg, no observation needed) dials under the bounded
+    /// observed budget; a LAN-first order without any public candidate
+    /// keeps the full task budget for slot 0.
+    #[tokio::test(start_paused = true)]
+    async fn staggered_pass_budget_rule_leading_public_gets_the_short_budget() {
+        let public: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.5:7000".parse().unwrap();
+        // Public leads the static order: the short hot-mapping budget.
+        let order = vec![public, lan];
+        let outcome = staggered_dial_pass(
+            &order,
+            None,
+            true, // sequential: one attempt is enough to observe it
+            |_addr, _marks, budget| async move { budget },
+            |budget: &Duration| {
+                if *budget == OBSERVED_DIAL_BUDGET {
+                    AttemptVerdict::Done
+                } else {
+                    AttemptVerdict::Fatal
+                }
+            },
+        )
+        .await;
+        assert!(
+            outcome.done.is_some(),
+            "public-first slot gets the observed budget: {outcome:?}"
+        );
+        // LAN leads, but the observed head is the public candidate: the
+        // head is pinned first and carries the short budget.
+        let order = vec![lan, public];
+        let outcome = staggered_dial_pass(
+            &order,
+            Some(public),
+            true,
+            |_addr, _marks, budget| async move { budget },
+            |budget: &Duration| {
+                if *budget == OBSERVED_DIAL_BUDGET {
+                    AttemptVerdict::Done
+                } else {
+                    AttemptVerdict::Fatal
+                }
+            },
+        )
+        .await;
+        assert!(
+            outcome.done.is_some(),
+            "the pinned head gets the observed budget: {outcome:?}"
+        );
+        // An order with NO public candidate and no observation: slot 0
+        // is LAN — full budget (legacy semantics).
+        let lan2: SocketAddr = "10.0.0.7:7000".parse().unwrap();
+        let order = vec![lan, lan2];
+        let outcome = staggered_dial_pass(
+            &order,
+            None,
+            true,
+            |_addr, _marks, budget| async move { budget },
+            |budget: &Duration| {
+                if *budget == TASK_CONNECT_BUDGET {
+                    AttemptVerdict::Done
+                } else {
+                    AttemptVerdict::Fatal
+                }
+            },
+        )
+        .await;
+        assert!(
+            outcome.done.is_some(),
+            "an all-LAN order with no observation keeps the full budget: {outcome:?}"
+        );
+    }
+
+    /// Sequential mode (the adopted-socket path): attempts run strictly
+    /// one at a time — the next attempt starts only after the previous
+    /// future finished (concurrent QUIC endpoints on one OS socket are
+    /// forbidden), and the retryable/fatal classification behaves like
+    /// the old serial loop.
+    #[tokio::test(start_paused = true)]
+    async fn staggered_pass_sequential_runs_one_attempt_at_a_time() {
+        let first: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let second: SocketAddr = "192.168.1.5:7000".parse().unwrap();
+        let timeline: Arc<StdMutex<Vec<(&'static str, u128)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let t0 = tokio::time::Instant::now();
+        let log = Arc::clone(&timeline);
+        let outcome = staggered_dial_pass(
+            &[first, second],
+            None,
+            true,
+            move |addr, _marks, _budget| {
+                let log = Arc::clone(&log);
+                async move {
+                    if let Ok(mut log) = log.lock() {
+                        log.push(("start", t0.elapsed().as_millis()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if let Ok(mut log) = log.lock() {
+                        log.push(("end", t0.elapsed().as_millis()));
+                    }
+                    if addr == first {
+                        MockOutcome::Retry(addr)
+                    } else {
+                        MockOutcome::Ok(addr)
+                    }
+                }
+            },
+            mock_verdict,
+        )
+        .await;
+        let timeline = timeline.lock().expect("timeline").clone();
+        assert_eq!(
+            outcome.done,
+            Some((second, MockOutcome::Ok(second))),
+            "the second attempt won: {:?}",
+            outcome.done
+        );
+        assert_eq!(
+            outcome.failures,
+            vec![(first, "mock retry".to_string())],
+            "the first attempt's retryable failure is recorded"
+        );
+        assert_eq!(timeline.len(), 4, "two start/end pairs: {timeline:?}");
+        assert!(
+            timeline[2].1 >= timeline[1].1,
+            "attempt 2 started only after attempt 1 finished: {timeline:?}"
+        );
+    }
+
+    /// A Fatal attempt (post-connect failure / declined) ends the pass
+    /// immediately — another address cannot fix it — and the outcome
+    /// carries the failing address for the adapter's own message.
+    #[tokio::test(start_paused = true)]
+    async fn staggered_pass_fatal_stops_the_pass() {
+        let a: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let b: SocketAddr = "192.168.1.5:7000".parse().unwrap();
+        let outcome = staggered_dial_pass(
+            &[a, b],
+            None,
+            false,
+            |addr, _marks, _budget| async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                if addr == a {
+                    MockOutcome::Bad(addr)
+                } else {
+                    MockOutcome::Ok(addr)
+                }
+            },
+            mock_verdict,
+        )
+        .await;
+        assert!(outcome.done.is_none(), "a fatal attempt never yields Done");
+        assert_eq!(outcome.fatal, Some((a, MockOutcome::Bad(a))));
+        assert!(outcome.failures.is_empty());
+    }
+
+    /// The reflexive opener: after [`SENDER_DIAL_PAUSE`] it sends exactly
+    /// ONE probe-shaped packet per PUBLIC candidate from the ADOPTED
+    /// socket's port (LAN candidates are skipped), and without an
+    /// adopted socket it sends nothing (but still pauses — uniform
+    /// adapter timing).
+    ///
+    /// Routing note: the "public" target is a `::ffff:127.0.0.1` mapped
+    /// loopback — `prefers_lan` sees the v6 variant (not v4-loopback,
+    /// not v6-loopback ⇒ public) while the dual-stack socket's send
+    /// still delivers on loopback, so the test neither depends on
+    /// external routing nor leaves the host. Real public addresses are
+    /// covered by the pure selection rule above.
+    #[tokio::test(start_paused = true)]
+    async fn sender_reflexive_opener_pauses_and_punches_public_targets() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_port = target.local_addr().expect("target addr").port();
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let adopted_port = adopted.local_addr().expect("adopted addr").port();
+        let public: SocketAddr = format!("[::ffff:127.0.0.1]:{target_port}")
+            .parse()
+            .expect("mapped loopback parses");
+        let lan: SocketAddr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let started = tokio::time::Instant::now();
+        let sent = sender_reflexive_opener(Some(&adopted), &[lan, public]).await;
+        let elapsed = started.elapsed();
+        assert_eq!(sent, 1, "exactly the public candidate was opened");
+        assert!(
+            elapsed >= SENDER_DIAL_PAUSE,
+            "the opener waits the post-pairing pause: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SENDER_DIAL_PAUSE + Duration::from_millis(150),
+            "and nothing else delays it: {elapsed:?}"
+        );
+        target
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("target timeout");
+        let mut buffer = [0u8; 1500];
+        let (len, from) = target.recv_from(&mut buffer).expect("the opener packet");
+        assert!(
+            ak_net::holepunch::is_probe_packet(&buffer[..len]),
+            "the opener packet is probe-shaped"
+        );
+        assert_eq!(from.port(), adopted_port, "it left the adopted socket");
+        // The target socket RECEIVING the datagram is the proof it was
+        // aimed at the public (mapped) candidate — `from` names the
+        // sender (plain-v4 presentation of the dual-stack socket), and
+        // the family bridging itself is pinned by
+        // `punch_targets_filter_bridge_and_cap`.
+        // No adopted socket: the pause still runs, nothing is sent.
+        let started = tokio::time::Instant::now();
+        let sent = sender_reflexive_opener(None, &[public]).await;
+        assert_eq!(sent, 0);
+        assert!(started.elapsed() >= SENDER_DIAL_PAUSE);
     }
 }

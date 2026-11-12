@@ -40,4 +40,7 @@ tokio = { workspace = true }
 # itself never links a server-side SQLite.
 ak-signal = { workspace = true, features = ["server-persistence"] }
 env_logger = { workspace = true }
+# CR-P1-06/CR-P3-09: the task_net dial-pass/pause tests run on the paused
+# clock so their time bounds are exact (dev-only; same workspace tokio).
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

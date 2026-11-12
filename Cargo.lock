@@ -142,6 +142,7 @@ dependencies = [
  "ak-net",
  "ak-signal",
  "ak-store",
+ "ak-wire",
  "blake3",
  "env_logger",
  "log",

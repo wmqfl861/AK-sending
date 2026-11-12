@@ -404,7 +404,7 @@ impl BlobParser<'_> {
                     _ => return Err(TaskError::BadEndpoint("unknown escape")),
                 },
                 byte if byte < 0x20 => {
-                    return Err(TaskError::BadEndpoint("raw control byte in string"))
+                    return Err(TaskError::BadEndpoint("raw control byte in string"));
                 }
                 byte if byte < 0x80 => out.push(byte as char),
                 byte => {

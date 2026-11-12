@@ -54,6 +54,11 @@ pub mod client;
 pub mod error;
 pub mod orchestrator;
 pub mod task;
+/// The v1 task-plane connectivity plumbing shared by ak-ffi and ak-cli
+/// (CR-P2-11 dedup — see the module docs). Deliberately NOT re-exported
+/// wholesale at the `pairing` root: the adapters import it as
+/// `pairing::task_net::{…}` so the shared surface stays greppable.
+pub mod task_net;
 pub mod transport;
 
 pub use ak_identity::pairing_txn::VerifiedPairing;

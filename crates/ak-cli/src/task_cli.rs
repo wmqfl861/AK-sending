@@ -31,11 +31,9 @@
 //! explicit reason and exits non-zero.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -49,105 +47,40 @@ use ak_identity::pairing_txn::random_id16;
 use ak_identity::tls::make_self_signed;
 use ak_identity::{DeviceKeyPair, Fingerprint};
 use ak_session::pairing::{
-    ClientConfig, OrchestratorConfig, PairFlowError, PairingOrchestrator, PeerEndpoint,
-    ProbeOptions, ProbeOutcome, RegistryClient, TaskDirection, TaskDisconnectReason, TaskError,
-    TaskEvent, TaskPaired, TaskPairing, TaskPairingConfig, TASK_CODE_TTL_SECS,
+    ClientConfig, OrchestratorConfig, PairingOrchestrator, PeerEndpoint, ProbeOutcome,
+    RegistryClient, TaskDirection, TaskDisconnectReason, TaskError, TaskEvent, TaskPaired,
+    TaskPairing, TaskPairingConfig, TASK_CODE_TTL_SECS,
 };
-use ak_wire::{Frame, Message};
+// CR-P2-11 (review 2026-11-11 §4.5): the v1 connectivity plumbing this
+// file used to duplicate against crates/ak-ffi/src/task.rs lives in ONE
+// shared module now — ak-session `pairing::task_net` (a pure move: same
+// bodies, same tunables, same rationale docs; the mirrored unit tests
+// moved with them). This adapter keeps only the CLI-side wiring — stdout
+// lines instead of events, the one-shot session state. The shared names
+// are imported directly so the moved call sites read unchanged.
+use ak_session::pairing::task_net::{
+    bind_echo_responder_socket, bind_receiver_socket, blob_candidates, deliver_close_notify,
+    drive_with_connect_budget, echo_responder_loop, handshake_failure_word,
+    insert_reflexive_candidate, local_candidates, order_candidates, prefers_lan, probe_dial_round,
+    probe_with_retry, windows_root_name_refusal, ConnectMarks, ATTEMPT_PAUSE, OBSERVED_DIAL_BUDGET,
+    RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_BUDGET,
+    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
+    TASK_SETTLE_PAUSE,
+};
 
 use crate::invite::RegistrySettings;
 
 // ---------------------------------------------------------------------------
-// Tunables (mirroring crates/ak-ffi/src/task.rs — same rationale per value).
+// Tunables. CR-P2-11 (review 2026-11-11 §4.5): the connectivity tunables
+// this file used to mirror against crates/ak-ffi/src/task.rs moved to the
+// shared ak-session `pairing::task_net` module (imported above); only the
+// CLI-only seams stay here.
 // ---------------------------------------------------------------------------
 
 /// Offer-level consent window: the terminal prompt waits this long, then
 /// auto-DECLINES (never auto-accepts). 30 s per the frozen v1 model; the
 /// field is injectable so tests exercise the expiry on a short window.
 pub(crate) const CONSENT_WINDOW: Duration = Duration::from_secs(30);
-
-/// Bounded wait for the registry connect of the task-pairing stack.
-const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Redeem window offered to the registry: how long the code owner has to
-/// answer once a joiner typed the code (ak-session's 90 s default is the
-/// long-lived invite UX, not the short-TTL task-code one).
-const TASK_REDEEM_WINDOW_MS: u64 = 10_000;
-
-/// Probe tunables: one round listens 1.5 s with probes every 150 ms; a
-/// failed first round gets exactly one retry after a short stagger.
-const TASK_PROBE_OPTIONS: ProbeOptions = ProbeOptions {
-    interval: Duration::from_millis(150),
-    window: Duration::from_millis(1_500),
-};
-const TASK_PROBE_RETRY_PAUSE: Duration = Duration::from_millis(300);
-
-/// Bound for the resident receiver's first bind.
-const RECEIVER_BIND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Per-candidate connect budget of the send driver (split budget: the clock
-/// starts at the engine's `Connecting` report, never during the source
-/// scan, and stops once connected).
-const TASK_CONNECT_BUDGET: Duration = Duration::from_secs(10);
-
-/// Idle budget of a task send: must comfortably cover the receiver's
-/// [`CONSENT_WINDOW`] plus slow-storage scans on the far end.
-const TASK_SEND_IDLE: Duration = Duration::from_secs(120);
-
-/// Whole-list connect passes: a send may fire the instant its pairing
-/// returned while the peer's admission bookkeeping trails by a beat —
-/// purely connect-level failures are retried after a short settle pause.
-const TASK_CONNECT_PASSES: usize = 3;
-const TASK_SETTLE_PAUSE: Duration = Duration::from_millis(300);
-const ATTEMPT_PAUSE: Duration = Duration::from_millis(150);
-
-/// Tunables of the send-time simultaneous-probe round (CR-P1-02 改法第 3
-/// 条, mirroring ak-ffi): ONE dual-stack UDP socket fires
-/// `holepunch::probe` packets at every dial candidate every
-/// [`PROBE_DIAL_INTERVAL`] for one [`PROBE_DIAL_WINDOW`] before the
-/// first QUIC dial attempt. The window IS the pre-dial latency budget
-/// (cap ~1-2 s per the fix brief) and runs OUTSIDE the per-attempt
-/// connect budgets and pass counting; see ak-ffi's constant for the full
-/// rationale (the CLI keeps the same values).
-const PROBE_DIAL_INTERVAL: Duration = Duration::from_millis(150);
-const PROBE_DIAL_WINDOW: Duration = Duration::from_secs(1);
-
-/// Connect budget of the FIRST dial attempt when it targets the probe
-/// round's OBSERVED address (CR-P1-02 改法第 3 条, mirroring ak-ffi): an
-/// observation names a route that ANSWERED PROBES, not a socket that
-/// necessarily accepts QUIC — the bounded-risk budget keeps a stale or
-/// echo-only observation from costing the static order's full
-/// [`TASK_CONNECT_BUDGET`]; see ak-ffi's constant for the full rationale.
-const OBSERVED_DIAL_BUDGET: Duration = Duration::from_secs(2);
-
-/// Upper bounds of the endpoint blob's candidate list (the wire bound is
-/// 16 candidates / 512 bytes; the caps keep the blob well under both).
-/// The dial cap truncates from the tail and IPv4 leads the documented
-/// family order, so only a v4-heavy host (5+ interface addresses) can
-/// crowd IPv6 out — the common laptop set fits whole.
-const MAX_DIAL_CANDIDATES: usize = 8;
-const MAX_ECHO_CANDIDATES: usize = 4;
-/// Cap of globally-routable IPv6 interface addresses in the derived
-/// candidate list (CR-P1-02 改法第 1 条): at most one address per distinct
-/// /64 prefix (a NIC's stable + privacy-temporary GUAs collapse to one),
-/// at most this many overall.
-const MAX_V6_IFACE_CANDIDATES: usize = 3;
-
-/// Wire marker of the idle close notification: a disconnecting side with no
-/// live transfer dials the peer's data endpoint and hands it exactly one
-/// Error frame with this text, so the LISTENING peer learns the departure
-/// instead of staying "connected" (wave-29 P2-03 shape).
-const TASK_CLOSE_MESSAGE: &str = "TASK-CLOSE: paired device disconnected";
-const TASK_CLOSE_CONNECT_BUDGET: Duration = Duration::from_secs(3);
-const TASK_CLOSE_TOTAL_BUDGET: Duration = Duration::from_secs(6);
-
-/// Anti-reflection constants of the probe echo responder (wave-29 P2-12):
-/// replies carry the all-zero nonce and are never themselves answered;
-/// each source endpoint gets a bounded reply budget per window.
-const ECHO_REPLY_NONCE: [u8; 16] = [0u8; 16];
-const ECHO_REPLY_BUDGET: u32 = 32;
-const ECHO_REPLY_WINDOW: Duration = Duration::from_secs(1);
-const ECHO_SOURCES_MAX: usize = 1024;
 
 /// Rate bound of the echo responder's "probe observed from …" diagnostic
 /// line (CR-P1-02 改法第 3 条): a genuinely new source is named at most
@@ -163,17 +96,6 @@ const ECHO_OBSERVE_LOG_WINDOW: Duration = Duration::from_secs(5);
 /// when CR-P3-03 (single hostname for the coordination server) lands — a
 /// hard-coded IP cannot survive a server migration.
 const DEFAULT_STUN_ADDR: &str = "122.51.121.24:7101";
-
-/// Total wall-clock budget one STUN server-reflexive query may add to
-/// receiver startup (CR-P1-02 改法第 2 条) — mirrors ak-ffi's
-/// `STUN_QUERY_BUDGET` verbatim (kept as a second copy because the CLI
-/// duplicates the task plane's helpers by design). Chosen against
-/// `ak_signal::stun::query_on`'s INTERNAL schedule — it retransmits on a
-/// 1 s / 2 s / 4 s backoff bounded by the timeout it is handed, so 2 s
-/// buys two transmissions and returns `Timeout` by t=2 s at the latest:
-/// an unreachable server costs at most 2 s, fail-open, a fraction of
-/// [`RECEIVER_BIND_TIMEOUT`].
-const STUN_QUERY_BUDGET: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // clap surface
@@ -777,30 +699,36 @@ impl Session {
 
 impl Session {
     /// Bind the probe echo responder (derived candidates append its port
-    /// last; see `blob_candidates`). Dual-stack first (CR-P1-02 改法第 1
-    /// 条): the responder must answer probes aimed at the advertised IPv6
-    /// candidates too; hosts without a clearable V6ONLY fall back to the
-    /// historical v4 wildcard socket. Since 改法第 3 条 the responder
-    /// also OBSERVES: every genuine probe's source lands in
-    /// [`Session::echo_observed`] (`echo_responder_loop`).
+    /// last; see `blob_candidates`): the shared socket bind + loop live in
+    /// `task_net` (dual-stack first, CR-P1-02 改法第 1 条 — the responder
+    /// must answer probes aimed at the advertised IPv6 candidates too;
+    /// hosts without a clearable V6ONLY fall back to the historical v4
+    /// wildcard socket). Since 改法第 3 条 the responder also OBSERVES:
+    /// every genuine probe's source lands in [`Session::echo_observed`],
+    /// and the CLI-side "probe observed from …" stdout line is injected
+    /// as the loop's observation callback — rate-limited here so spoofed
+    /// source churn cannot flood stdout (the print site stays in the CLI:
+    /// the itests grep these strings).
     fn bind_echo_responder(&mut self) -> Result<SocketAddr> {
-        let std_socket = match ak_net::holepunch::bind_dual_stack_udp(0) {
-            Ok(socket) => socket,
-            Err(_) => {
-                std::net::UdpSocket::bind("0.0.0.0:0").context("cannot bind the probe responder")?
-            }
-        };
-        std_socket
-            .set_nonblocking(true)
-            .context("cannot arm the probe responder")?;
-        let addr = std_socket
-            .local_addr()
-            .context("probe responder bind address")?;
-        let socket = tokio::net::UdpSocket::from_std(std_socket)
-            .context("cannot register the probe responder")?;
+        let (socket, addr) = bind_echo_responder_socket().map_err(anyhow::Error::msg)?;
         let observed = Arc::clone(&self.echo_observed);
+        let mut last_logged: Option<(SocketAddr, Instant)> = None;
         self.echo = Some(tokio::spawn(async move {
-            echo_responder_loop(socket, observed).await;
+            echo_responder_loop(socket, observed, move |source_plain| {
+                let now = Instant::now();
+                let log_it = match last_logged {
+                    Some((logged_at_addr, logged_at)) => {
+                        logged_at_addr != source_plain
+                            && now.duration_since(logged_at) >= ECHO_OBSERVE_LOG_WINDOW
+                    }
+                    None => true,
+                };
+                if log_it {
+                    println!("[task] probe observed from {source_plain}");
+                    last_logged = Some((source_plain, now));
+                }
+            })
+            .await;
         }));
         Ok(addr)
     }
@@ -1017,122 +945,6 @@ struct ReceiverCtx {
     stun: Option<SocketAddr>,
 }
 
-/// The receiver's pre-QUIC bind outcome (CR-P1-02 改法第 2 条) — mirrors
-/// ak-ffi's `ReceiverSocket` verbatim (kept as a second copy because the
-/// CLI duplicates the task plane's helpers by design): the UDP socket
-/// QUIC will adopt, plus the diagnostics of the two optional steps that
-/// ran on it.
-struct ReceiverSocket {
-    /// The bound socket — handed to QUIC unchanged via
-    /// `DirectEndpoint::bind_with_socket`, so any NAT mapping the STUN
-    /// query created stays valid for the QUIC listener.
-    socket: std::net::UdpSocket,
-    /// The STUN server-reflexive address observed ON `socket`, or `None`
-    /// when no server was configured or the query failed (fail-open).
-    reflexive: Option<SocketAddr>,
-    /// Whether `socket` is the dual-stack `[::]` bind (C1, 改法第 1 条).
-    /// Tracked HERE, not read back from the endpoint: adopted-socket
-    /// endpoints report `is_dual_stack() == false` by contract (ak-net
-    /// cannot portably re-query `IPV6_V6ONLY`), while dialing keys off
-    /// the socket family and works either way.
-    dual_stack: bool,
-    /// Bounded reason the dual-stack bind fell back to v4 (C1 pattern).
-    bind_fallback: Option<String>,
-    /// Bounded reason the STUN query failed (`None` on success or when
-    /// no server was configured — `reflexive` distinguishes those).
-    stun_error: Option<String>,
-}
-
-/// Create the receiver's UDP socket and — when a STUN server is
-/// configured — query its server-reflexive address ON THAT SAME SOCKET
-/// before the socket is handed to QUIC (CR-P1-02 改法第 2 条: the mapping
-/// the query opens on the NAT is exactly the mapping the QUIC listener
-/// needs, so the query must not run on a throwaway socket). Mirrors
-/// ak-ffi's `bind_receiver_socket` verbatim; see that copy for the full
-/// lifecycle rationale (dual-stack first with C1's v4 fallback chain,
-/// std→tokio→std hand-off preserving the one OS socket, mapped-form v4
-/// server dial from the v6-family socket, fail-open bounded by
-/// [`STUN_QUERY_BUDGET`]).
-async fn bind_receiver_socket(stun: Option<SocketAddr>) -> Result<ReceiverSocket, String> {
-    // Step 1 — C1's chain: dual-stack first, historical v4 fallback.
-    let (mut socket, dual_stack, bind_fallback) = match ak_net::holepunch::bind_dual_stack_udp(0) {
-        Ok(socket) => (socket, true, None),
-        Err(reason) => (
-            std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
-                .map_err(|error| format!("receiver socket bind failed: {error}"))?,
-            false,
-            Some(reason.to_string()),
-        ),
-    };
-    // Step 2 — the reflexive query on the SAME socket. `query_on` owns
-    // its retransmission schedule; STUN_QUERY_BUDGET bounds the whole
-    // exchange (see the const's rationale). The std socket MOVES into
-    // the tokio wrapper and back via `into_std` — the same OS socket
-    // handle throughout, so the query's send/recv map exactly the socket
-    // QUIC is about to own.
-    let Some(server) = stun else {
-        // Not configured: no query, fail-open.
-        return Ok(ReceiverSocket {
-            socket,
-            reflexive: None,
-            dual_stack,
-            bind_fallback,
-            stun_error: None,
-        });
-    };
-    if server.ip().is_unspecified() {
-        // A configured-but-meaningless server (0.0.0.0): treat as absent.
-        return Ok(ReceiverSocket {
-            socket,
-            reflexive: None,
-            dual_stack,
-            bind_fallback,
-            stun_error: None,
-        });
-    }
-    if let Err(error) = socket.set_nonblocking(true) {
-        // The dual-stack path already armed this; only the v4 fallback
-        // could refuse. Fail-open with the bounded reason.
-        return Ok(ReceiverSocket {
-            socket,
-            reflexive: None,
-            dual_stack,
-            bind_fallback,
-            stun_error: Some(format!("socket not queryable: {error}")),
-        });
-    }
-    let tokio_socket = tokio::net::UdpSocket::from_std(socket)
-        .map_err(|error| format!("receiver socket registration failed: {error}"))?;
-    // The v4 server must ride the mapped form on the v6-family socket
-    // (the ONLY v4 shape an AF_INET6 socket can send to; the reply's
-    // XOR-MAPPED address comes back in plain v4 either way).
-    let server_for_family = match (tokio_socket.local_addr(), server) {
-        (Ok(local), _) if local.is_ipv6() && server.is_ipv4() => {
-            ak_net::classify::to_mapped(server)
-        }
-        _ => server,
-    };
-    let outcome =
-        ak_signal::stun::query_on(&tokio_socket, server_for_family, STUN_QUERY_BUDGET).await;
-    socket = tokio_socket
-        .into_std()
-        .map_err(|error| format!("receiver socket recovery failed: {error}"))?;
-    let (reflexive, stun_error) = match outcome {
-        Ok(reflexive) => (Some(ak_net::classify::expand_mapped(reflexive)), None),
-        // Fail-open: bounded reason only (StunError's vocabulary is
-        // bounded; io errors carry the OS text like C1's fallback_reason
-        // does).
-        Err(error) => (None, Some(error.to_string())),
-    };
-    Ok(ReceiverSocket {
-        socket,
-        reflexive,
-        dual_stack,
-        bind_fallback,
-        stun_error,
-    })
-}
-
 /// The resident receiver loop (wave-29 P1-04/P2-05 semantics, the FFI
 /// shape): one bound port, a loop of connections, fingerprint-bound
 /// admission, per-connection consent, decline keeps listening, done is
@@ -1315,39 +1127,6 @@ async fn run_task_receiver(
                 return;
             }
         }
-    }
-}
-
-/// CR-P3-02 (review 2026-11-11) pre-Accept name preflight, the CLI twin
-/// of the FFI gate in `ak-ffi/src/task.rs`: the readable refusal reason
-/// when this receiver runs on Windows and the offered root name cannot
-/// exist on a Windows filesystem — one of `< > " | ? *`, or an extended
-/// reserved device stem (`CONIN$`, `CONOUT$`, `CLOCK$`, superscript
-/// `COM¹`–`COM³`/`LPT¹`–`LPT³`; the exact spelling list lives in
-/// `ak_core::manifest::windows_incompatible`). `None` on every other
-/// platform — the platform-neutral path rules already ran at decode time
-/// and a Linux→Linux transfer may legitimately carry these names — and
-/// for names Windows accepts.
-///
-/// Honest scope: the Offer's root name is the ONE payload name visible
-/// before the wire Accept. The full manifest arrives only after Accept
-/// inside ak-engine, so per-entry gating of every manifest row is an
-/// engine-side follow-up; this gate refuses the top-level name before
-/// the consent prompt is ever shown.
-fn windows_root_name_refusal(root_name: &str) -> Option<String> {
-    if !cfg!(windows) {
-        return None;
-    }
-    ak_core::manifest::windows_incompatible(root_name)
-        .map(|issue| format!("cannot save {root_name:?} on Windows: {issue}"))
-}
-
-/// Bounded reason word of one failed accept — a fixed vocabulary, never
-/// the raw transport text (hostile peers control parts of it).
-fn handshake_failure_word(error: &ak_net::ConnectError) -> &'static str {
-    match error {
-        ak_net::ConnectError::PeerIdentity(_) => "peer certificate rejected",
-        _ => "handshake transport failure",
     }
 }
 
@@ -1587,322 +1366,10 @@ fn spawn_consent_decider(
     })
 }
 
-/// Errors that only mean "this one datagram is gone", not "the responder
-/// must stop" (the same set ak-net's probe tolerates; its helper is
-/// private). On Windows, SIO_UDP_CONNRESET turns a late ICMP
-/// port-unreachable for one of our REPLIES into ConnectionReset on the
-/// NEXT recv — and a probe socket closes the moment its window ends
-/// (`probe_peer`, 改法第 3 条's `probe_dial_round`), so a reply racing
-/// that close dooms the next recv. Returning there would kill the
-/// responder between the pairing-time probe round and the send-time one
-/// — the send-time round then honestly observes nothing — so the loop
-/// skips these and keeps serving.
-fn responder_error_is_transient(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-    )
-}
-
-/// The echo responder body: answer ak-net hole-punch probe packets from
-/// any advertised address with the all-zero nonce (never answered itself),
-/// under a per-source reply budget per window. Since CR-P1-02 改法第 3
-/// 条 the loop also OBSERVES: every genuine probe's source is remembered
-/// in the shared slot (most recent, plain-family form) for
-/// [`close_notify_peer`], and one bounded stdout line names a NEWLY
-/// observed source at most once per [`ECHO_OBSERVE_LOG_WINDOW`] (the
-/// wording deliberately avoids "advertising"/"connected via" — the
-/// itests grep those).
-async fn echo_responder_loop(
-    socket: tokio::net::UdpSocket,
-    observed: Arc<StdMutex<Option<SocketAddr>>>,
-) {
-    let mut buffer = [0u8; 1500];
-    let mut budgets: HashMap<SocketAddr, (Instant, u32)> = HashMap::new();
-    let mut last_logged: Option<(SocketAddr, Instant)> = None;
-    loop {
-        match socket.recv_from(&mut buffer).await {
-            Ok((len, source)) => {
-                if !ak_net::holepunch::is_probe_packet(&buffer[..len]) {
-                    continue;
-                }
-                // A reply (all-zero nonce) is never answered again — the
-                // loop-killer; a genuine probe's nonce never is all-zero.
-                if buffer[8..len] == ECHO_REPLY_NONCE {
-                    continue;
-                }
-                // 改法第 3 条: remember the OBSERVED source (one bounded
-                // store; a poisoned lock loses the observation, never the
-                // reply) and name a newly observed source within the log
-                // window (bounded against spoofed source churn).
-                let source_plain = ak_net::classify::expand_mapped(source);
-                if let Ok(mut slot) = observed.lock() {
-                    *slot = Some(source_plain);
-                }
-                let now = Instant::now();
-                let log_it = match last_logged {
-                    Some((logged_at_addr, logged_at)) => {
-                        logged_at_addr != source_plain
-                            && now.duration_since(logged_at) >= ECHO_OBSERVE_LOG_WINDOW
-                    }
-                    None => true,
-                };
-                if log_it {
-                    println!("[task] probe observed from {source_plain}");
-                    last_logged = Some((source_plain, now));
-                }
-                let allowed = match budgets.get_mut(&source) {
-                    Some(entry) => {
-                        if now.duration_since(entry.0) >= ECHO_REPLY_WINDOW {
-                            *entry = (now, 1);
-                            true
-                        } else if entry.1 < ECHO_REPLY_BUDGET {
-                            entry.1 += 1;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    None => {
-                        if budgets.len() >= ECHO_SOURCES_MAX {
-                            budgets.clear();
-                        }
-                        budgets.insert(source, (now, 1));
-                        true
-                    }
-                };
-                if allowed {
-                    let _ = socket
-                        .send_to(&ak_net::holepunch::probe_packet(&ECHO_REPLY_NONCE), source)
-                        .await;
-                }
-            }
-            // Transient datagram loss (see responder_error_is_transient)
-            // keeps the responder alive for the NEXT probe round; only a
-            // hard socket error ends the loop.
-            Err(error) if responder_error_is_transient(&error) => continue,
-            Err(_) => return,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Candidates (the ak-ffi shapes, verbatim semantics)
-// ---------------------------------------------------------------------------
-
-/// Every local interface address (v4, then globally-routable v6) with
-/// `bound`'s port, loopbacks last in each family — the ak-ffi shape,
-/// verbatim semantics (selection rule: `filter_and_order_candidates`).
-fn local_candidates(bound: SocketAddr) -> Vec<SocketAddr> {
-    let port = bound.port();
-    let raw = match ak_net::classify::local_nets() {
-        Ok(nets) => nets.into_iter().map(|net| net.addr).collect(),
-        Err(_) => Vec::new(),
-    };
-    filter_and_order_candidates(raw)
-        .into_iter()
-        .map(|ip| SocketAddr::new(ip, port))
-        .collect()
-}
-
-/// Candidate selection over raw interface addresses — pure on purpose (no
-/// NIC reads; tests pin the rule without host dependence). Mirrors
-/// ak-ffi's `filter_and_order_candidates` verbatim (kept as a second copy
-/// because the CLI duplicates the task plane's helpers by design; the
-/// `candidate_helpers_match_the_ffi_shape` test pins the shared shape).
-/// Rule (CR-P1-02 改法第 1 条):
-///
-/// * v4-mapped IPv6 input (`::ffff:a.b.c.d`) normalizes to plain IPv4;
-/// * every plain IPv4 interface address is kept, deduped, input order
-///   preserved — byte-identical to the pre-IPv6 list;
-/// * IPv6 keeps ONLY globally-routable unicast addresses — link-local
-///   `fe80::/10` (needs a scope index the `ip:port` candidate form
-///   cannot carry), ULA `fc00::/7`, multicast and other non-global
-///   ranges are excluded — deduped, at most one per distinct /64 prefix,
-///   capped at [`MAX_V6_IFACE_CANDIDATES`];
-/// * `127.0.0.1` and `::1` are appended when absent;
-/// * family order is v4 first, then v6; the consumer
-///   ([`order_candidates`]) re-sorts LAN-first with this order stable
-///   within each group, so a v4-only peer's dial sequence is unchanged.
-fn filter_and_order_candidates(raw: Vec<std::net::IpAddr>) -> Vec<std::net::IpAddr> {
-    use std::net::IpAddr;
-    let mut v4: Vec<IpAddr> = Vec::with_capacity(raw.len());
-    let mut v6: Vec<IpAddr> = Vec::new();
-    let mut v6_prefixes: Vec<u64> = Vec::new();
-    for addr in raw {
-        let addr = match addr {
-            IpAddr::V6(v6_addr) => match v6_addr.to_ipv4_mapped() {
-                Some(v4_addr) => IpAddr::V4(v4_addr),
-                None => {
-                    let prefix = (u128::from(v6_addr) >> 64) as u64;
-                    if is_global_unicast_v6(v6_addr)
-                        && v6.len() < MAX_V6_IFACE_CANDIDATES
-                        && !v6_prefixes.contains(&prefix)
-                    {
-                        v6_prefixes.push(prefix);
-                        v6.push(IpAddr::V6(v6_addr));
-                    }
-                    continue;
-                }
-            },
-            v4_addr => v4_addr,
-        };
-        if !v4.contains(&addr) {
-            v4.push(addr);
-        }
-    }
-    let v4_loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    if !v4.contains(&v4_loopback) {
-        v4.push(v4_loopback);
-    }
-    let v6_loopback = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
-    if !v6.contains(&v6_loopback) {
-        v6.push(v6_loopback);
-    }
-    v4.extend(v6);
-    v4
-}
-
-/// Globally-routable IPv6 unicast (IANA 2000::/3 minus the documentation
-/// `2001:db8::/32` and benchmarking `2001:2::/48` sub-ranges) — the
-/// stable-toolchain equivalent of std's unstable `Ipv6Addr::
-/// `is_unicast_global`, mirroring ak-ffi's copy verbatim.
-fn is_global_unicast_v6(addr: std::net::Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    let global_block = (segments[0] & 0xe000) == 0x2000;
-    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
-    let benchmarking = segments[0] == 0x2001 && segments[1] == 0x0002;
-    global_block && !documentation && !benchmarking
-}
-
-/// Insert the STUN server-reflexive candidate (CR-P1-02 改法第 2 条) into
-/// a DERIVED candidate list — pure on purpose (tests pin the rule without
-/// any socket). Mirrors ak-ffi's `insert_reflexive_candidate` verbatim
-/// (the `candidate_helpers_match_the_ffi_shape` test pins the shared
-/// shape). Rules:
-///
-/// * `None` (no `--stun` resolved, or the caller-supplied list is
-///   explicit/verbatim) returns the list unchanged;
-/// * a v4-mapped reflexive address normalizes to plain IPv4; an
-///   unspecified address (`0.0.0.0`/`::`, a broken server's reflection)
-///   is dropped — the probe would skip it as undialable anyway;
-/// * a reflexive address that EQUALS an existing candidate means the host
-///   is not behind a mapping NAT for this socket — the duplicate is
-///   skipped, nothing new is dialable;
-/// * otherwise the reflexive address is inserted right after the v4
-///   INTERFACE block and before the loopback tail (the slot
-///   `filter_and_order_candidates` reserves between them). The reflexive
-///   address is public — HIGHER reachability across NATs than private LAN
-///   addresses, but the consumer ([`order_candidates`]) re-sorts
-///   LAN-first, so same-subnet matches still dial first; within the
-///   non-LAN group the v4 reflexive leads the interface-IPv6 block.
-fn insert_reflexive_candidate(
-    candidates: Vec<SocketAddr>,
-    reflexive: Option<SocketAddr>,
-) -> Vec<SocketAddr> {
-    let Some(reflexive) = reflexive else {
-        return candidates;
-    };
-    let reflexive = ak_net::classify::expand_mapped(reflexive);
-    if reflexive.ip().is_unspecified() {
-        return candidates;
-    }
-    if candidates
-        .iter()
-        .any(|addr| ak_net::classify::expand_mapped(*addr) == reflexive)
-    {
-        return candidates;
-    }
-    let mut out = candidates;
-    // The insertion slot: after the last plain-v4 interface address, i.e.
-    // just before the first loopback/v6 entry of the derived order.
-    let slot = out
-        .iter()
-        .position(|addr| match ak_net::classify::expand_mapped(*addr).ip() {
-            std::net::IpAddr::V4(v4) => v4.is_loopback(),
-            std::net::IpAddr::V6(_) => true,
-        })
-        .unwrap_or(out.len());
-    out.insert(slot, reflexive);
-    out
-}
-
-/// LAN preference (RFC1918 private IPv4, loopback v6): a routing hint,
-/// never an authorization.
-fn prefers_lan(addr: &SocketAddr) -> bool {
-    match addr.ip() {
-        std::net::IpAddr::V4(v4) => ak_net::classify::is_ipv4_private(v4),
-        std::net::IpAddr::V6(v6) => v6.is_loopback(),
-    }
-}
-
-/// Dedupe (normalizing v4-mapped IPv6), then stable-sort LAN-first.
-fn order_candidates(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let mut ordered: Vec<SocketAddr> = Vec::with_capacity(targets.len());
-    for addr in targets {
-        let addr = ak_net::classify::expand_mapped(addr);
-        if !ordered.contains(&addr) {
-            ordered.push(addr);
-        }
-    }
-    ordered.sort_by_key(|addr| !prefers_lan(addr));
-    ordered
-}
-
-/// Which observed address leads the dial order after one simultaneous
-/// probe round (CR-P1-02 改法第 3 条, mirroring ak-ffi) — pure on purpose
-/// (tests pin the rule without any socket). Rules, in order:
-///
-/// 1. The FIRST candidate of the static LAN-first order that the round
-///    saw answering (`report.reachable`): the route to that candidate is
-///    confirmed bidirectional and the local NAT mapping toward it is hot
-///    — the "dial the observed reply source first" leg. Reachable
-///    entries outside the static list are ignored here (they name the
-///    peer's ephemeral probe socket, not an advertised endpoint) and
-///    fall through to rule 2 verbatim.
-/// 2. The raw first source a PEER PROBE was observed from
-///    (`report.peer_observed_from` — on the pairing overlap this is the
-///    peer's own probe round arriving from an address the candidate list
-///    never named, e.g. its NAT mapping), normalized from `::ffff:`
-///    mapped form; an unspecified observation (a broken reflection) is
-///    dropped.
-///
-/// `None` when the round observed nothing — the dial loop keeps the
-/// static order exactly as before (strictly additive fallback).
-fn observed_dial_head(
-    ordered: &[SocketAddr],
-    report: &ak_net::holepunch::PunchReport,
-) -> Option<SocketAddr> {
-    if let Some(hit) = ordered
-        .iter()
-        .find(|candidate| report.reachable.contains(candidate))
-    {
-        return Some(*hit);
-    }
-    report
-        .peer_observed_from
-        .map(ak_net::classify::expand_mapped)
-        .filter(|addr| !addr.ip().is_unspecified())
-}
-
-/// Prepend one observed address to a dial order, deduped — the shared
-/// merge of the sender's probe-informed dialing (`drive_task_send`) and
-/// the receiver side's observed-source close notify
-/// (`close_notify_peer`): the observation leads, every static entry
-/// survives in its existing order, `None` changes nothing.
-fn observed_first_order(ordered: Vec<SocketAddr>, observed: Option<SocketAddr>) -> Vec<SocketAddr> {
-    let Some(observed) = observed else {
-        return ordered;
-    };
-    let observed = ak_net::classify::expand_mapped(observed);
-    let mut out = Vec::with_capacity(ordered.len() + 1);
-    out.push(observed);
-    out.extend(ordered.into_iter().filter(|addr| *addr != observed));
-    out
-}
+// CR-P2-11: candidate enumeration/ordering, reflexive insertion and
+// the observed-dial-order helpers (local_candidates, filter_and_order_,
+// insert_reflexive_, order_candidates, observed_dial_head,
+// observed_first_order) moved to ak-session `pairing::task_net`.
 
 /// Assemble the endpoint-blob candidate list: the dial candidates (the
 /// receiver's real port first), then the probe echo port, deduped, capped,
@@ -1945,77 +1412,20 @@ fn with_advertised(
     out
 }
 
-fn blob_candidates(dial: Vec<SocketAddr>, echo: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let mut out: Vec<SocketAddr> = Vec::with_capacity(dial.len() + echo.len());
-    for addr in dial.into_iter().take(MAX_DIAL_CANDIDATES) {
-        let addr = ak_net::classify::expand_mapped(addr);
-        if !out.contains(&addr) {
-            out.push(addr);
-        }
-    }
-    for addr in echo.into_iter().take(MAX_ECHO_CANDIDATES) {
-        let addr = ak_net::classify::expand_mapped(addr);
-        if !out.contains(&addr) {
-            out.push(addr);
-        }
-    }
-    if out.len() > ak_session::pairing::ENDPOINT_BLOB_MAX_CANDIDATES {
-        out.truncate(ak_session::pairing::ENDPOINT_BLOB_MAX_CANDIDATES);
-    }
-    while out.len() > 1 {
-        let endpoint = PeerEndpoint {
-            candidates: out.clone(),
-            name: String::new(),
-            direction: TaskDirection::Send,
-        };
-        if ak_session::pairing::encode_endpoint_blob(&endpoint).is_ok() {
-            break;
-        }
-        out.pop();
-    }
-    out
-}
-
 /// Map an ak-session task-pairing failure onto bounded CLI error strings
 /// (the registry never reveals whether a code exists — unknown, expired
-/// and revoked all answer PAIR_UNAVAILABLE).
+/// and revoked all answer PAIR_UNAVAILABLE) — the anyhow adapter over the
+/// shared `task_net::task_error_message` vocabulary (CR-P2-11; the
+/// underlying `TaskError` rides the chain so `--debug` printing keeps the
+/// full cause).
 fn task_error_message(error: TaskError) -> anyhow::Error {
-    let text = match &error {
-        TaskError::Flow(PairFlowError::Rejected { code })
-            if *code == ak_signal::protocol_v2::message::REDEEM_EXHAUSTED =>
-        {
-            "the task code was already joined (one code pairs exactly once)".to_string()
-        }
-        TaskError::Flow(PairFlowError::Unavailable { .. }) => {
-            "unknown task code (or expired, revoked, owner offline)".to_string()
-        }
-        TaskError::Flow(PairFlowError::BadCode(cause)) => {
-            format!("task code rejected: {cause}")
-        }
-        other => format!("registry task pairing failed: {other}"),
-    };
+    let text = ak_session::pairing::task_net::task_error_message(&error);
     anyhow::Error::new(error).context(text)
 }
 
 // ---------------------------------------------------------------------------
 // Probing
 // ---------------------------------------------------------------------------
-
-/// One probe round with exactly one retry after a short stagger (the
-/// peer's own probe may start a beat later on the slow path).
-async fn probe_with_retry(pairing: &TaskPairing, peer: &PeerEndpoint) -> ProbeOutcome {
-    let first = pairing.probe_peer(peer).await;
-    if matches!(first, ProbeOutcome::Success { .. }) {
-        return first;
-    }
-    tokio::time::sleep(TASK_PROBE_RETRY_PAUSE).await;
-    let second = pairing.probe_peer(peer).await;
-    if matches!(second, ProbeOutcome::Success { .. }) {
-        second
-    } else {
-        first
-    }
-}
 
 /// Run the honest reachability probe and print its verdict (an all-failed
 /// probe does not abort: it proves UDP liveness, not QUIC dialability).
@@ -2064,96 +1474,6 @@ enum Attempt {
     ConnectFailed(String),
 }
 
-/// The send-time simultaneous-probe round's outcome for the dial loop
-/// (CR-P1-02 改法第 3 条, mirroring ak-ffi): the dial order with the
-/// observed head leading, plus the one bounded stdout line that says
-/// what the round saw (the itests key off "connected via" and
-/// "advertising" — this line deliberately carries neither).
-struct ProbeDialOrder {
-    /// The full dial order: the observed head (when any) first, then the
-    /// static LAN-first order, deduped ([`observed_first_order`]).
-    order: Vec<SocketAddr>,
-    /// The observed address leading `order` (always its first entry when
-    /// present) — dialed under [`OBSERVED_DIAL_BUDGET`] instead of
-    /// [`TASK_CONNECT_BUDGET`] (see the constant's rationale).
-    head: Option<SocketAddr>,
-}
-
-/// One simultaneous-probe round (CR-P1-02 改法第 3 条, mirroring ak-ffi)
-/// at the START of the sender's connect phase: ONE dual-stack UDP socket
-/// (`bind_dual_stack_udp`, v4 wildcard fallback for hosts without a
-/// clearable V6ONLY) fires `holepunch::probe` packets at EVERY dial
-/// candidate for [`PROBE_DIAL_WINDOW`]. The paired receiver's echo
-/// responder answers on its bound socket (its reply IS a probe packet,
-/// so the round observes the answering candidate), and a peer probe
-/// round still overlapping from the pairing lands here as an observed
-/// source the candidate list never named. The dial plan then puts the
-/// observed address first ([`observed_dial_head`]); the socket itself is
-/// dropped afterwards — the engine's `SendSpec` cannot adopt a
-/// pre-bound socket (the recorded ak-net/ak-engine API wish), so the
-/// probe socket's NAT mapping does NOT carry into the QUIC dial and the
-/// observed-first leg buys its reachability proof, not port reuse.
-///
-/// Strictly additive and fail-open: a bind or probe error (and an empty
-/// observation) returns the static order untouched — never worse than
-/// the pre-C3 dialing.
-async fn probe_dial_round(ordered: Vec<SocketAddr>) -> ProbeDialOrder {
-    let probe_count = ordered.len();
-    let std_socket = match ak_net::holepunch::bind_dual_stack_udp(0) {
-        Ok(socket) => socket,
-        Err(_) => match std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))) {
-            Ok(socket) => socket,
-            Err(_) => {
-                return ProbeDialOrder {
-                    order: ordered,
-                    head: None,
-                }
-            }
-        },
-    };
-    if std_socket.set_nonblocking(true).is_err() {
-        return ProbeDialOrder {
-            order: ordered,
-            head: None,
-        };
-    }
-    let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) else {
-        return ProbeDialOrder {
-            order: ordered,
-            head: None,
-        };
-    };
-    let report =
-        match ak_net::holepunch::probe(&socket, &ordered, PROBE_DIAL_INTERVAL, PROBE_DIAL_WINDOW)
-            .await
-        {
-            Ok(report) => report,
-            Err(_) => {
-                return ProbeDialOrder {
-                    order: ordered,
-                    head: None,
-                }
-            }
-        };
-    let head = observed_dial_head(&ordered, &report);
-    // One bounded line saying what the round saw (deliberately avoids
-    // the words "advertising" and "connected via" — the itests grep
-    // those for the candidate list and the transfer verdict).
-    match head {
-        Some(head) => println!(
-            "[task] probe round observed {head} ({} of {probe_count} candidate(s) answered, {} peer probe packet(s) in); dialing the observed address first",
-            report.reachable.len(),
-            report.packets_received,
-        ),
-        None => println!(
-            "[task] probe round observed nothing ({probe_count} candidate(s) probed in {} ms); dialing the advertised order",
-            report.elapsed.as_millis(),
-        ),
-    }
-    let order = observed_first_order(ordered, head);
-    ProbeDialOrder { order, head }
-}
-
 /// One task send: iterate the peer's candidates LAN-first under the split
 /// connect budget; a post-connect failure fails the send (another address
 /// cannot fix it); a DECLINED answer is surfaced verbatim; purely
@@ -2175,9 +1495,24 @@ async fn drive_task_send(
     if static_order.is_empty() {
         bail!("the paired peer advertised no dial candidates");
     }
-    // 改法第 3 条: probe round first (≤ PROBE_DIAL_WINDOW before the
-    // first dial attempt), observed address leads when any.
-    let dial = probe_dial_round(static_order).await;
+    // 改法第 3 条: probe round first (≤ the shared PROBE_DIAL_WINDOW
+    // before the first dial attempt), observed address leads when any.
+    // The CLI-side stdout line rides the shared round's observation
+    // callback (deliberately avoids the words "advertising" and
+    // "connected via" — the itests grep those for the candidate list and
+    // the transfer verdict).
+    let dial = probe_dial_round(static_order, |head, report, probe_count| match head {
+        Some(head) => println!(
+            "[task] probe round observed {head} ({} of {probe_count} candidate(s) answered, {} peer probe packet(s) in); dialing the observed address first",
+            report.reachable.len(),
+            report.packets_received,
+        ),
+        None => println!(
+            "[task] probe round observed nothing ({probe_count} candidate(s) probed in {} ms); dialing the advertised order",
+            report.elapsed.as_millis(),
+        ),
+    })
+    .await;
     let printer = crate::progress_printer("send");
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
@@ -2287,7 +1622,7 @@ async fn attempt_send(
             ))
         }
     };
-    let after_connect = marks.connected.load(Ordering::Relaxed);
+    let after_connect = marks.connected();
     match result {
         Ok(report) => Attempt::Done(report),
         Err(error) => {
@@ -2301,84 +1636,11 @@ async fn attempt_send(
             if after_connect {
                 Attempt::FailedAfterConnect {
                     peer_gone: matches!(error, EngineError::PeerClosed),
-                    nothing_offered: !marks.offered.load(Ordering::Relaxed),
+                    nothing_offered: !marks.offered(),
                     reason,
                 }
             } else {
                 Attempt::ConnectFailed(reason)
-            }
-        }
-    }
-}
-
-/// Connect-phase bookkeeping: the engine invokes its progress callback
-/// synchronously inside the polled future, so the marks carry no race.
-struct ConnectMarks {
-    connecting_at: StdMutex<Option<tokio::time::Instant>>,
-    connecting: tokio::sync::Notify,
-    connected: AtomicBool,
-    /// Whether the Offer ever went out (the retryable-close test of
-    /// [`Attempt::FailedAfterConnect`]).
-    offered: AtomicBool,
-}
-
-impl ConnectMarks {
-    fn new() -> Self {
-        Self {
-            connecting_at: StdMutex::new(None),
-            connecting: tokio::sync::Notify::new(),
-            connected: AtomicBool::new(false),
-            offered: AtomicBool::new(false),
-        }
-    }
-
-    fn mark(&self, progress: &Progress) {
-        match progress {
-            Progress::Connecting => {
-                if let Ok(mut slot) = self.connecting_at.lock() {
-                    *slot = Some(tokio::time::Instant::now());
-                }
-                self.connecting.notify_one();
-            }
-            Progress::Connected { .. } => {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-            Progress::Offered { .. } | Progress::Accepted { .. } => {
-                self.offered.store(true, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The split-budget driver: unbudgeted preparation, budgeted
-/// bind/connect/handshake from the engine's own `Connecting` report,
-/// unbudgeted transfer once connected.
-async fn drive_with_connect_budget<S>(
-    marks: &ConnectMarks,
-    mut send: std::pin::Pin<&mut S>,
-    budget: Duration,
-) -> Result<<S as Future>::Output, ()>
-where
-    S: Future + ?Sized,
-{
-    let connect_started = tokio::select! {
-        _ = marks.connecting.notified() => {
-            marks
-                .connecting_at
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .expect("Connecting instant is recorded before notify")
-        }
-        done = send.as_mut() => return Ok(done),
-    };
-    match tokio::time::timeout_at(connect_started + budget, send.as_mut()).await {
-        Ok(done) => Ok(done),
-        Err(_deadline_elapsed) => {
-            if marks.connected.load(Ordering::Relaxed) {
-                Ok(send.await)
-            } else {
-                Err(())
             }
         }
     }
@@ -2391,61 +1653,12 @@ where
 /// Dial the paired peer's advertised data candidates (LAN-first,
 /// family-matched, TLS pinned to the pairing's verified fingerprint) and
 /// deliver exactly one TASK-CLOSE Error frame, so a LISTENING peer learns
-/// the departure instead of staying "connected". Best effort and bounded:
-/// an unreachable peer is an honest miss.
-///
-/// CR-P1-02 改法第 3 条, the RECEIVER side's consumption of its observed
-/// probe sources: `observed` is the most recent address this session's
-/// echo responder OBSERVED a peer probe from (the raw hole-punch
-/// observation — a NAT-mapped source the advertised list never named),
-/// and it leads the dial order here: this close-notify dial is the
-/// receiver's one outbound role, and the observed source is exactly the
-/// address an idle close behind a NAT should try first. Best effort, so
-/// a stale observation costs one bounded failed attempt before the
-/// static list, nothing more.
+/// the departure instead of staying "connected" — the CLI adapter over
+/// the shared `task_net::deliver_close_notify` core (best effort and
+/// bounded; CR-P1-02 改法第 3 条's observed-source lead is decided inside
+/// the core — see its docs).
 async fn close_notify_peer(key: &DeviceKeyPair, link: &TaskLink, observed: Option<SocketAddr>) {
-    let identity = make_self_signed(key);
-    let candidates = order_candidates(link.peer.candidates.clone());
-    let candidates = observed_first_order(
-        candidates,
-        observed.filter(|addr| !addr.ip().is_unspecified()),
-    );
-    let mut remaining = TASK_CLOSE_TOTAL_BUDGET;
-    for addr in candidates {
-        if remaining.is_zero() {
-            return;
-        }
-        let bind = if addr.is_ipv6() {
-            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        };
-        let Ok(endpoint) = ak_net::DirectEndpoint::bind(bind, &identity).await else {
-            return;
-        };
-        let dial = tokio::time::timeout(
-            TASK_CLOSE_CONNECT_BUDGET.min(remaining),
-            endpoint.connect(addr, &link.peer_fp),
-        )
-        .await;
-        remaining = remaining.saturating_sub(TASK_CLOSE_CONNECT_BUDGET);
-        let Ok(Ok(channel)) = dial else {
-            continue; // candidate down: try the next
-        };
-        if let Ok(mut stream) = channel.open_bi().await {
-            let frame = Frame {
-                version: ak_wire::VERSION,
-                message: Message::Error {
-                    code: ak_core::error::ErrorCode::Cancelled,
-                    message: TASK_CLOSE_MESSAGE.to_string(),
-                },
-            };
-            let _ = stream.send_frame(&frame).await;
-            let _ = stream.finish_send();
-        }
-        channel.close(0, b"task closed");
-        return; // one delivered notification is enough
-    }
+    deliver_close_notify(key, link.peer.candidates.clone(), link.peer_fp, observed).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2626,7 +1839,7 @@ pub(crate) async fn run_code_send(
         // the echo port appended last is the genuinely reachable one.
         let dial = local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)));
         let blob = with_advertised(
-            blob_candidates(dial, local_candidates(echo_addr)),
+            blob_candidates(dial, Vec::new(), local_candidates(echo_addr), ""),
             &cfg.advertise,
             echo_addr.port(),
         );
@@ -2704,7 +1917,9 @@ pub(crate) async fn run_code_recv(cfg: TaskRunConfig, mut hooks: TaskHooks) -> R
         let blob = with_advertised(
             blob_candidates(
                 insert_reflexive_candidate(local_candidates(bound), reflexive),
+                Vec::new(),
                 local_candidates(echo_addr),
+                "",
             ),
             &cfg.advertise,
             bound.port(),
@@ -2764,7 +1979,7 @@ pub(crate) async fn run_join_send(
         let echo_addr = session.bind_echo_responder()?;
         let dial = local_candidates(SocketAddr::from(([0, 0, 0, 0], 0)));
         let blob = with_advertised(
-            blob_candidates(dial, local_candidates(echo_addr)),
+            blob_candidates(dial, Vec::new(), local_candidates(echo_addr), ""),
             &cfg.advertise,
             echo_addr.port(),
         );
@@ -2816,7 +2031,9 @@ pub(crate) async fn run_join_recv(
         let blob = with_advertised(
             blob_candidates(
                 insert_reflexive_candidate(local_candidates(bound), reflexive),
+                Vec::new(),
                 local_candidates(echo_addr),
+                "",
             ),
             &cfg.advertise,
             bound.port(),
@@ -3326,122 +2543,14 @@ mod tests {
         assert!(resolve_ttl(Some(2_592_001)).is_err());
     }
 
-    /// CR-P3-02: the consent-time preflight is a verdict only on Windows —
-    /// the CLI twin of ak-ffi's gate; the platform-neutral rules stay the
-    /// only gate elsewhere (Linux→Linux transfers may carry these names).
-    #[test]
-    fn windows_root_name_preflight_follows_the_local_platform() {
-        if cfg!(windows) {
-            for (bad, expected_char) in [("a?b.bin", '?'), ("star*name", '*')] {
-                let reason = windows_root_name_refusal(bad)
-                    .unwrap_or_else(|| panic!("must refuse {bad:?} on Windows"));
-                assert!(
-                    reason.contains(bad) && reason.contains(expected_char),
-                    "reason must name the offender and the character: {reason}"
-                );
-            }
-            for reserved in ["CONIN$.txt", "clock$", "com\u{b9}.dat", "LPT\u{b3}"] {
-                assert!(
-                    windows_root_name_refusal(reserved).is_some(),
-                    "must refuse the extended reserved stem {reserved:?}"
-                );
-            }
-            for ok in ["plain.bin", "multi", "设备照片.jpg"] {
-                assert_eq!(
-                    windows_root_name_refusal(ok),
-                    None,
-                    "must keep prompting the user for {ok:?}"
-                );
-            }
-        } else {
-            for linux_legal in ["a?b.bin", "CONIN$.txt", "clock$", "com\u{b9}.dat"] {
-                assert_eq!(windows_root_name_refusal(linux_legal), None);
-            }
-        }
-    }
-
-    // ---- candidate enumeration (CR-P1-02 改法第 1 条, ak-ffi shape) -----
-
-    fn ips(texts: &[&str]) -> Vec<std::net::IpAddr> {
-        texts
-            .iter()
-            .map(|text| text.parse().expect("test address"))
-            .collect()
-    }
-
-    /// Same rule as ak-ffi's `filter_and_order_candidates`: v4 interface
-    /// addresses first (input order, deduped), 127.0.0.1, then global-
-    /// unicast v6, then ::1; fe80::/10, ULA, documentation and multicast
-    /// ranges drop out; v4-mapped input normalizes into the v4 group.
-    #[test]
-    fn candidate_selection_keeps_both_families_in_documented_order() {
-        let raw = ips(&[
-            "2606:4700:4000::a",  // global v6, first interface
-            "fe80::1",            // link-local: excluded
-            "192.168.1.5",        // v4 interface
-            "2606:4700:4000::b",  // same /64: collapsed away
-            "::ffff:192.168.1.5", // v4-mapped: dedups with the v4
-            "10.0.0.7",           // second v4 interface
-            "2a00:1450:4001::81", // global v6, second prefix
-            "::1",                // raw loopback: appended at tail
-            "2001:db8::1",        // documentation range: excluded
-            "fd00::42",           // ULA: excluded (not global)
-            "ff02::1",            // multicast: excluded
-        ]);
-        assert_eq!(
-            filter_and_order_candidates(raw),
-            ips(&[
-                "192.168.1.5",
-                "10.0.0.7",
-                "127.0.0.1",
-                "2606:4700:4000::a",
-                "2a00:1450:4001::81",
-                "::1",
-            ])
-        );
-    }
-
-    /// One v6 candidate per /64 prefix and at most
-    /// [`MAX_V6_IFACE_CANDIDATES`] overall (GUA-heavy hosts cannot crowd
-    /// the v4 candidates or the 512-byte wire bound).
-    #[test]
-    fn candidate_selection_collapses_per_prefix_and_caps_global_v6() {
-        let raw = ips(&[
-            "2606:4700:4000::a",
-            "2606:4700:4000::dead:beef", // same /64 as above
-            "2a00:1450:4001::81",
-            "2408:847a:11:2200::1",
-            "2600:1f16:1a1:100::2",
-            "2a01:4f8:1c17:77::3",
-        ]);
-        assert_eq!(
-            filter_and_order_candidates(raw),
-            ips(&[
-                "127.0.0.1",
-                "2606:4700:4000::a",
-                "2a00:1450:4001::81",
-                "2408:847a:11:2200::1",
-                "::1",
-            ])
-        );
-    }
-
-    /// No interfaces at all: both loopbacks survive (a same-host join
-    /// keeps a working candidate of each family).
-    #[test]
-    fn candidate_selection_with_no_interfaces_keeps_both_loopbacks() {
-        assert_eq!(
-            filter_and_order_candidates(Vec::new()),
-            ips(&["127.0.0.1", "::1"])
-        );
-    }
-
     /// `--advertise` entries lead the blob, and a v6-heavy mix still fits
     /// the 512-byte wire bound after the shrink loop (the loop pops the
     /// tail: the advertised head survives, the least-significant derived
-    /// entry gives way).
+    /// entry gives way). Pins the CLI-only `with_advertised` seam over
+    /// the shared `task_net` blob helpers.
     #[test]
     fn advertised_blobs_shrink_to_the_wire_bound() {
+        use ak_session::pairing::task_net::MAX_DIAL_CANDIDATES;
         // A dial list that alone fits the bound: eight full-length global
         // v6 candidates (~49 bytes each encoded).
         let dial: Vec<SocketAddr> = (1..=8u16)
@@ -3469,7 +2578,11 @@ mod tests {
                 ]))
             })
             .collect();
-        let out = with_advertised(blob_candidates(dial, Vec::new()), &advertise, 41_000);
+        let out = with_advertised(
+            blob_candidates(dial, Vec::new(), Vec::new(), ""),
+            &advertise,
+            41_000,
+        );
         assert!(
             out.len() > 1 && out.len() < 16,
             "the shrink kept a bounded tail: {out:?}"
@@ -3485,219 +2598,6 @@ mod tests {
             direction: TaskDirection::Send,
         };
         assert!(ak_session::pairing::encode_endpoint_blob(&endpoint).is_ok());
-    }
-
-    #[test]
-    fn candidate_helpers_match_the_ffi_shape() {
-        // LAN-first ordering with dedupe and v4-mapped normalization.
-        let ordered = order_candidates(vec![
-            "8.8.8.8:1".parse().unwrap(),
-            "[::ffff:192.168.1.5]:2".parse().unwrap(),
-            "192.168.1.5:2".parse().unwrap(),
-            "127.0.0.1:3".parse().unwrap(),
-        ]);
-        assert_eq!(
-            ordered,
-            vec![
-                "192.168.1.5:2".parse::<SocketAddr>().unwrap(),
-                "127.0.0.1:3".parse().unwrap(),
-                "8.8.8.8:1".parse().unwrap(),
-            ]
-        );
-        // The blob caps dial candidates at 8 and echo candidates at 4.
-        let dial: Vec<SocketAddr> = (1..=12)
-            .map(|i| SocketAddr::from(([192, 168, 0, i], 7000)))
-            .collect();
-        let blob = blob_candidates(dial, Vec::new());
-        assert_eq!(blob.len(), MAX_DIAL_CANDIDATES);
-        // Local candidates always include loopback and carry the port.
-        let locals = local_candidates("0.0.0.0:7100".parse().unwrap());
-        assert!(locals.contains(&"127.0.0.1:7100".parse().unwrap()));
-        assert!(locals.iter().all(|addr| addr.port() == 7100));
-    }
-
-    // -- reflexive-candidate insertion (CR-P1-02 改法第 2 条; the same
-    // battery as ak-ffi's task_tests pins the shared shape) ---------------
-
-    fn addrs(texts: &[&str]) -> Vec<SocketAddr> {
-        texts
-            .iter()
-            .map(|text| text.parse().expect("test address"))
-            .collect()
-    }
-
-    #[test]
-    fn reflexive_candidate_inserts_after_the_v4_interface_block() {
-        let derived = addrs(&[
-            "192.168.1.5:7000",
-            "10.0.0.7:7000",
-            "127.0.0.1:7000",
-            "[2606:4700:4000::a]:7000",
-            "[::1]:7000",
-        ]);
-        assert_eq!(
-            insert_reflexive_candidate(derived.clone(), Some("203.0.113.7:7000".parse().unwrap())),
-            addrs(&[
-                "192.168.1.5:7000",
-                "10.0.0.7:7000",
-                "203.0.113.7:7000",
-                "127.0.0.1:7000",
-                "[2606:4700:4000::a]:7000",
-                "[::1]:7000",
-            ])
-        );
-        assert_eq!(insert_reflexive_candidate(derived.clone(), None), derived);
-        // No v4 interface at all: the reflexive address still takes the
-        // reserved slot (ahead of the loopback tail; the consumer's
-        // LAN-first re-sort keeps loopback first at dial time).
-        assert_eq!(
-            insert_reflexive_candidate(
-                addrs(&["127.0.0.1:7000", "[::1]:7000"]),
-                Some("203.0.113.7:7000".parse().unwrap())
-            ),
-            addrs(&["203.0.113.7:7000", "127.0.0.1:7000", "[::1]:7000"])
-        );
-    }
-
-    #[test]
-    fn reflexive_candidate_dedups_against_existing_entries() {
-        let derived = addrs(&["192.168.1.5:7000", "127.0.0.1:7000", "[::1]:7000"]);
-        // The reflected loopback (same socket, same port): nothing new.
-        assert_eq!(
-            insert_reflexive_candidate(derived.clone(), Some("127.0.0.1:7000".parse().unwrap())),
-            derived
-        );
-        // The public IP already sits on an interface (1:1 NAT / cloud VM):
-        // nothing new.
-        assert_eq!(
-            insert_reflexive_candidate(derived.clone(), Some("192.168.1.5:7000".parse().unwrap())),
-            derived
-        );
-        // v4-mapped reflexive form normalizes before dedup and insertion.
-        assert_eq!(
-            insert_reflexive_candidate(derived, Some("[::ffff:203.0.113.7]:7000".parse().unwrap())),
-            addrs(&[
-                "192.168.1.5:7000",
-                "203.0.113.7:7000",
-                "127.0.0.1:7000",
-                "[::1]:7000",
-            ])
-        );
-    }
-
-    #[test]
-    fn reflexive_candidate_drops_unspecified_reflections() {
-        let derived = addrs(&["192.168.1.5:7000", "127.0.0.1:7000"]);
-        assert_eq!(
-            insert_reflexive_candidate(derived.clone(), Some("0.0.0.0:7000".parse().unwrap())),
-            derived
-        );
-        assert_eq!(
-            insert_reflexive_candidate(derived, Some("[::]:7000".parse().unwrap())),
-            addrs(&["192.168.1.5:7000", "127.0.0.1:7000"])
-        );
-    }
-
-    // -- observed-address dial order (CR-P1-02 改法第 3 条, the ak-ffi
-    // shape verbatim: both entry points keep the same rule) -------------
-
-    fn punch_report(
-        reachable: &[&str],
-        peer_observed_from: Option<&str>,
-    ) -> ak_net::holepunch::PunchReport {
-        ak_net::holepunch::PunchReport {
-            reachable: addrs(reachable),
-            peer_observed_from: peer_observed_from.map(|text| text.parse().expect("observed")),
-            packets_sent: 0,
-            packets_received: 0,
-            elapsed: Duration::ZERO,
-        }
-    }
-
-    /// Rule (i): the observed head is the FIRST candidate of the static
-    /// LAN-first order that answered the probe — arrival order in the
-    /// report does not reorder the dial.
-    #[test]
-    fn observed_head_is_the_first_static_candidate_that_answered() {
-        let ordered = addrs(&[
-            "192.168.1.5:7000",
-            "203.0.113.7:7000",
-            "127.0.0.1:7000",
-            "[::1]:7000",
-        ]);
-        // The later static candidate answered FIRST (arrival order) — the
-        // head is still the earlier static entry that also answered.
-        assert_eq!(
-            observed_dial_head(
-                &ordered,
-                &punch_report(&["127.0.0.1:7000", "203.0.113.7:7000"], None)
-            ),
-            Some("203.0.113.7:7000".parse().unwrap())
-        );
-        // Reachable entries outside the static list (the peer's ephemeral
-        // probe socket) never become the head by rule (i).
-        assert_eq!(
-            observed_dial_head(&ordered, &punch_report(&["198.51.100.9:40123"], None)),
-            None
-        );
-    }
-
-    /// Rule (ii): with no reachable candidate, the raw first peer-probe
-    /// source leads — normalized from `::ffff:` mapped form (how a v4
-    /// peer appears on the dual-stack probe socket); an unspecified
-    /// observation is dropped (nothing observed).
-    #[test]
-    fn observed_head_falls_back_to_the_raw_peer_observation() {
-        let ordered = addrs(&["192.168.1.5:7000", "127.0.0.1:7000"]);
-        assert_eq!(
-            observed_dial_head(
-                &ordered,
-                &punch_report(&[], Some("[::ffff:203.0.113.7]:41000"))
-            ),
-            Some("203.0.113.7:41000".parse().unwrap())
-        );
-        assert_eq!(
-            observed_dial_head(&ordered, &punch_report(&[], Some("0.0.0.0:41000"))),
-            None
-        );
-        assert_eq!(observed_dial_head(&ordered, &punch_report(&[], None)), None);
-    }
-
-    /// The merge: the observation leads the order, every static entry
-    /// survives in its existing order, dedup keeps one occurrence, and
-    /// `None` changes nothing (the strictly-additive fallback shape).
-    #[test]
-    fn observed_first_order_prepends_dedupes_and_preserves_the_static_order() {
-        let ordered = addrs(&["192.168.1.5:7000", "127.0.0.1:7000", "[::1]:7000"]);
-        assert_eq!(
-            observed_first_order(ordered.clone(), Some("203.0.113.7:41000".parse().unwrap())),
-            addrs(&[
-                "203.0.113.7:41000",
-                "192.168.1.5:7000",
-                "127.0.0.1:7000",
-                "[::1]:7000",
-            ])
-        );
-        // An observation that IS a static entry moves to the front — one
-        // occurrence, the rest keep their order.
-        assert_eq!(
-            observed_first_order(ordered.clone(), Some("127.0.0.1:7000".parse().unwrap())),
-            addrs(&["127.0.0.1:7000", "192.168.1.5:7000", "[::1]:7000"])
-        );
-        // v4-mapped observation normalizes before the merge.
-        assert_eq!(
-            observed_first_order(
-                ordered.clone(),
-                Some("[::ffff:203.0.113.7]:41000".parse().unwrap())
-            ),
-            addrs(&[
-                "203.0.113.7:41000",
-                "192.168.1.5:7000",
-                "127.0.0.1:7000",
-                "[::1]:7000",
-            ])
-        );
-        assert_eq!(observed_first_order(ordered.clone(), None), ordered);
     }
 
     /// `--stun` resolution: the empty value is the explicit opt-out, a

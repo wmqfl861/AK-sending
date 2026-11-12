@@ -23,6 +23,12 @@ ak-identity = { workspace = true }
 ak-signal = { workspace = true }
 # Wave 21 (A6): the local pairing-transaction journal (`pairing_journal`).
 ak-store = { workspace = true }
+# CR-P2-11 (review 2026-11-11): `pairing::task_net` — the v1 task-plane
+# connectivity plumbing shared verbatim by ak-ffi and ak-cli — delivers the
+# idle TASK-CLOSE notification as one `ak_wire` Error frame, so the shared
+# module needs the frozen frame codec (ak-wire depends on nothing above
+# ak-core; no cycle).
+ak-wire = { workspace = true }
 blake3 = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

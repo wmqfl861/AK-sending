@@ -326,7 +326,7 @@ impl PairingTransport for RealTransport {
                         });
                     }
                     CtrlMessage::PairError { code, .. } => {
-                        return Err(PairingError::rejected(&format!("pair error 0x{code:04x}")))
+                        return Err(PairingError::rejected(&format!("pair error 0x{code:04x}")));
                     }
                     _ => continue,
                 }

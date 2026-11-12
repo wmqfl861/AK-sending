@@ -271,6 +271,7 @@ fn free_port() -> u16 {
 struct Proc {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 impl Proc {
@@ -283,10 +284,29 @@ impl Proc {
             .spawn()
             .unwrap_or_else(|err| panic!("spawn ({:?} {:?}): {err}", cli, args));
         let stdout = pipe_lines(child.stdout.take().expect("stdout piped"));
-        // Drain stderr too (into the void) so a chatty child can never
-        // block on a full pipe.
-        let _ = pipe_lines(child.stderr.take().expect("stderr piped"));
-        Proc { child, stdout }
+        // Keep stderr instead of draining to the void (run 43312035496
+        // diagnosis): a daemon that fails BEFORE its first stdout event
+        // exits through stderr only — the listening event IS the first
+        // stdout line — and a silently dead child was indistinguishable
+        // from a hang. Same buffer discipline as stdout.
+        let stderr = pipe_lines(child.stderr.take().expect("stderr piped"));
+        Proc {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn stderr_tail(&self, lines: usize) -> String {
+        let buf = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = buf.len().saturating_sub(lines);
+        buf[start..].join(
+            "
+",
+        )
     }
 
     fn stdout_joined(&self) -> String {
@@ -296,7 +316,7 @@ impl Proc {
             .join("\n")
     }
 
-    fn wait_stdout(&self, needle: &str, timeout: Duration) -> String {
+    fn wait_stdout(&mut self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
             let lines = self
@@ -309,10 +329,29 @@ impl Proc {
                     return line;
                 }
             }
+            // Fast-fail on a dead child (run 43312035496 diagnosis): a
+            // daemon whose startup redeem fails exits via stderr and the
+            // old loop burned the WHOLE ceiling waiting on a corpse.
+            if let Ok(status) = self.child.try_wait() {
+                if let Some(status) = status {
+                    panic!(
+                        "child exited before printing {needle:?} ({status});                          stdout so far:
+{}
+stderr tail:
+{}",
+                        self.stdout_joined(),
+                        self.stderr_tail(15)
+                    );
+                }
+            }
             assert!(
                 Instant::now() < deadline,
-                "no stdout line containing {needle:?} within {timeout:?}; got:\n{}",
-                self.stdout_joined()
+                "no stdout line containing {needle:?} within {timeout:?}; got:
+{}
+stderr tail:
+{}",
+                self.stdout_joined(),
+                self.stderr_tail(15)
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -378,7 +417,7 @@ struct RegistryProc {
 impl RegistryProc {
     fn spawn(server_dir: &Path, db: &Path) -> RegistryProc {
         let port = free_port();
-        let proc = Proc::spawn(&[
+        let mut proc = Proc::spawn(&[
             "registry-server",
             "--port",
             &port.to_string(),
@@ -734,7 +773,7 @@ async fn revoke_after_pairing_preserves_books_and_admits_further_sends() {
         .and_then(|rest| rest.split(' ').next().map(str::to_owned))
         .expect("code id printed");
 
-    let a_daemon = Proc::spawn(&[
+    let mut a_daemon = Proc::spawn(&[
         "daemon",
         "--id-dir",
         &a_dir.to_string_lossy(),
@@ -751,7 +790,7 @@ async fn revoke_after_pairing_preserves_books_and_admits_further_sends() {
         "--registry-fp",
         &fp,
     ]);
-    let b_daemon = Proc::spawn(&[
+    let mut b_daemon = Proc::spawn(&[
         "daemon",
         "--id-dir",
         &b_dir.to_string_lossy(),
@@ -909,7 +948,7 @@ fn malformed_invite_codes_fail_closed_at_the_cli() {
     std::fs::create_dir_all(&b_dir).expect("b dir");
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let port = free_port();
-    let server = Proc::spawn(&[
+    let mut server = Proc::spawn(&[
         "registry-server",
         "--port",
         &port.to_string(),

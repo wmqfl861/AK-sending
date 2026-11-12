@@ -72,6 +72,12 @@ pub(crate) struct DaemonOptions {
 /// the `"type"` values are a script-facing contract: extend, never rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaemonEvent<'a> {
+    /// Startup progress (run-43312035496 diagnosis finding 2): before the
+    /// first bind the daemon's stdout carries literally nothing and every
+    /// earlier failure exits via stderr — an extend-only progress event
+    /// per phase makes startup stalls/early-exits visible in json-lines
+    /// mode without touching any frozen shape.
+    Starting { phase: &'a str },
     /// Emitted once per daemon run after the first successful bind: the
     /// concrete listen address, this device's fingerprint and name, whether
     /// the mDNS announcement went out, and the wave-25 `candidates` list
@@ -110,7 +116,17 @@ impl DaemonEvent<'_> {
     /// caller-controlled strings go through `json_escape`, so the output
     /// can never break line discipline.
     pub(crate) fn to_json_line(&self) -> String {
+        // Starting renders before the match so the frozen arms stay
+        // byte-identical (extend-only).
+        if let DaemonEvent::Starting { phase } = self {
+            return format!(
+                "{{\"type\":\"starting\",\"phase\":\"{}\"}}",
+                crate::json_escape(phase)
+            );
+        }
         match self {
+            // Rendered above; the arm exists only for exhaustiveness.
+            DaemonEvent::Starting { .. } => unreachable!("Starting handled above"),
             DaemonEvent::Listening {
                 addr,
                 port,
@@ -1344,7 +1360,16 @@ pub(crate) async fn daemon_core(
         let settings = registry
             .as_ref()
             .expect("invite-code implies the wired registry settings");
+        // run-43312035496: the redeem transaction can legitimately run
+        // ~90-105 s (window + waits) under load; without a progress line
+        // the json-lines stdout stays empty through the whole phase.
+        if opts.json_lines {
+            emit_line(&DaemonEvent::Starting { phase: "redeem" }.to_json_line());
+        }
         let verified = crate::invite::redeem_and_pair(id, code, settings).await?;
+        if opts.json_lines {
+            emit_line(&DaemonEvent::Starting { phase: "paired" }.to_json_line());
+        }
         let peer = verified.owner_fingerprint(); // the code owner is the peer
         out.note("paired with the code owner:");
         out.note(&crate::fingerprint_lines("owner", &peer));

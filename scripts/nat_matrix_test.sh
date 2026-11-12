@@ -103,6 +103,19 @@ for arg in "$@"; do
 done
 
 log()  { printf '%s %s\n' "$TAG" "$*"; }
+
+# Run a critical setup command; on failure log the stage and return 1 from
+# the CALLER (use as `must "stage" cmd args...` inside functions that
+# `return 1` on error). G0 hardening: `set -uo pipefail` does not stop
+# plain failures when functions run in `||` contexts, so critical ip/
+# sysctl/iptables calls are checked explicitly (judgment-layer finding C).
+must() {
+  local stage="$1"; shift
+  if ! "$@"; then
+    log "FAIL: setup step failed: $stage ($*)"
+    return 1
+  fi
+}
 skip() { printf '%s SKIP: %s\n' "$TAG" "$*"; exit 0; }
 
 # ---------------------------------------------------------------------------
@@ -272,6 +285,11 @@ build_case_topology() {
   ip -n "$NS_CORE" link set c-to-r1 up
   ip -n "$NS_CORE" link set c-to-r1 master akbr0
   link_ns "$NS_R2" r2-to-i "$NS_INET" i-to-r2
+  # G0 fix (run 43253690898 root cause): the IPv4 gateway address on the
+  # persistent inet side was NEVER configured (only the v6 case added an
+  # IPv6 address) — every `via 10.20.0.2` route below died with "Nexthop
+  # has invalid gateway" and all four cases stopped at the pre-NAT smoke.
+  ip -n "$NS_INET" addr add 10.20.0.254/24 dev i-to-r2
   ip -n "$NS_INET" link set i-to-r2 up
   # Alice <-> r1.
   link_ns "$NS_A" a-to-r1 "$NS_R1" r1-to-a
@@ -305,15 +323,27 @@ build_case_topology() {
   # Routing: endpoints default to their router; r1 reaches bob's LAN via
   # the "public internet" hop; r2 defaults to it; inet routes both LANs;
   # svc returns to alice directly and to bob via the internet hop.
-  ip -n "$NS_R1" route add 10.10.2.0/24 via 10.10.0.254
-  ip -n "$NS_R2" route add 10.10.0.0/24 via 10.20.0.254
+  # G0 fix: routes to the PEER LAN (below) are not enough — once r2
+  # MASQUERADEs bob's sources to 10.20.0.2, replies (STUN/registry) and
+  # alice's punches to bob's reflexive address need 10.20.0.0/24 routes
+  # on r1 AND svc too, or the NAT'd round trips die after the smoke.
+  must "r1 route to bob LAN"   ip -n "$NS_R1" route add 10.10.2.0/24 via 10.10.0.254 || return 1
+  must "r1 route to bob NAT"   ip -n "$NS_R1" route add 10.20.0.0/24 via 10.10.0.254 || return 1
+  must "svc route to bob NAT"  ip -n "$NS_SVC" route replace 10.20.0.0/24 via 10.10.0.254 || return 1
+  must "r2 route to core"      ip -n "$NS_R2" route add 10.10.0.0/24 via 10.20.0.254 || return 1
   ip -n "$NS_R2" route add 10.10.1.0/24 via 10.20.0.254
-  ip -n "$NS_INET" route add 10.10.1.0/24 via 10.10.0.1
-  ip -n "$NS_INET" route add 10.10.2.0/24 via 10.20.0.2
-  ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::254 2>/dev/null || true
-  ip -n "$NS_R2" -6 route add default via 2001:77:ee::1 2>/dev/null || true
-  ip -n "$NS_INET" -6 route add 2001:77:1::/64 via 2001:77:ff::1 2>/dev/null || true
-  ip -n "$NS_INET" -6 route add 2001:77:2::/64 via 2001:77:ee::2 2>/dev/null || true
+  # akinet is persistent across cases: its routes are re-asserted every
+  # case, so they must be idempotent (plain `add` produced "File exists"
+  # from case 2 onward — run 43253690898 logs, 3 occurrences).
+  must "inet route to alice LAN" ip -n "$NS_INET" route replace 10.10.1.0/24 via 10.10.0.1 || return 1
+  must "inet route to bob LAN"   ip -n "$NS_INET" route replace 10.10.2.0/24 via 10.20.0.2 || return 1
+  # r1/r2 are fresh per case (add is fine); akinet is persistent (replace).
+  # Errors are checked, not swallowed: a failed v6 route means the v6 case
+  # would silently ride the wrong path.
+  ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::254     || { log "FAIL: r1 v6 route install failed"; return 1; }
+  ip -n "$NS_R2" -6 route add default via 2001:77:ee::1     || { log "FAIL: r2 v6 route install failed"; return 1; }
+  ip -n "$NS_INET" -6 route replace 2001:77:1::/64 via 2001:77:ff::1     || { log "FAIL: inet v6 route (alice LAN) failed"; return 1; }
+  ip -n "$NS_INET" -6 route replace 2001:77:2::/64 via 2001:77:ee::2     || { log "FAIL: inet v6 route (bob LAN) failed"; return 1; }
   for ns in "$NS_R1" "$NS_R2"; do
     ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.forwarding=1
@@ -347,14 +377,17 @@ build_case_topology() {
 # port-restricted filtering; the modes add the mapping flavor.
 nat_rules() {
   local ns="$1" lan="$2" core="$3" subnet="$4" mode="$5"
-  ip netns exec "$ns" iptables -P FORWARD DROP
-  ip netns exec "$ns" iptables -F FORWARD
-  ip netns exec "$ns" iptables -F -t nat
-  ip netns exec "$ns" iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  # G0 hardening: every iptables mutation is checked (finding C) — a
+  # silently-failed flush/append would run the case under rules that do
+  # not model the intended NAT at all.
+  ip netns exec "$ns" iptables -P FORWARD DROP || return 1
+  ip netns exec "$ns" iptables -F FORWARD || return 1
+  ip netns exec "$ns" iptables -F -t nat || return 1
+  ip netns exec "$ns" iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
   case "$mode" in
     pcone)
-      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -j ACCEPT
-      ip netns exec "$ns" iptables -t nat -A POSTROUTING -s "$subnet" -o "$core" -j MASQUERADE
+      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -j ACCEPT || return 1
+      ip netns exec "$ns" iptables -t nat -A POSTROUTING -s "$subnet" -o "$core" -j MASQUERADE || return 1
       ;;
     fullcone)
       # 1:1 static DNAT (port-preserving) + unconditional inbound UDP to the
@@ -367,8 +400,8 @@ nat_rules() {
       ip netns exec "$ns" iptables -A FORWARD -i "$core" -p udp -d "$host_ip" -j ACCEPT
       ;;
     symmetric)
-      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -j ACCEPT
-      ip netns exec "$ns" iptables -t nat -A POSTROUTING -s "$subnet" -o "$core" -j MASQUERADE --random-fully
+      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -j ACCEPT || return 1
+      ip netns exec "$ns" iptables -t nat -A POSTROUTING -s "$subnet" -o "$core" -j MASQUERADE --random-fully || return 1
       ;;
     control-only)
       # v6 case: the v4 data plane must die (peer dials are not to the
@@ -450,48 +483,99 @@ start_services() {
 #    downstream result meaningless — the case is judged "fixture
 #    invalid", never a product pass/fail.
 # ---------------------------------------------------------------------------
-fixture_probe() { # fixture_probe <ns> -> prints "PORT1 PORT2" or fails
+fixture_probe() { # fixture_probe <ns> -> prints "IP:PORT IP:PORT" or fails
+  # G0 hardening: the previous parser accepted wrong txid / wrong source /
+  # wrong type / wrong cookie / wrong family / zero-length headers /
+  # truncated XOR-MAPPED bodies, reused replies across destinations, and
+  # rejected valid padded responses (attribute walk ignored STUN 4-byte
+  # alignment). It printed only ports, so a probe that bypassed the NAT
+  # (seeing the LAN address) could pass the same-port check trivially.
+  # This parser validates everything and returns BOTH mapped addresses.
   ip netns exec "$1" python3 - <<'PY'
-import socket, struct, os, sys
+import os, socket, struct, sys
+
+MAGIC = 0x2112A442
+BINDING_REQUEST = 0x0001
+BINDING_RESPONSE = 0x0101
+XOR_MAPPED = 0x0020
+
+def parse_response(data, txid, peer):
+    if len(data) < 20:
+        return None
+    mtype, mlen, cookie = struct.unpack("!HHI", data[:8])
+    if mtype != BINDING_RESPONSE or cookie != MAGIC or data[8:20] != txid:
+        return None
+    if len(data) < 20 + mlen:  # declared length vs datagram bounds
+        return None
+    off = 20
+    while off + 4 <= len(data):
+        atype, alen = struct.unpack("!HH", data[off:off + 4])
+        body = data[off + 4:off + 4 + alen]
+        if len(body) < alen:  # attribute extends past the message
+            return None
+        if atype == XOR_MAPPED and alen >= 8:
+            fam = body[1]
+            if fam != 0x01:  # IPv4 only in this fixture
+                return None
+            xport = struct.unpack("!H", body[2:4])[0] ^ (MAGIC >> 16)
+            xip = bytes(b ^ k for b, k in zip(body[4:8], struct.pack("!I", MAGIC)))
+            return socket.inet_ntoa(xip), xport
+        off += 4 + ((alen + 3) & ~3)  # STUN attributes are 4-byte aligned
+    return None
 
 def query(sock, addr):
     txid = os.urandom(12)
-    msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txid
+    msg = struct.pack("!HHI", BINDING_REQUEST, 0, MAGIC) + txid
     for _ in range(4):
         sock.sendto(msg, addr)
         sock.settimeout(1.0)
         try:
-            data, _ = sock.recvfrom(560)
+            data, src = sock.recvfrom(560)
         except socket.timeout:
             continue
-        if len(data) < 20:
-            continue
-        off = 20
-        while off + 4 <= len(data):
-            atype, alen = struct.unpack("!HH", data[off:off + 4])
-            body = data[off + 4:off + 4 + alen]
-            if atype == 0x0020 and alen >= 8:  # XOR-MAPPED-ADDRESS
-                xport = struct.unpack("!H", body[2:4])[0]
-                return xport ^ 0x2112
-            off += 4 + alen
+        if src[0] != addr[0]:  # a late reply from the OTHER destination
+            continue           # must not be misattributed (G0 finding E)
+        parsed = parse_response(data, txid, addr)
+        if parsed is not None:
+            return parsed
     return None
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-p1 = query(s, ("10.10.0.10", 17101))
-p2 = query(s, ("10.10.0.10", 17102))
-if p1 is None or p2 is None:
+r1 = query(s, ("10.10.0.10", 17101))
+r2 = query(s, ("10.10.0.10", 17102))
+if r1 is None or r2 is None:
     print("PROBE-FAIL")
     sys.exit(1)
-print(f"{p1} {p2}")
+print(f"{r1[0]}:{r1[1]} {r2[0]}:{r2[1]}")
 PY
 }
 
 # fixture_check <ns> <mode>: judges the probe against the mode's claim.
 fixture_check() {
-  local ns="$1" mode="$2" out p1 p2
+  local ns="$1" mode="$2" out a1 p1 a2 p2
   out="$(fixture_probe "$ns")" || { log "FAIL: fixture probe ($ns) got no STUN answers"; return 1; }
-  read -r p1 p2 <<<"$out"
-  log "    fixture ($ns/$mode): same-socket ports $p1 vs $p2"
+  read -r a1 p1 a2 p2 <<<"$out"  # two "IP:PORT" results — wait, split below
+  # out is "IP1:PORT1 IP2:PORT2"; split each field
+  local m1 m2
+  m1="${out%% *}"; m2="${out##* }"
+  a1="${m1%%:*}"; p1="${m1##*:}"
+  a2="${m2%%:*}"; p2="${m2##*:}"
+  log "    fixture ($ns/$mode): same socket -> $m1 and $m2"
+  # Address assertion by mode (G0 finding E): the observed address proves
+  # whether the NAT is actually engaged — without it a probe bypassing
+  # the NAT sees the LAN address and a same-port verdict proves nothing.
+  local expected_addr
+  case "$ns:$mode" in
+    "$NS_A":pcone|"$NS_A":fullcone|"$NS_A":symmetric) expected_addr="10.10.0.1" ;;
+    "$NS_B":pcone|"$NS_B":fullcone|"$NS_B":symmetric) expected_addr="10.20.0.2" ;;
+    "$NS_A":control-only) expected_addr="10.10.1.2" ;;  # no v4 MASQ: LAN address
+    "$NS_B":control-only) expected_addr="10.10.2.2" ;;
+    *) expected_addr="" ;;
+  esac
+  if [[ -n "$expected_addr" ]]; then
+    [[ "$a1" == "$expected_addr" && "$a2" == "$expected_addr" ]]       || { log "FAIL: fixture invalid — $ns/$mode must observe $expected_addr (NAT engagement), got $a1/$a2"; return 1; }
+  fi
+  # Port comparison by mode (the original CR-P2-14 point 3 semantics).
   case "$mode" in
     pcone|fullcone)
       [[ "$p1" == "$p2" ]] || { log "FAIL: fixture invalid — $mode must map one socket to ONE external port ($p1 != $p2)"; return 1; }
@@ -500,7 +584,7 @@ fixture_check() {
       [[ "$p1" != "$p2" ]] || { log "FAIL: fixture invalid — symmetric must remap per destination ($p1 == $p2)"; return 1; }
       ;;
     control-only)
-      # v6 case routers do no v4 NAT (no MASQUERADE) — nothing to assert.
+      # No v4 NAT: ports are the socket's own — nothing more to assert.
       ;;
   esac
   return 0
@@ -525,7 +609,9 @@ print_via() { # connected-via of a case, for the log regardless of outcome
   if [[ -n "$via" ]]; then
     log "    connected-via: $via"
   else
-    log "    connected-via: (none — transfer never connected)"
+    # The CLI prints this marker only at Attempt::Done — its absence means
+    # the success marker is missing, NOT that no connection ever existed.
+    log "    connected-via: (no success marker — Attempt::Done never printed)"
   fi
 }
 
@@ -536,7 +622,11 @@ run_case() {
   local case_name="$1" expect="$2"
   local case_dir="$WORK/$case_name"
   mkdir -p "$case_dir/id-alice" "$case_dir/id-bob" "$case_dir/out" "$case_dir/src"
-  dd if=/dev/urandom of="$case_dir/src/payload.bin" bs=1M count="$SIZE_MB" status=none
+  # G0 hardening: payload generation must SUCCEED — a failed dd previously
+  # produced an empty/missing file whose "clean failure" could satisfy the
+  # xfail wording check (judgment-layer finding F).
+  dd if=/dev/urandom of="$case_dir/src/payload.bin" bs=1M count="$SIZE_MB" status=none     || { log "FAIL [$case_name]: dd failed to generate the payload (input invalid — never a valid xfail)"; return 1; }
+  [[ -s "$case_dir/src/payload.bin" ]]     || { log "FAIL [$case_name]: payload file empty after dd"; return 1; }
 
   # The receiver: consent auto-fed with a fresh 'y' stream (the CLI
   # discards stale input; `yes` keeps supplying fresh lines).
@@ -575,12 +665,22 @@ run_case() {
   fi
   wait "$send_pid"
   local send_rc=$?
-  # Let the receiver finish its own teardown (bounded).
+  # Let the receiver finish its own teardown (bounded), then record HOW it
+  # ended: a controlled exit (observed before the budget) is normal; a
+  # timeout-kill is flagged — it is either a slow-but-fine teardown or a
+  # hang, and the flag keeps the log honest about which happened without
+  # claiming every kill is clean (judgment-layer finding F/d).
   local rwait=0
   while kill -0 "$recv_pid" 2>/dev/null && [[ $rwait -lt 150 ]]; do
     sleep 0.2; rwait=$((rwait + 1))
   done
-  kill "$recv_pid" 2>/dev/null
+  if kill -0 "$recv_pid" 2>/dev/null; then
+    kill "$recv_pid" 2>/dev/null
+    wait "$recv_pid" 2>/dev/null
+    log "note [$case_name]: receiver teardown exceeded 30s and was killed (slow teardown or hang — not judged as a controlled exit)"
+  else
+    wait "$recv_pid" 2>/dev/null || true
+  fi
 
   local send_log="$case_dir/send.log" recv_log="$case_dir/recv.log"
   if [[ "$expect" == "pass-v4" || "$expect" == "pass-v6" ]]; then
@@ -621,8 +721,9 @@ run_case() {
       || { log "FAIL [$case_name]: xfail case exited 0 without completing"; return 1; }
     grep -q "no candidate accepted the connection" "$send_log" \
       || { log "FAIL [$case_name]: the xfail failure must be the bounded no-candidate wording (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
-    if [[ -e "$case_dir/out/payload.bin" ]]; then
-      log "FAIL [$case_name]: payload landed despite the failed transfer — impossible without a relay (P0-class)"
+    if find "$case_dir/out" -type f 2>/dev/null | grep -q .; then
+      log "FAIL [$case_name]: files landed despite the failed transfer (payload/.akpart/staging) — impossible without a relay (P0-class)"
+      find "$case_dir/out" -type f 2>/dev/null | head -5 | sed 's/^/      /'
       return 1
     fi
     print_via "$send_log"
@@ -632,8 +733,9 @@ run_case() {
       || { log "FAIL [$case_name]: symmetric<->symmetric must NOT succeed (E3 territory)"; print_via "$send_log"; return 1; }
     grep -q "no candidate accepted the connection" "$send_log" \
       || { log "FAIL [$case_name]: the failure must be the bounded no-candidate wording (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
-    if [[ -e "$case_dir/out/payload.bin" ]]; then
-      log "FAIL [$case_name]: payload landed despite the failed transfer — impossible without a relay (P0-class)"
+    if find "$case_dir/out" -type f 2>/dev/null | grep -q .; then
+      log "FAIL [$case_name]: files landed despite the failed transfer (payload/.akpart/staging) — impossible without a relay (P0-class)"
+      find "$case_dir/out" -type f 2>/dev/null | head -5 | sed 's/^/      /'
       return 1
     fi
     print_via "$send_log"
@@ -650,8 +752,8 @@ case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect>
   local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6"
   log "---- case $name: $desc"
   build_case_topology "$use_v6" || { log "FAIL [$name]: topology setup failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
-  nat_rules "$NS_R1" r1-to-a r1-to-c 10.10.1.0/24 "$r1"
-  nat_rules "$NS_R2" r2-to-b r2-to-i 10.10.2.0/24 "$r2"
+  nat_rules "$NS_R1" r1-to-a r1-to-c 10.10.1.0/24 "$r1"     || { log "FAIL [$name]: r1 NAT rules failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
+  nat_rules "$NS_R2" r2-to-b r2-to-i 10.10.2.0/24 "$r2"     || { log "FAIL [$name]: r2 NAT rules failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
   if [[ "$use_v6" -eq 1 ]]; then
     v6_firewall "$NS_R1" r1-to-a
     v6_firewall "$NS_R2" r2-to-b

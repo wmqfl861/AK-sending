@@ -262,9 +262,13 @@ async fn netem_delay_50_100ms_64mib_loopback_throughput() {
             LOOP_DEV,
             "root",
             "netem",
+            // Argument order matters: tc's netem grammar takes `limit`
+            // BEFORE `delay` (`netem limit N delay Xms`). The reversed
+            // order is rejected by GitHub-runner iproute2 with
+            // `What is "limit 100000"?` (netem first run 43264263605).
+            &format!("limit {NETEM_LIMIT_PACKETS}"),
             "delay",
             &format!("{delay_ms}ms"),
-            &format!("limit {NETEM_LIMIT_PACKETS}"),
         ]);
         assert!(
             shape_ok,

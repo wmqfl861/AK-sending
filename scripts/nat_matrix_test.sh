@@ -144,6 +144,19 @@ trap cleanup EXIT INT TERM
 #   bob:   b-to-r2 (10.10.2.2/24, v6 2001:77:2::2/64)
 #   svc:   svc-to-c (10.10.0.10/24)
 
+# Route/interface dump for every namespace — printed on topology smoke
+# failures so a CI log is self-diagnosing instead of a blind 40-minute
+# iteration cycle.
+dump_routes() {
+  for ns in "$NS_CORE" "$NS_SVC" "$NS_A" "$NS_B" "$NS_R1" "$NS_R2"; do
+    log "--- routes in $ns:"
+    ip -n "$ns" route show 2>&1 | while read -r line; do log "    $line"; done
+    ip -n "$ns" -6 route show 2>&1 | while read -r line; do log "    $line"; done
+    log "--- links in $ns:"
+    ip -n "$ns" -br link 2>&1 | while read -r line; do log "    $line"; done
+  done
+}
+
 make_ns() { ip netns add "$1" && ip -n "$1" link set lo up; }
 
 link_ns() { # link_ns <ns-a> <if-a> <ns-b> <if-b>
@@ -216,11 +229,27 @@ build_case_topology() {
     ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.forwarding=1
   done
+  # The services host needs return routes to both LANs: the baseline
+  # smoke runs BEFORE the NAT rules, so alice/bob traffic arrives with
+  # its ORIGINAL source address and svc would drop the reply (no
+  # route) — exactly the first CI run's "base topology broken".
+  # (After MASQUERADE the sources become the routers' core IPs, which
+  # are on-link, but the smoke must pass pre-NAT.)
+  ip -n "$NS_SVC" route replace 10.10.1.0/24 via 10.10.0.1
+  ip -n "$NS_SVC" route replace 10.10.2.0/24 via 10.10.0.2
+  # Reverse-path filtering off everywhere: the punch traffic this suite
+  # exists to test arrives from addresses the endpoint never talked to
+  # (the peer's NAT reflection), which strict rp_filter would drop as
+  # spoofing — the exact false negative the matrix must not have.
+  for ns in "$NS_A" "$NS_B" "$NS_R1" "$NS_R2" "$NS_SVC"; do
+    ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0
+    ip netns exec "$ns" sysctl -qw net.ipv4.conf.default.rp_filter=0
+  done
   # Baseline connectivity smoke: both endpoints reach the services host.
   ip netns exec "$NS_A" ping -c1 -W2 10.10.0.10 >/dev/null 2>&1 \
-    || { log "FAIL: alice cannot reach the services host (base topology broken)"; return 1; }
+    || { log "FAIL: alice cannot reach the services host (base topology broken)"; dump_routes; return 1; }
   ip netns exec "$NS_B" ping -c1 -W2 10.10.0.10 >/dev/null 2>&1 \
-    || { log "FAIL: bob cannot reach the services host (base topology broken)"; return 1; }
+    || { log "FAIL: bob cannot reach the services host (base topology broken)"; dump_routes; return 1; }
 }
 
 # nat_rules <router-ns> <lan-iface> <core-iface> <lan-subnet> <mode>

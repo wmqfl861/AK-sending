@@ -12,6 +12,10 @@ on:
       - .github/workflows/netem-benchmark.yml
       - scripts/run_netem_benchmark.sh
       - scripts/tests/test_netem_benchmark.py
+      # The benchmark source is an input to the measurement: a change to
+      # its tc invocation or assertions must re-run the evidence workflow
+      # (the tc argument-order fix in 2312250 did not trigger one).
+      - crates/ak-itests/tests/bench_netem.rs
   workflow_dispatch:
 
 permissions:

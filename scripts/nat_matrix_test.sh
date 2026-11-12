@@ -319,6 +319,14 @@ build_case_topology() {
     ip -n "$NS_R2" -6 addr add 2001:77:2::1/64 dev r2-to-b
     ip -n "$NS_R2" -6 addr add 2001:77:ee::2/64 dev r2-to-i
     ip -n "$NS_INET" -6 addr add 2001:77:ee::1/64 dev i-to-r2
+    # v6 routes belong HERE: they are only installable once the global v6
+    # addresses above exist — running them unconditionally broke every v4
+    # case (run 43266120269: "r1 v6 route install failed" on pcone-pcone).
+    # akinet is persistent: replace. r1/r2 are fresh: add. All checked.
+    ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::254       || { log "FAIL: r1 v6 route install failed"; return 1; }
+    ip -n "$NS_R2" -6 route add default via 2001:77:ee::1       || { log "FAIL: r2 v6 route install failed"; return 1; }
+    ip -n "$NS_INET" -6 route replace 2001:77:1::/64 via 2001:77:ff::1       || { log "FAIL: inet v6 route (alice LAN) failed"; return 1; }
+    ip -n "$NS_INET" -6 route replace 2001:77:2::/64 via 2001:77:ee::2       || { log "FAIL: inet v6 route (bob LAN) failed"; return 1; }
   fi
   # Routing: endpoints default to their router; r1 reaches bob's LAN via
   # the "public internet" hop; r2 defaults to it; inet routes both LANs;
@@ -337,13 +345,6 @@ build_case_topology() {
   # from case 2 onward — run 43253690898 logs, 3 occurrences).
   must "inet route to alice LAN" ip -n "$NS_INET" route replace 10.10.1.0/24 via 10.10.0.1 || return 1
   must "inet route to bob LAN"   ip -n "$NS_INET" route replace 10.10.2.0/24 via 10.20.0.2 || return 1
-  # r1/r2 are fresh per case (add is fine); akinet is persistent (replace).
-  # Errors are checked, not swallowed: a failed v6 route means the v6 case
-  # would silently ride the wrong path.
-  ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::254     || { log "FAIL: r1 v6 route install failed"; return 1; }
-  ip -n "$NS_R2" -6 route add default via 2001:77:ee::1     || { log "FAIL: r2 v6 route install failed"; return 1; }
-  ip -n "$NS_INET" -6 route replace 2001:77:1::/64 via 2001:77:ff::1     || { log "FAIL: inet v6 route (alice LAN) failed"; return 1; }
-  ip -n "$NS_INET" -6 route replace 2001:77:2::/64 via 2001:77:ee::2     || { log "FAIL: inet v6 route (bob LAN) failed"; return 1; }
   for ns in "$NS_R1" "$NS_R2"; do
     ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.forwarding=1

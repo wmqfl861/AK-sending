@@ -135,13 +135,15 @@ pub const TASK_SETTLE_PAUSE: Duration = Duration::from_millis(300);
 /// IS the pre-dial latency budget (cap ~1-2 s per the fix brief): the
 /// receiver's echo responder — and, while the pairing-time rounds still
 /// overlap, the peer's own pairing probe — answers within the first
-/// 150 ms burst on a live path, but `holepunch::probe` only reports at
-/// window end, so the round blocks the full second even then (an
-/// early-exit hook on the ak-net probe is the recorded API wish). The
-/// round runs OUTSIDE the per-attempt connect budgets and pass counting:
-/// [`TASK_CONNECT_BUDGET`] × [`TASK_CONNECT_PASSES`] behave exactly as
-/// before, so the worst-case total connect phase grows by at most
-/// window + [`OBSERVED_DIAL_BUDGET`] ≈ 3 s.
+/// 150 ms burst on a live path. Since CR-P3-06 (G2) the round runs
+/// `holepunch::probe_with_early_exit`: the first candidate of the
+/// static order being echo-confirmed ends the round then and there (a
+/// same-LAN send pays one probe round-trip, not the fixed second — the
+/// recorded API wish, landed); only an unconfirmed head blocks out the
+/// window. The round runs OUTSIDE the per-attempt connect budgets and
+/// pass counting: [`TASK_CONNECT_BUDGET`] × [`TASK_CONNECT_PASSES`]
+/// behave exactly as before, so the worst-case total connect phase
+/// grows by at most window + [`OBSERVED_DIAL_BUDGET`] ≈ 3 s.
 pub const PROBE_DIAL_INTERVAL: Duration = Duration::from_millis(150);
 /// The probe round's wall-clock window (see [`PROBE_DIAL_INTERVAL`]).
 pub const PROBE_DIAL_WINDOW: Duration = Duration::from_secs(1);
@@ -1092,18 +1094,29 @@ where
             head: None,
         };
     };
-    let report =
-        match ak_net::holepunch::probe(&socket, &ordered, PROBE_DIAL_INTERVAL, PROBE_DIAL_WINDOW)
-            .await
-        {
-            Ok(report) => report,
-            Err(_) => {
-                return ProbeDialOrder {
-                    order: ordered,
-                    head: None,
-                };
-            }
-        };
+    // CR-P3-06 (G2): the round exits early once the static order's first
+    // candidate is echo-confirmed — a same-LAN send pays one probe
+    // round-trip instead of the fixed 1 s window; an unconfirmed head
+    // still runs the whole window (fail-open reachability observation
+    // verbatim). Both adapters (FFI `run_send`, CLI `drive_task_send`)
+    // dial through HERE, so both get the early exit without touching
+    // their files.
+    let report = match ak_net::holepunch::probe_with_early_exit(
+        &socket,
+        &ordered,
+        PROBE_DIAL_INTERVAL,
+        PROBE_DIAL_WINDOW,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(_) => {
+            return ProbeDialOrder {
+                order: ordered,
+                head: None,
+            };
+        }
+    };
     let head = observed_dial_head(&ordered, &report);
     observe(head, &report, probed);
     let order = observed_first_order(ordered, head);
@@ -2493,6 +2506,45 @@ mod tests {
             started.elapsed() >= PROBE_DIAL_WINDOW - Duration::from_millis(100),
             "the round ran its window: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// CR-P3-06 (G2), the wiring: the shared send-time round exits the
+    /// moment the static order's FIRST candidate is echo-confirmed — an
+    /// echo responder heading the list (plus silent trailing candidates)
+    /// brings the round home in one probe round-trip, far inside the
+    /// 1 s window. Both adapters dial through this round, so this pins
+    /// the loopback/LAN send latency recovery end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_dial_round_exits_early_once_the_head_candidate_answers() {
+        let observed = Arc::new(StdMutex::new(None));
+        let (responder, bound) = bind_echo_responder_socket().expect("responder binds");
+        let slot = Arc::clone(&observed);
+        let task = tokio::spawn(async move {
+            echo_responder_loop(responder, slot, |_| {}).await;
+        });
+        let echo_addr = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+        // A silent TRAILING candidate: the exit must not wait for it.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent bind");
+        let silent_addr = SocketAddr::from((
+            [127, 0, 0, 1],
+            silent.local_addr().expect("silent addr").port(),
+        ));
+        let started = Instant::now();
+        let plan = probe_dial_round(vec![echo_addr, silent_addr], |_, _, _| {}).await;
+        let elapsed = started.elapsed();
+        task.abort();
+        drop(silent);
+
+        assert_eq!(plan.head, Some(echo_addr), "the echo head leads");
+        assert!(
+            plan.order.first() == Some(&echo_addr),
+            "the observed head leads the dial order: {:?}",
+            plan.order
+        );
+        assert!(
+            elapsed + Duration::from_millis(300) < PROBE_DIAL_WINDOW,
+            "the round must exit on the first confirmation, not the window: {elapsed:?}"
         );
     }
 

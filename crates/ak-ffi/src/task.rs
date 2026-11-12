@@ -1706,6 +1706,37 @@ fn probe_result_line(conn_id: &[u8; 16], outcome: &ProbeOutcome) -> (String, &'s
     }
 }
 
+/// Render the `probe_observed` event line of one send-time probe round
+/// (batchF G2 / CR-P3-06 diagnostics; contract ffi-v2 §8.3, prose
+/// registration beside `sender_bind`): exactly ONE bounded line per
+/// round — the observed peer address, its candidate kind and the dial
+/// phase — whether or not anything was observed (the fail-open shape
+/// mirrors the round itself). `kind` follows
+/// [`task_net::observed_dial_head`]'s two rules: a head inside
+/// `report.reachable` is an ADVERTISED candidate the round
+/// echo-confirmed (`candidate`); any other head is the raw source of a
+/// PEER probe from outside the candidate list (`observed`); no head at
+/// all is `none`.
+fn probe_observed_event(
+    conn_id: &[u8; 16],
+    head: Option<SocketAddr>,
+    report: &ak_net::holepunch::PunchReport,
+) -> String {
+    let kind = match head {
+        Some(head) if report.reachable.contains(&head) => "candidate",
+        Some(_) => "observed",
+        None => "none",
+    };
+    format!(
+        "{{\"event\":\"probe_observed\",\"conn\":\"{}\",\"observed\":{},\"kind\":\"{kind}\",\"phase\":\"send\",\"reachable\":{},\"packets_in\":{},\"elapsed_ms\":{}}}",
+        core::hex_encode(conn_id),
+        head.map_or_else(|| "null".to_string(), |addr| quoted(&addr.to_string())),
+        report.reachable.len(),
+        report.packets_received,
+        report.elapsed.as_millis(),
+    )
+}
+
 /// Bind the probe echo responder (the shared loop lives in
 /// `task_net::echo_responder_loop`): a small UDP socket that answers
 /// ak-net hole-punch probe packets from any of this device's advertised
@@ -3334,11 +3365,29 @@ async fn run_send(
     // arrive at the sender's NAT, or Linux-type SNAT rewrites the external
     // port (the conntrack tuple conflict this fix exists for).
     sender_reflexive_opener(adopted.as_ref(), &static_order).await;
+    // batchF G2: the round's observation rides one bounded
+    // `probe_observed` event per send (the emission pattern of
+    // `sender_bind` — a plain `push_event`, unknown-name-tolerated on
+    // the Dart side); the round itself early-exits on the first
+    // confirmed head since CR-P3-06 (task_net's probe_dial_round_on).
     let dial = match adopted.as_ref().map(|socket| socket.try_clone().ok()) {
         Some(Some(round_socket)) => {
-            probe_dial_round_on(round_socket, static_order.len(), static_order, |_, _, _| {}).await
+            probe_dial_round_on(
+                round_socket,
+                static_order.len(),
+                static_order,
+                |head, report, _| {
+                    rt.push_event(probe_observed_event(&conn_id, head, report));
+                },
+            )
+            .await
         }
-        _ => probe_dial_round(static_order, |_, _, _| {}).await,
+        _ => {
+            probe_dial_round(static_order, |head, report, _| {
+                rt.push_event(probe_observed_event(&conn_id, head, report));
+            })
+            .await
+        }
     };
     let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     for pass in 0..TASK_CONNECT_PASSES {
@@ -4560,6 +4609,24 @@ mod task_tests {
         assert!(done.contains("\"conn\":\""), "{done}");
         let delivered = find_file(&inbox, "e2e.bin").expect("the file landed in the save dir");
         assert_eq!(std::fs::read(&delivered).unwrap(), payload);
+        // batchF G2 (CR-P3-06): the sender's pre-dial probe round
+        // reported exactly one `probe_observed` line — the loopback echo
+        // responder confirms the head candidate, so the kind is
+        // `candidate` (the observed-first dial still lands the transfer).
+        // Polled BEFORE the joiner's `done` drain: wait_event discards
+        // non-matching queued lines, and this event was queued first.
+        let observed = wait_event(engine, &joiner, "\"event\":\"probe_observed\"");
+        assert_eq!(
+            conn_of(&observed),
+            conn_of(&join_json),
+            "the line correlates with the connection: {observed}"
+        );
+        assert!(observed.contains("\"phase\":\"send\""), "{observed}");
+        assert!(
+            observed.contains("\"kind\":\"candidate\""),
+            "the loopback echo responder confirms the head: {observed}"
+        );
+        assert!(observed.contains("\"observed\":\""), "{observed}");
         // The sender-side done event too.
         let _ = wait_event(engine, &joiner, "\"event\":\"done\"");
         ak_engine_free(engine);
@@ -5049,6 +5116,68 @@ mod task_tests {
         assert!(dead_probe.contains("\"reason\":"), "{dead_probe}");
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);
+    }
+
+    /// Unit shape of the `probe_observed` line (batchF G2): the three
+    /// `kind` verdicts of `observed_dial_head`'s rules and the counted
+    /// fields — pure formatting, no sockets.
+    #[test]
+    fn probe_observed_event_renders_the_three_kinds() {
+        let conn_id = [7u8; 16];
+        let candidate: SocketAddr = "192.168.1.9:52000".parse().expect("candidate");
+        let outside: SocketAddr = "203.0.113.4:9".parse().expect("outside source");
+        let mut report = ak_net::holepunch::PunchReport {
+            reachable: vec![candidate],
+            peer_observed_from: Some(outside),
+            packets_sent: 3,
+            packets_received: 2,
+            elapsed: Duration::from_millis(1200),
+        };
+        let candidate_line = probe_observed_event(&conn_id, Some(candidate), &report);
+        assert!(
+            candidate_line.contains("\"kind\":\"candidate\""),
+            "{candidate_line}"
+        );
+        assert!(
+            candidate_line.contains("\"observed\":\"192.168.1.9:52000\""),
+            "{candidate_line}"
+        );
+        assert!(
+            candidate_line.contains("\"phase\":\"send\""),
+            "{candidate_line}"
+        );
+        assert!(
+            candidate_line.contains("\"reachable\":1"),
+            "{candidate_line}"
+        );
+        assert!(
+            candidate_line.contains("\"packets_in\":2"),
+            "{candidate_line}"
+        );
+        assert!(
+            candidate_line.contains("\"elapsed_ms\":1200"),
+            "{candidate_line}"
+        );
+
+        // Rule 2 head (a peer-probe source outside the candidate list).
+        let observed_line = probe_observed_event(&conn_id, Some(outside), &report);
+        assert!(
+            observed_line.contains("\"kind\":\"observed\""),
+            "{observed_line}"
+        );
+        assert!(
+            observed_line.contains("\"observed\":\"203.0.113.4:9\""),
+            "{observed_line}"
+        );
+
+        // Nothing observed: still exactly one bounded line, `null` +
+        // `none` (the fail-open shape).
+        report.reachable.clear();
+        report.peer_observed_from = None;
+        report.packets_received = 0;
+        let none_line = probe_observed_event(&conn_id, None, &report);
+        assert!(none_line.contains("\"observed\":null"), "{none_line}");
+        assert!(none_line.contains("\"kind\":\"none\""), "{none_line}");
     }
 
     /// A remote disconnect reaches the peer's runtime: engine A owns a

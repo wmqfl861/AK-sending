@@ -92,6 +92,8 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskRuntimeFfi,
         TaskFfi;
 
+import 'connection_diagnostics.dart' show ConnectionDiagnosticsLog;
+
 /// CR-P2-05 (review 2026-11-11, item 1): the adaptive EVENT-poll cadence,
 /// in milliseconds, as a PURE function of observable activity — the
 /// decision [SimpleTransferService] re-makes on every activity transition
@@ -858,13 +860,23 @@ final class SimpleTransferService {
     _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
     final lastSeen = <String, int>{}; // THIS waiter's cross-poll ledger
     try {
-      return await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
+      final report = await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
             interval: opPollInterval,
             timeout: timeout,
             delay: _delay,
             ensureLive: _ensureLive,
             onPoll: () => _progressAdvancedSince(lastSeen, <String>[connId]),
           );
+      // G2: the GUI analog of the CLI's "connected via" fact — the
+      // address the engine actually transferred over (task_send's
+      // `peer`), one bounded line for the diagnostics export.
+      ConnectionDiagnosticsLog.shared.recordRaw('sent_via', {
+        'conn': connId,
+        'peer': report['peer'],
+        'files': report['files'],
+        'bytes': report['bytes'],
+      });
+      return report;
     } on TimeoutException {
       final cancelFailure = _tryCancelTaskConnection(runtime, connId);
       if (cancelFailure != null) {
@@ -1590,6 +1602,11 @@ final class SimpleTransferService {
   }
 
   void _route(TaskEvent event) {
+    // G2 (batchF 2026-11-13): every polled event passes the diagnostics
+    // ring buffer FIRST (it filters to the diagnostic class internally —
+    // bind/probe/connect/disconnect facts ride to the settings page's
+    // export; everything else drops, exactly like the branches below).
+    ConnectionDiagnosticsLog.shared.record(event);
     if (event is TaskConnectedEvent) {
       // The engine announces the CONNECTION (pairing bookkeeping) before
       // probing: a fresh row starts at `probing`; a row the pump already

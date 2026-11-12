@@ -3038,14 +3038,10 @@ mod tests {
             .await
         });
         let window = Duration::from_millis(1500);
-        let a_report = holepunch::probe_with_early_exit(
-            &a,
-            &[b_addr],
-            Duration::from_millis(25),
-            window,
-        )
-        .await
-        .expect("probe a");
+        let a_report =
+            holepunch::probe_with_early_exit(&a, &[b_addr], Duration::from_millis(25), window)
+                .await
+                .expect("probe a");
         let b_report = b_task.await.expect("join").expect("probe b");
 
         assert!(

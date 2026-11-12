@@ -417,6 +417,8 @@ int32_t ak_task_set_event_notify(
 
 `sender_bind` 事件（新增，2026-11-12 CR-P1-05）：发送端（create-code 发送角色与 join-send）与接收端对称的生命周期事件——携带 `addr`/`dual_stack`/`fallback_reason`/`reflexive`/`stun_error` 字段，形状沿用 `receiver_bind` 先例：发送端先绑定将来承载 QUIC 的双栈 socket，在同一 socket 上做有界 STUN 查询（同上 fail-open 语义），反射地址进入发送端自身 endpoint blob，随后该 socket 被 QUIC 拨号收养（端口等式由测试钉死）。§8.3 的 JSON 事件块不逐事件枚举——未知事件名必须被 Dart 解析器容忍（既有约定），此处仅作散文登记。
 
+`probe_observed` 事件（新增，2026-11-13 batchF G2，CR-P3-06 配套诊断；散文登记，同 `receiver_bind`/`sender_bind` 先例）：发送端每次 send 的前置同时探测轮结束时发出**恰好一条**（有无观测都发，fail-open 口径与探测轮一致），携带 `conn`（关联连接 id）、`observed`（观测到的对端地址 `ip:port`——静态序中首个被回显确认的候选，或候选表之外的对端探测源地址；无观测为 `null`）、`kind`（候选类型：`candidate`=公告候选被回显确认 / `observed`=候选表之外的对端探测源 / `none`=无观测）、`phase`（阶段：`send`=发送前置探测轮，后续阶段按需扩名）与计数字段 `reachable`/`packets_in`/`elapsed_ms`。探测轮自 CR-P3-06 起在静态序首个候选被回显确认后提前返回，`elapsed_ms` 因此可远小于 1 s 窗口。用途：GUI"导出连接诊断"（G2 第 3 件）收集本事件与 `receiver_bind`/`sender_bind`/`connected` 等供用户本地导出自查；Dart 解析器按既有约定把未知名落入 `TaskUnknownEvent`，旧版本互不影响。
+
 ### 8.2 op 结果 JSON（经 ak_pairing_op_result）
 
 ```json
@@ -457,6 +459,8 @@ wave-31 修订（复审 R30-P3-01）：`handshake_failed` 形状修正为与原�
 wave-31 修订（复审 R30-P2-02/P2-03、P2-06 残项）：**双方连接事实共享同一码 id**——`connected` 事件（双端各一）与 `ak_task_join` 结果均携带 `code_id`（32hex，与 create 结果一致），加入侧据此填充 conn→码映射兜底；**发送/接收进度行统一以连接 id 为 `job`**（接收行原"当前码 id"废止，见 §8.4）；`incoming_request` 登记与发布为同一临界区（连接已断后到达的 Offer 不再发布事件、直接拒绝，`request_closed` 之后的迟到 `incoming_request` 结构性不可能，见 §8.4）；接收保存夹为**每次传输一个不可变绑定**——`incoming_request.saveDir` 与 `done.saveDir` 携带引擎实际落盘的同一目录（`done.saveDir` 为新增字段：实际落盘结果，UI 完成态可显示真实目录）。
 
 wave-31 实现边界（P2-06）：冻结语义原定"save_dir 在同意决定时刻解析"（接受时从当前设置读取、落盘跟随）。ak-engine 的全部接收入口在入口处（Offer/同意点之前）即绑定 `LocalSaveTarget`，同意应答通道为纯 `oneshot<bool>`，FFI 层无法在决定时刻把新目录传给已进入引擎的接收——本波落地的是 wave-28 原报告允许的替代方案"绑定并展示同一个不可变实际目标"：绑定发生在传输开始（连接接受）时刻，事件与 `done` 展示同一绑定值，事件/横幅与实际落盘**永不错位**；pending 同意期间修改设置对进行中传输无效（对下一个请求生效）。
+
+batchF-G2 增补（2026-11-13，CR-P3-06）：新增 `probe_observed` 事件（发送前置探测轮的观测结论，`conn`/`observed`/`kind`/`phase`/`reachable`/`packets_in`/`elapsed_ms`）——不进入上方枚举块，散文登记见 §8.1 `sender_bind` 段后；探测轮同批提前返回（首个候选回显确认即出）。
 
 `ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
 "connections":[{"conn":"<32hex>","role":"sender","state":

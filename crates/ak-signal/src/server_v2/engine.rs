@@ -1628,6 +1628,19 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
             return;
         }
     }
+    // Close signaled: flush any frames already queued (notably the
+    // ERR_DEVICE_REPLACED reason from the replace path above) before the
+    // TLS shutdown — the select above is randomly fair between `closed`
+    // and `out.recv()`, so without this drain the reason frame can be
+    // skipped and the peer sees a bare EOF after all.
+    while let Ok(frame) = out.try_recv() {
+        if !matches!(
+            tokio::time::timeout(write_budget, write_frame(&mut write, &frame, Role::Server)).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+    }
     let _ = write.shutdown().await;
 }
 
@@ -1888,6 +1901,19 @@ fn process_hello(
             inner.next_conn_id = inner.next_conn_id.wrapping_add(1);
             let conn_id = inner.next_conn_id;
             if let Some(previous) = inner.conns.get(&device_id) {
+                // R36-P2-04 remainder (run 43321601964 diagnosis): the
+                // replaced connection gets the REASON FRAME before the
+                // close signal — a bare close reads as plain EOF on the
+                // client, `replace_closed` never sets, and the daemon's
+                // keeper reconnects IMMEDIATELY (backoff step 0),
+                // killing the one-shot (invite revoke) that replaced it:
+                // the exact connection war this loop used to cause by
+                // silence. 0x1001/`ERR_DEVICE_REPLACED` is the
+                // long-reserved code both client stacks already route.
+                deliver_msg(
+                    &previous.out,
+                    server_error(0x1001, "replaced by a newer connection"),
+                );
                 let _ = previous.close.send(true);
             }
             inner.conns.insert(
@@ -3363,6 +3389,50 @@ mod tests {
         assert!(cache.admit(digest, t0, window));
         assert!(!cache.admit(digest, t0 + Duration::from_secs(1), window));
         assert!(cache.admit(digest, t0 + Duration::from_secs(11), window));
+    }
+
+    /// R36-P2-04 remainder (run 43321601964 diagnosis): when a newer
+    /// same-device Hello replaces an older connection, the OLD connection
+    /// must receive the ERR_DEVICE_REPLACED reason FRAME before the close
+    /// — a bare close reads as plain EOF on the client, `replace_closed`
+    /// never sets, and the daemon keeper reconnects immediately (backoff
+    /// 0), re-killing the one-shot that replaced it (the invite-revoke
+    /// connection war). This pins the SERVER side of that contract; the
+    /// client pacing side is pinned in ak-session's keeper tests.
+    #[tokio::test]
+    async fn replaced_connection_receives_the_reason_frame_before_eof() {
+        let server = spawn_server().await;
+        let key = DeviceKeyPair::generate();
+        let mut first =
+            TestClient::connect(server.addr, &server.registry_id(), key.clone(), "a").await;
+        // Same device identity connects again: the server replaces the
+        // first connection.
+        let _second = TestClient::connect(server.addr, &server.registry_id(), key, "a").await;
+        // The FIRST connection must now see the reason frame — not a
+        // bare EOF — and only then the stream end.
+        let frame = first.recv().await;
+        match frame {
+            CtrlMessage::ServerError { code, message } => {
+                assert_eq!(code, 0x1001, "the reserved ERR_DEVICE_REPLACED code");
+                assert!(
+                    !message.is_empty(),
+                    "the reason carries a human-readable message"
+                );
+            }
+            other => panic!("expected ServerError(0x1001), got {other:?}"),
+        }
+        // After the frame, the stream closes: raw read returns None
+        // (EOF) or an error — recv() would panic on that, so read
+        // directly.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            crate::server_v2::framing::read_frame(&mut first.stream).await
+        })
+        .await;
+        assert!(
+            matches!(closed, Ok(Ok(None)) | Ok(Err(_)) | Err(_)),
+            "stream must end (EOF or error) after the reason frame: {closed:?}"
+        );
+        server.stop().await;
     }
 
     #[test]

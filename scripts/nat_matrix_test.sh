@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# CR-P1-05 (review 2026-11-11 §4.5, 改法第 5 条): the NAT matrix test.
+# CR-P1-05 (review 2026-11-11 §4.5, 改法第 5 条) + CR-P2-14 (batchF review
+# 2026-11-12: evidence-fidelity hardening): the NAT matrix test.
 #
 # HONESTY — what this is and is NOT:
 #   This is a SIMULATION of NAT/firewall behaviors with Linux network
@@ -18,41 +19,69 @@
 #   UDP); file data can structurally never traverse it — a failing case
 #   simply fails, it cannot "succeed through a server".
 #
-# Matrix (per docs/REVIEW_2026-11-11.zh-CN.md §4.5 acceptance):
-#   1. port-restricted <-> port-restricted ......... MUST transfer
-#   2. port-restricted (alice) <-> full-cone (bob) . MUST transfer
-#   3. IPv6 both sides, stateful firewalls ......... MUST transfer (v6 leg)
-#   4. symmetric <-> symmetric (--random-fully) .... MUST FAIL cleanly
-#      (the E3-class final wording lands in F11; here we assert the clear
-#      failure path that exists today: the CLI's bounded no-candidate
-#      wording and a non-zero exit — never a hang, never a fake success)
+# Matrix (CR-P2-14 semantics):
+#   1. port-restricted <-> port-restricted ... strict xfail until CR-P1-06
+#      is fixed (IPv4 tuple-conflict: the receiver's punch arrives at the
+#      sender's NAT first and the sender's SNAT then changes its external
+#      port; batchF review §4.3). Unexpected pass = RED ("flip to
+#      pass-v4"). After CR-P1-06: expect pass-v4.
+#   2. port-restricted (alice) <-> full-cone (bob) ... pass-v4: the
+#      transfer must ride the peer router's public address (10.10.0.1).
+#   3. IPv6 both sides, stateful firewalls ... pass-v6 (v4 data plane
+#      restricted to the services host; endpoints v6-only candidates).
+#   4. symmetric <-> symmetric (--random-fully) ... MUST FAIL cleanly
+#      (bounded wording, no hang, zero payload; in this closed simulation
+#      there is no v4 path, so a "success" means the fixture lies).
 #
-# Topology (fresh endpoint/router namespaces per case; the core+services
-# namespaces live for the whole run; RAII-style trap cleanup at exit):
+#   IPv4 cases do not configure endpoint IPv6 addresses AND set
+#   ip6tables FORWARD DROP on both routers (CR-P2-14: the batchF runs
+#   let the product bypass the NATs over IPv6 and counted it as v4
+#   success). Every case runs a FIXTURE SELF-CHECK before the transfer:
+#   one socket queries two STUN destinations; pcone/fullcone must show
+#   the SAME external port, symmetric must show DIFFERENT ones — else
+#   the case is judged "fixture invalid", not a product result.
 #
-#   akalice ──(10.10.1.0/24)── akr1 ──(core bridge, 10.10.0.0/24)── akr2 ──(10.10.2.0/24)── akbob
-#                                 │                                  │
-#                              [NAT A]                           [NAT B]
-#                                 └──────────── aksvc ─────────────┘
-#                                  (registry TCP + STUN UDP, 10.10.0.10)
+# Topology (fresh endpoint/router namespaces per case; core/inet/services
+# live for the whole run; RAII-style trap cleanup at exit):
+#
+#   akalice ─(10.10.1.0/24)─ akr1 ─┐                        ┌─(10.20.0.0/24)─ akr2 ─(10.10.2.0/24)─ akbob
+#                             [NAT] │      akcore (L2)       │      [NAT]
+#                                   ├─ 10.10.0.0/24 bridge ──┤ i-to-r2 10.20.0.254
+#                                 r1-to-c 10.10.0.1          │
+#                                                            │
+#                          aksvc 10.10.0.10 (registry+STUN)  │
+#                          c-to-i 10.10.0.254 ───────────────┘ (akinet, the
+#                                                                   "public internet"
+#                                                                   routed hop — no
+#                                                                   NAT, enables
+#                                                                   mid-path TTL
+#                                                                   expiry for
+#                                                                   CR-P1-06's
+#                                                                   low-TTL punch)
+#   v6 (v6 case): 2001:77:1::/64 alice-r1, 2001:77:ff::/64 bridge,
+#                 2001:77:ee::/64 inet-r2, 2001:77:2::/64 r2-bob.
 #
 #   akr1/akr2 are the two "home routers" (independent conntrack and NAT
-#   rules per side); akcore hosts the L2 bridge tying r1/r2/svc together.
-#   Alice runs `task code-recv` (the RECEIVER), bob runs `task join-send`
-#   (the SENDER) — the product CLIs, real registry, real STUN, real QUIC,
-#   byte-identical sha256 assertion. Both sides point `--stun` at the
-#   in-topology responder so each side's future-QUIC socket learns its
-#   mapping (CR-P1-05: the sender verbs carry --stun too).
+#   rules per side); akinet is a plain routed hop between them (the
+#   "public internet" — forwarding only, no NAT, so a low-TTL packet can
+#   die mid-path as it would on the real internet); aksvc hosts registry
+#   TCP + two STUN UDP responders (the second exists for the fixture
+#   self-check's two-destination probe). Alice runs `task code-recv`
+#   (the RECEIVER), bob runs `task join-send` (the SENDER) — the product
+#   CLIs, real registry, real STUN, real QUIC, byte-identical sha256
+#   assertion. Both sides point `--stun` at the in-topology responder.
 #
 # Skip rules (exit 0 with reasons, like scripts/check_targets.sh): not
-# Linux, no root and no passwordless sudo, missing ip/iptables tools, or a
-# kernel that refuses namespace/bridge setup. The privileged Linux-only
-# path is for CI (ubuntu runners) and rooted Linux hosts; the script
-# states that plainly instead of faking results.
+# Linux, no root and no passwordless sudo, missing ip/iptables/ping/
+# sha256sum/python3 tools, or a kernel that refuses namespace/bridge
+# setup. The privileged Linux-only path is for CI (ubuntu runners) and
+# rooted Linux hosts; the script states that plainly instead of faking
+# results.
 #
 # Usage:
 #   bash scripts/nat_matrix_test.sh [--skip-build] [--size-mb N]
-#   (CI: sudo bash scripts/nat_matrix_test.sh — see the nat-matrix job)
+#   (CI: sudo bash scripts/nat_matrix_test.sh --skip-build — see the
+#    nat-matrix job; the runner user builds, root orchestrates)
 
 set -uo pipefail
 
@@ -85,7 +114,7 @@ case "$(uname -s)" in
   *) skip "Linux-only network-namespace test (this host runs $(uname -s)); the privileged Linux path is for CI ubuntu runners and rooted Linux hosts" ;;
 esac
 
-for tool in ip iptables ping sha256sum; do
+for tool in ip iptables ping sha256sum python3; do
   command -v "$tool" >/dev/null 2>&1 || skip "required tool '$tool' not found in PATH"
 done
 
@@ -119,7 +148,8 @@ log "workspace: $WORK"
 # ---------------------------------------------------------------------------
 PIDS_REG="" PIDS_STUN="" PIDS_KIDS=""
 NS_A=akalice NS_B=akbob NS_R1=akr1 NS_R2=akr2 NS_CORE=akcore NS_SVC=aksvc
-ALL_NS=("$NS_A" "$NS_B" "$NS_R1" "$NS_R2" "$NS_CORE" "$NS_SVC")
+NS_INET=akinet
+ALL_NS=("$NS_A" "$NS_B" "$NS_R1" "$NS_R2" "$NS_CORE" "$NS_SVC" "$NS_INET")
 cleanup() {
   for pid in $PIDS_KIDS $PIDS_STUN $PIDS_REG; do
     kill "$pid" 2>/dev/null || true
@@ -135,25 +165,38 @@ trap cleanup EXIT INT TERM
 # 3. Topology builders.
 # ---------------------------------------------------------------------------
 # Interfaces (veth names must be <= 15 chars):
-#   alice: a-to-r1 (10.10.1.2/24, v6 2001:77:1::2/64)
-#   r1:    r1-to-a (10.10.1.1/24, v6 2001:77:1::1/64),
-#          r1-to-c (10.10.0.1/24, v6 2001:77:ff::1/64)
-#   core:  bridge akbr0 with c-to-r1, c-to-r2, c-to-svc (L2 only)
-#   r2:    r2-to-c (10.10.0.2/24, v6 2001:77:ff::2/64),
-#          r2-to-b (10.10.2.1/24, v6 2001:77:2::1/64)
-#   bob:   b-to-r2 (10.10.2.2/24, v6 2001:77:2::2/64)
+#   alice: a-to-r1 (10.10.1.2/24; v6 only in the v6 case)
+#   r1:    r1-to-a (10.10.1.1/24), r1-to-c (10.10.0.1/24)
+#   core:  bridge akbr0 with c-to-r1, c-to-svc, c-to-i (L2 only)
 #   svc:   svc-to-c (10.10.0.10/24)
+#   inet:  i-to-c (10.10.0.254/24, v6 2001:77:ff::254/64),
+#          i-to-r2 (10.20.0.254/24, v6 2001:77:ee::1/64)
+#   r2:    r2-to-i (10.20.0.2/24), r2-to-b (10.10.2.1/24)
+#   bob:   b-to-r2 (10.10.2.2/24)
 
 # Route/interface dump for every namespace — printed on topology smoke
 # failures so a CI log is self-diagnosing instead of a blind 40-minute
 # iteration cycle.
 dump_routes() {
-  for ns in "$NS_CORE" "$NS_SVC" "$NS_A" "$NS_B" "$NS_R1" "$NS_R2"; do
+  for ns in "${ALL_NS[@]}"; do
     log "--- routes in $ns:"
     ip -n "$ns" route show 2>&1 | while read -r line; do log "    $line"; done
     ip -n "$ns" -6 route show 2>&1 | while read -r line; do log "    $line"; done
     log "--- links in $ns:"
     ip -n "$ns" -br link 2>&1 | while read -r line; do log "    $line"; done
+  done
+}
+
+# conntrack dump of both NAT routers — printed on ANY case failure
+# (CR-P2-14 point 4: the batchF root-cause evidence was exactly this
+# table; make it automatic).
+dump_conntrack() {
+  local ns
+  for ns in "$NS_R1" "$NS_R2"; do
+    log "--- conntrack (udp) in $ns:"
+    ip netns exec "$ns" sh -c \
+      'command -v conntrack >/dev/null 2>&1 && conntrack -L -p udp 2>/dev/null || grep -a "udp" /proc/net/nf_conntrack 2>/dev/null' \
+      | while read -r line; do log "    $line"; done
   done
 }
 
@@ -165,10 +208,25 @@ link_ns() { # link_ns <ns-a> <if-a> <ns-b> <if-b>
   ip link set "$4" netns "$3"
 }
 
+# CR-P2-14 point 2: deleting a netns destroys its veths and their peers
+# ASYNCHRONOUSLY; recreating same-name interfaces races the kernel's
+# cleanup ("An interface with the same name exists in the target netns",
+# CI run 43188955077). Poll until the stale names are really gone.
+wait_iface_gone() { # wait_iface_gone <ns> <iface> [budget-deciseconds]
+  local ns="$1" iface="$2" budget="${3:-50}" waited=0
+  while ip -n "$ns" link show dev "$iface" >/dev/null 2>&1; do
+    [[ $waited -ge $budget ]] && return 1
+    sleep 0.1; waited=$((waited + 1))
+  done
+  return 0
+}
+
 build_core() {
-  # The core bridge + the services namespace live for the whole run.
+  # The core bridge, the "public internet" routed hop and the services
+  # namespace live for the whole run.
   make_ns "$NS_CORE"
   make_ns "$NS_SVC"
+  make_ns "$NS_INET"
   ip -n "$NS_CORE" link add akbr0 type bridge
   ip -n "$NS_CORE" link set akbr0 up
   link_ns "$NS_SVC" svc-to-c "$NS_CORE" c-to-svc
@@ -176,55 +234,86 @@ build_core() {
   ip -n "$NS_CORE" link set c-to-svc master akbr0
   ip -n "$NS_SVC" addr add 10.10.0.10/24 dev svc-to-c
   ip -n "$NS_SVC" link set svc-to-c up
+  link_ns "$NS_INET" i-to-c "$NS_CORE" c-to-i
+  ip -n "$NS_CORE" link set c-to-i up
+  ip -n "$NS_CORE" link set c-to-i master akbr0
+  ip -n "$NS_INET" addr add 10.10.0.254/24 dev i-to-c
+  ip -n "$NS_INET" -6 addr add 2001:77:ff::254/64 dev i-to-c
+  ip -n "$NS_INET" link set i-to-c up
+  # akinet is a plain ROUTED hop (the "public internet"): forwarding on,
+  # no NAT, default-accept filtering — its whole purpose is to give
+  # low-TTL packets a mid-path place to expire (CR-P1-06 改法 5).
+  ip netns exec "$NS_INET" sysctl -qw net.ipv4.ip_forward=1
+  ip netns exec "$NS_INET" sysctl -qw net.ipv6.conf.all.forwarding=1
+  ip netns exec "$NS_INET" sysctl -qw net.ipv4.conf.all.rp_filter=0
 }
 
+# build_case_topology <use_v6:0|1>
+#  Fresh endpoints and routers per case. For v4 cases (use_v6=0) the
+#  endpoints get NO IPv6 addresses at all (CR-P2-14 point 1: with v6
+#  configured, the product simply talked v6 past the NATs under test);
+#  the routers additionally get ip6tables FORWARD DROP in case_pass.
 build_case_topology() {
-  # Fresh endpoints and routers per case; they re-attach to the persistent
-  # core bridge with fresh veths.
+  local use_v6="$1"
   for ns in "$NS_A" "$NS_B" "$NS_R1" "$NS_R2"; do
     ip netns del "$ns" 2>/dev/null || true
   done
+  # Wait for the asynchronous veth teardown (see wait_iface_gone): the
+  # core/inet-side peers of the deleted routers' links must be gone
+  # before same-name links are recreated.
+  wait_iface_gone "$NS_CORE" c-to-r1 || { log "FAIL: stale c-to-r1 never vanished"; return 1; }
+  wait_iface_gone "$NS_CORE" c-to-r2 || { log "FAIL: stale c-to-r2 never vanished"; return 1; }
+  wait_iface_gone "$NS_INET" i-to-r2 || { log "FAIL: stale i-to-r2 never vanished"; return 1; }
   for ns in "$NS_A" "$NS_B" "$NS_R1" "$NS_R2"; do
     make_ns "$ns" || return 1
   done
+  # r1 attaches to the core bridge; r2 attaches to the "public internet".
   link_ns "$NS_R1" r1-to-c "$NS_CORE" c-to-r1
-  link_ns "$NS_R2" r2-to-c "$NS_CORE" c-to-r2
   ip -n "$NS_CORE" link set c-to-r1 up
-  ip -n "$NS_CORE" link set c-to-r2 master akbr0
-  ip -n "$NS_CORE" link set c-to-r2 up 2>/dev/null || true
-  ip -n "$NS_CORE" link set c-to-r1 master akbr0 2>/dev/null || true
+  ip -n "$NS_CORE" link set c-to-r1 master akbr0
+  link_ns "$NS_R2" r2-to-i "$NS_INET" i-to-r2
+  ip -n "$NS_INET" link set i-to-r2 up
   # Alice <-> r1.
   link_ns "$NS_A" a-to-r1 "$NS_R1" r1-to-a
   ip -n "$NS_A" addr add 10.10.1.2/24 dev a-to-r1
-  ip -n "$NS_A" -6 addr add 2001:77:1::2/64 dev a-to-r1
   ip -n "$NS_A" link set a-to-r1 up
   ip -n "$NS_A" route add default via 10.10.1.1
-  ip -n "$NS_A" -6 route add default via 2001:77:1::1
   ip -n "$NS_R1" addr add 10.10.1.1/24 dev r1-to-a
-  ip -n "$NS_R1" -6 addr add 2001:77:1::1/64 dev r1-to-a
   ip -n "$NS_R1" addr add 10.10.0.1/24 dev r1-to-c
-  ip -n "$NS_R1" -6 addr add 2001:77:ff::1/64 dev r1-to-c
   ip -n "$NS_R1" link set r1-to-a up
   ip -n "$NS_R1" link set r1-to-c up
   # Bob <-> r2.
   link_ns "$NS_B" b-to-r2 "$NS_R2" r2-to-b
   ip -n "$NS_B" addr add 10.10.2.2/24 dev b-to-r2
-  ip -n "$NS_B" -6 addr add 2001:77:2::2/64 dev b-to-r2
   ip -n "$NS_B" link set b-to-r2 up
   ip -n "$NS_B" route add default via 10.10.2.1
-  ip -n "$NS_B" -6 route add default via 2001:77:2::1
   ip -n "$NS_R2" addr add 10.10.2.1/24 dev r2-to-b
-  ip -n "$NS_R2" -6 addr add 2001:77:2::1/64 dev r2-to-b
-  ip -n "$NS_R2" addr add 10.10.0.2/24 dev r2-to-c
-  ip -n "$NS_R2" -6 addr add 2001:77:ff::2/64 dev r2-to-c
+  ip -n "$NS_R2" addr add 10.20.0.2/24 dev r2-to-i
   ip -n "$NS_R2" link set r2-to-b up
-  ip -n "$NS_R2" link set r2-to-c up
-  # Routing: each router knows the peer LAN via the core; endpoints default
-  # to their router; the services host reaches both routers directly.
-  ip -n "$NS_R1" route add 10.10.2.0/24 via 10.10.0.2
-  ip -n "$NS_R2" route add 10.10.1.0/24 via 10.10.0.1
-  ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::2
-  ip -n "$NS_R2" -6 route add 2001:77:1::/64 via 2001:77:ff::1
+  ip -n "$NS_R2" link set r2-to-i up
+  if [[ "$use_v6" -eq 1 ]]; then
+    ip -n "$NS_A" -6 addr add 2001:77:1::2/64 dev a-to-r1
+    ip -n "$NS_A" -6 route add default via 2001:77:1::1
+    ip -n "$NS_R1" -6 addr add 2001:77:1::1/64 dev r1-to-a
+    ip -n "$NS_R1" -6 addr add 2001:77:ff::1/64 dev r1-to-c
+    ip -n "$NS_B" -6 addr add 2001:77:2::2/64 dev b-to-r2
+    ip -n "$NS_B" -6 route add default via 2001:77:2::1
+    ip -n "$NS_R2" -6 addr add 2001:77:2::1/64 dev r2-to-b
+    ip -n "$NS_R2" -6 addr add 2001:77:ee::2/64 dev r2-to-i
+    ip -n "$NS_INET" -6 addr add 2001:77:ee::1/64 dev i-to-r2
+  fi
+  # Routing: endpoints default to their router; r1 reaches bob's LAN via
+  # the "public internet" hop; r2 defaults to it; inet routes both LANs;
+  # svc returns to alice directly and to bob via the internet hop.
+  ip -n "$NS_R1" route add 10.10.2.0/24 via 10.10.0.254
+  ip -n "$NS_R2" route add 10.10.0.0/24 via 10.20.0.254
+  ip -n "$NS_R2" route add 10.10.1.0/24 via 10.20.0.254
+  ip -n "$NS_INET" route add 10.10.1.0/24 via 10.10.0.1
+  ip -n "$NS_INET" route add 10.10.2.0/24 via 10.20.0.2
+  ip -n "$NS_R1" -6 route add 2001:77:2::/64 via 2001:77:ff::254 2>/dev/null || true
+  ip -n "$NS_R2" -6 route add default via 2001:77:ee::1 2>/dev/null || true
+  ip -n "$NS_INET" -6 route add 2001:77:1::/64 via 2001:77:ff::1 2>/dev/null || true
+  ip -n "$NS_INET" -6 route add 2001:77:2::/64 via 2001:77:ee::2 2>/dev/null || true
   for ns in "$NS_R1" "$NS_R2"; do
     ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.forwarding=1
@@ -233,10 +322,10 @@ build_case_topology() {
   # smoke runs BEFORE the NAT rules, so alice/bob traffic arrives with
   # its ORIGINAL source address and svc would drop the reply (no
   # route) — exactly the first CI run's "base topology broken".
-  # (After MASQUERADE the sources become the routers' core IPs, which
-  # are on-link, but the smoke must pass pre-NAT.)
+  # (After MASQUERADE the sources become on-link router addresses,
+  # but the smoke must pass pre-NAT. Bob's LAN now returns via akinet.)
   ip -n "$NS_SVC" route replace 10.10.1.0/24 via 10.10.0.1
-  ip -n "$NS_SVC" route replace 10.10.2.0/24 via 10.10.0.2
+  ip -n "$NS_SVC" route replace 10.10.2.0/24 via 10.10.0.254
   # Reverse-path filtering off everywhere: the punch traffic this suite
   # exists to test arrives from addresses the endpoint never talked to
   # (the peer's NAT reflection), which strict rp_filter would drop as
@@ -269,7 +358,7 @@ nat_rules() {
       ;;
     fullcone)
       # 1:1 static DNAT (port-preserving) + unconditional inbound UDP to the
-      # LAN host: any outsider may send to the published endpoint = full cone.
+      # LAN host: any outsiders may send to the published endpoint = full cone.
       local host_ip
       host_ip="${subnet%0/24}2"
       ip netns exec "$ns" iptables -A FORWARD -i "$lan" -j ACCEPT
@@ -284,7 +373,8 @@ nat_rules() {
     control-only)
       # v6 case: the v4 data plane must die (peer dials are not to the
       # services host), while the control plane (registry/STUN, always
-      # initiated outbound toward 10.10.0.10) stays alive.
+      # initiated outbound toward 10.10.0.10) stays alive. No MASQUERADE:
+      # svc holds explicit return routes.
       ip netns exec "$ns" iptables -A FORWARD -i "$lan" -d 10.10.0.10 -j ACCEPT
       ;;
   esac
@@ -301,12 +391,22 @@ v6_firewall() {
   ip netns exec "$ns" ip6tables -A FORWARD -i "$lan" -j ACCEPT
 }
 
+# v6_blocked <router-ns>: IPv4 cases must not leak v6 past the NAT under
+# test even if some future edit re-adds endpoint v6 addresses (belt to
+# the suspenders of not configuring them at all).
+v6_blocked() {
+  ip netns exec "$1" ip6tables -P FORWARD DROP
+  ip netns exec "$1" ip6tables -F FORWARD
+}
+
 # ---------------------------------------------------------------------------
-# 4. Services: the real registry + the real standalone STUN responder
-#    (F3's `ak-cli stun-server`), both inside the services namespace.
+# 4. Services: the real registry + TWO standalone STUN responders (the
+#    second is the fixture self-check's second destination), all inside
+#    the services namespace.
 # ---------------------------------------------------------------------------
 REG_PORT=17300
 STUN_PORT=17101
+STUN_PORT2=17102
 start_services() {
   mkdir -p "$WORK/svc-id"
   ip netns exec "$NS_SVC" "$CLI" registry-server \
@@ -315,7 +415,10 @@ start_services() {
   PIDS_REG=$!
   ip netns exec "$NS_SVC" "$CLI" stun-server --port "$STUN_PORT" \
     >"$WORK/stun.log" 2>&1 &
-  PIDS_STUN=$!
+  PIDS_STUN="$!"
+  ip netns exec "$NS_SVC" "$CLI" stun-server --port "$STUN_PORT2" \
+    >"$WORK/stun2.log" 2>&1 &
+  PIDS_STUN="$PIDS_STUN $!"
   local waited=0 line
   while [[ $waited -lt 300 ]]; do
     grep -q "registry id (pin with --registry-fp): " "$WORK/registry.log" 2>/dev/null && break
@@ -326,16 +429,85 @@ start_services() {
   [[ "${#REG_FP}" -eq 64 ]] || { log "FAIL: registry did not come up (log: $(tail -3 "$WORK/registry.log" 2>/dev/null))"; return 1; }
   waited=0
   while [[ $waited -lt 150 ]]; do
-    grep -q "stun responder" "$WORK/stun.log" 2>/dev/null && break
+    grep -q "stun responder" "$WORK/stun.log" 2>/dev/null \
+      && grep -q "stun responder" "$WORK/stun2.log" 2>/dev/null && break
     sleep 0.2; waited=$((waited + 1))
   done
   grep -q "stun responder" "$WORK/stun.log" 2>/dev/null \
     || { log "FAIL: stun-server did not come up (log: $(tail -3 "$WORK/stun.log" 2>/dev/null))"; return 1; }
-  log "services up: registry 10.10.0.10:$REG_PORT (fp ${REG_FP:0:8}…), stun 10.10.0.10:$STUN_PORT"
+  grep -q "stun responder" "$WORK/stun2.log" 2>/dev/null \
+    || { log "FAIL: second stun-server did not come up (fixture self-check destination)"; return 1; }
+  log "services up: registry 10.10.0.10:$REG_PORT (fp ${REG_FP:0:8}…), stun :$STUN_PORT + :$STUN_PORT2 (fixture probe)"
 }
 
 # ---------------------------------------------------------------------------
-# 5. One transfer case. run_case <case-name> <expect: pass|fail|pass-v6>
+# 5. Fixture self-check (CR-P2-14 point 3): from ONE UDP socket inside an
+#    endpoint namespace, query the TWO STUN destinations; the two
+#    XOR-MAPPED ports reveal the router's mapping behavior:
+#      pcone/fullcone -> SAME external port (endpoint-independent)
+#      symmetric      -> DIFFERENT ports (per-destination random)
+#    A router that does not behave as its mode claims makes every
+#    downstream result meaningless — the case is judged "fixture
+#    invalid", never a product pass/fail.
+# ---------------------------------------------------------------------------
+fixture_probe() { # fixture_probe <ns> -> prints "PORT1 PORT2" or fails
+  ip netns exec "$1" python3 - <<'PY'
+import socket, struct, os, sys
+
+def query(sock, addr):
+    txid = os.urandom(12)
+    msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txid
+    for _ in range(4):
+        sock.sendto(msg, addr)
+        sock.settimeout(1.0)
+        try:
+            data, _ = sock.recvfrom(560)
+        except socket.timeout:
+            continue
+        if len(data) < 20:
+            continue
+        off = 20
+        while off + 4 <= len(data):
+            atype, alen = struct.unpack("!HH", data[off:off + 4])
+            body = data[off + 4:off + 4 + alen]
+            if atype == 0x0020 and alen >= 8:  # XOR-MAPPED-ADDRESS
+                xport = struct.unpack("!H", body[2:4])[0]
+                return xport ^ 0x2112
+            off += 4 + alen
+    return None
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+p1 = query(s, ("10.10.0.10", 17101))
+p2 = query(s, ("10.10.0.10", 17102))
+if p1 is None or p2 is None:
+    print("PROBE-FAIL")
+    sys.exit(1)
+print(f"{p1} {p2}")
+PY
+}
+
+# fixture_check <ns> <mode>: judges the probe against the mode's claim.
+fixture_check() {
+  local ns="$1" mode="$2" out p1 p2
+  out="$(fixture_probe "$ns")" || { log "FAIL: fixture probe ($ns) got no STUN answers"; return 1; }
+  read -r p1 p2 <<<"$out"
+  log "    fixture ($ns/$mode): same-socket ports $p1 vs $p2"
+  case "$mode" in
+    pcone|fullcone)
+      [[ "$p1" == "$p2" ]] || { log "FAIL: fixture invalid — $mode must map one socket to ONE external port ($p1 != $p2)"; return 1; }
+      ;;
+    symmetric)
+      [[ "$p1" != "$p2" ]] || { log "FAIL: fixture invalid — symmetric must remap per destination ($p1 == $p2)"; return 1; }
+      ;;
+    control-only)
+      # v6 case routers do no v4 NAT (no MASQUERADE) — nothing to assert.
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 6. One transfer case. run_case <name> <expect: pass-v4|xfail|fail|pass-v6>
 #    alice = `task code-recv` (receiver), bob = `task join-send` (sender).
 # ---------------------------------------------------------------------------
 wait_for_text() { # wait_for_text <file> <needle> <timeout-secs> -> 0/1
@@ -347,10 +519,20 @@ wait_for_text() { # wait_for_text <file> <needle> <timeout-secs> -> 0/1
   return 1
 }
 
+print_via() { # connected-via of a case, for the log regardless of outcome
+  local via
+  via="$(grep -m1 '\[task\] connected via ' "$1" 2>/dev/null | awk '{print $NF}')"
+  if [[ -n "$via" ]]; then
+    log "    connected-via: $via"
+  else
+    log "    connected-via: (none — transfer never connected)"
+  fi
+}
+
 run_case() {
   # NOTE: split declarations — under `set -u`, one `local` line expands
-  # ALL its words BEFORE assigning, so `case_dir="$WORK/$case_name"` on
-  # the same line would see $case_name unbound (the round-2 CI failure).
+  # ALL its words BEFORE assigning, so a later field referencing an
+  # earlier one would see it unbound (the round-2 CI failure).
   local case_name="$1" expect="$2"
   local case_dir="$WORK/$case_name"
   mkdir -p "$case_dir/id-alice" "$case_dir/id-bob" "$case_dir/out" "$case_dir/src"
@@ -401,7 +583,7 @@ run_case() {
   kill "$recv_pid" 2>/dev/null
 
   local send_log="$case_dir/send.log" recv_log="$case_dir/recv.log"
-  if [[ "$expect" == "pass" || "$expect" == "pass-v6" ]]; then
+  if [[ "$expect" == "pass-v4" || "$expect" == "pass-v6" ]]; then
     grep -q "\[task\] done:" "$send_log" \
       || { log "FAIL [$case_name]: sender did not complete (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
     grep -q "\[task\] received" "$recv_log" \
@@ -411,8 +593,14 @@ run_case() {
     local via
     via="$(grep -m1 '\[task\] connected via ' "$send_log" | awk '{print $NF}')"
     if [[ "$expect" == "pass-v6" ]]; then
-      [[ "$via" == *:* ]] \
+      [[ "$via" == *:* && "$via" != *.* ]] \
         || { log "FAIL [$case_name]: expected the IPv6 leg, carried by '$via'"; return 1; }
+    else
+      # pass-v4: the ride MUST be the peer router's public (core) address —
+      # a private 10.10.1.x/10.10.2.x or a v6 form means the case is not
+      # proving what it claims (CR-P2-14 point 1).
+      [[ "$via" == 10.10.0.1:* ]] \
+        || { log "FAIL [$case_name]: expected the v4 reflexive leg via alice's router (10.10.0.1), got '$via'"; return 1; }
     fi
     local sum_src sum_dst
     sum_src="$(sha256sum "$case_dir/src/payload.bin" | awk '{print $1}')"
@@ -420,52 +608,82 @@ run_case() {
     [[ -n "$sum_dst" && "$sum_src" == "$sum_dst" ]] \
       || { log "FAIL [$case_name]: payload sha256 mismatch (src=$sum_src dst=$sum_dst)"; return 1; }
     log "PASS [$case_name]: direct transfer, ${SIZE_MB}MiB byte-identical via $via"
+  elif [[ "$expect" == "xfail" ]]; then
+    # Strict expected-failure (CR-P2-14 point 6): the case must fail the
+    # documented way while CR-P1-06 is open — and an unexpected PASS is a
+    # RED (the expectation has become stale: flip the case to pass-v4).
+    if grep -q "\[task\] done:" "$send_log"; then
+      print_via "$send_log"
+      log "FAIL [$case_name]: UNEXPECTEDLY PASSED — this case is marked xfail for CR-P1-06; if that is fixed, flip the expectation to pass-v4"
+      return 1
+    fi
+    [[ $send_rc -ne 0 ]] \
+      || { log "FAIL [$case_name]: xfail case exited 0 without completing"; return 1; }
+    grep -q "no candidate accepted the connection" "$send_log" \
+      || { log "FAIL [$case_name]: the xfail failure must be the bounded no-candidate wording (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
+    if [[ -e "$case_dir/out/payload.bin" ]]; then
+      log "FAIL [$case_name]: payload landed despite the failed transfer — impossible without a relay (P0-class)"
+      return 1
+    fi
+    print_via "$send_log"
+    log "PASS [$case_name]: xfail held (CR-P1-06 still open) — clean bounded failure, no data moved"
   else
     [[ $send_rc -ne 0 ]] \
-      || { log "FAIL [$case_name]: symmetric<->symmetric must NOT succeed (E3 territory)"; grep -m1 "done:" "$send_log"; return 1; }
+      || { log "FAIL [$case_name]: symmetric<->symmetric must NOT succeed (E3 territory)"; print_via "$send_log"; return 1; }
     grep -q "no candidate accepted the connection" "$send_log" \
       || { log "FAIL [$case_name]: the failure must be the bounded no-candidate wording (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
     if [[ -e "$case_dir/out/payload.bin" ]]; then
       log "FAIL [$case_name]: payload landed despite the failed transfer — impossible without a relay (P0-class)"
       return 1
     fi
+    print_via "$send_log"
     log "PASS [$case_name]: symmetric<->symmetric failed cleanly (bounded wording, no hang, no data moved)"
   fi
   return 0
 }
 
 # ---------------------------------------------------------------------------
-# 6. The matrix.
+# 7. The matrix.
 # ---------------------------------------------------------------------------
 FAILURES=0
 case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect>
   local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6"
   log "---- case $name: $desc"
-  build_case_topology || { log "FAIL [$name]: topology setup failed"; FAILURES=$((FAILURES + 1)); return; }
+  build_case_topology "$use_v6" || { log "FAIL [$name]: topology setup failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
   nat_rules "$NS_R1" r1-to-a r1-to-c 10.10.1.0/24 "$r1"
-  nat_rules "$NS_R2" r2-to-b r2-to-c 10.10.2.0/24 "$r2"
+  nat_rules "$NS_R2" r2-to-b r2-to-i 10.10.2.0/24 "$r2"
   if [[ "$use_v6" -eq 1 ]]; then
     v6_firewall "$NS_R1" r1-to-a
     v6_firewall "$NS_R2" r2-to-b
+  else
+    # CR-P2-14 point 1: no v6 leg may bypass the v4 NATs under test.
+    v6_blocked "$NS_R1"
+    v6_blocked "$NS_R2"
   fi
-  run_case "$name" "$expect" || FAILURES=$((FAILURES + 1))
+  # CR-P2-14 point 3: fixture self-check — the NATs must behave as their
+  # mode claims before any product result counts.
+  fixture_check "$NS_A" "$r1" || { log "FAIL [$name]: r1 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
+  fixture_check "$NS_B" "$r2" || { log "FAIL [$name]: r2 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
+  run_case "$name" "$expect" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
 }
 
 build_core || { log "FAIL: core topology setup failed (kernel refusing namespaces/bridges?)"; exit 1; }
 start_services || exit 1
 
-case_pass "pcone-pcone"    "port-restricted <-> port-restricted (MASQUERADE + stateful both)" pcone pcone 0 pass
-case_pass "pcone-fullcone" "port-restricted (alice) <-> full-cone DNAT (bob)"                 pcone fullcone 0 pass
+# CR-P1-06 open: pcone<->pcone over v4 fails on Linux-type NATs (the
+# batchF review's conntrack evidence); strict xfail until it is fixed.
+case_pass "pcone-pcone"    "port-restricted <-> port-restricted — xfail while CR-P1-06 is open" pcone pcone 0 xfail
+case_pass "pcone-fullcone" "port-restricted (alice) <-> full-cone DNAT (bob) — v4 reflexive leg" pcone fullcone 0 pass-v4
 if command -v ip6tables >/dev/null 2>&1; then
   case_pass "v6-stateful"  "IPv6 both sides behind stateful firewalls (v4 control-plane only)" control-only control-only 1 pass-v6
 else
   log "SKIP case v6-stateful: ip6tables not available on this host"
 fi
-case_pass "symm-symm"      "symmetric <-> symmetric (--random-fully; EXPECTED FAILURE)"        symmetric symmetric 0 fail
+case_pass "symm-symm"      "symmetric <-> symmetric (--random-fully; MUST FAIL cleanly)"        symmetric symmetric 0 fail
 
 log "======================================"
 if [[ $FAILURES -eq 0 ]]; then
-  log "RESULT: all runnable matrix cases PASS"
+  log "RESULT: all runnable matrix cases PASS (incl. fixture self-checks)"
   exit 0
 fi
 log "RESULT: $FAILURES matrix case(s) FAILED"

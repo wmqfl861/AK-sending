@@ -143,6 +143,32 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked --workspace --no-deps
 
+  # CR-P3-14 (H3, review 2026-11-11 §4.5): the frozen legacy plaintext
+  # signal plane lives behind the opt-in `legacy-plaintext-signal`
+  # feature (G5/E1 isolation) and still runs in production until E6
+  # deletes it -- but every default-graph job above deliberately never
+  # builds it, which left the frozen code with ZERO CI coverage (it
+  # could stop compiling unnoticed). Stopgap until E6: compile-check
+  # every target of both feature-carrying crates (ak-signal's legacy
+  # modules, plus ak-itests' t04/t07 whole test binaries whose
+  # required-features gate keeps them out of the default build), then
+  # run the ak-signal suite under the feature. Delete this job together
+  # with the legacy code in E6.
+  legacy-signal:
+    name: Legacy plaintext signal (frozen code gate, CR-P3-14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: legacy-signal
+      - name: cargo check (ak-signal + ak-itests, all targets, legacy feature)
+        run: cargo check --locked --all-targets -p ak-signal -p ak-itests --features legacy-plaintext-signal
+      - name: cargo test (ak-signal, legacy feature)
+        run: cargo test --locked -p ak-signal --features legacy-plaintext-signal
+
   # Flutter gate (CR-P2-06 fix 2): the 173+ widget/service tests and the
   # analyzer that previously ran only on the owner's machine. The SDK
   # version comes from .fvmrc at the repo root ({"flutter": "3.47.9"}),

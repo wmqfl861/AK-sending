@@ -11,10 +11,15 @@
 #   4. every received file is `cmp`-verified byte for byte;
 #   5. `pair list` shows A<->B pairing (explicit + trust-on-first-use) and
 #      `jobs list` shows a completed checkpoint on BOTH sides;
-#   6. (optional section, on by default; --skip-probe drops it) a local
-#      signal-server + TWO `probe` processes exchange candidates, punch and
-#      finish a pinned QUIC handshake (same coordination+data planes a real
-#      two-machine run would use).
+#   6. (optional section; --skip-probe drops it) a local signal-server +
+#      TWO `probe` processes exchange candidates, punch and finish a pinned
+#      QUIC handshake (same coordination+data planes a real two-machine run
+#      would use). CR-P3-14 (H3): since E1/G5 the DEFAULT build no longer
+#      carries these legacy-plaintext-signal subcommands, so the section
+#      first PROBES whether they exist and SKIPS (with a note, exit 0 for
+#      the smoke as a whole) when they do not -- only a feature-built
+#      binary (cargo build -p ak-cli --features legacy-plaintext-signal)
+#      exercises it.
 #
 # Usage:
 #   bash scripts/smoke_loopback.sh [OPTIONS]
@@ -260,9 +265,18 @@ assert_contains "$LOGS/pair-list-B.log" "fingerprint (full): $FP_A" "B book carr
 "$AK_BIN" --id-dir "$WORK/idB" jobs list > "$LOGS/jobs-B.log" 2>&1
 assert_contains "$LOGS/jobs-A.log" "1 job checkpoint(s) in " "A has one checkpoint"
 assert_contains "$LOGS/jobs-B.log" "1 job checkpoint(s) in " "B has one checkpoint"
-assert_contains "$LOGS/jobs-A.log" "$SEND_JOB receive completed " "A checkpoint: receive + completed"
-assert_contains "$LOGS/jobs-B.log" "$SEND_JOB send completed "    "B checkpoint: send + completed"
-note "pair books symmetric (A explicit, B TOFU); both checkpoints completed"
+# The checkpoint line is keyed by the engine RECORD id, not the wire job
+# id: record_id_for (ak-engine) hashes content id + peer + direction +
+# root, and by frozen design "no wire frame ever carries this value"
+# (Offer.job_id keeps the content id). H3/CR-P3-14 fix: this script's
+# original "wire job id appears in jobs list" assertion predated that
+# split and could never pass against the current engine -- assert the
+# direction+state line with any 32-hex record id instead.
+RECV_REC=$(sed -n 's/^\([0-9a-f]\{32\}\) receive completed.*/\1/p' "$LOGS/jobs-A.log" | head -1)
+SEND_REC=$(sed -n 's/^\([0-9a-f]\{32\}\) send completed.*/\1/p' "$LOGS/jobs-B.log" | head -1)
+[ ${#RECV_REC} -eq 32 ] || fail "A checkpoint lacks a '<record> receive completed' line (see $LOGS/jobs-A.log)"
+[ ${#SEND_REC} -eq 32 ] || fail "B checkpoint lacks a '<record> send completed' line (see $LOGS/jobs-B.log)"
+note "pair books symmetric (A explicit, B TOFU); both checkpoints completed (record ids $RECV_REC / $SEND_REC)"
 
 # ---------------------------------------------------------------------------
 # Step 8: probe section (signaling + STUN + hole punch + pinned QUIC)
@@ -270,6 +284,15 @@ note "pair books symmetric (A explicit, B TOFU); both checkpoints completed"
 if [ "$SKIP_PROBE" -eq 1 ]; then
   step "8/8 probe section skipped (--skip-probe)"
   note "transfer smoke passed; coordination-plane probe not exercised"
+elif ! "$AK_BIN" probe --help >/dev/null 2>&1 || ! "$AK_BIN" signal-server --help >/dev/null 2>&1; then
+  # CR-P3-14 (H3): the default build has no legacy plaintext signal plane
+  # (E1/G5 put `probe`/`signal-server` behind the legacy-plaintext-signal
+  # feature) -- the section used to die on an unknown-subcommand error.
+  # Probe for the subcommands and skip with a note instead of failing.
+  step "8/8 probe section skipped (no probe/signal-server in this build)"
+  note "this ak-cli lacks the legacy plaintext signal subcommands (default build"
+  note "since E1/G5; build with the legacy-plaintext-signal feature to exercise"
+  note "this section) -- transfer smoke itself fully passed"
 else
   step "8/8 probe: signal-server + two probe processes"
   # `probe --peer` wants the peer's DEVICE ID (the `device id:` line), not

@@ -88,5 +88,62 @@ class BannedDependencyTests(unittest.TestCase):
         self.assertNotEqual(checks.banned_crates(Path("does-not-exist.lock")), [])
 
 
+class ReviewStatusTableTests(unittest.TestCase):
+    """CR-P3-10: section-7 status table shape (columns + no 本提交)."""
+
+    @staticmethod
+    def _doc(*rows: str) -> str:
+        return (
+            "## 6. 门槛命令\n\n## 7. 状态表（执行 agent 每完成一项就更新）\n\n"
+            "| 编号 | 批次 | 状态 | 提交 | 证据摘要 |\n"
+            "|---|---|---|---|---|\n"
+            + "\n".join(rows)
+            + "\n\n## 8. 需所有者确认的事项\n"
+        )
+
+    def test_well_formed_rows_pass(self):
+        for row in [
+            "| CR-P1-01 | A | 已完成 | 3b3eb64 | CI 全绿 |",
+            "| R36-P2-04 剩余 | E / G6 | 已完成 | 9029c08 | 服务端原因帧 |",
+            "| E2/G4 | G4 | 已完成 | f2c5fc4 | 确认窗口 30s→120s |",
+            # Blank 提交/证据摘要 cells are real columns, not stray pipes.
+            "| CR-P2-08 | E | 待所有者（E1） | | |",
+            "| CR-P2-12 | F0 | 未开始 | | 2026-11-12 新增 |",
+        ]:
+            with self.subTest(row=row):
+                rows_checked, errors = checks.status_table_issues(self._doc(row))
+                self.assertEqual((rows_checked, errors), (1, []))
+
+    def test_six_column_row_fails(self):
+        rows_checked, errors = checks.status_table_issues(
+            self._doc("| CR-P1-01 | A | 已完成 | 3b3eb64 | CI 全绿 | 多余列 |")
+        )
+        self.assertEqual(rows_checked, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("6 columns", errors[0])
+        self.assertIn("expected 5", errors[0])
+
+    def test_placeholder_row_fails(self):
+        rows_checked, errors = checks.status_table_issues(
+            self._doc("| CR-P3-09 | G1 | 代码完成，验收中 | 本提交 | 证据 |")
+        )
+        self.assertEqual(rows_checked, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("本提交", errors[0])
+
+    def test_escaped_pipe_keeps_five_columns(self):
+        # CR-P3-02 shape: \| inside cell text is not a column separator.
+        rows_checked, errors = checks.status_table_issues(
+            self._doc(r'| CR-P3-02 | E | 已完成 | 44e4cbd | windows_incompatible（<>"\|?* 五字符） |')
+        )
+        self.assertEqual((rows_checked, errors), (1, []))
+
+    def test_missing_section_fails_closed(self):
+        rows_checked, errors = checks.status_table_issues("## 8. 其他\n\n| CR-P1-01 | A | 已完成 | x | y |\n")
+        self.assertEqual(rows_checked, 0)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("not found", errors[0])
+
+
 if __name__ == "__main__":
     unittest.main()

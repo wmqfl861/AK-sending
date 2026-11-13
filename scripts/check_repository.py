@@ -37,6 +37,18 @@ BANNED_CRATE_PATTERNS = ("relay", "turn", "iroh", "webrtc", "str0m", "datachanne
 # Explicit names for crates whose names dodge the substring patterns.
 BANNED_CRATE_NAMES = {"coturn", "libquic-tunnel"}
 
+# CR-P3-10 leftover (REVIEW_2026-11-11.zh-CN.md §4/§5, 2026-11-12 evening
+# re-review): "集成者每次回写状态表后，用脚本检查列数和'本提交'字样".
+# The section 7 status table has 5 columns (编号/批次/状态/提交/证据摘要);
+# every execution row must keep exactly 5 columns (escaped \| is cell text,
+# not a separator) and the 提交 column must carry a commit hash, never the
+# "本提交" placeholder.
+REVIEW_DOC = "docs/REVIEW_2026-11-11.zh-CN.md"
+STATUS_TABLE_HEADING = "## 7."
+STATUS_ROW_PREFIXES = ("| CR-", "| R36", "| E")
+STATUS_TABLE_COLUMNS = 5
+COMMIT_PLACEHOLDER = "本提交"
+
 EXPECTED_ARCHITECTURE = {
     "schema_version": 1,
     "project": "AK-sending",
@@ -87,6 +99,54 @@ def banned_crates(lockfile: Path) -> list[str]:
         if lowered in BANNED_CRATE_NAMES or any(p in lowered for p in BANNED_CRATE_PATTERNS):
             found.append(name)
     return sorted(set(found))
+
+
+def status_table_issues(text: str) -> tuple[int, list[str]]:
+    """CR-P3-10: validate the review doc's section-7 status table.
+
+    Every table row whose ID cell starts with CR-/R36/E (i.e. the execution
+    rows; header/separator rows are excluded by the prefix match) must have
+    exactly 5 columns and must not use the "本提交" placeholder in place of a
+    commit hash. Column counting is escape-aware: ``\\|`` inside a cell is
+    literal text (e.g. CR-P3-02's ``<>\"\\|?*``), never a separator. Empty
+    leading/trailing fragments come from the delimiting pipes; interior empty
+    fragments are real empty cells (e.g. CR-P2-08's blank 提交/证据摘要).
+    Returns (rows_checked, errors) and fails closed when the section is gone.
+    """
+    lines = text.splitlines()
+    start = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith(STATUS_TABLE_HEADING):
+            start = i
+        elif start is not None and line.startswith("## "):
+            end = i
+            break
+    if start is None:
+        return 0, [f"{REVIEW_DOC}: status table section not found"]
+    rows = 0
+    errors: list[str] = []
+    for i in range(start + 1, end):
+        row = lines[i].lstrip()
+        if not row.startswith(STATUS_ROW_PREFIXES):
+            continue
+        rows += 1
+        cells = re.split(r"(?<!\\)\|", row)
+        if cells and cells[0].strip() == "":
+            cells = cells[1:]
+        if cells and cells[-1].strip() == "":
+            cells = cells[:-1]
+        if len(cells) != STATUS_TABLE_COLUMNS:
+            errors.append(
+                f"{REVIEW_DOC}:{i + 1}: status table row has {len(cells)} columns, "
+                f"expected {STATUS_TABLE_COLUMNS}"
+            )
+        if COMMIT_PLACEHOLDER in row:
+            errors.append(
+                f'{REVIEW_DOC}:{i + 1}: status table row uses "{COMMIT_PLACEHOLDER}" '
+                "placeholder instead of a commit hash"
+            )
+    return rows, errors
 
 
 def check(root: Path) -> dict:
@@ -158,6 +218,14 @@ def check(root: Path) -> dict:
                 )
     source_files = sorted((root / "crates").rglob("*.rs"))
     rust_tests = sum(p.read_text(encoding="utf-8").count("#[test]") for p in source_files)
+    # CR-P3-10: gate the review status table's shape after every write-back.
+    try:
+        status_rows, status_errors = status_table_issues(
+            (root / REVIEW_DOC).read_text(encoding="utf-8")
+        )
+    except OSError as exc:
+        status_rows, status_errors = 0, [f"cannot read {REVIEW_DOC}: {exc}"]
+    errors.extend(status_errors)
     # Contract consistency vs the frozen docs/contracts (wave-24 advisory
     # add-on, Codex final review #1). Appended call only: any drift or crash
     # reported here is a WARNING, never a gate failure, so every check above
@@ -181,6 +249,7 @@ def check(root: Path) -> dict:
         "markdown_files_checked": len(markdowns),
         "local_links_checked": checked_links,
         "rust_test_cases_present_not_executed": rust_tests,
+        "review_status_table_rows_checked": status_rows,
         "banned_dependency_scan": "clean" if not violations else violations,
         "network_tests_executed": False,
         "contract_consistency_warning": contract_consistency,

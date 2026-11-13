@@ -55,16 +55,13 @@
 //!   with reflexive/observed addresses strictly first; sequential on the
 //!   adopted socket, where concurrent QUIC endpoints on handles of one OS
 //!   socket would compete for its receive queue);
-//! * the pairing-time opener + mapping keepalive (CR-P1-07, review
-//!   2026-11-13 §4.4 改法 1) —
-//!   [`task_net::sender_pairing_opener`]: the SAME opener timing the CLI
-//!   always had, now run at PAIRING COMPLETION by both adapters (the GUI's
-//!   "pair, then pick files, then send" latency no longer outlives the
-//!   receiver's punch window), followed by probe-shaped keepalive packets
-//!   every [`task_net::OPENER_KEEPALIVE_INTERVAL`] until the send starts /
-//!   the connection ends / [`task_net::OPENER_KEEPALIVE_BUDGET`] elapses —
-//!   one shared function, so the CLI matrix exercises the exact code the
-//!   GUI runs;
+//! * the pairing-time opener + mapping keepalive (CR-P1-07 / CR-P3-15) —
+//!   [`task_net::sender_pairing_keeper`], one resident worker used by both
+//!   adapters: Idle sends normal-TTL ticks, Active pauses them, Closed
+//!   releases resources. Its absolute deadline survives absent sockets or
+//!   filtered targets; the adapter's lifecycle gate settles expiry only
+//!   when no admitted send owns the pairing. Recovery never repeats the
+//!   low-TTL opener or resets the budget;
 //! * the Windows receiver's low-TTL punch (CR-P1-08, review 2026-11-13
 //!   §4.4 改法 3) — the private `SocketTtlGuard` (the socket-level
 //!   `setsockopt(IP_TTL)` fallback for hosts without
@@ -255,11 +252,10 @@ pub const SENDER_DIAL_PAUSE: Duration = Duration::from_millis(300);
 /// NATs) — are refreshed with a full interval of margin.
 pub const OPENER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// CR-P1-07: total wall-clock budget of the pairing-time keepalive. The
-/// task-code TTL default is 10 minutes (wave-29 P2-04) — a paired-but-
-/// never-sent connection keeps its NAT mapping for exactly as long as
-/// the code that created it could still have served a transfer, then the
-/// honest expiry is a later send failing to connect.
+/// Local idle-hold policy limit, anchored once at pairing completion.
+/// The resident keeper never resets this deadline on failed sends. The
+/// adapter defers expiry while sends remain active; no socket or usable
+/// target changes this policy. This is not a claim about NAT timeout.
 pub const OPENER_KEEPALIVE_BUDGET: Duration = Duration::from_secs(10 * 60);
 
 /// Granularity at which bounded side loops poll their shared stop flag
@@ -1570,8 +1566,12 @@ impl Drop for SocketTtlGuard<'_> {
 /// no low-TTL send at all (the pre-CR-P1-08 Windows shape) for the NAT
 /// matrix's "receiver without low TTL" case. Such a receiver also
 /// delays its punch start — see [`punch_candidates`].
-/// CR-P3-16: compile environment reads only with the opt-in
-/// `exp-knobs` feature; default builds keep the unset behavior.
+///
+/// CR-P3-16 (review 2026-11-13-batchH §4): the read exists ONLY in
+/// `exp-knobs` builds (ak-session's cargo feature, default off — release
+/// builds must not enable it); a default build returns the constant
+/// `false`, bit-identical to the env-unset branch, and the variable's
+/// NAME is not compiled in at all (release `strings` stay clean).
 fn exp_no_low_ttl() -> bool {
     #[cfg(feature = "exp-knobs")]
     {
@@ -1860,7 +1860,8 @@ pub struct OpenerKeepaliveReport {
 }
 
 /// CR-P1-07 (review 2026-11-13 §4.4 改法 1), the SHARED sender-side
-/// pairing-time core both adapters call at PAIRING COMPLETION:
+/// one-shot pairing-time core. The adapters use the resident
+/// [`sender_pairing_keeper`] to avoid stop/restart ownership races:
 ///
 /// 1. the opener half — byte-identical to [`sender_reflexive_opener`]
 ///    ([`SENDER_DIAL_PAUSE`], then the adopted socket's first outbound
@@ -1871,6 +1872,9 @@ pub struct OpenerKeepaliveReport {
 ///    the SAME adopted socket, until the shared `stop` flag flips (the
 ///    send op sets it at its start; disconnect/teardown flip it too),
 ///    the connection/task ends, or [`OPENER_KEEPALIVE_BUDGET`] elapses.
+///    CR-P3-15: a FAILED or DECLINED send does not leave the flag set
+///    forever — the adapter restarts this half via
+///    [`resume_sender_keepalive`] within the budget's remaining slice.
 ///
 /// Why the keepalive exists: the CLI always sent seconds after pairing,
 /// inside the receiver's 4 s punch window; the GUI sends when the user
@@ -1888,7 +1892,7 @@ pub struct OpenerKeepaliveReport {
 /// itself is silent by design (no event; the end report is the
 /// adapter's optional bounded diagnostic). `None` adopted socket (bind
 /// failed / an older flow) runs the pause and reports zero — uniform
-/// timing, nothing to keep alive.
+/// timing, with a packet-free timer still enforcing the budget.
 pub async fn sender_pairing_opener<F>(
     adopted: Option<&std::net::UdpSocket>,
     static_order: &[SocketAddr],
@@ -1900,20 +1904,73 @@ where
 {
     let opener_packets = sender_reflexive_opener(adopted, static_order).await;
     on_opener(opener_packets);
-    let Some(adopted) = adopted else {
-        return OpenerKeepaliveReport {
-            opener_packets,
-            ..OpenerKeepaliveReport::default()
-        };
-    };
-    let Some((clone, targets)) = opener_send_handles(adopted, static_order) else {
-        return OpenerKeepaliveReport {
-            opener_packets,
-            ..OpenerKeepaliveReport::default()
-        };
-    };
+    let handles = adopted.and_then(|socket| opener_send_handles(socket, static_order));
+    let (clone, targets) = handles
+        .as_ref()
+        .map_or((None, &[][..]), |(socket, targets)| {
+            (Some(socket), targets.as_slice())
+        });
+    let (keepalive_packets, keepalive_ticks, stopped_early, budget_elapsed) =
+        keepalive_until(clone, targets, stop, OPENER_KEEPALIVE_BUDGET).await;
+    OpenerKeepaliveReport {
+        opener_packets,
+        keepalive_packets,
+        keepalive_ticks,
+        stopped_early,
+        budget_elapsed,
+    }
+}
+
+/// CR-P3-15 (review 2026-11-13-batchH §4, the shared core of the J2 fix):
+/// the RESUME half of the pairing-time opener — a keepalive-only restart
+/// after a send op failed or was declined, bounded by the REMAINING slice
+/// of the pairing's [`OPENER_KEEPALIVE_BUDGET`] (the caller computes it
+/// from the pairing-completion anchor; the budget is never reset by a
+/// resume). The low-TTL opener half deliberately does NOT re-run, and
+/// `on_opener`-shaped reporting does not exist here: the first attempt's
+/// QUIC traffic left both NAT mappings replied/assured inside their
+/// stream timeouts, and the keepalive's probe-shaped datagrams refresh
+/// that existing state from the first tick — so the contract's "exactly
+/// ONE `reflexive_opener` event per pairing" stays true. The end report's
+/// `budget_elapsed` is the adapter's convergence signal (a `None` adopted
+/// socket or an empty target filter still waits for stop/deadline;
+/// only the packet counters stay zero).
+pub async fn resume_sender_keepalive(
+    adopted: Option<&std::net::UdpSocket>,
+    static_order: &[SocketAddr],
+    stop: &AtomicBool,
+    remaining: Duration,
+) -> OpenerKeepaliveReport {
+    let handles = adopted.and_then(|socket| opener_send_handles(socket, static_order));
+    let (clone, targets) = handles
+        .as_ref()
+        .map_or((None, &[][..]), |(socket, targets)| {
+            (Some(socket), targets.as_slice())
+        });
+    let (keepalive_packets, keepalive_ticks, stopped_early, budget_elapsed) =
+        keepalive_until(clone, targets, stop, remaining).await;
+    OpenerKeepaliveReport {
+        opener_packets: 0,
+        keepalive_packets,
+        keepalive_ticks,
+        stopped_early,
+        budget_elapsed,
+    }
+}
+
+/// The keepalive loop shared by the pairing-time opener and the CR-P3-15
+/// resume: one probe-shaped packet per public target every
+/// [`OPENER_KEEPALIVE_INTERVAL`] until `stop` flips (→ `stopped_early`)
+/// or `budget` elapses measured from NOW (→ `budget_elapsed`). Returns
+/// `(packets, ticks, stopped_early, budget_elapsed)`.
+async fn keepalive_until(
+    clone: Option<&std::net::UdpSocket>,
+    targets: &[SocketAddr],
+    stop: &AtomicBool,
+    budget: Duration,
+) -> (usize, usize, bool, bool) {
     let started = tokio::time::Instant::now();
-    let deadline = started + OPENER_KEEPALIVE_BUDGET;
+    let deadline = started + budget;
     let mut next_tick = started + OPENER_KEEPALIVE_INTERVAL;
     let mut keepalive_packets = 0usize;
     let mut keepalive_ticks = 0usize;
@@ -1921,34 +1978,110 @@ where
         // Wake at the earlier of the next tick and the total budget; a
         // flipped stop flag returns within one STOP_POLL_INTERVAL.
         if sleep_polling_stop(next_tick.min(deadline), stop).await {
-            return OpenerKeepaliveReport {
-                opener_packets,
-                keepalive_packets,
-                keepalive_ticks,
-                stopped_early: true,
-                budget_elapsed: false,
-            };
+            return (keepalive_packets, keepalive_ticks, true, false);
         }
         if tokio::time::Instant::now() >= deadline {
-            return OpenerKeepaliveReport {
-                opener_packets,
-                keepalive_packets,
-                keepalive_ticks,
-                stopped_early: false,
-                budget_elapsed: true,
-            };
+            return (keepalive_packets, keepalive_ticks, false, true);
         }
         keepalive_ticks += 1;
         // A fresh nonce per tick (a real prober's nonce is time-derived;
         // the peer's echo responder never answers the all-zero reply
         // nonce either way).
         let packet = ak_net::holepunch::probe_packet(&punch_nonce());
-        for target in &targets {
-            if clone.send_to(&packet, target).is_ok() {
+        for target in targets {
+            if clone.is_some_and(|socket| socket.send_to(&packet, target).is_ok()) {
                 keepalive_packets += 1;
             }
         }
         next_tick += OPENER_KEEPALIVE_INTERVAL;
+    }
+}
+
+/// Activity of a paired sender. The adapter's lifecycle gate is the
+/// authority; changing to Active pauses probe packets, not the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderKeepaliveState {
+    /// No sends own the pairing: refresh any usable UDP targets.
+    Idle,
+    /// At least one send owns the pairing; QUIC supplies outbound traffic.
+    Active,
+    /// The pairing ended; release the keeper's socket clone and timer.
+    Closed,
+}
+
+/// One resident keeper per pairing, shared by FFI and CLI. The opener
+/// reports once; later Idle transitions only resume normal-TTL ticks.
+/// No socket/targets still waits for the SAME absolute deadline. At that
+/// deadline the adapter callback rechecks its gate; Active is never
+/// expired here. A last-send settlement after the deadline is handled by
+/// the adapter, so the worker parks on state changes rather than spinning.
+pub async fn sender_pairing_keeper<O, E>(
+    adopted: Option<&std::net::UdpSocket>,
+    candidates: &[SocketAddr],
+    deadline: tokio::time::Instant,
+    mut state: tokio::sync::watch::Receiver<SenderKeepaliveState>,
+    on_opener: O,
+    on_idle_deadline: E,
+) -> OpenerKeepaliveReport
+where
+    O: FnOnce(usize),
+    E: FnOnce(),
+{
+    let mut report = OpenerKeepaliveReport::default();
+    // Keep the opener's original pairing-time pause, but don't change a
+    // live QUIC socket's TTL if a send was admitted before the pause ends.
+    tokio::time::sleep(SENDER_DIAL_PAUSE).await;
+    if *state.borrow() == SenderKeepaliveState::Idle {
+        report.opener_packets = adopted
+            .and_then(|socket| opener_send_handles(socket, candidates))
+            .map_or(0, |(socket, targets)| {
+                send_opener_packets(&socket, &targets)
+            });
+    }
+    on_opener(report.opener_packets);
+    let handles = adopted.and_then(|socket| opener_send_handles(socket, candidates));
+    let mut next_tick = tokio::time::Instant::now() + OPENER_KEEPALIVE_INTERVAL;
+    let mut expiry = Some(on_idle_deadline);
+    loop {
+        let mode = *state.borrow_and_update();
+        if mode == SenderKeepaliveState::Closed {
+            report.stopped_early = !report.budget_elapsed;
+            return report;
+        }
+        let tick = tokio::time::sleep_until(next_tick);
+        let expires = tokio::time::sleep_until(deadline);
+        tokio::select! {
+            biased;
+            changed = state.changed() => {
+                if changed.is_err() {
+                    report.stopped_early = !report.budget_elapsed;
+                    return report;
+                }
+                next_tick = tokio::time::Instant::now() + OPENER_KEEPALIVE_INTERVAL;
+            }
+            _ = expires, if expiry.is_some() => {
+                report.budget_elapsed = true;
+                if let Some(callback) = expiry.take() {
+                    callback();
+                }
+            }
+            _ = tick, if mode == SenderKeepaliveState::Idle && expiry.is_some() => {
+                // Recheck after the wake; the gate may have admitted a
+                // send since this iteration inspected its watch value.
+                if *state.borrow() == SenderKeepaliveState::Idle {
+                    if let Some((socket, targets)) = &handles {
+                        report.keepalive_ticks += 1;
+                        let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+                        for target in targets {
+                            if socket.send_to(&packet, target).is_ok() {
+                                report.keepalive_packets += 1;
+                            }
+                        }
+                    }
+                }
+                next_tick = tokio::time::Instant::now() + OPENER_KEEPALIVE_INTERVAL;
+            }
+        }
     }
 }
 
@@ -4021,14 +4154,190 @@ mod tests {
             "ticks ≈ budget / interval (the deadline arm preempts the last tick): {report:?}"
         );
         // Without an adopted socket the opener count is 0 and the
-        // keepalive never runs (nothing to hold), on_opener still fires.
+        // packet counters stay zero but the policy timer still runs.
         let mut opener_count = None;
         let report = sender_pairing_opener(None, &[public], &stop, |packets| {
             opener_count = Some(packets)
         })
         .await;
         assert_eq!(opener_count, Some(0), "the event fires with zero");
-        assert_eq!(report, OpenerKeepaliveReport::default());
+        assert!(report.budget_elapsed);
+        assert_eq!(report.keepalive_packets, 0);
+    }
+
+    /// CR-P3-15 (coordinator review of batch J): a set stop flag beats
+    /// the budget EVEN WHEN THE DEADLINE PASSES — an active transfer
+    /// (whose send start set the flag) can never be ended by the idle
+    /// budget, no matter how long it runs past the anchor. The loop's
+    /// every wake checks the flag first, so a stop set before the
+    /// deadline returns `stopped_early`, never `budget_elapsed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_set_stop_flag_beats_the_budget() {
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        // A send starts well inside the (shortened-for-the-test) budget.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let report = keepalive_until(Some(&adopted), &[], &stop, Duration::from_millis(200)).await;
+        let (_, _, stopped_early, budget_elapsed) = report;
+        assert!(
+            stopped_early && !budget_elapsed,
+            "the send's stop flag ends the loop, not the budget: {stopped_early}/{budget_elapsed}"
+        );
+        // And the already-set flag returns immediately even with a huge
+        // budget (a transfer that runs for hours).
+        stop.store(true, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        let (_, _, stopped_early, budget_elapsed) =
+            keepalive_until(Some(&adopted), &[], &stop, OPENER_KEEPALIVE_BUDGET).await;
+        assert!(stopped_early && !budget_elapsed);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// No usable UDP path must not disable the pairing's local deadline.
+    #[tokio::test(start_paused = true)]
+    async fn keeper_without_send_targets_still_expires() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for (adopted, targets) in [
+            (None, vec![]),
+            (Some(&socket), vec!["127.0.0.1:9".parse().unwrap()]),
+            (Some(&socket), vec!["[2001:db8::1]:9".parse().unwrap()]),
+        ] {
+            let stop = AtomicBool::new(false);
+            let started = tokio::time::Instant::now();
+            let report =
+                resume_sender_keepalive(adopted, &targets, &stop, Duration::from_secs(2)).await;
+            assert!(
+                report.budget_elapsed,
+                "no UDP targets must still reach the idle deadline: {report:?}"
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(2));
+            assert_eq!(report.keepalive_packets, 0);
+        }
+    }
+
+    /// CR-P3-15: the RESUME half — after a failed/declined send, the
+    /// keepalive restarts within the caller-supplied REMAINING budget,
+    /// keepalive-only (no low-TTL opener half, zero opener packets) from
+    /// the adopted socket's port toward the same public targets, and the
+    /// stop flag still ends it promptly (the next send start).
+    #[tokio::test(start_paused = true)]
+    async fn resumed_keepalive_ticks_within_the_remaining_budget() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_port = target.local_addr().expect("target addr").port();
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let adopted_port = adopted.local_addr().expect("adopted addr").port();
+        let public: SocketAddr = format!("[::ffff:127.0.0.1]:{target_port}")
+            .parse()
+            .expect("mapped loopback parses");
+        let lan: SocketAddr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let adopted_task = Arc::new(adopted);
+        let remaining = 2 * OPENER_KEEPALIVE_INTERVAL + Duration::from_millis(500);
+        let task = tokio::spawn(async move {
+            resume_sender_keepalive(
+                Some(adopted_task.as_ref()),
+                &[lan, public],
+                &task_stop,
+                remaining,
+            )
+            .await
+        });
+        // Two ticks fit in the remaining slice (the resume's grid starts
+        // immediately — no SENDER_DIAL_PAUSE, no opener half).
+        tokio::time::sleep(2 * OPENER_KEEPALIVE_INTERVAL + Duration::from_millis(250)).await;
+        stop.store(true, Ordering::Relaxed);
+        let report = tokio::time::timeout(STOP_POLL_INTERVAL * 4, task)
+            .await
+            .expect("the stop ends the resumed keepalive promptly")
+            .expect("join");
+        assert!(report.stopped_early, "the flag ended it: {report:?}");
+        assert!(!report.budget_elapsed);
+        assert_eq!(
+            report.opener_packets, 0,
+            "the resume is keepalive-only (no second reflexive opener): {report:?}"
+        );
+        assert!(
+            report.keepalive_ticks >= 2,
+            "two ticks fired inside the remaining slice: {report:?}"
+        );
+        assert!(
+            report.keepalive_packets >= report.keepalive_ticks,
+            "one packet per target per tick: {report:?}"
+        );
+        // The packets reached the target from the adopted socket's port.
+        target
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("target timeout");
+        let mut packets = 0usize;
+        loop {
+            let mut buffer = [0u8; 1500];
+            match target.recv_from(&mut buffer) {
+                Ok((len, from)) => {
+                    assert!(
+                        ak_net::holepunch::is_probe_packet(&buffer[..len]),
+                        "resumed keepalive packets are probe-shaped"
+                    );
+                    assert_eq!(from.port(), adopted_port, "from the adopted socket");
+                    packets += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            packets >= 2,
+            "the resumed keepalive's ticks reached the target: {packets}"
+        );
+    }
+
+    /// CR-P3-15: an exhausted budget converges, not dials — a resume with
+    /// ZERO remaining reports `budget_elapsed` immediately, having sent
+    /// nothing (the adapter's convergence signal), and the no-socket
+    /// resume reports the same shape with zero counters.
+    #[tokio::test(start_paused = true)]
+    async fn zero_remaining_resume_reports_budget_elapsed_without_packets() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_port = target.local_addr().expect("target addr").port();
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let public: SocketAddr = format!("[::ffff:127.0.0.1]:{target_port}")
+            .parse()
+            .expect("mapped loopback parses");
+        let stop = AtomicBool::new(false);
+        let started = tokio::time::Instant::now();
+        let report =
+            resume_sender_keepalive(Some(&adopted), &[public], &stop, Duration::ZERO).await;
+        assert!(report.budget_elapsed, "no budget left: {report:?}");
+        assert!(!report.stopped_early);
+        assert_eq!(report.keepalive_ticks, 0, "nothing was sent: {report:?}");
+        assert_eq!(report.keepalive_packets, 0);
+        assert_eq!(report.opener_packets, 0);
+        assert!(
+            started.elapsed() < OPENER_KEEPALIVE_INTERVAL,
+            "the zero-budget resume returns immediately: {:?}",
+            started.elapsed()
+        );
+        target
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("target timeout");
+        let mut buffer = [0u8; 1500];
+        assert!(
+            target.recv_from(&mut buffer).is_err(),
+            "the zero-budget resume must not emit even one packet"
+        );
+        // The no-socket shape reports the same zero counters.
+        let report = resume_sender_keepalive(None, &[public], &stop, Duration::ZERO).await;
+        assert!(report.budget_elapsed);
+        assert_eq!(report.keepalive_packets, 0);
     }
 
     /// CR-P1-07 改法 2: the adopted-socket probe round folds into the

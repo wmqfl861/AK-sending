@@ -225,11 +225,11 @@
 //!   receiver/echo listeners and emits `code_cancelled`.
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use ak_engine::{
@@ -255,11 +255,11 @@ use ak_session::pairing::task_net::{
     bind_receiver_socket, bind_sender_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, handshake_failure_word, insert_reflexive_candidate,
     local_candidates, one_line_reason, order_candidates, probe_dial_round, probe_dial_round_on,
-    probe_with_retry, round_probe_outcome, sender_pairing_opener, staggered_dial_pass,
+    probe_with_retry, round_probe_outcome, sender_pairing_keeper, staggered_dial_pass,
     task_error_message, windows_root_name_refusal, AttemptVerdict, ConnectMarks,
-    RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, SENDER_DIAL_PAUSE, TASK_CLOSE_MESSAGE,
-    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
-    TASK_SETTLE_PAUSE,
+    SenderKeepaliveState, OPENER_KEEPALIVE_BUDGET, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT,
+    SENDER_DIAL_PAUSE, TASK_CLOSE_MESSAGE, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS,
+    TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -646,6 +646,12 @@ pub(crate) struct TaskRt {
     /// Initial ([`punch_candidates`]). Entries are removed on disconnect
     /// / cancel; teardown drops the runtime (and the sockets) wholesale.
     hole_sockets: StdMutex<HashMap<[u8; 16], HoleSocket>>,
+    /// Lock order: lifecycle -> request_ids / conns / op outcome / holes.
+    /// No reverse nesting and no await while holding this gate. Admission,
+    /// Finished publication + lease release, expiry and terminal close all
+    /// serialize here; UDP resources are optional, lifecycle state is not.
+    sender_lifetimes: StdMutex<HashMap<[u8; 16], SenderLifetime>>,
+    executor: tokio::runtime::Handle,
 }
 
 /// CR-P1-05: one code's hole socket plus the shared early-stop flag of
@@ -695,6 +701,16 @@ impl TaskRt {
                 for task in tasks {
                     task.abort();
                 }
+            }
+        }
+        if let Ok(mut lifetimes) = self.sender_lifetimes.lock() {
+            for life in lifetimes.values_mut() {
+                life.close();
+            }
+        }
+        if let Ok(mut holes) = self.hole_sockets.lock() {
+            for (_, socket) in holes.drain() {
+                socket.punch_stop.store(true, Ordering::Relaxed);
             }
         }
         if let Ok(ops) = self.ops.lock() {
@@ -829,18 +845,56 @@ impl TaskRt {
     /// exactly once per connection (already-severed entries are silent).
     /// Returns the conn id when THIS call was the one that severed it.
     fn push_disconnected_once(&self, conn_id: &[u8; 16], reason: &str) -> Option<[u8; 16]> {
-        let mut conns = self.conns.lock().ok()?;
-        let conn = conns.get_mut(conn_id)?;
-        if conn.state == ConnState::Disconnected {
-            return None;
+        let mut lifetimes = self.sender_lifetimes.lock().ok()?;
+        self.close_connection_locked(&mut lifetimes, conn_id, reason)
+            .map(|conn| conn.conn_id)
+    }
+
+    fn close_connection_locked(
+        &self,
+        lifetimes: &mut HashMap<[u8; 16], SenderLifetime>,
+        conn_id: &[u8; 16],
+        reason: &str,
+    ) -> Option<TaskConn> {
+        let conn = {
+            let mut conns = self.conns.lock().ok()?;
+            let conn = conns.get_mut(conn_id)?;
+            if conn.state == ConnState::Disconnected {
+                return None;
+            }
+            conn.state = ConnState::Disconnected;
+            conn.clone()
+        };
+        if let Some(life) = lifetimes.get_mut(conn_id) {
+            life.close();
         }
-        conn.state = ConnState::Disconnected;
+        drop_hole_socket(self, &conn.code_id);
         self.push_event(format!(
             "{{\"event\":\"disconnected\",\"conn\":\"{}\",\"reason\":{}}}",
             core::hex_encode(conn_id),
             quoted(reason),
         ));
-        Some(*conn_id)
+        Some(conn)
+    }
+
+    /// Called only under the lifecycle gate. A deadline is a local
+    /// policy limit, never evidence that an active QUIC path died.
+    fn reconcile_sender_locked(
+        &self,
+        lifetimes: &mut HashMap<[u8; 16], SenderLifetime>,
+        conn_id: &[u8; 16],
+    ) -> Option<TaskConn> {
+        let life = lifetimes.get_mut(conn_id)?;
+        if life.terminal || !life.active.is_empty() {
+            return None;
+        }
+        if tokio::time::Instant::now() >= life.deadline {
+            return self.close_connection_locked(lifetimes, conn_id, "idle_expired");
+        }
+        if *life.state.borrow() != SenderKeepaliveState::Idle {
+            life.state.send_replace(SenderKeepaliveState::Idle);
+        }
+        None
     }
 
     /// Record an in-flight op under its connection (a disconnect aborts
@@ -1314,6 +1368,8 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         engine_progress,
         notify: StdMutex::new(None),
         hole_sockets: StdMutex::new(HashMap::new()),
+        sender_lifetimes: StdMutex::new(HashMap::new()),
+        executor: engine.runtime().handle().clone(),
     });
     {
         let mut v2 = engine
@@ -1639,6 +1695,14 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
         .unwrap_or_else(|| "null".to_string());
     let display = display_of_code(rt, &code_id);
     {
+        let Ok(mut lifetimes) = rt.sender_lifetimes.lock() else {
+            return;
+        };
+        if role == TaskRole::Sender {
+            lifetimes.entry(conn_id).or_insert_with(|| {
+                SenderLifetime::new(tokio::time::Instant::now() + OPENER_KEEPALIVE_BUDGET)
+            });
+        }
         let Ok(mut conns) = rt.conns.lock() else {
             return;
         };
@@ -1655,6 +1719,9 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
                 code: display.clone(),
             },
         );
+    }
+    if let Some(conn) = rt.conn_of_code(&code_id) {
+        ensure_sender_lifetime(rt, &conn);
     }
     rt.push_event(format!(
         "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{endpoint},\"code\":{}}}",
@@ -1676,7 +1743,7 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
 ///
 /// CR-P1-07 (review 2026-11-13 §4.4 改法 1/2): the sender role now runs
 /// its PAIRING-TIME opener + mapping keepalive here (the same shared
-/// `task_net::sender_pairing_opener` the CLI runs — identical timing), and
+/// `task_net::sender_pairing_keeper` the CLI runs — identical timing), and
 /// its connectivity test rides the ADOPTED dial socket
 /// ([`adopted_socket_probe`]) instead of a throwaway socket. A receiver
 /// owner keeps the CR-P1-05 punch plus the pairing-plane probe: its QUIC
@@ -1878,8 +1945,7 @@ fn abort_spawned(rt: &TaskRt, key: [u8; 16]) {
     drop_hole_socket(rt, &key);
 }
 
-/// CR-P1-05: remove one code's hole socket (disconnect / cancel / failed
-/// op) and stop its punch loop. Idempotent.
+/// Release UDP resources without owning the pairing's policy deadline.
 fn drop_hole_socket(rt: &TaskRt, code_id: &[u8; 16]) {
     if let Ok(mut holes) = rt.hole_sockets.lock() {
         if let Some(socket) = holes.remove(code_id) {
@@ -1928,47 +1994,205 @@ fn spawn_receiver_punch(rt: &Arc<TaskRt>, code_id: [u8; 16], sender_candidates: 
     });
 }
 
-/// CR-P1-07 (review 2026-11-13 §4.4 改法 1), the sender half of the
-/// pairing-completion hook: spawn the shared pairing-time opener + mapping
-/// keepalive ([`sender_pairing_opener`]) toward the paired RECEIVER's
-/// advertised candidates, from the sender's stashed adopted dial socket.
-/// The opener half's packet count surfaces as exactly ONE
-/// `reflexive_opener` event (contract ffi-v2 §8.1 — since CR-P1-07 it
-/// fires at PAIRING COMPLETION, not per send op; `packets` is 0 when no
-/// socket was stashed or no target survived the filter). The keepalive
-/// then holds both NAT mappings open (task_net's 15 s cadence, 10 min
-/// cap) until the send op stops it (the stash's shared `punch_stop`
-/// flag — `run_send` flips it at its start), the connection/task drops
-/// the stash, or teardown aborts the task (it is registered under the
-/// code id in `spawned` like every resident task).
+/// One lifetime per paired sender, including degraded/no-socket pairings.
+struct SenderLifetime {
+    deadline: tokio::time::Instant,
+    active: HashSet<[u8; 16]>,
+    terminal: bool,
+    state: tokio::sync::watch::Sender<SenderKeepaliveState>,
+    keeper: Option<JoinHandle<()>>,
+}
+
+impl SenderLifetime {
+    fn new(deadline: tokio::time::Instant) -> Self {
+        let (state, _) = tokio::sync::watch::channel(SenderKeepaliveState::Idle);
+        Self {
+            deadline,
+            active: HashSet::new(),
+            terminal: false,
+            state,
+            keeper: None,
+        }
+    }
+
+    fn admit(&mut self, op_id: [u8; 16]) {
+        self.active.insert(op_id);
+        self.state.send_replace(SenderKeepaliveState::Active);
+    }
+
+    fn close(&mut self) {
+        self.terminal = true;
+        self.state.send_replace(SenderKeepaliveState::Closed);
+        if let Some(task) = self.keeper.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for SenderLifetime {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Install the deadline before any send can be admitted. Also called by
+/// the keeper hook, which is idempotent (no second opener on catch-up).
+fn ensure_sender_lifetime(rt: &TaskRt, conn: &TaskConn) {
+    if conn.role == TaskRole::Sender {
+        if let Ok(mut lifetimes) = rt.sender_lifetimes.lock() {
+            lifetimes.entry(conn.conn_id).or_insert_with(|| {
+                SenderLifetime::new(tokio::time::Instant::now() + OPENER_KEEPALIVE_BUDGET)
+            });
+        }
+    }
+}
+
 fn spawn_sender_opener(rt: &Arc<TaskRt>, code_id: [u8; 16], receiver_candidates: &[SocketAddr]) {
-    let (socket, stop) = {
-        let Ok(holes) = rt.hole_sockets.lock() else {
+    let Some(conn) = rt.conn_of_code(&code_id) else {
+        return;
+    };
+    ensure_sender_lifetime(rt, &conn);
+    let Ok(mut lifetimes) = rt.sender_lifetimes.lock() else {
+        return;
+    };
+    let Some(life) = lifetimes.get_mut(&conn.conn_id) else {
+        return;
+    };
+    if life.terminal || life.keeper.is_some() || rt.is_stopped() {
+        return;
+    }
+    let socket = rt.hole_sockets.lock().ok().and_then(|holes| {
+        holes
+            .get(&code_id)
+            .and_then(|hole| hole.socket.try_clone().ok())
+    });
+    let deadline = life.deadline;
+    let state = life.state.subscribe();
+    let candidates = order_candidates(receiver_candidates.to_vec());
+    // The resident task never strongly owns TaskRt; dropping the runtime
+    // closes/aborts the keeper and releases its socket without an Arc ring.
+    let opener_rt = Arc::downgrade(rt);
+    let expiry_rt = Arc::downgrade(rt);
+    let conn_id = conn.conn_id;
+    life.keeper = Some(rt.executor.spawn(async move {
+        sender_pairing_keeper(
+            socket.as_ref(),
+            &candidates,
+            deadline,
+            state,
+            |packets| {
+                if let Some(rt) = opener_rt.upgrade() {
+                    if !rt.is_stopped() {
+                        rt.push_event(format!(
+                            "{{\"event\":\"reflexive_opener\",\"packets\":{packets}}}"
+                        ));
+                    }
+                }
+            },
+            || {
+                if let Some(rt) = expiry_rt.upgrade() {
+                    expire_idle_sender(&rt, &conn_id);
+                }
+            },
+        )
+        .await;
+    }));
+}
+
+fn expire_idle_sender(rt: &Arc<TaskRt>, conn_id: &[u8; 16]) {
+    let expired = {
+        let Ok(mut lifetimes) = rt.sender_lifetimes.lock() else {
             return;
         };
-        match holes.get(&code_id) {
-            Some(entry) => (
-                entry.socket.try_clone().ok(),
-                Some(Arc::clone(&entry.punch_stop)),
-            ),
-            None => (None, None),
-        }
+        rt.reconcile_sender_locked(&mut lifetimes, conn_id)
     };
-    let candidates = order_candidates(receiver_candidates.to_vec());
-    let event_rt = Arc::clone(rt);
-    let stop = stop.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let task = tokio::spawn(async move {
-        // The keepalive end is silent by contract (bounded diagnostics
-        // ride the opener event alone).
-        let _report = sender_pairing_opener(socket.as_ref(), &candidates, &stop, |packets| {
-            event_rt.push_event(format!(
-                "{{\"event\":\"reflexive_opener\",\"packets\":{packets}}}"
-            ));
-        })
-        .await;
-    });
-    if let Ok(mut spawned) = rt.spawned.lock() {
-        spawned.entry(code_id).or_default().push(task);
+    finish_idle_expiry(rt, expired);
+}
+
+/// Terminal state/event were decided under the gate. Network cleanup is
+/// outside it; idle expiry never aborts a live send because active is empty.
+fn finish_idle_expiry(rt: &Arc<TaskRt>, expired: Option<TaskConn>) {
+    let Some(conn) = expired else {
+        return;
+    };
+    rt.decline_pending_of_conn(&conn.conn_id);
+    if let Ok(table) = rt.codes.lock() {
+        if let Some(entry) = table.values().find(|entry| entry.code_id == conn.code_id) {
+            let peer = if entry.owner.runtime_id == rt.runtime_id {
+                entry.joiner.clone()
+            } else {
+                Some(Arc::clone(&entry.owner))
+            };
+            if let Some(peer) = peer {
+                peer.push_disconnected_once(&conn.conn_id, "peer");
+            }
+        }
+    }
+    if let Some(stack) = rt.stack.lock().ok().and_then(|slot| slot.clone()) {
+        rt.executor.spawn(async move {
+            let _ = stack.pairing.disconnect(conn.code_id).await;
+        });
+    }
+}
+
+/// Owns exactly one admission. Constructed before spawn so cancellation
+/// before first poll also releases it. The awaited send future is created
+/// after this guard enters the task, and is dropped before the guard.
+struct SendLease {
+    rt: Weak<TaskRt>,
+    conn_id: [u8; 16],
+    op_id: [u8; 16],
+    entry: Arc<OpEntry>,
+    settled: bool,
+}
+
+impl SendLease {
+    fn finish(&mut self, result: Option<(bool, String)>) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let Some(rt) = self.rt.upgrade() else {
+            return;
+        };
+        let expired = {
+            let Ok(mut lifetimes) = rt.sender_lifetimes.lock() else {
+                return;
+            };
+            // Publication precedes releasing admission, in the same
+            // critical section. Duplicate/cancelled settlement is silent.
+            if let Ok(mut outcome) = self.entry.outcome.lock() {
+                if matches!(&*outcome, OpOutcome::Running { .. }) {
+                    let (ok, json) = result.unwrap_or_else(|| {
+                        (
+                            false,
+                            "{\"op\":\"task_send\",\"error\":\"cancelled by caller\"}".to_string(),
+                        )
+                    });
+                    *outcome = OpOutcome::Finished { ok, json };
+                    rt.push_event(format!(
+                        "{{\"event\":\"{}\",\"op_id\":\"{}\",\"op\":\"task_send\"}}",
+                        if ok { "op_done" } else { "op_failed" },
+                        core::hex_encode(&self.op_id),
+                    ));
+                }
+            }
+            let removed = lifetimes
+                .get_mut(&self.conn_id)
+                .is_some_and(|life| life.active.remove(&self.op_id));
+            if removed {
+                rt.reconcile_sender_locked(&mut lifetimes, &self.conn_id)
+            } else {
+                None
+            }
+        };
+        finish_idle_expiry(&rt, expired);
+    }
+}
+
+impl Drop for SendLease {
+    fn drop(&mut self) {
+        self.finish(None);
     }
 }
 
@@ -2155,12 +2379,22 @@ fn gate_request(
     conn: Option<[u8; 16]>,
     enforce_live_conn: bool,
     args: &crate::core::json::Json,
+    lifetime: Option<&SenderLifetime>,
 ) -> Result<RequestGate, FfiError> {
     let Some(request_text) = field_str(args, "request_id", false)? else {
         if enforce_live_conn {
             // No dedupe key: still refuse a send on a severed connection
             // before any op exists.
             ensure_conn_live(rt, &conn.expect("send gate carries a conn id"))?;
+            if rt.is_stopped()
+                || lifetime.is_some_and(|life| {
+                    life.terminal || tokio::time::Instant::now() >= life.deadline
+                })
+            {
+                return Err(FfiError::invalid(
+                    "the pairing idle budget expired or runtime stopped",
+                ));
+            }
         }
         return Ok(RequestGate::NoId);
     };
@@ -2180,6 +2414,15 @@ fn gate_request(
             if enforce_live_conn {
                 // Fresh requests only — replays above keep answering.
                 ensure_conn_live(rt, &conn.expect("send gate carries a conn id"))?;
+                if rt.is_stopped()
+                    || lifetime.is_some_and(|life| {
+                        life.terminal || tokio::time::Instant::now() >= life.deadline
+                    })
+                {
+                    return Err(FfiError::invalid(
+                        "the pairing idle budget expired or runtime stopped",
+                    ));
+                }
             }
             let op_id = random_id16();
             let entry = Arc::new(OpEntry {
@@ -2239,6 +2482,16 @@ fn launch_task_op(
     spec: TaskOpSpec,
     reserved: Option<ReservedOp>,
 ) -> Result<[u8; 16], FfiError> {
+    launch_task_op_inner(engine, rt, spec, reserved, None)
+}
+
+fn launch_task_op_inner(
+    engine: &AkEngine,
+    rt: &Arc<TaskRt>,
+    spec: TaskOpSpec,
+    reserved: Option<ReservedOp>,
+    lifetimes: Option<&mut HashMap<[u8; 16], SenderLifetime>>,
+) -> Result<[u8; 16], FfiError> {
     let op = spec.op();
     let (op_id, entry) = match reserved {
         // Already registered (atomically with the request reservation).
@@ -2259,14 +2512,27 @@ fn launch_task_op(
             (op_id, entry)
         }
     };
-    // Sends are abortable by a disconnect of their connection.
-    if let TaskOpSpec::Send { conn_id, .. } = &spec {
+    let lease = if let TaskOpSpec::Send { conn_id, .. } = &spec {
+        let lifetimes = lifetimes.expect("send launcher owns the admission gate");
+        if let Some(life) = lifetimes.get_mut(conn_id) {
+            life.admit(op_id);
+        }
         rt.track_conn_op(*conn_id, op_id);
-    }
+        Some(SendLease {
+            rt: Arc::downgrade(rt),
+            conn_id: *conn_id,
+            op_id,
+            entry: Arc::clone(&entry),
+            settled: false,
+        })
+    } else {
+        None
+    };
     let task = {
         let entry = Arc::clone(&entry);
         let rt = Arc::clone(rt);
         engine.runtime().spawn(async move {
+            let mut lease = lease;
             let (ok, json) = match run_task_op(&rt, spec).await {
                 Ok(json) => (true, json),
                 Err(message) => (
@@ -2274,6 +2540,10 @@ fn launch_task_op(
                     format!("{{\"op\":{},\"error\":{}}}", quoted(op), quoted(&message)),
                 ),
             };
+            if let Some(lease) = &mut lease {
+                lease.finish(Some((ok, json)));
+                return;
+            }
             if let Ok(mut slot) = entry.outcome.lock() {
                 if matches!(&*slot, OpOutcome::Running { .. }) {
                     *slot = OpOutcome::Finished {
@@ -2329,7 +2599,7 @@ pub fn task_create_code_start(
     } else {
         ttl_secs as u32
     };
-    let reserved = match gate_request(&rt, "task_create_code", None, false, &args)? {
+    let reserved = match gate_request(&rt, "task_create_code", None, false, &args, None)? {
         RequestGate::Replay(op_id) => return Ok(op_id),
         RequestGate::Fresh(reserved) => Some(reserved),
         RequestGate::NoId => None,
@@ -2371,7 +2641,7 @@ pub fn task_join_start(
         Some(text) => Some(TaskRole::parse(&text)?),
     };
     let candidates = parse_candidates(&args)?;
-    let reserved = match gate_request(&rt, "task_join", None, false, &args)? {
+    let reserved = match gate_request(&rt, "task_join", None, false, &args, None)? {
         RequestGate::Replay(op_id) => return Ok(op_id),
         RequestGate::Fresh(reserved) => Some(reserved),
         RequestGate::NoId => None,
@@ -2432,22 +2702,40 @@ pub fn task_send_start(
             "entries of \"paths\" must be non-empty paths",
         ));
     }
-    // Replay answers first; a FRESH send additionally requires a live
-    // connection (inside the gate's atomic acceptance).
-    let reserved = match gate_request(&rt, "task_send", Some(*conn_id), true, &args)? {
-        RequestGate::Replay(op_id) => return Ok(op_id),
-        RequestGate::Fresh(reserved) => Some(reserved),
-        RequestGate::NoId => None,
-    };
-    launch_task_op(
-        engine,
-        &rt,
-        TaskOpSpec::Send {
-            conn_id: *conn_id,
-            paths,
-        },
-        reserved,
-    )
+    let mut lifetimes = rt
+        .sender_lifetimes
+        .lock()
+        .map_err(|_| FfiError::internal("sender lifecycle lock poisoned"))?;
+    let expired = rt.reconcile_sender_locked(&mut lifetimes, conn_id);
+    // The entire acceptance (including task registration) is protected
+    // against expiry/close. Replays never acquire another send lease.
+    let result = (|| {
+        let reserved = match gate_request(
+            &rt,
+            "task_send",
+            Some(*conn_id),
+            true,
+            &args,
+            lifetimes.get(conn_id),
+        )? {
+            RequestGate::Replay(op_id) => return Ok(op_id),
+            RequestGate::Fresh(reserved) => Some(reserved),
+            RequestGate::NoId => None,
+        };
+        launch_task_op_inner(
+            engine,
+            &rt,
+            TaskOpSpec::Send {
+                conn_id: *conn_id,
+                paths,
+            },
+            reserved,
+            Some(&mut lifetimes),
+        )
+    })();
+    drop(lifetimes);
+    finish_idle_expiry(&rt, expired);
+    result
 }
 
 /// `ak_task_server_info` (G6 follow-through, batch G6b 2026-11-13): accept
@@ -2540,25 +2828,18 @@ pub fn task_disconnect(
     conn_id: &[u8; 16],
 ) -> Result<(), FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
-    let code_id = {
-        let mut conns = rt
-            .conns
-            .lock()
-            .map_err(|_| FfiError::internal("task connection table lock poisoned"))?;
-        let Some(conn) = conns.get_mut(conn_id) else {
-            drop(conns);
-            return cancel_unjoined_code(engine, &rt, conn_id);
-        };
-        if conn.state == ConnState::Disconnected {
-            return Ok(());
-        }
-        conn.state = ConnState::Disconnected;
-        conn.code_id
+    let Some(conn) = rt
+        .conns
+        .lock()
+        .ok()
+        .and_then(|conns| conns.get(conn_id).cloned())
+    else {
+        return cancel_unjoined_code(engine, &rt, conn_id);
     };
-    rt.push_event(format!(
-        "{{\"event\":\"disconnected\",\"conn\":\"{}\",\"reason\":\"local\"}}",
-        core::hex_encode(conn_id),
-    ));
+    if rt.push_disconnected_once(conn_id, "local").is_none() {
+        return Ok(());
+    }
+    let code_id = conn.code_id;
     // Wake this connection's parked consents (P2-07: a disconnect must
     // resolve its pending offers, not wait out the 120 s window).
     rt.decline_pending_of_conn(conn_id);
@@ -3427,21 +3708,22 @@ async fn run_join(
     if let Some((socket, _)) = sender_sock {
         stash_hole_socket(rt, code_id, socket);
     }
-    match my_role {
-        TaskRole::Receiver => {
-            spawn_receiver_punch(rt, code_id, &dial_candidates);
-        }
-        TaskRole::Sender => {
-            spawn_sender_opener(rt, code_id, &dial_candidates);
-        }
-    }
     if let Some(slot) = code_slot {
         if let Ok(mut value) = slot.lock() {
             *value = code_id;
         }
     }
-    // Joiner side bookkeeping.
+    // Publish the connection and its policy deadline under the same gate.
     {
+        let mut lifetimes = rt
+            .sender_lifetimes
+            .lock()
+            .map_err(|_| "sender lifecycle lock poisoned".to_string())?;
+        if my_role == TaskRole::Sender {
+            lifetimes.entry(conn_id).or_insert_with(|| {
+                SenderLifetime::new(tokio::time::Instant::now() + OPENER_KEEPALIVE_BUDGET)
+            });
+        }
         let mut conns = rt
             .conns
             .lock()
@@ -3459,6 +3741,14 @@ async fn run_join(
                 code: code.to_string(),
             },
         );
+    }
+    match my_role {
+        TaskRole::Receiver => {
+            spawn_receiver_punch(rt, code_id, &dial_candidates);
+        }
+        TaskRole::Sender => {
+            spawn_sender_opener(rt, code_id, &dial_candidates);
+        }
     }
     // Same-engine cache flip: the owner runtime (if any) learns the
     // joiner + conn id for its instant disconnect notify.
@@ -3528,8 +3818,8 @@ async fn run_join(
 /// budget; with no observation the round is invisible and the static
 /// order dials exactly as before. Since CR-P1-07 the send-time
 /// reflexive opener is GONE — the opener + mapping keepalive run at
-/// PAIRING COMPLETION ([`spawn_sender_opener`]) and this op stops them
-/// at its start.
+/// PAIRING COMPLETION ([`spawn_sender_opener`]); the admission gate pauses
+/// keeper packets while any send owns the connection.
 async fn run_send(
     rt: &Arc<TaskRt>,
     conn_id: [u8; 16],
@@ -3566,19 +3856,13 @@ async fn run_send(
     // ride one socket). No stash (bind failed, or an old runtime): the
     // legacy throwaway round, byte-identical to the pre-CR path.
     //
-    // CR-P1-07: the PAIRING-TIME opener + mapping keepalive (spawned when
-    // the pairing completed) stops HERE — the send phase's own probe round
-    // and QUIC dial take over the adopted socket's outbound traffic. The
-    // opener itself already ran at pairing time with CLI-identical timing
-    // (its one `reflexive_opener` event fired there, contract §8.1); a
-    // RETRY send keeps the stash's stop flag set, which is correct — the
-    // mappings the first attempt's dial just used are hotter than any
-    // keepalive cadence.
-    let adopted = rt.hole_sockets.lock().ok().and_then(|holes| {
-        let entry = holes.get(&conn.code_id)?;
-        entry.punch_stop.store(true, Ordering::Relaxed);
-        entry.socket.try_clone().ok()
-    });
+    // Admission, not this attempt, owns keeper activity. No sender-side
+    // stop flag or epoch lives in the socket stash.
+    let adopted = rt
+        .hole_sockets
+        .lock()
+        .ok()
+        .and_then(|holes| holes.get(&conn.code_id)?.socket.try_clone().ok());
     // batchF G2: the round's observation rides one bounded
     // `probe_observed` event per send (the emission pattern of
     // `sender_bind` — a plain `push_event`, unknown-name-tolerated on
@@ -3673,6 +3957,9 @@ async fn run_send(
         if let Some((addr, failure)) = outcome.fatal {
             if let AttemptOutcome::FailedAfterConnect { reason, peer_gone } = failure {
                 if peer_gone {
+                    // The peer's data plane is gone — the pairing is
+                    // ending ByPeer through the event pump; a resumed
+                    // keepalive would only hold a dead mapping.
                     report_peer_gone(rt, &conn);
                 }
                 return Err(format!(
@@ -3914,38 +4201,42 @@ pub(crate) fn task_cancel_op(
     op_id: &[u8; 16],
 ) -> Result<(), FfiError> {
     let rt = task_runtime_of(engine, runtime_id)?;
-    let ops = rt
+    let entry = rt
         .ops
         .lock()
-        .map_err(|_| FfiError::internal("task op table lock poisoned"))?;
-    let entry = ops.get(op_id).ok_or_else(|| {
-        FfiError::not_found(format!(
-            "unknown op {} on task runtime {}",
-            core::hex_encode(op_id),
-            core::hex_encode(runtime_id),
-        ))
-    })?;
-    let task = entry
-        .task
-        .lock()
-        .map_err(|_| FfiError::internal("task op task lock poisoned"))?
-        .take();
+        .map_err(|_| FfiError::internal("task op table lock poisoned"))?
+        .get(op_id)
+        .cloned()
+        .ok_or_else(|| FfiError::not_found("unknown task op"))?;
+    let task = {
+        let _gate = rt
+            .sender_lifetimes
+            .lock()
+            .map_err(|_| FfiError::internal("sender lifecycle lock poisoned"))?;
+        let mut outcome = entry
+            .outcome
+            .lock()
+            .map_err(|_| FfiError::internal("task op outcome lock poisoned"))?;
+        if let OpOutcome::Running { op } = &*outcome {
+            *outcome = OpOutcome::Finished {
+                ok: false,
+                json: format!(
+                    "{{\"op\":{},\"error\":\"cancelled by caller\"}}",
+                    quoted(op)
+                ),
+            };
+        }
+        entry
+            .task
+            .lock()
+            .map_err(|_| FfiError::internal("task op lock poisoned"))?
+            .take()
+    };
     if let Some(task) = task {
         task.abort();
     }
-    let mut outcome = entry
-        .outcome
-        .lock()
-        .map_err(|_| FfiError::internal("task op outcome lock poisoned"))?;
-    if let OpOutcome::Running { op } = &*outcome {
-        *outcome = OpOutcome::Finished {
-            ok: false,
-            json: format!(
-                "{{\"op\":{},\"error\":\"cancelled by caller\"}}",
-                quoted(op)
-            ),
-        };
-    }
+    // SendLease drops only after the cancelled future's UDP owner is gone.
+
     Ok(())
 }
 
@@ -6357,6 +6648,273 @@ mod task_tests {
         ak_engine_free(engine_b);
     }
 
+    fn synthetic_sender(engine: &AkEngine) -> (tempfile::TempDir, Arc<TaskRt>, TaskConn) {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = task_start(engine, &spec_for(dir.path())).unwrap();
+        let rt = task_runtime_of(engine, &runtime).unwrap();
+        let conn = TaskConn {
+            conn_id: [71; 16],
+            code_id: [72; 16],
+            role: TaskRole::Sender,
+            state: ConnState::Connected,
+            candidates: vec!["127.0.0.1:9".parse().unwrap()],
+            peer_endpoint: None,
+            peer_fp: None,
+            code: "synthetic".to_string(),
+        };
+        rt.conns.lock().unwrap().insert(conn.conn_id, conn.clone());
+        ensure_sender_lifetime(&rt, &conn);
+        (dir, rt, conn)
+    }
+
+    /// Uses the same admission + lease settlement as the production
+    /// launcher, but barriers replace the engine I/O to force ordering.
+    fn synthetic_send(rt: &Arc<TaskRt>, conn: &TaskConn, id: [u8; 16]) -> SendLease {
+        let mut lives = rt.sender_lifetimes.lock().unwrap();
+        let entry = Arc::new(OpEntry {
+            outcome: StdMutex::new(OpOutcome::Running { op: "task_send" }),
+            task: StdMutex::new(None),
+        });
+        rt.ops.lock().unwrap().insert(id, Arc::clone(&entry));
+        lives.get_mut(&conn.conn_id).unwrap().admit(id);
+        SendLease {
+            rt: Arc::downgrade(rt),
+            conn_id: conn.conn_id,
+            op_id: id,
+            entry,
+            settled: false,
+        }
+    }
+
+    /// Catches the old B-counts-two/A-has-old-epoch dead end. Exactly the
+    /// last Finished publication restores idle, in either completion order.
+    #[test]
+    fn reverse_send_failures_restore_idle_holding() {
+        let engine = AkEngine::new().unwrap();
+        let (_dir, rt, conn) = synthetic_sender(&engine);
+        for order in [[1u8, 0], [0, 1]] {
+            let mut first = synthetic_send(&rt, &conn, [73; 16]);
+            let mut second = synthetic_send(&rt, &conn, [74; 16]);
+            let deadline = rt.sender_lifetimes.lock().unwrap()[&conn.conn_id].deadline;
+            let mut state = rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+                .state
+                .subscribe();
+            state.borrow_and_update();
+            engine.runtime().block_on(async {
+                let (a_tx, a_rx) = oneshot::channel();
+                let (b_tx, b_rx) = oneshot::channel();
+                let a = tokio::spawn(async move {
+                    a_rx.await.unwrap();
+                    first.finish(Some((false, "A failed".into())));
+                });
+                let b = tokio::spawn(async move {
+                    b_rx.await.unwrap();
+                    second.finish(Some((false, "B failed".into())));
+                });
+                if order[0] == 1 {
+                    b_tx.send(()).unwrap();
+                    b.await.unwrap();
+                    assert!(
+                        !state.has_changed().unwrap(),
+                        "not the last send: keeper remains paused"
+                    );
+                    assert_eq!(
+                        rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+                            .active
+                            .len(),
+                        1
+                    );
+                    a_tx.send(()).unwrap();
+                    a.await.unwrap();
+                } else {
+                    a_tx.send(()).unwrap();
+                    a.await.unwrap();
+                    assert!(!state.has_changed().unwrap());
+                    b_tx.send(()).unwrap();
+                    b.await.unwrap();
+                }
+            });
+            assert!(state.has_changed().unwrap());
+            assert_eq!(*state.borrow_and_update(), SenderKeepaliveState::Idle);
+            assert!(
+                !state.has_changed().unwrap(),
+                "one idle transition, no extra restart"
+            );
+            let lives = rt.sender_lifetimes.lock().unwrap();
+            assert!(lives[&conn.conn_id].active.is_empty());
+            assert_eq!(
+                lives[&conn.conn_id].deadline, deadline,
+                "budget never resets"
+            );
+            for id in [[73; 16], [74; 16]] {
+                assert!(matches!(
+                    *rt.ops.lock().unwrap()[&id].outcome.lock().unwrap(),
+                    OpOutcome::Finished { .. }
+                ));
+            }
+        }
+        rt.teardown(engine.runtime());
+    }
+
+    /// The timer survives zero targets/no socket. An admitted send can
+    /// span the deadline; only its final failed settlement ends pairing.
+    #[test]
+    fn resource_free_pairing_deadline_and_active_deferral() {
+        let engine = AkEngine::new().unwrap();
+        let (_dir, rt, conn) = synthetic_sender(&engine);
+        let timer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        for variant in 0..3 {
+            for busy in [false, true] {
+                rt.conns
+                    .lock()
+                    .unwrap()
+                    .get_mut(&conn.conn_id)
+                    .unwrap()
+                    .state = ConnState::Connected;
+                rt.events.lock().unwrap().clear();
+                timer.block_on(async {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    rt.sender_lifetimes
+                        .lock()
+                        .unwrap()
+                        .insert(conn.conn_id, SenderLifetime::new(deadline));
+                    let mut lease = busy.then(|| synthetic_send(&rt, &conn, [75; 16]));
+                    let state = rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+                        .state
+                        .subscribe();
+                    let socket =
+                        (variant != 0).then(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+                    let candidates = match variant {
+                        0 => vec![],
+                        1 => vec!["127.0.0.1:9".parse().unwrap()],
+                        _ => vec!["[2001:db8::1]:9".parse().unwrap()],
+                    };
+                    let weak = Arc::downgrade(&rt);
+                    let conn_id = conn.conn_id;
+                    let keeper = tokio::spawn(async move {
+                        sender_pairing_keeper(
+                            socket.as_ref(),
+                            &candidates,
+                            deadline,
+                            state,
+                            |_| {},
+                            || {
+                                expire_idle_sender(&weak.upgrade().unwrap(), &conn_id);
+                            },
+                        )
+                        .await
+                    });
+                    tokio::task::yield_now().await;
+                    tokio::time::advance(Duration::from_secs(3)).await;
+                    tokio::task::yield_now().await;
+                    if let Some(lease) = &mut lease {
+                        assert_eq!(
+                            rt.conns.lock().unwrap()[&conn.conn_id].state,
+                            ConnState::Connected
+                        );
+                        assert!(
+                            !keeper.is_finished(),
+                            "active at deadline: no terminal verdict"
+                        );
+                        assert!(!rt
+                            .events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|line| line.contains("idle_expired")));
+                        lease.finish(Some((false, "failed after deadline".into())));
+                    }
+                    let report = keeper.await.unwrap();
+                    assert_eq!(report.keepalive_packets, 0);
+                    assert_eq!(
+                        rt.conns.lock().unwrap()[&conn.conn_id].state,
+                        ConnState::Disconnected
+                    );
+                    let events = rt.events.lock().unwrap();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|line| line.contains("\"reason\":\"idle_expired\""))
+                            .count(),
+                        1
+                    );
+                    if busy {
+                        let finished = events
+                            .iter()
+                            .position(|line| line.contains("op_failed"))
+                            .unwrap();
+                        let expired = events
+                            .iter()
+                            .position(|line| line.contains("idle_expired"))
+                            .unwrap();
+                        assert!(
+                            finished < expired,
+                            "Finished event is published before expiry"
+                        );
+                    }
+                    drop(events);
+                    expire_idle_sender(&rt, &conn.conn_id);
+                    assert_eq!(
+                        rt.events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|line| line.contains("idle_expired"))
+                            .count(),
+                        1
+                    );
+                });
+            }
+        }
+        rt.teardown(engine.runtime());
+    }
+
+    /// A lease survives until the cancelled future is actually dropped,
+    /// including cancellation before the spawned future's first poll.
+    #[test]
+    fn cancelled_send_releases_once_without_resurrecting_terminal_pairing() {
+        let engine = AkEngine::new().unwrap();
+        let (_dir, rt, conn) = synthetic_sender(&engine);
+        let lease = synthetic_send(&rt, &conn, [76; 16]);
+        engine.runtime().block_on(async {
+            let task = tokio::spawn(async move {
+                let _lease = lease;
+                std::future::pending::<()>().await;
+            });
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+        assert!(rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+            .active
+            .is_empty());
+        assert_eq!(
+            *rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+                .state
+                .borrow(),
+            SenderKeepaliveState::Idle
+        );
+        let lease = synthetic_send(&rt, &conn, [77; 16]);
+        rt.push_disconnected_once(&conn.conn_id, "local");
+        drop(lease);
+        assert_eq!(
+            *rt.sender_lifetimes.lock().unwrap()[&conn.conn_id]
+                .state
+                .borrow(),
+            SenderKeepaliveState::Closed
+        );
+        assert!(!rt
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("idle_expired")));
+        rt.teardown(engine.runtime());
+    }
+
     /// P2-06: the save folder is resolved when a transfer STARTS, not when
     /// the code was generated — a `set_save_dir` after the code (but
     /// before the offer) applies to the incoming task.
@@ -6869,7 +7427,7 @@ mod task_tests {
         .expect("args");
         // The gate reserves AND registers — then we STOP between the gate
         // and the launcher (the report's exact interleaving).
-        let reserved = match gate_request(&rt, "task_create_code", None, false, &args)
+        let reserved = match gate_request(&rt, "task_create_code", None, false, &args, None)
             .expect("gate accepts")
         {
             RequestGate::Fresh(reserved) => reserved,
@@ -6895,7 +7453,7 @@ mod task_tests {
         let (ok, json) = wait_op_owned(&engine, &runtime, &op_id);
         assert!(ok, "{json}");
         // The replay of the same request answers the SAME op.
-        match gate_request(&rt, "task_create_code", None, false, &args).expect("replay") {
+        match gate_request(&rt, "task_create_code", None, false, &args, None).expect("replay") {
             RequestGate::Replay(replayed) => assert_eq!(replayed, op_id),
             _other => panic!("replay, got a different gate outcome"),
         }

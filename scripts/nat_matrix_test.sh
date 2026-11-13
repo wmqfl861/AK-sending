@@ -43,6 +43,12 @@
 #      pre-H1 Windows shape). Must still pass: the sender's pairing-time
 #      opener rides a LOW TTL (never reaches the receiver's NAT) and the
 #      receiver delays its whole punch past that window.
+#   8. decline then retry >=40 s (CR-P3-15): pcone<->pcone, the receiver
+#      declines the FIRST offer (decline-first stdin feeder), the sender
+#      retries after >=40 s (AK_EXP_SEND_RETRY_MS — the GUI's "declined,
+#      user tries again later" timing). During the wait the mapping
+#      keepalive resumes within the pairing's remaining idle budget; the
+#      retry must ride the refreshed mappings (pass-v4).
 #
 #   IPv4 cases do not configure endpoint IPv6 addresses AND set
 #   ip6tables FORWARD DROP on both routers (CR-P2-14: the batchF runs
@@ -618,15 +624,27 @@ fixture_check() {
 
 # ---------------------------------------------------------------------------
 # 6. One transfer case. run_case <name> <expect: pass-v4|xfail|fail|pass-v6>
-#    [sender-env] [receiver-env]
+#    [sender-env] [receiver-env] [recv-feed: accept|decline-first]
 #    alice = `task code-recv` (receiver), bob = `task join-send` (sender).
 #    The optional env prefixes (CR-P1-07, review 2026-11-13 §4.4 改法 4)
-#    feed the HIDDEN DEBUG KNOBS the late-send / no-low-TTL cases need
-#    (default off — an unset/empty prefix runs the plain product):
+#    feed the HIDDEN DEBUG KNOBS the late-send / no-low-TTL / decline-retry
+#    cases need (default off — an unset/empty prefix runs the plain
+#    product; the knobs compile ONLY in exp-knobs builds, CR-P3-16):
 #      AK_EXP_SEND_DELAY_MS=<ms>  sender: delay the send start after
 #                                 pairing (the GUI's pick-files timing)
 #      AK_EXP_NO_TTL=1            receiver: punch with NO low-TTL phase
 #                                 (the pre-CR-P1-08 Windows shape)
+#      AK_EXP_SEND_RETRY_MS=<ms>  sender: after a FAILED/DECLINED attempt,
+#                                 wait this long and retry (the GUI's
+#                                 "declined, user tries again later"
+#                                 timing; the mapping keepalive resumes
+#                                 within the remaining budget meanwhile —
+#                                 CR-P3-15)
+#    recv-feed selects the receiver's stdin shape: `accept` (default)
+#    auto-accepts every consent prompt; `decline-first` answers the FIRST
+#    prompt with `n` and every later one with `y` — the CLI discards
+#    input that predates a prompt (R36-P2-01), so each answer is fed only
+#    after its prompt appears in the receiver's log.
 # ---------------------------------------------------------------------------
 # Failure forensics (CR-P3-11): the 6832f79 commit message described
 # this function and a conntrack sampler but neither was actually written.
@@ -655,6 +673,77 @@ wait_for_text() { # wait_for_text <file> <needle> <timeout-secs> -> 0/1
   return 1
 }
 
+# count_text <file> <needle> -> number of matching lines (0 on missing file)
+count_text() {
+  grep -c -- "$2" "$1" 2>/dev/null || true
+}
+
+# The decline-first receiver stdin feeder (CR-P3-15's matrix case): watch
+# the receiver's log and answer each consent prompt as it appears — the
+# FIRST prompt gets a confirmed `n`, the SECOND gets `y` (then `yes`
+# keeps any further prompt accepted; the first decline is never masked).
+# Two timing facts shape it:
+#   * the CLI's terminal input discards lines whose read completed before
+#     the prompt's freshness boundary (R36-P2-01), and the boundary lands
+#     a beat AFTER the prompt text hits the log — a write the instant the
+#     line appears can still be discarded (J1 walkthrough measured it;
+#     600 ms of settle after the observed prompt is the proven margin);
+#   * every wait is BOUNDED (300 s each): a dead receiver ends the feeder
+#     (its stdin then reads EOF and the CLI fail-closed declines) instead
+#     of leaking an infinite loop past the case.
+decline_first_feeder() { # decline_first_feeder <recv.log> — runs as a pipe stage
+  local log="$1" waited=0
+  local bound=1500  # 300 s in 0.2 s polls
+  while [[ "$(count_text "$log" 'accept? \[Y/n\]')" -lt 1 ]]; do
+    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+  done
+  sleep 0.6
+  printf 'n\n'
+  # The first decline must actually LAND (the receiver prints its
+  # "offer declined; still listening" line) before the second wait
+  # starts — the scenario needs a real first rejection, not a lost one.
+  waited=0
+  while ! grep -q 'offer declined' "$log" 2>/dev/null; do
+    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+  done
+  waited=0
+  while [[ "$(count_text "$log" 'accept? \[Y/n\]')" -lt 2 ]]; do
+    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+  done
+  sleep 0.6
+  printf 'y\n'
+  yes
+}
+
+# CR-P3-15 retry-evidence audit (integration review of batch J): parse
+# the SENDER's actually-measured evidence lines and assert the scenario
+# really happened — the first attempt ended DECLINED, the retry started
+# >= min_ms (monotonic ms since the first failure, measured by the CLI,
+# not a config echo), the retry COMPLETED, and both attempts rode the
+# SAME pairing (exactly one "paired;" line). Prints the de-sensitized
+# summary line for CI-log consumption on success (case name + numbers +
+# the bounded class word only — no codes, keys, id dirs or diagnostics).
+assert_retry_evidence() { # assert_retry_evidence <case_name> <send.log> <min_ms>
+  local case_name="$1" send_log="$2" min_ms="$3"
+  local line since_ms
+  line="$(grep -m1 'retry-evidence attempt=2 since_failure_ms=' "$send_log" 2>/dev/null)" \
+    || { log "FAIL [$case_name]: no retry-evidence timing line in the sender log"; return 1; }
+  since_ms="$(printf '%s' "$line" | sed -n 's/.*since_failure_ms=\([0-9]*\).*/\1/p')"
+  [[ -n "$since_ms" ]] || { log "FAIL [$case_name]: unparseable since_failure_ms: $line"; return 1; }
+  [[ "$since_ms" -ge "$min_ms" ]] \
+    || { log "FAIL [$case_name]: retry gap ${since_ms}ms < ${min_ms}ms (the knob did not actually wait)"; return 1; }
+  grep -q 'retry-evidence attempt=2 since_failure_ms=.* first_failure=declined' "$send_log" \
+    || { log "FAIL [$case_name]: the first attempt did not end declined (evidence: $(grep -m1 'first_failure=' "$send_log" || echo missing))"; return 1; }
+  grep -q 'retry-evidence attempt=2 outcome=completed' "$send_log" \
+    || { log "FAIL [$case_name]: the retry never completed"; return 1; }
+  local pairings
+  pairings="$(count_text "$send_log" 'paired; peer')"
+  [[ "$pairings" -eq 1 ]] \
+    || { log "FAIL [$case_name]: expected exactly one pairing for both attempts, saw $pairings"; return 1; }
+  log "[retry-evidence] case=$case_name first=declined same_pairing=true delay_ms=$since_ms retry=completed"
+  return 0
+}
+
 print_via() { # connected-via of a case, for the log regardless of outcome
   local via
   via="$(grep -m1 '\[task\] connected via ' "$1" 2>/dev/null | awk '{print $NF}')"
@@ -671,7 +760,7 @@ run_case() {
   # NOTE: split declarations — under `set -u`, one `local` line expands
   # ALL its words BEFORE assigning, so a later field referencing an
   # earlier one would see it unbound (the round-2 CI failure).
-  local case_name="$1" expect="$2" sender_env="${3:-}" recv_env="${4:-}"
+  local case_name="$1" expect="$2" sender_env="${3:-}" recv_env="${4:-}" recv_feed="${5:-accept}"
   local case_dir="$WORK/$case_name"
   mkdir -p "$case_dir/id-alice" "$case_dir/id-bob" "$case_dir/out" "$case_dir/src"
   # G0 hardening: payload generation must SUCCEED — a failed dd previously
@@ -680,15 +769,24 @@ run_case() {
   dd if=/dev/urandom of="$case_dir/src/payload.bin" bs=1M count="$SIZE_MB" status=none     || { log "FAIL [$case_name]: dd failed to generate the payload (input invalid — never a valid xfail)"; return 1; }
   [[ -s "$case_dir/src/payload.bin" ]]     || { log "FAIL [$case_name]: payload file empty after dd"; return 1; }
 
-  # The receiver: consent auto-fed with a fresh 'y' stream (the CLI
-  # discards stale input; `yes` keeps supplying fresh lines). The
-  # optional env prefix (CR-P1-07 knob, unquoted word-split by design:
-  # "VAR=VAL" or empty) rides ahead of the namespace exec.
-  yes | env $recv_env ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
-      --out "$case_dir/out" \
-      --server "203.0.113.10:$REG_PORT" --registry-fp "$REG_FP" \
-      --stun "203.0.113.10:$STUN_PORT" \
-      >"$case_dir/recv.log" 2>&1 &
+  # The receiver: consent auto-fed (default: a fresh 'y' stream — the CLI
+  # discards stale input; `yes` keeps supplying fresh lines. The
+  # decline-first feeder answers the first prompt with `n` and later ones
+  # with `y`, CR-P3-15's case). The optional env prefix (CR-P1-07 knob,
+  # unquoted word-split by design: "VAR=VAL" or empty) rides ahead of the
+  # namespace exec.
+  run_receiver() { # stdin = the consent feed; env prefix word-splits by design
+    env $recv_env ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
+        --out "$case_dir/out" \
+        --server "203.0.113.10:$REG_PORT" --registry-fp "$REG_FP" \
+        --stun "203.0.113.10:$STUN_PORT" \
+        >"$case_dir/recv.log" 2>&1
+  }
+  if [[ "$recv_feed" == "decline-first" ]]; then
+    decline_first_feeder "$case_dir/recv.log" | run_receiver &
+  else
+    yes | run_receiver &
+  fi
   local recv_pid=$!
   PIDS_KIDS="$PIDS_KIDS $recv_pid"
   wait_for_text "$case_dir/recv.log" "AKI1-" 120 \
@@ -777,6 +875,13 @@ run_case() {
     sum_dst="$(sha256sum "$case_dir/out/payload.bin" 2>/dev/null | awk '{print $1}')"
     [[ -n "$sum_dst" && "$sum_src" == "$sum_dst" ]] \
       || { log "FAIL [$case_name]: payload sha256 mismatch (src=$sum_src dst=$sum_dst)"; return 1; }
+    # CR-P3-15: the decline-retry scenario's machine-verifiable audit —
+    # only AFTER the byte-identical check (the summary line certifies
+    # first=declined + same-pairing + measured monotonic gap + completed
+    # retry on the ACTUAL run, never a config echo).
+    if [[ "$recv_feed" == "decline-first" ]]; then
+      assert_retry_evidence "$case_name" "$send_log" 40000 || return 1
+    fi
     log "PASS [$case_name]: direct transfer, ${SIZE_MB}MiB byte-identical via $via"
   elif [[ "$expect" == "xfail" ]]; then
     # Strict expected-failure (CR-P2-14 point 6): the case must fail the
@@ -832,8 +937,8 @@ ipv6_usable() {
 }
 
 FAILURES=0
-case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect> [sender-env] [receiver-env]
-  local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6" sender_env="${7:-}" recv_env="${8:-}"
+case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect> [sender-env] [receiver-env] [recv-feed]
+  local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6" sender_env="${7:-}" recv_env="${8:-}" recv_feed="${9:-accept}"
   log "---- case $name: $desc"
   build_case_topology "$use_v6" || { log "FAIL [$name]: topology setup failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
   nat_rules "$NS_R1" r1-to-a r1-to-c 10.10.1.0/24 "$r1"     || { log "FAIL [$name]: r1 NAT rules failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
@@ -850,7 +955,7 @@ case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect> [s
   # mode claims before any product result counts.
   fixture_check "$NS_A" "$r1" || { log "FAIL [$name]: r1 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
   fixture_check "$NS_B" "$r2" || { log "FAIL [$name]: r2 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
-  run_case "$name" "$expect" "$sender_env" "$recv_env" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
+  run_case "$name" "$expect" "$sender_env" "$recv_env" "$recv_feed" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
 }
 
 build_core || { log "FAIL: core topology setup failed (kernel refusing namespaces/bridges?)"; exit 1; }
@@ -887,6 +992,23 @@ case_pass "late-send-40s"  "pcone<->pcone, send starts >=40s after pairing (past
 # punches meet an EXISTING sender-side flow instead of creating the
 # inbound-only conntrack record.
 case_pass "recv-no-lowttl" "pcone<->pcone, receiver WITHOUT the low-TTL punch phase (pre-CR-P1-08 Windows shape)" pcone pcone 0 pass-v4 "" "AK_EXP_NO_TTL=1"
+
+# CR-P3-15 (review 2026-11-13-batchH §4): the decline-retry case — the
+# receiver DECLINES the first offer (the decline-first stdin feeder; a
+# decline is not a task terminal state, so the listener keeps serving),
+# the sender's retry waits >=40 s (past the 30 s unreplied-conntrack
+# timeout) driven by the hidden AK_EXP_SEND_RETRY_MS knob, and during
+# the wait the mapping keepalive RESUMES within the pairing's remaining
+# idle budget (the exact recovery the FFI runs in product behavior). The
+# second attempt must ride the refreshed mappings: pass-v4 via the peer
+# router's reflexive address. On success (AFTER the byte-identical
+# sha256 check) assert_retry_evidence audits the sender's measured
+# retry-evidence lines and prints the de-sensitized
+# "[retry-evidence] case=decline-retry-40s first=declined
+# same_pairing=true delay_ms=<measured> retry=completed" summary for
+# the CI log (the case's WORK dir is RAII-deleted at exit — the stdout
+# summary is the durable record; J5's streak runner collects it).
+case_pass "decline-retry-40s" "pcone<->pcone, first offer DECLINED, send retried >=40s later (CR-P3-15 keepalive recovery)" pcone pcone 0 pass-v4 "AK_EXP_SEND_RETRY_MS=40000" "" "decline-first"
 
 log "======================================"
 if [[ $FAILURES -eq 0 ]]; then

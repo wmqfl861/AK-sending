@@ -34,3 +34,6 @@ tokio = { workspace = true }
 # the ak-ffi library itself never links a server-side SQLite.
 ak-signal = { workspace = true, features = ["server-persistence"] }
 tempfile = "3"
+
+# Paused-clock pairing lifetime regressions (dev-only).
+tokio = { workspace = true, features = ["test-util"] }

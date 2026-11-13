@@ -76,11 +76,12 @@ use ak_session::pairing::task_net::{
     bind_echo_responder_socket, bind_receiver_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, echo_responder_loop, handshake_failure_word,
     insert_reflexive_candidate, local_candidates, order_candidates, prefers_lan, probe_dial_round,
-    probe_dial_round_on, probe_with_retry, punch_candidates, sender_pairing_opener,
+    probe_dial_round_on, probe_with_retry, punch_candidates, sender_pairing_keeper,
     staggered_dial_pass, windows_root_name_refusal, AttemptVerdict, ConnectMarks,
-    OpenerKeepaliveReport, PUNCH_INTERVAL, PUNCH_WINDOW, RECEIVER_BIND_TIMEOUT,
-    REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS,
-    TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
+    OpenerKeepaliveReport, SenderKeepaliveState, OPENER_KEEPALIVE_BUDGET, PUNCH_INTERVAL,
+    PUNCH_WINDOW, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE,
+    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
+    TASK_SETTLE_PAUSE,
 };
 // CR-P1-05: the shared sender-socket bind (aliased — the Session method
 // of the same role wraps it with this adapter's stdout lines).
@@ -2026,21 +2027,10 @@ pub(crate) async fn run_code_send(
     flow
 }
 
-/// The post-pairing send phase (pairing-time opener/keepalive + probe +
-/// transfer), cancellable: Ctrl-C (or a test's cancel channel) aborts the
-/// phase before or mid-transfer and the flow ends as a LOCAL stop — the
-/// teardown then close-notifies the waiting peer so it exits with the
-/// explicit peer-departure reason.
-///
-/// CR-P1-07 (review 2026-11-13 §4.4 改法 1): the reflexive opener now runs
-/// as part of the SHARED pairing-time opener/keepalive
-/// (`task_net::sender_pairing_opener`, the exact function the FFI spawns
-/// at pairing completion) instead of an inline pre-probe call — same
-/// timing (the opener fires ~SENDER_DIAL_PAUSE after pairing, before the
-/// probe report), and the keepalive then holds both NAT mappings open
-/// across the probe window (and the experimental delay knob below) until
-/// the send starts. The matrix therefore exercises the identical code the
-/// GUI runs.
+/// One resident pairing keeper, paused while the serial CLI send owns
+/// the connection. Failed/declined attempts return it to Idle without
+/// replacing the worker or resetting its absolute deadline. Production
+/// remains one-shot; exp-knobs enables the matrix's delayed retry only.
 async fn send_phase(
     session: &Session,
     hooks: &TaskHooks,
@@ -2048,28 +2038,30 @@ async fn send_phase(
     link: &TaskLink,
     paths: &[PathBuf],
 ) -> Result<Result<Report>> {
-    // CR-P1-07: the pairing-time opener + mapping keepalive task. The
-    // opener's packet count still prints as its own bounded line (the
-    // run-43304434327 fingerprint: zero with a bound socket + non-empty
-    // candidates means the filter is too strict); the keepalive end
-    // prints one bounded summary when the send stops it.
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut opener_task = {
-        let flag = Arc::clone(&stop);
+    let deadline = tokio::time::Instant::now() + OPENER_KEEPALIVE_BUDGET;
+    let (state, state_rx) = tokio::sync::watch::channel(SenderKeepaliveState::Idle);
+    let _keeper = {
         let adopted = session
             .sender_socket
             .as_ref()
             .and_then(|socket| socket.try_clone().ok());
-        let static_order = order_candidates(link.peer.candidates.clone());
+        let candidates = order_candidates(link.peer.candidates.clone());
         AbortOnDrop(tokio::spawn(async move {
-            sender_pairing_opener(adopted.as_ref(), &static_order, &flag, |packets| {
-                println!("[task] reflexive opener sent {packets} packet(s)")
-            })
+            sender_pairing_keeper(
+                adopted.as_ref(),
+                &candidates,
+                deadline,
+                state_rx,
+                |packets| println!("[task] reflexive opener sent {packets} packet(s)"),
+                || {},
+            )
             .await
         }))
     };
     let flow = async {
-        probe_and_print(&session.stack.pairing, link).await;
+        tokio::time::timeout_at(deadline, probe_and_print(&session.stack.pairing, link))
+            .await
+            .map_err(|_| anyhow::anyhow!("pairing idle_expired; re-pair to send again"))?;
         // CR-P1-07 matrix knob (hidden debug parameter, DEFAULT OFF —
         // never set in production): delay the send start after pairing,
         // simulating the GUI's "pair, then pick files, then send" latency
@@ -2081,41 +2073,99 @@ async fn send_phase(
                 "[task] experimental send delay {} ms (AK_EXP_SEND_DELAY_MS)",
                 delay.as_millis()
             );
-            tokio::time::sleep(delay).await;
+            wait_pairing_delay(deadline, delay).await?;
         }
-        // The send starts: stop the keepalive (its mappings are the dial's
-        // to refresh now) and fold its bounded report into the log.
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(report) = (&mut opener_task.0).await {
+        // CR-P3-15: the knob-gated retry cadence (also DEFAULT OFF — a
+        // production run makes exactly one attempt). `attempt` numbers
+        // the tries for the machine-verifiable retry-evidence lines the
+        // NAT matrix parses (facts measured from the ACTUAL run — the
+        // monotonic gap between the first failure and the retry's start,
+        // and the bounded failure class — never a config echo).
+        let retry_wait = exp_send_retry();
+        let mut retries_left = SEND_RETRY_LIMIT;
+        let mut attempt = 1usize;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("pairing idle_expired; re-pair to send again");
+            }
+            state.send_replace(SenderKeepaliveState::Active);
+            let outcome = drive_task_send(
+                &session.stack.pairing,
+                &session.key,
+                id_dir,
+                link,
+                paths,
+                // CR-P1-05: the sender flow's adopted dial socket (None on
+                // receiver flows and bind failure — the legacy path).
+                session.sender_socket.as_ref(),
+            )
+            .await;
+            state.send_replace(SenderKeepaliveState::Idle);
+            let failure = match outcome {
+                Ok(report) => {
+                    if attempt > 1 {
+                        // Retry evidence, completion half: measured on
+                        // the ACTUAL transfer outcome (the matrix only
+                        // accepts the summary after its byte-identical
+                        // sha256 check also passed).
+                        println!(
+                            "[task] retry-evidence attempt={attempt} outcome=completed files={} bytes={}",
+                            report.files, report.bytes
+                        );
+                    }
+                    return Ok(report);
+                }
+                Err(failure) => failure,
+            };
+            // No retry without the knob; no retry past the bound.
+            let Some(delay) = retry_wait else {
+                return Err(failure);
+            };
+            if retries_left == 0 {
+                println!("[task] retry budget exhausted; giving up");
+                return Err(failure);
+            }
+            retries_left -= 1;
+            // Retry evidence, attempt half: the bounded failure CLASS of
+            // the attempt that just ended (no addresses, no diagnostics —
+            // the string is classified, not echoed raw).
+            let failure_class = if failure.to_string().to_lowercase().contains("declin") {
+                "declined"
+            } else {
+                "failed"
+            };
+            let failed_at = Instant::now();
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure.context("pairing idle_expired; re-pair to send again"));
+            }
             println!(
-                "[task] pairing keepalive held the mapping: {} tick(s), {} packet(s), ended {}",
-                report.keepalive_ticks,
-                report.keepalive_packets,
-                if report.stopped_early {
-                    "at send start"
-                } else if report.budget_elapsed {
-                    "at the time budget"
-                } else {
-                    "without an adopted socket"
-                },
+                "[task] send failed ({failure}); retrying in {} ms (keepalive resumes within the remaining budget)",
+                delay.as_millis()
+            );
+            wait_pairing_delay(deadline, delay).await?;
+            attempt += 1;
+            // Retry evidence, timing half: the MONOTONIC gap from the
+            // previous failure to THIS attempt's start (>= the knob's
+            // wait by construction; the matrix asserts the bound).
+            println!(
+                "[task] retry-evidence attempt={attempt} since_failure_ms={} knob_ms={} first_failure={failure_class}",
+                failed_at.elapsed().as_millis(),
+                delay.as_millis(),
             );
         }
-        drive_task_send(
-            &session.stack.pairing,
-            &session.key,
-            id_dir,
-            link,
-            paths,
-            // CR-P1-05: the sender flow's adopted dial socket (None on
-            // receiver flows and bind failure — the legacy path).
-            session.sender_socket.as_ref(),
-        )
-        .await
     };
-    Ok(tokio::select! {
+    let result = tokio::select! {
         report = flow => report,
-        _ = wait_cancelled(&hooks.cancel) => return Ok(Err(TaskCancelled.into())),
-    })
+        _ = wait_cancelled(&hooks.cancel) => Err(TaskCancelled.into()),
+    };
+    state.send_replace(SenderKeepaliveState::Closed);
+    Ok(result)
+}
+
+async fn wait_pairing_delay(deadline: tokio::time::Instant, delay: Duration) -> Result<()> {
+    tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+        .await
+        .map_err(|_| anyhow::anyhow!("pairing idle_expired; re-pair to send again"))
 }
 
 /// Abort the spawned pairing-opener/keepalive task when the guard drops:
@@ -2136,8 +2186,12 @@ impl Drop for AbortOnDrop {
 /// delays the send start after the pairing-time probe, simulating the
 /// GUI's "pair, then pick files, then send" latency for the NAT matrix's
 /// late-send cases (≥5 s and ≥40 s tiers). Unset/0/unparsable = no delay.
-/// CR-P3-16: compile environment reads only with the opt-in
-/// `exp-knobs` feature; default builds keep the unset behavior.
+///
+/// CR-P3-16 (review 2026-11-13-batchH §4): the read exists ONLY in
+/// `exp-knobs` builds (ak-cli's cargo feature, default off — release
+/// builds must not enable it); a default build returns the constant
+/// `None`, bit-identical to the env-unset branch, and the variable's
+/// NAME is not compiled in at all.
 fn exp_send_delay() -> Option<Duration> {
     #[cfg(feature = "exp-knobs")]
     {
@@ -2150,6 +2204,35 @@ fn exp_send_delay() -> Option<Duration> {
         None
     }
 }
+
+/// CR-P3-15 (review 2026-11-13-batchH §4): hidden debug parameter,
+/// DEFAULT OFF — never set in production. `AK_EXP_SEND_RETRY_MS=<millis>`
+/// makes a FAILED or DECLINED send attempt wait that long and then retry
+/// (bounded by [`SEND_RETRY_LIMIT`]), simulating the GUI's "declined, user
+/// tries again later" latency for the NAT matrix's decline-retry case —
+/// during the wait the mapping keepalive RESUMES within the pairing's
+/// remaining idle budget (the exact recovery the FFI runs in product
+/// behavior). An exhausted budget ends the flow with the honest idle
+/// wording instead of a doomed cold dial. Unset/0/unparsable = one-shot
+/// (the production behavior, unchanged). Gated to `exp-knobs` builds
+/// like [`exp_send_delay`] (CR-P3-16).
+fn exp_send_retry() -> Option<Duration> {
+    #[cfg(feature = "exp-knobs")]
+    {
+        let raw = std::env::var("AK_EXP_SEND_RETRY_MS").ok()?;
+        let millis: u64 = raw.parse().ok()?;
+        (millis > 0).then(|| Duration::from_millis(millis))
+    }
+    #[cfg(not(feature = "exp-knobs"))]
+    {
+        None
+    }
+}
+
+/// CR-P3-15: attempts the knob-gated retry loop may make after the first
+/// failure. Small on purpose: the matrix case needs exactly one, and an
+/// unbounded knob loop would spin a hopeless case until CI's hang guard.
+const SEND_RETRY_LIMIT: usize = 3;
 /// it, wait for the joiner, probe, then serve receives behind the consent
 /// prompt until one transfer completes (or the peer departs).
 pub(crate) async fn run_code_recv(cfg: TaskRunConfig, mut hooks: TaskHooks) -> Result<TaskOutcome> {

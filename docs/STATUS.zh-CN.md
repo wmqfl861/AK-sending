@@ -22,7 +22,7 @@
 
 ## 交接入口
 
-> **交接文档**：第一轮修复 [HANDOFF-REVIEW-FIXES-2026-11](HANDOFF-REVIEW-FIXES-2026-11.zh-CN.md)；批次 F [HANDOFF-BATCH-F-2026-11-12](HANDOFF-BATCH-F-2026-11-12.zh-CN.md)（含 nat-matrix 三轮记录与待决三选项）。
+> **交接文档**：第一轮 [HANDOFF-REVIEW-FIXES-2026-11](HANDOFF-REVIEW-FIXES-2026-11.zh-CN.md)；批次 F [HANDOFF-BATCH-F-2026-11-12](HANDOFF-BATCH-F-2026-11-12.zh-CN.md)；批次 G [HANDOFF-BATCH-G-2026-11-13](HANDOFF-BATCH-G-2026-11-13.zh-CN.md)。
 
 - [HANDOFF](HANDOFF.zh-CN.md)：逐波交接记录、实现与验证边界、重启恢复手册（历史口径，其"当前/进行中"字样以本页为准）。
 - [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md)：本轮审核意见＋执行计划（第 5 节）＋状态表（第 7 节）＋待所有者决定清单（第 8 节）。

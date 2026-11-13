@@ -18,6 +18,12 @@
 /// `consent_expired` event (via `expiredIncomingRequests`) removes the
 /// banner at expiry; the ticker only shows the number. An offer with no
 /// `windowSecs` (an engine predating the field) shows no countdown.
+///
+/// Client UI U1 (2026-11-13): while receiving, the banner renders the
+/// live [TransferProgress] of the request's connection (bytes, percent,
+/// throughput, time left, the file in flight); the finished card names
+/// the elapsed time and average speed; and every finished or failed
+/// receive is recorded in the session's 「最近传输」 list.
 library;
 
 import 'dart:async' show StreamSubscription, Timer;
@@ -25,6 +31,10 @@ import 'dart:async' show StreamSubscription, Timer;
 import 'package:flutter/material.dart';
 
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_format.dart';
+import '../service/transfer_history.dart';
+import '../theme.dart';
+import 'transfer_progress_view.dart';
 
 enum _Stage { pending, receiving, done, failed }
 
@@ -34,6 +44,10 @@ class _BannerState {
   final IncomingRequest request;
   _Stage stage;
   String? error;
+
+  /// How long the accepted receive took, from the 接受 click to the end
+  /// (set when it finished).
+  Duration? elapsed;
 }
 
 class IncomingRequestsHost extends StatefulWidget {
@@ -48,7 +62,16 @@ class IncomingRequestsHost extends StatefulWidget {
 class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
   StreamSubscription<IncomingRequest>? _sub;
   StreamSubscription<String>? _expiredSub;
+  StreamSubscription<TransferProgress>? _progressSub;
+  StreamSubscription<List<TaskConnection>>? _connectionsSub;
   final List<_BannerState> _banners = [];
+
+  /// U1: the latest progress snapshot per connection id.
+  final Map<String, TransferProgress> _progress = {};
+
+  /// U1: peer labels by connection id (the 「最近传输」 record names the
+  /// sender; the offer itself carries no peer name).
+  final Map<String, String> _peerNames = {};
 
   @override
   void initState() {
@@ -65,13 +88,43 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
         () => _banners.removeWhere((banner) => banner.request.jobId == jobId),
       );
     }, onError: (Object _) {});
+    _progressSub = widget.service.transferProgress.listen((progress) {
+      if (!mounted) return;
+      // Only receives this host shows a banner for are worth a rebuild.
+      final shown = _banners.any((banner) =>
+          banner.request.connId == progress.connId &&
+          banner.stage == _Stage.receiving);
+      if (shown) {
+        setState(() => _progress[progress.connId] = progress);
+      } else {
+        _progress[progress.connId] = progress;
+      }
+    }, onError: (Object _) {});
+    _connectionsSub = widget.service.connections.listen((rows) {
+      for (final row in rows) {
+        _peerNames[row.id] = row.peerName;
+      }
+      // Keep progress only for live rows and rows a banner still shows.
+      final live = {for (final row in rows) row.id};
+      final bannered = {for (final banner in _banners) banner.request.connId};
+      _progress.removeWhere(
+          (connId, _) => !live.contains(connId) && !bannered.contains(connId));
+    }, onError: (Object _) {});
   }
 
   @override
   void dispose() {
     _sub?.cancel();
     _expiredSub?.cancel();
+    _progressSub?.cancel();
+    _connectionsSub?.cancel();
     super.dispose();
+  }
+
+  /// The sender's label for [banner]'s record.
+  String _peerOf(_BannerState banner) {
+    final connId = banner.request.connId;
+    return (connId == null ? null : _peerNames[connId]) ?? '对端设备';
   }
 
   Future<void> _respond(_BannerState banner, bool accept) async {
@@ -87,12 +140,38 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
       }
       return;
     }
+    // U1: read the session history BEFORE the await (no context use
+    // after an async gap).
+    final history = TransferHistoryScope.read(context);
+    final started = DateTime.now();
     setState(() => banner.stage = _Stage.receiving);
     try {
       await widget.service.consent(banner.request.jobId, true);
+      final elapsed = DateTime.now().difference(started);
+      history?.add(TransferRecord(
+        role: TaskRole.receive,
+        peerName: _peerOf(banner),
+        succeeded: true,
+        finishedAt: DateTime.now(),
+        fileCount: banner.request.fileCount,
+        totalBytes: banner.request.totalBytes,
+        elapsed: elapsed,
+      ));
       if (!mounted) return;
-      setState(() => banner.stage = _Stage.done);
+      setState(() {
+        banner.stage = _Stage.done;
+        banner.elapsed = elapsed;
+      });
     } on Object catch (e) {
+      history?.add(TransferRecord(
+        role: TaskRole.receive,
+        peerName: _peerOf(banner),
+        succeeded: false,
+        finishedAt: DateTime.now(),
+        fileCount: banner.request.fileCount,
+        totalBytes: banner.request.totalBytes,
+        detail: '$e',
+      ));
       if (!mounted) return;
       setState(() {
         banner.stage = _Stage.failed;
@@ -103,6 +182,13 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
 
   void _dismiss(_BannerState banner) {
     setState(() => _banners.remove(banner));
+  }
+
+  /// U1: the latest progress of [banner]'s receive (null before the first
+  /// snapshot, or when the offer did not name its connection).
+  TransferProgress? _progressOf(_BannerState banner) {
+    final connId = banner.request.connId;
+    return connId == null ? null : _progress[connId];
   }
 
   @override
@@ -119,6 +205,7 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
             _IncomingBannerCard(
               banner: banner,
               saveDir: widget.service.saveDir,
+              progress: _progressOf(banner),
               onAccept: () => _respond(banner, true),
               onReject: () => _respond(banner, false),
               onDismiss: () => _dismiss(banner),
@@ -139,6 +226,7 @@ class _IncomingBannerCard extends StatefulWidget {
   const _IncomingBannerCard({
     required this.banner,
     required this.saveDir,
+    required this.progress,
     required this.onAccept,
     required this.onReject,
     required this.onDismiss,
@@ -146,6 +234,10 @@ class _IncomingBannerCard extends StatefulWidget {
 
   final _BannerState banner;
   final String saveDir;
+
+  /// U1: the receive's latest progress snapshot (null = none yet).
+  final TransferProgress? progress;
+
   final VoidCallback onAccept;
   final VoidCallback onReject;
   final VoidCallback onDismiss;
@@ -205,6 +297,20 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
   void dispose() {
     _ticker?.cancel();
     super.dispose();
+  }
+
+  /// U1: `用时 12 秒 · 平均 3.2 MB/s` for a finished receive (null when
+  /// the duration was not measured).
+  String? _summaryLine(IncomingRequest request) {
+    final elapsed = widget.banner.elapsed;
+    if (elapsed == null) {
+      return null;
+    }
+    final seconds = elapsed.inMilliseconds / 1000;
+    final average = request.totalBytes > 0 && seconds >= 1
+        ? ' · 平均 ${formatSpeed(request.totalBytes / seconds)}'
+        : '';
+    return '用时 ${formatElapsed(elapsed)}$average';
   }
 
   @override
@@ -298,12 +404,15 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
               ),
             ],
             if (widget.banner.stage == _Stage.receiving) ...[
-              const SizedBox(height: 8),
-              LinearProgressIndicator(
-                key: ValueKey('incoming_progress_$jobId'),
+              const SizedBox(height: 10),
+              // U1: the live progress of this receive (an indeterminate
+              // bar + 「正在接收…」 until the first snapshot lands).
+              TransferProgressView(
+                progress: widget.progress,
+                role: TaskRole.receive,
+                barKey: ValueKey('incoming_progress_$jobId'),
+                keyPrefix: 'incoming_progress_$jobId',
               ),
-              const SizedBox(height: 6),
-              Text('正在接收…', style: theme.textTheme.bodySmall),
             ],
             if (widget.banner.stage == _Stage.done) ...[
               const SizedBox(height: 8),
@@ -311,7 +420,7 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
                 children: [
                   Icon(
                     Icons.check_circle,
-                    color: Colors.green.shade700,
+                    color: successColor(scheme),
                     size: 20,
                   ),
                   const SizedBox(width: 6),
@@ -321,12 +430,24 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
                       '保存在：${request.saveDir ?? widget.saveDir}',
                       key: ValueKey('incoming_success_$jobId'),
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        color: Colors.green.shade800,
+                        color: successColor(scheme),
                       ),
                     ),
                   ),
                 ],
               ),
+              if (_summaryLine(request) case final summary?) ...[
+                const SizedBox(height: 2),
+                Padding(
+                  padding: const EdgeInsets.only(left: 26),
+                  child: Text(
+                    summary,
+                    key: ValueKey('incoming_summary_$jobId'),
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                ),
+              ],
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton(

@@ -3130,16 +3130,11 @@ async fn run_resident_receiver(
             // keep a diagnosable code-id row rather than dropping the
             // event silently.
             .unwrap_or_else(|| core::hex_encode(&code_id));
-        if let Ok(mut queue) = progress_queue.lock() {
-            core::push_capped(
-                &mut queue,
-                format!(
-                    "{{\"job\":{},\"event\":{}}}",
-                    quoted(&job),
-                    quoted(core::progress_name(&event)),
-                ),
-            );
-        }
+        // Client UI U1 (ffi-v2 §8.4 U1 revision): the task plane renders
+        // the SAME payload fields as the engine-level lines (`files`/
+        // `bytes`/`file`/`chunk`/`path`/`verified`) — the GUI's live
+        // progress needs the byte counts, not just the event name.
+        core::push_event(&progress_queue, &job, None, &event);
     };
     loop {
         if rt.is_stopped() {
@@ -3777,16 +3772,8 @@ async fn attempt_task_send(
     let send_marks = Arc::clone(&marks);
     let progress = move |event: Progress| {
         send_marks.mark(&event);
-        if let Ok(mut queue) = progress_queue.lock() {
-            core::push_capped(
-                &mut queue,
-                format!(
-                    "{{\"job\":{},\"event\":{}}}",
-                    quoted(&conn_hex),
-                    quoted(core::progress_name(&event)),
-                ),
-            );
-        }
+        // Client UI U1: the engine payload fields ride along (ffi-v2 §8.4).
+        core::push_event(&progress_queue, &conn_hex, None, &event);
     };
     let send = send(spec, &progress);
     tokio::pin!(send);
@@ -7348,6 +7335,29 @@ mod task_tests {
                 .iter()
                 .any(|row| row.contains(&format!("\"job\":\"{conn_hex}\""))),
             "send progress keeps the connection-id key: {send_rows:?}"
+        );
+        // Client UI U1 (ffi-v2 §8.4 U1 revision): the task-plane rows
+        // carry the engine payload fields — the GUI's byte progress reads
+        // the totals and the per-file sizes from them.
+        let total = payload.len();
+        assert!(
+            recv_rows.iter().any(|row| row.contains(&format!(
+                "\"job\":\"{conn_hex}\",\"event\":\"accepted\",\"files\":1,\"bytes\":{total}}}"
+            ))),
+            "the receiver's accepted row carries files/bytes: {recv_rows:?}"
+        );
+        assert!(
+            send_rows.iter().any(|row| row.starts_with(&format!(
+                "{{\"job\":\"{conn_hex}\",\"event\":\"file_started\",\"file\":0,\"path\":"
+            )) && row.ends_with(&format!(",\"bytes\":{total}}}"))),
+            "the sender's file_started row carries file/path/bytes: {send_rows:?}"
+        );
+        assert!(
+            send_rows
+                .iter()
+                .chain(recv_rows.iter())
+                .all(|row| !row.contains("\"conn\":")),
+            "task-plane rows never carry the engine-level conn index: {send_rows:?}"
         );
     }
 

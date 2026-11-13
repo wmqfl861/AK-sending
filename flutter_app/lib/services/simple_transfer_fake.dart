@@ -14,6 +14,9 @@
 /// receive:      emitIncomingRequest(...) ─▶ consent(jobId,true) ─▶
 ///               finishIncoming(jobId) / failIncoming(jobId, reason)
 /// send:         sendFiles(...)            ─▶ completeSend(text)/failSend(reason)
+/// progress:     emitProgress(TransferProgress(...))   (client UI U1)
+/// one-task end: endConnection(id) (the engine retires a row whose one
+///               transfer finished — the row leaves the list)
 /// teardown:     disconnect(id) / simulateNetworkChange() (drops everything)
 /// ```
 ///
@@ -102,6 +105,10 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// [failEngine]).
   final StreamController<EngineHealth> _engineHealthController =
       StreamController<EngineHealth>.broadcast();
+
+  /// Client UI U1: the progress fan-out (driven by [emitProgress]).
+  final StreamController<TransferProgress> _progressController =
+      StreamController<TransferProgress>.broadcast();
 
   /// True after [failEngine] (the fake's terminal latch).
   bool _engineFailed = false;
@@ -214,6 +221,9 @@ class LocalSimpleTransferService implements SimpleTransferService {
   }
 
   @override
+  Stream<TransferProgress> get transferProgress => _progressController.stream;
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     consentCalls += 1;
     consentRequests.add((jobId, accept));
@@ -280,6 +290,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _incomingController.close();
     _expiredIncomingController.close();
     _engineHealthController.close();
+    _progressController.close();
   }
 
   // ---------------------------------------------------------------------
@@ -358,6 +369,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     required int totalBytes,
     String? saveDir,
     int? windowSecs = 120,
+    String? connId,
   }) {
     final id = jobId ?? 'job-${_jobSeq += 1}';
     _incomingController.add(IncomingRequest(
@@ -366,6 +378,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
       totalBytes: totalBytes,
       saveDir: saveDir ?? _saveDir,
       windowSecs: windowSecs,
+      connId: connId, // U1: the receive's progress key (null = unknown)
     ));
     return id;
   }
@@ -414,6 +427,22 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _pendingSends.removeWhere((c) => c.isCompleted);
     return _pendingSends.isEmpty ? null : _pendingSends.removeAt(0);
   }
+
+  // ---------------------------------------------------------------------
+  // Test knobs — client UI U1 (progress and the one-task end).
+  // ---------------------------------------------------------------------
+
+  /// Emits one progress snapshot on [transferProgress].
+  void emitProgress(TransferProgress progress) {
+    if (!_progressController.isClosed) {
+      _progressController.add(progress);
+    }
+  }
+
+  /// Retires connection [connId] the way the real engine does once its
+  /// ONE transfer finished (v1: one pairing = one transfer — the row
+  /// converges to `done` and leaves the live list).
+  void endConnection(String connId) => _dropConnection(connId);
 
   // ---------------------------------------------------------------------
   // Internals.

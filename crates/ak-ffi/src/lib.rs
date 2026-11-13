@@ -140,6 +140,10 @@
 //! it with the id from `ak_*_start`, not with the wire-protocol job id
 //! (which appears as `"wire_job"` in the result).
 //!
+//! Task-plane rows (`ak_task_*`; client UI U1, ffi-v2 §8.4) share this
+//! queue with the same event names and payload fields; their `"job"` is
+//! the 32-hex connection id and they never carry a `"conn"` index.
+//!
 //! # result JSON (`ak_job_result`)
 //!
 //! Success (status `1`):

@@ -1377,7 +1377,9 @@ fn finish(outcome: &Mutex<Outcome>, value: Outcome) {
 }
 
 /// Serialize one progress event as a compact JSON line, dropping it only if
-/// the queue is at capacity (see `MAX_QUEUED_EVENTS`).
+/// the queue is at capacity (see `MAX_QUEUED_EVENTS`). Shared by the
+/// engine-level jobs and (client UI U1, ffi-v2 §8.4) the task plane, which
+/// keys its rows by the connection id and passes no `conn` index.
 pub(crate) fn push_event(
     queue: &Arc<Mutex<VecDeque<String>>>,
     job: &str,
@@ -1441,13 +1443,6 @@ fn event_name(event: &Progress) -> &'static str {
         Progress::FinalAck { .. } => "final_ack",
         Progress::Done => "done",
     }
-}
-
-/// The wire event name of one [`Progress`] (B8 wave 28: shared with the
-/// task plane's progress forwarding, which renders `ak_poll_progress`
-/// lines under the conn/code id).
-pub(crate) fn progress_name(event: &Progress) -> &'static str {
-    event_name(event)
 }
 
 fn event_fields(event: &Progress) -> Vec<(&'static str, Field<'_>)> {

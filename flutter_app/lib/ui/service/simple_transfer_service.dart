@@ -61,8 +61,10 @@ enum TaskConnectionState {
   connected,
 
   /// Probe FAILED (wave-29 P2-09): the pairing committed but no data
-  /// path to the peer could be verified. Not terminal-disconnected — the
-  /// user should re-pair (or check the network) rather than retry a send.
+  /// path to the peer could be verified. Not terminal-disconnected and,
+  /// since CR-P1-07 (batch H), not a dead end either: the send phase runs
+  /// its own probe round and dial on the real socket, so the UI keeps the
+  /// send available and words the failed test as informational.
   unreachable,
 
   /// The connection dropped (either end or a network change). Services
@@ -156,11 +158,19 @@ class IncomingRequest {
     required this.totalBytes,
     this.saveDir,
     this.windowSecs,
+    this.connId,
   });
 
   final String jobId;
   final int fileCount;
   final int totalBytes;
+
+  /// The connection this offer arrived on (client UI U1, 2026-11-13;
+  /// additive nullable like [saveDir]/[windowSecs] before it): the key of
+  /// this receive's [TransferProgress] snapshots. Null = the
+  /// implementation lacks the fact; the banner then shows an
+  /// indeterminate progress bar instead of a guessed one.
+  final String? connId;
 
   /// The save folder THIS request will use (wave-30 P2-06): snapshotted
   /// by the engine at offer time and carried on the event — the receive
@@ -176,6 +186,100 @@ class IncomingRequest {
   /// the implementation lacks the fact; show no countdown rather than a
   /// wrong one.
   final int? windowSecs;
+}
+
+/// Phase of one live transfer as the UI renders it (client UI U1,
+/// 2026-11-13). Derived from the engine's progress lines; a phase never
+/// moves backwards within one transfer.
+enum TransferPhase {
+  /// Connecting / handshaking / exchanging the file list.
+  connecting,
+
+  /// SENDER ONLY: the offer reached the peer and waits for the receiving
+  /// user's 接受 (the consent window — 120 s since E2/G4).
+  awaitingConsent,
+
+  /// Bytes are moving.
+  transferring,
+
+  /// Every byte moved; the receiver verifies the whole transfer (the
+  /// sender waits for its final acknowledgement).
+  verifying,
+
+  /// Every file was verified and committed (the transfer finished).
+  completed,
+}
+
+/// One progress snapshot of the transfer running on connection [connId]
+/// (client UI U1, 2026-11-13). Totals are null when the engine did not
+/// report them (an engine predating the task-plane payload fields —
+/// ffi-v2 §8.4 U1): the UI then shows an indeterminate bar rather than a
+/// guessed percentage.
+class TransferProgress {
+  const TransferProgress({
+    required this.connId,
+    required this.phase,
+    this.totalFiles,
+    this.totalBytes,
+    this.completedFiles = 0,
+    this.transferredBytes = 0,
+    this.currentFileName,
+    this.currentFileIndex,
+    this.bytesPerSecond,
+  });
+
+  /// The connection the transfer runs on (send AND receive progress are
+  /// keyed by the connection id — ffi-v2 §8.4 wave-31).
+  final String connId;
+
+  final TransferPhase phase;
+
+  /// Files in the whole transfer; null = unknown.
+  final int? totalFiles;
+
+  /// Bytes in the whole transfer; null = unknown.
+  final int? totalBytes;
+
+  /// Files finished so far (every byte moved, or verified).
+  final int completedFiles;
+
+  /// Verified bytes so far (the engine reports acknowledged bytes per
+  /// file on its checkpoint cadence, so the number advances in steps).
+  final int transferredBytes;
+
+  /// Display name (last path segment only) of the file in flight.
+  final String? currentFileName;
+
+  /// Zero-based index of the file in flight.
+  final int? currentFileIndex;
+
+  /// Smoothed throughput; null until two samples could be measured.
+  final double? bytesPerSecond;
+
+  /// Completed fraction in `0..1`; null when [totalBytes] is unknown
+  /// (or zero — an empty transfer has no meaningful fraction).
+  double? get fraction {
+    final total = totalBytes;
+    if (total == null || total <= 0) {
+      return phase == TransferPhase.completed ? 1.0 : null;
+    }
+    return (transferredBytes / total).clamp(0.0, 1.0);
+  }
+
+  /// Estimated time left at the current throughput; null when either
+  /// number is unknown.
+  Duration? get remaining {
+    final total = totalBytes;
+    final speed = bytesPerSecond;
+    if (total == null || speed == null || speed <= 0) {
+      return null;
+    }
+    final left = total - transferredBytes;
+    if (left <= 0) {
+      return Duration.zero;
+    }
+    return Duration(milliseconds: (left / speed * 1000).round());
+  }
 }
 
 /// The wave-28 minimal transfer service (frozen shape + the wave-29
@@ -241,6 +345,16 @@ abstract class SimpleTransferService {
   /// declined (nothing is received) and the future completes immediately —
   /// including when the request already expired (wave-29 P2-11).
   Future<void> consent(String jobId, bool accept);
+
+  /// Live transfer progress (client UI U1, 2026-11-13; additive member
+  /// like [engineHealth] before it): one [TransferProgress] snapshot per
+  /// change, for sends AND receives, keyed by the connection id. The
+  /// final snapshot of a finished transfer carries
+  /// [TransferPhase.completed]; an aborted transfer simply stops
+  /// producing snapshots (the send/consent futures carry the failure).
+  /// Broadcast; no replay — a page subscribes before it starts a
+  /// transfer and keeps the latest snapshot it saw.
+  Stream<TransferProgress> get transferProgress;
 
   /// Sends [paths] (files and/or one directory) over connection [connId]
   /// and completes with a readable summary when the peer has everything;

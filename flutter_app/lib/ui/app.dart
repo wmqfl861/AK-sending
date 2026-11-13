@@ -28,17 +28,25 @@ import 'pages/settings_page.dart';
 import 'service/file_pick_gateway.dart';
 import 'service/save_dir_store.dart';
 import 'service/simple_transfer_service.dart';
+import 'service/transfer_history.dart';
+import 'theme.dart';
 import 'widgets/engine_error_card.dart';
 import 'widgets/incoming_requests_host.dart';
 
 /// Material 3 app root for the wave-28 minimal-pairing UI.
-class AkSendingApp extends StatelessWidget {
+///
+/// Client UI U1 (2026-11-13): follows the system light/dark setting, and
+/// owns the session's [TransferHistory] — provided ABOVE the MaterialApp
+/// so pushed routes (the connection detail page) record into the same
+/// list the home page shows.
+class AkSendingApp extends StatefulWidget {
   const AkSendingApp({
     super.key,
     required this.service,
     this.startupError,
     this.store = const SharedPrefsSaveDirStore(),
     this.picker = const PluginFilePickGateway(),
+    this.history,
   });
 
   final SimpleTransferService service;
@@ -52,19 +60,40 @@ class AkSendingApp extends StatelessWidget {
   final SaveDirStore store;
   final FilePickGateway picker;
 
+  /// The session's transfer list; null (the default) creates one owned by
+  /// this widget. Tests inject their own to assert on it.
+  final TransferHistory? history;
+
+  @override
+  State<AkSendingApp> createState() => _AkSendingAppState();
+}
+
+class _AkSendingAppState extends State<AkSendingApp> {
+  late final TransferHistory _history = widget.history ?? TransferHistory();
+
+  @override
+  void dispose() {
+    if (widget.history == null) {
+      _history.dispose(); // only the instance this widget created
+    }
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'AK-sending',
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF316A5A)),
-      ),
-      home: AppShell(
-        service: service,
-        startupError: startupError,
-        store: store,
-        picker: picker,
+    return TransferHistoryScope(
+      history: _history,
+      child: MaterialApp(
+        title: 'AK-sending',
+        theme: buildAppTheme(Brightness.light),
+        darkTheme: buildAppTheme(Brightness.dark),
+        themeMode: ThemeMode.system,
+        home: AppShell(
+          service: widget.service,
+          startupError: widget.startupError,
+          store: widget.store,
+          picker: widget.picker,
+        ),
       ),
     );
   }

@@ -87,21 +87,59 @@ class DirectUnavailableGuidance extends StatelessWidget {
   }
 }
 
+/// U1: the one-line progress caption of a connection card
+/// (`发送中 27%`, `等待对方接受…`, `正在校验…`); null when there is
+/// nothing running to report.
+String? connectionProgressCaption(TaskRole role, TransferProgress? progress) {
+  if (progress == null) {
+    return null;
+  }
+  final verb = role == TaskRole.send ? '发送' : '接收';
+  switch (progress.phase) {
+    case TransferPhase.connecting:
+      return '正在建立传输连接…';
+    case TransferPhase.awaitingConsent:
+      return '等待对方接受…';
+    case TransferPhase.transferring:
+      final fraction = progress.fraction;
+      return fraction == null
+          ? '$verb中…'
+          : '$verb中 ${(fraction * 100).floor()}%';
+    case TransferPhase.verifying:
+      return '正在校验…';
+    case TransferPhase.completed:
+      return null;
+  }
+}
+
 /// One live connection row of the home page's 「当前连接」 section:
 /// peer name + direction + state. Tapping opens the detail page.
+///
+/// U1: a running transfer adds a thin progress bar and a caption.
 class ConnectionCard extends StatelessWidget {
   const ConnectionCard({
     super.key,
     required this.connection,
     required this.onOpen,
+    this.progress,
   });
 
   final TaskConnection connection;
   final VoidCallback onOpen;
 
+  /// The connection's latest transfer progress (null = none running).
+  final TransferProgress? progress;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final caption = connectionProgressCaption(connection.role, progress);
+    final snapshot = progress;
+    final barValue = snapshot != null &&
+            (snapshot.phase == TransferPhase.transferring ||
+                snapshot.phase == TransferPhase.verifying)
+        ? snapshot.fraction
+        : null;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: InkWell(
@@ -135,6 +173,24 @@ class ConnectionCard extends StatelessWidget {
                       key: ValueKey('conn_card_role_${connection.id}'),
                       style: theme.textTheme.bodySmall,
                     ),
+                    if (caption != null) ...[
+                      const SizedBox(height: 6),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: LinearProgressIndicator(
+                          key: ValueKey('conn_card_progress_${connection.id}'),
+                          minHeight: 3,
+                          value: barValue,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        caption,
+                        key: ValueKey('conn_card_caption_${connection.id}'),
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: theme.colorScheme.primary),
+                      ),
+                    ],
                   ],
                 ),
               ),

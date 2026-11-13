@@ -1,6 +1,11 @@
 /// Wave-28 home (「连接」 tab): the two pairing actions (生成配对码 /
 /// 输入配对码) plus the live 「当前连接」 list. No IP/port/fingerprint
 /// forms anywhere — the whole page runs on one-time pairing codes.
+///
+/// Client UI U1 (2026-11-13): connection cards show the live progress of
+/// a running transfer, and a 「最近传输」 section lists this session's
+/// finished transfers (a v1 pairing carries one transfer and then leaves
+/// the connection list, so this is where the user looks back).
 library;
 
 import 'dart:async' show StreamSubscription;
@@ -16,6 +21,9 @@ import 'package:flutter/services.dart'
 import '../service/file_pick_gateway.dart';
 import '../service/pairing_flow_controller.dart';
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_format.dart';
+import '../service/transfer_history.dart';
+import '../theme.dart';
 import '../widgets/engine_error_card.dart';
 import '../widgets/task_connection_views.dart';
 import 'connection_detail_page.dart';
@@ -42,7 +50,11 @@ class _HomePageState extends State<HomePage> {
   late final PairingFlowController _flow;
   StreamSubscription<List<TaskConnection>>? _connectionsSub;
   StreamSubscription<EngineHealth>? _engineHealthSub;
+  StreamSubscription<TransferProgress>? _progressSub;
   List<TaskConnection> _connections = const [];
+
+  /// U1: the latest progress snapshot per LIVE connection id.
+  final Map<String, TransferProgress> _progress = {};
 
   /// The engine health as the health stream last reported it (R36-P2-03)
   /// — a latched failure renders the recoverable engine-failed card.
@@ -59,7 +71,23 @@ class _HomePageState extends State<HomePage> {
     _connectionsSub = widget.service.connections.listen(
       (snapshot) {
         if (mounted) {
-          setState(() => _connections = snapshot);
+          setState(() {
+            _connections = snapshot;
+            // U1: a retired row's progress goes with it.
+            final live = {for (final connection in snapshot) connection.id};
+            _progress.removeWhere((connId, _) => !live.contains(connId));
+          });
+        }
+      },
+      onError: (Object _) {},
+    );
+    _progressSub = widget.service.transferProgress.listen(
+      (progress) {
+        if (!mounted) return;
+        final listed =
+            _connections.any((connection) => connection.id == progress.connId);
+        if (listed) {
+          setState(() => _progress[progress.connId] = progress);
         }
       },
       onError: (Object _) {},
@@ -84,6 +112,7 @@ class _HomePageState extends State<HomePage> {
     _flow.dispose();
     _connectionsSub?.cancel();
     _engineHealthSub?.cancel();
+    _progressSub?.cancel();
     super.dispose();
   }
 
@@ -157,8 +186,10 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 24),
         _ConnectionsSection(
           connections: _connections,
+          progress: _progress,
           onOpen: _openConnection,
         ),
+        const _HistorySection(),
       ],
     );
   }
@@ -560,12 +591,13 @@ class _FlowSuccessView extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final connection = controller.connection;
+    final success = successColor(theme.colorScheme);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Row(
           children: [
-            Icon(Icons.check_circle, color: Colors.green.shade600, size: 40),
+            Icon(Icons.check_circle, color: success, size: 40),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -574,7 +606,7 @@ class _FlowSuccessView extends StatelessWidget {
                   Text('连接成功',
                       key: const ValueKey('flow_success'),
                       style: theme.textTheme.titleLarge
-                          ?.copyWith(color: Colors.green.shade700)),
+                          ?.copyWith(color: success)),
                   if (connection != null)
                     Text(
                       '连通测试通过：${connection.peerName}'
@@ -664,10 +696,15 @@ class _FlowFailedView extends StatelessWidget {
 class _ConnectionsSection extends StatelessWidget {
   const _ConnectionsSection({
     required this.connections,
+    required this.progress,
     required this.onOpen,
   });
 
   final List<TaskConnection> connections;
+
+  /// U1: the latest transfer progress per connection id.
+  final Map<String, TransferProgress> progress;
+
   final ValueChanged<TaskConnection> onOpen;
 
   @override
@@ -700,10 +737,131 @@ class _ConnectionsSection extends StatelessWidget {
           ...connections.map(
             (connection) => ConnectionCard(
               connection: connection,
+              progress: progress[connection.id],
               onOpen: () => onOpen(connection),
             ),
           ),
       ],
+    );
+  }
+}
+
+/// U1: 「最近传输」 — this session's finished transfers, newest first.
+/// Hidden when the app shell provides no [TransferHistoryScope] (direct
+/// widget tests) or nothing finished yet.
+class _HistorySection extends StatelessWidget {
+  const _HistorySection();
+
+  /// How many records the home page lists (the history keeps more).
+  static const int shown = 10;
+
+  @override
+  Widget build(BuildContext context) {
+    final history = TransferHistoryScope.watch(context);
+    if (history == null || history.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final theme = Theme.of(context);
+    final records = history.records.take(shown).toList();
+    return Padding(
+      key: const ValueKey('history_section'),
+      padding: const EdgeInsets.only(top: 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text('最近传输', style: theme.textTheme.titleMedium),
+              ),
+              TextButton(
+                key: const ValueKey('history_clear_button'),
+                onPressed: history.clear,
+                child: const Text('清空'),
+              ),
+            ],
+          ),
+          Text('仅保留本次运行期间的记录，不含文件名。',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline)),
+          const SizedBox(height: 4),
+          for (var i = 0; i < records.length; i++)
+            _HistoryTile(key: ValueKey('history_item_$i'), record: records[i]),
+        ],
+      ),
+    );
+  }
+}
+
+/// One 「最近传输」 row: direction, size, result, time, duration, path.
+class _HistoryTile extends StatelessWidget {
+  const _HistoryTile({super.key, required this.record});
+
+  final TransferRecord record;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final sending = record.role == TaskRole.send;
+    final files = record.fileCount;
+    final bytes = record.totalBytes;
+    final title = StringBuffer(sending ? '发送' : '接收');
+    if (files != null) {
+      title.write(' $files 个文件');
+    }
+    if (bytes != null) {
+      title.write('（${formatBytes(bytes)}）');
+    }
+    final finished = record.finishedAt;
+    final clock = '${finished.hour.toString().padLeft(2, '0')}:'
+        '${finished.minute.toString().padLeft(2, '0')}';
+    final elapsed = record.elapsed;
+    final details = <String>[
+      record.succeeded ? '完成' : '失败',
+      clock,
+      if (elapsed != null) '用时 ${formatElapsed(elapsed)}',
+      if (record.pathLabel case final path?) path,
+      record.peerName,
+    ];
+    final color = record.succeeded ? successColor(scheme) : scheme.error;
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Icon(
+              sending ? Icons.upload_outlined : Icons.download_outlined,
+              color: color,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title.toString(),
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall,
+                  ),
+                  Text(
+                    details.join(' · '),
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              record.succeeded ? Icons.check_circle : Icons.error_outline,
+              color: color,
+              size: 20,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

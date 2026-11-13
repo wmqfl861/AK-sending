@@ -272,6 +272,216 @@ final class SimpleIncomingRequest {
       'saveDir=$saveDir windowSecs=$windowSecs)';
 }
 
+/// Client UI U1 (2026-11-13): one progress snapshot of the transfer on
+/// connection [connId], folded from the task-plane `ak_poll_progress`
+/// lines (ffi-v2 §8.4 U1 revision: task-plane rows carry the engine's
+/// payload fields — `files`/`bytes`/`file`/`chunk`/`path`). An engine
+/// predating that revision only sends `job`/`event`: totals then stay
+/// null and the UI shows an indeterminate bar.
+final class SimpleTransferProgress {
+  const SimpleTransferProgress({
+    required this.connId,
+    required this.phase,
+    this.totalFiles,
+    this.totalBytes,
+    this.completedFiles = 0,
+    this.transferredBytes = 0,
+    this.currentFile,
+    this.currentFileIndex,
+    this.bytesPerSecond,
+  });
+
+  /// The connection id (send AND receive rows key by it — §8.4 wave-31).
+  final String connId;
+
+  /// `connecting` | `awaiting_consent` | `transferring` | `verifying` |
+  /// `completed` — monotonic within one transfer.
+  final String phase;
+
+  final int? totalFiles;
+  final int? totalBytes;
+
+  /// Files finished so far: every byte moved, or verified/committed.
+  final int completedFiles;
+
+  /// Bytes so far: acknowledged bytes per file (the engine's checkpoint
+  /// cadence), refined by the per-file chunk position (1 MiB chunks, the
+  /// task plane's engine default), clamped to each file's size.
+  final int transferredBytes;
+
+  /// Display name (last path segment) of the file in flight.
+  final String? currentFile;
+
+  final int? currentFileIndex;
+
+  /// Average throughput since the first byte moved; null until measurable.
+  final double? bytesPerSecond;
+
+  @override
+  String toString() => 'SimpleTransferProgress($connId $phase '
+      '$transferredBytes/$totalBytes files=$completedFiles/$totalFiles)';
+}
+
+/// The fold state of one transfer's progress lines (see
+/// [SimpleTransferProgress]). Private to the service: snapshots are the
+/// only thing that leaves it.
+///
+/// Accounting is incremental: a file whose bytes are complete moves from
+/// the in-flight maps into [_doneBytes], so a snapshot costs O(files in
+/// flight) — not O(files in the transfer) — however large a folder is.
+final class _TransferTracker {
+  _TransferTracker(this.connId);
+
+  final String connId;
+
+  /// 0 connecting · 1 awaiting_consent · 2 transferring · 3 verifying ·
+  /// 4 completed — never decreases.
+  int phaseRank = 0;
+
+  int? totalFiles;
+  int? totalBytes;
+
+  /// In-flight files only (a finished file leaves these maps).
+  final Map<int, int> _sizes = <int, int>{};
+  final Map<int, int> _acked = <int, int>{};
+  final Map<int, int> _chunks = <int, int>{};
+
+  /// Every file index known finished (bytes complete, or verified).
+  final Set<int> _done = <int>{};
+
+  /// The bytes of the finished files.
+  int _doneBytes = 0;
+
+  String? currentFile;
+  int? currentFileIndex;
+
+  /// When the first transferring-phase line arrived (the throughput base).
+  DateTime? transferStartedAt;
+
+  /// Changed since the last emitted snapshot.
+  bool dirty = false;
+
+  /// The task plane's chunk size: the engine default (ak-core
+  /// `default_chunk_size`, 1 MiB) — task sends never override it. Used
+  /// only to refine progress between the 16-ack checkpoint reports.
+  static const int chunkBytes = 1024 * 1024;
+
+  static const List<String> phaseNames = <String>[
+    'connecting',
+    'awaiting_consent',
+    'transferring',
+    'verifying',
+    'completed',
+  ];
+
+  void raiseTo(int rank) {
+    if (rank > phaseRank) {
+      phaseRank = rank;
+      dirty = true;
+    }
+  }
+
+  /// `file_started`: the file's size is known from here on (an empty
+  /// file is finished at once — no chunk will ever name it).
+  void fileStarted(int file, int? size) {
+    if (_done.contains(file) || size == null) {
+      return;
+    }
+    _sizes[file] = size;
+    _settleIfComplete(file);
+  }
+
+  /// `bytes_acked`: the cumulative acknowledged bytes of [file].
+  void acked(int file, int bytes) {
+    if (_done.contains(file)) {
+      return;
+    }
+    if (bytes > (_acked[file] ?? 0)) {
+      _acked[file] = bytes;
+    }
+    _settleIfComplete(file);
+  }
+
+  /// `chunk_sent` / `chunk_received`: [index] is the per-file chunk
+  /// index, so `index + 1` chunks of [file] have moved.
+  void chunk(int file, int index) {
+    if (_done.contains(file)) {
+      return;
+    }
+    if (index + 1 > (_chunks[file] ?? 0)) {
+      _chunks[file] = index + 1;
+    }
+    _settleIfComplete(file);
+  }
+
+  /// `file_verified` / `file_committed`: [file] is finished whatever the
+  /// byte facts said.
+  void markDone(int file) {
+    if (!_done.add(file)) {
+      return;
+    }
+    final size = _sizes.remove(file);
+    final acked = _acked.remove(file);
+    final chunks = _chunks.remove(file);
+    _doneBytes += size ?? _estimate(acked, chunks, null);
+  }
+
+  /// The in-flight bytes estimate of one file: acknowledged bytes,
+  /// refined by the chunk position, clamped to the file's size.
+  static int _estimate(int? acked, int? chunks, int? size) {
+    var done = acked ?? 0;
+    if (chunks != null && chunks * chunkBytes > done) {
+      done = chunks * chunkBytes;
+    }
+    return size != null && done > size ? size : done;
+  }
+
+  void _settleIfComplete(int file) {
+    final size = _sizes[file];
+    if (size != null && _estimate(_acked[file], _chunks[file], size) >= size) {
+      markDone(file);
+    }
+  }
+
+  int get completedFiles => _done.length;
+
+  int get transferredBytes {
+    final known = totalBytes;
+    if (phaseRank >= 4 && known != null) {
+      return known;
+    }
+    var sum = _doneBytes;
+    final inFlight = <int>{..._sizes.keys, ..._acked.keys, ..._chunks.keys};
+    for (final file in inFlight) {
+      sum += _estimate(_acked[file], _chunks[file], _sizes[file]);
+    }
+    return known != null && sum > known ? known : sum;
+  }
+
+  SimpleTransferProgress snapshot(DateTime now) {
+    final bytes = transferredBytes;
+    double? speed;
+    final started = transferStartedAt;
+    if (started != null && bytes > 0) {
+      final elapsedMs = now.difference(started).inMilliseconds;
+      if (elapsedMs >= 1000) {
+        speed = bytes * 1000 / elapsedMs;
+      }
+    }
+    return SimpleTransferProgress(
+      connId: connId,
+      phase: phaseNames[phaseRank],
+      totalFiles: totalFiles,
+      totalBytes: totalBytes,
+      completedFiles: completedFiles,
+      transferredBytes: bytes,
+      currentFile: currentFile,
+      currentFileIndex: currentFileIndex,
+      bytesPerSecond: speed,
+    );
+  }
+}
+
 /// The result of a successful task-code creation (wave-30 P2-04): the
 /// DISPLAY code plus the engine's `code_id` — the cancel key. Calling
 /// [SimpleTransferService.disconnect] with [codeId] while the code is
@@ -401,8 +611,10 @@ final class SimpleTransferService {
     this.idlePollInterval = const Duration(milliseconds: idleEventPollMs),
     AkTaskDoorbellRegistrar? doorbellRegistrar,
     Future<void> Function(Duration)? delay,
+    DateTime Function()? clock,
   })  : _doorbellRegistrar = doorbellRegistrar ?? _registerNativeDoorbell,
-        _delay = delay ?? Future<void>.delayed;
+        _delay = delay ?? Future<void>.delayed,
+        _clock = clock ?? DateTime.now;
 
   /// C12: one pump tick handles at most this many events (and drains at
   /// most this many progress lines) — the per-tick budget that keeps a
@@ -469,6 +681,10 @@ final class SimpleTransferService {
   /// Injectable delay (tests drive the loops synchronously with a
   /// zero-delay stand-in).
   final Future<void> Function(Duration) _delay;
+
+  /// Client UI U1: the wall clock behind the throughput figure of
+  /// [transferProgress] (tests inject a scripted clock).
+  final DateTime Function() _clock;
 
   /// CR-P2-05 (native-push half): the doorbell registrar — the native
   /// attempt by default; tests inject a fake doorbell to drive the
@@ -551,6 +767,16 @@ final class SimpleTransferService {
   /// send/receive stall loops). A tick advancing means "bytes moved since
   /// the last look" — the deadline-renewal fact.
   final Map<String, int> _progressTicks = <String, int>{};
+
+  /// Client UI U1: the live transfers' progress folds, by connection id
+  /// (created by the first progress line, dropped when the connection
+  /// goes terminal).
+  final Map<String, _TransferTracker> _transfers =
+      <String, _TransferTracker>{};
+
+  /// Client UI U1: the progress snapshot fan-out (see [transferProgress]).
+  final StreamController<SimpleTransferProgress> _progressController =
+      StreamController<SimpleTransferProgress>.broadcast();
 
   /// Wave-30 P2-11: pending (undecided) incoming requests — job id → the
   /// event's conn id. Drained by [consent] (decided), the native
@@ -671,6 +897,8 @@ final class SimpleTransferService {
     _doneController.close();
     _expiredIncomingController.close();
     _healthController.close();
+    _progressController.close();
+    _transfers.clear();
   }
 
   // -- the three actions --------------------------------------------------
@@ -1020,38 +1248,216 @@ final class SimpleTransferService {
     }
     var malformed = 0;
     var drained = 0;
-    while (drained < pumpEventBudget && !_engineFailed) {
-      final String? line;
-      try {
-        line = runtime.pollProgressLine();
-      } on AkFfiException catch (error) {
-        _notePollFailure('进度事件轮询失败', error);
-        return ProgressDrainResult(polled: false, malformed: malformed);
-      } on StateError catch (error) {
-        // C07: revoked lease — the same immediate stop as the event loop.
-        _latchEngineFailed('引擎租约已撤销（C07 lease）', error);
-        return ProgressDrainResult(polled: false, malformed: malformed);
-      }
-      if (line == null) {
-        return ProgressDrainResult(polled: true, malformed: malformed);
-      }
-      drained++;
-      try {
-        final decoded = jsonDecode(line);
-        if (decoded is Map<String, dynamic>) {
-          final job = decoded['job'];
-          if (job is String && job.isNotEmpty) {
-            _progressTicks[job] = (_progressTicks[job] ?? 0) + 1;
-          }
+    try {
+      while (drained < pumpEventBudget && !_engineFailed) {
+        final String? line;
+        try {
+          line = runtime.pollProgressLine();
+        } on AkFfiException catch (error) {
+          _notePollFailure('进度事件轮询失败', error);
+          return ProgressDrainResult(polled: false, malformed: malformed);
+        } on StateError catch (error) {
+          // C07: revoked lease — the same immediate stop as the event loop.
+          _latchEngineFailed('引擎租约已撤销（C07 lease）', error);
+          return ProgressDrainResult(polled: false, malformed: malformed);
         }
-      } on Object {
-        // A malformed progress line never breaks the timeout machinery —
-        // but it IS an engine-protocol failure: count it (C12).
-        malformed++;
-        _notePollFailure('进度行解析失败', line);
+        if (line == null) {
+          return ProgressDrainResult(polled: true, malformed: malformed);
+        }
+        drained++;
+        Map<String, dynamic>? fields;
+        try {
+          final decoded = jsonDecode(line);
+          if (decoded is Map<String, dynamic>) {
+            final job = decoded['job'];
+            if (job is String && job.isNotEmpty) {
+              _progressTicks[job] = (_progressTicks[job] ?? 0) + 1;
+              fields = decoded;
+            }
+          }
+        } on Object {
+          // A malformed progress line never breaks the timeout machinery —
+          // but it IS an engine-protocol failure: count it (C12).
+          malformed++;
+          // U1: rows may carry transfer-relative paths (ffi-v2 §8.4) —
+          // the failure reason names the size only, never the content.
+          _notePollFailure('进度行解析失败', '${line.length} 字节，内容不记录');
+        }
+        if (fields != null) {
+          _foldProgress(fields);
+        }
+      }
+      return ProgressDrainResult(polled: true, malformed: malformed);
+    } finally {
+      // Client UI U1: whatever ended the drain, the lines it consumed
+      // reach the UI as at most ONE snapshot per transfer.
+      _emitProgressSnapshots();
+    }
+  }
+
+  /// Client UI U1: live transfer progress, one [SimpleTransferProgress]
+  /// per change (at most one per transfer per drain), for sends and
+  /// receives alike. A transfer that completes ends with a `completed`
+  /// snapshot; an aborted one simply stops (its send/consent future
+  /// carries the failure). Broadcast, no replay.
+  Stream<SimpleTransferProgress> get transferProgress =>
+      _progressController.stream;
+
+  /// Folds one decoded progress line into its transfer's tracker. NEVER
+  /// throws and never feeds the C12 streak: a line whose payload fields
+  /// are missing (an engine predating the ffi-v2 §8.4 U1 revision) or
+  /// oddly typed simply contributes less detail.
+  ///
+  /// Only a LIVE connection of this service gets a tracker: a line keyed
+  /// by anything else (an engine-level job, a receive row that fell back
+  /// to its code id) or arriving after the row went terminal is ignored,
+  /// so nothing accumulates for ids no page will ever ask about.
+  void _foldProgress(Map<String, dynamic> line) {
+    try {
+      final job = line['job'] as String;
+      final event = line['event'];
+      if (event is! String) {
+        return;
+      }
+      var tracker = _transfers[job];
+      if (tracker == null) {
+        final row = _connections[job];
+        if (row == null || _stateRank(row.state) >= 2) {
+          return;
+        }
+        // A new transfer announces itself at once (`connecting`), so the
+        // UI can say what the send waits for before any byte moves.
+        tracker = _TransferTracker(job)..dirty = true;
+        _transfers[job] = tracker;
+      } else if (tracker.phaseRank >= 4) {
+        // v1: one pairing carries ONE transfer — a completed tracker
+        // stays until its row goes terminal, and nothing reopens it.
+        return;
+      }
+      int? number(String key) {
+        final value = line[key];
+        return value is int && value >= 0 ? value : null;
+      }
+
+      switch (event) {
+        case 'offered':
+          tracker.totalFiles = number('files') ?? tracker.totalFiles;
+          tracker.totalBytes = number('bytes') ?? tracker.totalBytes;
+          // The SENDER now waits for the receiving user's 接受; on the
+          // receiving side the offer is not a waiting state of its own.
+          if (_connections[job]?.role == 'sender') {
+            tracker.raiseTo(1);
+          }
+        case 'accepted':
+          tracker.totalFiles = number('files') ?? tracker.totalFiles;
+          tracker.totalBytes = number('bytes') ?? tracker.totalBytes;
+          _beginTransferring(tracker);
+        case 'resuming':
+          _beginTransferring(tracker);
+        case 'chunk_sent':
+        case 'chunk_received':
+          _beginTransferring(tracker);
+          final file = number('file');
+          final chunk = number('chunk');
+          if (file != null && chunk != null) {
+            tracker.chunk(file, chunk);
+          }
+        case 'file_started':
+          _beginTransferring(tracker);
+          final file = number('file');
+          if (file != null) {
+            tracker.currentFileIndex = file;
+            tracker.fileStarted(file, number('bytes'));
+          }
+          final path = line['path'];
+          if (path is String && path.isNotEmpty) {
+            tracker.currentFile = _displayNameOf(path);
+          }
+        case 'bytes_acked':
+          _beginTransferring(tracker);
+          final file = number('file');
+          final bytes = number('bytes');
+          if (file != null && bytes != null) {
+            tracker.acked(file, bytes);
+          }
+        case 'file_verified':
+        case 'file_committed':
+          _beginTransferring(tracker);
+          final file = number('file');
+          if (file != null) {
+            tracker.markDone(file);
+          }
+        case 'verifying':
+        case 'final_ack':
+          tracker.raiseTo(3);
+        case 'done':
+          tracker.raiseTo(4);
+        default:
+          // connecting / connected / manifest_* / paused / resumed /
+          // unknown: nothing to fold beyond the tick.
+          return;
+      }
+      // Every byte moved: what remains is the receiver's whole-transfer
+      // verification (the sender waits for its final ack).
+      final total = tracker.totalBytes;
+      if (tracker.phaseRank == 2 &&
+          total != null &&
+          total > 0 &&
+          tracker.transferredBytes >= total) {
+        tracker.raiseTo(3);
+      }
+      tracker.dirty = true;
+    } on Object {
+      // A fold bug must never touch the poll-failure accounting.
+    }
+  }
+
+  void _beginTransferring(_TransferTracker tracker) {
+    tracker.raiseTo(2);
+    tracker.transferStartedAt ??= _clock();
+  }
+
+  /// The last path segment (`photos/img.bin` → `img.bin`); progress rows
+  /// use `/` separators (the engine normalizes `\`).
+  static String _displayNameOf(String path) {
+    final trimmed =
+        path.endsWith('/') ? path.substring(0, path.length - 1) : path;
+    final slash = trimmed.lastIndexOf('/');
+    return slash < 0 ? trimmed : trimmed.substring(slash + 1);
+  }
+
+  /// Fans out one snapshot per DIRTY tracker. Never throws. Trackers
+  /// (completed ones included) live until their row goes terminal — see
+  /// [_settleTransfer].
+  void _emitProgressSnapshots() {
+    if (_transfers.isEmpty) {
+      return;
+    }
+    final now = _clock();
+    for (final tracker in _transfers.values) {
+      if (!tracker.dirty) {
+        continue;
+      }
+      tracker.dirty = false;
+      if (!_progressController.isClosed) {
+        _progressController.add(tracker.snapshot(now));
       }
     }
-    return ProgressDrainResult(polled: true, malformed: malformed);
+  }
+
+  /// A connection went terminal: its tracker goes with the row. A transfer
+  /// that COMPLETED but whose `completed` snapshot was not out yet (the
+  /// task `done` event can be pumped before the progress queue's own
+  /// `done` line) gets it now; an aborted transfer simply stops.
+  void _settleTransfer(String connId, String state) {
+    final tracker = _transfers.remove(connId);
+    if (tracker == null || state != 'done' || tracker.phaseRank >= 4) {
+      return;
+    }
+    tracker.raiseTo(4);
+    if (!_progressController.isClosed) {
+      _progressController.add(tracker.snapshot(_clock()));
+    }
   }
 
   /// The monotonic progress tick of [job] (0 = no progress line ever
@@ -1539,6 +1945,8 @@ final class SimpleTransferService {
   /// connection (P2-11: the engine rejects pending offers with the
   /// connection; the banner must go, not wait for a native event).
   void _markTerminal(String connId, String state) {
+    // Client UI U1: the transfer's progress fold ends with the row.
+    _settleTransfer(connId, state);
     final existing = _connections[connId];
     if (existing == null) {
       return;

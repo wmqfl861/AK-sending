@@ -85,8 +85,11 @@ import '../ui/service/simple_transfer_service.dart'
         TaskConnection,
         TaskConnectionState,
         TaskRole,
+        TransferPhase,
+        TransferProgress,
         formatBytes;
 
+import 'direct_path_label.dart' show directPathLabel;
 import 'simple_transfer_service.dart' as task_engine;
 
 /// The real wave-28 service for the frozen UI contract.
@@ -265,6 +268,30 @@ final class FfiSimpleTransferService implements SimpleTransferService {
             totalBytes: request.bytes,
             saveDir: request.saveDir, // P2-06: the request's real target
             windowSecs: request.windowSecs, // E2/G4: countdown's source
+            connId: request.connId, // U1: this receive's progress key
+          ));
+
+  /// Client UI U1: the engine service's folded progress, in the UI
+  /// contract's vocabulary (an unknown phase name — a newer engine
+  /// service — reads as `transferring`, the neutral live state).
+  @override
+  Stream<TransferProgress> get transferProgress =>
+      _engine.transferProgress.map((progress) => TransferProgress(
+            connId: progress.connId,
+            phase: switch (progress.phase) {
+              'connecting' => TransferPhase.connecting,
+              'awaiting_consent' => TransferPhase.awaitingConsent,
+              'verifying' => TransferPhase.verifying,
+              'completed' => TransferPhase.completed,
+              _ => TransferPhase.transferring,
+            },
+            totalFiles: progress.totalFiles,
+            totalBytes: progress.totalBytes,
+            completedFiles: progress.completedFiles,
+            transferredBytes: progress.transferredBytes,
+            currentFileName: progress.currentFile,
+            currentFileIndex: progress.currentFileIndex,
+            bytesPerSecond: progress.bytesPerSecond,
           ));
 
   @override
@@ -451,7 +478,12 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         await _engine.sendFiles(connId, paths, timeout: sendTimeout);
     final files = report['files'] is int ? report['files'] as int : 0;
     final bytes = report['bytes'] is int ? report['bytes'] as int : 0;
-    return '已发送 $files 个文件（${formatBytes(bytes)}）';
+    // U1: the direct path the engine actually used (task_send's `peer`),
+    // as the UX's channel label — only when the address is parsable.
+    final peer = report['peer'];
+    final path = directPathLabel(peer is String ? peer : null);
+    return '已发送 $files 个文件（${formatBytes(bytes)}）'
+        '${path == null ? '' : ' · $path'}';
   }
 
   @override

@@ -235,6 +235,9 @@ class _ThrowingStartService implements SimpleTransferService {
   Stream<EngineHealth> get engineHealth => const Stream.empty();
 
   @override
+  Stream<TransferProgress> get transferProgress => const Stream.empty();
+
+  @override
   Future<void> consent(String jobId, bool accept) async {
     throw StateError('引擎启动失败：注册中心不可达');
   }

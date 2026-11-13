@@ -821,7 +821,7 @@ class _HistoryTile extends StatelessWidget {
       record.succeeded ? '完成' : '失败',
       clock,
       if (elapsed != null) '用时 ${formatElapsed(elapsed)}',
-      if (record.pathLabel case final path?) path,
+      ?record.pathLabel,
       record.peerName,
     ];
     final color = record.succeeded ? successColor(scheme) : scheme.error;

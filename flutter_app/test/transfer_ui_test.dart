@@ -118,12 +118,21 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('conn_back_home_button')));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
+    // Let the pop transition finish (the platform default page transition
+    // can outlast the push-side 400 ms the other tests pump).
+    await tester.pump(const Duration(seconds: 2));
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing);
     expect(find.byKey(ValueKey('conn_card_name_$id')), findsNothing);
     expect(find.byKey(const ValueKey('history_section')), findsOneWidget);
     expect(find.text('发送 2 个文件（4.0 MB）'), findsOneWidget);
-    expect(find.textContaining('局域网直连'), findsOneWidget);
-    expect(find.textContaining('办公本-ThinkPad'), findsOneWidget);
+    final item = find.byKey(const ValueKey('history_item_0'));
+    expect(
+        find.descendant(of: item, matching: find.textContaining('局域网直连')),
+        findsOneWidget);
+    expect(
+        find.descendant(
+            of: item, matching: find.textContaining('办公本-ThinkPad')),
+        findsOneWidget);
   });
 
   testWidgets('a connection card captions its running transfer',
@@ -238,7 +247,8 @@ void main() {
 
     await tester.pageBack();
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(seconds: 2));
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing);
     expect(find.byKey(const ValueKey('history_item_0')), findsOneWidget);
     // 1536 B + 512 KiB of the two picked files.
     expect(find.text('发送 2 个文件（514 KB）'), findsOneWidget);

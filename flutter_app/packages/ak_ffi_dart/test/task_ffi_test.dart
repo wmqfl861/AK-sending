@@ -803,6 +803,53 @@ void main() {
       expect(akTaskEventNotifyExportName, 'ak_task_set_event_notify');
     });
   });
+
+  group('G6b (2026-11-13): ak_task_server_info', () {
+    test('the op resolves with the scripted revision; null is a DONE op',
+        () async {
+      final fake = FakeAkTaskCalls()..serverRevision = '0.1.0+4739f4d';
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+        registry: '127.0.0.1:7200',
+        registryIdHex: regId64,
+        idDir: 'C:/ak/info',
+      ));
+      // runtime_ready precedes every op announcement in the shared queue.
+      expect(runtime.pollEvent(), isA<TaskRuntimeReadyEvent>());
+      final result =
+          await runtime.serverInfo().wait(delay: immediateDelay);
+      expect(result['op'], 'task_server_info');
+      expect(result['revision'], '0.1.0+4739f4d');
+      // The settle announcement rides the shared event channel.
+      final settled = runtime.pollEvent();
+      expect(settled, isA<TaskOpSettledEvent>());
+      expect((settled as TaskOpSettledEvent).ok, isTrue);
+    });
+
+    test('the degrade shape (old server) is revision:null, not a failure',
+        () async {
+      final fake = FakeAkTaskCalls(); // serverRevision == null
+      final runtime = TaskFfi(calls: fake).start(AkTaskStartSpec(
+        registry: '127.0.0.1:7200',
+        registryIdHex: regId64,
+        idDir: 'C:/ak/old',
+      ));
+      final handle = runtime.serverInfo();
+      final result = await handle.wait(delay: immediateDelay);
+      expect(result['revision'], isNull,
+          reason: '无能力位的旧服务器从不被发问——null 是诚实答案');
+      // Unknown runtime still answers the frozen -4.
+      expect(fake.serverInfo(Uint8List(16), Uint8List(16)),
+          AkStatus.errNotFound);
+    });
+
+    test('the export name is NOT part of the frozen task-plane gate', () {
+      // Same old-DLL tolerance rule as the doorbell: a DLL missing ONLY
+      // this symbol still passes missingTaskExports; the revision answer
+      // then degrades to "unknown" (§8.7).
+      expect(akTaskExportNames, isNot(contains(akTaskServerInfoExportName)));
+      expect(akTaskServerInfoExportName, 'ak_task_server_info');
+    });
+  });
 }
 
 /// A zero-delay `Future.delayed` stand-in (the wait loops become

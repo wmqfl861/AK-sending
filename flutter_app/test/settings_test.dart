@@ -1,6 +1,7 @@
 /// Wave-28 settings: the single save-folder setting — display, change
 /// via the directory picker, persistence through the store, and restore
-/// into the service on shell startup.
+/// into the service on shell startup — plus the G6b (batch G6,
+/// 2026-11-13)「关于」card: the registry server's build revision.
 library;
 
 import 'package:flutter/material.dart';
@@ -81,5 +82,39 @@ void main() {
 
     expect(fake.saveDir, 'E:\\上次选的目录');
     expect(fake.saveDirRequests.single, 'E:\\上次选的目录');
+  });
+
+  // -- G6b (batch G6, 2026-11-13): the「关于」card -----------------------
+
+  testWidgets('关于 card shows the registry revision and the honest '
+      'unknown degrade', (tester) async {
+    final store = InMemorySaveDirStore();
+    final fake = await pumpApp(tester, store: store);
+    // The fake defaults to null — the old-server / no-information shape.
+    fake.serverRevisionValue = null;
+
+    await tester.tap(find.text('设置'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(
+        find.byKey(const ValueKey('settings_server_revision')), findsOneWidget);
+    // The SettingsPage is BUILT inside an IndexedStack at app pump, but
+    // its query is gated on first tab selection — the tap above ran it
+    // exactly once.
+    expect(fake.serverRevisionCalls, 1);
+    // null answers render the honest unknown copy (never an error).
+    expect(find.text('未知（服务器未报告版本）'), findsOneWidget);
+
+    // A server that reports a build renders it VERBATIM after 刷新.
+    fake.serverRevisionValue = '0.1.0+g6b4e19';
+    await tester
+        .tap(find.byKey(const ValueKey('settings_refresh_revision_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('0.1.0+g6b4e19'), findsOneWidget);
+    expect(find.text('未知（服务器未报告版本）'), findsNothing);
+    expect(fake.serverRevisionCalls, 2);
   });
 }

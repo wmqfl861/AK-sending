@@ -141,6 +141,12 @@ class FakeAkTaskCalls implements AkTaskCalls {
   /// Total `pollProgress` calls served (assertion material).
   int pollProgressCallCount = 0;
 
+  /// G6b (2026-11-13): the scripted registry build revision served by
+  /// [serverInfo] — null (the default) models the honest `"revision":
+  /// null` degrade (an old server without the capability bit); set a
+  /// string (e.g. `0.1.0+4739f4d`) to model a G6 server's answer.
+  String? serverRevision;
+
   // -- seam ------------------------------------------------------------
 
   @override
@@ -475,6 +481,23 @@ class FakeAkTaskCalls implements AkTaskCalls {
     }
     runtime.pendingConsents.remove(key);
     runtime.decisions[key] = accept != 0;
+    return _ok();
+  }
+
+  /// G6b: the registry-revision query op — resolves immediately with the
+  /// scripted [serverRevision] (null = the degrade shape, a DONE op like
+  /// the engine's, never a failure).
+  @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) {
+    final runtime = _runtimeOf(runtimeId);
+    if (runtime == null) {
+      return _fail(AkStatus.errNotFound, 'fake: 未知任务运行时');
+    }
+    final op = _mintOp(runtime, 'task_server_info', opIdOut);
+    op.result = <String, dynamic>{
+      'op': 'task_server_info',
+      'revision': serverRevision,
+    };
     return _ok();
   }
 

@@ -253,6 +253,10 @@ class _ThrowingStartService implements SimpleTransferService {
   @override
   String get saveDir => '';
 
+  /// G6b: no engine — the honest "no information" answer.
+  @override
+  Future<String?> serverRevision() async => null;
+
   @override
   void dispose() {}
 }

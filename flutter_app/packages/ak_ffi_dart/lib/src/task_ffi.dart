@@ -13,6 +13,7 @@
 /// ak_task_set_save_dir(engine, runtime_id, path)
 /// ak_task_consent(engine, runtime_id, job_id[16], accept)
 /// ak_task_set_event_notify(engine, runtime_id, notify|NULL, ctx)  // 2026-11-12
+/// ak_task_server_info(engine, runtime_id, op_id_out[16])          // 2026-11-13
 /// ```
 ///
 /// Op RESULTS and EVENTS add no symbols: they flow through the existing
@@ -354,6 +355,14 @@ abstract interface class AkTaskCalls {
   /// `accept` uses the C-truthy form (0 = decline).
   int consent(Uint8List runtimeId, Uint8List jobId, int accept);
 
+  /// `ak_task_server_info` (G6b, 2026-11-13, ffi-v2.md §8.7): 0 accepted
+  /// (op id written) — the registry-revision query op, read through the
+  /// shared [opResult] channel as
+  /// `{"op":"task_server_info","revision":"<build>"}` (or
+  /// `"revision":null` — the degrade shape, never an error result).
+  /// -4 unknown runtime.
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut);
+
   /// `ak_pairing_op_result` with the TASK runtime id: 0 pending, 1 done,
   /// 2 failed, -3 too small (nothing consumed), -4 unknown op.
   int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap);
@@ -474,6 +483,13 @@ const List<String> akTaskExportNames = <String>[
 /// the frozen-export gate and the doorbell registrar falls back to pure
 /// polling (ffi-v2.md §8.6 "旧 DLL 明确退回纯轮询").
 const String akTaskEventNotifyExportName = 'ak_task_set_event_notify';
+
+/// The G6b (2026-11-13) registry-revision query export — the same
+/// tolerated-missing rule as [akTaskEventNotifyExportName]: an old DLL
+/// without it still passes the frozen-export gate; the revision lookup
+/// then degrades to "unknown" instead of tripping the §2 hard failure
+/// (ffi-v2.md §8.7).
+const String akTaskServerInfoExportName = 'ak_task_server_info';
 
 // ---------------------------------------------------------------------------
 // CR-P2-05 (2026-11-12): the optional native event doorbell.
@@ -687,6 +703,12 @@ final class AkTaskLeaseGate implements AkTaskCalls {
   }
 
   @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) {
+    _ensureTaskLease(isAlive);
+    return inner.serverInfo(runtimeId, opIdOut);
+  }
+
+  @override
   int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
     _ensureTaskLease(isAlive);
     return inner.opResult(runtimeId, opId, buffer, cap);
@@ -737,8 +759,10 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
         // DLL without it still satisfies the frozen task-plane gate; the
         // seam then reports no notify capability (setEventNotify throws
         // UnsupportedError, which [TaskEventDoorbell.tryRegister] turns
-        // into the pure-polling fallback).
-        _setEventNotify = _resolveEventNotify(library) {
+        // into the pure-polling fallback). G6b: the registry-revision
+        // export follows the same tolerated-missing rule (§8.7).
+        _setEventNotify = _resolveEventNotify(library),
+        _serverInfo = _resolveServerInfo(library) {
     _start = _library.lookupFunction<_StartC, _StartDart>('ak_task_start');
     _createCode =
         _library.lookupFunction<_OpStartC, _OpStartDart>('ak_task_create_code');
@@ -771,6 +795,17 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
     }
   }
 
+  /// G6b: the same tolerant lookup for the registry-revision export
+  /// (null on a DLL predating it — the revision answer then degrades to
+  /// "unknown", never a hard failure).
+  static _StartDart? _resolveServerInfo(DynamicLibrary library) {
+    try {
+      return library.lookupFunction<_StartC, _StartDart>(akTaskServerInfoExportName);
+    } on ArgumentError {
+      return null;
+    }
+  }
+
   final Pointer<AkEngine> _engine;
   final DynamicLibrary _library;
 
@@ -793,6 +828,10 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
   /// CR-P2-05: null on a DLL predating the doorbell export (the
   /// tolerated-missing symbol — see the constructor).
   final _SetEventNotifyDart? _setEventNotify;
+
+  /// G6b: null on a DLL predating the registry-revision export (the
+  /// tolerated-missing symbol of §8.7 — see the constructor).
+  final _StartDart? _serverInfo;
 
   /// The native detail captured right after the most recent failing call
   /// (null when the last call did not fail or carried no text).
@@ -823,6 +862,12 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
   /// an optional capability, never a gate.)
   static bool supportsEventNotify(DynamicLibrary library) =>
       _hasSymbol(library, akTaskEventNotifyExportName);
+
+  /// G6b: does [library] export the registry-revision query? (An old DLL
+  /// without it still passes [missingTaskExports] — the capability is
+  /// optional; the revision answer degrades to "unknown".)
+  static bool supportsServerInfo(DynamicLibrary library) =>
+      _hasSymbol(library, akTaskServerInfoExportName);
 
   static bool _hasSymbol(DynamicLibrary library, String name) {
     try {
@@ -865,6 +910,29 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
         final code = _note(_start(_engine, spec, idOut));
         if (code == AkStatus.ok) {
           runtimeIdOut.setAll(0, idOut.asTypedList(akPairingIdLength));
+        }
+        return code;
+      }, processAllocator);
+  }
+
+  /// G6b: `ak_task_server_info(engine, runtime_id, op_id_out)` (ffi-v2.md
+  /// §8.7) — the registry-revision op start. Throws [UnsupportedError] on
+  /// a DLL predating the export (callers degrade to "unknown", never a
+  /// hard failure).
+  @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) {
+    _ensureTaskLease(_isAlive); // C07: never touch a freed handle
+    final invoke = _serverInfo;
+    if (invoke == null) {
+      throw UnsupportedError(
+          '此 ak_ffi 版本没有导出 $akTaskServerInfoExportName（G6b 版本查询）');
+    }
+    return using((arena) {
+        final id = _idIn(runtimeId, arena);
+        final opOut = arena<Uint8>(akPairingIdLength);
+        final code = _note(invoke(_engine, id, opOut));
+        if (code == AkStatus.ok) {
+          opIdOut.setAll(0, opOut.asTypedList(akPairingIdLength));
         }
         return code;
       }, processAllocator);
@@ -1010,7 +1078,7 @@ final class AkTaskFfiBindings implements AkTaskCalls, AkTaskEventNotify {
 // ---------------------------------------------------------------------------
 
 /// Which `*_start` produced a task op.
-enum TaskOpKind { createCode, join, send }
+enum TaskOpKind { createCode, join, send, serverInfo }
 
 /// One snapshot of an `ak_pairing_op_result` poll over a task op.
 final class TaskOpResult {
@@ -1225,6 +1293,15 @@ final class TaskRuntimeFfi {
       'ak_task_send',
       (opOut) => _calls.send(
           runtimeId, akIdFromHex(connIdHex), spec.toJsonString(), opOut));
+
+  /// G6b (2026-11-13, ffi-v2.md §8.7): `ak_task_server_info` — accept one
+  /// registry-revision query op. The settled result map's `revision` is
+  /// the server's build string (e.g. `0.1.0+4739f4d`) or `null` — the
+  /// degrade shape (old server / failed query), which is a DONE op, never
+  /// a failure; only an unestablishable registry stack fails the op.
+  TaskOpHandle serverInfo() => _startOp(
+      TaskOpKind.serverInfo, 'ak_task_server_info',
+      (opOut) => _calls.serverInfo(runtimeId, opOut));
 
   /// `ak_task_list` with automatic `-3` growth (lossless).
   TaskListSnapshot list() {

@@ -1115,6 +1115,44 @@ final class SimpleTransferService {
   /// `<id_dir>/downloads` is learned at [start]; [setSaveDir] updates it).
   String? get saveDir => _saveDir;
 
+  /// G6b (2026-11-13): the registry server's build revision, e.g.
+  /// `0.1.0+4739f4d` — one `ak_task_server_info` op (ffi-v2.md §8.7),
+  /// waited like every other op. Null = "no information" and is NEVER an
+  /// error surface: an old server without the revision-query capability,
+  /// a failed query, an unreachable registry stack, a not-yet-started or
+  /// disposed service, the engine-failure latch, or an old DLL without
+  /// the export all degrade to null — the「关于」card then shows 未知.
+  /// Deliberately NOT part of the phase machine: a diagnostic query
+  /// never moves `creating`/`failed`.
+  Future<String?> serverRevision({
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final runtime = _runtime; // null: not started — nothing to ask
+    if (runtime == null || _disposed || _engineFailed) {
+      return null;
+    }
+    _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
+    try {
+      final result = await runtime.serverInfo().wait(
+            interval: opPollInterval,
+            timeout: timeout,
+            delay: _delay,
+            ensureLive: _ensureLive,
+          );
+      final revision = result['revision'];
+      return revision is String && revision.isNotEmpty ? revision : null;
+    } on Object {
+      // Every failure shape degrades to "no information" (the op's own
+      // `"revision":null` contract plus the wait's failure modes — op
+      // error, stall timeout, revoked lease, disposed service, an old
+      // DLL without the export): the About card never surfaces engine
+      // noise.
+      return null;
+    } finally {
+      _endOp();
+    }
+  }
+
   // -- state --------------------------------------------------------------
 
   /// The pairing phase (the state machine above).

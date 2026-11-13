@@ -259,6 +259,19 @@ class LocalSimpleTransferService implements SimpleTransferService {
   @override
   String get saveDir => _saveDir;
 
+  /// G6b test knob: what [serverRevision] answers (null — the default —
+  /// is the honest "no information" degrade; set e.g. `0.1.0+fake` to
+  /// rehearse the「关于」card's known-revision rendering).
+  String? serverRevisionValue;
+
+  int serverRevisionCalls = 0;
+
+  @override
+  Future<String?> serverRevision() async {
+    serverRevisionCalls += 1;
+    return serverRevisionValue;
+  }
+
   @override
   void dispose() {
     disposeCalls += 1;

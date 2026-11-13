@@ -174,6 +174,9 @@ class _AppShellState extends State<AppShell> {
                       service: widget.service,
                       store: widget.store,
                       picker: widget.picker,
+                      // G6b: the page is BUILT at startup (IndexedStack)
+                      // but its revision query waits for first selection.
+                      isActive: _index == 1,
                     ),
                   ],
                 ),

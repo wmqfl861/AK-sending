@@ -518,6 +518,24 @@
 //! status quo (Android/Windows embedders that never register are
 //! unaffected). Full thread/lifetime contract: `src/task.rs`
 //! (`TaskEventNotify`) and ffi-v2.md §8.6.
+//!
+//! # G6 follow-through (batch G6b, 2026-11-13): the registry-revision
+//! # query (`ak_task_server_info`)
+//!
+//! The ServerInfo plumbing G6 added to ak-session (contract
+//! protocol-v2.md §6a) surfaces to the GUI through one more task-plane
+//! symbol: `ak_task_server_info(engine, runtime_id, op_id_out)` accepts
+//! an ASYNC op (the network wait lives on the engine runtime — nothing
+//! blocks in the synchronous call, ADR-003) whose result reads through
+//! the existing `ak_pairing_op_result` as
+//! `{"op":"task_server_info","revision":"<build>"}`. The whole
+//! `RegistryClient::server_info` degrade contract rides unchanged:
+//! `"revision":null` (old server without the capability bit — never
+//! asked; failed query; disconnected) is NEVER an error, and the op only
+//! fails when the registry stack itself could not be established (not
+//! started / stopped / dial failed). No spec, no idempotency key: the
+//! Rust side caches per connection epoch and keeps one query in flight,
+//! so repeats are cheap. ffi-v2.md §8.7 has the prose registration.
 
 mod core;
 mod pairing;
@@ -544,5 +562,6 @@ pub use crate::shim::{
 };
 pub use crate::task_ext::{
     ak_task_consent, ak_task_create_code, ak_task_disconnect, ak_task_join, ak_task_list,
-    ak_task_send, ak_task_set_event_notify, ak_task_set_save_dir, ak_task_start,
+    ak_task_send, ak_task_server_info, ak_task_set_event_notify, ak_task_set_save_dir,
+    ak_task_start,
 };

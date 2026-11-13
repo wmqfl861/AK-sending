@@ -721,6 +721,12 @@ class CountingTaskCalls implements AkTaskCalls {
   }
 
   @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) {
+    _tick('serverInfo');
+    return _inner.serverInfo(runtimeId, opIdOut);
+  }
+
+  @override
   int opResult(
       Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
     _tick('opResult');

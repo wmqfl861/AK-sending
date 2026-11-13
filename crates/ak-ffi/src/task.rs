@@ -1934,6 +1934,14 @@ enum TaskOpSpec {
         conn_id: [u8; 16],
         paths: Vec<String>,
     },
+    /// G6 follow-through (batch G6b, 2026-11-13): ask the registry for
+    /// its build revision — the GUI's "关于" fact. A DIAGNOSTIC query,
+    /// never a transfer: no idempotency key of its own (the Rust side
+    /// caches per connection epoch and keeps one query in flight, so
+    /// repeats are cheap), and `None` answers as `"revision":null`
+    /// instead of an error (the `RegistryClient::server_info`
+    /// degrade-to-None contract rides unchanged).
+    ServerInfo,
 }
 
 impl TaskOpSpec {
@@ -1942,6 +1950,7 @@ impl TaskOpSpec {
             TaskOpSpec::CreateCode { .. } => "task_create_code",
             TaskOpSpec::Join { .. } => "task_join",
             TaskOpSpec::Send { .. } => "task_send",
+            TaskOpSpec::ServerInfo => "task_server_info",
         }
     }
 }
@@ -2343,6 +2352,23 @@ pub fn task_send_start(
     )
 }
 
+/// `ak_task_server_info` (G6 follow-through, batch G6b 2026-11-13): accept
+/// one registry-revision query on the task runtime — the GUI's「关于」fact.
+/// No spec, no idempotency key: the Rust side gates on the server's
+/// advertised capability bit, keeps one query in flight and caches per
+/// connection epoch, so repeated calls are cheap. The op resolves OK with
+/// `{"op":"task_server_info","revision":"<build>"}` or
+/// `"revision":null` (old server / failed query / degraded — NEVER an
+/// error); it only fails when the runtime cannot reach its registry stack
+/// at all (not started / stopped / dial failed).
+pub fn task_server_info_start(
+    engine: &AkEngine,
+    runtime_id: &[u8; 16],
+) -> Result<[u8; 16], FfiError> {
+    let rt = task_runtime_of(engine, runtime_id)?;
+    launch_task_op(engine, &rt, TaskOpSpec::ServerInfo, None)
+}
+
 // ---------------------------------------------------------------------------
 // ak_task_list / disconnect / set_save_dir / consent.
 // ---------------------------------------------------------------------------
@@ -2655,7 +2681,27 @@ async fn run_task_op(rt: &Arc<TaskRt>, spec: TaskOpSpec) -> Result<String, Strin
             role_hint,
         } => run_join(rt, &code, candidates, role_hint).await,
         TaskOpSpec::Send { conn_id, paths } => run_send(rt, conn_id, paths).await,
+        TaskOpSpec::ServerInfo => run_server_info(rt).await,
     }
+}
+
+/// The `task_server_info` op body (G6 follow-through, batch G6b): ask the
+/// runtime's shared registry client for the serving registry's build
+/// revision (protocol-v2.md §6a). The whole G6 degrade contract rides
+/// unchanged: an OLD server (no capability bit) is never asked, a failed
+/// query never faults the control connection, and both surface as
+/// `"revision":null` — the op itself only FAILS when the registry stack
+/// could not be established at all (not started / stopped / dial failed),
+/// exactly like every other op's `ensure_stack` gate.
+async fn run_server_info(rt: &Arc<TaskRt>) -> Result<String, String> {
+    let stack = ensure_stack(rt).await?;
+    let revision = stack.pairing.orchestrator().client().server_info().await;
+    Ok(format!(
+        "{{\"op\":\"task_server_info\",\"revision\":{}}}",
+        revision
+            .as_deref()
+            .map_or_else(|| "null".to_string(), quoted),
+    ))
 }
 
 /// Claim one task code at the registry. A RECEIVER-role creation binds
@@ -3825,8 +3871,8 @@ mod task_tests {
     use crate::task_ext::testabi::{
         ak_engine_free, ak_engine_last_error, ak_engine_new, ak_pairing_op_result,
         ak_pairing_poll_event, ak_task_consent, ak_task_create_code, ak_task_disconnect,
-        ak_task_join, ak_task_list, ak_task_send, ak_task_set_event_notify, ak_task_set_save_dir,
-        ak_task_start,
+        ak_task_join, ak_task_list, ak_task_send, ak_task_server_info, ak_task_set_event_notify,
+        ak_task_set_save_dir, ak_task_start,
     };
     use std::ffi::CString;
     use std::os::raw::c_char;
@@ -3851,6 +3897,13 @@ mod task_tests {
 
     impl TestRegistry {
         fn spawn() -> TestRegistry {
+            Self::spawn_with_revision(None)
+        }
+
+        /// G6b: the same registry with an explicit build revision (the
+        /// `serve_v2_with_revision` path production injects — the
+        /// `ak_task_server_info` op's answer source).
+        fn spawn_with_revision(revision: Option<&'static str>) -> TestRegistry {
             let (ready_tx, ready_rx) = mpsc::channel();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             thread::spawn(move || {
@@ -3870,11 +3923,12 @@ mod task_tests {
                     ready_tx
                         .send((addr, key.public_key()))
                         .expect("test is waiting");
-                    let server = ak_signal::server_v2::engine::serve_v2(
+                    let server = ak_signal::server_v2::engine::serve_v2_with_revision(
                         listener,
                         &key,
                         store,
                         ak_signal::server_v2::Limits::default(),
+                        revision,
                         stop_rx,
                     );
                     tokio::select! {
@@ -4243,6 +4297,84 @@ mod task_tests {
         assert_eq!(
             ak_pairing_poll_event(engine, out.as_ptr(), cbuf(CAP).as_mut_ptr(), CAP),
             -4
+        );
+        ak_engine_free(engine);
+    }
+
+    // -- ak_task_server_info (G6b) ------------------------------------------
+
+    /// G6b positive: the op asks the LIVE registry (via the runtime's
+    /// shared client) and resolves OK with the server's configured build
+    /// revision — read through the SHARED `ak_pairing_op_result` channel,
+    /// like every task op.
+    #[test]
+    fn server_info_op_reports_the_registry_revision() {
+        let registry = TestRegistry::spawn_with_revision(Some("0.1.0+g6btest1"));
+        let engine = ak_engine_new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = start_task_on(engine, &registry, dir.path());
+        let mut op_id = [0u8; 16];
+        let code = ak_task_server_info(engine, runtime_id.as_ptr(), op_id.as_mut_ptr());
+        let detail = last_error_of(engine);
+        assert_eq!(code, 0, "ak_task_server_info failed: {detail}");
+        let (ok, json) = wait_op(engine, &runtime_id, &op_id);
+        assert!(
+            ok,
+            "the revision query never fails against a live server: {json}"
+        );
+        assert_eq!(
+            json, "{\"op\":\"task_server_info\",\"revision\":\"0.1.0+g6btest1\"}",
+            "the configured build revision rides the op result"
+        );
+        // The repeat is cheap and answers the SAME cached fact (the
+        // per-epoch cache of `RegistryClient::server_info`).
+        let mut op2 = [0u8; 16];
+        let code2 = ak_task_server_info(engine, runtime_id.as_ptr(), op2.as_mut_ptr());
+        assert_eq!(code2, 0, "repeat query accepted: {}", last_error_of(engine));
+        let (ok2, json2) = wait_op(engine, &runtime_id, &op2);
+        assert!(ok2, "{json2}");
+        assert_eq!(
+            json2, "{\"op\":\"task_server_info\",\"revision\":\"0.1.0+g6btest1\"}",
+            "the repeat answers the same cached revision"
+        );
+        ak_engine_free(engine);
+    }
+
+    /// G6b degrade + negative: pointer discipline first, unknown runtime
+    /// `-4`, and an unreachable registry degrades the op to `revision:null`
+    /// — never an error verdict (the `server_info` degrade contract).
+    #[test]
+    fn server_info_op_degrades_and_validates() {
+        let engine = ak_engine_new();
+        let mut op_id = [0u8; 16];
+        // Null output pointer: refused before anything is registered.
+        assert_eq!(
+            ak_task_server_info(engine, [0u8; 16].as_ptr(), std::ptr::null_mut()),
+            -1
+        );
+        // Unknown runtime.
+        assert_eq!(
+            ak_task_server_info(engine, [0u8; 16].as_ptr(), op_id.as_mut_ptr()),
+            -4
+        );
+        // A runtime whose registry is unreachable (nothing listens at
+        // 127.0.0.1:7200): the op is ACCEPTED and then FAILS with a
+        // readable error — a stack that could not even be established is
+        // an honest op failure, NOT the `revision:null` degrade (which is
+        // reserved for a reachable server that lacks/failed the query).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_id = start_task(engine, dir.path());
+        let mut op2 = [0u8; 16];
+        let code = ak_task_server_info(engine, runtime_id.as_ptr(), op2.as_mut_ptr());
+        assert_eq!(code, 0, "accepted: {}", last_error_of(engine));
+        let (ok, json) = wait_op(engine, &runtime_id, &op2);
+        assert!(
+            !ok,
+            "an unreachable registry is an op failure, not a null answer: {json}"
+        );
+        assert!(
+            json.contains("\"op\":\"task_server_info\"") && json.contains("\"error\":"),
+            "the failure names the op and carries a reason: {json}"
         );
         ak_engine_free(engine);
     }

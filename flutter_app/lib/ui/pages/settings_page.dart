@@ -1,6 +1,9 @@
 /// Wave-28 settings page: exactly ONE setting — the default save folder
 /// (system directory picker, persisted across restarts via [SaveDirStore])
-/// — plus the G2 (batchF 2026-11-13)「导出连接诊断」entry.
+/// — plus the G2 (batchF 2026-11-13)「导出连接诊断」entry and the G6b
+/// (batch G6, 2026-11-13)「关于」card: the registry server's build
+/// revision (`RegistryClient::server_info`, shown as-is; null answers
+/// render as 未知 — an old server never reports a version).
 library;
 
 import 'package:flutter/material.dart';
@@ -17,6 +20,7 @@ class SettingsPage extends StatefulWidget {
     required this.store,
     this.picker = const PluginFilePickGateway(),
     this.exporter = const TempFileDiagnosticsExportGateway(),
+    this.isActive = true,
   });
 
   final SimpleTransferService service;
@@ -27,6 +31,15 @@ class SettingsPage extends StatefulWidget {
   /// default; tests inject a capturing fake).
   final DiagnosticsExportGateway exporter;
 
+  /// Whether this page is the shell's SELECTED tab. The shell hosts it
+  /// inside an [IndexedStack] (built at startup, visible or not), so the
+  /// G6b revision query deliberately waits for the FIRST activation — a
+  /// query nobody is looking at must not run (and must not put its
+  /// `op_done` line into the shared task event queue) while another tab
+  /// is up. Default true: a directly constructed page (tests, other
+  /// hosts) behaves as a plain always-active page.
+  final bool isActive;
+
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
@@ -34,6 +47,60 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   bool _busy = false;
   bool _exporting = false;
+
+  /// G6b: the registry server's build revision (null = unknown — an old
+  /// server without the revision-query capability, a failed query, or
+  /// the runtime not connected; the service's contract is "never an
+  /// error").
+  String? _serverRevision;
+  bool _revisionLoading = false;
+  bool _revisionLoadedOnce = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isActive) {
+      _loadRevision();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // G6b: first activation of a background-built tab — run the query
+    // exactly once, when the user actually opens 设置.
+    if (widget.isActive && !oldWidget.isActive && !_revisionLoadedOnce) {
+      _loadRevision();
+    }
+  }
+
+  /// G6b: fetch the registry revision once on entry (and on 刷新). The
+  /// call never throws per the service contract; the finally still keeps
+  /// the loading flag honest for a disposed page.
+  Future<void> _loadRevision() async {
+    if (_revisionLoading) return;
+    _revisionLoadedOnce = true;
+    setState(() => _revisionLoading = true);
+    try {
+      final revision = await widget.service.serverRevision();
+      if (!mounted) return;
+      setState(() => _serverRevision = revision);
+    } finally {
+      if (mounted) {
+        setState(() => _revisionLoading = false);
+      }
+    }
+  }
+
+  /// What the「关于」card shows for the revision: the build string, the
+  /// loading placeholder, or the honest unknown copy.
+  String get _revisionDisplay {
+    final revision = _serverRevision;
+    if (revision != null && revision.isNotEmpty) {
+      return revision;
+    }
+    return _revisionLoading ? '查询中…' : '未知（服务器未报告版本）';
+  }
 
   Future<void> _change() async {
     if (_busy) return;
@@ -197,6 +264,72 @@ class _SettingsPageState extends State<SettingsPage> {
                         )
                       : const Icon(Icons.file_download_outlined),
                   label: const Text('导出连接诊断'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        // G6b (batch G6, 2026-11-13): the「关于」card — the registry
+        // server's build revision, the ServerInfo fact G6 landed on the
+        // wire (protocol-v2.md §6a). Read-only diagnostic: 未知 is the
+        // honest answer of an old server (no capability bit — never
+        // asked), a failed query, or an unconnected runtime; the query
+        // itself never surfaces engine errors to this page.
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.info_outline, color: theme.colorScheme.primary),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text('关于', style: theme.textTheme.titleMedium),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '注册服务器版本：连接协调服务器报告的构建版本，用于排查连接问题。',
+                  style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          _revisionDisplay,
+                          key: const ValueKey('settings_server_revision'),
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      key: const ValueKey('settings_refresh_revision_button'),
+                      onPressed: _revisionLoading ? null : _loadRevision,
+                      icon: _revisionLoading
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.refresh),
+                      tooltip: '重新查询服务器版本',
+                    ),
+                  ],
                 ),
               ],
             ),

@@ -258,6 +258,16 @@ abstract class SimpleTransferService {
   /// seed a platform default).
   String get saveDir;
 
+  /// The registry server's build revision, e.g. `0.1.0+4739f4d` (G6
+  /// follow-through, batch G6b 2026-11-13; additive member like
+  /// [engineHealth] before it). Null = "no information" and is NEVER an
+  /// error: an older server without the revision-query capability, a
+  /// failed query, or the runtime not being connected all degrade to
+  /// null — the UI's「关于」area then shows 未知. An engine that cannot
+  /// answer at all (not started, old DLL without the export) also
+  /// answers null rather than throwing.
+  Future<String?> serverRevision();
+
   /// Releases resources. Idempotent.
   void dispose();
 }

@@ -465,6 +465,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   @override
   String get saveDir => _engine.saveDir ?? '';
 
+  /// G6b: delegate to the engine service's degrade-to-null op (the「关于」
+  /// fact — null means "no information", never an error to the UI).
+  @override
+  Future<String?> serverRevision() => _engine.serverRevision();
+
   // -- internals ----------------------------------------------------------
 
   static Map<String, String> _platformEnvironment() => Platform.environment;

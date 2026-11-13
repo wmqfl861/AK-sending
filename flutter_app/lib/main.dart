@@ -293,6 +293,12 @@ final class DiagTaskCallsGate implements AkTaskCalls {
   int consent(Uint8List runtimeId, Uint8List jobId, int accept) =>
       _invoke('task_consent', () => _inner.consent(runtimeId, jobId, accept));
 
+  /// G6b: the registry-revision op start — same gate/timing discipline
+  /// as every other op (a sealed/truncated stage refuses it too).
+  @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) =>
+      _invoke('task_server_info', () => _inner.serverInfo(runtimeId, opIdOut));
+
   @override
   int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) =>
       _invoke('pairing_op_result', () => _inner.opResult(runtimeId, opId, buffer, cap));
@@ -575,6 +581,11 @@ class UnusableSimpleTransferService implements SimpleTransferService {
 
   @override
   String get saveDir => '';
+
+  /// G6b: no engine — the honest "no information" answer (never throws;
+  /// the「关于」card shows 未知).
+  @override
+  Future<String?> serverRevision() async => null;
 
   @override
   void dispose() {}

@@ -164,6 +164,12 @@ final class RecordingTaskCalls implements AkTaskCalls {
   }
 
   @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) {
+    calls.add('task_server_info');
+    return _inner.serverInfo(runtimeId, opIdOut);
+  }
+
+  @override
   int opResult(Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) {
     calls.add('pairing_op_result');
     return _inner.opResult(runtimeId, opId, buffer, cap);

@@ -20,6 +20,7 @@
 //! ak_task_set_save_dir(engine, runtime_id, path)
 //! ak_task_consent(engine, runtime_id, job_id[16], accept)
 //! ak_task_set_event_notify(engine, runtime_id, notify|NULL, ctx)  // 2026-11-12
+//! ak_task_server_info(engine, runtime_id, op_id_out[16])          // 2026-11-13
 //! ```
 //!
 //! Op RESULTS and EVENTS do not add symbols: they flow through the
@@ -583,6 +584,59 @@ pub unsafe extern "C" fn ak_task_set_event_notify(
     }
 }
 
+/// `ak_task_server_info` (G6 follow-through, batch G6b 2026-11-13;
+/// ffi-v2.md §8.7): accept one ASYNC registry-revision query on the task
+/// runtime — `AK_OK` with the 16-byte `op_id` written; the result reads
+/// through the existing `ak_pairing_op_result` as
+/// `{"op":"task_server_info","revision":"<build>"}` (`"revision":null` =
+/// old server / failed query / degraded, NEVER an error). No spec, no
+/// idempotency key: the Rust side caches per connection epoch and keeps
+/// one query in flight, so repeats are cheap. `-1` null pointers; `-4`
+/// unknown runtime. The network wait lives in the op body on the engine
+/// runtime — nothing blocks in this synchronous call (ADR-003).
+///
+/// # Safety
+///
+/// SAFETY (caller contract): `runtime_id` non-null and readable for 16
+/// bytes; `op_id_out` non-null and writable for 16 bytes (checked before
+/// anything is registered). Engine handle as `ak_send_start`.
+#[no_mangle]
+pub unsafe extern "C" fn ak_task_server_info(
+    engine: *mut AkEngine,
+    runtime_id: *const u8,
+    op_id_out: *mut u8,
+) -> i32 {
+    core::clear_last_error();
+    let Some(engine) = engine_or_fail(engine) else {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "engine handle is null".to_string(),
+        });
+    };
+    // Output pointer first: a failed query must never leave side effects
+    // behind (the F6 discipline of every start export).
+    if op_id_out.is_null() {
+        return fail(FfiError {
+            code: AK_ERR_NULL,
+            message: "op_id_out argument is null".to_string(),
+        });
+    }
+    // SAFETY: read_id verifies non-null and copies exactly 16 bytes.
+    let runtime_id = match unsafe { read_id(runtime_id) } {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
+    match guarded(|| task::task_server_info_start(engine, &runtime_id)) {
+        Ok(op_id) => match unsafe { write_id(op_id_out, &op_id) } {
+            // SAFETY: write_id verifies non-null and writes exactly the 16
+            // documented bytes within the caller's buffer.
+            Ok(()) => AK_OK,
+            Err(error) => fail(error),
+        },
+        Err(error) => fail(error),
+    }
+}
+
 #[cfg(test)]
 mod abi_shape_tests {
     //! P0-01-style guard: pin every `ak_task_*` export's name AND full call
@@ -624,6 +678,10 @@ mod abi_shape_tests {
             Option<extern "C" fn(*mut c_void)>,
             *mut c_void,
         ) -> i32 = ak_task_set_event_notify;
+        // G6 follow-through (batch G6b, 2026-11-13): the registry-revision
+        // query export — the second task-plane ADDITION (a spec-less op
+        // start; ffi-v2.md §8.7).
+        let _: unsafe extern "C" fn(*mut AkEngine, *const u8, *mut u8) -> i32 = ak_task_server_info;
     }
 }
 
@@ -650,6 +708,7 @@ pub(crate) mod testabi {
         ak_task_consent as ffi_task_consent, ak_task_create_code as ffi_task_create_code,
         ak_task_disconnect as ffi_task_disconnect, ak_task_join as ffi_task_join,
         ak_task_list as ffi_task_list, ak_task_send as ffi_task_send,
+        ak_task_server_info as ffi_task_server_info,
         ak_task_set_event_notify as ffi_task_set_event_notify,
         ak_task_set_save_dir as ffi_task_set_save_dir, ak_task_start as ffi_task_start,
     };
@@ -787,5 +846,15 @@ pub(crate) mod testabi {
         // sentinel address the counter records verbatim (never
         // dereferenced).
         unsafe { ffi_task_set_event_notify(engine, runtime_id, notify, ctx) }
+    }
+
+    pub(crate) fn ak_task_server_info(
+        engine: *mut AkEngine,
+        runtime_id: *const u8,
+        op_id_out: *mut u8,
+    ) -> i32 {
+        // SAFETY: the id is the test's 16-byte array; `op_id_out` is a
+        // 16-byte test array.
+        unsafe { ffi_task_server_info(engine, runtime_id, op_id_out) }
     }
 }

@@ -323,7 +323,7 @@ signal-server
 - 指针先检；`-3` 无副作用；异步请求；取消/释放；真实 DLL 双实例 e2e。
 - B7（CLI）侧另按 B.9 表验证：旧命令回归；两进程入队仍串行；同身份不重复登录；秘密不进输出日志。
 
-## 8. 任务面扩展：`ak_task_*` 八导出（wave-28 冻结，按 §1 裁决第 4 条新增符号；2026-11-12 增补第 9 个符号 `ak_task_set_event_notify`，见 §8.6）
+## 8. 任务面扩展：`ak_task_*` 八导出（wave-28 冻结，按 §1 裁决第 4 条新增符号；2026-11-12 增补第 9 个符号 `ak_task_set_event_notify`，见 §8.6；2026-11-13 batch G6b 增补第 10 个符号 `ak_task_server_info`，见 §8.7）
 
 v1 极简配对的产品模型（用户冻结）：三动作——生成任务码（选角色）/ 输码加入 / 连接列表+断开；连接后发送方选文件发送，接收方收到请求可接受/拒绝；设置仅一个默认保存文件夹。**全程零 IP/端口/指纹进 UI。** 本节符号全部为新增，已发布签名的参数形状一字不动；除下表两个例外，状态码、`-3` 无损重试、`request_id` 幂等、`last_error` 全路径等纪律与 §2/§3 完全一致。
 
@@ -383,6 +383,13 @@ int32_t ak_task_set_event_notify(
     const uint8_t runtime_id[16],
     void (*notify)(void *ctx),
     void *ctx);
+
+/* 2026-11-13 增补（G6 收尾 batch G6b，§8.7）：注册服务器版本查询。
+ * 无 spec、无幂等键；结果经既有 ak_pairing_op_result 读取。 */
+int32_t ak_task_server_info(
+    AkEngine *engine,
+    const uint8_t runtime_id[16],
+    uint8_t op_id_out[16]);
 ```
 
 **结果与事件通道不新增符号**（wave-28 裁决）：任务 op 结果经既有 `ak_pairing_op_result(engine, runtime_id, op_id, buf, cap)` 读取、事件经既有 `ak_pairing_poll_event(engine, runtime_id, buf, cap)` 读取、取消经 `ak_pairing_cancel_op`——`runtime_id` 指任务运行时即可；两平面表不相交，配对平面先查、未命中落任务面，`-4` 语义不变。
@@ -498,3 +505,12 @@ wave-28 的并行占位槽位已全部落地为真实路径：任务码经 ak-se
 - **Dart 侧配套**：绑定层以可选能力探测本符号（旧 DLL 缺失该导出 → 明确退回纯轮询，不落入 §2 "旧 DLL 不支持" 的硬失败路径，因为八个冻结导出仍齐全）；服务层门铃唤醒立即排空，D1 自适应泵降频为**安全网**（活动 250 ms / 空闲 1 s 的兜底 tick——漏铃永不卡死 UI）。
 
 **C07/C12 实现边界（wave-33b，提交 `bcf5de0`）**：C07＝FFI 绑定租约——facade 在 `engine_free` 之前把租约翻为 not-alive，借用句柄的后续调用得到显式 `StateError` 而非触达已释放指针（Dart 侧该租约撤销直接闩入 C12 故障态）。C12＝Dart 事件泵预算与故障闩——每 tick 最多 64 条事件＋64 条进度行；**连续 10 次**原生轮询失败（事件/进度轮询异常与坏进度行 alike，且自 2026-11-09 R36-P2-02 起只有**两通道当 tick 均成功**才清零计数）闩上终态 `engineFailed`：泵停止、服务拒绝一切后续操作；自 R36-P2-03 起该闩经可回放的 `engineHealth` 流送达 UI（主页故障卡），待处理操作与接收等待以同一故障及时结束。恢复＝仅重建服务（GUI 侧即重启应用）。
+
+### 8.7 注册服务器版本查询：`ak_task_server_info`（2026-11-13 增补，G6 收尾 batch G6b）
+
+G6（提交 09d4465）为 ak-session 落地了 ServerInfo 问答（protocol-v2.md §6a：`ServerInfoRequest 0x1F` / `ServerInfo{revision} 0x20`，能力位 `0x0008`，客户端按连接世代缓存、单飞行、一切失败降级为 `None`）。本符号把该事实面接到 GUI「设置/关于」区：**新增独立任务面符号，不改任何已发布签名**（§1 裁决第 4 条路径，与 §8.6 同一先例）：
+
+- **形态**：`ak_task_server_info(engine, runtime_id, op_id_out)`——无 spec、无幂等键。**异步 op**（网络等待全部在引擎运行时的 op 体内，同步调用零阻塞，ADR-003）；`0` 受理（16 字节 op id 写出），`-1` 空指针（输出指针先检——失败零副作用），`-4` 未知 runtime。结果经既有 `ak_pairing_op_result(engine, runtime_id, op_id, buf, cap)` 读取，事件面照常发 `op_done`/`op_failed`。
+- **结果 JSON**：`{"op":"task_server_info","revision":"0.1.0+4739f4d"}`（服务器 `--version` 同源的版本+git sha，≤34B UTF-8）。**`"revision":null` 永远不是错误**：旧服务器未通告能力位（从不发问——纯增量互操作）、查询失败、连接中断，一律如实降级为 null——这是 ak-session `RegistryClient::server_info` 的既有口径，本符号原样透传。op **失败**仅保留一种诚实场景：registry 栈本身未能建立（运行时未启动/已停止/拨号失败），错误消息可读。
+- **为什么无幂等键**：诊断性只读查询；Rust 侧已按连接世代缓存＋单飞行，重复调用开销可忽略，且 GUI 的「关于」卡片每次进入重查一次即得最新世代答案。
+- **Dart 侧配套**：绑定层以可选能力探测本符号（与 §8.6 门铃同一先例——旧 DLL 缺失不触发 §2 硬失败，退回「版本未知」）；服务层超时/异常一律返回 null，UI 显示「未知」，不弹错误。

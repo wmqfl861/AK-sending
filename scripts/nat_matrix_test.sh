@@ -26,12 +26,23 @@
 #      port; batchF review §4.3). Unexpected pass = RED ("flip to
 #      pass-v4"). After CR-P1-06: expect pass-v4.
 #   2. port-restricted (alice) <-> full-cone (bob) ... pass-v4: the
-#      transfer must ride the peer router's public address (10.10.0.1).
+#      transfer must ride the peer router's public address (203.0.113.1).
 #   3. IPv6 both sides, stateful firewalls ... pass-v6 (v4 data plane
 #      restricted to the services host; endpoints v6-only candidates).
 #   4. symmetric <-> symmetric (--random-fully) ... MUST FAIL cleanly
 #      (bounded wording, no hang, zero payload; in this closed simulation
 #      there is no v4 path, so a "success" means the fixture lies).
+#   5. late send, >=5 s tier (CR-P1-07, review 2026-11-13 §4.4 改法 4):
+#      pcone<->pcone, the sender's send start delayed past the receiver's
+#      4 s punch window (the GUI's pair-then-pick-files timing). The
+#      pairing-time opener + mapping keepalive must carry the connection.
+#   6. late send, >=40 s tier: same, past the 30 s unreplied-conntrack
+#      timeout — only the keepalive's refreshes keep both mappings alive.
+#   7. receiver without low TTL (CR-P1-08): pcone<->pcone with the
+#      receiver's low-TTL punch phase disabled (AK_EXP_NO_TTL — the
+#      pre-H1 Windows shape). Must still pass: the sender's pairing-time
+#      opener rides a LOW TTL (never reaches the receiver's NAT) and the
+#      receiver delays its whole punch past that window.
 #
 #   IPv4 cases do not configure endpoint IPv6 addresses AND set
 #   ip6tables FORWARD DROP on both routers (CR-P2-14: the batchF runs
@@ -44,13 +55,23 @@
 # Topology (fresh endpoint/router namespaces per case; core/inet/services
 # live for the whole run; RAII-style trap cleanup at exit):
 #
-#   akalice ─(10.10.1.0/24)─ akr1 ─┐                        ┌─(10.20.0.0/24)─ akr2 ─(10.10.2.0/24)─ akbob
+#   CR-P3-13 (H3, review 2026-11-13 §5.3): the CORE and INET segments use
+#   RFC 5737 documentation ranges (203.0.113.0/24 = TEST-NET-3,
+#   198.51.100.0/24 = TEST-NET-2) so `prefers_lan` classifies them PUBLIC
+#   exactly as it would a real deployment — with the old RFC1918
+#   10.10.0.0/24 the reflexive address was "LAN", and the production
+#   "reflexive first" / "short budget for the first public candidate"
+#   paths never ran in the matrix (the matrix only proved the
+#   observed-address path). The home LANs (10.10.1.0/24, 10.10.2.0/24)
+#   stay RFC1918 on purpose — they model the private side of the NAT.
+#
+#   akalice ─(10.10.1.0/24)─ akr1 ─┐                        ┌─(198.51.100.0/24)─ akr2 ─(10.10.2.0/24)─ akbob
 #                             [NAT] │      akcore (L2)       │      [NAT]
-#                                   ├─ 10.10.0.0/24 bridge ──┤ i-to-r2 10.20.0.254
-#                                 r1-to-c 10.10.0.1          │
+#                                   ├─ 203.0.113.0/24 bridge ──┤ i-to-r2 198.51.100.254
+#                                 r1-to-c 203.0.113.1          │
 #                                                            │
-#                          aksvc 10.10.0.10 (registry+STUN)  │
-#                          c-to-i 10.10.0.254 ───────────────┘ (akinet, the
+#                          aksvc 203.0.113.10 (registry+STUN)  │
+#                          c-to-i 203.0.113.254 ───────────────┘ (akinet, the
 #                                                                   "public internet"
 #                                                                   routed hop — no
 #                                                                   NAT, enables
@@ -179,12 +200,12 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # Interfaces (veth names must be <= 15 chars):
 #   alice: a-to-r1 (10.10.1.2/24; v6 only in the v6 case)
-#   r1:    r1-to-a (10.10.1.1/24), r1-to-c (10.10.0.1/24)
+#   r1:    r1-to-a (10.10.1.1/24), r1-to-c (203.0.113.1/24)
 #   core:  bridge akbr0 with c-to-r1, c-to-svc, c-to-i (L2 only)
-#   svc:   svc-to-c (10.10.0.10/24)
-#   inet:  i-to-c (10.10.0.254/24, v6 2001:77:ff::254/64),
-#          i-to-r2 (10.20.0.254/24, v6 2001:77:ee::1/64)
-#   r2:    r2-to-i (10.20.0.2/24), r2-to-b (10.10.2.1/24)
+#   svc:   svc-to-c (203.0.113.10/24)
+#   inet:  i-to-c (203.0.113.254/24, v6 2001:77:ff::254/64),
+#          i-to-r2 (198.51.100.254/24, v6 2001:77:ee::1/64)
+#   r2:    r2-to-i (198.51.100.2/24), r2-to-b (10.10.2.1/24)
 #   bob:   b-to-r2 (10.10.2.2/24)
 
 # Route/interface dump for every namespace — printed on topology smoke
@@ -245,12 +266,12 @@ build_core() {
   link_ns "$NS_SVC" svc-to-c "$NS_CORE" c-to-svc
   ip -n "$NS_CORE" link set c-to-svc up
   ip -n "$NS_CORE" link set c-to-svc master akbr0
-  ip -n "$NS_SVC" addr add 10.10.0.10/24 dev svc-to-c
+  ip -n "$NS_SVC" addr add 203.0.113.10/24 dev svc-to-c
   ip -n "$NS_SVC" link set svc-to-c up
   link_ns "$NS_INET" i-to-c "$NS_CORE" c-to-i
   ip -n "$NS_CORE" link set c-to-i up
   ip -n "$NS_CORE" link set c-to-i master akbr0
-  ip -n "$NS_INET" addr add 10.10.0.254/24 dev i-to-c
+  ip -n "$NS_INET" addr add 203.0.113.254/24 dev i-to-c
   ip -n "$NS_INET" -6 addr add 2001:77:ff::254/64 dev i-to-c
   ip -n "$NS_INET" link set i-to-c up
   # akinet is a plain ROUTED hop (the "public internet"): forwarding on,
@@ -287,9 +308,9 @@ build_case_topology() {
   link_ns "$NS_R2" r2-to-i "$NS_INET" i-to-r2
   # G0 fix (run 43253690898 root cause): the IPv4 gateway address on the
   # persistent inet side was NEVER configured (only the v6 case added an
-  # IPv6 address) — every `via 10.20.0.2` route below died with "Nexthop
+  # IPv6 address) — every `via 198.51.100.2` route below died with "Nexthop
   # has invalid gateway" and all four cases stopped at the pre-NAT smoke.
-  ip -n "$NS_INET" addr add 10.20.0.254/24 dev i-to-r2
+  ip -n "$NS_INET" addr add 198.51.100.254/24 dev i-to-r2
   ip -n "$NS_INET" link set i-to-r2 up
   # Alice <-> r1.
   link_ns "$NS_A" a-to-r1 "$NS_R1" r1-to-a
@@ -297,7 +318,7 @@ build_case_topology() {
   ip -n "$NS_A" link set a-to-r1 up
   ip -n "$NS_A" route add default via 10.10.1.1
   ip -n "$NS_R1" addr add 10.10.1.1/24 dev r1-to-a
-  ip -n "$NS_R1" addr add 10.10.0.1/24 dev r1-to-c
+  ip -n "$NS_R1" addr add 203.0.113.1/24 dev r1-to-c
   ip -n "$NS_R1" link set r1-to-a up
   ip -n "$NS_R1" link set r1-to-c up
   # Bob <-> r2.
@@ -306,7 +327,7 @@ build_case_topology() {
   ip -n "$NS_B" link set b-to-r2 up
   ip -n "$NS_B" route add default via 10.10.2.1
   ip -n "$NS_R2" addr add 10.10.2.1/24 dev r2-to-b
-  ip -n "$NS_R2" addr add 10.20.0.2/24 dev r2-to-i
+  ip -n "$NS_R2" addr add 198.51.100.2/24 dev r2-to-i
   ip -n "$NS_R2" link set r2-to-b up
   ip -n "$NS_R2" link set r2-to-i up
   if [[ "$use_v6" -eq 1 ]]; then
@@ -332,19 +353,19 @@ build_case_topology() {
   # the "public internet" hop; r2 defaults to it; inet routes both LANs;
   # svc returns to alice directly and to bob via the internet hop.
   # G0 fix: routes to the PEER LAN (below) are not enough — once r2
-  # MASQUERADEs bob's sources to 10.20.0.2, replies (STUN/registry) and
-  # alice's punches to bob's reflexive address need 10.20.0.0/24 routes
+  # MASQUERADEs bob's sources to 198.51.100.2, replies (STUN/registry) and
+  # alice's punches to bob's reflexive address need 198.51.100.0/24 routes
   # on r1 AND svc too, or the NAT'd round trips die after the smoke.
-  must "r1 route to bob LAN"   ip -n "$NS_R1" route add 10.10.2.0/24 via 10.10.0.254 || return 1
-  must "r1 route to bob NAT"   ip -n "$NS_R1" route add 10.20.0.0/24 via 10.10.0.254 || return 1
-  must "svc route to bob NAT"  ip -n "$NS_SVC" route replace 10.20.0.0/24 via 10.10.0.254 || return 1
-  must "r2 route to core"      ip -n "$NS_R2" route add 10.10.0.0/24 via 10.20.0.254 || return 1
-  ip -n "$NS_R2" route add 10.10.1.0/24 via 10.20.0.254
+  must "r1 route to bob LAN"   ip -n "$NS_R1" route add 10.10.2.0/24 via 203.0.113.254 || return 1
+  must "r1 route to bob NAT"   ip -n "$NS_R1" route add 198.51.100.0/24 via 203.0.113.254 || return 1
+  must "svc route to bob NAT"  ip -n "$NS_SVC" route replace 198.51.100.0/24 via 203.0.113.254 || return 1
+  must "r2 route to core"      ip -n "$NS_R2" route add 203.0.113.0/24 via 198.51.100.254 || return 1
+  ip -n "$NS_R2" route add 10.10.1.0/24 via 198.51.100.254
   # akinet is persistent across cases: its routes are re-asserted every
   # case, so they must be idempotent (plain `add` produced "File exists"
   # from case 2 onward — run 43253690898 logs, 3 occurrences).
-  must "inet route to alice LAN" ip -n "$NS_INET" route replace 10.10.1.0/24 via 10.10.0.1 || return 1
-  must "inet route to bob LAN"   ip -n "$NS_INET" route replace 10.10.2.0/24 via 10.20.0.2 || return 1
+  must "inet route to alice LAN" ip -n "$NS_INET" route replace 10.10.1.0/24 via 203.0.113.1 || return 1
+  must "inet route to bob LAN"   ip -n "$NS_INET" route replace 10.10.2.0/24 via 198.51.100.2 || return 1
   for ns in "$NS_R1" "$NS_R2"; do
     ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
     ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.forwarding=1
@@ -355,8 +376,8 @@ build_case_topology() {
   # route) — exactly the first CI run's "base topology broken".
   # (After MASQUERADE the sources become on-link router addresses,
   # but the smoke must pass pre-NAT. Bob's LAN now returns via akinet.)
-  ip -n "$NS_SVC" route replace 10.10.1.0/24 via 10.10.0.1
-  ip -n "$NS_SVC" route replace 10.10.2.0/24 via 10.10.0.254
+  ip -n "$NS_SVC" route replace 10.10.1.0/24 via 203.0.113.1
+  ip -n "$NS_SVC" route replace 10.10.2.0/24 via 203.0.113.254
   # Reverse-path filtering off everywhere: the punch traffic this suite
   # exists to test arrives from addresses the endpoint never talked to
   # (the peer's NAT reflection), which strict rp_filter would drop as
@@ -366,9 +387,9 @@ build_case_topology() {
     ip netns exec "$ns" sysctl -qw net.ipv4.conf.default.rp_filter=0
   done
   # Baseline connectivity smoke: both endpoints reach the services host.
-  ip netns exec "$NS_A" ping -c1 -W2 10.10.0.10 >/dev/null 2>&1 \
+  ip netns exec "$NS_A" ping -c1 -W2 203.0.113.10 >/dev/null 2>&1 \
     || { log "FAIL: alice cannot reach the services host (base topology broken)"; dump_routes; return 1; }
-  ip netns exec "$NS_B" ping -c1 -W2 10.10.0.10 >/dev/null 2>&1 \
+  ip netns exec "$NS_B" ping -c1 -W2 203.0.113.10 >/dev/null 2>&1 \
     || { log "FAIL: bob cannot reach the services host (base topology broken)"; dump_routes; return 1; }
 }
 
@@ -407,9 +428,9 @@ nat_rules() {
     control-only)
       # v6 case: the v4 data plane must die (peer dials are not to the
       # services host), while the control plane (registry/STUN, always
-      # initiated outbound toward 10.10.0.10) stays alive. No MASQUERADE:
+      # initiated outbound toward 203.0.113.10) stays alive. No MASQUERADE:
       # svc holds explicit return routes.
-      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -d 10.10.0.10 -j ACCEPT
+      ip netns exec "$ns" iptables -A FORWARD -i "$lan" -d 203.0.113.10 -j ACCEPT
       ;;
   esac
 }
@@ -471,7 +492,7 @@ start_services() {
     || { log "FAIL: stun-server did not come up (log: $(tail -3 "$WORK/stun.log" 2>/dev/null))"; return 1; }
   grep -q "stun responder" "$WORK/stun2.log" 2>/dev/null \
     || { log "FAIL: second stun-server did not come up (fixture self-check destination)"; return 1; }
-  log "services up: registry 10.10.0.10:$REG_PORT (fp ${REG_FP:0:8}…), stun :$STUN_PORT + :$STUN_PORT2 (fixture probe)"
+  log "services up: registry 203.0.113.10:$REG_PORT (fp ${REG_FP:0:8}…), stun :$STUN_PORT + :$STUN_PORT2 (fixture probe)"
 }
 
 # ---------------------------------------------------------------------------
@@ -542,8 +563,8 @@ def query(sock, addr):
     return None
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-r1 = query(s, ("10.10.0.10", 17101))
-r2 = query(s, ("10.10.0.10", 17102))
+r1 = query(s, ("203.0.113.10", 17101))
+r2 = query(s, ("203.0.113.10", 17102))
 if r1 is None or r2 is None:
     print("PROBE-FAIL")
     sys.exit(1)
@@ -567,8 +588,8 @@ fixture_check() {
   # the NAT sees the LAN address and a same-port verdict proves nothing.
   local expected_addr
   case "$ns:$mode" in
-    "$NS_A":pcone|"$NS_A":fullcone|"$NS_A":symmetric) expected_addr="10.10.0.1" ;;
-    "$NS_B":pcone|"$NS_B":fullcone|"$NS_B":symmetric) expected_addr="10.20.0.2" ;;
+    "$NS_A":pcone|"$NS_A":fullcone|"$NS_A":symmetric) expected_addr="203.0.113.1" ;;
+    "$NS_B":pcone|"$NS_B":fullcone|"$NS_B":symmetric) expected_addr="198.51.100.2" ;;
     "$NS_A":control-only) expected_addr="10.10.1.2" ;;  # no v4 MASQ: LAN address
     "$NS_B":control-only) expected_addr="10.10.2.2" ;;
     *) expected_addr="" ;;
@@ -593,7 +614,15 @@ fixture_check() {
 
 # ---------------------------------------------------------------------------
 # 6. One transfer case. run_case <name> <expect: pass-v4|xfail|fail|pass-v6>
+#    [sender-env] [receiver-env]
 #    alice = `task code-recv` (receiver), bob = `task join-send` (sender).
+#    The optional env prefixes (CR-P1-07, review 2026-11-13 §4.4 改法 4)
+#    feed the HIDDEN DEBUG KNOBS the late-send / no-low-TTL cases need
+#    (default off — an unset/empty prefix runs the plain product):
+#      AK_EXP_SEND_DELAY_MS=<ms>  sender: delay the send start after
+#                                 pairing (the GUI's pick-files timing)
+#      AK_EXP_NO_TTL=1            receiver: punch with NO low-TTL phase
+#                                 (the pre-CR-P1-08 Windows shape)
 # ---------------------------------------------------------------------------
 # Failure forensics (CR-P3-11): the 6832f79 commit message described
 # this function and a conntrack sampler but neither was actually written.
@@ -638,7 +667,7 @@ run_case() {
   # NOTE: split declarations — under `set -u`, one `local` line expands
   # ALL its words BEFORE assigning, so a later field referencing an
   # earlier one would see it unbound (the round-2 CI failure).
-  local case_name="$1" expect="$2"
+  local case_name="$1" expect="$2" sender_env="${3:-}" recv_env="${4:-}"
   local case_dir="$WORK/$case_name"
   mkdir -p "$case_dir/id-alice" "$case_dir/id-bob" "$case_dir/out" "$case_dir/src"
   # G0 hardening: payload generation must SUCCEED — a failed dd previously
@@ -648,11 +677,13 @@ run_case() {
   [[ -s "$case_dir/src/payload.bin" ]]     || { log "FAIL [$case_name]: payload file empty after dd"; return 1; }
 
   # The receiver: consent auto-fed with a fresh 'y' stream (the CLI
-  # discards stale input; `yes` keeps supplying fresh lines).
-  yes | ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
+  # discards stale input; `yes` keeps supplying fresh lines). The
+  # optional env prefix (CR-P1-07 knob, unquoted word-split by design:
+  # "VAR=VAL" or empty) rides ahead of the namespace exec.
+  yes | env $recv_env ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
       --out "$case_dir/out" \
-      --server "10.10.0.10:$REG_PORT" --registry-fp "$REG_FP" \
-      --stun "10.10.0.10:$STUN_PORT" \
+      --server "203.0.113.10:$REG_PORT" --registry-fp "$REG_FP" \
+      --stun "203.0.113.10:$STUN_PORT" \
       >"$case_dir/recv.log" 2>&1 &
   local recv_pid=$!
   PIDS_KIDS="$PIDS_KIDS $recv_pid"
@@ -662,11 +693,12 @@ run_case() {
   code="$(grep -o 'AKI1-[0-9A-Z-]*' "$case_dir/recv.log" | head -1)"
   [[ -n "$code" ]] || { log "FAIL [$case_name]: no parsable code"; return 1; }
 
-  # The sender.
-  ip netns exec "$NS_B" "$CLI" --id-dir "$case_dir/id-bob" task join-send \
+  # The sender (same optional env prefix — the late-send knob lives on
+  # the sender side).
+  env $sender_env ip netns exec "$NS_B" "$CLI" --id-dir "$case_dir/id-bob" task join-send \
       "$code" "$case_dir/src/payload.bin" \
-      --server "10.10.0.10:$REG_PORT" --registry-fp "$REG_FP" \
-      --stun "10.10.0.10:$STUN_PORT" \
+      --server "203.0.113.10:$REG_PORT" --registry-fp "$REG_FP" \
+      --stun "203.0.113.10:$STUN_PORT" \
       >"$case_dir/send.log" 2>&1 &
   local send_pid=$!
   PIDS_KIDS="$PIDS_KIDS $send_pid"
@@ -733,8 +765,8 @@ run_case() {
       # pass-v4: the ride MUST be the peer router's public (core) address —
       # a private 10.10.1.x/10.10.2.x or a v6 form means the case is not
       # proving what it claims (CR-P2-14 point 1).
-      [[ "$via" == 10.10.0.1:* ]] \
-        || { log "FAIL [$case_name]: expected the v4 reflexive leg via alice's router (10.10.0.1), got '$via'"; return 1; }
+      [[ "$via" == 203.0.113.1:* ]] \
+        || { log "FAIL [$case_name]: expected the v4 reflexive leg via alice's router (203.0.113.1), got '$via'"; return 1; }
     fi
     local sum_src sum_dst
     sum_src="$(sha256sum "$case_dir/src/payload.bin" | awk '{print $1}')"
@@ -781,9 +813,23 @@ run_case() {
 # ---------------------------------------------------------------------------
 # 7. The matrix.
 # ---------------------------------------------------------------------------
+# CR-P3-13 (H3): a kernel without IPv6 (module absent, or ipv6.disable=1)
+# makes the v6 case's namespace setup die at the first `-6 addr add` /
+# route install — an ENVIRONMENT limit, not a product failure, so the
+# case must SKIP with its reason like every other gate, never FAIL.
+# Probe the root namespace's stack (netns inherit kernel-wide v6 state):
+# `::1` on lo is the last address a healthy stack always has, and
+# net.ipv6.conf.all.disable_ipv6=1 speaks for boot-time disabling.
+ipv6_usable() {
+  if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]]; then
+    return 1
+  fi
+  ip -6 addr show dev lo 2>/dev/null | grep -q 'inet6'
+}
+
 FAILURES=0
-case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect>
-  local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6"
+case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect> [sender-env] [receiver-env]
+  local name="$1" desc="$2" r1="$3" r2="$4" use_v6="$5" expect="$6" sender_env="${7:-}" recv_env="${8:-}"
   log "---- case $name: $desc"
   build_case_topology "$use_v6" || { log "FAIL [$name]: topology setup failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
   nat_rules "$NS_R1" r1-to-a r1-to-c 10.10.1.0/24 "$r1"     || { log "FAIL [$name]: r1 NAT rules failed"; dump_routes; FAILURES=$((FAILURES + 1)); return; }
@@ -800,7 +846,7 @@ case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect>
   # mode claims before any product result counts.
   fixture_check "$NS_A" "$r1" || { log "FAIL [$name]: r1 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
   fixture_check "$NS_B" "$r2" || { log "FAIL [$name]: r2 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
-  run_case "$name" "$expect" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
+  run_case "$name" "$expect" "$sender_env" "$recv_env" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
 }
 
 build_core || { log "FAIL: core topology setup failed (kernel refusing namespaces/bridges?)"; exit 1; }
@@ -812,12 +858,31 @@ start_services || exit 1
 # to pass-v4.
 case_pass "pcone-pcone"    "port-restricted <-> port-restricted — v4 reflexive leg (CR-P1-06 strike-3 fix)" pcone pcone 0 pass-v4
 case_pass "pcone-fullcone" "port-restricted (alice) <-> full-cone DNAT (bob) — v4 reflexive leg" pcone fullcone 0 pass-v4
-if command -v ip6tables >/dev/null 2>&1; then
-  case_pass "v6-stateful"  "IPv6 both sides behind stateful firewalls (v4 control-plane only)" control-only control-only 1 pass-v6
-else
+if ! command -v ip6tables >/dev/null 2>&1; then
   log "SKIP case v6-stateful: ip6tables not available on this host"
+elif ! ipv6_usable; then
+  log "SKIP case v6-stateful: no IPv6 stack on this host (no inet6 address on lo, or net.ipv6.conf.all.disable_ipv6=1) — environment limit, not a product failure (CR-P3-13)"
+else
+  case_pass "v6-stateful"  "IPv6 both sides behind stateful firewalls (v4 control-plane only)" control-only control-only 1 pass-v6
 fi
 case_pass "symm-symm"      "symmetric <-> symmetric (--random-fully; MUST FAIL cleanly)"        symmetric symmetric 0 fail
+
+# CR-P1-07 (review 2026-11-13 §4.4 改法 4): the late-send tiers — the GUI's
+# "pair, then pick files, then send" latency, driven through the hidden
+# AK_EXP_SEND_DELAY_MS debug knob (default off; only the matrix sets it).
+# The pairing-time opener fires at pairing and the keepalive refreshes
+# both NAT mappings every 15 s until the send starts.
+case_pass "late-send-5s"   "pcone<->pcone, send starts >=5s after pairing (GUI timing; CR-P1-07 keepalive)" pcone pcone 0 pass-v4 "AK_EXP_SEND_DELAY_MS=5000" ""
+case_pass "late-send-40s"  "pcone<->pcone, send starts >=40s after pairing (past the 30s unreplied timeout; CR-P1-07)" pcone pcone 0 pass-v4 "AK_EXP_SEND_DELAY_MS=40000" ""
+
+# CR-P1-08: the receiver's low-TTL punch phase disabled entirely (the
+# hidden AK_EXP_NO_TTL knob — the pre-H1 Windows shape). Passes because
+# the sender's pairing-time opener sends its own IPv4 packets with a LOW
+# TTL (they open only the sender's NAT flow) and the knob receiver
+# delays its whole punch past PUNCH_LOW_TTL_PHASE, so its normal-TTL
+# punches meet an EXISTING sender-side flow instead of creating the
+# inbound-only conntrack record.
+case_pass "recv-no-lowttl" "pcone<->pcone, receiver WITHOUT the low-TTL punch phase (pre-CR-P1-08 Windows shape)" pcone pcone 0 pass-v4 "" "AK_EXP_NO_TTL=1"
 
 log "======================================"
 if [[ $FAILURES -eq 0 ]]; then

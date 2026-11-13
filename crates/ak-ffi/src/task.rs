@@ -255,10 +255,11 @@ use ak_session::pairing::task_net::{
     bind_receiver_socket, bind_sender_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, handshake_failure_word, insert_reflexive_candidate,
     local_candidates, one_line_reason, order_candidates, probe_dial_round, probe_dial_round_on,
-    probe_with_retry, sender_reflexive_opener, staggered_dial_pass, task_error_message,
-    windows_root_name_refusal, AttemptVerdict, ConnectMarks, RECEIVER_BIND_TIMEOUT,
-    REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS,
-    TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
+    probe_with_retry, round_probe_outcome, sender_pairing_opener, staggered_dial_pass,
+    task_error_message, windows_root_name_refusal, AttemptVerdict, ConnectMarks,
+    RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, SENDER_DIAL_PAUSE, TASK_CLOSE_MESSAGE,
+    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
+    TASK_SETTLE_PAUSE,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -1672,22 +1673,41 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
 /// connection's honest `probing → connected|unreachable` settle (wave-30
 /// P2-09 residual: a total probe failure settles to `unreachable`, never
 /// a fake `connected`).
+///
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 1/2): the sender role now runs
+/// its PAIRING-TIME opener + mapping keepalive here (the same shared
+/// `task_net::sender_pairing_opener` the CLI runs — identical timing), and
+/// its connectivity test rides the ADOPTED dial socket
+/// ([`adopted_socket_probe`]) instead of a throwaway socket. A receiver
+/// owner keeps the CR-P1-05 punch plus the pairing-plane probe: its QUIC
+/// socket is already owned by quinn, so a receive round on a clone would
+/// compete for the socket queue.
 async fn owner_side_probe(rt: &Arc<TaskRt>, stack: &Arc<TaskStack>, paired: TaskPaired) {
     let conn_id = paired.pairing_id;
+    let role = TaskRole::of_direction(paired.direction);
     // CR-P1-05, receiver half (the create-code entry point): the pairing
     // just completed and the SENDER's advertised candidates are known —
     // punch them from the resident receiver's QUIC-socket clone,
     // concurrently with the sender's dial. Owners of sender-role codes
-    // have no punch role (their peer is the receiver).
-    if TaskRole::of_direction(paired.direction) == TaskRole::Receiver {
-        spawn_receiver_punch(rt, paired.code_id, &paired.peer.candidates);
+    // run their own opener instead (their peer is the receiver).
+    match role {
+        TaskRole::Receiver => {
+            spawn_receiver_punch(rt, paired.code_id, &paired.peer.candidates);
+        }
+        TaskRole::Sender => {
+            spawn_sender_opener(rt, paired.code_id, &paired.peer.candidates);
+        }
     }
-    let endpoint_probe = PeerEndpoint {
-        candidates: paired.peer.candidates.clone(),
-        name: paired.peer.name.clone(),
-        direction: paired.peer.direction,
+    let outcome = if role == TaskRole::Sender {
+        adopted_socket_probe(rt, &paired.code_id, &paired.peer.candidates).await
+    } else {
+        let endpoint_probe = PeerEndpoint {
+            candidates: paired.peer.candidates.clone(),
+            name: paired.peer.name.clone(),
+            direction: paired.peer.direction,
+        };
+        probe_with_retry(&stack.pairing, &endpoint_probe).await
     };
-    let outcome = probe_with_retry(&stack.pairing, &endpoint_probe).await;
     settle_probe_state(rt, &conn_id, &outcome);
     let (line, _verdict) = probe_result_line(&conn_id, &outcome);
     rt.push_event(line);
@@ -1906,6 +1926,84 @@ fn spawn_receiver_punch(rt: &Arc<TaskRt>, code_id: [u8; 16], sender_candidates: 
     tokio::spawn(async move {
         ak_session::pairing::task_net::punch_candidates(socket, &candidates, &stop, |_| {}).await;
     });
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 1), the sender half of the
+/// pairing-completion hook: spawn the shared pairing-time opener + mapping
+/// keepalive ([`sender_pairing_opener`]) toward the paired RECEIVER's
+/// advertised candidates, from the sender's stashed adopted dial socket.
+/// The opener half's packet count surfaces as exactly ONE
+/// `reflexive_opener` event (contract ffi-v2 §8.1 — since CR-P1-07 it
+/// fires at PAIRING COMPLETION, not per send op; `packets` is 0 when no
+/// socket was stashed or no target survived the filter). The keepalive
+/// then holds both NAT mappings open (task_net's 15 s cadence, 10 min
+/// cap) until the send op stops it (the stash's shared `punch_stop`
+/// flag — `run_send` flips it at its start), the connection/task drops
+/// the stash, or teardown aborts the task (it is registered under the
+/// code id in `spawned` like every resident task).
+fn spawn_sender_opener(rt: &Arc<TaskRt>, code_id: [u8; 16], receiver_candidates: &[SocketAddr]) {
+    let (socket, stop) = {
+        let Ok(holes) = rt.hole_sockets.lock() else {
+            return;
+        };
+        match holes.get(&code_id) {
+            Some(entry) => (
+                entry.socket.try_clone().ok(),
+                Some(Arc::clone(&entry.punch_stop)),
+            ),
+            None => (None, None),
+        }
+    };
+    let candidates = order_candidates(receiver_candidates.to_vec());
+    let event_rt = Arc::clone(rt);
+    let stop = stop.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let task = tokio::spawn(async move {
+        // The keepalive end is silent by contract (bounded diagnostics
+        // ride the opener event alone).
+        let _report = sender_pairing_opener(socket.as_ref(), &candidates, &stop, |packets| {
+            event_rt.push_event(format!(
+                "{{\"event\":\"reflexive_opener\",\"packets\":{packets}}}"
+            ));
+        })
+        .await;
+    });
+    if let Ok(mut spawned) = rt.spawned.lock() {
+        spawned.entry(code_id).or_default().push(task);
+    }
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 2): the SENDER's pairing-time
+/// connectivity test on the ADOPTED dial socket — one
+/// [`probe_dial_round_on`] round over a `try_clone` of the stashed socket
+/// (the exact round the send phase runs), folded into the pairing plane's
+/// [`ProbeOutcome`] vocabulary. The legacy throwaway-socket test
+/// (`probe_with_retry`) could STRUCTURALLY never pass through a
+/// port-restricted-cone NAT — its mapping was not the QUIC socket's — and
+/// its false `unreachable` used to gate the GUI's send button; on the
+/// adopted socket the round observes the peer's own punch packets
+/// arriving on the real mapping, so the verdict is meaningful. The
+/// [`SENDER_DIAL_PAUSE`] wait keeps the opener's packets the adopted
+/// socket's FIRST outbound (the CR-P1-06 ordering); without a stash (bind
+/// failed at create/join) the throwaway round stays the honest fallback.
+async fn adopted_socket_probe(
+    rt: &TaskRt,
+    code_id: &[u8; 16],
+    candidates: &[SocketAddr],
+) -> ProbeOutcome {
+    let ordered = order_candidates(candidates.to_vec());
+    tokio::time::sleep(SENDER_DIAL_PAUSE).await;
+    let adopted = rt
+        .hole_sockets
+        .lock()
+        .ok()
+        .and_then(|holes| holes.get(code_id).and_then(|e| e.socket.try_clone().ok()));
+    let plan = match adopted {
+        Some(socket) => {
+            probe_dial_round_on(socket, ordered.len(), ordered.clone(), |_, _, _| {}).await
+        }
+        None => probe_dial_round(ordered.clone(), |_, _, _| {}).await,
+    };
+    round_probe_outcome(&ordered, &plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -3327,12 +3425,20 @@ async fn run_join(
     // real code id (the send op adopts it); the joining RECEIVER punches
     // toward the paired sender's advertised candidates from its stashed
     // QUIC-socket clone — concurrent with the sender's dial, bounded by
-    // PUNCH_WINDOW, stopped by the accept path's flag.
+    // PUNCH_WINDOW, stopped by the accept path's flag. CR-P1-07: the
+    // joining SENDER runs its pairing-time opener + mapping keepalive now
+    // (the same shared core as the CLI) instead of at send time — the
+    // GUI's send may come arbitrarily late.
     if let Some((socket, _)) = sender_sock {
         stash_hole_socket(rt, code_id, socket);
     }
-    if my_role == TaskRole::Receiver {
-        spawn_receiver_punch(rt, code_id, &dial_candidates);
+    match my_role {
+        TaskRole::Receiver => {
+            spawn_receiver_punch(rt, code_id, &dial_candidates);
+        }
+        TaskRole::Sender => {
+            spawn_sender_opener(rt, code_id, &dial_candidates);
+        }
     }
     if let Some(slot) = code_slot {
         if let Ok(mut value) = slot.lock() {
@@ -3386,10 +3492,17 @@ async fn run_join(
         endpoint,
         quoted(code),
     ));
-    // The REAL reachability probe over the peer's advertised candidates;
-    // the settle is honest (P2-09): all-failed leaves the entry
-    // `unreachable`, matching the join result's `probe` verdict.
-    let outcome = probe_with_retry(&stack.pairing, &paired.peer).await;
+    // The REAL reachability probe; the settle is honest (P2-09):
+    // all-failed leaves the entry `unreachable`, matching the join
+    // result's `probe` verdict. CR-P1-07 改法 2: a SENDER's test rides the
+    // ADOPTED dial socket (meaningful through a port-restricted-cone NAT,
+    // and the GUI no longer treats its failure as terminal); a RECEIVER
+    // keeps the pairing-plane probe (quinn owns its socket).
+    let outcome = if my_role == TaskRole::Sender {
+        adopted_socket_probe(rt, &code_id, &dial_candidates).await
+    } else {
+        probe_with_retry(&stack.pairing, &paired.peer).await
+    };
     let (probe_line, verdict) = probe_result_line(&conn_id, &outcome);
     settle_probe_state(rt, &conn_id, &outcome);
     rt.push_event(probe_line);
@@ -3418,10 +3531,10 @@ async fn run_join(
 /// ([`probe_dial_round`]): when it observes an answering address, that
 /// address leads the dial order under the bounded observed-candidate
 /// budget; with no observation the round is invisible and the static
-/// order dials exactly as before. Since CR-P1-06 改法 2 the phase is
-/// PRECEDED by `task_net::sender_reflexive_opener` — the post-pairing
-/// pause plus the adopted socket's first outbound packets toward the
-/// receiver's reflexive addresses.
+/// order dials exactly as before. Since CR-P1-07 the send-time
+/// reflexive opener is GONE — the opener + mapping keepalive run at
+/// PAIRING COMPLETION ([`spawn_sender_opener`]) and this op stops them
+/// at its start.
 async fn run_send(
     rt: &Arc<TaskRt>,
     conn_id: [u8; 16],
@@ -3457,24 +3570,20 @@ async fn run_send(
     // review's core rule (审核改法第 4 条: the probing AND the QUIC dial
     // ride one socket). No stash (bind failed, or an old runtime): the
     // legacy throwaway round, byte-identical to the pre-CR path.
+    //
+    // CR-P1-07: the PAIRING-TIME opener + mapping keepalive (spawned when
+    // the pairing completed) stops HERE — the send phase's own probe round
+    // and QUIC dial take over the adopted socket's outbound traffic. The
+    // opener itself already ran at pairing time with CLI-identical timing
+    // (its one `reflexive_opener` event fired there, contract §8.1); a
+    // RETRY send keeps the stash's stop flag set, which is correct — the
+    // mappings the first attempt's dial just used are hotter than any
+    // keepalive cadence.
     let adopted = rt.hole_sockets.lock().ok().and_then(|holes| {
-        holes
-            .get(&conn.code_id)
-            .and_then(|e| e.socket.try_clone().ok())
+        let entry = holes.get(&conn.code_id)?;
+        entry.punch_stop.store(true, Ordering::Relaxed);
+        entry.socket.try_clone().ok()
     });
-    // CR-P1-06 改法 2 (packet half): the brief post-pairing pause, then the
-    // adopted socket's FIRST outbound packets toward the receiver's
-    // reflexive addresses — this socket's outbound NAT flow must exist
-    // before the receiver's normal-TTL backup punches (phase 2, ≥1 s) can
-    // arrive at the sender's NAT, or Linux-type SNAT rewrites the external
-    // port (the conntrack tuple conflict this fix exists for).
-    let opener_packets = sender_reflexive_opener(adopted.as_ref(), &static_order).await;
-    // Bounded one-shot diagnostic (run-43304434327 fingerprint: zero sent
-    // with an adopted socket + non-empty candidates = filter too strict).
-    // Unknown-event-tolerated on the Dart side, like sender_bind.
-    rt.push_event(format!(
-        "{{\"event\":\"reflexive_opener\",\"packets\":{opener_packets}}}"
-    ));
     // batchF G2: the round's observation rides one bounded
     // `probe_observed` event per send (the emission pattern of
     // `sender_bind` — a plain `push_event`, unknown-name-tolerated on
@@ -6153,16 +6262,32 @@ mod task_tests {
         );
         let (declined_ok, _) = wait_op(engine_b, &joiner, &op_one);
         assert!(!declined_ok, "the declined attempt fails the op");
-        // The listener (and the connection) survived the decline.
-        let mut buf = cbuf(CAP);
-        assert_eq!(
-            ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
-            1
-        );
+        // The listener (and the connection) survived the decline. Poll
+        // the owner's list until its pairing-time probe SETTLES first:
+        // since CR-P1-07 the joiner's join returns after its (faster,
+        // early-exit) adopted-socket round, so the owner's 1.5 s
+        // probe-with-retry can still be mid-window here — `probing` is a
+        // transient state, never a verdict.
+        let deadline = Instant::now() + WAIT;
+        let settled = loop {
+            let mut buf = cbuf(CAP);
+            assert_eq!(
+                ak_task_list(engine_a, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+                1
+            );
+            let text = text_of(&buf);
+            if !text.contains("\"state\":\"probing\"") {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the owner's pairing-time probe never settled: {text}"
+            );
+            std::thread::sleep(POLL);
+        };
         assert!(
-            text_of(&buf).contains("\"state\":\"connected\""),
-            "a decline is not a task terminal state: {}",
-            text_of(&buf)
+            settled.contains("\"state\":\"connected\""),
+            "a decline is not a task terminal state: {settled}"
         );
 
         // Attempt 2 (a fresh op on the SAME connection): accepted, lands.
@@ -6891,6 +7016,59 @@ mod task_tests {
             !text_of(&buf).contains("\"state\":\"connected\""),
             "a dead candidate must not settle connected: {}",
             text_of(&buf)
+        );
+        ak_engine_free(engine_a);
+        ak_engine_free(engine_b);
+    }
+
+    /// CR-P1-07 (review 2026-11-13 §4.4 改法 1): the sender's reflexive
+    /// opener fires ONCE at PAIRING COMPLETION — both entry points. The
+    /// JOINING sender sees its `reflexive_opener` event while the join op
+    /// is settling (the shared pairing-time opener/keepalive task spawned
+    /// right after the redeem), and the OWNER of a sender-role code sees
+    /// its own from `owner_side_probe`. The event carries the opener's
+    /// packet count (host-dependent — 0 only without an adopted socket or
+    /// non-loopback candidates).
+    #[test]
+    fn reflexive_opener_event_fires_at_pairing_on_both_sender_paths() {
+        let registry = TestRegistry::spawn();
+        let engine_a = ak_engine_new();
+        let engine_b = ak_engine_new();
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let owner = start_task_on(engine_a, &registry, dir_a.path());
+        let joiner = start_task_on(engine_b, &registry, dir_b.path());
+
+        // Joiner-sender path: the owner holds a receiver-role code, the
+        // joiner joins as the SENDER with derived candidates (an adopted
+        // dial socket is bound before the redeem).
+        let (_, ok, json) = create_code(
+            engine_a,
+            &owner,
+            "{\"spec_version\":1,\"role\":\"receiver\"}",
+        );
+        assert!(ok, "{json}");
+        let code = code_of(&json);
+        let (join_ok, join_json) = join_code_as(engine_b, &joiner, &code, Some("sender"));
+        assert!(join_ok, "join accepted: {join_json}");
+        let opener = wait_event(engine_b, &joiner, "reflexive_opener");
+        assert!(
+            opener.contains("\"packets\":"),
+            "the pairing-time opener's count rides the event: {opener}"
+        );
+
+        // Owner-sender path: the owner of a sender-role code runs its
+        // opener from owner_side_probe when the joiner's redeem completes.
+        let (_, ok_two, json_two) =
+            create_code(engine_a, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
+        assert!(ok_two, "{json_two}");
+        let code_two = code_of(&json_two);
+        let (join_two_ok, join_two_json) = join_code_as(engine_b, &joiner, &code_two, None);
+        assert!(join_two_ok, "second join accepted: {join_two_json}");
+        let owner_opener = wait_event(engine_a, &owner, "reflexive_opener");
+        assert!(
+            owner_opener.contains("\"packets\":"),
+            "the owner-side pairing-time opener fired: {owner_opener}"
         );
         ak_engine_free(engine_a);
         ak_engine_free(engine_b);

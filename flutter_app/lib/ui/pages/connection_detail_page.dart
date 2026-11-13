@@ -170,9 +170,15 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final connection = _connection;
+    // CR-P1-07 (review 2026-11-13 §4.4 改法 2): only `disconnected` ends
+    // the page's liveness — a failed pairing-time connectivity test
+    // (`unreachable`) is informational. The test rides the adopted QUIC
+    // socket since H1, but its window can still skew against the peer's
+    // punch window (an honest negative), and the send phase carries its
+    // own probe round + dial, so the buttons must stay usable and the
+    // copy says the send can still be tried.
     final live = connection != null &&
-        connection.state != TaskConnectionState.disconnected &&
-        connection.state != TaskConnectionState.unreachable;
+        connection.state != TaskConnectionState.disconnected;
     final peerName = connection?.peerName ?? '对端';
 
     return Scaffold(
@@ -219,8 +225,14 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                       child: Text(
                         switch (connection.state) {
                           TaskConnectionState.testing => '正在测试连通性…',
+                          // CR-P1-07: a failed pairing-time test is NOT a
+                          // dead end — the send phase retries on its own
+                          // probe round and dial (same for the receiver:
+                          // nothing gates the incoming transfer).
                           TaskConnectionState.unreachable =>
-                            '连通测试未通过：无法与对端建立数据直连，请重新配对。',
+                            connection.role == TaskRole.send
+                                ? '连通测试未通过，仍可尝试发送。'
+                                : '连通测试未通过，仍可等待对方发送。',
                           _ => '正在建立连接…',
                         },
                         style: theme.textTheme.bodySmall?.copyWith(

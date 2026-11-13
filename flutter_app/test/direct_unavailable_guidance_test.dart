@@ -192,10 +192,16 @@ void main() {
       expect(find.textContaining('连通测试未通过'), findsOneWidget);
       expect(find.byKey(const ValueKey('conn_send_button')), findsNothing);
       if (role == TaskRole.send) {
+        // CR-P1-07 (review 2026-11-13 §4.4 改法 2): a failed pairing-time
+        // test no longer gates the send — the pick (and send) buttons stay
+        // ENABLED; the copy says the send can still be tried.
         final pick = tester.widget<FilledButton>(
           find.byKey(const ValueKey('conn_pick_files_button')),
         );
-        expect(pick.onPressed, isNull);
+        expect(pick.onPressed, isNotNull);
+        expect(find.text('连通测试未通过，仍可尝试发送。'), findsOneWidget);
+      } else {
+        expect(find.text('连通测试未通过，仍可等待对方发送。'), findsOneWidget);
       }
       expect(tester.takeException(), isNull);
 

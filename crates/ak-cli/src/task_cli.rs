@@ -76,11 +76,11 @@ use ak_session::pairing::task_net::{
     bind_echo_responder_socket, bind_receiver_socket, blob_candidates, deliver_close_notify,
     drive_with_connect_budget, echo_responder_loop, handshake_failure_word,
     insert_reflexive_candidate, local_candidates, order_candidates, prefers_lan, probe_dial_round,
-    probe_dial_round_on, probe_with_retry, punch_candidates, sender_reflexive_opener,
-    staggered_dial_pass, windows_root_name_refusal, AttemptVerdict, ConnectMarks, PUNCH_INTERVAL,
-    PUNCH_WINDOW, RECEIVER_BIND_TIMEOUT, REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE,
-    TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS, TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE,
-    TASK_SETTLE_PAUSE,
+    probe_dial_round_on, probe_with_retry, punch_candidates, sender_pairing_opener,
+    staggered_dial_pass, windows_root_name_refusal, AttemptVerdict, ConnectMarks,
+    OpenerKeepaliveReport, PUNCH_INTERVAL, PUNCH_WINDOW, RECEIVER_BIND_TIMEOUT,
+    REGISTRY_CONNECT_TIMEOUT, TASK_CLOSE_MESSAGE, TASK_CONNECT_PASSES, TASK_PROBE_OPTIONS,
+    TASK_REDEEM_WINDOW_MS, TASK_SEND_IDLE, TASK_SETTLE_PAUSE,
 };
 // CR-P1-05: the shared sender-socket bind (aliased — the Session method
 // of the same role wraps it with this adapter's stdout lines).
@@ -1568,8 +1568,10 @@ enum Attempt {
 /// dial attempt adopts the same socket — the review's core rule (审核改法
 /// 第 4 条: probing AND QUIC on one socket); the legacy throwaway round
 /// covers the no-stash fallback byte for byte. CR-P1-06 改法 2: the
-/// phase is PRECEDED by [`sender_reflexive_opener`] — see there (the
-/// caller's `send_phase`).
+/// phase used to be PRECEDED by the reflexive opener; since CR-P1-07 the
+/// opener runs at PAIRING time in the caller's `send_phase` (the shared
+/// pairing-time opener + keepalive) and the dial may start arbitrarily
+/// later — the keepalive holds the mappings in between.
 async fn drive_task_send(
     pairing: &TaskPairing,
     key: &DeviceKeyPair,
@@ -2024,10 +2026,21 @@ pub(crate) async fn run_code_send(
     flow
 }
 
-/// The post-pairing send phase (probe + transfer), cancellable: Ctrl-C (or
-/// a test's cancel channel) aborts the phase before or mid-transfer and
-/// the flow ends as a LOCAL stop — the teardown then close-notifies the
-/// waiting peer so it exits with the explicit peer-departure reason.
+/// The post-pairing send phase (pairing-time opener/keepalive + probe +
+/// transfer), cancellable: Ctrl-C (or a test's cancel channel) aborts the
+/// phase before or mid-transfer and the flow ends as a LOCAL stop — the
+/// teardown then close-notifies the waiting peer so it exits with the
+/// explicit peer-departure reason.
+///
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 1): the reflexive opener now runs
+/// as part of the SHARED pairing-time opener/keepalive
+/// (`task_net::sender_pairing_opener`, the exact function the FFI spawns
+/// at pairing completion) instead of an inline pre-probe call — same
+/// timing (the opener fires ~SENDER_DIAL_PAUSE after pairing, before the
+/// probe report), and the keepalive then holds both NAT mappings open
+/// across the probe window (and the experimental delay knob below) until
+/// the send starts. The matrix therefore exercises the identical code the
+/// GUI runs.
 async fn send_phase(
     session: &Session,
     hooks: &TaskHooks,
@@ -2035,26 +2048,58 @@ async fn send_phase(
     link: &TaskLink,
     paths: &[PathBuf],
 ) -> Result<Result<Report>> {
+    // CR-P1-07: the pairing-time opener + mapping keepalive task. The
+    // opener's packet count still prints as its own bounded line (the
+    // run-43304434327 fingerprint: zero with a bound socket + non-empty
+    // candidates means the filter is too strict); the keepalive end
+    // prints one bounded summary when the send stops it.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut opener_task = {
+        let flag = Arc::clone(&stop);
+        let adopted = session
+            .sender_socket
+            .as_ref()
+            .and_then(|socket| socket.try_clone().ok());
+        let static_order = order_candidates(link.peer.candidates.clone());
+        AbortOnDrop(tokio::spawn(async move {
+            sender_pairing_opener(adopted.as_ref(), &static_order, &flag, |packets| {
+                println!("[task] reflexive opener sent {packets} packet(s)")
+            })
+            .await
+        }))
+    };
     let flow = async {
-        // CR-P1-06 改法 2: the opener runs BEFORE the pairing-plane
-        // reachability report (which takes ≥ its 1.5 s probe window, up to
-        // ~3.3 s with the retry) — the review's "配对后短暂等待，然后立即
-        // 从收养 socket 向接收端反射地址发包" pins the adopted socket's
-        // first outbound to ~SENDER_DIAL_PAUSE after pairing, well inside
-        // the receiver's 1 s low-TTL punch phase; deferring it past the
-        // report would let the receiver's phase-2 normal-TTL punches reach
-        // the sender's NAT first and re-create the conntrack tuple
-        // conflict this fix removes.
-        let opened = sender_reflexive_opener(
-            session.sender_socket.as_ref(),
-            &order_candidates(link.peer.candidates.clone()),
-        )
-        .await;
-        // Zero sent with an adopted socket + non-empty candidates is the
-        // run-43304434327 failure fingerprint (filter too strict): make
-        // it visible, not a silent no-op.
-        println!("[task] reflexive opener sent {opened} packet(s)");
         probe_and_print(&session.stack.pairing, link).await;
+        // CR-P1-07 matrix knob (hidden debug parameter, DEFAULT OFF —
+        // never set in production): delay the send start after pairing,
+        // simulating the GUI's "pair, then pick files, then send" latency
+        // for the NAT matrix's late-send cases (review 2026-11-13 §4.4
+        // 改法 4). The pairing keepalive holds the mappings across the
+        // delay — that is exactly what those cases prove.
+        if let Some(delay) = exp_send_delay() {
+            println!(
+                "[task] experimental send delay {} ms (AK_EXP_SEND_DELAY_MS)",
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+        }
+        // The send starts: stop the keepalive (its mappings are the dial's
+        // to refresh now) and fold its bounded report into the log.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(report) = (&mut opener_task.0).await {
+            println!(
+                "[task] pairing keepalive held the mapping: {} tick(s), {} packet(s), ended {}",
+                report.keepalive_ticks,
+                report.keepalive_packets,
+                if report.stopped_early {
+                    "at send start"
+                } else if report.budget_elapsed {
+                    "at the time budget"
+                } else {
+                    "without an adopted socket"
+                },
+            );
+        }
         drive_task_send(
             &session.stack.pairing,
             &session.key,
@@ -2071,6 +2116,30 @@ async fn send_phase(
         report = flow => report,
         _ = wait_cancelled(&hooks.cancel) => return Ok(Err(TaskCancelled.into())),
     })
+}
+
+/// Abort the spawned pairing-opener/keepalive task when the guard drops:
+/// Ctrl-C cancels the send phase mid-flow and the keepalive must not
+/// outlive the session — its socket `try_clone` would keep the adopted OS
+/// socket (and the NAT mappings) alive for up to the whole keepalive
+/// budget. Aborting a finished task is a no-op.
+struct AbortOnDrop(tokio::task::JoinHandle<OpenerKeepaliveReport>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 4): hidden debug parameter,
+/// DEFAULT OFF — never set in production. `AK_EXP_SEND_DELAY_MS=<millis>`
+/// delays the send start after the pairing-time probe, simulating the
+/// GUI's "pair, then pick files, then send" latency for the NAT matrix's
+/// late-send cases (≥5 s and ≥40 s tiers). Unset/0/unparsable = no delay.
+fn exp_send_delay() -> Option<Duration> {
+    let raw = std::env::var("AK_EXP_SEND_DELAY_MS").ok()?;
+    let millis: u64 = raw.parse().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
 }
 /// it, wait for the joiner, probe, then serve receives behind the consent
 /// prompt until one transfer completes (or the peer departs).

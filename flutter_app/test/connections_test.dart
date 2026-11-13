@@ -160,6 +160,84 @@ void main() {
         find.byKey(const ValueKey('conn_detail_save_dir')), findsOneWidget);
   });
 
+  // CR-P1-07 (review 2026-11-13 §4.4 改法 2): a FAILED pairing-time
+  // connectivity test (`unreachable`) must not gate the send — the pick
+  // and send buttons stay enabled and the copy says the send can still
+  // be tried (the send phase carries its own probe round and dial).
+  testWidgets('unreachable keeps the send buttons enabled and says the '
+      'send can still be tried (CR-P1-07)', (tester) async {
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+
+    await fake.createCode(TaskRole.send);
+    final id = fake.simulatePeerJoin(peerName: '办公本-ThinkPad');
+    await pumpEvents(tester);
+    await tester.pump();
+    fake.failProbe(id);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    await tester.tap(find.byKey(ValueKey('conn_card_name_$id')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    // The dead-end wording is gone; the new copy names the option.
+    expect(find.textContaining('请重新配对'), findsNothing);
+    expect(find.text('连通测试未通过，仍可尝试发送。'), findsOneWidget);
+    // The pick button stays ENABLED (onPressed non-null = enabled).
+    final pick = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('conn_pick_files_button')));
+    expect(pick.onPressed, isNotNull,
+        reason: 'unreachable must not disable pick');
+
+    // Pick through the sheet, then the send button is enabled too.
+    await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('pick_files_option')));
+    await tester.pump();
+    expect(find.text('已选 2 项'), findsOneWidget);
+    final send = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('conn_send_button')));
+    expect(send.onPressed, isNotNull,
+        reason: 'unreachable must not disable send');
+    // The pre-H1 "not ready" hint only belongs to a disconnected page.
+    expect(find.text('连接未就绪，暂时不能发送。'), findsNothing);
+
+    // Sending still flows through the service with the probe failed.
+    await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('conn_send_progress')), findsOneWidget);
+    expect(fake.sendRequests.single.$1, id);
+    fake.completeSend();
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('conn_send_result')), findsOneWidget);
+  });
+
+  // CR-P1-07, receiver view of the same verdict: the copy waits for the
+  // peer instead of telling the user to re-pair (nothing gates an
+  // incoming transfer).
+  testWidgets('receiver unreachable copy waits for the peer (CR-P1-07)',
+      (tester) async {
+    final fake = await pumpApp(tester);
+
+    await fake.createCode(TaskRole.receive);
+    final id = fake.simulatePeerJoin(peerName: '同事的电脑');
+    await pumpEvents(tester);
+    await tester.pump();
+    fake.failProbe(id);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    await tester.tap(find.byKey(ValueKey('conn_card_name_$id')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.text('连通测试未通过，仍可等待对方发送。'), findsOneWidget);
+    expect(find.textContaining('请重新配对'), findsNothing);
+  });
+
   testWidgets('disconnect asks for confirmation, then drops the card',
       (tester) async {
     final fake = await pumpApp(tester);

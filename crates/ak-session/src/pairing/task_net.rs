@@ -55,6 +55,24 @@
 //!   with reflexive/observed addresses strictly first; sequential on the
 //!   adopted socket, where concurrent QUIC endpoints on handles of one OS
 //!   socket would compete for its receive queue);
+//! * the pairing-time opener + mapping keepalive (CR-P1-07, review
+//!   2026-11-13 §4.4 改法 1) —
+//!   [`task_net::sender_pairing_opener`]: the SAME opener timing the CLI
+//!   always had, now run at PAIRING COMPLETION by both adapters (the GUI's
+//!   "pair, then pick files, then send" latency no longer outlives the
+//!   receiver's punch window), followed by probe-shaped keepalive packets
+//!   every [`task_net::OPENER_KEEPALIVE_INTERVAL`] until the send starts /
+//!   the connection ends / [`task_net::OPENER_KEEPALIVE_BUDGET`] elapses —
+//!   one shared function, so the CLI matrix exercises the exact code the
+//!   GUI runs;
+//! * the Windows receiver's low-TTL punch (CR-P1-08, review 2026-11-13
+//!   §4.4 改法 3) — the private `SocketTtlGuard` (the socket-level
+//!   `setsockopt(IP_TTL)` fallback for hosts without
+//!   per-packet control data, armed only while no QUIC connection exists
+//!   on the socket, restored at the phase end) and the delayed punch
+//!   start of [`task_net::punch_candidates`] when NO low-TTL send exists
+//!   at all (the sender's own low-TTL opener then owns the pre-punch
+//!   window — 改法 3b's ordering without a wire-format capability bit);
 //! * the probe echo responder — [`task_net::bind_echo_responder_socket`] +
 //!   [`task_net::echo_responder_loop`] (anti-reflection, per-source reply budgets,
 //!   the CR-P1-02 leg-3 observation slot) and the transient-error
@@ -224,6 +242,34 @@ pub const PUNCH_LOW_TTL_PHASE: Duration = Duration::from_secs(1);
 /// mapping, and the sender's own outbound flow is established before the
 /// receiver's normal-TTL backup phase begins.
 pub const SENDER_DIAL_PAUSE: Duration = Duration::from_millis(300);
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 1): cadence of the pairing-time
+/// mapping KEEPALIVE — after the opener, one probe-shaped packet per
+/// public target leaves the adopted socket every 15 s until the send
+/// starts, the connection/task ends, or [`OPENER_KEEPALIVE_BUDGET`]
+/// elapses. 15 s sits at half the 30 s Linux conntrack UNREPLIED UDP
+/// timeout (the shortest mapping lifetime a home router is likely to
+/// enforce): both sides' entries — the sender's outbound flow and the
+/// receiver's punched mapping, which a keepalive datagram matches in the
+/// reverse direction, marking it REPLIED/assured (120 s on Linux-type
+/// NATs) — are refreshed with a full interval of margin.
+pub const OPENER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// CR-P1-07: total wall-clock budget of the pairing-time keepalive. The
+/// task-code TTL default is 10 minutes (wave-29 P2-04) — a paired-but-
+/// never-sent connection keeps its NAT mapping for exactly as long as
+/// the code that created it could still have served a transfer, then the
+/// honest expiry is a later send failing to connect.
+pub const OPENER_KEEPALIVE_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// Granularity at which bounded side loops poll their shared stop flag
+/// between sleeps ([`sender_pairing_opener`]'s keepalive and
+/// [`punch_candidates`]'s delayed start): a plain `sleep_until(interval)`
+/// would only notice the flag at the next tick — up to a full
+/// [`OPENER_KEEPALIVE_INTERVAL`] after the send already started. Four
+/// idle wakeups per keepalive tick is nothing; a 250 ms stop latency is
+/// invisible next to the send phase's own probe round.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// CR-P3-09 (review 2026-11-11 §4.5): Happy-Eyeballs stagger — one
 /// connect attempt starts every 250 ms while the previous ones are still
@@ -1196,10 +1242,26 @@ pub struct PunchReport {
     /// ticks; per-datagram send errors do not count).
     pub packets_sent: usize,
     /// CR-P1-06: punch packets sent with the low [`PUNCH_LOW_TTL`]
-    /// (first phase, IPv4 targets, hosts with per-packet TTL support).
-    /// Zero on Windows (documented normal-TTL degradation) and during a
-    /// window entirely covered by early stop.
+    /// (first phase, IPv4 targets) — via per-packet control data OR the
+    /// CR-P1-08 socket-level fallback (see `low_ttl_socket`). Zero only
+    /// when the host has no low-TTL send at all (or the knob disabled
+    /// it) and during a window entirely covered by early stop.
     pub low_ttl_packets: usize,
+    /// CR-P1-08: the low phase rode the SOCKET-LEVEL TTL fallback
+    /// (`setsockopt(IP_TTL)` armed/restored around the phase) — hosts
+    /// without per-packet control data, e.g. Windows. `false` on
+    /// per-packet hosts and when no low-TTL send exists at all.
+    pub low_ttl_socket: bool,
+    /// CR-P1-08 改法 3b: the whole punch was DELAYED past
+    /// [`PUNCH_LOW_TTL_PHASE`] because this host has NO low-TTL send at
+    /// all (both the per-packet path and the socket-level fallback
+    /// unavailable, or the `AK_EXP_NO_TTL` test knob) — the sender's own
+    /// low-TTL pairing-time opener ([`sender_pairing_opener`]) then owns
+    /// the pre-punch window, so this side's normal-TTL punches can only
+    /// ever arrive at the sender's EXISTING outbound flow instead of
+    /// creating the inbound-only conntrack record that made SNAT rewrite
+    /// the sender's external port.
+    pub start_delayed: bool,
     /// Tick rounds that fired (≈ `window / interval`, fewer on early
     /// stop).
     pub ticks: usize,
@@ -1232,18 +1294,35 @@ pub struct PunchReport {
 ///
 /// CR-P1-06 two-phase TTL (review 2026-11-11 §4.5 改法 1/3, batchF
 /// conntrack evidence): the FIRST [`PUNCH_LOW_TTL_PHASE`] sends its
-/// IPv4 datagrams with the low per-packet [`PUNCH_LOW_TTL`] — they open
-/// THIS side's NAT mapping but expire before the sender's NAT, so they
-/// cannot leave the inbound-only conntrack record that made Linux-type
-/// SNAT rewrite the sender's external port (the pcone↔pcone failure).
-/// After the phase (and for IPv6 targets always — no NAT, normal hop
-/// limit) the punch continues at the socket's normal TTL: the backup
-/// behavior for NATs that need to actually see the peer's traffic. The
-/// low TTL rides per-packet `sendmsg` control messages
-/// (`ak_net::holepunch::send_to_with_ttl`) — the shared socket's own
-/// TTL is never modified; on hosts without per-packet TTL support
-/// (Windows: `WSASendMsg` documents no IPv4 `IP_TTL` control data) the
-/// whole window runs at normal TTL — the honest documented degradation.
+/// IPv4 datagrams with a low TTL — they open THIS side's NAT mapping but
+/// expire before the sender's NAT, so they cannot leave the inbound-only
+/// conntrack record that made Linux-type SNAT rewrite the sender's
+/// external port (the pcone↔pcone failure). After the phase (and for
+/// IPv6 targets always — no NAT, normal hop limit) the punch continues
+/// at the socket's normal TTL: the backup behavior for NATs that need to
+/// actually see the peer's traffic.
+///
+/// CR-P1-08 (review 2026-11-13 §4.4 改法 3): the low TTL rides per-packet
+/// `sendmsg` control messages (`ak_net::holepunch::send_to_with_ttl`)
+/// where the host has them; a host WITHOUT per-packet support (Windows:
+/// `WSASendMsg` documents no IPv4 `IP_TTL` control data) falls back to
+/// the `SocketTtlGuard` — the socket's OWN TTL is temporarily set low for
+/// the phase and restored after. Safe at pairing time by construction:
+/// the punch starts the moment the pairing completes and the task's QUIC
+/// socket carries no connection yet (the acknowledged cost — an IPv4
+/// peer's racing handshake reply would expire in transit and recover via
+/// retransmission once the phase ends; LAN (1 hop) and IPv6 are
+/// unaffected).
+///
+/// CR-P1-08 改法 3b, receiver half: when NO low-TTL send exists at all
+/// (both paths unavailable, or the hidden `AK_EXP_NO_TTL` matrix knob),
+/// the whole punch is DELAYED past [`PUNCH_LOW_TTL_PHASE`] — the paired
+/// sender's own low-TTL pairing-time opener ([`sender_pairing_opener`])
+/// opens the sender-side NAT flow inside that window, so this side's
+/// normal-TTL punches arrive at an EXISTING outbound conntrack flow
+/// (matching it reverse-direction, marking it replied) instead of
+/// creating the inbound-only record. No wire-format capability bit is
+/// needed: the receiver decides from its OWN capability alone.
 ///
 /// Bounded and never blocking: family-undialable candidates are skipped
 /// (a v4 socket cannot send to v6; a v6-family socket dials plain-v4
@@ -1277,6 +1356,8 @@ pub async fn punch_candidates<F>(
             report(PunchReport {
                 packets_sent: 0,
                 low_ttl_packets: 0,
+                low_ttl_socket: false,
+                start_delayed: false,
                 ticks: 0,
                 stopped_early: false,
             });
@@ -1288,24 +1369,78 @@ pub async fn punch_candidates<F>(
     // if any, lands in quinn's queue and is discarded — the loop never
     // reads it back).
     let packet = ak_net::holepunch::probe_packet(&punch_nonce());
-    let low_ttl_supported = ak_net::holepunch::per_packet_ttl_supported();
-    let started = tokio::time::Instant::now();
-    let low_phase_end = started + PUNCH_LOW_TTL_PHASE;
-    let deadline = started + PUNCH_WINDOW;
+    // CR-P1-08: the low-TTL first phase needs a low-TTL SEND on this
+    // host — per-packet control data first, else the socket-level
+    // fallback (armed once HERE, before the window; the phase boundary
+    // restores it), else no low phase at all. IPv6-only target lists
+    // never need it (no NAT — the delay below would be pure latency).
+    let knob_disabled = exp_no_low_ttl();
+    let per_packet = !knob_disabled && ak_net::holepunch::per_packet_ttl_supported();
+    let has_v4_target = targets
+        .iter()
+        .any(|addr| ak_net::classify::expand_mapped(*addr).is_ipv4());
+    let mut socket_ttl = SocketTtlGuard::new(&socket);
+    let mut low_ttl_socket = false;
+    let low_ttl_available = if !has_v4_target || knob_disabled {
+        false
+    } else if per_packet {
+        true
+    } else {
+        match socket_ttl.arm(PUNCH_LOW_TTL) {
+            Ok(()) => {
+                low_ttl_socket = true;
+                true
+            }
+            Err(_) => false,
+        }
+    };
+    let start_delayed = has_v4_target && !low_ttl_available;
     let mut packets_sent = 0usize;
     let mut low_ttl_packets = 0usize;
     let mut ticks = 0usize;
+    if start_delayed
+        && sleep_polling_stop(tokio::time::Instant::now() + PUNCH_LOW_TTL_PHASE, stop).await
+    {
+        // Teardown/first-connection arrived before the delayed window
+        // even opened: the honest bounded end, nothing was sent.
+        report(PunchReport {
+            packets_sent,
+            low_ttl_packets,
+            low_ttl_socket,
+            start_delayed,
+            ticks,
+            stopped_early: true,
+        });
+        return;
+    }
+    let started = tokio::time::Instant::now();
+    // No low phase at all when unavailable: `low_phase_end == started`
+    // makes every tick's `low_phase` false.
+    let low_phase_end = if low_ttl_available {
+        started + PUNCH_LOW_TTL_PHASE
+    } else {
+        started
+    };
+    let deadline = started + PUNCH_WINDOW;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         ticks += 1;
         let low_phase = tokio::time::Instant::now() < low_phase_end;
+        if !per_packet && low_ttl_available && !low_phase && socket_ttl.armed() {
+            // CR-P1-08: the phase boundary — restore the socket's normal
+            // TTL (a refused restore retries next tick; the guard's Drop
+            // retries once more, so the armed window is always bounded).
+            let _ = socket_ttl.restore();
+        }
         for target in &targets {
             // Per-datagram TTL decision (pure, unit-pinned below): low
             // TTL only for IPv4 targets inside the first phase on hosts
-            // that can send it; everything else normal.
-            let sent = match punch_send_ttl(*target, low_phase, low_ttl_supported) {
+            // that can send it per-packet; everything else normal (the
+            // socket-level fallback's low TTL rides the plain send
+            // below while its guard is armed).
+            let sent = match punch_send_ttl(*target, low_phase, per_packet) {
                 // A refused/failed cmsg send is skipped, never retried
                 // at normal TTL inside the low phase (see the function
                 // doc — a normal-TTL fallback would re-create the very
@@ -1322,7 +1457,13 @@ pub async fn punch_candidates<F>(
                 // delivery; per-datagram errors (unreachable,
                 // WSAECONNRESET-shaped) cost nothing and never end the
                 // loop.
-                None => socket.send_to(&packet, target).is_ok(),
+                None => {
+                    let ok = socket.send_to(&packet, target).is_ok();
+                    if ok && socket_ttl.armed() && low_phase {
+                        low_ttl_packets += 1;
+                    }
+                    ok
+                }
             };
             if sent {
                 packets_sent += 1;
@@ -1346,9 +1487,110 @@ pub async fn punch_candidates<F>(
     report(PunchReport {
         packets_sent,
         low_ttl_packets,
+        low_ttl_socket,
+        start_delayed,
         ticks,
         stopped_early,
     });
+}
+
+/// CR-P1-08 (review 2026-11-13 §4.4 改法 3a): temporarily set a WHOLE
+/// socket's IPv4 TTL low and restore it afterwards. For hosts without
+/// per-packet TTL control data (Windows `WSASendMsg` documents no IPv4
+/// `IP_TTL` cmsg) this is the receiver punch's low-phase fallback: at
+/// pairing completion the task's QUIC socket carries NO connection yet,
+/// so the socket-wide TTL cannot disturb any other traffic (the review's
+/// §6.4 correction of its earlier "never touch a shared socket" rule).
+/// Fail-open by design: a host that refuses the option (`ttl()`/
+/// `set_ttl()` errors, e.g. a dual-stack shape the platform won't take
+/// `IP_TTL` on) simply keeps normal TTL — the documented degradation.
+struct SocketTtlGuard<'a> {
+    socket: &'a std::net::UdpSocket,
+    /// The TTL observed at arm time (restored verbatim; a failed read
+    /// leaves `None` and the arm is refused).
+    original: Option<u32>,
+    armed: bool,
+}
+
+impl<'a> SocketTtlGuard<'a> {
+    fn new(socket: &'a std::net::UdpSocket) -> Self {
+        Self {
+            socket,
+            original: None,
+            armed: false,
+        }
+    }
+
+    fn armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Read the current TTL, set `ttl`, mark armed. A refused read/set
+    /// leaves the guard unarmed (the caller degrades to normal TTL).
+    fn arm(&mut self, ttl: u32) -> std::io::Result<()> {
+        if self.armed {
+            return Ok(());
+        }
+        let original = self.socket.ttl()?;
+        self.socket.set_ttl(ttl)?;
+        self.original = Some(original);
+        self.armed = true;
+        Ok(())
+    }
+
+    /// Restore the TTL observed at arm time. A refused set keeps the
+    /// guard armed so the caller/Drop retries.
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        // `arm` captures the original before flipping `armed`, so an
+        // armed guard always carries it.
+        let original = self
+            .original
+            .expect("an armed SocketTtlGuard captured the original TTL");
+        self.socket.set_ttl(original)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for SocketTtlGuard<'_> {
+    fn drop(&mut self) {
+        // The early-stop path (first connection / teardown) can land
+        // mid-phase: never leave a low TTL behind on the QUIC socket.
+        let _ = self.restore();
+    }
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 4): hidden debug parameter,
+/// DEFAULT OFF — never set in production. `AK_EXP_NO_TTL` disables the
+/// receiver punch's low-TTL phase ENTIRELY (both the per-packet path and
+/// the CR-P1-08 socket-level fallback), simulating a receiver host with
+/// no low-TTL send at all (the pre-CR-P1-08 Windows shape) for the NAT
+/// matrix's "receiver without low TTL" case. Such a receiver also
+/// delays its punch start — see [`punch_candidates`].
+fn exp_no_low_ttl() -> bool {
+    std::env::var("AK_EXP_NO_TTL")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+}
+
+/// Sleep until `deadline` in [`STOP_POLL_INTERVAL`] chunks, returning
+/// early (`true`) the moment `stop` flips: the bounded side loops share
+/// one stop flag with no async signal, and a full-interval sleep would
+/// notice a send that already started only at the next keepalive tick.
+async fn sleep_polling_stop(deadline: tokio::time::Instant, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(STOP_POLL_INTERVAL)).await;
+    }
 }
 
 /// The per-datagram TTL decision of [`punch_candidates`] — pure on
@@ -1464,8 +1706,13 @@ pub fn punch_targets(local: SocketAddr, candidates: &[SocketAddr]) -> Vec<Socket
 /// toward the receiver, the flow that occupies the sender-NAT tuple
 /// BEFORE the receiver's normal-TTL backup punches (phase 2, ≥
 /// [`PUNCH_LOW_TTL_PHASE`]) can arrive there, and the mapping the QUIC
-/// Initial then rides. The packets are probe-shaped with a real nonce;
-/// at the receiver they land in quinn's queue and are silently discarded.
+/// Initial then rides. Since CR-P1-07 the IPv4 datagrams ride the LOW
+/// [`PUNCH_LOW_TTL`] where the host can send it (see the private
+/// `send_opener_packets`): the opener only needs to open THIS side's
+/// NAT flow — reaching the peer was never required (the peer's QUIC
+/// stack silently discards the probe-shaped packet), and a normal-TTL
+/// datagram arriving before the peer's own first punch would poison the
+/// PEER's NAT with the inbound-only record CR-P1-06 exists to avoid.
 ///
 /// No adopted socket (bind failed / an older flow): the wait still runs
 /// (uniform, adapter-identical timing) but no packets are sent — a
@@ -1510,22 +1757,215 @@ pub async fn sender_reflexive_opener(
     // opener targets (they simply get no mapping); the loopback
     // exclusion keeps same-host noise out. Selection shares the punch's
     // family bridge and caps.
-    let Some(local) = adopted.local_addr().ok() else {
+    let Some((clone, targets)) = opener_send_handles(adopted, static_order) else {
         return 0;
     };
-    let public = opener_targets(static_order);
-    let targets = punch_targets(local, &public);
-    let Some(clone) = adopted.try_clone().ok() else {
-        return 0;
-    };
+    send_opener_packets(&clone, &targets)
+}
+
+/// The opener's send-only clone of the adopted socket plus its
+/// family-bridged, capped target list — the shared prep of the
+/// standalone opener ([`sender_reflexive_opener`]) and the pairing-time
+/// keepalive ([`sender_pairing_opener`]). `None` when the socket cannot
+/// be cloned or no dialable target survives the filters (nothing to
+/// open).
+fn opener_send_handles(
+    adopted: &std::net::UdpSocket,
+    static_order: &[SocketAddr],
+) -> Option<(std::net::UdpSocket, Vec<SocketAddr>)> {
+    let local = adopted.local_addr().ok()?;
+    let targets = punch_targets(local, &opener_targets(static_order));
+    if targets.is_empty() {
+        return None;
+    }
+    let clone = adopted.try_clone().ok()?;
+    Some((clone, targets))
+}
+
+/// The opener's per-target send. CR-P1-07 (review 2026-11-13 §4.4
+/// 改法 1/3b, sender half): IPv4 datagrams ride the LOW
+/// [`PUNCH_LOW_TTL`] wherever this host can send it — per-packet control
+/// data first (`send_low_ttl_punch`), else the [`SocketTtlGuard`]
+/// socket-level fallback, else the honest normal-TTL degradation.
+/// Rationale: the opener's job is to open THIS side's NAT flow for the
+/// tuple the QUIC dial will ride — the packet reaching the peer was
+/// never required (the peer's QUIC stack discards it) — while a
+/// NORMAL-TTL opener that arrives before the peer's own first punch
+/// packet creates exactly the inbound-only conntrack record at the
+/// PEER's NAT that CR-P1-06 removed on the other leg. A receiver with
+/// no low-TTL send of its own punches late for the same reason (see
+/// [`punch_candidates`]). IPv6 targets keep the normal hop limit (no
+/// NAT). Loopback/LAN delivery decrements no TTL — same-host and LAN
+/// transfers are unaffected.
+fn send_opener_packets(clone: &std::net::UdpSocket, targets: &[SocketAddr]) -> usize {
     let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+    let per_packet = ak_net::holepunch::per_packet_ttl_supported();
+    let mut guard = SocketTtlGuard::new(clone);
+    if !per_packet {
+        // The socket-level fallback: the whole socket's TTL stays low for
+        // exactly these sends (restored below); a refused arm degrades to
+        // normal TTL — the honest pre-CR-P1-08 behavior.
+        let _ = guard.arm(PUNCH_LOW_TTL);
+    }
     let mut sent = 0usize;
-    for target in &targets {
-        if clone.send_to(&packet, target).is_ok() {
+    for target in targets {
+        let delivered = if per_packet && ak_net::classify::expand_mapped(*target).is_ipv4() {
+            // A refused/failed low-TTL send is skipped, never retried at
+            // normal TTL (a normal datagram is exactly the inbound-record
+            // creator the low TTL exists to avoid).
+            send_low_ttl_punch(clone, &packet, *target, PUNCH_LOW_TTL)
+        } else {
+            // IPv6 (no NAT), the socket-level fallback (the armed guard's
+            // low TTL rides the plain send), or the no-low-TTL
+            // degradation.
+            clone.send_to(&packet, target).is_ok()
+        };
+        if delivered {
             sent += 1;
         }
     }
+    let _ = guard.restore();
     sent
+}
+
+/// Bounded end report of one [`sender_pairing_opener`] run (CR-P1-07):
+/// the opener half's packet count plus the keepalive's tick/packet
+/// counts and which bound ended it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenerKeepaliveReport {
+    /// Probe-shaped packets the OPENER half sent (0 without an adopted
+    /// socket or with no public candidates — diagnostics only, the same
+    /// number the `reflexive_opener` event carries).
+    pub opener_packets: usize,
+    /// Keepalive packets sent after the opener (one per target per
+    /// tick).
+    pub keepalive_packets: usize,
+    /// Keepalive ticks that fired (≈ elapsed / interval).
+    pub keepalive_ticks: usize,
+    /// The stop flag ended the keepalive before the budget elapsed (the
+    /// send started, or the connection/task ended).
+    pub stopped_early: bool,
+    /// The total keepalive budget elapsed (the mapping hold ended by
+    /// time, not by the stop flag).
+    pub budget_elapsed: bool,
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 1), the SHARED sender-side
+/// pairing-time core both adapters call at PAIRING COMPLETION:
+///
+/// 1. the opener half — byte-identical to [`sender_reflexive_opener`]
+///    ([`SENDER_DIAL_PAUSE`], then the adopted socket's first outbound
+///    packets toward the receiver's public/reflexive candidates, low TTL
+///    for IPv4 where the host can send it);
+/// 2. the keepalive half — every [`OPENER_KEEPALIVE_INTERVAL`] one
+///    probe-shaped packet per public target from a send-only clone of
+///    the SAME adopted socket, until the shared `stop` flag flips (the
+///    send op sets it at its start; disconnect/teardown flip it too),
+///    the connection/task ends, or [`OPENER_KEEPALIVE_BUDGET`] elapses.
+///
+/// Why the keepalive exists: the CLI always sent seconds after pairing,
+/// inside the receiver's 4 s punch window; the GUI sends when the user
+/// has picked files — minutes later, long after the receiver's punch
+/// ended and (past 30 s) after Linux-type NATs expire the unreplied
+/// mappings. Each keepalive datagram refreshes BOTH sides' entries: the
+/// sender's outbound flow (forward direction) and the receiver's punched
+/// mapping (reverse direction — which also marks it REPLIED/assured,
+/// 120 s on Linux-type NATs), so the eventual QUIC Initial rides the
+/// same hot tuple regardless of when the send starts.
+///
+/// `on_opener` fires ONCE with the opener half's packet count (both
+/// adapters surface it — the FFI's `reflexive_opener` event, the CLI's
+/// stdout line) whether or not an adopted socket exists. The keepalive
+/// itself is silent by design (no event; the end report is the
+/// adapter's optional bounded diagnostic). `None` adopted socket (bind
+/// failed / an older flow) runs the pause and reports zero — uniform
+/// timing, nothing to keep alive.
+pub async fn sender_pairing_opener<F>(
+    adopted: Option<&std::net::UdpSocket>,
+    static_order: &[SocketAddr],
+    stop: &AtomicBool,
+    on_opener: F,
+) -> OpenerKeepaliveReport
+where
+    F: FnOnce(usize),
+{
+    let opener_packets = sender_reflexive_opener(adopted, static_order).await;
+    on_opener(opener_packets);
+    let Some(adopted) = adopted else {
+        return OpenerKeepaliveReport {
+            opener_packets,
+            ..OpenerKeepaliveReport::default()
+        };
+    };
+    let Some((clone, targets)) = opener_send_handles(adopted, static_order) else {
+        return OpenerKeepaliveReport {
+            opener_packets,
+            ..OpenerKeepaliveReport::default()
+        };
+    };
+    let started = tokio::time::Instant::now();
+    let deadline = started + OPENER_KEEPALIVE_BUDGET;
+    let mut next_tick = started + OPENER_KEEPALIVE_INTERVAL;
+    let mut keepalive_packets = 0usize;
+    let mut keepalive_ticks = 0usize;
+    loop {
+        // Wake at the earlier of the next tick and the total budget; a
+        // flipped stop flag returns within one STOP_POLL_INTERVAL.
+        if sleep_polling_stop(next_tick.min(deadline), stop).await {
+            return OpenerKeepaliveReport {
+                opener_packets,
+                keepalive_packets,
+                keepalive_ticks,
+                stopped_early: true,
+                budget_elapsed: false,
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return OpenerKeepaliveReport {
+                opener_packets,
+                keepalive_packets,
+                keepalive_ticks,
+                stopped_early: false,
+                budget_elapsed: true,
+            };
+        }
+        keepalive_ticks += 1;
+        // A fresh nonce per tick (a real prober's nonce is time-derived;
+        // the peer's echo responder never answers the all-zero reply
+        // nonce either way).
+        let packet = ak_net::holepunch::probe_packet(&punch_nonce());
+        for target in &targets {
+            if clone.send_to(&packet, target).is_ok() {
+                keepalive_packets += 1;
+            }
+        }
+        next_tick += OPENER_KEEPALIVE_INTERVAL;
+    }
+}
+
+/// CR-P1-07 (review 2026-11-13 §4.4 改法 2): fold one adopted-socket
+/// probe round's [`ProbeDialOrder`] into the pairing-time
+/// [`ProbeOutcome`] vocabulary — any observed head (an echo-confirmed
+/// candidate, or the raw source of a peer probe arriving on the QUIC
+/// socket's own mapping) is a genuine two-way observation (`Success`);
+/// silence over every candidate is the honest all-failed verdict with
+/// ONE bounded reason per candidate. Pure.
+pub fn round_probe_outcome(ordered: &[SocketAddr], plan: &ProbeDialOrder) -> ProbeOutcome {
+    match plan.head {
+        Some(address) => ProbeOutcome::Success { address },
+        None => ProbeOutcome::AllFailed {
+            failures: ordered
+                .iter()
+                .map(|candidate| super::CandidateFailure {
+                    candidate: *candidate,
+                    // The same bounded string ak-session's probe plane
+                    // uses for a silent candidate (reasons::SILENT is
+                    // private to the parent module — mirrored verbatim).
+                    reason: "no probe answer within the window",
+                })
+                .collect(),
+        },
+    }
 }
 
 /// CR-P3-09: reorder one static dial order so every PUBLIC (reflexive)
@@ -2781,13 +3221,19 @@ mod tests {
     /// the first phase's IPv4 punches ride the low TTL (loopback delivers
     /// them regardless — local delivery decrements nothing, the expiry is
     /// the matrix's akinet hop's to prove) and the backup phase keeps
-    /// sending after it; on Windows the whole window runs normal TTL.
+    /// sending after it. CR-P1-08: on a host without per-packet TTL the
+    /// SOCKET-LEVEL fallback arms (low_ttl_socket) and the socket's own
+    /// TTL is RESTORED after the phase; only when no low-TTL send exists
+    /// at all does the window degrade to normal TTL — and then the punch
+    /// START is delayed (start_delayed), which the happy path never is.
     #[tokio::test]
     async fn punch_candidates_punches_every_candidate_with_bounded_packets() {
         let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
         let target_addr = target.local_addr().expect("target addr");
         let puncher = std::net::UdpSocket::bind("127.0.0.1:0").expect("puncher bind");
         let puncher_port = puncher.local_addr().expect("puncher addr").port();
+        let ttl_before = puncher.ttl().expect("read the puncher's TTL");
+        let ttl_witness = puncher.try_clone().expect("ttl witness handle");
         let started = Instant::now();
         let stop = AtomicBool::new(false);
         // Same-family mock candidates: a real one plus undialable ones
@@ -2843,10 +3289,25 @@ mod tests {
             "the loop never overruns its window: {:?}",
             started.elapsed()
         );
-        // The two-phase TTL split (CR-P1-06). One candidate per tick; the
-        // low phase covers ~PUNCH_LOW_TTL_PHASE/PUNCH_INTERVAL ticks.
+        assert!(
+            !report.start_delayed,
+            "this host has a low-TTL send (or only v6 targets): no delayed start: {report:?}"
+        );
+        // CR-P1-08: the socket's own TTL is ALWAYS back to its original
+        // value after the run — the socket-level fallback must never leak
+        // the low TTL past its phase (the witness handle reads the same
+        // OS socket the puncher moved into the loop).
+        assert_eq!(
+            ttl_witness.ttl().expect("read the TTL after the run"),
+            ttl_before,
+            "the socket TTL is restored after the punch"
+        );
+        // The two-phase TTL split (CR-P1-06 + CR-P1-08). One candidate
+        // per tick; the low phase covers ~PUNCH_LOW_TTL_PHASE/PUNCH_
+        // INTERVAL ticks.
         let phase_ticks = (PUNCH_LOW_TTL_PHASE.as_millis() / PUNCH_INTERVAL.as_millis()) as usize;
         if ak_net::holepunch::per_packet_ttl_supported() {
+            assert!(!report.low_ttl_socket, "per-packet host: {report:?}");
             assert!(
                 report.low_ttl_packets > 0,
                 "the first phase punches ride the low TTL: {report:?}"
@@ -2859,10 +3320,26 @@ mod tests {
                 report.packets_sent > report.low_ttl_packets,
                 "the normal-TTL backup phase keeps punching after the low phase: {report:?}"
             );
+        } else if report.low_ttl_socket {
+            // CR-P1-08, the socket-level fallback (the Windows shape; a
+            // plain v4 socket takes IP_TTL everywhere): same two-phase
+            // counts, but the low TTL rode the whole socket.
+            assert!(
+                report.low_ttl_packets > 0,
+                "the fallback's first phase rides the low TTL: {report:?}"
+            );
+            assert!(
+                report.low_ttl_packets <= phase_ticks + 1,
+                "the low-TTL phase is phase-bounded: {report:?}"
+            );
+            assert!(
+                report.packets_sent > report.low_ttl_packets,
+                "the normal-TTL backup phase keeps punching after the low phase: {report:?}"
+            );
         } else {
             assert_eq!(
                 report.low_ttl_packets, 0,
-                "the documented Windows degradation: normal TTL all window: {report:?}"
+                "no low-TTL send at all: normal TTL for the whole window: {report:?}"
             );
             assert!(
                 report.packets_sent >= punches,
@@ -3324,5 +3801,261 @@ mod tests {
         let sent = sender_reflexive_opener(None, &[public]).await;
         assert_eq!(sent, 0);
         assert!(started.elapsed() >= SENDER_DIAL_PAUSE);
+    }
+
+    // -- CR-P1-07 / CR-P1-08 (review 2026-11-13 §4.4): the pairing-time
+    //    opener + keepalive, the adopted-socket probe fold and the
+    //    socket-level TTL guard ------------------------------------------
+
+    /// The socket-level TTL guard: arm sets the socket's own TTL low,
+    /// restore puts the ORIGINAL value back, and a guard dropped while
+    /// armed restores too (the punch loop's early-stop path). Genuinely
+    /// exercises `IP_TTL` on every host (a plain v4 socket takes it on
+    /// Unix and Windows alike).
+    #[test]
+    fn socket_ttl_guard_arms_restores_and_restores_on_drop() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("guard socket bind");
+        let original = socket.ttl().expect("read the socket TTL");
+        let mut guard = SocketTtlGuard::new(&socket);
+        assert!(!guard.armed(), "a fresh guard is unarmed");
+        guard.arm(PUNCH_LOW_TTL).expect("arm the low TTL");
+        assert!(guard.armed());
+        assert_eq!(
+            socket.ttl().expect("read the TTL while armed"),
+            PUNCH_LOW_TTL,
+            "the armed guard's low TTL is visible on the socket"
+        );
+        guard.restore().expect("restore");
+        assert!(!guard.armed());
+        assert_eq!(
+            socket.ttl().expect("read the TTL after restore"),
+            original,
+            "the ORIGINAL TTL is back"
+        );
+        // Idempotence: restore/step on an unarmed guard are no-ops.
+        guard
+            .restore()
+            .expect("restore of an unarmed guard is a no-op");
+        // The Drop path (early stop mid-phase): never leave a low TTL on
+        // the socket the QUIC listener is about to own.
+        {
+            let mut guard = SocketTtlGuard::new(&socket);
+            guard.arm(PUNCH_LOW_TTL).expect("arm for the drop path");
+        }
+        assert_eq!(
+            socket.ttl().expect("read the TTL after the armed drop"),
+            original,
+            "Drop restores an armed guard"
+        );
+    }
+
+    /// The bounded stop-poll sleep: it sleeps exactly to its deadline
+    /// with the flag down, and a flag flipped MID-sleep returns within
+    /// one STOP_POLL_INTERVAL of the flip (never the full window).
+    #[tokio::test(start_paused = true)]
+    async fn sleep_polling_stop_wakes_on_deadline_and_on_the_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        // Deadline path: the full window elapses, returning false.
+        let started = tokio::time::Instant::now();
+        assert!(!sleep_polling_stop(started + Duration::from_secs(2), &stop).await);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        // Already-set flag: returns immediately.
+        stop.store(true, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        assert!(sleep_polling_stop(started + Duration::from_secs(2), &stop).await);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        // Mid-sleep flip (a spawned task flips at t=1s of a 5s window):
+        // the return lands within one poll chunk of the flip.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = tokio::time::Instant::now();
+        assert!(sleep_polling_stop(started + Duration::from_secs(5), &stop).await);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1)
+                && elapsed <= Duration::from_secs(1) + STOP_POLL_INTERVAL,
+            "the stop is noticed within one poll chunk of the flip: {elapsed:?}"
+        );
+    }
+
+    /// The pairing-time opener + keepalive (CR-P1-07): the opener half
+    /// fires at SENDER_DIAL_PAUSE (`on_opener` carries its packet count),
+    /// the keepalive then ticks every OPENER_KEEPALIVE_INTERVAL from the
+    /// ADOPTED socket's port toward the SAME public targets, and the stop
+    /// flag ends it — promptly, inside one poll chunk, with the honest
+    /// report. Virtual time (start_paused) advances the ticks.
+    #[tokio::test(start_paused = true)]
+    async fn pairing_opener_runs_then_keepalives_until_stopped() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_port = target.local_addr().expect("target addr").port();
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let adopted_port = adopted.local_addr().expect("adopted addr").port();
+        let adopted = Arc::new(adopted);
+        // Mapped loopback passes the opener's non-loopback filter (see
+        // the standalone opener test); plain loopback is the filtered
+        // LAN candidate.
+        let public: SocketAddr = format!("[::ffff:127.0.0.1]:{target_port}")
+            .parse()
+            .expect("mapped loopback parses");
+        let lan: SocketAddr = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let opener_seen = Arc::new(StdMutex::new(None::<usize>));
+        let seen_slot = Arc::clone(&opener_seen);
+        let adopted_task = Arc::clone(&adopted);
+        let task = tokio::spawn(async move {
+            sender_pairing_opener(
+                Some(adopted_task.as_ref()),
+                &[lan, public],
+                &task_stop,
+                move |packets| {
+                    if let Ok(mut slot) = seen_slot.lock() {
+                        *slot = Some(packets);
+                    }
+                },
+            )
+            .await
+        });
+        // The opener fires at the pause; let two keepalive ticks pass
+        // (the task's tick grid starts at ITS pause completion — the
+        // 500 ms tail keeps the second tick clear of this wake).
+        tokio::time::sleep(
+            SENDER_DIAL_PAUSE + 2 * OPENER_KEEPALIVE_INTERVAL + Duration::from_millis(500),
+        )
+        .await;
+        let seen: Option<usize> = *opener_seen.lock().expect("slot");
+        assert_eq!(
+            seen,
+            Some(1),
+            "on_opener fired with the opener's packet count"
+        );
+        stop.store(true, Ordering::Relaxed);
+        let report = tokio::time::timeout(STOP_POLL_INTERVAL * 4, task)
+            .await
+            .expect("the stop ends the keepalive promptly")
+            .expect("join");
+        assert!(report.stopped_early, "the flag ended it: {report:?}");
+        assert!(!report.budget_elapsed);
+        assert_eq!(report.opener_packets, 1);
+        assert!(
+            report.keepalive_ticks >= 2,
+            "two ticks fired before the stop: {report:?}"
+        );
+        assert!(
+            report.keepalive_packets >= report.keepalive_ticks,
+            "one packet per target per tick: {report:?}"
+        );
+        // The target observed opener + keepalive packets, all from the
+        // adopted socket's port (the mapping the QUIC dial rides).
+        target
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("target timeout");
+        let mut packets = 0usize;
+        loop {
+            let mut buffer = [0u8; 1500];
+            match target.recv_from(&mut buffer) {
+                Ok((len, from)) => {
+                    assert!(
+                        ak_net::holepunch::is_probe_packet(&buffer[..len]),
+                        "keepalive packets are probe-shaped"
+                    );
+                    assert_eq!(from.port(), adopted_port, "from the adopted socket");
+                    packets += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            packets >= 3,
+            "the opener packet plus two keepalive ticks reached the target: {packets}"
+        );
+        // The adopted socket's own TTL is untouched by the keepalive (the
+        // opener's low TTL rides per-packet/socket data, restored inline).
+        if let Ok(ttl) = adopted.ttl() {
+            assert!(
+                ttl != PUNCH_LOW_TTL || !ak_net::holepunch::per_packet_ttl_supported(),
+                "no low TTL leaks past the opener on per-packet hosts: {ttl}"
+            );
+        }
+    }
+
+    /// The keepalive's honest expiry: with the stop flag never set, the
+    /// total budget ends it (`budget_elapsed`), after ~budget/interval
+    /// ticks — virtual time makes the 10-minute run instant.
+    #[tokio::test(start_paused = true)]
+    async fn pairing_opener_keepalive_ends_at_the_budget() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target bind");
+        let target_port = target.local_addr().expect("target addr").port();
+        let adopted = ak_net::holepunch::bind_dual_stack_udp(0)
+            .or_else(|_| std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))))
+            .expect("adopted bind");
+        let public: SocketAddr = format!("[::ffff:127.0.0.1]:{target_port}")
+            .parse()
+            .expect("mapped loopback parses");
+        let stop = AtomicBool::new(false);
+        let report = sender_pairing_opener(Some(&adopted), &[public], &stop, |_| {}).await;
+        assert!(report.budget_elapsed, "the budget ended it: {report:?}");
+        assert!(!report.stopped_early);
+        assert_eq!(report.opener_packets, 1);
+        let expected_ticks =
+            (OPENER_KEEPALIVE_BUDGET.as_secs() / OPENER_KEEPALIVE_INTERVAL.as_secs()) as usize;
+        assert!(
+            report.keepalive_ticks + 1 == expected_ticks
+                || report.keepalive_ticks == expected_ticks,
+            "ticks ≈ budget / interval (the deadline arm preempts the last tick): {report:?}"
+        );
+        // Without an adopted socket the opener count is 0 and the
+        // keepalive never runs (nothing to hold), on_opener still fires.
+        let mut opener_count = None;
+        let report = sender_pairing_opener(None, &[public], &stop, |packets| {
+            opener_count = Some(packets)
+        })
+        .await;
+        assert_eq!(opener_count, Some(0), "the event fires with zero");
+        assert_eq!(report, OpenerKeepaliveReport::default());
+    }
+
+    /// CR-P1-07 改法 2: the adopted-socket probe round folds into the
+    /// pairing-time ProbeOutcome vocabulary — an observed head is a
+    /// Success, silence is one bounded reason per candidate in the
+    /// static order. Pure.
+    #[test]
+    fn round_probe_outcome_folds_heads_and_silence() {
+        let ordered = addrs(&["192.168.1.5:7000", "203.0.113.7:7000"]);
+        let observed: SocketAddr = "203.0.113.7:7000".parse().unwrap();
+        let plan = ProbeDialOrder {
+            order: ordered.clone(),
+            head: Some(observed),
+        };
+        match round_probe_outcome(&ordered, &plan) {
+            ProbeOutcome::Success { address } => assert_eq!(address, observed),
+            other => panic!("an observed head folds to Success: {other:?}"),
+        }
+        let silent = ProbeDialOrder {
+            order: ordered.clone(),
+            head: None,
+        };
+        match round_probe_outcome(&ordered, &silent) {
+            ProbeOutcome::AllFailed { failures } => {
+                assert_eq!(
+                    failures.len(),
+                    ordered.len(),
+                    "one failure row per static candidate"
+                );
+                assert_eq!(failures[0].candidate, ordered[0], "static order kept");
+                assert!(
+                    failures[0].reason.len() < 64,
+                    "the reason is bounded: {:?}",
+                    failures[0].reason
+                );
+            }
+            other => panic!("silence folds to AllFailed: {other:?}"),
+        }
     }
 }

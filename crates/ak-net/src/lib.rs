@@ -3329,16 +3329,21 @@ mod tests {
         // falling back to the IPv4-only bind"): skip the dual-stack
         // half with a note instead of panicking, so IPv6-less hosts
         // report 0 failures. Any OTHER bind error still fails the test.
+        // Skip-set spelling for the platforms this cfg(unix) test
+        // compiles on: the raw errno of a v6-less kernel (EAFNOSUPPORT /
+        // EPROTONOSUPPORT — no stable ErrorKind spelling exists for
+        // either; the AddrfamilyNotSupported/ProtocolNotSupported names
+        // used before aae55db do not exist and broke the ubuntu clippy
+        // job, run 43410016551) plus the generic Unsupported kind.
         let mapped = crate::classify::to_mapped(target_addr);
         let sender6 = match holepunch::bind_dual_stack_udp(0) {
             Ok(socket) => socket,
             Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AddrfamilyNotSupported
-                        | std::io::ErrorKind::ProtocolNotSupported
-                        | std::io::ErrorKind::Unsupported
-                ) =>
+                if err.kind() == std::io::ErrorKind::Unsupported
+                    || matches!(
+                        err.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT)
+                    ) =>
             {
                 eprintln!("note: dual-stack half skipped — no IPv6 on this host ({err})");
                 return;

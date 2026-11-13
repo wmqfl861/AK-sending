@@ -7,35 +7,43 @@ AK-sending 的 Flutter 应用壳：Material 3 + NavigationRail（主页 / 接收
 ## 架构
 
 ```text
-lib/ui/** 页面与壳（并行 UI 波次）
-   │  只依赖 ui/service/transfer_service.dart（UI 契约：DeviceInfo/ReceiveOptions/
-   │  SendOptions/JobController 会话/status 通知）
+lib/main.dart（bootstrapAppService：DLL 解析一次 + 先探测后创建，C08）
    ▼
-lib/services/ffi_transfer_service.dart   ← 契约的权威实现（会话、状态机、
-   │                                       事件折叠进 JobController、终态轮询）
+lib/services/ak_engine_facade.dart       ← AkEngineDartFacade：DLL 打开、任务面
+   │                                       导出探测、ak_engine_new、引擎句柄租约
+   ▼ borrowEngine()（ffi-v2 §2：只借不还）
+lib/ui/service/simple_transfer_service.dart ← UI 契约（TaskCode/JoinResult/
+   │                                       TaskConnection/IncomingRequest 流）
+   ▼ 由 FfiSimpleTransferService 实现
+lib/services/ffi_simple_transfer_service.dart ← 契约适配：环境变量/身份目录、
+   │                                       引擎释放顺序（P1-05）
    ▼
-lib/services/real_transfer_service.dart  ← 核心服务：job 注册表（32-hex id ↔
-   │                                       16 字节 FFI id）、Timer 轮询泵把
-   │                                       ak_poll_progress 队列转为广播事件流
+lib/services/simple_transfer_service.dart ← ak_task_* 循环引擎服务
    ▼
-flutter_app/packages/ak_ffi_dart         ← 纯 Dart FFI 绑定（9 个 ak_* 导出、
-   │                                       spec 镜像校验、-3 自动扩容、
-   │                                       19 种进度事件模型、JobController）
+flutter_app/packages/ak_ffi_dart         ← 纯 Dart FFI 绑定（任务面导出、
+   │                                       spec 镜像校验、-3 自动扩容）
    ▼
 ak_ffi.dll（cargo build -p ak-ffi --release）
    ▼
 crates/ak-engine（内嵌 tokio 运行时，句柄式 C ABI，契约见 docs/adr/003）
 ```
 
+> 2026-11-13（G5/E1）：旧 Dart 服务层（wave-11/22 的 `ffi_transfer_service`
+> / `real_transfer_service` / `invite_service` 与两份旧 `transfer_service`
+> 契约）已按验收决定删除——自 v1 simple-transfer 栈落地起即从 `main.dart`
+> 不可达。
+
 关键文件：
 
 | 文件 | 职责 |
 |---|---|
-| `lib/main.dart` | 入口：构造 `FfiTransferService` 交给 `ui/app.dart` 的壳 |
+| `lib/main.dart` | 入口：`bootstrapAppService` 构造真实服务（或可见降级卡）交给壳 |
 | `lib/services/dll_path.dart` | DLL 探测（Android tier-0 内置 so + 桌面三级；纯函数，可单测） |
-| `lib/services/transfer_service.dart` | 核心层抽象 + `DeviceInfo` 波次边界 + 异常 |
-| `lib/services/real_transfer_service.dart` | `EngineBackend` 注入缝、轮询泵、事件路由、单例 |
-| `lib/services/ffi_transfer_service.dart` | UI 契约实现（会话/准入/停止/历史 + 安卓目录适配） |
+| `lib/services/ak_engine_facade.dart` | 引擎门面：打开/探测/创建/租约 + E4 分级截断缝 |
+| `lib/services/ffi_simple_transfer_service.dart` | UI 契约适配（环境变量/安卓身份目录/释放顺序） |
+| `lib/services/simple_transfer_service.dart` | ak_task_* 循环引擎服务 + 诊断日志 |
+| `lib/services/connection_diagnostics.dart` | 连接诊断环形日志与导出 |
+| `lib/services/simple_transfer_fake.dart` | 测试专用注入实现（生产路径不引用） |
 | `windows/runner/CMakeLists.txt` | 构建时把 `ak_ffi.dll` 拷到 exe 旁（见下） |
 | `android/app/build.gradle.kts` | Android 平台：minSdk 24（NDK android24 对齐）、applicationId `dev.ak.ak_sending_app` |
 
@@ -58,7 +66,8 @@ flutter build windows --release
 
 ### DLL 三级探测（运行期，`lib/services/dll_path.dart`）
 
-`FfiTransferService` 打开引擎时按以下顺序解析 `ak_ffi.dll`，取第一个命中：
+`bootstrapAppService`（`lib/main.dart`）打开引擎前按以下顺序解析 `ak_ffi.dll`，
+取第一个命中：
 
 1. **环境变量 `AK_FFI_DLL`** — 显式覆盖，原样使用（不检查存在性，写错会在
    引擎卡上以加载错误原文报出）；
@@ -69,8 +78,8 @@ flutter build windows --release
    `build`）与 `../../../target/release/ak_ffi.dll`（CWD =
    packages/ak_ffi_dart，与该包自身默认一致）。
 
-三级全部未命中时构造不崩溃：状态点变"服务异常"，版本卡显示探测过的全部
-候选路径与修复提示；`startReceive`/`startSend` 抛 `StateError`。
+三级全部未命中时构造不崩溃：`bootstrapAppService` 降级为可见的启动错误卡
+（列出探测过的全部候选路径与修复提示），导航保持可用，操作如实报错。
 
 ## 构建（Android，wave 13）
 
@@ -120,8 +129,7 @@ runner 目标 POST_BUILD 拷贝，来源优先级（可在 configure 时覆盖�
 ## 测试
 
 ```bash
-flutter test test/services_test.dart    # 服务层：探测顺序、事件路由（Fake 驱动）、
-                                        # 适配器会话语义、真实 DLL 冒烟（缺失自动 skip）
+flutter test                             # 全套（服务层探测顺序在 services_test.dart）
 flutter analyze                          # 静态检查
 ```
 

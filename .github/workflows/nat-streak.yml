@@ -1,0 +1,82 @@
+# J5: ten consecutive FULL matrices, one checkout and one exp-knobs build.
+# Linux network-namespace simulation only; this is not real-device NAT evidence.
+name: NAT streak (10 full rounds)
+
+on:
+  push:
+    branches: [dev/review-fixes-20261111]
+    paths:
+      - .github/workflows/nat-streak.yml
+      - scripts/run_nat_streak.py
+      - scripts/tests/test_nat_streak.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Independent of ordinary CI and netem; never cancel an earlier streak to make
+# way for a later push. A new attempt always starts from round one.
+concurrency:
+  group: nat-streak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nat-streak:
+    name: Ten consecutive NAT matrices (simulation)
+    if: github.ref == 'refs/heads/dev/review-fixes-20261111'
+    runs-on: ubuntu-latest
+    # A full round includes the ~228s symmetric expected-failure case and the
+    # >=40s decline retry. Bound each round at 15m (+30s kill grace); leave build
+    # and artifact headroom around the ordinary ~350s/round expected duration.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Same versions as ci.yml. Do not independently upgrade these pins.
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: nat-streak
+      - name: Coordinator boundary tests (no real sudo or network)
+        run: python -B -m unittest discover -s scripts/tests -p test_nat_streak.py -v
+      - name: Matrix shell syntax
+        run: bash -n scripts/nat_matrix_test.sh
+      - name: Build once as runner user, then ten full matrices
+        # The Python coordinator owns both commands and their REAL return codes:
+        # cargo build -p ak-cli --locked --features exp-knobs
+        # sudo timeout --kill-after=30s 15m bash scripts/nat_matrix_test.sh --skip-build --size-mb 8
+        # No case/repeat arguments, pipeline, retry, resume or root cargo build.
+        # Per-round target PASS, retry evidence, final RESULT and namespace
+        # teardown all gate the next launch. SKIP (including IPv6) fails closed.
+        env:
+          CARGO_TERM_COLOR: never
+        run: python -B scripts/run_nat_streak.py --output "$RUNNER_TEMP/nat-streak-public"
+      - name: Upload only reconstructed, redacted evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, same as ci.yml
+        with:
+          name: nat-streak-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          # Literal allowlist only. Never upload RUNNER_TEMP, workspace, target,
+          # ak-nat-streak-private-*, raw logs, identity dirs or matrix diagnostics.
+          path: |
+            ${{ runner.temp }}/nat-streak-public/summary.txt
+            ${{ runner.temp }}/nat-streak-public/results.json
+            ${{ runner.temp }}/nat-streak-public/results.csv
+            ${{ runner.temp }}/nat-streak-public/round-01.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-02.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-03.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-04.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-05.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-06.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-07.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-08.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-09.pass.txt
+            ${{ runner.temp }}/nat-streak-public/round-10.pass.txt
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false

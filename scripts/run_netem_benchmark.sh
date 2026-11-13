@@ -55,8 +55,8 @@ try:
     text = Path(sys.argv[1]).read_text(encoding="utf-8")
     if re.search(r"\bSKIP\b", text, re.IGNORECASE):
         raise ValueError("benchmark printed SKIP; NOT-MEASURED")
-    if "[netem summary] 67108864 bytes (8 x 8 MiB)" not in text:
-        raise ValueError("missing 64 MiB netem summary")
+    if "[netem summary] 268435456 bytes (8 x 32 MiB)" not in text:
+        raise ValueError("missing 256 MiB netem summary")
     if "[netem bench] cleanup verified: dev lo carries no netem qdisc" not in text:
         raise ValueError("benchmark cleanup was not verified")
     if not re.search(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", text, re.MULTILINE):
@@ -68,16 +68,19 @@ try:
         lines = re.findall(rf"^{re.escape(label)}\s+.*$", text, re.MULTILINE)
         if len(lines) != 1:
             raise ValueError(f"expected one numeric sample for {label}, got {len(lines)}")
-        match = re.fullmatch(rf"{re.escape(label)}\s+{duration}\s+({number})\s+({number})x\s*", lines[0])
+        match = re.fullmatch(rf"{re.escape(label)}\s+{duration}\s+({number})\s+({number}|inf)\s+({number})x\s*", lines[0])
         if not match:
             raise ValueError(f"invalid numeric sample or units for {label}")
-        wall, unit, throughput, ratio = match.groups()
+        wall, unit, throughput, rtts, ratio = match.groups()
         if not all(math.isfinite(float(v)) for v in (wall, throughput, ratio)) or float(wall) <= 0 or float(throughput) <= 0:
             raise ValueError(f"non-positive/non-finite sample for {label}")
-        rows.append(f"| {label} | {delay} | {rtt} | {wall}{unit} | {throughput} | {ratio}x |")
+        rows.append(f"| {label} | {delay} | {rtt} | {wall}{unit} | {throughput} | {rtts} | {ratio}x |")
     # The Rust test owns all correctness/floor assertions; never override them.
-    print("| Shape | One-way delay (ms) | Approx. added RTT (ms) | Wall time | Throughput (MiB/s) | vs baseline |")
-    print("|---|---:|---:|---:|---:|---:|")
+    # The RTTs column is informational (baseline prints inf: no shaping,
+    # the wall/RTT ratio is undefined) -- finite checks only cover wall,
+    # throughput and ratio.
+    print("| Shape | One-way delay (ms) | Approx. added RTT (ms) | Wall time | Throughput (MiB/s) | RTTs (informational) | vs baseline |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
     print("\n".join(rows))
 except (OSError, ValueError) as error:
     sys.exit(f"measurement validation failed: {error}")
@@ -210,7 +213,7 @@ finish() {
 run_logged_benchmark() {
   set +e
   ns_exec timeout --signal=TERM --kill-after=15s 2100s "$executable" \
-    --exact netem_delay_50_100ms_64mib_loopback_throughput \
+    --exact netem_delay_50_100ms_256mib_loopback_throughput \
     --ignored --nocapture --test-threads=1 2>&1 | tee "$output_dir/benchmark.log"
   local codes=("${PIPESTATUS[@]}")
   printf '%s %s\n' "${codes[0]}" "${codes[1]}" > "$output_dir/benchmark-exit-codes.txt"

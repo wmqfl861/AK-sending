@@ -18,16 +18,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts/run_netem_benchmark.sh"
 BASH = shutil.which("bash")
-TEST_NAME = "netem_delay_50_100ms_64mib_loopback_throughput"
+TEST_NAME = "netem_delay_50_100ms_256mib_loopback_throughput"
 # Deliberately synthetic numbers, not measurements of AK-sending.
 SAMPLE = """running 1 test
-[netem summary] 67108864 bytes (8 x 8 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection):
-shape                      wall    MiB/s  vs baseline
-no-netem               640.00ms    100.0         1.00x
-delay 50ms                1.60s     40.0         0.40x
-delay 100ms               3.20s     20.0         0.20x
+[netem summary] 268435456 bytes (8 x 32 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection):
+shape                      wall    MiB/s      RTTs  vs baseline
+no-netem               640.00ms    100.0        inf         1.00x
+delay 50ms                1.60s     40.0       16.0         0.40x
+delay 100ms               3.20s     20.0       16.0         0.20x
+[netem bench] baseline host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
 [netem bench] cleanup verified: dev lo carries no netem qdisc
-test netem_delay_50_100ms_64mib_loopback_throughput ... ok
+test netem_delay_50_100ms_256mib_loopback_throughput ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.44s
 """
@@ -124,7 +125,7 @@ timeout() {
   [[ "$*" == "--signal=TERM --kill-after=15s 2100s "* ]] || return 90
   shift 3
   printf 'benchmark %s\n' "$*" >> "$MOCK_ROOT/commands"
-  [[ "$*" == "$MOCK_EXE --exact netem_delay_50_100ms_64mib_loopback_throughput --ignored --nocapture --test-threads=1" ]] || return 90
+  [[ "$*" == "$MOCK_EXE --exact netem_delay_50_100ms_256mib_loopback_throughput --ignored --nocapture --test-threads=1" ]] || return 90
   : > "$MOCK_ROOT/ran"
   : > "$MOCK_ROOT/qdisc"
   : > "$MOCK_ROOT/pids"
@@ -142,6 +143,31 @@ export MOCK_MAIN_PID=$BASHPID
 
 
 class RunnerTests(unittest.TestCase):
+    def test_exact_name_matches_the_bench_source_and_runner(self):
+        # aae55db lesson (netem run 43410016378): the runner invokes the
+        # bench with `--exact NAME`; the 64->256 MiB payload rename left
+        # the runner selecting ZERO tests and (by design) failing the
+        # workflow as NOT-MEASURED in step 6 -- while THIS contract suite
+        # stayed green, because it validated the script only against its
+        # own mocks (constant + mock expectation drifted together). Pin
+        # the triangle: Python constant <-> runner script <-> bench
+        # source, so a future rename fails HERE, in step 5, instead.
+        bench = (ROOT / "crates/ak-itests/tests/bench_netem.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f"async fn {TEST_NAME}",
+            bench,
+            "the bench no longer defines TEST_NAME -- update the runner's "
+            "--exact filter and this suite together",
+        )
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn(
+            f"--exact {TEST_NAME}",
+            runner,
+            "the runner's --exact filter drifted from TEST_NAME",
+        )
+
     def setUp(self):
         self.assertIsNotNone(BASH, "Bash is required for runner contract tests")
         self.assertTrue(RUNNER.is_file(), "the isolated netem runner has not been implemented")
@@ -257,8 +283,8 @@ python3() {
         self.assertIn("SKIP", result.stderr)
 
     def test_rejects_incomplete_duplicate_non_numeric_and_unverified_output(self):
-        cases = [SAMPLE.replace("delay 100ms               3.20s     20.0         0.20x\n", ""),
-                 SAMPLE + "delay 50ms                1.60s     40.0         0.40x\n",
+        cases = [SAMPLE.replace("delay 100ms               3.20s     20.0       16.0         0.20x\n", ""),
+                 SAMPLE + "delay 50ms                1.60s     40.0       16.0         0.40x\n",
                  SAMPLE.replace("40.0", "NaN"), SAMPLE.replace("40.0", "0.0"),
                  SAMPLE.replace("1.60s", "1.60"),
                  SAMPLE.replace("[netem summary]", "[different summary]"),

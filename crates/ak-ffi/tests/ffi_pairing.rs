@@ -39,6 +39,10 @@ use ak_ffi::{
 // Helpers.
 // ---------------------------------------------------------------------------
 
+// `c_char` is `u8` on aarch64 (where our unix clippy probe runs) but `i8` on
+// other mainstream targets, so the cast below is required on half the
+// platforms and an identity on the other half.
+#[allow(clippy::unnecessary_cast)]
 fn cbuf_to_string(buf: &[c_char]) -> String {
     let bytes: Vec<u8> = buf
         .iter()

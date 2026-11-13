@@ -28,6 +28,7 @@ python scripts/check_repository.py                       # L0 仓库检查（含
 cargo fmt --all -- --check                               # 格式化门槛（零 diff，与 CI 第一步一致）
 cargo test --workspace                                   # 全部单元/集成测试
 cargo clippy --workspace --all-targets -- -D warnings    # 静态检查零警告
+bash scripts/clippy_unix_probe.sh                        # unix 路径 clippy 本地预警（可选，需 Android NDK；缺工具自动 SKIP；动机见 6235bec）
 cargo test -p ak-store --features sqlite                 # 可选特性后端（默认依赖图不启用）
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps   # rustdoc 门槛（零警告；Windows PowerShell 用 $env:RUSTDOCFLAGS = "-D warnings"）
 ```

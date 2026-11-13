@@ -17,6 +17,18 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+[features]
+# CR-P3-16 (review 2026-11-13-batchH §4): opt-in compile gate for the
+# hidden AK_EXP_* test knobs this crate carries (`AK_EXP_QUIC_WINDOW_KIB`
+# in `src/tls.rs` — the netem benchmark's default-window A/B arm). Off
+# (the default) the knob's environment read is not compiled at all: the
+# behavior is bit-identical to the env-unset branch and the variable
+# NAME is absent from release binaries (strings stay clean — ak-net
+# links into libak_ffi, so this is the Android/Windows release surface).
+# Test infrastructure ONLY — release builds MUST NOT enable it (the
+# netem runner builds with --features ak-net/exp-knobs explicitly).
+exp-knobs = []
+
 # CR-P1-06 (review 2026-11-11 §4.5 改法 1): the per-packet TTL sendmsg
 # control messages need the platform cmsg constants (IP_TTL /
 # IPV6_HOPLIMIT) and cmsghdr layout on the Unix-likes; Windows ships the

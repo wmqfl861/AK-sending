@@ -34,6 +34,17 @@ log = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+[features]
+# CR-P3-16 (review 2026-11-13-batchH §4): opt-in compile gate for the
+# hidden AK_EXP_* test knobs this crate carries (`AK_EXP_NO_TTL` in
+# `pairing/task_net.rs` — the NAT matrix's "receiver without low-TTL
+# punch" case). Off (the default) the knob's environment read is not
+# compiled at all: the behavior is bit-identical to the env-unset branch
+# and the variable NAME is absent from release binaries (strings stay
+# clean). Test infrastructure ONLY — release builds MUST NOT enable it
+# (the matrix/CI jobs that need it pass --features explicitly).
+exp-knobs = []
+
 [dev-dependencies]
 # The e2e pairing tests boot the real v2 registry server (engine + SQLite
 # store), which lives behind this feature. Dev-only: the ak-session library

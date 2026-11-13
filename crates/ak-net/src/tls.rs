@@ -279,15 +279,22 @@ pub(crate) const SEND_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 // Experimental window override (2026-11-13 review §5.2 follow-up): the netem
 // benchmark's default-window A/B arm needs to run the SAME product config
 // path with quinn's 1.25 MiB default windows instead of the CR-P2-04 table.
+// CR-P3-16 (review 2026-11-13-batchH §4): the whole override exists ONLY in
+// `exp-knobs` builds (ak-net's cargo feature, default off — release builds
+// must not enable it); a default build's [`exp_window_override_bytes`] is
+// the constant `None` (bit-identical to the env-unset branch) and the
+// variable's NAME is not compiled in at all (release `strings` stay clean).
 // ---------------------------------------------------------------------------
 
 /// Environment variable of the hidden debug window override (precedent:
 /// `AK_EXP_NO_TTL` / `AK_EXP_SEND_DELAY_MS` — default off, never set in
 /// production). See [`exp_window_override_bytes`].
+#[cfg(feature = "exp-knobs")]
 const EXP_QUIC_WINDOW_KIB_ENV: &str = "AK_EXP_QUIC_WINDOW_KIB";
 
 /// Largest accepted override in KiB: `kib * 1024` must still fit the `u32`
 /// window API (`u32::MAX / 1024` = 4194303, far above any sane window).
+#[cfg(any(test, feature = "exp-knobs"))]
 const EXP_WINDOW_KIB_MAX: u64 = (u32::MAX as u64) / 1024;
 
 /// Last override state announced on stderr: `0` = constant table (default,
@@ -295,6 +302,7 @@ const EXP_WINDOW_KIB_MAX: u64 = (u32::MAX as u64) / 1024;
 /// `1..=EXP_WINDOW_KIB_MAX` = that many KiB, `u64::MAX` = last value was
 /// invalid. Swapped (not loaded+stored) so exactly one thread prints per
 /// state change even when endpoint builds race.
+#[cfg(feature = "exp-knobs")]
 static LAST_ANNOUNCED_WINDOW_KIB: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -303,6 +311,7 @@ static LAST_ANNOUNCED_WINDOW_KIB: std::sync::atomic::AtomicU64 =
 /// every invalid value (non-numeric, 0, above [`EXP_WINDOW_KIB_MAX`]) keep
 /// the CR-P2-04 constant table; only a plain decimal KiB count overrides.
 /// Unit-testable without touching process-global environment state.
+#[cfg(any(test, feature = "exp-knobs"))]
 fn resolve_exp_window(raw: Option<&str>) -> (u64, Option<u32>) {
     match raw.map(str::parse::<u64>) {
         None => (0, None),
@@ -330,23 +339,35 @@ fn resolve_exp_window(raw: Option<&str>) -> (u64, Option<u32>) {
 /// state change announces the experimental override. Set-but-invalid: one
 /// stderr line announces the refusal — a mistyped benchmark arm must never
 /// silently measure the default windows.
+///
+/// CR-P3-16: the environment read compiles ONLY under `exp-knobs` (the
+/// netem benchmark's build passes the feature); a default build returns
+/// `None` — bit-identical to the UNSET branch, and no `AK_EXP_*` string
+/// exists in the binary for a stray environment variable to match.
 fn exp_window_override_bytes() -> Option<u32> {
-    let raw = std::env::var(EXP_QUIC_WINDOW_KIB_ENV).ok();
-    let (state, bytes) = resolve_exp_window(raw.as_deref());
-    if LAST_ANNOUNCED_WINDOW_KIB.swap(state, std::sync::atomic::Ordering::Relaxed) != state {
-        match (&raw, bytes) {
-            (None, _) => eprintln!(
-                "[ak-net] {EXP_QUIC_WINDOW_KIB_ENV} cleared - CR-P2-04 constant flow-control windows restored"
-            ),
-            (Some(text), Some(bytes)) => eprintln!(
-                "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}={text}: overriding all three CR-P2-04 flow-control windows with {bytes} bytes ({text} KiB) - hidden debug knob, never a production setting"
-            ),
-            (Some(text), None) => eprintln!(
-                "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}='{text}' is not a usable window (want an integer 1..={EXP_WINDOW_KIB_MAX}, in KiB) - keeping the CR-P2-04 constant windows"
-            ),
+    #[cfg(feature = "exp-knobs")]
+    {
+        let raw = std::env::var(EXP_QUIC_WINDOW_KIB_ENV).ok();
+        let (state, bytes) = resolve_exp_window(raw.as_deref());
+        if LAST_ANNOUNCED_WINDOW_KIB.swap(state, std::sync::atomic::Ordering::Relaxed) != state {
+            match (&raw, bytes) {
+                (None, _) => eprintln!(
+                    "[ak-net] {EXP_QUIC_WINDOW_KIB_ENV} cleared - CR-P2-04 constant flow-control windows restored"
+                ),
+                (Some(text), Some(bytes)) => eprintln!(
+                    "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}={text}: overriding all three CR-P2-04 flow-control windows with {bytes} bytes ({text} KiB) - hidden debug knob, never a production setting"
+                ),
+                (Some(text), None) => eprintln!(
+                    "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}='{text}' is not a usable window (want an integer 1..={EXP_WINDOW_KIB_MAX}, in KiB) - keeping the CR-P2-04 constant windows"
+                ),
+            }
         }
+        bytes
     }
-    bytes
+    #[cfg(not(feature = "exp-knobs"))]
+    {
+        None
+    }
 }
 
 /// Build the [`quinn::TransportConfig`] shared by every server and client

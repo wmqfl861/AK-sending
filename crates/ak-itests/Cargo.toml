@@ -39,6 +39,14 @@ ak-signal = { workspace = true, features = ["server-persistence"] }
 # `cargo test -p ak-itests --features legacy-plaintext-signal`.
 legacy-plaintext-signal = ["ak-signal/legacy-plaintext-signal"]
 
+# CR-P3-16 (review 2026-11-13-batchH §4): forwards ak-net's exp-knobs gate
+# so the netem benchmark's build can arm the `AK_EXP_QUIC_WINDOW_KIB`
+# window override with ONE crate-local flag (scripts/run_netem_benchmark.sh
+# builds `--features exp-knobs`; the bench drives the tls.rs override
+# through the product transport_config path). Off by default, like the
+# knob itself — test infrastructure ONLY, release builds MUST NOT enable.
+exp-knobs = ["ak-net/exp-knobs"]
+
 # G5 / E1: whole-file legacy signal itests; required-features filters
 # these targets out of the default build entirely (the legacy code and
 # its tests compile only opt-in).

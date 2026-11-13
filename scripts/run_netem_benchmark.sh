@@ -318,7 +318,13 @@ main() {
 
   log 'Building only the release bench_netem test as the runner user'
   set +e
+  # CR-P3-16 (review 2026-11-13-batchH §4): the tls.rs window override
+  # (AK_EXP_QUIC_WINDOW_KIB, the A/B arm below) compiles only in exp-knobs
+  # builds -- ak-itests' feature forwards to ak-net's gate. Without the
+  # flag the override is absent and the A/B arm would silently measure the
+  # default windows (the validator's activation-line check would fail).
   cargo test --locked --release -p ak-itests --test bench_netem --no-run \
+    --features exp-knobs \
     --message-format=json-render-diagnostics 2> "$output_dir/build.stderr.log" | tee "$output_dir/cargo-artifacts.jsonl"
   local build_codes=("${PIPESTATUS[@]}")
   set -e

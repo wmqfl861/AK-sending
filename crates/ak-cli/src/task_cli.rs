@@ -2136,10 +2136,19 @@ impl Drop for AbortOnDrop {
 /// delays the send start after the pairing-time probe, simulating the
 /// GUI's "pair, then pick files, then send" latency for the NAT matrix's
 /// late-send cases (≥5 s and ≥40 s tiers). Unset/0/unparsable = no delay.
+/// CR-P3-16: compile environment reads only with the opt-in
+/// `exp-knobs` feature; default builds keep the unset behavior.
 fn exp_send_delay() -> Option<Duration> {
-    let raw = std::env::var("AK_EXP_SEND_DELAY_MS").ok()?;
-    let millis: u64 = raw.parse().ok()?;
-    (millis > 0).then(|| Duration::from_millis(millis))
+    #[cfg(feature = "exp-knobs")]
+    {
+        let raw = std::env::var("AK_EXP_SEND_DELAY_MS").ok()?;
+        let millis: u64 = raw.parse().ok()?;
+        (millis > 0).then(|| Duration::from_millis(millis))
+    }
+    #[cfg(not(feature = "exp-knobs"))]
+    {
+        None
+    }
 }
 /// it, wait for the joiner, probe, then serve receives behind the consent
 /// prompt until one transfer completes (or the peer departs).

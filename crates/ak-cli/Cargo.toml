@@ -48,6 +48,18 @@ path = "src/main.rs"
 # `stun-server` (CR-P2-13 standalone STUN responder, nat-matrix depends
 # on it) and `registry-server` (the v2 registry; server-persistence).
 legacy-plaintext-signal = ["ak-signal/legacy-plaintext-signal"]
+# CR-P3-16 (review 2026-11-13-batchH §4): opt-in compile gate for the
+# hidden AK_EXP_* test knobs — ak-cli's own `AK_EXP_SEND_DELAY_MS` /
+# `AK_EXP_SEND_RETRY_MS` (task_cli.rs, the NAT matrix's late-send and
+# decline-retry cases) plus the knobs living in this crate's task-plane
+# dependencies (ak-session's `AK_EXP_NO_TTL`, ak-net's
+# `AK_EXP_QUIC_WINDOW_KIB`), forwarded so ONE flag arms every knob the
+# matrix drives. Off (the default) each read is not compiled at all:
+# behavior is bit-identical to the env-unset branch and the variable
+# NAMES are absent from release binaries (strings stay clean). Test
+# infrastructure ONLY — release builds MUST NOT enable it (the NAT
+# matrix job passes --features exp-knobs explicitly).
+exp-knobs = ["ak-session/exp-knobs", "ak-net/exp-knobs"]
 
 [dev-dependencies]
 tempfile = "3"

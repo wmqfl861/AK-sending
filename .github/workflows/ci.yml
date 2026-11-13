@@ -277,6 +277,46 @@ jobs:
         # jniLibs, then the strict symbol check (frozen ABI + v2 contract +
         # all 8 ak_task_* exports) -- any missing symbol fails the job.
         run: bash scripts/build_android_ffi.sh --ndk "$ANDROID_SDK_ROOT/ndk/28.2.13676358" --api 24
+      - name: Release knob leak check (AK_EXP_ strings absent, CR-P3-16)
+        # The hidden AK_EXP_* debug knobs compile only in exp-knobs builds;
+        # the Android release library is built default-featured, so no knob
+        # NAME may exist in either ABI's .so. A leak here means a knob
+        # escaped its #[cfg(feature = "exp-knobs")] gate. (The Windows DLL
+        # has no CI artifact step; it is verified locally and recorded in
+        # the batch J report -- Android is the CI-side assertion.)
+        #
+        # Integration review of batch J: `strings | grep -q` under
+        # pipefail can flip a DIRTY library into a false clean -- grep -q
+        # exits at the first match, strings then dies of SIGPIPE (141)
+        # and pipefail reports the pipeline non-zero, which the `if`
+        # reads as "no leak". The scan therefore captures strings' FULL
+        # output to a temp file first (a strings failure fails the step:
+        # an unreadable library is never a clean verdict), then greps it
+        # without -q and distinguishes grep's exit 1 (clean) from any
+        # other grep failure.
+        run: |
+          set -euo pipefail
+          for abi in x86_64 arm64-v8a; do
+            so="flutter_app/android/app/src/main/jniLibs/${abi}/libak_ffi.so"
+            dump="$RUNNER_TEMP/ak-exp-strings-${abi}.txt"
+            matches="$RUNNER_TEMP/ak-exp-matches-${abi}.txt"
+            strings "$so" > "$dump"
+            rc=0
+            grep 'AK_EXP_' "$dump" > "$matches" || rc=$?
+            case "$rc" in
+              0)
+                echo "FAIL: AK_EXP_ knob names leaked into the ${abi} release libak_ffi.so (CR-P3-16): $(wc -l < "$matches") matching line(s))"
+                exit 1
+                ;;
+              1)
+                echo "${abi}: no AK_EXP_ strings in libak_ffi.so (sha256 $(sha256sum "$so" | awk '{print $1}'))"
+                ;;
+              *)
+                echo "FAIL: grep exited $rc scanning the ${abi} strings dump -- not a clean verdict"
+                exit 1
+                ;;
+            esac
+          done
       - name: Build provenance + ak_task_* export list
         # CR-P2-06 fix 3: the log must carry the source SHA, Cargo.lock
         # digest, toolchain version and the exported ak_task_* symbols so a
@@ -398,6 +438,10 @@ jobs:
         with:
           key: nat-matrix
       - name: Build ak-cli (runner user; root has no rustup)
-        run: cargo build -p ak-cli --locked
+        # CR-P3-16: the matrix drives the hidden AK_EXP_* knobs, which
+        # compile only in exp-knobs builds — the flag arms every knob the
+        # late-send / no-low-TTL / decline-retry cases need (ak-cli's
+        # feature forwards to ak-session's and ak-net's gates).
+        run: cargo build -p ak-cli --locked --features exp-knobs
       - name: Run the NAT matrix under sudo
         run: sudo bash scripts/nat_matrix_test.sh --skip-build

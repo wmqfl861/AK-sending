@@ -1570,10 +1570,19 @@ impl Drop for SocketTtlGuard<'_> {
 /// no low-TTL send at all (the pre-CR-P1-08 Windows shape) for the NAT
 /// matrix's "receiver without low TTL" case. Such a receiver also
 /// delays its punch start — see [`punch_candidates`].
+/// CR-P3-16: compile environment reads only with the opt-in
+/// `exp-knobs` feature; default builds keep the unset behavior.
 fn exp_no_low_ttl() -> bool {
-    std::env::var("AK_EXP_NO_TTL")
-        .map(|value| !value.is_empty() && value != "0")
-        .unwrap_or(false)
+    #[cfg(feature = "exp-knobs")]
+    {
+        std::env::var("AK_EXP_NO_TTL")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "exp-knobs"))]
+    {
+        false
+    }
 }
 
 /// Sleep until `deadline` in [`STOP_POLL_INTERVAL`] chunks, returning

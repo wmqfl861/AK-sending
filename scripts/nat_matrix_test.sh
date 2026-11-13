@@ -168,9 +168,13 @@ fi
 # ---------------------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$REPO_ROOT/target/debug/ak-cli"
+# CR-P3-16 (review 2026-11-13-batchH §4): the matrix drives the hidden
+# AK_EXP_* knobs, which compile ONLY in exp-knobs builds — arm the
+# feature here so the late-send / no-low-TTL / decline-retry cases have
+# their switches. The product default (no feature) keeps the knobs absent.
 if [[ "$SKIP_BUILD" -ne 1 ]] || [[ ! -x "$CLI" ]]; then
-  log "building ak-cli (cargo build -p ak-cli)…"
-  (cd "$REPO_ROOT" && cargo build -p ak-cli --locked) || { log "FAIL: cargo build -p ak-cli failed"; exit 1; }
+  log "building ak-cli (cargo build -p ak-cli --features exp-knobs)…"
+  (cd "$REPO_ROOT" && cargo build -p ak-cli --locked --features exp-knobs) || { log "FAIL: cargo build -p ak-cli failed"; exit 1; }
 fi
 [[ -x "$CLI" ]] || { log "FAIL: $CLI missing after build"; exit 1; }
 

@@ -67,7 +67,7 @@ readlink() {
 cargo() {
   if [[ "$*" == --version ]]; then printf 'cargo 1.99.1 (fixture)\n'; return; fi
   printf '%s\n' "$*" >> "$MOCK_ROOT/commands"
-  [[ "$*" == 'test --locked --release -p ak-itests --test bench_netem --no-run --message-format=json-render-diagnostics' ]] || return 90
+  [[ "$*" == 'test --locked --release -p ak-itests --test bench_netem --no-run --features exp-knobs --message-format=json-render-diagnostics' ]] || return 90
   command "$TEST_PYTHON" -I -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text(), end="")' "$MOCK_ROOT/artifacts.jsonl"
   return "${MOCK_BUILD_RC:-0}"
 }

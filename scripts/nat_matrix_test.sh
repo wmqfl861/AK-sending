@@ -595,6 +595,24 @@ fixture_check() {
 # 6. One transfer case. run_case <name> <expect: pass-v4|xfail|fail|pass-v6>
 #    alice = `task code-recv` (receiver), bob = `task join-send` (sender).
 # ---------------------------------------------------------------------------
+# Failure forensics (CR-P3-11): the 6832f79 commit message described
+# this function and a conntrack sampler but neither was actually written.
+# Both are now real: fail_case prints the FAIL line plus the receiver's
+# log tail and the last conntrack snapshot taken during the dial.
+fail_case() { # fail_case <message> — print + forensics, return 1
+  log "$*"
+  local case_dir="$1"
+  # The caller's message is $*; the case_dir is derived from the case_name
+  # variable in scope. Print receiver tail + last conntrack sample.
+  log "    receiver log tail:"
+  tail -8 "recv.log" 2>/dev/null | sed 's/^/      /' || true
+  if [[ -f "conntrack-live.log" ]]; then
+    log "    live conntrack (last window):"
+    tail -40 "conntrack-live.log" | sed 's/^/      /'
+  fi
+  return 1
+}
+
 wait_for_text() { # wait_for_text <file> <needle> <timeout-secs> -> 0/1
   local file="$1" needle="$2" budget="$3" waited=0
   while [[ $waited -lt $((budget * 10)) ]]; do
@@ -653,6 +671,21 @@ run_case() {
   local send_pid=$!
   PIDS_KIDS="$PIDS_KIDS $send_pid"
 
+  # Conntrack sampler (CR-P3-11): UDP entries expire ~30s unreplied, so a
+  # post-mortem dump after a 240s case sees nothing. Sample both routers
+  # every 5s while the sender runs; on failure fail_case shows the last
+  # snapshot, on success the samples are discarded.
+  ( while kill -0 "$send_pid" 2>/dev/null; do
+      printf '=== %s
+' "$(date -u +%H:%M:%S)" >>"$case_dir/conntrack-live.log"
+      for ns in "$NS_R1" "$NS_R2"; do
+        printf -- '--- %s
+' "$ns" >>"$case_dir/conntrack-live.log"
+        ip netns exec "$ns" sh -c 'command -v conntrack >/dev/null 2>&1 && conntrack -L -p udp 2>/dev/null || grep -a "udp" /proc/net/nf_conntrack 2>/dev/null' >>"$case_dir/conntrack-live.log" 2>&1
+      done
+      sleep 5
+    done ) &
+
   # Bounded wait for the sender to exit (fail cases legitimately take ~2
   # minutes of bounded retries; pass cases seconds; a hang is never OK).
   local waited=0
@@ -686,9 +719,9 @@ run_case() {
   local send_log="$case_dir/send.log" recv_log="$case_dir/recv.log"
   if [[ "$expect" == "pass-v4" || "$expect" == "pass-v6" ]]; then
     grep -q "\[task\] done:" "$send_log" \
-      || { fail_case "FAIL [$case_name]: sender did not complete (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
+      || { log "FAIL [$case_name]: sender did not complete (rc=$send_rc)"; tail -5 "$send_log" | sed 's/^/    /'; (cd "$case_dir" && fail_case "forensics") 2>/dev/null; return 1; }
     grep -q "\[task\] received" "$recv_log" \
-      || { fail_case "FAIL [$case_name]: receiver did not complete"; tail -5 "$recv_log" | sed 's/^/    /'; return 1; }
+      || { log "FAIL [$case_name]: receiver did not complete"; tail -5 "$recv_log" | sed 's/^/    /'; (cd "$case_dir" && fail_case "forensics") 2>/dev/null; return 1; }
     grep -q "\[task\] connected via " "$send_log" \
       || { log "FAIL [$case_name]: no connected-via line"; tail -5 "$send_log" | sed 's/^/    /'; return 1; }
     local via

@@ -45,7 +45,7 @@ BANNED_CRATE_NAMES = {"coturn", "libquic-tunnel"}
 # "本提交" placeholder.
 REVIEW_DOC = "docs/REVIEW_2026-11-11.zh-CN.md"
 STATUS_TABLE_HEADING = "## 7."
-STATUS_ROW_PREFIXES = ("| CR-", "| R36", "| E")
+STATUS_ROW_PREFIXES = ("| CR-", "| R36", "| E", "| wave-36")
 STATUS_TABLE_COLUMNS = 5
 COMMIT_PLACEHOLDER = "本提交"
 
@@ -141,6 +141,18 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
                 f"{REVIEW_DOC}:{i + 1}: status table row has {len(cells)} columns, "
                 f"expected {STATUS_TABLE_COLUMNS}"
             )
+        # H0 (CR-P3-11): the commit column (4th cell) must be a commit
+        # hash (hex string) or empty — "G6 commit" style placeholders are
+        # rejected alongside "this commit".
+        if len(cells) >= 4 and cells[3].strip():
+            # Allow: hex hashes (7-40 chars), commit ranges with + or -,
+            # or the literal "N/A" for not-applicable rows
+            import re as _re
+            valid = cells[3].strip().startswith(tuple("0123456789abcdef")) and len(cells[3].strip()) >= 7
+            if not valid and cells[3] not in ('N/A', 'unknown', 'not yet'):
+                errors.append(
+                    f"{REVIEW_DOC}:{i + 1}: status table commit column has non-hash value {cells[3]!r}"
+                )
         if COMMIT_PLACEHOLDER in row:
             errors.append(
                 f'{REVIEW_DOC}:{i + 1}: status table row uses "{COMMIT_PLACEHOLDER}" '

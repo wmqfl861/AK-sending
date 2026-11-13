@@ -29,7 +29,7 @@
 | `4f23127` | H0 docs | 状态表七行回写 + CR-P2-04"8MiB 窗口实证"措辞更正 + 本交接文档（其 netem 二跑暴露 §4 第 3 项） |
 | `6302487` | H3/CR-P3-13 | 校验器接受基线行字面 "-" RTTs 列（netem 二跑红修复，忠实重构验证纪律）——netem 三跑成功 |
 
-批次 I（本交接之后追加，非批次 H 范畴）：`e498fa2`（I2）unix clippy 硬化——c_char 转换债清零 + `scripts/clippy_unix_probe.sh` 本地预警；I1（tls.rs 窗口覆写 + quinn stats 钩子 + bench A/B 臂）另行入库。
+批次 I（本交接之后追加，非批次 H 范畴，均已 CI 绿）：`e498fa2`（I2）unix clippy 硬化——c_char 转换债清零 + `scripts/clippy_unix_probe.sh` 本地预警（run 43418204512 绿）；`2dd2507`（I1）tls.rs 窗口覆写 + quinn stats 钩子 + bench A/B 臂——A/B 首测 run 43420288043 **成功**（CI run 43420288223 绿），8 MiB vs 1.25 MiB 对照数字在 run summary/artifact。
 
 ## 2. 关键实现与根因（复核要点对照）
 

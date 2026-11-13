@@ -215,7 +215,7 @@
 
 - 分支 `review/claude-batchh-ui-20261113`，PR #15 → `dev/review-fixes-20261111`。
 - 代码提交：`b007b16`（U1）、`d0eab21`（analyzer 提示）、`ab3d6e5`（测试时序）。
-- 文档提交：本文、U1 交接、审核文档第 4.5/7 节、STATUS。
+- 文档提交：`a8dc521`（本文、U1 交接、审核文档第 4.5/7 节、STATUS），随后一个提交把 `a8dc521` 填进状态表 CR-P3-18 行。
 - CI：run [43433201562](https://github.com/wmqfl861/AK-sending/actions/runs/43433201562)（`ab3d6e5`）全部任务成功：flutter analyze 无问题、app 测试 193/193、`ak_ffi_dart` 170/170；Rust ubuntu/windows、Android（双 ABI、符号校验、APK）、NAT 矩阵七案、legacy-signal、audit、deny、checks、portability×3 全部成功（release-deep-tests 为手动任务，按设计跳过）
 
 ---

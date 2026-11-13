@@ -136,16 +136,15 @@ WantedBy=multi-user.target
   4. **旧 signal 进程的退役条件（E6 告诫的 CR-P2-13 修订）**：E6 原文"CR-P2-13 完成前不要停旧 signal 进程"。现在 CR-P2-13 代码已落地，但**线上独立 STUN 尚未部署（未核实）**——§0 步骤 3 的外网验证通过之前仍不要停旧进程；验证通过后即可停止旧 signal-server（TCP 7100 照第 2 条关闭，UDP 7101 交给 stun-server）。
   5. SSH：收敛来源白名单、禁密码登录（CR-P3-05），密钥登录。
 
-### 7. 客户端可查询服务器版本——设计提案（未实施；v2 契约冻结）
+### 7. 客户端可查询服务器版本（G6 已实施，2026-11-13）
 
-- **现状**：v2 `Welcome`（tag `0x02`，契约 [protocol-v2](contracts/protocol-v2.md) §3）载荷恰为 `session_ttl_secs:u32 + capabilities:u32`（8 字节，`scripts/check_contracts.py` 机械钉死）；`capabilities` 已定义位仅 `0x1` 邀请码管理、`0x2` 配对事务、`0x4` v2 会话（`crates/ak-signal/src/server_v2/mod.rs`），**没有任何字段承载构建版本**；客户端现完全忽略 `capabilities`（`client_v2/conn.rs` 只校验 ttl>0）。
-- **为何不塞现有字段**：把 git sha 编进 `capabilities` 剩余位会破坏"能力位"语义且不可读，属契约语义变更；给 `Welcome` 追加尾随节会命中"尾随字节全部拒绝"规则，**旧客户端会断连**——不可作为默认行为。
-- **提案（走契约修订流程：集成者核准＋ADR-004 同步，本轮不改冻结契约）**：
-  - 新增两个消息：`ServerInfoRequest`（客户端→服务端，无载荷，幂等廉价）与 `ServerInfo { revision:u16长度+≤32B UTF-8 }`（服务端→客户端，内容如 `0.1.0+4739f4d`，即 §1 版本行同一来源）；两者预算入契约 §4 表。
-  - **门控＝现有 `Welcome.capabilities` 新能力位 `0x0008`（可查询服务器版本）**：升级后的服务端在 Welcome 置位；客户端只在看到该位后才发 `ServerInfoRequest`。旧服务端不置位→新客户端不问；旧客户端本就忽略 capabilities→不发。**零破坏、纯增量，不触碰任何既有帧形状**。
-  - 服务端实现点：`server_v2::CAPABILITIES` 增位；engine 在 Welcome 后按需应答。客户端实现点：`client_v2` 事件面暴露 revision（连接信息/诊断），GUI "关于/连接详情" 与 `ak-cli doctor` 可展示。
-  - 安全注意：revision 是构建指纹，不含路径/主机名等敏感信息；应答限频并入现有每连接帧预算即可。
-- **实施顺序**：服务端先行（旧客户端无感知）→ 客户端随后按位启用；落地后本手册 §1 "客户端远程查询"由提案改为操作说明。
+> 原为 CR-P2-09 遗留设计提案；批次 G6 按契约修订流程落地（`docs/contracts/protocol-v2.md` §6a），本节由提案改为操作说明。
+
+- **协议**（契约 §6a）：新增消息对 `ServerInfoRequest`（tag `0x1F`，客户端→服务端，无载荷、无 request_id、幂等）与 `ServerInfo { revision }`（tag `0x20`，服务端→客户端，`u16长度+≤32B UTF-8`，预算 34）。门控＝`Welcome.capabilities` 新能力位 **`0x0008`**（服务端能力声明，与既有 `0x1/0x2/0x4` 并列）：**服务端仅在请求后应答、永不主动推送**；客户端只在看到该位后才发请求。旧服务端不置位→新客户端不问；旧客户端忽略能力位→不发。零破坏、纯加法，既有帧形状零改动。
+- **服务端**：`ak-cli registry-server` 启动时注入 revision（`<版本>+<git sha>`，与 `--version` 版本行同源，例如 `0.1.0+4739f4d`）；engine 应答前已归一化——空、超 32 字节或含控制字符的注入降级为 `unknown`，不会让服务起不来。嵌入式 `serve_v2` 未配置版本时同样应答 `unknown`。
+- **客户端**（ak-session `RegistryClient::server_info`，真产品链路）：按位门控查询，每连接至多一个在途、按连接代缓存（重连后重新查询）；**查询失败一律降级为 `None`**（不置位不问、超时、`ServerError` 应答、断连），绝不影响控制连接的其余功能。`client_v2`（脚本化测试客户端）不实现查询——产品客户端是 `RegistryClient`。
+- **运维用法**：核对线上服务端版本时，客户端侧调用 `server_info()`（后续 `ak-cli doctor`/GUI 连接详情可接入显示）；服务器本机仍以 `--version` 与启动日志为准。安全注意不变：revision 是构建指纹，不含路径/主机名/用户数据；限频由既有每连接帧预算覆盖，无独立限额。
+- **互通矩阵**（测试钉死）：旧客户端×新服务端＝忽略新位、不发送请求，一切如常（全部既有 e2e 即此组合）；新客户端×旧服务端＝不置位→不问（`server_info_is_not_asked_without_the_capability_bit`）；新×新＝往返取回 revision（`server_info_roundtrips_against_the_real_registry`）。
 
 ## 协调服务器运维（signal-server 与 stun-server，CLI 原型现状）
 

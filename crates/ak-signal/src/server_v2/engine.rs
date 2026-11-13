@@ -163,16 +163,41 @@ pub async fn run_v2(
         RegistryStore::open(&config.db_path)
     }
     .map_err(|e| io::Error::other(format!("registry store: {e}")))?;
-    serve_v2(listener, registry, store, config.limits, shutdown).await
+    serve_v2_with_revision(
+        listener,
+        registry,
+        store,
+        config.limits,
+        config.revision.as_deref(),
+        shutdown,
+    )
+    .await
 }
 
 /// Serve v2 on an already-bound listener (embedders/tests bind ephemeral
-/// ports themselves and get identical behavior).
+/// ports themselves and get identical behavior). No build revision
+/// configured: a `ServerInfoRequest` is answered with `unknown`.
 pub async fn serve_v2(
     listener: TcpListener,
     registry: &DeviceKeyPair,
     store: RegistryStore,
     limits: Limits,
+    shutdown: watch::Receiver<bool>,
+) -> io::Result<()> {
+    serve_v2_with_revision(listener, registry, store, limits, None, shutdown).await
+}
+
+/// [`serve_v2`] with an explicit build revision for the G6
+/// `ServerInfoRequest` → `ServerInfo` answer (contract protocol-v2.md
+/// §6a). The revision must be a ≤32-byte control-free UTF-8 build
+/// fingerprint (e.g. `0.1.0+4739f4d`); anything else degrades to
+/// `unknown` with a warning rather than failing the server.
+pub async fn serve_v2_with_revision(
+    listener: TcpListener,
+    registry: &DeviceKeyPair,
+    store: RegistryStore,
+    limits: Limits,
+    revision: Option<&str>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let bundle = ak_identity::tls::make_self_signed(registry);
@@ -182,6 +207,7 @@ pub async fn serve_v2(
         acceptor,
         store,
         limits,
+        server_revision: sanitize_revision(revision),
         inner: Mutex::new(Inner::default()),
         conn_count: AtomicUsize::new(0),
         reject_count: AtomicUsize::new(0),
@@ -843,6 +869,9 @@ struct Shared {
     acceptor: tokio_rustls::TlsAcceptor,
     store: RegistryStore,
     limits: Limits,
+    /// The build revision this server answers `ServerInfoRequest` with
+    /// (G6 §6a; already sanitized to the wire budget at startup).
+    server_revision: Arc<str>,
     inner: Mutex<Inner>,
     /// Live (accepted, not yet finished) connections — the admission
     /// counter for [`MAX_LIVE_CONNECTIONS`], reserved atomically at
@@ -1406,6 +1435,33 @@ fn server_error(code: u16, context: &str) -> CtrlMessage {
     CtrlMessage::ServerError { code, message }
 }
 
+/// Normalize a configured build revision to the `ServerInfo` wire budget
+/// (G6 §6a): ≤32 UTF-8 bytes, no control characters, non-empty; `None`
+/// or anything violating the budget degrades to `"unknown"` — an
+/// operator-injected over-long or dirty string must not wedge the server
+/// or leak more than a fingerprint.
+fn sanitize_revision(revision: Option<&str>) -> Arc<str> {
+    const FALLBACK: &str = "unknown";
+    match revision {
+        Some(text)
+            if !text.is_empty()
+                && text.len() <= crate::protocol_v2::message::MAX_REVISION_BYTES
+                && !text.chars().any(|c| c.is_control()) =>
+        {
+            Arc::from(text)
+        }
+        Some(text) => {
+            log::warn!(
+                "ignoring configured server revision {:?} (empty, over the \
+                 32-byte budget, or control characters); answering 'unknown'",
+                text
+            );
+            Arc::from(FALLBACK)
+        }
+        None => Arc::from(FALLBACK),
+    }
+}
+
 fn now_ms() -> u64 {
     RegistryStore::now_ms()
 }
@@ -1689,6 +1745,20 @@ fn process(
         }
         CtrlMessage::Ping { nonce } => {
             deliver_msg(out, CtrlMessage::Pong { nonce });
+            Flow::Continue
+        }
+        // G6 §6a: answer the revision query with this build's fingerprint
+        // (sanitized to the wire budget at startup). Idempotent,
+        // stateless, and rate-limited by the connection's frame token
+        // bucket like every other frame; the server NEVER pushes it
+        // unasked, so an old client never sees the new tag.
+        CtrlMessage::ServerInfoRequest => {
+            deliver_msg(
+                out,
+                CtrlMessage::ServerInfo {
+                    revision: shared.server_revision.to_string(),
+                },
+            );
             Flow::Continue
         }
         CtrlMessage::InviteClaim {
@@ -3435,6 +3505,72 @@ mod tests {
         server.stop().await;
     }
 
+    /// G6 §6a: the Welcome advertises the server-info capability bit, and
+    /// a `ServerInfoRequest` is answered with the configured build
+    /// revision — never pushed unasked (an idle connection sees nothing).
+    #[tokio::test]
+    async fn server_info_is_advertised_and_answered_on_request() {
+        let server = spawn_server_with_revision("0.1.0+test1234").await;
+        let key = DeviceKeyPair::generate();
+        let mut client = TestClient::connect(server.addr, &server.registry_id(), key, "info").await;
+        assert!(
+            client.welcome_caps & crate::server_v2::CAP_SERVER_INFO != 0,
+            "the Welcome must advertise the server-info bit (got 0x{:08x})",
+            client.welcome_caps
+        );
+        client.send(&CtrlMessage::ServerInfoRequest).await;
+        match client.recv().await {
+            CtrlMessage::ServerInfo { revision } => {
+                assert_eq!(revision, "0.1.0+test1234");
+            }
+            other => panic!("expected ServerInfo, got {other:?}"),
+        }
+        // Nothing is pushed without a request: an idle read window stays
+        // silent (the recv-deadline surfaces as a timeout error, not a
+        // frame).
+        let unsolicited = tokio::time::timeout(Duration::from_millis(300), client.recv()).await;
+        assert!(unsolicited.is_err(), "the server never pushes ServerInfo");
+        server.stop().await;
+    }
+
+    /// G6 §6a: a server started without a configured revision (every
+    /// pre-G6 embedder of `serve_v2`) still advertises the bit and
+    /// answers `unknown` — the answer is always well-formed.
+    #[tokio::test]
+    async fn server_info_without_a_configured_revision_answers_unknown() {
+        let server = spawn_server().await;
+        let key = DeviceKeyPair::generate();
+        let mut client = TestClient::connect(server.addr, &server.registry_id(), key, "anon").await;
+        assert!(client.welcome_caps & crate::server_v2::CAP_SERVER_INFO != 0);
+        client.send(&CtrlMessage::ServerInfoRequest).await;
+        match client.recv().await {
+            CtrlMessage::ServerInfo { revision } => assert_eq!(revision, "unknown"),
+            other => panic!("expected ServerInfo(unknown), got {other:?}"),
+        }
+        server.stop().await;
+    }
+
+    #[test]
+    fn sanitize_revision_degrades_illegal_build_stamps() {
+        use super::sanitize_revision;
+        assert_eq!(sanitize_revision(None).as_ref(), "unknown");
+        assert_eq!(sanitize_revision(Some("")).as_ref(), "unknown");
+        assert_eq!(
+            sanitize_revision(Some(&"x".repeat(33))).as_ref(),
+            "unknown",
+            "over the 32-byte wire budget"
+        );
+        assert_eq!(
+            sanitize_revision(Some("0.1.0+\u{1}evil")).as_ref(),
+            "unknown",
+            "control characters are not a fingerprint"
+        );
+        assert_eq!(
+            sanitize_revision(Some("0.1.0+4739f4d")).as_ref(),
+            "0.1.0+4739f4d"
+        );
+    }
+
     #[test]
     fn transcript_bindings_reject_key_and_code_substitution() {
         let registry = [0x11u8; 32];
@@ -3539,6 +3675,36 @@ mod tests {
         }
     }
 
+    /// A server answering `ServerInfoRequest` with an explicit build
+    /// revision (G6 §6a; the plain `spawn_server_with` answers
+    /// `"unknown"` — the unconfigured default).
+    async fn spawn_server_with_revision(revision: &str) -> TestServer {
+        let store = RegistryStore::open_in_memory().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = DeviceKeyPair::generate();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let key = registry.clone();
+        let revision = revision.to_string();
+        let task = tokio::spawn(async move {
+            serve_v2_with_revision(
+                listener,
+                &key,
+                store,
+                Limits::default(),
+                Some(revision.as_str()),
+                shutdown_rx,
+            )
+            .await
+        });
+        TestServer {
+            addr,
+            registry,
+            shutdown,
+            task,
+        }
+    }
+
     /// Default budgets EXCEPT the per-source caps raised past the global
     /// serving cap AND the reject budget (CR-P1-03): lets the global-cap
     /// tests below open MAX_LIVE_CONNECTIONS held sockets plus the
@@ -3572,6 +3738,9 @@ mod tests {
     struct TestClient {
         stream: tokio_rustls::client::TlsStream<TcpStream>,
         key: DeviceKeyPair,
+        /// The `Welcome.capabilities` this connection's Welcome carried
+        /// (G6 tests assert the advertised bits).
+        welcome_caps: u32,
     }
 
     impl TestClient {
@@ -3654,9 +3823,16 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut client = TestClient { stream, key };
+            let mut client = TestClient {
+                stream,
+                key,
+                welcome_caps: 0,
+            };
             match client.recv().await {
-                CtrlMessage::Welcome { .. } => client,
+                CtrlMessage::Welcome { capabilities, .. } => {
+                    client.welcome_caps = capabilities;
+                    client
+                }
                 other => panic!("expected Welcome, got {other:?}"),
             }
         }

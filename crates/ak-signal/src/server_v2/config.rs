@@ -235,6 +235,12 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Authoritative registry database file (`:memory:` for ephemeral).
     pub db_path: PathBuf,
+    /// Build revision this server answers `ServerInfoRequest` with
+    /// (G6 §6a): a ≤32-byte UTF-8 build fingerprint such as
+    /// `0.1.0+4739f4d`. `None` (the default) answers `unknown`. The
+    /// value is sanitized at startup — an over-long or dirty string
+    /// degrades to `unknown` instead of failing the server.
+    pub revision: Option<String>,
     pub limits: Limits,
 }
 
@@ -243,6 +249,7 @@ impl Default for Config {
         Config {
             listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_V2_PORT)),
             db_path: PathBuf::from(":memory:"),
+            revision: None,
             limits: Limits::default(),
         }
     }

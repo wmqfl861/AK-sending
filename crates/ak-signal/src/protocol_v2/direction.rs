@@ -106,6 +106,10 @@ impl CtrlMessage {
             CtrlMessage::PairError { .. } => Direction::ServerToClient,
             CtrlMessage::Ping { .. } => Direction::ClientToServer,
             CtrlMessage::Pong { .. } => Direction::ServerToClient,
+            // G6 §6a: the revision query pair — client asks (only after
+            // the Welcome capability bit), server answers.
+            CtrlMessage::ServerInfoRequest => Direction::ClientToServer,
+            CtrlMessage::ServerInfo { .. } => Direction::ServerToClient,
         }
     }
 

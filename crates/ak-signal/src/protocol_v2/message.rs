@@ -1,6 +1,7 @@
 //! v2 `CtrlMessage`: the closed control-plane message set, tags
-//! `0x01..=0x1E`, every field bounded and laid out byte-exactly as frozen
-//! in the contract (`docs/contracts/protocol-v2.md` == plan A.4 tables).
+//! `0x01..=0x20`, every field bounded and laid out byte-exactly as frozen
+//! in the contract (`docs/contracts/protocol-v2.md` == plan A.4 tables,
+//! plus the G6 §6a ServerInfo pair).
 //!
 //! Layout rules: big-endian integers; fixed arrays without length prefix;
 //! payload budgets exclude the 4-byte frame header; undefined tag bytes,
@@ -170,6 +171,13 @@ pub const PAIR_ERROR_PAYLOAD: usize = 39;
 pub const PING_PAYLOAD: usize = 16;
 /// Pong: 16.
 pub const PONG_PAYLOAD: usize = 16;
+/// ServerInfoRequest: no payload (G6 §6a).
+pub const SERVER_INFO_REQUEST_PAYLOAD: usize = 0;
+/// ServerInfo: 2+32 (G6 §6a).
+pub const SERVER_INFO_MAX_PAYLOAD: usize = 34;
+/// Byte budget of one `ServerInfo.revision` string (G6 §6a): a build
+/// fingerprint like `0.1.0+4739f4d`, never paths or hostnames.
+pub const MAX_REVISION_BYTES: usize = 32;
 
 // ---- Fixed business error codes (plan A.6) ------------------------------
 // Carried in `PairError.code` / `ServerError.code`; kept as constants so
@@ -421,7 +429,7 @@ pub struct RedeemRequest {
 // ---- The closed message set ----------------------------------------------
 
 // Wire type values (contract A.4). The set is closed: decode rejects every
-// byte outside 0x01..=0x1E and tests enumerate all 256 values.
+// byte outside 0x01..=0x20 and tests enumerate all 256 values.
 const TYPE_HELLO: u8 = 0x01;
 const TYPE_WELCOME: u8 = 0x02;
 const TYPE_REGISTER: u8 = 0x03;
@@ -452,10 +460,12 @@ const TYPE_PAIR_ABORT: u8 = 0x1B;
 const TYPE_PAIR_ERROR: u8 = 0x1C;
 const TYPE_PING: u8 = 0x1D;
 const TYPE_PONG: u8 = 0x1E;
+const TYPE_SERVER_INFO_REQUEST: u8 = 0x1F;
+const TYPE_SERVER_INFO: u8 = 0x20;
 
 /// First and last defined type byte; everything outside is `UnknownType`.
 pub(super) const MIN_TYPE: u8 = TYPE_HELLO;
-pub(super) const MAX_TYPE: u8 = TYPE_PONG;
+pub(super) const MAX_TYPE: u8 = TYPE_SERVER_INFO;
 
 pub(super) fn is_known_type(ty: u8) -> bool {
     (MIN_TYPE..=MAX_TYPE).contains(&ty)
@@ -677,6 +687,22 @@ pub enum CtrlMessage {
     Pong {
         nonce: [u8; 16],
     },
+
+    // ---- G6 §6a: the server-revision query pair ------------------------
+    /// Ask which build serves this connection. NO payload and NO request
+    /// id (idempotent, cheap, stateless): a client sends it only after
+    /// the current connection's `Welcome.capabilities` advertised the
+    /// server-info bit, at most one query in flight; an old server never
+    /// sees one (its Welcome never set the bit, so a capability-aware
+    /// client does not ask — the pure-addition interop rule).
+    ServerInfoRequest,
+    /// The answer: this server build's revision fingerprint (e.g.
+    /// `0.1.0+4739f4d`, the same source as the CLI version line; ≤32
+    /// UTF-8 bytes, never paths/hostnames/user data). Only ever sent in
+    /// answer to [`CtrlMessage::ServerInfoRequest`].
+    ServerInfo {
+        revision: String,
+    },
 }
 
 impl CtrlMessage {
@@ -713,6 +739,8 @@ impl CtrlMessage {
             CtrlMessage::PairError { .. } => TYPE_PAIR_ERROR,
             CtrlMessage::Ping { .. } => TYPE_PING,
             CtrlMessage::Pong { .. } => TYPE_PONG,
+            CtrlMessage::ServerInfoRequest => TYPE_SERVER_INFO_REQUEST,
+            CtrlMessage::ServerInfo { .. } => TYPE_SERVER_INFO,
         }
     }
 }
@@ -1017,6 +1045,13 @@ pub(super) fn encode_payload(
         }
         CtrlMessage::Ping { nonce } => out.extend_from_slice(nonce),
         CtrlMessage::Pong { nonce } => out.extend_from_slice(nonce),
+        // G6 §6a: the request carries no payload at all; the answer is one
+        // length-prefixed bounded string.
+        CtrlMessage::ServerInfoRequest => {}
+        CtrlMessage::ServerInfo { revision } => {
+            wire::check_str(revision, MAX_REVISION_BYTES)?;
+            wire::put_str(out, revision);
+        }
     }
     // wave-28 trailing extension section (absent ⇒ legacy bytes).
     let mut flags = 0u8;
@@ -1268,6 +1303,14 @@ pub(super) fn decode_payload(
         },
         TYPE_PONG => CtrlMessage::Pong {
             nonce: cur.fixed::<16>()?,
+        },
+        // G6 §6a: an empty payload for the request (any trailing byte is
+        // refused by the strict-shape check below); the answer's revision
+        // rides the same bounded-string helper as every other string
+        // field (length + UTF-8 + control-char rules).
+        TYPE_SERVER_INFO_REQUEST => CtrlMessage::ServerInfoRequest,
+        TYPE_SERVER_INFO => CtrlMessage::ServerInfo {
+            revision: wire::get_str(&mut cur, MAX_REVISION_BYTES)?,
         },
         _ => return Err(DecodeError::UnknownType(ty)),
     };

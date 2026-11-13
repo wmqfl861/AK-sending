@@ -1380,18 +1380,27 @@ pub(crate) async fn daemon_core(
     // runtime's RealTransport). The v2 registry keeps exactly one live
     // connection per device — a second connect used to kick the first,
     // silently rerouting every redeem offer to a plane nobody read.
+    //
+    // R36-P2-04 / batch G6: the daemon participates in the SAME
+    // per-identity control-connection lock as the CLI task commands and
+    // the FFI task runtime (ak-session `pairing::connection_lock`). The
+    // lease — guard PLUS heartbeat — lives for the WHOLE daemon run:
+    // the original code dropped both at the end of the `if` block below
+    // while the shared client lived on (the audit's C5 finding: the file
+    // vanished immediately, a detached heartbeat kept re-stamping it),
+    // so a CLI task run against this id-dir would refuse for a moment
+    // and then silently kick the daemon's connection after all. Held
+    // here, the lock releases on EVERY exit path of `run` — wired and
+    // direct branches alike — via the lease's Drop (heartbeat aborted
+    // first, file removed after).
+    let mut _registry_lock: Option<ak_session::pairing::ConnectionLockLease> = None;
     let shared_registry = if wired_mode || opts.pairing {
-        // R36-P2-04 (audit follow-up): the daemon participates in the
-        // SAME per-identity control-connection lock as the CLI task
-        // commands (task_cli::acquire_connection_lock) — a CLI task run
-        // against this daemon's id-dir now refuses loudly instead of
-        // silently kicking the daemon's registry connection (and being
-        // kicked back by the daemon's keeper). The lock lives for the
-        // whole daemon run; its heartbeat task is aborted at exit via
-        // the handle, the file cleans itself in Drop.
-        let _lock = crate::task_cli::acquire_connection_lock(id)
-            .context("cannot claim the identity's control-connection lock")?;
-        let _lock_heartbeat = crate::task_cli::spawn_connection_lock_heartbeat(&_lock);
+        _registry_lock = Some(
+            ak_session::pairing::ConnectionLockLease::acquire(id).map_err(|error| {
+                anyhow::Error::new(error)
+                    .context("cannot claim the identity's control-connection lock")
+            })?,
+        );
         let settings = match registry.as_ref() {
             Some(settings) => *settings,
             None => crate::invite::resolve_registry(id, opts.server, opts.registry_fp.clone())?,

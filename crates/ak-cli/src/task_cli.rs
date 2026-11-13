@@ -60,7 +60,8 @@ use ak_identity::pairing_txn::random_id16;
 use ak_identity::tls::make_self_signed;
 use ak_identity::{DeviceKeyPair, Fingerprint};
 use ak_session::pairing::{
-    ClientConfig, OrchestratorConfig, PairingOrchestrator, PeerEndpoint, ProbeOutcome,
+    acquire_connection_lock, spawn_connection_lock_heartbeat, ClientConfig, ConnectionLock,
+    ConnectionLockError, OrchestratorConfig, PairingOrchestrator, PeerEndpoint, ProbeOutcome,
     RegistryClient, TaskDirection, TaskDisconnectReason, TaskError, TaskEvent, TaskPaired,
     TaskPairing, TaskPairingConfig, TASK_CODE_TTL_SECS,
 };
@@ -639,8 +640,11 @@ async fn open_session(cfg: &TaskRunConfig, owner: bool) -> Result<Session> {
     // machine. The registry REPLACES an older same-device connection, so
     // a second local process on the same id-dir would silently kick this
     // one (and be kicked back); refuse loudly instead. The guard releases
-    // itself if anything below fails.
-    let lock = acquire_connection_lock(&cfg.id_dir)?;
+    // itself if anything below fails. Batch G6: the primitive lives in
+    // ak-session `pairing::connection_lock` (shared with the daemon and
+    // the FFI task runtime; N2 hardened — exclusive-create acquisition,
+    // same-PID second-runtime refusal, holder-checked heartbeat).
+    let lock = acquire_connection_lock(&cfg.id_dir).map_err(connection_lock_error)?;
     let (key, _) = crate::load_identity(&cfg.id_dir)?;
     let name = crate::whoami();
     let connect = RegistryClient::connect_with_config(
@@ -930,100 +934,23 @@ impl Session {
 }
 
 // ---------------------------------------------------------------------------
-// The per-identity control-connection lock (R36-P2-04, CLI side)
+// The per-identity control-connection lock (R36-P2-04)
 // ---------------------------------------------------------------------------
+// Batch G6: the lock primitive moved to ak-session
+// (`pairing::connection_lock` — imported above) so the CLI task commands,
+// the daemon AND the FFI task runtime share ONE protocol, and the wave-36
+// audit N2 defects are fixed once for all three: exclusive-create
+// acquisition (no read-check-write window), same-PID second-runtime
+// refusal, and a heartbeat that stops refreshing once the hold was broken
+// out from under it. The file format (`pid\nheartbeat-ms\n`,
+// `registry-connection.lock` under `id_dir`) is unchanged.
 
-/// Lock file under `id_dir` marking which local process holds this
-/// identity's registry control connection (`pid` + heartbeat `unix-ms`).
-const CONNECTION_LOCK_FILE: &str = "registry-connection.lock";
-/// While holding, the session refreshes the heartbeat at this cadence.
-const CONNECTION_LOCK_REFRESH: Duration = Duration::from_secs(5);
-/// A heartbeat older than this means the holder crashed (or suspended):
-/// the lock is breakable by the next run. Generous versus the refresh
-/// cadence, short versus a user's patience.
-const CONNECTION_LOCK_STALE: Duration = Duration::from_secs(15);
-
-/// One parsed lock file (`pid heartbeat-ms`).
-pub(crate) struct LockHolder {
-    pid: u32,
-    beat_ms: u64,
-}
-
-pub(crate) fn parse_lock_holder(text: &str) -> Option<LockHolder> {
-    let mut parts = text.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
-    let beat_ms = parts.next()?.parse().ok()?;
-    Some(LockHolder { pid, beat_ms })
-}
-
-pub(crate) fn write_lock_file(path: &Path) {
-    let _ = std::fs::write(
-        path,
-        format!("{}\n{}\n", std::process::id(), crate::now_unix_ms()),
-    );
-}
-
-/// The run's hold on the identity's control connection: acquired before
-/// the registry dial, released (file removed) on drop — including the
-/// failure paths inside [`open_session`].
-#[derive(Debug)]
-pub(crate) struct ConnectionLock {
-    path: PathBuf,
-}
-
-/// Claim the identity's control connection for THIS process
-/// ([`CONNECTION_LOCK_FILE`]). A live holder (fresh heartbeat, different
-/// PID) refuses loudly — the registry would otherwise let the two
-/// processes silently kick each other's connection forever. A stale lock
-/// (crashed/suspended holder, heartbeat past [`CONNECTION_LOCK_STALE`])
-/// or our own PID (same process) is broken/refreshed. Best-effort by
-/// design: no atomic file locking, only the documented pid+heartbeat
-/// protocol.
-pub(crate) fn acquire_connection_lock(id_dir: &Path) -> Result<ConnectionLock> {
-    let path = id_dir.join(CONNECTION_LOCK_FILE);
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Some(holder) = parse_lock_holder(&text) {
-            let age = crate::now_unix_ms().saturating_sub(holder.beat_ms);
-            if holder.pid != std::process::id() && age < CONNECTION_LOCK_STALE.as_millis() as u64 {
-                bail!(
-                    "this identity is already holding a control connection (process {}); \
-                     reuse that process or pass a different --id-dir",
-                    holder.pid
-                );
-            }
-        }
-        // Unparseable, our own PID, or stale: breakable below.
-    }
-    write_lock_file(&path);
-    Ok(ConnectionLock { path })
-}
-
-/// Keep the heartbeat fresh while the session lives, so a later run on
-/// the same id-dir sees a LIVE holder (a crashed process stops
-/// refreshing and its lock goes stale).
-pub(crate) fn spawn_connection_lock_heartbeat(
-    lock: &ConnectionLock,
-) -> tokio::task::JoinHandle<()> {
-    let path = lock.path.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(CONNECTION_LOCK_REFRESH).await;
-            write_lock_file(&path);
-        }
-    })
-}
-
-impl Drop for ConnectionLock {
-    fn drop(&mut self) {
-        // Remove the file only when it still names THIS process: a run
-        // that broke our stale lock (we suspended past the stale window)
-        // owns it now and must not be unlocked by our exit.
-        if let Ok(text) = std::fs::read_to_string(&self.path) {
-            if parse_lock_holder(&text).is_some_and(|holder| holder.pid == std::process::id()) {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
+/// Surface a connection-lock refusal with the CLI's remedy hint. The
+/// shared primitive's message names the holder / the second-runtime
+/// situation; the `--id-dir` hint is CLI vocabulary (the FFI task runtime
+/// surfaces the same error through `last_error` with its own wording).
+fn connection_lock_error(error: ConnectionLockError) -> anyhow::Error {
+    anyhow::Error::new(error).context("reuse the holding process or pass a different --id-dir")
 }
 
 /// What the resident receiver reported to the driver.
@@ -2325,6 +2252,7 @@ pub(crate) async fn run_join_recv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ak_session::pairing::{CONNECTION_LOCK_FILE, CONNECTION_LOCK_STALE};
     use std::sync::mpsc;
     use std::thread;
 
@@ -3049,7 +2977,7 @@ mod tests {
         write_holder_lock(id_dir.path(), 424_242, Duration::from_secs(1));
         let error = acquire_connection_lock(id_dir.path())
             .expect_err("a live holder must refuse a second process");
-        let text = format!("{error:#}");
+        let text = format!("{:#}", connection_lock_error(error));
         assert!(
             text.contains("424242"),
             "the error names the holding process: {text}"
@@ -3061,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_lock_breaks_stale_and_own_locks_and_releases() {
+    fn connection_lock_breaks_stale_refuses_second_runtime_and_releases() {
         let id_dir = identity_dir("lk-stale");
 
         // A crashed holder (heartbeat far past the stale window) is
@@ -3079,12 +3007,18 @@ mod tests {
             "drop removes the lock we own"
         );
 
-        // A fresh lock naming OUR OWN pid never refuses us (sequential
-        // runs of the same process).
+        // Batch G6 / N2: a FRESH lock naming our own pid now refuses —
+        // "same PID means us" would let a second FFI task runtime in this
+        // process silently stack a second control connection (the
+        // registry allows one per device id). Sequential runs are still
+        // fine: the drop above removed the file, so a fresh acquire wins.
         write_holder_lock(id_dir.path(), std::process::id(), Duration::ZERO);
-        let lock = acquire_connection_lock(id_dir.path()).expect("own pid is not a conflict");
-        drop(lock);
-        assert!(!id_dir.path().join(CONNECTION_LOCK_FILE).exists());
+        match acquire_connection_lock(id_dir.path()) {
+            Err(ConnectionLockError::HeldByThisProcess) => {}
+            other => panic!("a fresh own-pid lock must refuse a second runtime: {other:?}"),
+        }
+        // The refused acquire leaves the existing holder's file alone.
+        assert!(id_dir.path().join(CONNECTION_LOCK_FILE).exists());
     }
 
     /// R36-P1-01 (the real validation, loopback + a real v2 registry

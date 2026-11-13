@@ -13,7 +13,7 @@ integrator approval + ADR-004 sync before any edit).
 Checks
 ------
 1  wire-message payload budgets
-1a docs/contracts/protocol-v2.md sections 3/4/6 per-tag budget tables
+1a docs/contracts/protocol-v2.md sections 3/4/6/6a per-tag budget tables
    (type tag -> payload bytes) vs the per-tag budget constants and TYPE_*
    tag assignments of the v2 codec,
    crates/ak-signal/src/protocol_v2/message.rs;
@@ -139,7 +139,7 @@ def check_wire_budgets_protocol_v2() -> dict:
     by_variant, code_tags = _codec_budget_constants(code)
 
     rows: list[tuple[int, str, int]] = []
-    for number in ("3", "4", "6"):
+    for number in ("3", "4", "6", "6a"):
         for tag_hex, variant, budget in re.findall(
             r"^\|\s*`(0x[0-9A-Fa-f]{2})`\s*\|\s*`([A-Za-z]+)`\s*\|.*\|"
             r"\s*≤?\s*(\d+)\s*\|$",
@@ -168,7 +168,7 @@ def check_wire_budgets_protocol_v2() -> dict:
             )
     return {
         "id": "1a_wire_budgets_protocol_v2",
-        "title": "protocol-v2.md budget tables (3/4/6) vs ak-signal codec constants",
+        "title": "protocol-v2.md budget tables (3/4/6/6a) vs ak-signal codec constants",
         "passed": not details,
         "rows_compared": len(rows),
         "details": details,

@@ -69,6 +69,11 @@ pub const CAP_INVITE_MANAGE: u32 = 0x0000_0001;
 pub const CAP_PAIRING_TXN: u32 = 0x0000_0002;
 /// Capability bit: v2 sessions keyed by (pairing_id, code_id, connection_id).
 pub const CAP_V2_SESSIONS: u32 = 0x0000_0004;
+/// Capability bit (G6, contract protocol-v2.md §6a): the client may query
+/// this server's build revision (`ServerInfoRequest` → `ServerInfo`).
+/// Pure addition — old clients ignore capability bits they do not know.
+pub const CAP_SERVER_INFO: u32 = 0x0000_0008;
 
 /// Capabilities this server advertises in `Welcome`.
-pub const CAPABILITIES: u32 = CAP_INVITE_MANAGE | CAP_PAIRING_TXN | CAP_V2_SESSIONS;
+pub const CAPABILITIES: u32 =
+    CAP_INVITE_MANAGE | CAP_PAIRING_TXN | CAP_V2_SESSIONS | CAP_SERVER_INFO;

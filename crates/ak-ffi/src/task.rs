@@ -467,6 +467,22 @@ struct TaskStack {
     /// change) — pairing-plane subscriptions survive reconnection by
     /// design, so the owner loop keeps answering redeems across the gap.
     keeper: StdMutex<Option<JoinHandle<()>>>,
+    /// Batch G6 (R36-P2-04, the client half): this stack's hold on the
+    /// identity's per-identity control-connection lock — the SAME
+    /// primitive the CLI task commands and the daemon use
+    /// (`ak_session::pairing::connection_lock`). Acquired in
+    /// [`ensure_stack`] BEFORE the registry dial; released in
+    /// [`TaskRt::teardown`] AFTER the client closed (in-flight op bodies
+    /// may still hold `Arc<TaskStack>` clones, so the release must not
+    /// wait for the last Arc). A failed build releases via the stack's
+    /// drop. A second task runtime on the same id-dir — in THIS process
+    /// (same PID: refused as a second runtime) or in another process
+    /// (live foreign holder) — fails its first op loudly instead of
+    /// silently kicking this stack's control connection. One-shot
+    /// registry verbs (`invite revoke`) deliberately do NOT take this
+    /// lock; they rely on the server's replacement reason frame plus the
+    /// keeper's replacement pacing.
+    connection_lock: StdMutex<Option<ak_session::pairing::ConnectionLockLease>>,
 }
 
 impl TaskStack {
@@ -727,6 +743,21 @@ impl TaskRt {
             let _ = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_millis(500), client.close()).await
             });
+            // Batch G6: release the identity's control-connection lock
+            // only now — AFTER the client closed. In-flight op bodies can
+            // still hold `Arc<TaskStack>` clones, so the lease is taken
+            // explicitly instead of waiting for the last Arc to drop; its
+            // Drop aborts the heartbeat first, then removes the lock file
+            // (a fresh runtime or a CLI task run can claim the identity
+            // immediately after).
+            if let Some(lease) = stack
+                .connection_lock
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+            {
+                drop(lease);
+            }
         }
         // Drop this runtime's cached code registrations: it breaks the
         // table↔runtime Arc cycle AND un-advertises codes whose owner is
@@ -1368,6 +1399,21 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
     if rt.is_stopped() {
         return Err("task runtime is stopped".to_string());
     }
+    // Batch G6 (R36-P2-04 client half): claim the identity's
+    // control-connection lock BEFORE the registry dial — the registry
+    // replaces older same-device connections, so without this a CLI task
+    // run or a daemon on the same id-dir (or a second task runtime in
+    // this same engine) would silently kick this stack's connection and
+    // be kicked back by its keeper forever. The lease (guard + heartbeat)
+    // releases itself on every failure path below and otherwise moves
+    // into the stack, holding until teardown.
+    let connection_lock =
+        ak_session::pairing::ConnectionLockLease::acquire(&rt.id_dir).map_err(|error| {
+            format!(
+                "cannot claim the identity's control-connection lock under {}: {error}",
+                rt.id_dir.display()
+            )
+        })?;
     let connect = RegistryClient::connect_with_config(
         rt.registry_addr,
         rt.registry_id,
@@ -1412,6 +1458,7 @@ async fn ensure_stack(rt: &Arc<TaskRt>) -> Result<Arc<TaskStack>, String> {
         owner_loop: StdMutex::new(None),
         event_pump: StdMutex::new(None),
         keeper: StdMutex::new(None),
+        connection_lock: StdMutex::new(Some(connection_lock)),
     });
     // Wave 36 (R36-P1-02): the shared connection keeper from ak-session
     // (RegistryClient::spawn_connection_keeper — the same component the
@@ -4244,6 +4291,49 @@ mod task_tests {
         // wildcard bind to interface addresses).
         assert!(json.contains("\"endpoint\":\""), "{json}");
         ak_engine_free(engine);
+    }
+
+    /// Batch G6 (R36-P2-04, the FFI half): the task runtime participates
+    /// in the per-identity control-connection lock — a SECOND runtime on
+    /// the same id_dir (same engine, same PID) fails its first registry
+    /// op loudly instead of silently kicking the first runtime's control
+    /// connection, and the lease releases at teardown (the lock file
+    /// disappears with the engine).
+    #[test]
+    fn second_runtime_on_the_same_id_dir_fails_its_first_op_loudly() {
+        let registry = TestRegistry::spawn();
+        let engine = ak_engine_new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = start_task_on(engine, &registry, dir.path());
+        let (_, ok, json) = create_code(engine, &first, "{\"spec_version\":1,\"role\":\"sender\"}");
+        assert!(ok, "the first runtime's create must succeed: {json}");
+        // The first runtime's stack now holds the identity's lock.
+        let lock_file = dir.path().join("registry-connection.lock");
+        assert!(lock_file.exists(), "the lock file exists while held");
+
+        // A second runtime on the SAME id_dir: start is accepted (local
+        // bootstrap only — no network yet), but its first registry op
+        // must refuse loudly.
+        let second = start_task_on(engine, &registry, dir.path());
+        let (_, ok, json) =
+            create_code(engine, &second, "{\"spec_version\":1,\"role\":\"sender\"}");
+        assert!(!ok, "the second runtime's op must fail: {json}");
+        assert!(
+            json.contains("control-connection lock"),
+            "the failure names the lock: {json}"
+        );
+        assert!(
+            json.contains("second runtime"),
+            "the failure names the same-process second-runtime situation: {json}"
+        );
+
+        // Teardown releases: the engine drop releases every stack's lease,
+        // so a later run (or a CLI task command) can claim the identity.
+        ak_engine_free(engine);
+        assert!(
+            !lock_file.exists(),
+            "the lock file is gone after the engine teardown"
+        );
     }
 
     #[test]

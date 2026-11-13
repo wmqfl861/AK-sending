@@ -51,6 +51,10 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+/// The per-identity registry control-connection lock shared by the CLI
+/// task commands, the daemon and the FFI task runtime (R36-P2-04, batch
+/// G6 — see the module docs).
+pub mod connection_lock;
 pub mod error;
 pub mod orchestrator;
 pub mod task;
@@ -63,6 +67,10 @@ pub mod transport;
 
 pub use ak_identity::pairing_txn::VerifiedPairing;
 pub use client::{ClientConfig, ClientState, RegistryClient};
+pub use connection_lock::{
+    acquire_connection_lock, spawn_connection_lock_heartbeat, ConnectionLock, ConnectionLockError,
+    ConnectionLockLease, CONNECTION_LOCK_FILE, CONNECTION_LOCK_REFRESH, CONNECTION_LOCK_STALE,
+};
 pub use error::{ClientError, PairFlowError};
 pub use orchestrator::{
     redeem_request_mac, CommittedPairing, CreatedInvite, OrchestratorConfig, PairingOrchestrator,

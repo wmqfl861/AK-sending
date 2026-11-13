@@ -3790,6 +3790,11 @@ fn registry_server_config(
     let config = ak_signal::server_v2::Config {
         listen,
         db_path: db_path.unwrap_or_else(|| registry_db_path(id)),
+        // G6 (P2-09 ServerInfo): the revision a client can query over the
+        // wire — the same source as the version line (`0.1.0+<sha>`),
+        // sanitized to the 32-byte wire budget by the engine (a dirty or
+        // over-long build stamp degrades to "unknown" there).
+        revision: Some(format!("{}+{}", env!("CARGO_PKG_VERSION"), build_git_sha())),
         ..ak_signal::server_v2::Config::default()
     };
     (config, note)

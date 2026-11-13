@@ -56,6 +56,8 @@ type Signature64  = [u8; 64];
 
 `ServerError` 保留有界旧类错误；邀请码业务错误走下面的固定 `PairError`，不回显用户输入。
 
+`Welcome.capabilities` 是**服务端能力声明**（u32 位掩码），已定义位：`0x0001` 邀请码管理（claim/list/revoke）、`0x0002` 配对事务、`0x0004` v2 会话、`0x0008` 可查询服务器版本（G6 修订，见第 6a 节）。未定义位客户端忽略；旧客户端本就只校验 `session_ttl_secs > 0`，新位对它们是纯加法。`Hello` 无客户端能力位——capabilities 不是双方协商。
+
 ## 4. 邀请码管理消息
 
 `InviteSummary` 固定为：
@@ -151,6 +153,22 @@ signature = Ed25519.Sign(
 - 不增加 `extra_json`、`metadata`、`attachment` 等扩展口。
 - 对合法但不存在或无权查询的对象，返回统一不可用结果。
 
+## 6a. G6 契约修订：ServerInfo 消息对（2026-11-13）
+
+> **G6 契约修订轮（复核 2026-11-12 §6 F6 行）。** 纯加法：两个新 tag（`0x1F`/`0x20`，旧解码器拒绝未知 tag——但旧客户端永不发送请求、新服务端仅在请求后应答，所以任何旧×新组合都不会产生新帧）、`Welcome.capabilities` 新能力位 `0x0008`（§3）。既有帧形状零改动。
+
+| Tag | 变体 | 字段 | Payload 预算 |
+|---|---|---|---:|
+| `0x1F` | `ServerInfoRequest` | 无载荷 | 0 |
+| `0x20` | `ServerInfo` | `revision:u16长度+≤32B UTF-8` | ≤34 |
+
+语义与门控：
+
+- **仅按请求应答**：服务端永不主动推送 `ServerInfo`；客户端仅在当前连接的 `Welcome.capabilities` 置位 `0x0008` 后发送 `ServerInfoRequest`。旧服务端不置位→新客户端不发送；旧客户端忽略能力位→不发送。一切旧×新组合行为与修订前逐字节一致。
+- 消息对**无 request_id**（幂等、廉价、无状态）：每连接至多一个在途查询；`revision` 是构建指纹（如 `0.1.0+4739f4d`，版本行同一来源），**不含**路径、主机名、用户数据；未配置版本的服务进程以 `unknown` 应答。
+- 每连接帧预算（§11 的令牌桶）覆盖其限频，无独立限额。
+- 互通降级：新客户端对只置位不应答（或回答 `ServerError`、断连）的服务端，把查询降级为"无信息"，不得影响连接其余功能。
+
 ## 7. `PeerSignal` 子类型
 
 本功能**不向 `PeerSignal` 增加邀请码或通用认证载荷**。配对消息由上面的明确 `CtrlMessage` 变体承载。
@@ -200,6 +218,8 @@ signature = Ed25519.Sign(
 | `PairError`（0x1C） | 服务端 → 配对参与方 |
 | `Ping`（0x1D） | 客户端 → 服务端 |
 | `Pong`（0x1E） | 服务端 → 客户端 |
+| `ServerInfoRequest`（0x1F） | 客户端 → 服务端（仅 Welcome 能力位 0x0008 置位后） |
+| `ServerInfo`（0x20） | 服务端 → 客户端（仅按请求应答） |
 
 ## 9. 阶段（状态）规则
 

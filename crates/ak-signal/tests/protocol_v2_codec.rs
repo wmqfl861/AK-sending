@@ -65,7 +65,7 @@ fn redeem(seed: u8) -> RedeemRequest {
     }
 }
 
-/// One maximal sample per variant (30 total): longest strings, fullest
+/// One maximal sample per variant (32 total — G6 added the ServerInfo pair): longest strings, fullest
 /// arrays, extreme integers, so the closed-set sweep also stresses budgets.
 fn all_variants() -> Vec<CtrlMessage> {
     let max_candidates: Vec<SocketAddr> = (0..v2::MAX_CANDIDATES as u16).map(v6).collect();
@@ -224,6 +224,10 @@ fn all_variants() -> Vec<CtrlMessage> {
         },
         CtrlMessage::Ping { nonce: [0x1D; 16] },
         CtrlMessage::Pong { nonce: [0x1E; 16] },
+        CtrlMessage::ServerInfoRequest,
+        CtrlMessage::ServerInfo {
+            revision: "r".repeat(v2::message::MAX_REVISION_BYTES),
+        },
     ]
 }
 
@@ -273,9 +277,9 @@ fn wrap(ty: u8, payload: &[u8]) -> Vec<u8> {
 fn expected_direction(ty: u8) -> Direction {
     match ty {
         0x01 | 0x03 | 0x04 | 0x07 | 0x0A | 0x0C | 0x0E | 0x10 | 0x15 | 0x17 | 0x19 | 0x1B
-        | 0x1D => Direction::ClientToServer,
+        | 0x1D | 0x1F => Direction::ClientToServer,
         0x02 | 0x05 | 0x08 | 0x09 | 0x0B | 0x0D | 0x0F | 0x11 | 0x12 | 0x16 | 0x18 | 0x1A
-        | 0x1C | 0x1E => Direction::ServerToClient,
+        | 0x1C | 0x1E | 0x20 => Direction::ServerToClient,
         0x06 | 0x13 | 0x14 => Direction::Both,
         other => panic!("type byte {other:#04x} not in the closed set"),
     }
@@ -637,12 +641,12 @@ fn all_variants_roundtrip_closed_set() {
     let mut seen: Vec<u8> = samples.iter().map(|m| m.type_byte()).collect();
     seen.sort_unstable();
     seen.dedup();
-    assert_eq!(seen.len(), 30, "one sample per variant expected");
+    assert_eq!(seen.len(), 32, "one sample per variant expected");
     assert_eq!(seen.first(), Some(&0x01));
-    assert_eq!(seen.last(), Some(&0x1E));
+    assert_eq!(seen.last(), Some(&0x20));
     for message in samples {
         let ty = message.type_byte();
-        assert!((0x01..=0x1E).contains(&ty), "type byte outside legal set");
+        assert!((0x01..=0x20).contains(&ty), "type byte outside legal set");
         roundtrip(message);
     }
 }
@@ -683,11 +687,14 @@ fn budget_table_locked() {
         (0x1C, m::PAIR_ERROR_PAYLOAD),
         (0x1D, m::PING_PAYLOAD),
         (0x1E, m::PONG_PAYLOAD),
+        (0x1F, m::SERVER_INFO_REQUEST_PAYLOAD),
+        (0x20, m::SERVER_INFO_MAX_PAYLOAD),
     ];
     // The frozen numbers themselves, independent of the module constants.
     // Wave-28: the four extended tags (0x0A/0x10/0x12/0x16) grew by the
     // optional trailing extension section (flags+u16 len+512-byte blob,
     // claim additionally u32 max_redeems); every other tag is unchanged.
+    // G6 §6a added 0x1F (empty request) / 0x20 (2+32 revision answer).
     let frozen: &[(u8, usize)] = &[
         (0x01, 204),
         (0x02, 8),
@@ -719,6 +726,8 @@ fn budget_table_locked() {
         (0x1C, 39),
         (0x1D, 16),
         (0x1E, 16),
+        (0x1F, 0),
+        (0x20, 34),
     ];
     for ((ty, constant), (_, number)) in expected.iter().zip(frozen) {
         assert_eq!(constant, number, "budget constant drift for tag {ty:#04x}");
@@ -1062,6 +1071,75 @@ fn err_server_error_message_budget_and_control_chars() {
         .try_encode(&mut Vec::new()),
         Err(EncodeError::ControlChars)
     ));
+}
+
+/// G6 §6a: the revision-query pair. The request is a true zero-payload
+/// frame (any byte after the header is trailing garbage → refused); the
+/// answer is one u16-length-prefixed ≤32-byte UTF-8 string, budget
+/// locked at 2+32, over-budget and control-character revisions refused
+/// on both encode and decode.
+#[test]
+fn roundtrip_and_budget_server_info_pair() {
+    // Request: exactly the header, empty payload.
+    let mut req = Vec::new();
+    CtrlFrame::new(CtrlMessage::ServerInfoRequest)
+        .try_encode(&mut req)
+        .unwrap();
+    assert_eq!(req.len() - HEADER_LEN, 0);
+    // A non-empty request payload is trailing bytes → refused.
+    assert!(matches!(
+        CtrlFrame::decode(&wrap(0x1F, &[0x00])),
+        Err(DecodeError::Trailing(1))
+    ));
+
+    // Answer: at budget with a 32-byte revision.
+    let mut at_cap = Vec::new();
+    CtrlFrame::new(CtrlMessage::ServerInfo {
+        revision: "r".repeat(v2::message::MAX_REVISION_BYTES),
+    })
+    .try_encode(&mut at_cap)
+    .unwrap();
+    assert_eq!(
+        at_cap.len() - HEADER_LEN,
+        v2::message::SERVER_INFO_MAX_PAYLOAD
+    );
+    // Over budget on encode …
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::ServerInfo {
+            revision: "r".repeat(v2::message::MAX_REVISION_BYTES + 1),
+        })
+        .try_encode(&mut Vec::new()),
+        Err(EncodeError::StringTooLong {
+            limit: v2::message::MAX_REVISION_BYTES
+        })
+    ));
+    // … and on decode (crafted 33-byte revision).
+    let mut over = Vec::new();
+    over.extend_from_slice(&((v2::message::MAX_REVISION_BYTES + 1) as u16).to_be_bytes());
+    over.extend_from_slice(&[b'r'; v2::message::MAX_REVISION_BYTES + 1]);
+    assert!(matches!(
+        CtrlFrame::decode(&wrap(0x20, &over)),
+        Err(DecodeError::StringTooLong {
+            limit: v2::message::MAX_REVISION_BYTES
+        })
+    ));
+    // Control characters refused (a revision is a build fingerprint).
+    assert!(matches!(
+        CtrlFrame::new(CtrlMessage::ServerInfo {
+            revision: "0.1.0\u{0}+evil".to_string(),
+        })
+        .try_encode(&mut Vec::new()),
+        Err(EncodeError::ControlChars)
+    ));
+    // The wrong direction is refused by the direction-aware paths.
+    assert!(CtrlFrame::new(CtrlMessage::ServerInfoRequest)
+        .try_encode_as(Role::Server, &mut Vec::new())
+        .is_err());
+    assert!(CtrlFrame::new(CtrlMessage::ServerInfo {
+        revision: "0.1.0+deadbee".to_string(),
+    })
+    .try_encode_as(Role::Client, &mut Vec::new())
+    .is_err());
 }
 
 // ---- candidate / address rules ---------------------------------------------

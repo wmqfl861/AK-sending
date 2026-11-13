@@ -11,7 +11,7 @@
 //! an independent module — v1 and its decoder stay untouched and v2 frames
 //! are never v1 frames with appended fields:
 //!
-//! - **Closed set**: type tags `0x01..=0x1E` and signal sub-tags
+//! - **Closed set**: type tags `0x01..=0x20` (G6 added the ServerInfo pair) and signal sub-tags
 //!   `0x01..=0x04` are exhaustive; every other byte is rejected and tests
 //!   enumerate all 256 values of each.
 //! - **Budgets first**: per-tag payload budgets are validated (on decode

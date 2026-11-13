@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -158,6 +158,11 @@ struct Dispatch {
     /// an evicted flow simply re-derives its endpoint from the next
     /// relay frame or fails the pairing honestly).
     endpoint_blob_order: std::collections::VecDeque<PairingId>,
+    /// The at-most-one in-flight G6 `ServerInfoRequest` waiter. The
+    /// message pair carries no request id (idempotent, stateless), so it
+    /// cannot ride the keyed waiter table; the single slot is enforced by
+    /// [`ClientInner::info_query`] and cleared on disconnect.
+    server_info_waiter: Option<oneshot::Sender<CtrlMessage>>,
 }
 
 /// Cache bound for relayed endpoint blobs (review P2-15). Generous
@@ -199,6 +204,17 @@ struct ClientInner {
     /// the event to the UI), this tells the connection keeper how to
     /// pace its reclaim — see [`KEEPER_REPLACEMENT_PAUSE`].
     replace_closed: AtomicBool,
+    /// The `Welcome.capabilities` the CURRENT connection's Welcome
+    /// carried (G6: 0 before the first Welcome; refreshed per connection
+    /// epoch — reconnects re-read it, so a server downgrade mid-run is
+    /// noticed on the next [`RegistryClient::server_info`] call).
+    welcome_caps: AtomicU32,
+    /// Per-connection-epoch cache of the G6 `ServerInfo` answer (cleared
+    /// on every reconnect, so a server upgrade is re-queried).
+    server_info_cache: StdMutex<Option<String>>,
+    /// Single-flight gate for the G6 revision query (the wire pair has no
+    /// request id; at most one query is in flight per client).
+    info_query: AsyncMutex<()>,
     unmatched: AtomicU64,
     state_tx: watch::Sender<ClientState>,
 }
@@ -328,7 +344,23 @@ impl ClientInner {
                 if *code == ak_signal::client_v2::ERR_DEVICE_REPLACED {
                     self.note_replaced();
                 }
+                // A pending G6 revision query degrades on an error answer
+                // (e.g. a proxy that set the capability bit but cannot
+                // answer): hand the frame to the waiter — it maps any
+                // non-ServerInfo reply to None — and keep the plane copy.
+                if let Some(tx) = dispatch.server_info_waiter.take() {
+                    delivered |= tx.send(message.clone()).is_ok();
+                }
                 delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+            }
+            CtrlMessage::ServerInfo { .. } => {
+                // G6: the revision answer has no request id — the single
+                // in-flight slot is its dispatch. Without a waiter it is
+                // an unsolicited push (the server never does this) and
+                // counts as unmatched like every other undeliverable.
+                if let Some(tx) = dispatch.server_info_waiter.take() {
+                    delivered |= tx.send(message).is_ok();
+                }
             }
             // Client-authored and handshake frames never arrive here (the
             // direction layer rejects them at decode).
@@ -358,11 +390,18 @@ impl ClientInner {
     /// Fail every one-shot waiter (disconnect) — their receivers observe a
     /// closed channel and map it to `ConnectionLost`/`Replaced`. Relayed
     /// endpoint blobs of pairings that never completed drop with them.
+    /// The G6 revision query degrades (None) and its per-epoch cache
+    /// drops with the connection that filled it.
     fn clear_waiters(&self) {
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
         dispatch.waiters.clear();
+        dispatch.server_info_waiter = None;
         dispatch.endpoint_blobs.clear();
         dispatch.endpoint_blob_order.clear();
+        drop(dispatch);
+        if let Ok(mut cache) = self.server_info_cache.lock() {
+            *cache = None;
+        }
     }
 
     /// Queue one plain message for the writer (bounded, non-blocking).
@@ -467,6 +506,9 @@ impl RegistryClient {
             closed: AtomicBool::new(false),
             replaced: AtomicBool::new(false),
             replace_closed: AtomicBool::new(false),
+            welcome_caps: AtomicU32::new(0),
+            server_info_cache: StdMutex::new(None),
+            info_query: AsyncMutex::new(()),
             unmatched: AtomicU64::new(0),
             state_tx,
         });
@@ -957,6 +999,97 @@ impl RegistryClient {
         }
     }
 
+    /// The `Welcome.capabilities` bits of the CURRENT connection epoch
+    /// (G6; 0 before the first Welcome). A diagnostic surface — the one
+    /// decision gated on it is [`RegistryClient::server_info`].
+    pub fn welcome_capabilities(&self) -> u32 {
+        self.inner.welcome_caps.load(Ordering::Acquire)
+    }
+
+    /// The build revision of the serving registry (G6, contract
+    /// protocol-v2.md §6a), e.g. `"0.1.0+4739f4d"`.
+    ///
+    /// `None` means "no information" and is NEVER an error:
+    ///
+    /// * the current server did not advertise the revision-query
+    ///   capability bit — an older build, which must not be asked (the
+    ///   pure-addition interop rule: old server × new client behaves
+    ///   exactly as before);
+    /// * or the query failed after the bit was seen (no answer within
+    ///   the response budget, a `ServerError` answer, or the connection
+    ///   dropped) — a diagnostic convenience query must not fault the
+    ///   caller's control connection usage.
+    ///
+    /// The answer is cached per connection epoch (a reconnect re-queries
+    /// against the new server build); at most one query is in flight
+    /// (the wire pair carries no request id).
+    pub async fn server_info(&self) -> Option<String> {
+        const INFO_CAP: u32 = ak_signal::server_v2::CAP_SERVER_INFO;
+        if self.welcome_capabilities() & INFO_CAP == 0 {
+            return None; // old server: never asked
+        }
+        // Single flight (no request id on the wire) — and the cache is
+        // re-checked under the gate so concurrent callers share one query.
+        let _inflight = self.inner.info_query.lock().await;
+        if let Some(cached) = self
+            .inner
+            .server_info_cache
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            return Some(cached);
+        }
+        if self.welcome_capabilities() & INFO_CAP == 0 {
+            return None; // re-check: the epoch may have changed while queued
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut dispatch = self.inner.dispatch.lock().expect("client dispatch lock");
+            if dispatch.server_info_waiter.is_some() {
+                return None; // unreachable behind the gate; kept defensive
+            }
+            dispatch.server_info_waiter = Some(tx);
+        }
+        let reply = match self.inner.send_frame(CtrlMessage::ServerInfoRequest) {
+            Err(error) => {
+                log::debug!("pairing client: server-info query not sent: {error}");
+                None
+            }
+            Ok(()) => match tokio::time::timeout(self.inner.config.response_timeout, rx).await {
+                Ok(Ok(CtrlMessage::ServerInfo { revision })) => Some(revision),
+                Ok(Ok(CtrlMessage::ServerError { code, .. })) => {
+                    log::debug!("pairing client: server-info query refused (0x{code:04x})");
+                    None
+                }
+                Ok(Ok(other)) => {
+                    log::debug!(
+                        "pairing client: unexpected server-info answer (type 0x{:02x})",
+                        other.type_byte()
+                    );
+                    None
+                }
+                Ok(Err(_dropped)) => None, // disconnected while waiting
+                Err(_elapsed) => {
+                    log::debug!("pairing client: server-info query timed out");
+                    None
+                }
+            },
+        };
+        // The waiter slot is single-use; clear a timed-out one so a later
+        // call can query again (an answered one is already taken).
+        {
+            let mut dispatch = self.inner.dispatch.lock().expect("client dispatch lock");
+            dispatch.server_info_waiter = None;
+        }
+        if let Some(revision) = &reply {
+            if let Ok(mut cache) = self.inner.server_info_cache.lock() {
+                *cache = Some(revision.clone());
+            }
+        }
+        reply
+    }
+
     /// Ask the registry to open a coordination session toward a paired
     /// peer (keyed by the verified `(pairing_id, code_id, connection_id)`
     /// triple); the waiter matches on `connection_id`.
@@ -1250,6 +1383,28 @@ pub const KEEPER_RETRY_BACKOFF_STEPS: [Duration; 6] = [
 /// 43159698726). A replacement kick is not a network blip: wait out the
 /// full cap so any short borrower finishes, then reclaim (a well-behaved
 /// lock participant never collides at all — it refuses loudly).
+///
+/// Batch G6 re-evaluation (2026-11-13) — KEPT at 30 s after the reason
+/// frame landed (9029c08). The "on-demand" goal is already achieved by
+/// the reason frame itself: the pause now triggers ONLY when the server
+/// explicitly said "replaced" (0x1001); every ordinary failure (network
+/// blip, server restart, EOF) reconnects at backoff step 0 as before —
+/// before 9029c08 the pause in fact NEVER fired in production (bare
+/// EOF). Shortening the FIXED value is the wrong trade:
+/// 1. the one-shots this window protects do not participate in the local
+///    lock BY PRODUCT SEMANTICS (revoke while a daemon lives is a
+///    supported path), so pacing is their only protection — and
+///    registry-class operations have observed long tails under load
+///    (redeem transactions legitimately run ~90–105 s), so a shorter
+///    window re-opens the exact connection war the pause ended;
+/// 2. a copied identity on ANOTHER machine is outside every local lock
+///    (see `pairing::connection_lock`); against a second resident keeper
+///    the 30 s floor is also the oscillation damper — shortening speeds
+///    that war up, not down;
+/// 3. 30 s equals the reconnect backoff cap, so a replacement is costed
+///    like a full outage batch — one coherent rule, no extra state;
+/// 4. no field data argues for less (C4 real-device testing is still
+///    pending). Revisit only with measured one-shot durations from C4.
 pub const KEEPER_REPLACEMENT_PAUSE: Duration = Duration::from_secs(30);
 
 /// The pause before reconnect batch `failed_batches + 1`
@@ -1477,8 +1632,18 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
         let bytes = read_with_timeout(&mut stream, connect_timeout).await?;
         match decode_server(&bytes)? {
             CtrlMessage::Welcome {
-                session_ttl_secs, ..
-            } if session_ttl_secs > 0 => {}
+                session_ttl_secs,
+                capabilities,
+            } if session_ttl_secs > 0 => {
+                // G6: remember the CURRENT connection epoch's capability
+                // bits — `server_info()` asks only when the server
+                // advertised the revision-query bit, so an old server is
+                // never asked (pure-addition interop).
+                inner.welcome_caps.store(capabilities, Ordering::Release);
+                if let Ok(mut cache) = inner.server_info_cache.lock() {
+                    *cache = None;
+                }
+            }
             CtrlMessage::ServerError { code, .. } => return Err(ClientError::Server { code }),
             other => {
                 return Err(ClientError::Protocol(format!(
@@ -1631,7 +1796,6 @@ mod tests {
 
     mod registry {
         use super::super::*;
-        use ak_signal::server_v2::engine::serve_v2;
         use ak_signal::server_v2::store::RegistryStore;
         use ak_signal::server_v2::Limits;
         use tokio::net::TcpListener;
@@ -1649,6 +1813,13 @@ mod tests {
         }
 
         pub(super) async fn spawn() -> TestRegistry {
+            spawn_with(None).await
+        }
+
+        /// [`registry::spawn`] with an optional build revision for the G6
+        /// `ServerInfo` answer (`None` = the engine's `unknown` default).
+        pub(super) async fn spawn_with(revision: Option<&str>) -> TestRegistry {
+            use ak_signal::server_v2::engine::serve_v2_with_revision;
             let registry_key = DeviceKeyPair::generate();
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1657,8 +1828,17 @@ mod tests {
             let store = RegistryStore::open_in_memory().expect("open registry store");
             let (shutdown, shutdown_rx) = watch::channel(false);
             let key = registry_key.clone();
+            let revision = revision.map(str::to_string);
             tokio::spawn(async move {
-                let _ = serve_v2(listener, &key, store, Limits::default(), shutdown_rx).await;
+                let _ = serve_v2_with_revision(
+                    listener,
+                    &key,
+                    store,
+                    Limits::default(),
+                    revision.as_deref(),
+                    shutdown_rx,
+                )
+                .await;
             });
             TestRegistry {
                 addr,
@@ -1813,6 +1993,162 @@ mod tests {
             "a fresh connection clears the pacing signal (sticky is_replaced stays)"
         );
         assert!(a.is_replaced(), "the sticky UI flag survives reconnects");
+
+        shutdown_tx.send(true).expect("stop the keeper");
+        let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;
+        a.close().await;
+        drop(registry);
+    }
+
+    /// G6 §6a end to end against the REAL `serve_v2_with_revision`: the
+    /// client saves the current epoch's Welcome capabilities, asks only
+    /// because the server advertised the bit, and gets the configured
+    /// revision back. (New client × new server.)
+    #[tokio::test]
+    async fn server_info_roundtrips_against_the_real_registry() {
+        let registry = registry::spawn_with(Some("0.1.0+abc12345")).await;
+        let key = DeviceKeyPair::generate();
+        let client =
+            RegistryClient::connect(registry.addr, registry.registry_id, &key, "info-asker")
+                .await
+                .expect("connect to the live registry");
+        assert!(
+            client.welcome_capabilities() & ak_signal::server_v2::CAP_SERVER_INFO != 0,
+            "the new server advertises the revision-query bit"
+        );
+        assert_eq!(
+            client.server_info().await,
+            Some("0.1.0+abc12345".to_string()),
+            "the query returns the configured build revision"
+        );
+        client.close().await;
+        drop(registry);
+    }
+
+    /// G6 interop gate (old server × new client): a server whose Welcome
+    /// does NOT carry the capability bit is never asked —
+    /// [`RegistryClient::server_info`] returns `None` without sending a
+    /// frame (an old server's decoder would treat 0x1F as an unknown tag
+    /// and drop the connection). The old-server Welcome is simulated by
+    /// clearing the saved epoch capabilities of a live client; the real
+    /// pre-G6 behavior (bits absent) is the same input to the decision.
+    #[tokio::test]
+    async fn server_info_is_not_asked_without_the_capability_bit() {
+        let registry = registry::spawn().await;
+        let key = DeviceKeyPair::generate();
+        let client =
+            RegistryClient::connect(registry.addr, registry.registry_id, &key, "old-server")
+                .await
+                .expect("connect to the live registry");
+        // Simulate the old server's Welcome (no 0x0008 bit).
+        client
+            .inner
+            .welcome_caps
+            .store(0x0000_0007, Ordering::Release);
+        assert_eq!(
+            client.server_info().await,
+            None,
+            "no bit → no query: the method must not send ServerInfoRequest"
+        );
+        // The connection is untouched by the refused query.
+        client
+            .ping()
+            .await
+            .expect("the control connection still works");
+        client.close().await;
+        drop(registry);
+    }
+
+    /// G6 degradation: the query must never fault the caller — offline
+    /// (the send fails), the answer degrades to `None` and the client
+    /// keeps working otherwise.
+    #[tokio::test]
+    async fn server_info_degrades_to_none_when_disconnected() {
+        let registry = registry::spawn_with(Some("0.1.0+abc12345")).await;
+        let key = DeviceKeyPair::generate();
+        let client = RegistryClient::connect(registry.addr, registry.registry_id, &key, "degrade")
+            .await
+            .expect("connect to the live registry");
+        assert_eq!(
+            client.server_info().await,
+            Some("0.1.0+abc12345".to_string())
+        );
+        // Drop the connection: a later query degrades instead of erroring.
+        client.simulate_connection_loss().await;
+        assert_eq!(
+            client.server_info().await,
+            None,
+            "a failed query degrades to None, never an error"
+        );
+        client.close().await;
+        drop(registry);
+    }
+
+    /// Batch G6 / 9029c08: the REAL replacement path end to end — a
+    /// second same-device connection makes the live server deliver the
+    /// ERR_DEVICE_REPLACED reason frame to the first connection, and the
+    /// keeper paces its reclaim (waits out `replacement_pause`) instead
+    /// of regrabbing the slot at backoff step 0. This is the production
+    /// producer the old pacing test had to inject (`simulate_replacement_
+    /// kick`); it pins that the reason frame really arms the pacing.
+    #[tokio::test]
+    async fn real_replacement_kick_paces_before_reclaiming() {
+        let registry = registry::spawn().await;
+        let key = DeviceKeyPair::generate(); // one device id, two connections
+        let a = RegistryClient::connect(registry.addr, registry.registry_id, &key, "real-a")
+            .await
+            .expect("connect A");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let keeper = a.spawn_connection_keeper_with(
+            ConnectionKeeperConfig {
+                ping_interval: Duration::from_secs(3600), // pings off: only the kick matters
+                replacement_pause: Duration::from_millis(700),
+            },
+            shutdown_rx,
+        );
+        assert!(!a.last_close_was_replacement());
+
+        // The REAL kick: B connects with the same device identity.
+        let b = RegistryClient::connect(registry.addr, registry.registry_id, &key, "real-b")
+            .await
+            .expect("connect B");
+        let mut state = a.state_watcher();
+        let kicked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ClientState::Disconnected) {
+                    return;
+                }
+                state.changed().await.expect("watcher alive");
+            }
+        })
+        .await;
+        assert!(kicked.is_ok(), "B's real Hello must kick A");
+        // The reason frame (not the bare EOF) is what armed the pacing:
+        // this is exactly what 9029c08 made the server send.
+        assert!(a.is_replaced(), "the sticky event flag is set");
+        assert!(
+            a.last_close_was_replacement(),
+            "the 0x1001 reason frame set the pacing signal"
+        );
+        drop(b);
+
+        // Pacing: A stays Disconnected past the immediate first retry.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(*state.borrow_and_update(), ClientState::Disconnected),
+            "the keeper honors the replacement pause after a real kick"
+        );
+        // ... and reclaims after the pause.
+        let reclaimed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(*state.borrow_and_update(), ClientState::Connected(_)) {
+                    return;
+                }
+                state.changed().await.expect("watcher alive");
+            }
+        })
+        .await;
+        assert!(reclaimed.is_ok(), "the keeper reclaims after the pause");
 
         shutdown_tx.send(true).expect("stop the keeper");
         let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;

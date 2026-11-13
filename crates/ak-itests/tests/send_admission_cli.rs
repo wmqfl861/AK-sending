@@ -934,10 +934,13 @@ impl DaemonChain {
 /// overlapped exactly when both opens precede the other's close.
 /// Max simultaneously-in-flight jobs and total started jobs, from the RAW
 /// event line order (+1 per job_started, -1 per job_done). Pairing-free by
-/// design: job_done.peer is optional and job_started carries no task id, so
-/// peer/id-based pairing is inherently ambiguous under parallel completion
-/// (CI runs 43029286253/43069873077/43077330860 each tripped a different
-/// ambiguity). Serial-vs-parallel semantics live in the ORDER alone.
+/// design: job_done.peer is optional (always filled since CR-P3-08, but a
+/// peer string is never a concurrency key) and job_started's id is the
+/// scheduler task id while job_done's id is the content id — different
+/// namespaces, so peer/id-based pairing is inherently ambiguous under
+/// parallel completion (CI runs 43029286253/43069873077/43077330860 each
+/// tripped a different ambiguity). Serial-vs-parallel semantics live in
+/// the ORDER alone.
 fn job_concurrency(owner: &Proc) -> (usize, usize) {
     let mut in_flight = 0usize;
     let mut max_in_flight = 0usize;

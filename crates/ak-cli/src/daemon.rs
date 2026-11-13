@@ -70,6 +70,13 @@ pub(crate) struct DaemonOptions {
 
 /// One NDJSON event of the `daemon --json-lines` stream. Field names and
 /// the `"type"` values are a script-facing contract: extend, never rename.
+/// Contract scope (CR-P3-08): this stream is the CLI's stdout format, NOT
+/// the FFI ABI — `docs/contracts/ffi-v2.md` freezes the FFI event polling
+/// model (§5) and the daemon FLAG surface (§6), not these lines, so the
+/// additive extensions below land directly in code. Extension rule: new
+/// fields are APPENDED after the existing ones so prefix parsers
+/// (`scripts/cross_device_test.sh` greps the `job_done` field prefix up to
+/// `duration_ms`) keep working byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaemonEvent<'a> {
     /// Startup progress (run-43312035496 diagnosis finding 2): before the
@@ -92,16 +99,28 @@ pub(crate) enum DaemonEvent<'a> {
         candidates: &'a [String],
     },
     /// A sender completed the handshake (its verified fingerprint in hex);
-    /// the transfer itself starts now.
-    JobStarted { peer: &'a str },
+    /// the transfer itself starts now. `id` (CR-P3-08) is the task id the
+    /// daemon can know BEFORE the transfer: the wired scheduler path's
+    /// `TaskOpen.job_id`, i.e. the sender's scheduler task identity (pairs
+    /// with the sender's `sched` snapshot, not with [`DaemonEvent::JobDone`]'s
+    /// `id`, which is the content id the Offer carries — the engine emits
+    /// `Connected` before reading the Offer, so no content id can exist at
+    /// this point; e716a61's finding). `None` (rendered `null`) on the
+    /// legacy/direct paths, which send no TaskOpen. External consumers pair
+    /// `job_started`/`job_done` of one job by `peer` — since CR-P3-08 both
+    /// events always carry it.
+    JobStarted { peer: &'a str, id: Option<&'a str> },
     /// One job finished and committed; the daemon keeps listening.
+    /// `peer` (CR-P3-08) is always filled when the daemon observed one:
+    /// the report's own field first, the `job_started` capture as the
+    /// fallback (`null` only if the transfer completed without a single
+    /// `Connected` observation, which cannot happen on a real path).
     JobDone {
         id: &'a str,
         files: u64,
         bytes: u64,
         duration_ms: u64,
         resumed: u64,
-        /// Sender fingerprint (full hex) when the report carries it.
         peer: Option<&'a str>,
     },
     /// A recoverable failure (rejected peer, job error); the daemon keeps
@@ -143,10 +162,18 @@ impl DaemonEvent<'_> {
                 crate::json_escape(name),
                 crate::json_string_array(candidates)
             ),
-            DaemonEvent::JobStarted { peer } => format!(
-                "{{\"type\":\"job_started\",\"peer\":\"{}\"}}",
-                crate::json_escape(peer)
-            ),
+            DaemonEvent::JobStarted { peer, id } => {
+                // CR-P3-08: `id` APPENDED after `peer` (extend-only — the
+                // frozen prefix stays byte-identical).
+                let id_json = match id {
+                    Some(id) => format!("\"{}\"", crate::json_escape(id)),
+                    None => "null".to_owned(),
+                };
+                format!(
+                    "{{\"type\":\"job_started\",\"peer\":\"{}\",\"id\":{id_json}}}",
+                    crate::json_escape(peer)
+                )
+            }
             DaemonEvent::JobDone {
                 id,
                 files,
@@ -265,27 +292,51 @@ fn pick_free_port() -> Result<u16> {
     Ok(port)
 }
 
-/// 32-hex job id of a finished report (same rendering as `report_summary`).
-fn job_id_hex(report: &Report) -> String {
-    report.job_id.iter().map(|b| format!("{b:02x}")).collect()
+/// 32-hex rendering of a 16-byte job/task id (the wire `Offer.job_id` of a
+/// finished report, same rendering as `report_summary`, and the
+/// `TaskOpen.job_id` of a started scheduler task).
+fn job_id_hex(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the daemon observed at `job_started` (CR-P3-08): the start instant
+/// (`job_done.duration_ms` spans started→done) and the verified peer
+/// fingerprint — the fallback that keeps `job_done.peer` filled even when
+/// the report's own peer field is empty.
+struct JobStart {
+    at: Instant,
+    peer: String,
 }
 
 /// Progress adapter for the daemon: `Connected` marks the job start (and
 /// becomes a `job_started` event in NDJSON mode); text mode reuses the
 /// `receive` single-line renderer, NDJSON mode drops the rest so stdout
-/// stays event-only.
+/// stays event-only. `start_slot` receives the started-at instant and peer
+/// (see [`JobStart`]); `start_id` is the task id the daemon already knows
+/// when the printer is armed — the wired scheduler path's `TaskOpen.job_id`
+/// — or `None` on paths whose first identity arrives only with the Offer.
 fn daemon_progress_printer(
     json_lines: bool,
-    connected_at: Arc<Mutex<Option<Instant>>>,
+    start_slot: Arc<Mutex<Option<JobStart>>>,
+    start_id: Option<String>,
 ) -> Arc<dyn Fn(Progress) + Send + Sync> {
     let line = Arc::new(ProgressLine::new("recv"));
     Arc::new(move |progress: Progress| {
         if let Progress::Connected { peer } = &progress {
-            *connected_at
+            *start_slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(JobStart {
+                at: Instant::now(),
+                peer: peer.clone(),
+            });
             if json_lines {
-                emit_line(&DaemonEvent::JobStarted { peer }.to_json_line());
+                emit_line(
+                    &DaemonEvent::JobStarted {
+                        peer,
+                        id: start_id.as_deref(),
+                    }
+                    .to_json_line(),
+                );
                 return;
             }
         }
@@ -999,8 +1050,7 @@ async fn wired_connection_handler(connection: WiredConnection) {
         mut channel,
     } = connection;
     let peer = channel.peer_fingerprint().to_hex();
-    let connected_at = Arc::new(Mutex::new(None::<Instant>));
-    let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
+    let start_slot = Arc::new(Mutex::new(None::<JobStart>));
     let spec = template.spec();
 
     // Handshake split. Shutdown only races this phase: once a task is
@@ -1031,14 +1081,19 @@ async fn wired_connection_handler(connection: WiredConnection) {
             // Compatibility path: the frozen single-job protocol on this
             // channel (resumed on the handed-back Hello stream), inside
             // the anonymous legacy group so the same-code policy keeps
-            // governing legacy concurrency.
+            // governing legacy concurrency. No TaskOpen exists here, so
+            // the `job_started` event carries no id (CR-P3-08).
             (
                 WiredExecutor::Legacy(Arc::new(LegacyChannelExecutor::new(
                     channel,
                     stream,
                     peer_capabilities,
                     spec,
-                    Some(printer),
+                    Some(daemon_progress_printer(
+                        out.json_lines,
+                        start_slot.clone(),
+                        None,
+                    )),
                 ))),
                 legacy_group(registry_id),
                 ak_session::runtime::PairingPlan::Local,
@@ -1046,6 +1101,12 @@ async fn wired_connection_handler(connection: WiredConnection) {
             )
         }
         Ok(WiredHandshake::Scheduler { open }) => {
+            // CR-P3-08: the TaskOpen's job id is the one task identity
+            // that exists BEFORE the transfer starts; it rides the
+            // printer as `job_started.id` (the sender's scheduler task
+            // identity — `job_done.id` is the later, different content
+            // id; see the event docs).
+            let start_id = job_id_hex(&open.job_id());
             // The channel executor owns the channel + the wire TaskOpen;
             // its accessors feed the relation check (wave-27 session API:
             // the group key may only come from a validated Ready
@@ -1054,7 +1115,11 @@ async fn wired_connection_handler(connection: WiredConnection) {
                 channel,
                 spec,
                 open,
-                Some(printer),
+                Some(daemon_progress_printer(
+                    out.json_lines,
+                    start_slot.clone(),
+                    Some(start_id),
+                )),
             );
             let (claim, channel_peer) = match (
                 channel_executor.claim(),
@@ -1134,7 +1199,7 @@ async fn wired_connection_handler(connection: WiredConnection) {
     let outcome = watch_wired_task(&mut events, task, |task| executor.outcome(task)).await;
     match outcome {
         Ok(report) => {
-            emit_job_done(&out, &connected_at, &report);
+            emit_job_done(&out, &start_slot, &report);
             out.text("waiting for next sender (Ctrl-C stops)...");
         }
         Err(JobFailure::Unauthorized) => {
@@ -1644,8 +1709,11 @@ pub(crate) async fn daemon_core(
             break;
         }
         let spec = config.iteration_spec();
-        let connected_at = Arc::new(Mutex::new(None::<Instant>));
-        let printer = daemon_progress_printer(out.json_lines, connected_at.clone());
+        let start_slot = Arc::new(Mutex::new(None::<JobStart>));
+        // Direct path: no TaskOpen precedes the transfer, so the
+        // `job_started` event carries no id (CR-P3-08) — the first job
+        // identity arrives only with the Offer, after `Connected`.
+        let printer = daemon_progress_printer(out.json_lines, start_slot.clone(), None);
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         let receiver =
             tokio::spawn(
@@ -1690,7 +1758,7 @@ pub(crate) async fn daemon_core(
         match outcome {
             Ok(Ok(report)) => {
                 rebind_retries = 0;
-                emit_job_done(&out, &connected_at, &report);
+                emit_job_done(&out, &start_slot, &report);
                 out.text("waiting for next sender (Ctrl-C stops)...");
             }
             Ok(Err(EngineError::Connect(ak_net::ConnectError::Unauthorized))) => {
@@ -1724,27 +1792,43 @@ pub(crate) async fn daemon_core(
     Ok(())
 }
 
+/// Render the `job_done` NDJSON line (pure, CR-P3-08; unit-tested). The
+/// pairing-relevant fields: `id` is the report's content id, and `peer` is
+/// the report's own field first with the `job_started` capture as the
+/// fallback — so started/done of one job always carry the same peer and
+/// external consumers can pair them reliably.
+fn job_done_line(started: Option<&JobStart>, report: &Report) -> String {
+    let id = job_id_hex(&report.job_id);
+    let duration_ms = match started {
+        Some(start) => start.at.elapsed().as_millis(),
+        None => report.duration.as_millis(),
+    };
+    let peer = report
+        .peer_fingerprint
+        .as_deref()
+        .or_else(|| started.map(|start| start.peer.as_str()));
+    DaemonEvent::JobDone {
+        id: &id,
+        files: report.files,
+        bytes: report.bytes,
+        duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
+        resumed: report.resumed_chunks,
+        peer,
+    }
+    .to_json_line()
+}
+
 /// Emit the job-done NDJSON event / text summary shared by both receive
 /// paths (the wired connection handlers and the direct loop). Duration
 /// spans `job_started` (handshake) to completion; if no `Connected` event
 /// was seen, the engine's own report duration is used.
-fn emit_job_done(out: &DaemonOut, connected_at: &Arc<Mutex<Option<Instant>>>, report: &Report) {
+fn emit_job_done(out: &DaemonOut, start_slot: &Arc<Mutex<Option<JobStart>>>, report: &Report) {
     if out.json_lines {
-        let started = connected_at
+        let started = start_slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        let duration_ms = started
-            .map(|at| at.elapsed().as_millis())
-            .unwrap_or_else(|| report.duration.as_millis());
-        out.event(&DaemonEvent::JobDone {
-            id: &job_id_hex(report),
-            files: report.files,
-            bytes: report.bytes,
-            duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
-            resumed: report.resumed_chunks,
-            peer: report.peer_fingerprint.as_deref(),
-        });
+        emit_line(&job_done_line(started.as_ref(), report));
     } else {
         crate::report_summary(report);
     }
@@ -1932,7 +2016,16 @@ mod tests {
                 candidates: &no_candidates,
             }
             .to_json_line(),
-            DaemonEvent::JobStarted { peer: &fp_hex }.to_json_line(),
+            DaemonEvent::JobStarted {
+                peer: &fp_hex,
+                id: None,
+            }
+            .to_json_line(),
+            DaemonEvent::JobStarted {
+                peer: &fp_hex,
+                id: Some(&"cd".repeat(16)),
+            }
+            .to_json_line(),
             DaemonEvent::JobDone {
                 id: &"09af".repeat(8),
                 files: 3,
@@ -1975,10 +2068,17 @@ mod tests {
         );
         assert_eq!(
             events[2],
-            format!("{{\"type\":\"job_started\",\"peer\":\"{fp_hex}\"}}")
+            format!("{{\"type\":\"job_started\",\"peer\":\"{fp_hex}\",\"id\":null}}")
         );
         assert_eq!(
             events[3],
+            format!(
+                "{{\"type\":\"job_started\",\"peer\":\"{fp_hex}\",\"id\":\"{}\"}}",
+                "cd".repeat(16)
+            )
+        );
+        assert_eq!(
+            events[4],
             format!(
                 "{{\"type\":\"job_done\",\"id\":\"{}\",\"files\":3,\"bytes\":4096,\
                  \"duration_ms\":1523,\"resumed\":7,\"peer\":\"{fp_hex}\"}}",
@@ -1986,7 +2086,7 @@ mod tests {
             )
         );
         assert_eq!(
-            events[4],
+            events[5],
             format!(
                 "{{\"type\":\"job_done\",\"id\":\"{}\",\"files\":1,\"bytes\":0,\
                  \"duration_ms\":0,\"resumed\":0,\"peer\":null}}",
@@ -1994,14 +2094,99 @@ mod tests {
             )
         );
         assert_eq!(
-            events[5],
+            events[6],
             "{\"type\":\"error\",\"message\":\"idle timeout\"}"
         );
-        assert_eq!(events[6], "{\"type\":\"stopped\",\"reason\":\"ctrl-c\"}");
+        assert_eq!(events[7], "{\"type\":\"stopped\",\"reason\":\"ctrl-c\"}");
         for line in events {
             assert!(!line.contains('\n'), "NDJSON line broke: {line}");
             assert!(!line.contains('\r'), "NDJSON line broke: {line}");
         }
+    }
+
+    /// CR-P3-08: `job_started`/`job_done` of ONE job must be pairable by
+    /// an external NDJSON consumer. Two invariants, driven through the
+    /// real emit machinery (the printer closure's `Connected` capture and
+    /// the pure `job_done_line`):
+    ///
+    /// * **peer**: started and done carry the SAME peer string even when
+    ///   the report's own peer field is empty — the `job_started`
+    ///   capture is the fallback. This is the pairing key that always
+    ///   exists (a content id cannot: the engine emits `Connected` before
+    ///   reading the Offer, so no `job_done.id`-namespace id exists at
+    ///   start time — e716a61's finding).
+    /// * **id (format level)**: when started and done carry the same id
+    ///   string, both render it byte-identically (`"id":"<hex>"`), so a
+    ///   consumer pairing by id matches exactly; `null` stays `null`.
+    #[test]
+    fn daemon_started_and_done_events_pair_by_peer_and_id() {
+        let sender_fp = "ab".repeat(32);
+        let task_id = [0xcdu8; 16];
+        let report = Report {
+            job_id: [0x09u8; 16],
+            files: 1,
+            bytes: 10,
+            duration: Duration::from_millis(2),
+            resumed_chunks: 0,
+            // The regression shape: a completion path that lost the peer.
+            peer_fingerprint: None,
+            roots: Vec::new(),
+        };
+
+        // The real start capture: the printer's `Connected` arm fills the
+        // shared slot with the instant AND the peer (it also prints the
+        // started line — the render is asserted via the same event below).
+        let start_slot = Arc::new(Mutex::new(None::<JobStart>));
+        let printer =
+            daemon_progress_printer(true, Arc::clone(&start_slot), Some(job_id_hex(&task_id)));
+        printer(Progress::Connected {
+            peer: sender_fp.clone(),
+        });
+        let started = start_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("Connected captured the job start");
+        assert_eq!(started.peer, sender_fp, "the capture holds the peer");
+
+        // The started line the printer emitted (same construction), and
+        // the done line for a peer-less report: done falls back to the
+        // captured peer, so the events pair.
+        let started_line = DaemonEvent::JobStarted {
+            peer: &started.peer,
+            id: Some(&job_id_hex(&task_id)),
+        }
+        .to_json_line();
+        let done_line = job_done_line(Some(&started), &report);
+        assert!(started_line.contains(&format!("\"peer\":\"{sender_fp}\"")));
+        assert!(
+            done_line.contains(&format!("\"peer\":\"{sender_fp}\"")),
+            "done.peer fell back to the started capture: {done_line}"
+        );
+
+        // Id pairing at the format level: the same id string renders
+        // byte-identically in both event shapes (and null stays null).
+        let same_id = job_id_hex(&report.job_id);
+        let started_with_done_id = DaemonEvent::JobStarted {
+            peer: &sender_fp,
+            id: Some(&same_id),
+        }
+        .to_json_line();
+        assert!(started_with_done_id.contains(&format!("\"id\":\"{same_id}\"")));
+        assert!(done_line.contains(&format!("\"id\":\"{same_id}\"")));
+        let started_null = DaemonEvent::JobStarted {
+            peer: &sender_fp,
+            id: None,
+        }
+        .to_json_line();
+        assert!(started_null.contains("\"id\":null"));
+        assert!(done_line.contains(&format!("\"id\":\"{}\"", job_id_hex(&report.job_id))));
+
+        // Without any Connected capture (a done whose start was never
+        // observed), the report's own peer still renders when present.
+        let mut with_peer = report.clone();
+        with_peer.peer_fingerprint = Some(sender_fp.clone());
+        assert!(job_done_line(None, &with_peer).contains(&format!("\"peer\":\"{sender_fp}\"")));
     }
 
     #[test]

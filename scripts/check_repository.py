@@ -147,7 +147,6 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
         if len(cells) >= 4 and cells[3].strip():
             # Allow: hex hashes (7-40 chars), commit ranges with + or -,
             # or the literal "N/A" for not-applicable rows
-            import re as _re
             valid = cells[3].strip().startswith(tuple("0123456789abcdef")) and len(cells[3].strip()) >= 7
             if not valid and cells[3] not in ('N/A', 'unknown', 'not yet'):
                 errors.append(

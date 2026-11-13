@@ -124,12 +124,34 @@ class ReviewStatusTableTests(unittest.TestCase):
         self.assertIn("expected 5", errors[0])
 
     def test_placeholder_row_fails(self):
+        # H0 (CR-P3-11) commit-prefix gate: "本提交" trips BOTH the
+        # placeholder check and the non-hash check — assert both errors.
         rows_checked, errors = checks.status_table_issues(
             self._doc("| CR-P3-09 | G1 | 代码完成，验收中 | 本提交 | 证据 |")
         )
         self.assertEqual(rows_checked, 1)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any("本提交" in e for e in errors), errors)
+        self.assertTrue(any("non-hash" in e for e in errors), errors)
+
+    def test_non_hash_commit_column_fails(self):
+        # H0 (CR-P3-11): "G6 提交"-style prose placeholders in the commit
+        # column are rejected even without the literal "本提交" marker.
+        rows_checked, errors = checks.status_table_issues(
+            self._doc("| CR-P3-11 | H0 | 已完成 | G6 提交 | CI 绿 |")
+        )
+        self.assertEqual(rows_checked, 1)
         self.assertEqual(len(errors), 1)
-        self.assertIn("本提交", errors[0])
+        self.assertIn("non-hash", errors[0])
+
+    def test_annotated_hash_commit_column_passes(self):
+        # Annotated hashes ("09d4465（服务端）") are real hashes with a
+        # provenance note — startswith-hex keeps them valid (the gate's
+        # stated purpose is catching placeholders, not annotations).
+        rows_checked, errors = checks.status_table_issues(
+            self._doc("| R36-P2-04 | G6 | 已完成 | 09d4465（服务端） | 原因帧 |")
+        )
+        self.assertEqual((rows_checked, errors), (1, []))
 
     def test_escaped_pipe_keeps_five_columns(self):
         # CR-P3-02 shape: \| inside cell text is not a column separator.

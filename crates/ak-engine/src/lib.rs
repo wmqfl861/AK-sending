@@ -193,6 +193,46 @@ const POLICY_GATE_CLOSE_CODE: u32 = 0xA0_01;
 /// precedes it (not even the admission TaskOpen).
 const PEER_MISMATCH_CLOSE_CODE: u32 = 0xA0_02;
 
+/// Optional end-of-transfer transport-stats sink (2026-11-13 review §5.2
+/// follow-up): invoked exactly once per successful transfer with an
+/// [`ak_net::ChannelStats`] snapshot taken from the transfer's QUIC
+/// connection right before the engine returns its [`Report`] — the
+/// congestion-window end value, congestion events, and loss/packet counters
+/// that are otherwise unreachable through the engine path (the engine owns
+/// the connection; callers never see the `quinn::Connection`).
+///
+/// Informational plumbing for benches and operators: the transfer never
+/// depends on the sink, failures inside it do not affect the transfer, and
+/// `None` (the default of every spec) keeps engine behavior identical.
+/// Wrapped in a newtype (not a bare type alias) so the specs keep their
+/// `Debug` derive — the closure itself is not `Debug`.
+///
+/// Field mapping and accounting limits: see `ak_net::ChannelStats` — `cwnd`
+/// is the end-of-transfer sample, and quinn 0.11 exposes no received-packet
+/// counter (the receive-side count is `rx_datagrams`).
+#[derive(Clone)]
+pub struct ChannelStatsSink(std::sync::Arc<dyn Fn(&ak_net::ChannelStats) + Send + Sync>);
+
+impl ChannelStatsSink {
+    /// Wrap one stats consumer; the engine calls it with the snapshot at
+    /// transfer completion (see the type docs).
+    pub fn new(sink: impl Fn(&ak_net::ChannelStats) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(sink))
+    }
+
+    /// Deliver one snapshot (engine-internal: called once per successful
+    /// transfer, immediately before the `Report` is returned).
+    fn notify(&self, stats: &ak_net::ChannelStats) {
+        (self.0)(stats);
+    }
+}
+
+impl std::fmt::Debug for ChannelStatsSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChannelStatsSink(..)")
+    }
+}
+
 /// Sender-side configuration.
 #[derive(Debug, Clone)]
 pub struct SendSpec {
@@ -230,6 +270,11 @@ pub struct SendSpec {
     /// `DirectPolicy::default()` (`allow_internet = true`,
     /// `allow_cellular = false`). A `LocalDirect` path always passes.
     pub policy: DirectPolicy,
+    /// Optional end-of-transfer transport-stats snapshot hook (see
+    /// [`ChannelStatsSink`]); `None` (the default) keeps behavior
+    /// identical. Notified on every completed send, including retry
+    /// passes that re-run the body on a fresh connection.
+    pub stats_sink: Option<ChannelStatsSink>,
     /// Adopted pre-bound UDP socket for the dial (CR-P1-05, review
     /// 2026-11-11 §4.5: both sides' probing/punching must happen on THE
     /// socket that will carry QUIC). Crate-private by design — the ONLY
@@ -266,6 +311,7 @@ impl SendSpec {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             multistream: false,
             policy: DirectPolicy::default(),
+            stats_sink: None,
             adopted_socket: None,
         }
     }
@@ -315,6 +361,10 @@ pub struct ReceiveSpec {
     /// Default: `DirectPolicy::default()` (`allow_internet = true`,
     /// `allow_cellular = false`). A `LocalDirect` path always passes.
     pub policy: DirectPolicy,
+    /// Optional end-of-transfer transport-stats snapshot hook (see
+    /// [`ChannelStatsSink`]); `None` (the default) keeps behavior
+    /// identical. Notified on every completed receive.
+    pub stats_sink: Option<ChannelStatsSink>,
 }
 
 impl ReceiveSpec {
@@ -333,6 +383,7 @@ impl ReceiveSpec {
             checkpoint_dir: std::env::temp_dir().join("ak-sending-checkpoints"),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             policy: DirectPolicy::default(),
+            stats_sink: None,
         }
     }
 }
@@ -2848,6 +2899,14 @@ async fn send_channel_body(
     store.save(&record).map_err(EngineError::Checkpoint)?;
     progress(Progress::Done);
 
+    // End-of-transfer transport-stats snapshot (see `ChannelStatsSink`):
+    // taken after the last payload byte was acked (FinalAck above) and
+    // before the report leaves the engine, so `cwnd` reads the
+    // end-of-transfer window. Informational only; skipped when no sink.
+    if let Some(sink) = &spec.stats_sink {
+        sink.notify(&channel.stats());
+    }
+
     Ok(Report {
         job_id,
         files: manifest.file_count(),
@@ -3304,6 +3363,7 @@ struct JobSpec {
     checkpoint_dir: PathBuf,
     idle_timeout: Duration,
     policy: DirectPolicy,
+    stats_sink: Option<ChannelStatsSink>,
 }
 
 impl JobSpec {
@@ -3316,6 +3376,7 @@ impl JobSpec {
             checkpoint_dir: spec.checkpoint_dir.clone(),
             idle_timeout: spec.idle_timeout,
             policy: spec.policy,
+            stats_sink: spec.stats_sink.clone(),
         }
     }
 }
@@ -3984,6 +4045,14 @@ async fn receive_frozen_body(
             }
         }
         progress(Progress::Done);
+
+        // End-of-transfer transport-stats snapshot (see `ChannelStatsSink`),
+        // receiver side: after the tail hold, so the counters are final
+        // (the sender has observed the FinalAck and closed by now in the
+        // healthy case; quinn keeps the stats queryable after close).
+        if let Some(sink) = &spec.stats_sink {
+            sink.notify(&channel.stats());
+        }
 
         Ok(Report {
             job_id,
@@ -4894,6 +4963,73 @@ mod tests {
         let (files, bytes) = count_entries(dst.path());
         assert_eq!((files, bytes), (2, 8 + 50_000));
         assert!(report.duration.as_nanos() > 0);
+    }
+
+    /// I1 (2026-11-13 review §5.2): the end-of-transfer transport-stats
+    /// hook (`SendSpec`/`ReceiveSpec` `stats_sink`). After a completed
+    /// loopback transfer both sinks must have fired with snapshots of a
+    /// LIVE connection — positive congestion window and packet/byte
+    /// counts on the sender (cwnd = the end-of-transfer value, taken
+    /// right before the `Report` is returned), positive receive counts on
+    /// the receiver — and the byte counts must reflect the payload scale.
+    /// Default-off check: no sink on a spec changes nothing (every other
+    /// transfer test in this module runs sink-less).
+    #[tokio::test]
+    async fn stats_sink_reports_end_of_transfer_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();
+        write(&src.path().join("stats.bin"), &payload);
+
+        let (mut send_spec, mut recv_spec, _) = specs(src.path(), dst.path(), 16);
+        let send_slot: std::sync::Arc<std::sync::Mutex<Option<ak_net::ChannelStats>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recv_slot: std::sync::Arc<std::sync::Mutex<Option<ak_net::ChannelStats>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        send_spec.stats_sink = Some({
+            let slot = std::sync::Arc::clone(&send_slot);
+            ChannelStatsSink::new(move |stats| *slot.lock().unwrap() = Some(*stats))
+        });
+        recv_spec.stats_sink = Some({
+            let slot = std::sync::Arc::clone(&recv_slot);
+            ChannelStatsSink::new(move |stats| *slot.lock().unwrap() = Some(*stats))
+        });
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let receiver = tokio::spawn(receive_with_addr(recv_spec, &noop, addr_tx));
+        send_spec.peer = addr_rx.await.unwrap();
+        let sender_spec = send_spec.clone();
+        let sender = tokio::spawn(async move { send(sender_spec, &noop).await });
+        sender.await.unwrap().expect("send should complete");
+        receiver.await.unwrap().expect("receive should complete");
+
+        let send_stats = send_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("sender stats sink must fire on a successful send");
+        let recv_stats = recv_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("receiver stats sink must fire on a successful receive");
+        assert!(
+            send_stats.cwnd_bytes > 0,
+            "sender cwnd is the live end-of-transfer congestion window: {send_stats:?}"
+        );
+        assert!(
+            send_stats.sent_packets > 0 && send_stats.tx_datagrams > 0,
+            "sender sent packets/datagrams on the transfer path: {send_stats:?}"
+        );
+        assert!(
+            send_stats.tx_bytes >= 50_000,
+            "sender carried the 50k payload inside its QUIC bytes: {send_stats:?}"
+        );
+        assert!(
+            recv_stats.rx_datagrams > 0 && recv_stats.rx_bytes >= 50_000,
+            "receiver observed the payload datagrams: {recv_stats:?}"
+        );
+        assert_eq!(fs::read(dst.path().join("stats.bin")).unwrap(), payload);
     }
 
     /// CR-P1-05 (review 2026-11-11 §4.5): a send whose spec ADOPTED a

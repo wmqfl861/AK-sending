@@ -71,6 +71,11 @@
 //! - `ChannelStats::lost_packets` comes from quinn's internal loss
 //!   detection (retransmission-timeout and probe inference), not from wire
 //!   observation; treat it as a transport-health signal, not ground truth.
+//! - `ChannelStats::cwnd_bytes` is a point-in-time sample of the congestion
+//!   controller's window (the value at the moment `stats()` is called, e.g.
+//!   the end-of-transfer window), not a time series; quinn 0.11 offers no
+//!   received-packet counter, so the receive-side count is
+//!   `rx_datagrams` (UDP datagrams).
 //! - quinn never increments the transmitted-side counter for
 //!   CONNECTION_CLOSE frames, so `tx_frames` can read one lower than the
 //!   peer's `rx_frames` once a connection has closed (see
@@ -641,11 +646,19 @@ fn handshake_error(err: quinn::ConnectionError) -> ConnectError {
 /// | `tx_bytes` / `rx_bytes` | `udp_tx.bytes` / `udp_rx.bytes` — total QUIC bytes inside sent/received UDP datagrams |
 /// | `tx_frames` / `rx_frames` | sum of every counter in `frame_tx` / `frame_rx` — all QUIC frame types |
 /// | `lost_packets` | `path.lost_packets` — packets declared lost by the transport |
+/// | `cwnd_bytes` | `path.cwnd` — the congestion controller's window, sampled when [`DirectChannel::stats`] is called |
+/// | `congestion_events` | `path.congestion_events` — congestion-window reductions counted by the controller |
+/// | `sent_packets` | `path.sent_packets` — packets handed to the socket on the current path (includes PLPMTUD probes) |
+/// | `tx_datagrams` / `rx_datagrams` | `udp_tx.datagrams` / `udp_rx.datagrams` — UDP datagrams observed |
 ///
 /// Byte counts exclude UDP/IP header overhead (see the crate-level known
 /// limitations). Frame totals follow quinn's accounting quirks: PADDING is
 /// never counted and CONNECTION_CLOSE is only counted on the receive side,
 /// so after a close `tx_frames` may be one lower than the peer's `rx_frames`.
+///
+/// Receive-side packet counts: quinn 0.11's `PathStats` has no received-
+/// packet counter (only `sent_packets`); `rx_datagrams` (UDP datagrams) is
+/// the closest receive-side packet count this snapshot can offer.
 ///
 /// Operational use: compare these data-plane counters against the control
 /// plane's session records. A transfer that completed here with only
@@ -664,6 +677,18 @@ pub struct ChannelStats {
     pub rx_frames: u64,
     /// Packets quinn's loss detection declared lost on the current path.
     pub lost_packets: u64,
+    /// Congestion window in bytes at snapshot time (the end-of-transfer
+    /// value when a caller samples after the last payload byte).
+    pub cwnd_bytes: u64,
+    /// Congestion events (congestion-window reductions) quinn counted.
+    pub congestion_events: u64,
+    /// Packets sent on the current path (quinn `path.sent_packets`).
+    pub sent_packets: u64,
+    /// UDP datagrams sent carrying this connection's packets.
+    pub tx_datagrams: u64,
+    /// UDP datagrams received for this connection — the closest
+    /// receive-side packet count quinn 0.11 exposes (see doc above).
+    pub rx_datagrams: u64,
 }
 
 /// Sum every per-type counter of quinn's `FrameStats` into one frame total.
@@ -827,6 +852,11 @@ impl DirectChannel {
             tx_frames: total_frames(&stats.frame_tx),
             rx_frames: total_frames(&stats.frame_rx),
             lost_packets: stats.path.lost_packets,
+            cwnd_bytes: stats.path.cwnd,
+            congestion_events: stats.path.congestion_events,
+            sent_packets: stats.path.sent_packets,
+            tx_datagrams: stats.udp_tx.datagrams,
+            rx_datagrams: stats.udp_rx.datagrams,
         }
     }
 }

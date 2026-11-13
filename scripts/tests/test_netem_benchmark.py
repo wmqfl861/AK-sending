@@ -20,13 +20,33 @@ RUNNER = ROOT / "scripts/run_netem_benchmark.sh"
 BASH = shutil.which("bash")
 TEST_NAME = "netem_delay_50_100ms_256mib_loopback_throughput"
 # Deliberately synthetic numbers, not measurements of AK-sending.
+# Shape-faithful to bench_netem.rs as of I1 (2026-11-13): per-pass bench
+# lines, per-tier quinn stats lines (engine stats_sink snapshots), the
+# tls.rs EXPERIMENTAL override announcement on stderr, the A/B arm's own
+# bench/stats/host-counter lines, and the A/B summary row + comparison line.
 SAMPLE = """running 1 test
-[netem summary] 268435456 bytes (8 x 32 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection):
+[netem bench] generated 8 x 32 MiB deterministic tree in 1.10s
+[bench      baseline] 268435456 bytes (8 x 32 MiB): wall 1.28s (200.0 MiB/s) | engine send 1.26s (203.2 MiB/s) | engine recv 1.27s (201.6 MiB/s)
+[netem bench] baseline host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
+[netem bench] baseline quinn stats: sender cwnd=13107200B congestion_events=0 lost_packets=15 sent_packets=218000 tx_bytes=268470000 rx_datagrams=219000 | receiver cwnd=13107200B congestion_events=0 lost_packets=9 sent_packets=219000 tx_bytes=1900000 rx_datagrams=218000
+[bench     netem-50ms] 268435456 bytes (8 x 32 MiB): wall 2.60s (98.6 MiB/s) | engine send 2.58s (99.4 MiB/s) | engine recv 2.59s (99.0 MiB/s)
+[netem bench] delay 50ms host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
+[netem bench] delay 50ms quinn stats: sender cwnd=13107200B congestion_events=2 lost_packets=900 sent_packets=220000 tx_bytes=268470000 rx_datagrams=221000 | receiver cwnd=13107200B congestion_events=2 lost_packets=950 sent_packets=221000 tx_bytes=1900000 rx_datagrams=220000
+[bench    netem-100ms] 268435456 bytes (8 x 32 MiB): wall 5.06s (50.7 MiB/s) | engine send 5.04s (50.9 MiB/s) | engine recv 5.05s (50.8 MiB/s)
+[netem bench] delay 100ms host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
+[netem bench] delay 100ms quinn stats: sender cwnd=13107200B congestion_events=4 lost_packets=1800 sent_packets=222000 tx_bytes=268470000 rx_datagrams=223000 | receiver cwnd=13107200B congestion_events=4 lost_packets=1900 sent_packets=223000 tx_bytes=1900000 rx_datagrams=222000
+[ak-net] EXPERIMENTAL AK_EXP_QUIC_WINDOW_KIB=1280: overriding all three CR-P2-04 flow-control windows with 1310720 bytes (1280 KiB) - hidden debug knob, never a production setting
+[bench netem-100ms-win1280kib] 268435456 bytes (8 x 32 MiB): wall 32.00s (8.0 MiB/s) | engine send 31.98s (8.0 MiB/s) | engine recv 31.99s (8.0 MiB/s)
+[netem bench] A/B 1280KiB host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
+[netem bench] A/B 1280KiB quinn stats: sender cwnd=1310720B congestion_events=0 lost_packets=60 sent_packets=260000 tx_bytes=268470000 rx_datagrams=261000 | receiver cwnd=1310720B congestion_events=0 lost_packets=80 sent_packets=261000 tx_bytes=1900000 rx_datagrams=260000
+[netem summary] 268435456 bytes (8 x 32 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection; A/B arm re-runs delay 100ms with quinn default 1.25 MiB windows via AK_EXP_QUIC_WINDOW_KIB=1280):
 shape                      wall    MiB/s      RTTs  vs baseline
 no-netem               640.00ms    100.0         -         1.00x
 delay 50ms                1.60s     40.0       16.0         0.40x
 delay 100ms               3.20s     20.0       16.0         0.20x
-[netem bench] baseline host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0
+A/B 1280KiB              32.00s      8.0     160.0         0.08x
+[netem A/B] delay 100ms (RTT ~200ms): CR-P2-04 8 MiB windows 20.0 MiB/s (16.0 RTTs) vs quinn defaults 1.25 MiB (AK_EXP_QUIC_WINDOW_KIB=1280) 8.0 MiB/s (160.0 RTTs) -> defaults/8MiB throughput ratio 0.40x (informational; the collapse tripwire is asserted on the default arm only)
+[netem reference] both directions traverse lo, so RTT ~ 2 x delay; single-stream caps at these RTTs: quinn defaults (1.25 MiB stream window) ~12.5 MiB/s @100ms / ~6.25 @200ms; CR-P2-04 8 MiB windows ~80 / ~40 MiB/s (ideal, before slow-start ramp and engine overhead); ramp-inclusive 256 MiB estimate with an effective 8 MiB window ~42 RTTs (~61 / ~30 MiB/s). The A/B row/line measures the default-window case directly on this box; per-tier quinn stats (cwnd end value, congestion events, loss/packet counters, both sides) print above each tier - cwnd plateauing far below the window or congestion events climbing there is the review's other-bottleneck signal. Loopback + artificial delay only - not a real-WAN claim.
 [netem bench] cleanup verified: dev lo carries no netem qdisc
 test netem_delay_50_100ms_256mib_loopback_throughput ... ok
 
@@ -276,6 +296,60 @@ python3() {
         self.assertEqual(result.returncode, 0, result.stderr)
         for value in ("640.00ms", "1.60s", "3.20s", "100.0", "40.0", "20.0", "MiB/s"):
             self.assertIn(value, result.stdout)
+
+    def test_accepts_quinn_stats_and_ab_arm_evidence(self):
+        # I1 (2026-11-13 review 5.2 follow-up): the validator must require
+        # the per-tier quinn stats lines, the tls.rs override-activation
+        # announcement (stderr is merged into benchmark.log by the runner)
+        # and the A/B arm's row + comparison line -- and surface them in
+        # the parsed-sample table it emits.
+        result = self.validate(SAMPLE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for fragment in (
+            "| A/B 1280KiB (quinn 1.25 MiB defaults) | 100 | 200 | 32.00s | 8.0 | 160.0 | 0.08x |",
+            "defaults/8MiB ratio 0.40x",
+            "Per-tier quinn stats lines",
+        ):
+            self.assertIn(fragment, result.stdout)
+
+    def test_rejects_missing_dead_or_duplicated_quinn_stats_lines(self):
+        stats_line = next(
+            line for line in SAMPLE.splitlines()
+            if line.startswith("[netem bench] delay 100ms quinn stats")
+        )
+        cases = [
+            # A whole tier's stats line gone.
+            SAMPLE.replace(stats_line + "\n", ""),
+            # Dead snapshot: sender cwnd of 0 cannot be a live transfer.
+            SAMPLE.replace(stats_line, stats_line.replace("cwnd=13107200B", "cwnd=0B", 1)),
+            # A dropped field breaks the strict stats-line shape.
+            SAMPLE.replace(" lost_packets=1800", "", 1),
+            # Two stats lines for one tier.
+            SAMPLE.replace(stats_line + "\n", stats_line + "\n" + stats_line + "\n", 1),
+        ]
+        for index, text in enumerate(cases):
+            with self.subTest(index=index):
+                self.assertNotEqual(self.validate(text).returncode, 0)
+
+    def test_rejects_missing_override_activation_or_ab_lines(self):
+        activation = next(
+            line for line in SAMPLE.splitlines() if line.startswith("[ak-net] EXPERIMENTAL")
+        )
+        ab_row = next(line for line in SAMPLE.splitlines() if line.startswith("A/B 1280KiB"))
+        ab_comparison = next(
+            line for line in SAMPLE.splitlines() if line.startswith("[netem A/B]")
+        )
+        cases = [
+            SAMPLE.replace(activation + "\n", ""),
+            SAMPLE.replace(ab_row + "\n", ""),
+            SAMPLE.replace(ab_row + "\n", ab_row + "\n" + ab_row + "\n", 1),
+            SAMPLE.replace(ab_comparison + "\n", ""),
+            # Zero throughput in the A/B comparison line is not a sample.
+            SAMPLE.replace(ab_comparison, ab_comparison.replace("8.0 MiB/s", "0.0 MiB/s")),
+        ]
+        for index, text in enumerate(cases):
+            with self.subTest(index=index):
+                self.assertNotEqual(self.validate(text).returncode, 0)
 
     def test_rejects_skip_even_with_three_numeric_samples(self):
         result = self.validate(SAMPLE + "[netem bench] SKIP: fixture\n")

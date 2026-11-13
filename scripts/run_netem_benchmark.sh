@@ -55,8 +55,8 @@ try:
     text = Path(sys.argv[1]).read_text(encoding="utf-8")
     if re.search(r"\bSKIP\b", text, re.IGNORECASE):
         raise ValueError("benchmark printed SKIP; NOT-MEASURED")
-    if "[netem summary] 268435456 bytes (8 x 32 MiB)" not in text:
-        raise ValueError("missing 256 MiB netem summary")
+    if "[netem summary] 268435456 bytes (8 x 32 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection; A/B arm re-runs delay 100ms with quinn default 1.25 MiB windows via AK_EXP_QUIC_WINDOW_KIB=1280):" not in text:
+        raise ValueError("missing 256 MiB netem summary (with the A/B arm note)")
     if "[netem bench] cleanup verified: dev lo carries no netem qdisc" not in text:
         raise ValueError("benchmark cleanup was not verified")
     if not re.search(r"^test result: ok\. 1 passed; 0 failed; 0 ignored;", text, re.MULTILINE):
@@ -75,6 +75,49 @@ try:
         if not all(math.isfinite(float(v)) for v in (wall, throughput, ratio)) or float(wall) <= 0 or float(throughput) <= 0:
             raise ValueError(f"non-positive/non-finite sample for {label}")
         rows.append(f"| {label} | {delay} | {rtt} | {wall}{unit} | {throughput} | {rtts} | {ratio}x |")
+    # A/B arm row (I1, 2026-11-13 review 5.2): same columns and shaping as
+    # the delay-100ms tier, quinn default 1.25 MiB windows via the tls.rs
+    # experimental override. Informational -- parsed and reported, never
+    # asserted against a floor (the collapse tripwire is default-arm only).
+    ab_label = "A/B 1280KiB"
+    lines = re.findall(rf"^{re.escape(ab_label)}\s+.*$", text, re.MULTILINE)
+    if len(lines) != 1:
+        raise ValueError(f"expected one numeric sample for {ab_label}, got {len(lines)}")
+    match = re.fullmatch(rf"{re.escape(ab_label)}\s+{duration}\s+({number})\s+({number}|-|inf)\s+({number})x\s*", lines[0])
+    if not match:
+        raise ValueError(f"invalid numeric sample or units for {ab_label}")
+    wall, unit, throughput, rtts, ratio = match.groups()
+    if not all(math.isfinite(float(v)) for v in (wall, throughput, ratio)) or float(wall) <= 0 or float(throughput) <= 0:
+        raise ValueError(f"non-positive/non-finite sample for {ab_label}")
+    rows.append(f"| {ab_label} (quinn 1.25 MiB defaults) | 100 | 200 | {wall}{unit} | {throughput} | {rtts} | {ratio}x |")
+    # Per-tier quinn stats lines (I1): exactly one per tier, numeric, and
+    # the sender side must show a live connection (cwnd/packets/bytes > 0)
+    # plus receiver rx datagrams -- all-zero stats would mean the sink
+    # plumbing fired on a dead snapshot instead of the transfer.
+    stats_fields = (r"cwnd=([0-9]+)B congestion_events=([0-9]+) lost_packets=([0-9]+) "
+                    r"sent_packets=([0-9]+) tx_bytes=([0-9]+) rx_datagrams=([0-9]+)")
+    for label in ("baseline", "delay 50ms", "delay 100ms", "A/B 1280KiB"):
+        pattern = rf"^\[netem bench\] {re.escape(label)} quinn stats: sender {stats_fields} \| receiver {stats_fields}\s*$"
+        found = [line for line in text.splitlines() if re.fullmatch(pattern, line)]
+        if len(found) != 1:
+            raise ValueError(f"expected one quinn stats line for {label}, got {len(found)}")
+        stats = re.fullmatch(pattern, found[0]).groups()
+        sender_cwnd, _sender_events, _sender_lost, sender_sent, sender_tx, _sender_rx = stats[:6]
+        _recv_cwnd, _recv_events, _recv_lost, _recv_sent, _recv_tx, recv_rx = stats[6:]
+        if min(int(sender_cwnd), int(sender_sent), int(sender_tx), int(recv_rx)) <= 0:
+            raise ValueError(f"quinn stats line for {label} shows a dead snapshot (zero cwnd/packets/bytes)")
+    # A/B activation proof: tls.rs announces the experimental override on
+    # stderr when (and only when) a transport config is built with the
+    # variable set; without this line the A/B row may silently be another
+    # default-window pass.
+    if not re.search(r"^\[ak-net\] EXPERIMENTAL AK_EXP_QUIC_WINDOW_KIB=1280: overriding all three CR-P2-04 flow-control windows with [0-9]+ bytes \(1280 KiB\) - hidden debug knob, never a production setting$", text, re.MULTILINE):
+        raise ValueError("A/B override activation line missing (AK_EXP_QUIC_WINDOW_KIB=1280 never announced)")
+    ab_line = re.search(r"^\[netem A/B\] delay 100ms \(RTT ~200ms\): CR-P2-04 8 MiB windows ([0-9.]+) MiB/s \(([0-9.]+) RTTs\) vs quinn defaults 1\.25 MiB \(AK_EXP_QUIC_WINDOW_KIB=1280\) ([0-9.]+) MiB/s \(([0-9.]+) RTTs\) -> defaults/8MiB throughput ratio ([0-9.]+)x \(informational; the collapse tripwire is asserted on the default arm only\)$", text, re.MULTILINE)
+    if not ab_line:
+        raise ValueError("missing or malformed [netem A/B] comparison line")
+    ab_8mib_tp, ab_8mib_rtts, ab_default_tp, ab_default_rtts, ab_ratio = ab_line.groups()
+    if not all(math.isfinite(float(v)) and float(v) > 0 for v in (ab_8mib_tp, ab_default_tp)) or not math.isfinite(float(ab_ratio)):
+        raise ValueError("non-positive/non-finite values in the [netem A/B] comparison line")
     # The Rust test owns all correctness/floor assertions; never override them.
     # The RTTs column is informational (the unshaped baseline prints a
     # literal '-': the wall/RTT ratio is undefined without shaping) --
@@ -82,6 +125,9 @@ try:
     print("| Shape | One-way delay (ms) | Approx. added RTT (ms) | Wall time | Throughput (MiB/s) | RTTs (informational) | vs baseline |")
     print("|---|---:|---:|---:|---:|---:|---:|")
     print("\n".join(rows))
+    print()
+    print(f"A/B (delay 100ms, RTT ~200ms): 8 MiB windows {ab_8mib_tp} MiB/s ({ab_8mib_rtts} RTTs) vs quinn 1.25 MiB defaults {ab_default_tp} MiB/s ({ab_default_rtts} RTTs), defaults/8MiB ratio {ab_ratio}x -- informational, no assertion.")
+    print("Per-tier quinn stats lines (sender cwnd end value, congestion events, loss/packet counters, both sides) validated present for baseline, delay 50ms, delay 100ms and the A/B arm; see benchmark.log.")
 except (OSError, ValueError) as error:
     sys.exit(f"measurement validation failed: {error}")
 PY
@@ -168,7 +214,7 @@ write_summary() {
       printf '## Parsed samples (accepted only when status is MEASURED)\n\n'
       while IFS= read -r line; do printf '%s\n' "$line"; done < "$output_dir/metrics.md"
     else
-      printf 'No validated three-sample table. See benchmark.log and validation.log if present.\n'
+      printf 'No validated sample table. See benchmark.log and validation.log if present.\n'
     fi
   } > "$output_dir/summary.md"
 }

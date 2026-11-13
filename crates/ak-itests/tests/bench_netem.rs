@@ -42,29 +42,33 @@
 //! （8 MiB 窗在 RTT 100/200 ms 约 80/40 MiB/s，未计慢启动爬坡与
 //! 引擎开销）对照阅读。
 //!
-//! 对照与证据口径（2026-11-13 H3，CR-P3-13 §5.2 的三条要求与本文件
-//! 的如实边界）：
+//! 对照与证据口径（2026-11-13 H3 起；I1 批次 2026-11-13 把复核 §5.2
+//! 点名的两处"不可达"补齐为可达）：
 //! - **RTT 数列**：汇总表每档打印 `wall / RTT`——8 MiB 窗生效时
 //!   256 MiB 约 42 个 RTT（爬坡 9–10 + 256/8），实测显著超出即说明
 //!   瓶颈在别处（拥塞控制 / UDP 收发缓冲 / 引擎节奏）。
-//! - **quinn `Connection::stats()`（cwnd/拥塞事件/丢包）**：API 在本
-//!   路径**不可达**——引擎在 `ak_engine::send`/`receive_with_addr`
-//!   内部驱动 QUIC，既不暴露 `quinn::Connection` 也没有 stats 钩子，
-//!   `ak_net` 的 `Channel::stats()`（`ChannelStats`）只在引擎不经过
-//!   的裸 Channel API 上。打通它需要 ak-net/ak-engine 的接口增补
-//!   （如 `ChannelStats` 增加 cwnd/拥塞事件或 `Report` 携带传输统
-//!   计），超出本文件权限——待后续批次落地后在此补打印。当前每档
-//!   打印**可达的**主机级证据：`lo` 收发字节/包/丢包
+//! - **quinn `Connection::stats()`（cwnd/拥塞事件/丢包/收发包数）**：
+//!   I1 起可达——`ChannelStats`（ak-net）扩了 cwnd 末值/拥塞事件/
+//!   path 发包数/UDP 收发数据报数，引擎（ak-engine）在发送与接收
+//!   两条路径的 `Report` 返回前用 `SendSpec`/`ReceiveSpec` 的
+//!   `stats_sink` 钩子把末值快照递给本 bench（见 `PassStats` 与
+//!   `print_quinn_stats`）。每档打印 sender/receiver 两行合一的
+//!   stats 行（信息性，不断言）。quinn 0.11 没有收方向的包计数，
+//!   收侧以 `rx_datagrams`（UDP 数据报数）近似——字段语义见
+//!   `ak_net::ChannelStats` 文档。
+//! - **默认窗口实测对照（A/B 臂）**：I1 起可达——`ak-net tls.rs` 提供
+//!   隐藏实验开关 `AK_EXP_QUIC_WINDOW_KIB`（默认关，生产零变化；
+//!   语义见 tls.rs），RTT≈200 ms 档在默认臂（CR-P2-04 8 MiB 常量
+//!   表）之后设 `AK_EXP_QUIC_WINDOW_KIB=1280`（= quinn 默认
+//!   1.25 MiB 流/连接窗）重跑一轮，打同一张表的 `A/B 1280KiB` 行与
+//!   一条 `[netem A/B]` 对照行（吞吐+RTT 数）。**坍塌绊线断言只保留
+//!   在默认臂上**，A/B 臂纯信息。tls.rs 在覆写生效时向 stderr 打
+//!   一行 EXPERIMENTAL 公告（每次取值变化一行），runner 校验器据
+//!   此确认 A/B 臂确实带覆写跑了。
+//! - 主机级证据照旧：每档打印 `lo` 收发字节/包/丢包
 //!   （`/proc/net/dev`）与 UDP 栈 `RcvbufErrors`/`SndbufErrors`
 //!   （`/proc/net/snmp`）的档前/档后差值——复核点名的两个候选瓶颈
 //!   （UDP 收发缓冲）正落在这里。
-//! - **默认窗口实测对照**：8 MiB 窗是 `ak-net tls.rs` 的编译期常量
-//!   表（无运行时开关），本文件无法在同套测试里切回 quinn 默认
-//!   1.25 MiB 窗跑对照——需要 tls.rs 提供测试用覆写入口（超出本
-//!   文件权限，待后续批次）。当前对照以汇总表/参考行的解析值给出
-//!   （默认窗 ~12.5/6.25 MiB/s、8 MiB 窗 ~80/40 MiB/s @RTT 100/200
-//!   ms），并按 §5.2 口径声明：实测数字**只支持**“窗口已不再是
-//!   1.25 MiB 默认值造成的瓶颈；8 MiB 的收益待测”。
 //!
 //! 如实记录：本文件尚无任何 Linux 特权环境实测数字（Windows 开发机
 //! 只能验证跳过路径）；首个特权运行后把数字补记在此。
@@ -75,11 +79,17 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use common::{mib_per_sec, run_bench_pass, write_file, BenchPass, Lcg, TransferOpts};
+use ak_engine::{receive_with_addr, send, ChannelStatsSink, ReceiveSpec, SendSpec};
+use ak_net::ChannelStats;
+use common::{
+    assert_no_part_files, assert_trees_identical, mib_per_sec, write_file, BenchPass, Lcg,
+};
 
 const FILE_COUNT: usize = 8;
 const FILE_MIB: usize = 32;
@@ -308,25 +318,195 @@ fn print_host_counters(label: &str, before: Option<HostCounters>, after: Option<
     }
 }
 
-/// One timed 256 MiB single-stream pass (engine-default chunk, window 32).
-/// Byte-correctness assertions (byte-identical tree, counts, no `.akpart`)
-/// live inside `run_bench_pass`.
-async fn run_pass(src: &Path, label: &str) -> BenchPass {
-    let opts = TransferOpts {
-        multistream: false,
-        in_flight_window: IN_FLIGHT_WINDOW,
-        ..TransferOpts::default()
-    };
-    run_bench_pass(
-        src,
-        label,
-        &format!("{FILE_COUNT} x {FILE_MIB} MiB"),
-        FILE_COUNT as u64,
-        TOTAL_BYTES,
-        BUDGET_SECS,
-        opts,
-    )
+/// A/B arm override value (2026-11-13 review §5.2): 1280 KiB = quinn's
+/// default 1.25 MiB stream/connection windows, applied via the tls.rs
+/// hidden experimental knob `AK_EXP_QUIC_WINDOW_KIB` (see the module docs
+/// and `crates/ak-net/src/tls.rs`).
+const AB_WINDOW_KIB: &str = "1280";
+
+/// Tier label of the A/B arm everywhere it prints (stats line, host
+/// counters, summary-table row, comparison line). Deliberately distinct
+/// from the three strict sample labels (`no-netem`, `delay 50ms`,
+/// `delay 100ms`) the runner validator counts — a label collision would
+/// make that validator see "two samples" and fail the run.
+const AB_LABEL: &str = "A/B 1280KiB";
+
+/// Environment variable of the tls.rs window override (mirrored here for
+/// the set/remove around the A/B pass; the definition lives in ak-net).
+const AB_WINDOW_ENV: &str = "AK_EXP_QUIC_WINDOW_KIB";
+
+/// Both sides' end-of-transfer quinn stats for one pass. Captured through
+/// the engine's `stats_sink` hook (I1, 2026-11-13): the engine owns the
+/// `quinn::Connection`, so the bench cannot read `Connection::stats()`
+/// directly — the sink receives a `ChannelStats` snapshot right before
+/// each side's `Report` is returned (cwnd = end-of-transfer value).
+struct PassStats {
+    send: ChannelStats,
+    recv: ChannelStats,
+}
+
+/// One timed 256 MiB single-stream pass (engine-default chunk, app window
+/// [`IN_FLIGHT_WINDOW`]), capturing both sides' end-of-transfer quinn
+/// stats via the engine's `stats_sink`.
+///
+/// Local pass runner (not `common::run_bench_pass`): the shared harness
+/// builds its own specs and cannot attach the engine's stats sink without
+/// edits outside this file's domain. The spec shape mirrors
+/// `common::try_run_transfer_opts` exactly (sender 0.0.0.0:0, receiver
+/// 127.0.0.1:0, single stream, engine-default chunk, fresh identities and
+/// checkpoint dirs per pass), and every byte-correctness assertion of
+/// `run_bench_pass` is kept: file/byte counts on both reports, matching
+/// job ids, a fresh (non-resumed) transfer, byte-identical trees, no
+/// `.akpart` residue. Speed is never asserted here (floors live at the
+/// tier level, on the default arm only).
+///
+/// Also asserts the stats plumbing itself: a successful pass must have
+/// notified BOTH sinks — a silent plumbing regression fails loudly instead
+/// of printing empty stats lines.
+async fn run_pass(src: &Path, label: &str) -> (BenchPass, PassStats) {
+    // Wall clock starts before identity generation, exactly like
+    // `common::run_bench_pass` starts before `try_run_transfer_opts`, so
+    // this bench's numbers stay comparable with the H3/CR-P3-13 runs.
+    let started = Instant::now();
+    let dst = tempfile::tempdir().expect("dst tempdir");
+    let sender_key = ak_identity::DeviceKeyPair::generate();
+    let receiver_key = ak_identity::DeviceKeyPair::generate();
+    let sender_bundle = ak_identity::tls::make_self_signed(&sender_key);
+    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    // Fresh checkpoint dirs per pass so passes never share transfer state.
+    let send_ckpt = tempfile::tempdir().unwrap();
+    let recv_ckpt = tempfile::tempdir().unwrap();
+
+    let mut send_spec = SendSpec::new(
+        src.to_path_buf(),
+        // Peer placeholder; replaced by the receiver's reported address.
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        receiver_key.fingerprint(),
+        sender_bundle,
+    );
+    send_spec.device_name = "ak-itests-netem-sender".into();
+    send_spec.in_flight_window = IN_FLIGHT_WINDOW;
+    send_spec.checkpoint_dir = send_ckpt.path().to_path_buf();
+
+    let mut recv_spec = ReceiveSpec::new(dst.path().to_path_buf(), receiver_bundle);
+    recv_spec.device_name = "ak-itests-netem-receiver".into();
+    // Port 0 and loopback only (same shape as the shared harness; never the
+    // default 0.0.0.0:7100).
+    recv_spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    recv_spec.chunk_size = send_spec.chunk_size;
+    recv_spec.checkpoint_dir = recv_ckpt.path().to_path_buf();
+
+    // Stats capture: one slot per side; the engine notifies each sink once,
+    // right before its Report is returned.
+    let send_slot: Arc<Mutex<Option<ChannelStats>>> = Arc::new(Mutex::new(None));
+    let recv_slot: Arc<Mutex<Option<ChannelStats>>> = Arc::new(Mutex::new(None));
+    {
+        let slot = Arc::clone(&send_slot);
+        send_spec.stats_sink = Some(ChannelStatsSink::new(move |stats| {
+            *slot.lock().expect("send stats slot") = Some(*stats);
+        }));
+    }
+    {
+        let slot = Arc::clone(&recv_slot);
+        recv_spec.stats_sink = Some(ChannelStatsSink::new(move |stats| {
+            *slot.lock().expect("recv stats slot") = Some(*stats);
+        }));
+    }
+
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver =
+        tokio::spawn(async move { receive_with_addr(recv_spec, &|_| {}, addr_tx).await });
+    let recv_local_addr = addr_rx.await.expect("receiver must report its address");
+    send_spec.peer = recv_local_addr;
+    let sender = tokio::spawn(async move { send(send_spec, &|_| {}).await });
+
+    let joined = tokio::time::timeout(Duration::from_secs(BUDGET_SECS), async {
+        (receiver.await, sender.await)
+    })
     .await
+    .unwrap_or_else(|_| panic!("[bench {label}] pass did not finish within {BUDGET_SECS}s"));
+    let wall = started.elapsed();
+
+    let (recv_result, send_result) = joined;
+    let send_report = send_result
+        .expect("sender task must not panic")
+        .unwrap_or_else(|e| panic!("[bench {label}] send failed: {e:?}"));
+    let recv_report = recv_result
+        .expect("receiver task must not panic")
+        .unwrap_or_else(|e| panic!("[bench {label}] receive failed: {e:?}"));
+
+    // Correctness only — never speed (mirrors run_bench_pass exactly).
+    assert_eq!(
+        send_report.files, FILE_COUNT as u64,
+        "[bench {label}] file count"
+    );
+    assert_eq!(send_report.bytes, TOTAL_BYTES, "[bench {label}] byte count");
+    assert_eq!(
+        recv_report.bytes, TOTAL_BYTES,
+        "[bench {label}] receiver byte count"
+    );
+    assert_eq!(send_report.job_id, recv_report.job_id);
+    assert_eq!(
+        send_report.resumed_chunks, 0,
+        "[bench {label}] fresh full transfer"
+    );
+    assert_trees_identical(src, dst.path());
+    assert_no_part_files(dst.path());
+
+    // Plumbing invariant: a successful pass must have produced BOTH stats
+    // snapshots (the engine notifies on the Report path; a None here is a
+    // regression in the sink plumbing, not a transfer failure).
+    let stats = PassStats {
+        send: send_slot
+            .lock()
+            .expect("send stats slot")
+            .take()
+            .expect("[bench {label}] sender stats sink never fired"),
+        recv: recv_slot
+            .lock()
+            .expect("recv stats slot")
+            .take()
+            .expect("[bench {label}] receiver stats sink never fired"),
+    };
+
+    let wall_tp = mib_per_sec(TOTAL_BYTES, wall);
+    let send_tp = mib_per_sec(TOTAL_BYTES, send_report.duration);
+    let recv_tp = mib_per_sec(TOTAL_BYTES, recv_report.duration);
+    println!(
+        "[bench {label:>13}] {TOTAL_BYTES} bytes ({FILE_COUNT} x {FILE_MIB} MiB): wall {wall:.2?} ({wall_tp:.1} MiB/s) | engine send {:.2?} ({send_tp:.1} MiB/s) | engine recv {:.2?} ({recv_tp:.1} MiB/s)",
+        send_report.duration, recv_report.duration,
+    );
+    (
+        BenchPass {
+            wall,
+            send: send_report.duration,
+            recv: recv_report.duration,
+        },
+        stats,
+    )
+}
+
+/// Print one tier's quinn stats line (I1, informational — never asserted at
+/// this layer; the runner validator only checks the line is present and
+/// numeric). One line carries both sides; quinn 0.11 has no received-PACKET
+/// counter, so the receive side reports `rx_datagrams` (see
+/// `ak_net::ChannelStats`).
+fn print_quinn_stats(tier: &str, stats: &PassStats) {
+    println!(
+        "[netem bench] {tier} quinn stats: sender cwnd={}B congestion_events={} lost_packets={} sent_packets={} tx_bytes={} rx_datagrams={} | receiver cwnd={}B congestion_events={} lost_packets={} sent_packets={} tx_bytes={} rx_datagrams={}",
+        stats.send.cwnd_bytes,
+        stats.send.congestion_events,
+        stats.send.lost_packets,
+        stats.send.sent_packets,
+        stats.send.tx_bytes,
+        stats.send.rx_datagrams,
+        stats.recv.cwnd_bytes,
+        stats.recv.congestion_events,
+        stats.recv.lost_packets,
+        stats.recv.sent_packets,
+        stats.recv.tx_bytes,
+        stats.recv.rx_datagrams,
+    );
 }
 
 /// Single-stream throughput under simulated public-internet RTT (`tc netem`
@@ -399,8 +579,9 @@ async fn netem_delay_50_100ms_256mib_loopback_throughput() {
     );
 
     let baseline_before = read_host_counters();
-    let baseline = run_pass(&src, "baseline").await;
+    let (baseline, baseline_stats) = run_pass(&src, "baseline").await;
     print_host_counters("baseline", baseline_before, read_host_counters());
+    print_quinn_stats("baseline", &baseline_stats);
     let baseline_tp = mib_per_sec(TOTAL_BYTES, baseline.wall);
     assert!(
         baseline_tp >= BASELINE_FLOOR_MIB_PER_S,
@@ -445,12 +626,13 @@ async fn netem_delay_50_100ms_256mib_loopback_throughput() {
         );
 
         let tier_before = read_host_counters();
-        let pass = run_pass(&src, &format!("netem-{delay_ms}ms")).await;
+        let (pass, pass_stats) = run_pass(&src, &format!("netem-{delay_ms}ms")).await;
         print_host_counters(
             &format!("delay {delay_ms}ms"),
             tier_before,
             read_host_counters(),
         );
+        print_quinn_stats(&format!("delay {delay_ms}ms"), &pass_stats);
         let tp = mib_per_sec(TOTAL_BYTES, pass.wall);
         assert!(
             tp >= floor_mib_per_s,
@@ -459,11 +641,41 @@ async fn netem_delay_50_100ms_256mib_loopback_throughput() {
         shaped.push((delay_ms, pass));
     }
 
+    // A/B arm (I1, 2026-11-13 review §5.2): re-run the RTT≈200 ms tier
+    // (the last SHAPES entry still shapes `lo`) with quinn's DEFAULT
+    // 1.25 MiB windows via the tls.rs hidden experimental override — the
+    // same product transport-config path, one runtime knob. The collapse
+    // tripwire above is deliberately DEFAULT-ARM ONLY: this arm exists to
+    // measure how much slower the old defaults are, so its numbers are
+    // informational (printed, never asserted). The env flip is safe here:
+    // single test process (--test-threads=1 in the runner, the only test
+    // in this binary), strictly between passes, and each pass builds
+    // fresh endpoints/connections that read the variable at config time.
+    let ab_delay_ms = SHAPES
+        .last()
+        .map(|&(delay_ms, _)| delay_ms)
+        .expect("SHAPES is non-empty");
+    let (ab_state_ok, ab_state_text) = run_tc(&["qdisc", "show", "dev", LOOP_DEV]);
+    assert!(
+        ab_state_ok && ab_state_text.contains("netem"),
+        "netem qdisc not visible on dev {LOOP_DEV} before the A/B pass (shaping silently absent): {ab_state_text}"
+    );
+    std::env::set_var(AB_WINDOW_ENV, AB_WINDOW_KIB);
+    let ab_before = read_host_counters();
+    let (ab_pass, ab_stats) = run_pass(&src, "netem-100ms-win1280kib").await;
+    print_host_counters(AB_LABEL, ab_before, read_host_counters());
+    print_quinn_stats(AB_LABEL, &ab_stats);
+    // The env is process-global: restore the constant-table windows so no
+    // later code in this process inherits the override. tls.rs announces
+    // both the override and this restore on stderr (once per state
+    // change); the runner validator pins the override announcement.
+    std::env::remove_var(AB_WINDOW_ENV);
+
     // Informational summary: the numbers are the point; only the floors
     // above are asserted.
     println!();
     println!(
-        "[netem summary] {TOTAL_BYTES} bytes ({FILE_COUNT} x {FILE_MIB} MiB), single stream, engine-default chunk, in-flight window {IN_FLIGHT_WINDOW} (QUIC windows: CR-P2-04 8 MiB send/stream/connection):"
+        "[netem summary] {TOTAL_BYTES} bytes ({FILE_COUNT} x {FILE_MIB} MiB), single stream, engine-default chunk, in-flight window {IN_FLIGHT_WINDOW} (QUIC windows: CR-P2-04 8 MiB send/stream/connection; A/B arm re-runs delay {ab_delay_ms}ms with quinn default 1.25 MiB windows via {AB_WINDOW_ENV}={AB_WINDOW_KIB}):"
     );
     println!(
         "{:<14} {:>16} {:>8} {:>8} {:>12}",
@@ -489,8 +701,33 @@ async fn netem_delay_50_100ms_256mib_loopback_throughput() {
             tp / baseline_tp.max(f64::EPSILON)
         );
     }
+    // A/B row: same columns, same shaping as the delay-100ms tier, quinn
+    // default windows. Informational — no tripwire on this arm.
+    let ab_tp = mib_per_sec(TOTAL_BYTES, ab_pass.wall);
+    let ab_rtts = ab_pass.wall.as_secs_f64() / (ab_delay_ms as f64 / 1000.0 * 2.0);
     println!(
-        "[netem reference] both directions traverse lo, so RTT ~ 2 x delay; single-stream caps at these RTTs: quinn defaults (1.25 MiB stream window) ~12.5 MiB/s @100ms / ~6.25 @200ms; CR-P2-04 8 MiB windows ~80 / ~40 MiB/s (ideal, before slow-start ramp and engine overhead); ramp-inclusive 256 MiB estimate with an effective 8 MiB window ~42 RTTs (~61 / ~30 MiB/s). Measured numbers only support 'the 1.25 MiB default is no longer the bottleneck; the 8 MiB gain is yet to be proven' (review 2026-11-13 section 5.2) - a default-window A/B needs a tls.rs override knob (not reachable from this bench) and per-connection cwnd/loss counters need an ak-net/ak-engine stats hook. Loopback + artificial delay only - not a real-WAN claim."
+        "{:<14} {:>16.2?} {:>8.1} {:>8.1} {:>12.2}x",
+        AB_LABEL,
+        ab_pass.wall,
+        ab_tp,
+        ab_rtts,
+        ab_tp / baseline_tp.max(f64::EPSILON)
+    );
+    // Direct A/B comparison against the delay-100ms default arm (the last
+    // shaped row): throughput + RTT count of both window configurations
+    // under identical shaping, and the defaults/8MiB throughput ratio.
+    let (default_delay_ms, default_pass) = shaped
+        .last()
+        .expect("the shaped tiers include the A/B reference tier");
+    let default_tp = mib_per_sec(TOTAL_BYTES, default_pass.wall);
+    let default_rtts = default_pass.wall.as_secs_f64() / (*default_delay_ms as f64 / 1000.0 * 2.0);
+    println!(
+        "[netem A/B] delay {default_delay_ms}ms (RTT ~{}ms): CR-P2-04 8 MiB windows {default_tp:.1} MiB/s ({default_rtts:.1} RTTs) vs quinn defaults 1.25 MiB ({AB_WINDOW_ENV}={AB_WINDOW_KIB}) {ab_tp:.1} MiB/s ({ab_rtts:.1} RTTs) -> defaults/8MiB throughput ratio {:.2}x (informational; the collapse tripwire is asserted on the default arm only)",
+        default_delay_ms * 2,
+        ab_tp / default_tp.max(f64::EPSILON),
+    );
+    println!(
+        "[netem reference] both directions traverse lo, so RTT ~ 2 x delay; single-stream caps at these RTTs: quinn defaults (1.25 MiB stream window) ~12.5 MiB/s @100ms / ~6.25 @200ms; CR-P2-04 8 MiB windows ~80 / ~40 MiB/s (ideal, before slow-start ramp and engine overhead); ramp-inclusive 256 MiB estimate with an effective 8 MiB window ~42 RTTs (~61 / ~30 MiB/s). The A/B row/line measures the default-window case directly on this box; per-tier quinn stats (cwnd end value, congestion events, loss/packet counters, both sides) print above each tier - cwnd plateauing far below the window or congestion events climbing there is the review's other-bottleneck signal. Loopback + artificial delay only - not a real-WAN claim."
     );
 
     // Cleanup: drop the guard, then verify lo is verifiably unshaped.

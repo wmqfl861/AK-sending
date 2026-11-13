@@ -275,6 +275,80 @@ pub(crate) const RECEIVE_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 /// [`RECEIVE_WINDOW_BYTES`] + [`SEND_WINDOW_BYTES`] = 16 MiB.
 pub(crate) const SEND_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// Experimental window override (2026-11-13 review §5.2 follow-up): the netem
+// benchmark's default-window A/B arm needs to run the SAME product config
+// path with quinn's 1.25 MiB default windows instead of the CR-P2-04 table.
+// ---------------------------------------------------------------------------
+
+/// Environment variable of the hidden debug window override (precedent:
+/// `AK_EXP_NO_TTL` / `AK_EXP_SEND_DELAY_MS` — default off, never set in
+/// production). See [`exp_window_override_bytes`].
+const EXP_QUIC_WINDOW_KIB_ENV: &str = "AK_EXP_QUIC_WINDOW_KIB";
+
+/// Largest accepted override in KiB: `kib * 1024` must still fit the `u32`
+/// window API (`u32::MAX / 1024` = 4194303, far above any sane window).
+const EXP_WINDOW_KIB_MAX: u64 = (u32::MAX as u64) / 1024;
+
+/// Last override state announced on stderr: `0` = constant table (default,
+/// also the initial state so production never prints anything),
+/// `1..=EXP_WINDOW_KIB_MAX` = that many KiB, `u64::MAX` = last value was
+/// invalid. Swapped (not loaded+stored) so exactly one thread prints per
+/// state change even when endpoint builds race.
+static LAST_ANNOUNCED_WINDOW_KIB: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Pure resolver behind [`exp_window_override_bytes`]: one optional raw
+/// environment value into `(announcement state, window bytes)`. `None` and
+/// every invalid value (non-numeric, 0, above [`EXP_WINDOW_KIB_MAX`]) keep
+/// the CR-P2-04 constant table; only a plain decimal KiB count overrides.
+/// Unit-testable without touching process-global environment state.
+fn resolve_exp_window(raw: Option<&str>) -> (u64, Option<u32>) {
+    match raw.map(str::parse::<u64>) {
+        None => (0, None),
+        Some(Ok(kib)) if (1..=EXP_WINDOW_KIB_MAX).contains(&kib) => {
+            (kib, Some((kib * 1024) as u32))
+        }
+        Some(_) => (u64::MAX, None),
+    }
+}
+
+/// CR-P2-04 follow-up (2026-11-13 review §5.2): hidden debug parameter,
+/// DEFAULT OFF — never set in production. `AK_EXP_QUIC_WINDOW_KIB=<kib>`
+/// overrides ALL THREE flow-control windows of the CR-P2-04 constant table
+/// ([`STREAM_RECEIVE_WINDOW_BYTES`], [`RECEIVE_WINDOW_BYTES`],
+/// [`SEND_WINDOW_BYTES`]) with one KiB value, so the netem benchmark can
+/// run its default-window A/B arm (1280 KiB = quinn's 1.25 MiB defaults)
+/// through the same product [`transport_config`] path instead of a
+/// bench-private transport config.
+///
+/// Read per [`transport_config`] call — every endpoint build re-resolves
+/// it (the bench flips the variable between passes and each pass builds
+/// fresh endpoints and connections; nothing caches across connections).
+/// UNSET (the production default): the constant table applies bit for bit,
+/// zero behavior change, zero output. Set-and-valid: one stderr line per
+/// state change announces the experimental override. Set-but-invalid: one
+/// stderr line announces the refusal — a mistyped benchmark arm must never
+/// silently measure the default windows.
+fn exp_window_override_bytes() -> Option<u32> {
+    let raw = std::env::var(EXP_QUIC_WINDOW_KIB_ENV).ok();
+    let (state, bytes) = resolve_exp_window(raw.as_deref());
+    if LAST_ANNOUNCED_WINDOW_KIB.swap(state, std::sync::atomic::Ordering::Relaxed) != state {
+        match (&raw, bytes) {
+            (None, _) => eprintln!(
+                "[ak-net] {EXP_QUIC_WINDOW_KIB_ENV} cleared - CR-P2-04 constant flow-control windows restored"
+            ),
+            (Some(text), Some(bytes)) => eprintln!(
+                "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}={text}: overriding all three CR-P2-04 flow-control windows with {bytes} bytes ({text} KiB) - hidden debug knob, never a production setting"
+            ),
+            (Some(text), None) => eprintln!(
+                "[ak-net] EXPERIMENTAL {EXP_QUIC_WINDOW_KIB_ENV}='{text}' is not a usable window (want an integer 1..={EXP_WINDOW_KIB_MAX}, in KiB) - keeping the CR-P2-04 constant windows"
+            ),
+        }
+    }
+    bytes
+}
+
 /// Build the [`quinn::TransportConfig`] shared by every server and client
 /// config this module produces, from the CR-P2-04 constant table above.
 ///
@@ -285,7 +359,21 @@ pub(crate) const SEND_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 ///
 /// Window constants are `u32` so `VarInt::from_u32` is infallible here; the
 /// QUIC VarInt ceiling (2^62-1) is never a constraint for windows this small.
+/// The one runtime deviation from the constant table is the hidden
+/// [`exp_window_override_bytes`] A/B knob — unset (production), the table
+/// below applies bit for bit.
 pub(crate) fn transport_config() -> quinn::TransportConfig {
+    // Same value for all three windows keeps the table's invariant
+    // (`receive_window == stream_receive_window`, send window comparable)
+    // under the override too.
+    let (stream_window, conn_window, send_window) = match exp_window_override_bytes() {
+        Some(bytes) => (bytes, bytes, u64::from(bytes)),
+        None => (
+            STREAM_RECEIVE_WINDOW_BYTES,
+            RECEIVE_WINDOW_BYTES,
+            u64::from(SEND_WINDOW_BYTES),
+        ),
+    };
     let mut config = quinn::TransportConfig::default();
     config
         .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
@@ -293,9 +381,9 @@ pub(crate) fn transport_config() -> quinn::TransportConfig {
             quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT)
                 .expect("60 s idle timeout fits the QUIC VarInt bound"),
         ))
-        .stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW_BYTES))
-        .receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW_BYTES))
-        .send_window(u64::from(SEND_WINDOW_BYTES));
+        .stream_receive_window(quinn::VarInt::from_u32(stream_window))
+        .receive_window(quinn::VarInt::from_u32(conn_window))
+        .send_window(send_window);
     config
 }
 
@@ -373,4 +461,41 @@ pub(crate) fn quinn_client_config(
     // CR-P2-04: explicit transport tuning (idle/keep-alive/flow-control).
     client_config.transport_config(Arc::new(transport_config()));
     Ok(client_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure resolver only (no environment mutation: ak-net's unit tests run
+    // multi-threaded in one process, so a set_var here could race the
+    // transport-config paths of parallel tests; the live env plumbing is
+    // exercised end-to-end by the bench).
+    #[test]
+    fn exp_window_resolver_bounds() {
+        // Unset (production): constant table, state 0, never announced.
+        assert_eq!(resolve_exp_window(None), (0, None));
+        // The A/B arm's value: 1280 KiB = quinn's 1.25 MiB default windows.
+        assert_eq!(resolve_exp_window(Some("1280")), (1280, Some(1_310_720)));
+        // Leading zeros/whitespace are not accepted (str::parse is exact).
+        assert_eq!(resolve_exp_window(Some(" 1280")), (u64::MAX, None));
+        // 0, negatives, non-numeric, overflow: refused loudly, table kept.
+        assert_eq!(resolve_exp_window(Some("0")), (u64::MAX, None));
+        assert_eq!(resolve_exp_window(Some("-5")), (u64::MAX, None));
+        assert_eq!(resolve_exp_window(Some("8MiB")), (u64::MAX, None));
+        assert_eq!(
+            resolve_exp_window(Some("99999999999999999999")),
+            (u64::MAX, None)
+        );
+        // The largest accepted value still fits the u32 window API.
+        let max_kib = EXP_WINDOW_KIB_MAX;
+        assert_eq!(
+            resolve_exp_window(Some(&max_kib.to_string())),
+            (max_kib, Some(u32::MAX - 1023))
+        );
+        assert_eq!(
+            resolve_exp_window(Some(&(max_kib + 1).to_string())),
+            (u64::MAX, None)
+        );
+    }
 }

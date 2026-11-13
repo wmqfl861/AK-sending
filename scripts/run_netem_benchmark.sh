@@ -68,7 +68,7 @@ try:
         lines = re.findall(rf"^{re.escape(label)}\s+.*$", text, re.MULTILINE)
         if len(lines) != 1:
             raise ValueError(f"expected one numeric sample for {label}, got {len(lines)}")
-        match = re.fullmatch(rf"{re.escape(label)}\s+{duration}\s+({number})\s+({number}|inf)\s+({number})x\s*", lines[0])
+        match = re.fullmatch(rf"{re.escape(label)}\s+{duration}\s+({number})\s+({number}|-|inf)\s+({number})x\s*", lines[0])
         if not match:
             raise ValueError(f"invalid numeric sample or units for {label}")
         wall, unit, throughput, rtts, ratio = match.groups()
@@ -76,9 +76,9 @@ try:
             raise ValueError(f"non-positive/non-finite sample for {label}")
         rows.append(f"| {label} | {delay} | {rtt} | {wall}{unit} | {throughput} | {rtts} | {ratio}x |")
     # The Rust test owns all correctness/floor assertions; never override them.
-    # The RTTs column is informational (baseline prints inf: no shaping,
-    # the wall/RTT ratio is undefined) -- finite checks only cover wall,
-    # throughput and ratio.
+    # The RTTs column is informational (the unshaped baseline prints a
+    # literal '-': the wall/RTT ratio is undefined without shaping) --
+    # finite checks only cover wall, throughput and ratio.
     print("| Shape | One-way delay (ms) | Approx. added RTT (ms) | Wall time | Throughput (MiB/s) | RTTs (informational) | vs baseline |")
     print("|---|---:|---:|---:|---:|---:|---:|")
     print("\n".join(rows))

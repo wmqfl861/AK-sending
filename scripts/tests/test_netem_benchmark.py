@@ -23,7 +23,7 @@ TEST_NAME = "netem_delay_50_100ms_256mib_loopback_throughput"
 SAMPLE = """running 1 test
 [netem summary] 268435456 bytes (8 x 32 MiB), single stream, engine-default chunk, in-flight window 32 (QUIC windows: CR-P2-04 8 MiB send/stream/connection):
 shape                      wall    MiB/s      RTTs  vs baseline
-no-netem               640.00ms    100.0        inf         1.00x
+no-netem               640.00ms    100.0         -         1.00x
 delay 50ms                1.60s     40.0       16.0         0.40x
 delay 100ms               3.20s     20.0       16.0         0.20x
 [netem bench] baseline host counters (tier delta): lo rx 0 B / 0 pkts (0 drops), lo tx 0 B / 0 pkts (0 drops); udp InErrors +0/RcvbufErrors +0/SndbufErrors +0

@@ -3011,8 +3011,9 @@ mod tests {
             plan.order
         );
         assert!(
-            elapsed + Duration::from_millis(300) < PROBE_DIAL_WINDOW,
-            "the round must exit on the first confirmation, not the window: {elapsed:?}"
+            elapsed < Duration::from_millis(200),
+            "the round must exit on the first confirmation, not the window \
+             (CR-P3-13 acceptance bound: back within 200 ms): {elapsed:?}"
         );
     }
 

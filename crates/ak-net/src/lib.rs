@@ -3011,12 +3011,14 @@ mod tests {
     }
 
     /// CR-P3-06 (G2): `probe_with_early_exit` returns as soon as the
-    /// static order's first candidate is echo-confirmed — well inside the
-    /// window (the acceptance bound is "within 200 ms of the first
-    /// confirmation"; the receive-to-return path is synchronous, so the
-    /// whole round costs the first probe round-trip). The same scenario
-    /// through the default [`holepunch::probe`] still runs the window
-    /// (pinned by `holepunch_probe_reports_reachable_peer`).
+    /// static order's first candidate is echo-confirmed — at the
+    /// acceptance bound itself ("within 200 ms of the first
+    /// confirmation", tightened from the old beat-the-1.5-s-window
+    /// margin by CR-P3-13 item 4/H3; the receive-to-return path is
+    /// synchronous, so the whole round costs the first probe
+    /// round-trip). The same scenario through the default
+    /// [`holepunch::probe`] still runs the window (pinned by
+    /// `holepunch_probe_reports_reachable_peer`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn holepunch_probe_early_exit_returns_after_first_confirmation() {
         let a = tokio::net::UdpSocket::bind(loopback_addr())
@@ -3058,12 +3060,16 @@ mod tests {
             b_report.reachable.contains(&a_addr),
             "A not reachable: {b_report:?}"
         );
-        // The early exit: A must be back LONG before the window's
-        // deadline (B's first burst leaves at t≈0, so the confirmation
-        // lands within the first ticks even on a slow runner).
+        // The early exit, at the CR-P3-06 acceptance bound itself
+        // (CR-P3-13 item 4, H3): "back within 200 ms of the first
+        // confirmation". B's first burst leaves at t≈0, so the
+        // confirmation lands within the first ticks even on a slow
+        // runner and the whole round (confirmation + the synchronous
+        // receive-to-return path) must fit inside 200 ms — not merely
+        // beat the window.
         assert!(
-            a_report.elapsed + Duration::from_millis(500) < window,
-            "the early exit did not fire: {:?} of {window:?}",
+            a_report.elapsed < Duration::from_millis(200),
+            "the early exit did not return within the 200 ms acceptance bound: {:?}",
             a_report.elapsed
         );
     }
@@ -3317,9 +3323,28 @@ mod tests {
         assert_eq!(len, 24, "probe-shaped payload: {len}");
         assert_eq!(from.port(), sender_port, "sent from the given socket");
         // The mapped form of the same target behaves identically (the
-        // dual-stack socket's only v4 shape).
+        // dual-stack socket's only v4 shape). CR-P3-13: on a kernel
+        // without IPv6 this bind fails with EAFNOSUPPORT — degrade
+        // exactly like the product does ("dual-stack bind unavailable …
+        // falling back to the IPv4-only bind"): skip the dual-stack
+        // half with a note instead of panicking, so IPv6-less hosts
+        // report 0 failures. Any OTHER bind error still fails the test.
         let mapped = crate::classify::to_mapped(target_addr);
-        let sender6 = holepunch::bind_dual_stack_udp(0).expect("dual-stack bind");
+        let sender6 = match holepunch::bind_dual_stack_udp(0) {
+            Ok(socket) => socket,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrfamilyNotSupported
+                        | std::io::ErrorKind::ProtocolNotSupported
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("note: dual-stack half skipped — no IPv6 on this host ({err})");
+                return;
+            }
+            Err(err) => panic!("dual-stack bind: {err}"),
+        };
         holepunch::send_to_with_ttl(&sender6, &packet, mapped, 1).expect("mapped low-ttl send");
         let (len, from2) = target.recv_from(&mut buffer).expect("mapped send delivers");
         assert_eq!(len, 24, "probe-shaped payload: {len}");

@@ -25,8 +25,11 @@
 //! 也绝不把整形的接口留给后续测试）；测试末尾显式 drop 守卫并断言
 //! `lo` 上已无 netem。
 //!
-//! 载荷与断言：进程内 LCG 确定性生成 8 x 8 MiB = 64 MiB（手法与
-//! bench_throughput 相同）；单流、引擎默认 1 MiB chunk、in-flight
+//! 载荷与断言：进程内 LCG 确定性生成 8 x 32 MiB = 256 MiB（手法与
+//! bench_throughput 相同；2026-11-13 H3/CR-P3-13 起，原 64 MiB——复核
+//! §5.2 的判定是"64 MiB 太短"：8 MiB 窗生效时慢启动爬坡（约 9–10 个
+//! RTT）在 64 MiB 里占比过高，实测 RTT 数（约 26）与 8 MiB 生效预期
+//! （约 18）的差额无法归因）；单流、引擎默认 1 MiB chunk、in-flight
 //! window 32（32 MiB，刻意大于 QUIC 8 MiB 窗，让 CR-P2-04 的传输窗
 //! 成为瓶颈方）。先测无 netem 基线，再依次 50 / 100 ms。每轮断言字节
 //! 正确性（run_bench_pass 内建：树级逐字节比对、无 `.akpart` 残留、
@@ -38,6 +41,30 @@
 //! 不用于锁定 8 MiB 窗的具体收益；收益数字照实打印，与参考上限
 //! （8 MiB 窗在 RTT 100/200 ms 约 80/40 MiB/s，未计慢启动爬坡与
 //! 引擎开销）对照阅读。
+//!
+//! 对照与证据口径（2026-11-13 H3，CR-P3-13 §5.2 的三条要求与本文件
+//! 的如实边界）：
+//! - **RTT 数列**：汇总表每档打印 `wall / RTT`——8 MiB 窗生效时
+//!   256 MiB 约 42 个 RTT（爬坡 9–10 + 256/8），实测显著超出即说明
+//!   瓶颈在别处（拥塞控制 / UDP 收发缓冲 / 引擎节奏）。
+//! - **quinn `Connection::stats()`（cwnd/拥塞事件/丢包）**：API 在本
+//!   路径**不可达**——引擎在 `ak_engine::send`/`receive_with_addr`
+//!   内部驱动 QUIC，既不暴露 `quinn::Connection` 也没有 stats 钩子，
+//!   `ak_net` 的 `Channel::stats()`（`ChannelStats`）只在引擎不经过
+//!   的裸 Channel API 上。打通它需要 ak-net/ak-engine 的接口增补
+//!   （如 `ChannelStats` 增加 cwnd/拥塞事件或 `Report` 携带传输统
+//!   计），超出本文件权限——待后续批次落地后在此补打印。当前每档
+//!   打印**可达的**主机级证据：`lo` 收发字节/包/丢包
+//!   （`/proc/net/dev`）与 UDP 栈 `RcvbufErrors`/`SndbufErrors`
+//!   （`/proc/net/snmp`）的档前/档后差值——复核点名的两个候选瓶颈
+//!   （UDP 收发缓冲）正落在这里。
+//! - **默认窗口实测对照**：8 MiB 窗是 `ak-net tls.rs` 的编译期常量
+//!   表（无运行时开关），本文件无法在同套测试里切回 quinn 默认
+//!   1.25 MiB 窗跑对照——需要 tls.rs 提供测试用覆写入口（超出本
+//!   文件权限，待后续批次）。当前对照以汇总表/参考行的解析值给出
+//!   （默认窗 ~12.5/6.25 MiB/s、8 MiB 窗 ~80/40 MiB/s @RTT 100/200
+//!   ms），并按 §5.2 口径声明：实测数字**只支持**“窗口已不再是
+//!   1.25 MiB 默认值造成的瓶颈；8 MiB 的收益待测”。
 //!
 //! 如实记录：本文件尚无任何 Linux 特权环境实测数字（Windows 开发机
 //! 只能验证跳过路径）；首个特权运行后把数字补记在此。
@@ -55,7 +82,7 @@ use std::time::Instant;
 use common::{mib_per_sec, run_bench_pass, write_file, BenchPass, Lcg, TransferOpts};
 
 const FILE_COUNT: usize = 8;
-const FILE_MIB: usize = 8;
+const FILE_MIB: usize = 32;
 const TOTAL_BYTES: u64 = (FILE_COUNT * FILE_MIB * 1024 * 1024) as u64;
 
 /// App-level in-flight window (chunks of the engine-default 1 MiB): 32 MiB,
@@ -141,7 +168,7 @@ impl Drop for NetemGuard {
     }
 }
 
-/// Deterministic 8 x 8 MiB tree (LCG bytes, reproducible across runs).
+/// Deterministic 8 x 32 MiB tree (LCG bytes, reproducible across runs).
 fn build_bench_tree(root: &Path) {
     let mut lcg = Lcg::new(0xDE1A_2026_1112);
     for index in 0..FILE_COUNT {
@@ -152,7 +179,136 @@ fn build_bench_tree(root: &Path) {
     }
 }
 
-/// One timed 64 MiB single-stream pass (engine-default chunk, window 32).
+// ---------------------------------------------------------------------------
+// Host-level per-tier evidence (H3, CR-P3-13 §5.2): the quinn
+// `Connection::stats()` the review asked for is NOT reachable through the
+// engine path (see the module docs); these /proc counters are the closest
+// reachable facts, and they speak directly to two of the review's three
+// candidate bottlenecks (UDP send/receive buffer pressure, packet loss).
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the host counters this bench can read: `lo` interface
+/// counters from `/proc/net/dev` and the UDP stack error counters from
+/// `/proc/net/snmp`. Global (not per-connection) — meaningful here because
+/// the deep-test process is the only heavy network user during a tier.
+#[derive(Debug, Clone, Copy, Default)]
+struct HostCounters {
+    lo_rx_bytes: u64,
+    lo_rx_packets: u64,
+    lo_rx_drops: u64,
+    lo_tx_bytes: u64,
+    lo_tx_packets: u64,
+    lo_tx_drops: u64,
+    udp_in_errors: u64,
+    udp_rcvbuf_errors: u64,
+    udp_sndbuf_errors: u64,
+}
+
+impl HostCounters {
+    /// `later - self`, saturating (counter resets read as zero delta).
+    fn delta_to(&self, later: &HostCounters) -> HostCounters {
+        HostCounters {
+            lo_rx_bytes: later.lo_rx_bytes.saturating_sub(self.lo_rx_bytes),
+            lo_rx_packets: later.lo_rx_packets.saturating_sub(self.lo_rx_packets),
+            lo_rx_drops: later.lo_rx_drops.saturating_sub(self.lo_rx_drops),
+            lo_tx_bytes: later.lo_tx_bytes.saturating_sub(self.lo_tx_bytes),
+            lo_tx_packets: later.lo_tx_packets.saturating_sub(self.lo_tx_packets),
+            lo_tx_drops: later.lo_tx_drops.saturating_sub(self.lo_tx_drops),
+            udp_in_errors: later.udp_in_errors.saturating_sub(self.udp_in_errors),
+            udp_rcvbuf_errors: later
+                .udp_rcvbuf_errors
+                .saturating_sub(self.udp_rcvbuf_errors),
+            udp_sndbuf_errors: later
+                .udp_sndbuf_errors
+                .saturating_sub(self.udp_sndbuf_errors),
+        }
+    }
+}
+
+/// Read the current snapshot; `None` where the /proc files do not exist
+/// (non-Linux — unreachable in practice: the bench already skipped) or do
+/// not parse (either way the bench prints a note and continues without
+/// them).
+fn read_host_counters() -> Option<HostCounters> {
+    let net_dev = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let snmp = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut counters = HostCounters::default();
+    let mut saw_lo = false;
+    for line in net_dev.lines() {
+        let Some((ifname, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if ifname.trim() != LOOP_DEV {
+            continue;
+        }
+        saw_lo = true;
+        // Interleaved layout: RX bytes packets errs drop … TX bytes packets
+        // errs drop … (16 fields; drops at 3 and 11).
+        let fields: Vec<u64> = rest
+            .split_whitespace()
+            .map(|field| field.parse().unwrap_or(0))
+            .collect();
+        if fields.len() >= 12 {
+            counters.lo_rx_bytes = fields[0];
+            counters.lo_rx_packets = fields[1];
+            counters.lo_rx_drops = fields[3];
+            counters.lo_tx_bytes = fields[8];
+            counters.lo_tx_packets = fields[9];
+            counters.lo_tx_drops = fields[11];
+        }
+        break;
+    }
+    if !saw_lo {
+        return None;
+    }
+    // The `Udp:` block is a header line followed by a value line.
+    let mut udp_lines = snmp.lines().filter(|line| line.starts_with("Udp:"));
+    let header: Vec<&str> = udp_lines.next()?.split_whitespace().skip(1).collect();
+    let values: Vec<u64> = udp_lines
+        .next()?
+        .split_whitespace()
+        .skip(1)
+        .map(|field| field.parse().unwrap_or(0))
+        .collect();
+    let named = |name: &str| {
+        header
+            .iter()
+            .position(|entry| *entry == name)
+            .and_then(|index| values.get(index).copied())
+            .unwrap_or(0)
+    };
+    counters.udp_in_errors = named("InErrors");
+    counters.udp_rcvbuf_errors = named("RcvbufErrors");
+    counters.udp_sndbuf_errors = named("SndbufErrors");
+    Some(counters)
+}
+
+/// Print one tier's counter delta (`before` -> `after`); a `None` snapshot
+/// prints the reachability note instead (never fails the bench).
+fn print_host_counters(label: &str, before: Option<HostCounters>, after: Option<HostCounters>) {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let d = before.delta_to(&after);
+            println!(
+                "[netem bench] {label} host counters (tier delta): lo rx {} B / {} pkts ({} drops), lo tx {} B / {} pkts ({} drops); udp InErrors +{}/RcvbufErrors +{}/SndbufErrors +{}",
+                d.lo_rx_bytes,
+                d.lo_rx_packets,
+                d.lo_rx_drops,
+                d.lo_tx_bytes,
+                d.lo_tx_packets,
+                d.lo_tx_drops,
+                d.udp_in_errors,
+                d.udp_rcvbuf_errors,
+                d.udp_sndbuf_errors,
+            );
+        }
+        _ => println!(
+            "[netem bench] {label} host counters: /proc/net/dev or /proc/net/snmp unreadable on this host - no tier deltas printed"
+        ),
+    }
+}
+
+/// One timed 256 MiB single-stream pass (engine-default chunk, window 32).
 /// Byte-correctness assertions (byte-identical tree, counts, no `.akpart`)
 /// live inside `run_bench_pass`.
 async fn run_pass(src: &Path, label: &str) -> BenchPass {
@@ -181,7 +337,7 @@ async fn run_pass(src: &Path, label: &str) -> BenchPass {
 /// meaningless).
 #[ignore = "Linux tc-netem throughput bench (CR-P2-04); needs root/CAP_NET_ADMIN and skips elsewhere; release only: cargo test --release -p ak-itests --test bench_netem -- --ignored --nocapture"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn netem_delay_50_100ms_64mib_loopback_throughput() {
+async fn netem_delay_50_100ms_256mib_loopback_throughput() {
     if std::env::consts::OS != "linux" {
         skip_bench(&format!(
             "host is {} - tc netem is Linux-only; simulated-RTT bench not applicable",
@@ -232,7 +388,7 @@ async fn netem_delay_50_100ms_64mib_loopback_throughput() {
         "probe netem was added but cannot be removed - refusing to continue with dev {LOOP_DEV} shaped; manual fix: tc qdisc del dev {LOOP_DEV} root netem ({probe_del_text})"
     );
 
-    // Bench: deterministic 64 MiB tree; baseline first, with lo unshaped.
+    // Bench: deterministic 256 MiB tree; baseline first, with lo unshaped.
     let base = tempfile::tempdir().expect("bench tempdir");
     let src = base.path().join("netem-src");
     let gen_started = Instant::now();
@@ -242,7 +398,9 @@ async fn netem_delay_50_100ms_64mib_loopback_throughput() {
         gen_started.elapsed()
     );
 
+    let baseline_before = read_host_counters();
     let baseline = run_pass(&src, "baseline").await;
+    print_host_counters("baseline", baseline_before, read_host_counters());
     let baseline_tp = mib_per_sec(TOTAL_BYTES, baseline.wall);
     assert!(
         baseline_tp >= BASELINE_FLOOR_MIB_PER_S,
@@ -286,7 +444,13 @@ async fn netem_delay_50_100ms_64mib_loopback_throughput() {
             "netem qdisc not visible on dev {LOOP_DEV} during the run (shaping silently absent): {state_text}"
         );
 
+        let tier_before = read_host_counters();
         let pass = run_pass(&src, &format!("netem-{delay_ms}ms")).await;
+        print_host_counters(
+            &format!("delay {delay_ms}ms"),
+            tier_before,
+            read_host_counters(),
+        );
         let tp = mib_per_sec(TOTAL_BYTES, pass.wall);
         assert!(
             tp >= floor_mib_per_s,
@@ -302,25 +466,31 @@ async fn netem_delay_50_100ms_64mib_loopback_throughput() {
         "[netem summary] {TOTAL_BYTES} bytes ({FILE_COUNT} x {FILE_MIB} MiB), single stream, engine-default chunk, in-flight window {IN_FLIGHT_WINDOW} (QUIC windows: CR-P2-04 8 MiB send/stream/connection):"
     );
     println!(
-        "{:<14} {:>16} {:>8} {:>12}",
-        "shape", "wall", "MiB/s", "vs baseline"
+        "{:<14} {:>16} {:>8} {:>8} {:>12}",
+        "shape", "wall", "MiB/s", "RTTs", "vs baseline"
     );
     println!(
-        "{:<14} {:>16.2?} {:>8.1} {:>12}",
-        "no-netem", baseline.wall, baseline_tp, "1.00x"
+        "{:<14} {:>16.2?} {:>8.1} {:>8} {:>12}",
+        "no-netem", baseline.wall, baseline_tp, "-", "1.00x"
     );
     for (delay_ms, pass) in &shaped {
         let tp = mib_per_sec(TOTAL_BYTES, pass.wall);
+        // The review's key metric (2026-11-13 §5.2): the tier's cost in
+        // RTTs. With a fully effective 8 MiB window, 256 MiB needs about
+        // 42 RTTs (slow-start ramp 9-10 + 256/8); ~26-ish per-64-MiB
+        // numbers of the first run meant something else was binding.
+        let rtts = pass.wall.as_secs_f64() / (*delay_ms as f64 / 1000.0 * 2.0);
         println!(
-            "{:<14} {:>16.2?} {:>8.1} {:>12.2}x",
+            "{:<14} {:>16.2?} {:>8.1} {:>8.1} {:>12.2}x",
             format!("delay {delay_ms}ms"),
             pass.wall,
             tp,
+            rtts,
             tp / baseline_tp.max(f64::EPSILON)
         );
     }
     println!(
-        "[netem reference] both directions traverse lo, so RTT ~ 2 x delay; single-stream caps at these RTTs: quinn defaults (1.25 MiB stream window) ~12.5 MiB/s @100ms / ~6.25 @200ms; CR-P2-04 8 MiB windows ~80 / ~40 MiB/s (before slow-start ramp and engine overhead). Loopback + artificial delay only - not a real-WAN claim."
+        "[netem reference] both directions traverse lo, so RTT ~ 2 x delay; single-stream caps at these RTTs: quinn defaults (1.25 MiB stream window) ~12.5 MiB/s @100ms / ~6.25 @200ms; CR-P2-04 8 MiB windows ~80 / ~40 MiB/s (ideal, before slow-start ramp and engine overhead); ramp-inclusive 256 MiB estimate with an effective 8 MiB window ~42 RTTs (~61 / ~30 MiB/s). Measured numbers only support 'the 1.25 MiB default is no longer the bottleneck; the 8 MiB gain is yet to be proven' (review 2026-11-13 section 5.2) - a default-window A/B needs a tls.rs override knob (not reachable from this bench) and per-connection cwnd/loss counters need an ak-net/ak-engine stats hook. Loopback + artificial delay only - not a real-WAN claim."
     );
 
     // Cleanup: drop the guard, then verify lo is verifiably unshaped.

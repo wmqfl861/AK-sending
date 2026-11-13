@@ -272,14 +272,14 @@ async fn attempt_settled_hook_precedes_slot_release_and_events() {
     let successor = TaskId::from_counter(2);
     let probe: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<SessionEvent>>>> =
         Arc::new(Mutex::new(None));
-    let fired: Arc<Mutex<Vec<TaskId>>> = Arc::new(Mutex::new(Vec::new()));
+    let fired: Arc<Mutex<Vec<(TaskId, bool)>>> = Arc::new(Mutex::new(Vec::new()));
     let (hook_probe, hook_fired) = (Arc::clone(&probe), Arc::clone(&fired));
     let env = env_with_config(
         policy(SameCodeMode::Serial, CrossCodeMode::Parallel, 1, 4, 64),
         |config: &mut RuntimeConfig| {
-            config.on_attempt_settled = Some(Arc::new(move |task| {
+            config.on_attempt_settled = Some(Arc::new(move |task, _outcome, terminal| {
                 let current = task.task_id();
-                hook_fired.lock().unwrap().push(current);
+                hook_fired.lock().unwrap().push((current, terminal));
                 let mut violations: Vec<&'static str> = Vec::new();
                 let guard = &mut *hook_probe.lock().unwrap();
                 if let Some(rx) = guard.as_mut() {
@@ -332,7 +332,176 @@ async fn attempt_settled_hook_precedes_slot_release_and_events() {
     );
     assert_eq!(
         *fired.lock().unwrap(),
-        vec![first, successor],
-        "the hook fired exactly once per settled task, in settle order"
+        vec![(first, true), (successor, true)],
+        "one fire per settled task, in settle order, each a terminal settlement"
+    );
+}
+
+/// CR-P3-17: `on_attempt_settled` fires ONCE PER ATTEMPT and carries the
+/// attempt's result plus whether the settlement is the task's terminal
+/// one. With `max_attempts = 2` — first attempt fails, second succeeds —
+/// the hook must observe the failed attempt as NON-terminal with its
+/// failure result, and fire its single terminal invocation only for the
+/// second attempt's completion, still strictly BEFORE the core applies
+/// the terminal transition (proven with the CR-P2-15 technique above:
+/// the event stream is drained synchronously inside the hook, and
+/// neither the task's terminal `TaskFinished` nor the freed slot's
+/// successor `TaskAdmitted` may have arrived yet). The successor queued
+/// behind the terminal release gets its own single terminal invocation.
+/// This is the contract the daemon's `job_done`/`error` printing rests
+/// on — by construction, not by a `max_attempts = 1` coincidence.
+#[tokio::test]
+async fn attempt_settled_hook_reports_attempts_and_fires_terminal_once() {
+    use std::sync::{Arc, Mutex};
+
+    use ak_session::runtime::{FinishOutcome, RuntimeConfig};
+    use ak_session::scheduler::SchedulerEvent;
+
+    let first = TaskId::from_counter(1);
+    let successor = TaskId::from_counter(2);
+    let probe: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<SessionEvent>>>> =
+        Arc::new(Mutex::new(None));
+    let fired: Arc<Mutex<Vec<(TaskId, FinishOutcome, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (hook_probe, hook_fired) = (Arc::clone(&probe), Arc::clone(&fired));
+    let env = env_with_config(
+        policy(SameCodeMode::Serial, CrossCodeMode::Parallel, 1, 4, 64),
+        |config: &mut RuntimeConfig| {
+            config.retry = RetryPolicy {
+                max_attempts: 2,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 200,
+                multiplier: 2,
+            };
+            config.on_attempt_settled = Some(Arc::new(
+                move |task, outcome, terminal| {
+                    let current = task.task_id();
+                    hook_fired
+                        .lock()
+                        .unwrap()
+                        .push((current, *outcome, terminal));
+                    let mut violations: Vec<&'static str> = Vec::new();
+                    let guard = &mut *hook_probe.lock().unwrap();
+                    if let Some(rx) = guard.as_mut() {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(SessionEvent::Scheduler(SchedulerEvent::TaskFinished {
+                                    task,
+                                    outcome: seen,
+                                    ..
+                                })) if task.task_id() == current
+                                    && seen == FinishOutcome::Completed =>
+                                {
+                                    violations.push(
+                                        "the task's terminal TaskFinished was broadcast before the hook",
+                                    );
+                                }
+                                Ok(SessionEvent::Scheduler(SchedulerEvent::TaskAdmitted {
+                                    task,
+                                    ..
+                                })) if terminal
+                                    && current == first
+                                    && task.task_id() == successor =>
+                                {
+                                    violations.push(
+                                        "the freed slot's next admission was broadcast before the hook",
+                                    );
+                                }
+                                Ok(SessionEvent::BackoffScheduled { task, .. })
+                                    if !terminal && task == current =>
+                                {
+                                    violations.push(
+                                        "the retry backoff was scheduled before the hook",
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    assert!(
+                        violations.is_empty(),
+                        "events beat the settled hook: {violations:?}"
+                    );
+                },
+            ));
+        },
+    )
+    .await;
+    *probe.lock().unwrap() = Some(env.handle.subscribe());
+
+    // `first` fails once, then completes on its second attempt. The
+    // successor (default completion script) is enqueued only once the
+    // second attempt is RUNNING, so the sole release that can admit it
+    // is `first`'s terminal one — exactly the release the terminal hook
+    // invocation must precede (a task enqueued earlier would overtake
+    // the retry in the queue and defeat the check).
+    env.executor.set_script(
+        first,
+        FakeScript::Fail {
+            scan_ms: 10,
+            error: ErrorCode::DirectUnavailable,
+            times: 1,
+            then_transfer_ms: 50,
+        },
+    );
+    env.handle
+        .enqueue(send_spec(1, group(1), &env.executor))
+        .await
+        .unwrap();
+
+    // Attempt 1 fails into its backoff: exactly one NON-terminal fire,
+    // carrying the attempt's failure result, before the backoff event
+    // even exists (asserted by the probe above).
+    run_until(
+        &env,
+        |s| common::view_of(s, first).attempts == 1 && !state_of(s, first).is_terminal(),
+        1_000,
+    )
+    .await;
+    assert_eq!(
+        *fired.lock().unwrap(),
+        vec![(
+            first,
+            FinishOutcome::Failed {
+                error: ErrorCode::DirectUnavailable
+            },
+            false
+        )],
+        "the failed first attempt fired once, non-terminal, with its result"
+    );
+
+    // The backoff elapses and the second attempt is running.
+    run_until(&env, |_| env.executor.start_count() == 2, 3_000).await;
+    env.handle
+        .enqueue(send_spec(2, group(1), &env.executor))
+        .await
+        .unwrap();
+
+    let snap = run_until(&env, all_terminal, 5_000).await;
+    assert!(
+        snap.tasks.iter().all(|t| t.state == TaskState::Completed),
+        "both tasks complete"
+    );
+    assert_eq!(
+        env.executor.start_count(),
+        3,
+        "first ran twice, successor once"
+    );
+    assert_eq!(
+        *fired.lock().unwrap(),
+        vec![
+            (
+                first,
+                FinishOutcome::Failed {
+                    error: ErrorCode::DirectUnavailable
+                },
+                false
+            ),
+            (first, FinishOutcome::Completed, true),
+            (successor, FinishOutcome::Completed, true),
+        ],
+        "one fire per attempt; exactly one terminal fire per task, the task's \
+         terminal one strictly after its final attempt"
     );
 }

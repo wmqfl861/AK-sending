@@ -9,7 +9,7 @@ use crate::runtime::executor::TransferExecutor;
 use crate::runtime::transport::{PairingId, PairingTransport, PeerFingerprint, RedeemPayload};
 use crate::scheduler::config::SchedulerPolicy;
 use crate::scheduler::key::{CodeGroupKey, RegistryId, TaskHandle, TaskId};
-use crate::scheduler::state::{SchedulerEvent, TaskState};
+use crate::scheduler::state::{FinishOutcome, SchedulerEvent, TaskState};
 
 /// Frozen broadcast bound for runtime events (contract §7: a slow UI must
 /// never grow memory without bound; the oldest events are dropped and the
@@ -182,9 +182,12 @@ impl RetryPolicy {
     }
 }
 
-/// CR-P2-15 hook shape (see [`RuntimeConfig::on_attempt_settled`]): the
-/// task whose attempt just settled.
-pub type AttemptSettledHook = Arc<dyn Fn(&TaskHandle) + Send + Sync>;
+/// CR-P2-15 hook shape, CR-P3-17 parameters (see
+/// [`RuntimeConfig::on_attempt_settled`]): the task whose attempt just
+/// settled, how that attempt ended (the executor's own
+/// [`FinishOutcome`] report), and whether this settlement is the task's
+/// TERMINAL one.
+pub type AttemptSettledHook = Arc<dyn Fn(&TaskHandle, &FinishOutcome, bool) + Send + Sync>;
 
 /// Configuration for [`SessionRuntime::start`](crate::runtime::SessionRuntime).
 pub struct RuntimeConfig {
@@ -208,16 +211,30 @@ pub struct RuntimeConfig {
     pub shutdown_timeout_ms: u64,
     /// Whether to run the resident pairing listener.
     pub listener_enabled: bool,
-    /// CR-P2-15 ordering hook: invoked synchronously by the runtime actor
-    /// when an executor reports a task's settled outcome, strictly BEFORE
-    /// the scheduler core applies the terminal transition (permit release,
-    /// requeue or pause) and therefore before the freed slot can admit any
-    /// queued task. Whatever the callback emits is thus ordered ahead of
-    /// every downstream consequence of the release — the next admission's
-    /// `TaskAdmitted`, its driver, its first progress report — which is
-    /// the ordering external event consumers see. At most once per task;
-    /// it runs on the actor's task, so it must be quick and must not
-    /// block.
+    /// CR-P2-15 ordering hook with CR-P3-17 semantics: invoked
+    /// synchronously by the runtime actor when an executor reports a
+    /// task's settled outcome — ONCE PER ATTEMPT, not once per task. The
+    /// parameters are the task, how the attempt ended
+    /// ([`FinishOutcome`]) and whether this settlement is the task's
+    /// terminal one: `true` for a completion, for a failure that
+    /// finalizes a requested cancellation, and for the
+    /// retry-budget-exhaustion park — each releases the task's slot with
+    /// no further automatic attempt — and `false` while the task still
+    /// has retry budget (a backoff and another attempt follow; the
+    /// permit stays held) as well as for a failure an ongoing shutdown
+    /// absorbs (its terminal transition happens in the shutdown
+    /// close-out, where this hook does not run). Every invocation
+    /// happens strictly BEFORE the scheduler core applies the
+    /// settlement's transition — the terminal permit release, requeue or
+    /// pause; the non-terminal backoff scheduling — and therefore before
+    /// a released slot can admit any queued task. Whatever the callback
+    /// emits is thus ordered ahead of every downstream consequence of
+    /// the release — the next admission's `TaskAdmitted`, its driver,
+    /// its first progress report — which is the ordering external event
+    /// consumers see. A task receives exactly one terminal invocation
+    /// per settlement cycle (a manually retried parked task starts a
+    /// new cycle). The hook runs on the actor's task, so it must be
+    /// quick and must not block.
     pub on_attempt_settled: Option<AttemptSettledHook>,
 }
 

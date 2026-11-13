@@ -392,6 +392,10 @@ struct WiredRuntime {
 /// `job_done`/`error` line prints from INSIDE the actor's finish
 /// handling — strictly before the scheduler releases the task's slot,
 /// hence before the task admitted into that slot can print anything.
+/// CR-P3-17: only the hook's TERMINAL invocations print (a retryable
+/// failure attempt settles non-terminal and must not end the job's
+/// event stream), so the guarantee no longer rests on the daemon's
+/// single-attempt budget.
 async fn start_wired_runtime(
     client: ak_session::pairing::RegistryClient,
     settings: &crate::invite::RegistrySettings,
@@ -416,22 +420,33 @@ async fn start_wired_runtime(
         default_executor as Arc<dyn TransferExecutor>,
         ak_session::runtime::RegistryId::from_bytes(settings.registry_id),
     );
-    // CR-P2-15: the settled hook prints the job's terminal line before
-    // the slot release. The handler-side fallback (see
-    // [`wired_connection_handler`]) covers terminal paths that never
+    // CR-P2-15/CR-P3-17: the settled hook prints the job's terminal line
+    // before the slot release, and only on the task's TERMINAL settlement
+    // — a retryable failure settles non-terminal and leaves the registry
+    // entry for the eventual terminal outcome. The handler-side fallback
+    // (see [`wired_connection_handler`]) covers terminal paths that never
     // reach an executor finish report.
     config.on_attempt_settled = Some(Arc::new(
-        move |task: &ak_session::scheduler::key::TaskHandle| {
+        move |task: &ak_session::scheduler::key::TaskHandle,
+              _outcome: &ak_session::runtime::FinishOutcome,
+              terminal: bool| {
+            if !terminal {
+                // A retryable attempt settled; the job is not over yet.
+                return;
+            }
             let id = task.task_id();
-            if let Some(terminal) = terminals.withdraw(&id) {
-                terminal.print(&id);
+            if let Some(context) = terminals.withdraw(&id) {
+                context.print(&id);
             }
         },
     ));
     // The daemon loop is the resident receive path; the runtime listener
     // would submit competing receive tasks on the same port.
     config.listener_enabled = false;
-    // One attempt per enqueued receive: the loop itself rebinds.
+    // One attempt per enqueued receive: the loop itself rebinds. The
+    // terminal print above no longer depends on this budget (CR-P3-17);
+    // it stays because re-binding a fresh receive per iteration is the
+    // daemon's own retry shape.
     config.retry = RetryPolicy {
         max_attempts: 1,
         initial_backoff_ms: 0,
@@ -1057,13 +1072,14 @@ struct WiredConnection {
 
 /// CR-P2-15: one job's terminal print context — everything needed to
 /// print the job's final NDJSON event (or text-mode report summary) the
-/// moment the runtime reports the task settled. Registered under the task
-/// id BEFORE the task is submitted, consumed exactly once: normally by
-/// the runtime's `on_attempt_settled` hook, which runs strictly before
-/// the scheduler releases the task's slot (see
-/// [`start_wired_runtime`]), so the `job_done`/`error` line can never
-/// land after the next task admitted into that slot prints its
-/// `job_started`.
+/// moment the runtime reports the task's terminal settlement. Registered
+/// under the task id BEFORE the task is submitted, consumed exactly
+/// once: normally by the runtime's `on_attempt_settled` hook on its
+/// TERMINAL invocation (CR-P3-17: retryable attempts settle non-terminal
+/// and do not consume it), which runs strictly before the scheduler
+/// releases the task's slot (see [`start_wired_runtime`]), so the
+/// `job_done`/`error` line can never land after the next task admitted
+/// into that slot prints its `job_started`.
 struct JobTerminal {
     out: DaemonOut,
     start_slot: Arc<Mutex<Option<JobStart>>>,
@@ -1105,11 +1121,13 @@ impl JobTerminal {
 /// handler registers its [`JobTerminal`] under the task id it
 /// pre-assigned ([`fresh_wired_task_id`]) BEFORE submitting the task;
 /// the runtime's settled hook withdraws and prints it inside the actor's
-/// finish handling — before the slot release. A handler that observes
-/// the task's end through a path that never fires the hook (a queued
-/// task cancelled at shutdown, a closed event stream) finds its entry
-/// still present after the task watcher returns and prints the terminal
-/// line itself, so every job's terminal line prints exactly once.
+/// finish handling on the task's TERMINAL settlement — before the slot
+/// release. A handler that observes the task's end through a path that
+/// never fires a terminal hook invocation (a queued task cancelled at
+/// shutdown, a failure the shutdown close-out terminalizes, a closed
+/// event stream) finds its entry still present after the task watcher
+/// returns and prints the terminal line itself, so every job's terminal
+/// line prints exactly once.
 #[derive(Default)]
 struct JobTerminals {
     entries: Mutex<HashMap<ak_session::runtime::TransferId, Arc<JobTerminal>>>,
@@ -1155,8 +1173,8 @@ fn fresh_wired_task_id() -> ak_session::runtime::TransferId {
 /// inside the session runtime, so the policy flags govern real groups —
 /// and emit the per-task NDJSON events (`job_started` comes from the
 /// engine's `Connected` progress through the daemon printer; `job_done`
-/// or `error` from the CR-P2-15 settled hook, which prints BEFORE the
-/// scheduler releases the task's slot).
+/// or `error` from the CR-P2-15 settled hook's TERMINAL invocation, which
+/// prints BEFORE the scheduler releases the task's slot).
 async fn wired_connection_handler(connection: WiredConnection) {
     let WiredConnection {
         handle,
@@ -1289,11 +1307,12 @@ async fn wired_connection_handler(connection: WiredConnection) {
     // finish before the watcher is armed.
     let mut events = handle.subscribe();
     // CR-P2-15: pre-assign the task id and register the terminal print
-    // context BEFORE submitting — the runtime's settled hook (which runs
-    // strictly before the scheduler releases this task's slot) can then
-    // print this job's final line with no registration race, keeping
-    // `job_done` ahead of the next same-code task's `job_started` on the
-    // event stream no matter how the tokio workers interleave.
+    // context BEFORE submitting — the runtime's settled hook (whose
+    // terminal invocation runs strictly before the scheduler releases
+    // this task's slot) can then print this job's final line with no
+    // registration race, keeping `job_done` ahead of the next same-code
+    // task's `job_started` on the event stream no matter how the tokio
+    // workers interleave.
     let task_id = fresh_wired_task_id();
     terminals.register(
         task_id,
@@ -1333,13 +1352,14 @@ async fn wired_connection_handler(connection: WiredConnection) {
         }
     };
     let outcome = watch_wired_task(&mut events, task, |task| executor.outcome(task)).await;
-    // CR-P2-15 fallback: terminal paths that never fire the settled hook
-    // (a queued task cancelled at shutdown, a closed event stream) find
-    // their entry still registered here and print it themselves. Such a
-    // task never started a transfer, so nothing it printed can invert
-    // the started/done order of a real job. When the hook already
-    // printed, the entry is gone and this is a no-op: every job's
-    // terminal line prints exactly once.
+    // CR-P2-15 fallback: terminal paths that never fire a terminal hook
+    // invocation (a queued task cancelled at shutdown, a failure the
+    // shutdown close-out terminalizes, a closed event stream) find their
+    // entry still registered here and print it themselves. Such a task
+    // never started a transfer, so nothing it printed can invert the
+    // started/done order of a real job. When the hook already printed,
+    // the entry is gone and this is a no-op: every job's terminal line
+    // prints exactly once.
     if let Some(terminal) = terminals.withdraw(&task_id) {
         terminal.print(&task_id);
     }

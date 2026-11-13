@@ -202,8 +202,9 @@ pub(crate) struct SchedulerActor {
     backoff_waiters: HashSet<TaskId>,
     /// CR-P2-15: the runtime-wide settled-outcome hook (see
     /// [`RuntimeConfig::on_attempt_settled`]), fired inside
-    /// [`SchedulerActor::on_finished`] before the core applies the
-    /// terminal transition.
+    /// [`SchedulerActor::on_finished`] with the attempt's outcome and
+    /// whether it is the task's terminal settlement (CR-P3-17), before
+    /// the core applies the settlement's transition.
     on_attempt_settled: Option<AttemptSettledHook>,
     shutdown: Option<ShutdownProgress>,
     finalized: bool,
@@ -585,13 +586,39 @@ impl SchedulerActor {
             return;
         }
         // CR-P2-15: the settled-outcome hook runs BEFORE the core applies
-        // the terminal transition below (permit release, requeue or
-        // pause). The actor is the single writer of the core, so whatever
-        // the hook emits precedes the slot release and every consequence
-        // of it — the next admission, its driver, its first progress —
-        // by construction, not by scheduling luck.
+        // the settlement's transition below (permit release, requeue,
+        // pause or backoff scheduling). The actor is the single writer of
+        // the core, so whatever the hook emits precedes the slot release
+        // and every consequence of it — the next admission, its driver,
+        // its first progress — by construction, not by scheduling luck.
+        //
+        // CR-P3-17: `terminal` mirrors the transition the match below is
+        // about to apply. Terminal settlements — a completion, a failure
+        // that finalizes a requested cancellation, and the
+        // retry-budget-exhaustion park — release the task's slot with no
+        // further automatic attempt. A failure with budget left is not
+        // terminal (a backoff and another attempt follow; the permit
+        // stays held), and neither is a failure an ongoing shutdown
+        // absorbs (the close-out terminalizes it later, outside this
+        // hook).
+        let terminal = match (&outcome, self.entries.get(&id)) {
+            (FinishOutcome::Completed, _) => true,
+            (
+                FinishOutcome::Failed { .. },
+                Some(TaskEntry::Active {
+                    cancel_requested,
+                    attempts,
+                    ..
+                }),
+            ) => {
+                *cancel_requested
+                    || self.core.task_state(task) == Some(TaskState::CancelRequested)
+                    || (self.shutdown.is_none() && *attempts + 1 >= self.retry.max_attempts)
+            }
+            (FinishOutcome::Failed { .. }, _) => false,
+        };
         if let Some(hook) = &self.on_attempt_settled {
-            hook(task);
+            hook(task, &outcome, terminal);
         }
         match outcome {
             FinishOutcome::Completed => {

@@ -72,6 +72,13 @@ void main() {
         'elapsed_ms': 31,
       },
     ));
+    // CR-P3-12: the opener's packet count rides the same tolerance
+    // contract — a zero here with an adopted socket is the
+    // run-43304434327 fingerprint of an over-strict target filter.
+    ConnectionDiagnosticsLog.shared.record(const TaskUnknownEvent(
+      name: 'reflexive_opener',
+      fields: {'packets': 2},
+    ));
     ConnectionDiagnosticsLog.shared.record(const TaskConnectedEvent(
       conn: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       role: 'sender',
@@ -109,13 +116,15 @@ void main() {
     expect(body, contains('ak-sending-connection-diagnostics'));
     expect(body, contains('"platform"'));
     expect(body, contains('"os"'));
-    expect(body, contains('"line_count":5'));
+    expect(body, contains('"line_count":6'));
 
     // The key diagnostic event lines, one JSON object per line.
     expect(body, contains('"event":"receiver_bind"'));
     expect(body, contains('"event":"sender_bind"'));
     expect(body, contains('"event":"probe_observed"'));
     expect(body, contains('"kind":"candidate"'));
+    expect(body, contains('"event":"reflexive_opener"'));
+    expect(body, contains('"packets":2'));
     expect(body, contains('"event":"connected"'));
     expect(body, contains('"peer_endpoint":"127.0.0.1:53112"'));
     expect(body, contains('"event":"sent_via"'));

@@ -5,7 +5,10 @@
 /// What lands here: the diagnostic-class task-plane events —
 /// `receiver_bind` / `sender_bind` (bind + STUN facts), `probe_observed`
 /// (the send-time probe round's observation, emitted since the same G2
-/// batch), `connected` (the pairing fact incl. `peer_endpoint`), the
+/// batch), `reflexive_opener` (the post-pairing opener's packet count,
+/// whitelisted since CR-P3-12 — a zero with an adopted socket is the
+/// run-43304434327 fingerprint of an over-strict target filter),
+/// `connected` (the pairing fact incl. `peer_endpoint`), the
 /// `probe_result` verdicts, `handshake_failed`, data-plane
 /// `disconnected` reasons — plus the send op's `sent_via` line (the GUI
 /// analog of the CLI's "connected via" fact: the address the engine
@@ -67,10 +70,10 @@ class ConnectionDiagnosticsLog {
   void clear() => _lines.clear();
 
   /// Record one polled task event IF it is diagnostic-class. Unknown
-  /// names ride the existing tolerance contract: only the three
+  /// names ride the existing tolerance contract: only the four
   /// registered diagnostic unknowns (`receiver_bind`, `sender_bind`,
-  /// `probe_observed`) land; every other unknown is dropped exactly like
-  /// the router drops it.
+  /// `probe_observed`, `reflexive_opener`) land; every other unknown is
+  /// dropped exactly like the router drops it.
   void record(TaskEvent event) {
     if (event is TaskConnectedEvent) {
       _push('connected', {
@@ -105,6 +108,7 @@ class ConnectionDiagnosticsLog {
         case 'receiver_bind':
         case 'sender_bind':
         case 'probe_observed':
+        case 'reflexive_opener': // CR-P3-12: opener packet count (C4 clue)
           _push(event.name, event.fields);
           return;
         default:

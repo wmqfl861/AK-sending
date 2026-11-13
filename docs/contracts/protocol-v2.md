@@ -56,6 +56,12 @@ type Signature64  = [u8; 64];
 
 `ServerError` 保留有界旧类错误；邀请码业务错误走下面的固定 `PairError`，不回显用户输入。
 
+`ServerError.code` 固定码表（连接级原因码，与 `PairError` 业务码分列；补登 2026-11-13 H3/CR-P3-12，语义自 `9029c08` 起已在实现中冻结）：
+
+| code | 名称 | 语义 |
+|---|---|---|
+| `0x1001` | `ERR_DEVICE_REPLACED` | 本连接被同一 `device_id` 的**新**控制连接替换：新连接 `Hello` 认证通过后，服务端在关闭旧连接**之前**先向旧连接投递本原因帧（`message` 有界，如 "replaced by a newer connection"），写端排空后关闭。客户端据此把"被替换"与普通断连区分（`is_replaced`），守护进程对重连**配速**（等满替换暂停窗口再回收连接，避免两个常驻实例互踢的连接战争）；普通网络失败仍按退避第 0 步立即重连。码点选择：高于 v1 旧类错误 `1..=5`，低于 v2 冻结业务码 `0x2101..=0x2109`；不进 `PairError` 表（`pairing-flow.md` §12）。 |
+
 `Welcome.capabilities` 是**服务端能力声明**（u32 位掩码），已定义位：`0x0001` 邀请码管理（claim/list/revoke）、`0x0002` 配对事务、`0x0004` v2 会话、`0x0008` 可查询服务器版本（G6 修订，见第 6a 节）。未定义位客户端忽略；旧客户端本就只校验 `session_ttl_secs > 0`，新位对它们是纯加法。`Hello` 无客户端能力位——capabilities 不是双方协商。
 
 ## 4. 邀请码管理消息

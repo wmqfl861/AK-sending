@@ -8,7 +8,7 @@ use crate::runtime::error::SessionError;
 use crate::runtime::executor::TransferExecutor;
 use crate::runtime::transport::{PairingId, PairingTransport, PeerFingerprint, RedeemPayload};
 use crate::scheduler::config::SchedulerPolicy;
-use crate::scheduler::key::{CodeGroupKey, RegistryId, TaskId};
+use crate::scheduler::key::{CodeGroupKey, RegistryId, TaskHandle, TaskId};
 use crate::scheduler::state::{SchedulerEvent, TaskState};
 
 /// Frozen broadcast bound for runtime events (contract §7: a slow UI must
@@ -182,6 +182,10 @@ impl RetryPolicy {
     }
 }
 
+/// CR-P2-15 hook shape (see [`RuntimeConfig::on_attempt_settled`]): the
+/// task whose attempt just settled.
+pub type AttemptSettledHook = Arc<dyn Fn(&TaskHandle) + Send + Sync>;
+
 /// Configuration for [`SessionRuntime::start`](crate::runtime::SessionRuntime).
 pub struct RuntimeConfig {
     /// Initial scheduling policy (may be switched later via
@@ -204,6 +208,17 @@ pub struct RuntimeConfig {
     pub shutdown_timeout_ms: u64,
     /// Whether to run the resident pairing listener.
     pub listener_enabled: bool,
+    /// CR-P2-15 ordering hook: invoked synchronously by the runtime actor
+    /// when an executor reports a task's settled outcome, strictly BEFORE
+    /// the scheduler core applies the terminal transition (permit release,
+    /// requeue or pause) and therefore before the freed slot can admit any
+    /// queued task. Whatever the callback emits is thus ordered ahead of
+    /// every downstream consequence of the release — the next admission's
+    /// `TaskAdmitted`, its driver, its first progress report — which is
+    /// the ordering external event consumers see. At most once per task;
+    /// it runs on the actor's task, so it must be quick and must not
+    /// block.
+    pub on_attempt_settled: Option<AttemptSettledHook>,
 }
 
 impl RuntimeConfig {
@@ -226,6 +241,7 @@ impl RuntimeConfig {
             retry: RetryPolicy::default(),
             shutdown_timeout_ms: 5000,
             listener_enabled: true,
+            on_attempt_settled: None,
         }
     }
 

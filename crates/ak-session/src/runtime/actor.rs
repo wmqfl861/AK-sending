@@ -27,9 +27,9 @@ use crate::runtime::executor::{ExecutorReport, ExecutorWork, ProgressSink};
 use crate::runtime::listener::ListenerStats;
 use crate::runtime::transport::{PairingConfirmation, PairingTransport};
 use crate::runtime::types::{
-    CancelReceipt, PairingPlan, ParkReason, RetryPolicy, SessionEvent, SessionSnapshot,
-    ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferDirection, TransferId,
-    TransferSpec, MAX_TERMINAL_HISTORY,
+    AttemptSettledHook, CancelReceipt, PairingPlan, ParkReason, RetryPolicy, SessionEvent,
+    SessionSnapshot, ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferDirection,
+    TransferId, TransferSpec, MAX_TERMINAL_HISTORY,
 };
 use crate::scheduler::config::SchedulerPolicy;
 use crate::scheduler::core::{CancelOutcome, FinishResult, PolicySwitch, SchedulerCore};
@@ -200,6 +200,11 @@ pub(crate) struct SchedulerActor {
     pending_engine_work: Vec<ExecutorWork>,
     /// Tasks holding their permit while waiting out a retry backoff.
     backoff_waiters: HashSet<TaskId>,
+    /// CR-P2-15: the runtime-wide settled-outcome hook (see
+    /// [`RuntimeConfig::on_attempt_settled`]), fired inside
+    /// [`SchedulerActor::on_finished`] before the core applies the
+    /// terminal transition.
+    on_attempt_settled: Option<AttemptSettledHook>,
     shutdown: Option<ShutdownProgress>,
     finalized: bool,
     next_task_id: u64,
@@ -222,6 +227,7 @@ impl SchedulerActor {
         listener_enabled: bool,
         retry: RetryPolicy,
         shutdown_timeout_ms: u64,
+        on_attempt_settled: Option<AttemptSettledHook>,
     ) -> Self {
         SchedulerActor {
             core,
@@ -240,6 +246,7 @@ impl SchedulerActor {
             drivers: HashMap::new(),
             pending_engine_work: Vec::new(),
             backoff_waiters: HashSet::new(),
+            on_attempt_settled,
             shutdown: None,
             finalized: false,
             next_task_id: 0,
@@ -576,6 +583,15 @@ impl SchedulerActor {
             // Terminal (or duplicate) report: the first persisted outcome
             // wins (P1-03 — never rewrite a terminal state).
             return;
+        }
+        // CR-P2-15: the settled-outcome hook runs BEFORE the core applies
+        // the terminal transition below (permit release, requeue or
+        // pause). The actor is the single writer of the core, so whatever
+        // the hook emits precedes the slot release and every consequence
+        // of it — the next admission, its driver, its first progress —
+        // by construction, not by scheduling luck.
+        if let Some(hook) = &self.on_attempt_settled {
+            hook(task);
         }
         match outcome {
             FinishOutcome::Completed => {

@@ -69,9 +69,9 @@ pub use transport::{
     PeerFingerprint, RedeemAccepted, RedeemPayload,
 };
 pub use types::{
-    CancelReceipt, ListenerView, PairingPlan, ParkReason, RetryPolicy, RuntimeConfig, SessionEvent,
-    SessionSnapshot, ShutdownMode, ShutdownSummary, SnapshotQuery, TaskView, TransferDirection,
-    TransferId, TransferSpec, EVENT_CAPACITY, MAX_TERMINAL_HISTORY,
+    AttemptSettledHook, CancelReceipt, ListenerView, PairingPlan, ParkReason, RetryPolicy,
+    RuntimeConfig, SessionEvent, SessionSnapshot, ShutdownMode, ShutdownSummary, SnapshotQuery,
+    TaskView, TransferDirection, TransferId, TransferSpec, EVENT_CAPACITY, MAX_TERMINAL_HISTORY,
 };
 
 // Re-export the scheduler-domain vocabulary runtime callers need, so the

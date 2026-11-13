@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -387,11 +387,17 @@ struct WiredRuntime {
 
 /// Start the wired runtime (see [`WiredRuntime`]). `default_executor` is
 /// the never-used listener slot (the listener is disabled).
+/// `terminals` is the CR-P2-15 terminal-print registry: it becomes the
+/// runtime's `on_attempt_settled` hook, so every wired job's
+/// `job_done`/`error` line prints from INSIDE the actor's finish
+/// handling — strictly before the scheduler releases the task's slot,
+/// hence before the task admitted into that slot can print anything.
 async fn start_wired_runtime(
     client: ak_session::pairing::RegistryClient,
     settings: &crate::invite::RegistrySettings,
     policy: ak_session::runtime::SchedulerPolicy,
     default_executor: Arc<ak_session::runtime::RealTransferExecutor>,
+    terminals: Arc<JobTerminals>,
 ) -> Result<WiredRuntime> {
     use ak_session::runtime::{
         RealClock, RetryPolicy, RuntimeClock, RuntimeConfig, SessionRuntime, TransferExecutor,
@@ -410,6 +416,18 @@ async fn start_wired_runtime(
         default_executor as Arc<dyn TransferExecutor>,
         ak_session::runtime::RegistryId::from_bytes(settings.registry_id),
     );
+    // CR-P2-15: the settled hook prints the job's terminal line before
+    // the slot release. The handler-side fallback (see
+    // [`wired_connection_handler`]) covers terminal paths that never
+    // reach an executor finish report.
+    config.on_attempt_settled = Some(Arc::new(
+        move |task: &ak_session::scheduler::key::TaskHandle| {
+            let id = task.task_id();
+            if let Some(terminal) = terminals.withdraw(&id) {
+                terminal.print(&id);
+            }
+        },
+    ));
     // The daemon loop is the resident receive path; the runtime listener
     // would submit competing receive tasks on the same port.
     config.listener_enabled = false;
@@ -995,7 +1013,9 @@ impl WiredJobTemplate {
 
 /// The executor of one wired connection, whichever branch the handshake
 /// split took. Both variants expose the same outcome query the task
-/// watcher needs.
+/// watcher needs. `Clone` (cheap Arc clones): the connection handler and
+/// the CR-P2-15 terminal-print registry each keep a copy.
+#[derive(Clone)]
 enum WiredExecutor {
     /// Legacy peer: the daemon's channel executor (this file).
     Legacy(Arc<LegacyChannelExecutor>),
@@ -1030,6 +1050,103 @@ struct WiredConnection {
     registry_id: [u8; 32],
     shutdown: tokio::sync::watch::Receiver<bool>,
     channel: ak_net::DirectChannel,
+    /// CR-P2-15: the daemon-wide terminal-print registry (see
+    /// [`JobTerminals`]).
+    terminals: Arc<JobTerminals>,
+}
+
+/// CR-P2-15: one job's terminal print context — everything needed to
+/// print the job's final NDJSON event (or text-mode report summary) the
+/// moment the runtime reports the task settled. Registered under the task
+/// id BEFORE the task is submitted, consumed exactly once: normally by
+/// the runtime's `on_attempt_settled` hook, which runs strictly before
+/// the scheduler releases the task's slot (see
+/// [`start_wired_runtime`]), so the `job_done`/`error` line can never
+/// land after the next task admitted into that slot prints its
+/// `job_started`.
+struct JobTerminal {
+    out: DaemonOut,
+    start_slot: Arc<Mutex<Option<JobStart>>>,
+    executor: WiredExecutor,
+}
+
+impl JobTerminal {
+    /// Print the terminal line of one job: the `job_done` event (or
+    /// report summary in text mode) on success, the matching `error`
+    /// event on failure. A shutdown cancellation prints nothing — the
+    /// closing `stopped` event is the report. Byte-identical to the
+    /// event lines the handler used to print after the task watcher
+    /// returned; only the TIMING moved (before slot release).
+    fn print(&self, task: &ak_session::runtime::TransferId) {
+        match self.executor.outcome(task) {
+            Some(RealOutcome::Completed { report }) => {
+                emit_job_done(&self.out, &self.start_slot, &report);
+            }
+            Some(RealOutcome::Failed(failure)) => match classify_real_failure(&failure) {
+                JobFailure::Unauthorized => self.out.event(&DaemonEvent::Error {
+                    message: "rejected a peer outside the accept policy",
+                }),
+                JobFailure::Cancelled => {}
+                JobFailure::AddrInUse => self.out.event(&DaemonEvent::Error {
+                    message: "bind failed: address already in use (retry budget exhausted)",
+                }),
+                JobFailure::Other { message } => {
+                    self.out.event(&DaemonEvent::Error { message: &message });
+                }
+            },
+            None => self.out.event(&DaemonEvent::Error {
+                message: "the receive task ended without an engine outcome",
+            }),
+        }
+    }
+}
+
+/// CR-P2-15: the wired daemon's terminal-print registry. Every connection
+/// handler registers its [`JobTerminal`] under the task id it
+/// pre-assigned ([`fresh_wired_task_id`]) BEFORE submitting the task;
+/// the runtime's settled hook withdraws and prints it inside the actor's
+/// finish handling — before the slot release. A handler that observes
+/// the task's end through a path that never fires the hook (a queued
+/// task cancelled at shutdown, a closed event stream) finds its entry
+/// still present after the task watcher returns and prints the terminal
+/// line itself, so every job's terminal line prints exactly once.
+#[derive(Default)]
+struct JobTerminals {
+    entries: Mutex<HashMap<ak_session::runtime::TransferId, Arc<JobTerminal>>>,
+}
+
+impl JobTerminals {
+    fn register(&self, task: ak_session::runtime::TransferId, terminal: Arc<JobTerminal>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task, terminal);
+    }
+
+    /// Remove and return one task's terminal context; `None` means
+    /// somebody else already withdrew (and printed) it.
+    fn withdraw(&self, task: &ak_session::runtime::TransferId) -> Option<Arc<JobTerminal>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task)
+    }
+}
+
+/// Pre-assigned wired task id (CR-P2-15): the terminal context must be
+/// registrable BEFORE the task is submitted, so the daemon assigns the id
+/// itself instead of taking the runtime's. The marker byte keeps this
+/// namespace clear of the runtime's auto ids (`from_counter` form, whose
+/// high eight bytes are zero); a millisecond timestamp plus a
+/// process-local counter keeps ids unique within the daemon's runtime.
+fn fresh_wired_task_id() -> ak_session::runtime::TransferId {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0xD1;
+    bytes[1..9].copy_from_slice(&crate::now_unix_ms().to_be_bytes());
+    bytes[9..].copy_from_slice(&seq.to_be_bytes()[1..]);
+    ak_session::runtime::TransferId::from_bytes(bytes)
 }
 
 /// Serve exactly one accepted connection (spawned per connection by the
@@ -1038,7 +1155,8 @@ struct WiredConnection {
 /// inside the session runtime, so the policy flags govern real groups —
 /// and emit the per-task NDJSON events (`job_started` comes from the
 /// engine's `Connected` progress through the daemon printer; `job_done`
-/// or `error` from the settled outcome).
+/// or `error` from the CR-P2-15 settled hook, which prints BEFORE the
+/// scheduler releases the task's slot).
 async fn wired_connection_handler(connection: WiredConnection) {
     let WiredConnection {
         handle,
@@ -1048,6 +1166,7 @@ async fn wired_connection_handler(connection: WiredConnection) {
         registry_id,
         mut shutdown,
         mut channel,
+        terminals,
     } = connection;
     let peer = channel.peer_fingerprint().to_hex();
     let start_slot = Arc::new(Mutex::new(None::<JobStart>));
@@ -1169,6 +1288,21 @@ async fn wired_connection_handler(connection: WiredConnection) {
     // sent after it existed, and a lightning-fast task must not be able to
     // finish before the watcher is armed.
     let mut events = handle.subscribe();
+    // CR-P2-15: pre-assign the task id and register the terminal print
+    // context BEFORE submitting — the runtime's settled hook (which runs
+    // strictly before the scheduler releases this task's slot) can then
+    // print this job's final line with no registration race, keeping
+    // `job_done` ahead of the next same-code task's `job_started` on the
+    // event stream no matter how the tokio workers interleave.
+    let task_id = fresh_wired_task_id();
+    terminals.register(
+        task_id,
+        Arc::new(JobTerminal {
+            out,
+            start_slot: Arc::clone(&start_slot),
+            executor: executor.clone(),
+        }),
+    );
     let task = match handle
         .enqueue(ak_session::runtime::TransferSpec {
             group_key: group,
@@ -1176,7 +1310,7 @@ async fn wired_connection_handler(connection: WiredConnection) {
             executor: executor.transfer(),
             direction: ak_session::runtime::TransferDirection::Receive,
             label,
-            task_id: None,
+            task_id: Some(task_id),
         })
         .await
     {
@@ -1184,12 +1318,14 @@ async fn wired_connection_handler(connection: WiredConnection) {
         Err(ak_session::runtime::SessionError::QueueFull) => {
             // Contract §7: the local queue is full — refuse THIS
             // connection (capacity), never block or disturb others.
+            terminals.withdraw(&task_id);
             let message = "queue full: connection refused (capacity)".to_owned();
             out.event(&DaemonEvent::Error { message: &message });
             out.text(&format!("{message}; still listening (Ctrl-C stops)"));
             return;
         }
         Err(err) => {
+            terminals.withdraw(&task_id);
             let message = format!("cannot enqueue the receive task: {err}");
             out.event(&DaemonEvent::Error { message: &message });
             out.text(&format!("{message}; still listening (Ctrl-C stops)"));
@@ -1197,15 +1333,23 @@ async fn wired_connection_handler(connection: WiredConnection) {
         }
     };
     let outcome = watch_wired_task(&mut events, task, |task| executor.outcome(task)).await;
+    // CR-P2-15 fallback: terminal paths that never fire the settled hook
+    // (a queued task cancelled at shutdown, a closed event stream) find
+    // their entry still registered here and print it themselves. Such a
+    // task never started a transfer, so nothing it printed can invert
+    // the started/done order of a real job. When the hook already
+    // printed, the entry is gone and this is a no-op: every job's
+    // terminal line prints exactly once.
+    if let Some(terminal) = terminals.withdraw(&task_id) {
+        terminal.print(&task_id);
+    }
+    // The terminal EVENT (or report summary) printed above; only the
+    // human follow-up lines remain here.
     match outcome {
-        Ok(report) => {
-            emit_job_done(&out, &start_slot, &report);
+        Ok(_) => {
             out.text("waiting for next sender (Ctrl-C stops)...");
         }
         Err(JobFailure::Unauthorized) => {
-            out.event(&DaemonEvent::Error {
-                message: "rejected a peer outside the accept policy",
-            });
             out.text("rejected a peer outside the accept policy; still listening (Ctrl-C stops)");
         }
         Err(JobFailure::Cancelled) => {
@@ -1214,12 +1358,9 @@ async fn wired_connection_handler(connection: WiredConnection) {
             out.text("task cancelled (daemon stopping)");
         }
         Err(JobFailure::AddrInUse) => {
-            let message = "bind failed: address already in use (retry budget exhausted)".to_owned();
-            out.event(&DaemonEvent::Error { message: &message });
-            out.text(&format!("{message}; still listening (Ctrl-C stops)"));
+            out.text("bind failed: address already in use (retry budget exhausted); still listening (Ctrl-C stops)");
         }
         Err(JobFailure::Other { message }) => {
-            out.event(&DaemonEvent::Error { message: &message });
             out.text(&format!("{message}; still listening (Ctrl-C stops)"));
         }
     }
@@ -1240,6 +1381,10 @@ struct WiredDaemon {
     candidates_json: Vec<String>,
     candidate_addrs: Vec<crate::AddressCandidate>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// CR-P2-15: the terminal-print registry shared with the runtime's
+    /// settled hook (one per daemon; every connection handler registers
+    /// its job here).
+    terminals: Arc<JobTerminals>,
 }
 
 impl WiredDaemon {
@@ -1281,6 +1426,7 @@ impl WiredDaemon {
                                     registry_id: self.wired.registry_id,
                                     shutdown: self.shutdown.clone(),
                                     channel,
+                                    terminals: Arc::clone(&self.terminals),
                                 },
                             )));
                             // Reap exited handlers so the join set stays
@@ -1602,7 +1748,10 @@ pub(crate) async fn daemon_core(
     // registry → real transport; the loop below enqueues real receive
     // tasks per iteration). The `default_executor` slot is never used —
     // the resident listener is disabled because the daemon loop itself is
-    // the resident receive path.
+    // the resident receive path. `wired_terminals` (CR-P2-15) is the
+    // terminal-print registry the runtime's settled hook and every
+    // connection handler share.
+    let wired_terminals = Arc::new(JobTerminals::default());
     let wired_runtime = if wired_mode {
         let settings = registry.as_ref().expect("checked above");
         let policy =
@@ -1617,7 +1766,14 @@ pub(crate) async fn daemon_core(
             .expect("wired mode implies the shared registry connection")
             .2
             .clone();
-        let wired = start_wired_runtime(shared_client, settings, policy, default_executor).await?;
+        let wired = start_wired_runtime(
+            shared_client,
+            settings,
+            policy,
+            default_executor,
+            Arc::clone(&wired_terminals),
+        )
+        .await?;
         let switch = wired
             .handle
             .set_policy(policy)
@@ -1693,6 +1849,7 @@ pub(crate) async fn daemon_core(
             candidates_json,
             candidate_addrs,
             shutdown,
+            terminals: wired_terminals,
         };
         return daemon.run().await;
     }
@@ -1921,6 +2078,19 @@ mod tests {
         assert_eq!(opts.cross_code, None);
         assert_eq!(opts.server, None);
         assert_eq!(opts.registry_fp, None);
+    }
+
+    /// CR-P2-15: pre-assigned wired task ids carry the daemon-namespace
+    /// marker byte (the runtime's auto ids are `from_counter` form, high
+    /// eight bytes zero) and never repeat within the process.
+    #[test]
+    fn wired_task_ids_are_marked_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            let id = fresh_wired_task_id();
+            assert_eq!(id.as_bytes()[0], 0xD1, "daemon namespace marker byte");
+            assert!(seen.insert(id), "task ids never repeat within the process");
+        }
     }
 
     #[test]
@@ -2400,6 +2570,7 @@ mod tests {
             &registry.settings,
             scheduler_policy_from_flags(Some("parallel"), Some("serial")).unwrap(),
             Arc::new(default_executor),
+            Arc::new(JobTerminals::default()),
         )
         .await
         .expect("wired runtime starts against the real registry transport");
@@ -2451,6 +2622,7 @@ mod tests {
             &registry.settings,
             scheduler_policy_from_flags(Some("parallel"), None).unwrap(),
             Arc::new(default_executor),
+            Arc::new(JobTerminals::default()),
         )
         .await
         .expect("wired runtime starts");
@@ -2595,6 +2767,9 @@ mod tests {
         registry_id: [u8; 32],
         validator: Arc<ak_session::runtime::admission::AdmissionValidator>,
         template: WiredJobTemplate,
+        /// CR-P2-15: the terminal-print registry the runtime hook and the
+        /// spawned handlers share (the daemon's own wiring, in miniature).
+        terminals: Arc<JobTerminals>,
     }
 
     impl WiredScaffold {
@@ -2696,11 +2871,13 @@ mod tests {
             let client = crate::invite::connect_registry(&self.registry.settings, &key)
                 .await
                 .unwrap();
+            let terminals = Arc::new(JobTerminals::default());
             let wired = start_wired_runtime(
                 client,
                 &self.registry.settings,
                 policy,
                 Arc::new(default_executor),
+                Arc::clone(&terminals),
             )
             .await
             .expect("wired runtime starts");
@@ -2734,6 +2911,7 @@ mod tests {
                 out_dir: self.out_dir,
                 validator,
                 template,
+                terminals,
             }
         }
     }
@@ -2773,6 +2951,7 @@ mod tests {
         validator: Arc<ak_session::runtime::admission::AdmissionValidator>,
         template: WiredJobTemplate,
         registry_id: [u8; 32],
+        terminals: Arc<JobTerminals>,
         connections: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -2789,6 +2968,7 @@ mod tests {
                         registry_id,
                         shutdown: shutdown_rx.clone(),
                         channel,
+                        terminals: Arc::clone(&terminals),
                     }));
                 }
             }
@@ -2885,6 +3065,7 @@ mod tests {
             Arc::clone(&scaffold.validator),
             scaffold.template.clone(),
             scaffold.registry_id,
+            Arc::clone(&scaffold.terminals),
             connections,
         );
         (addr, acceptor)

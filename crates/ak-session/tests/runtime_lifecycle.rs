@@ -250,3 +250,89 @@ async fn cancel_running_task_stops_engine_and_finalizes() {
         .await;
     assert!(next.is_ok());
 }
+
+/// CR-P2-15: the `on_attempt_settled` hook fires strictly BEFORE the
+/// scheduler core applies the task's terminal transition — before the
+/// task's own `TaskFinished` is broadcast and before the released slot
+/// admits the queued same-code successor. This is the ordering the
+/// daemon's `job_done`-before-`job_started` guarantee rests on: the
+/// actor is the single writer of the core, so the hook running inside
+/// `on_finished` precedes the slot release by construction, not by
+/// scheduling luck. The probe subscribes before any task is submitted
+/// and drains synchronously inside the hook; the events asserted absent
+/// are the exact consequences of the release.
+#[tokio::test]
+async fn attempt_settled_hook_precedes_slot_release_and_events() {
+    use std::sync::{Arc, Mutex};
+
+    use ak_session::runtime::RuntimeConfig;
+    use ak_session::scheduler::SchedulerEvent;
+
+    let first = TaskId::from_counter(1);
+    let successor = TaskId::from_counter(2);
+    let probe: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<SessionEvent>>>> =
+        Arc::new(Mutex::new(None));
+    let fired: Arc<Mutex<Vec<TaskId>>> = Arc::new(Mutex::new(Vec::new()));
+    let (hook_probe, hook_fired) = (Arc::clone(&probe), Arc::clone(&fired));
+    let env = env_with_config(
+        policy(SameCodeMode::Serial, CrossCodeMode::Parallel, 1, 4, 64),
+        |config: &mut RuntimeConfig| {
+            config.on_attempt_settled = Some(Arc::new(move |task| {
+                let current = task.task_id();
+                hook_fired.lock().unwrap().push(current);
+                let mut violations: Vec<&'static str> = Vec::new();
+                let guard = &mut *hook_probe.lock().unwrap();
+                if let Some(rx) = guard.as_mut() {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(SessionEvent::Scheduler(SchedulerEvent::TaskFinished {
+                                task,
+                                ..
+                            })) if task.task_id() == current => violations
+                                .push("the task's own TaskFinished was broadcast before the hook"),
+                            Ok(SessionEvent::Scheduler(SchedulerEvent::TaskAdmitted {
+                                task,
+                                ..
+                            })) if current == first && task.task_id() == successor => violations
+                                .push(
+                                    "the freed slot's next admission was broadcast before the hook",
+                                ),
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                assert!(
+                    violations.is_empty(),
+                    "events beat the settled hook: {violations:?}"
+                );
+            }));
+        },
+    )
+    .await;
+    *probe.lock().unwrap() = Some(env.handle.subscribe());
+
+    // Same group under same-code serial: the successor stays queued until
+    // the first task's slot release — exactly the release the hook must
+    // precede.
+    env.handle
+        .enqueue(send_spec(1, group(1), &env.executor))
+        .await
+        .unwrap();
+    env.handle
+        .enqueue(send_spec(2, group(1), &env.executor))
+        .await
+        .unwrap();
+
+    let snap = run_until(&env, all_terminal, 5_000).await;
+    assert!(
+        snap.tasks.iter().all(|t| t.state == TaskState::Completed),
+        "both tasks complete"
+    );
+    assert_eq!(
+        *fired.lock().unwrap(),
+        vec![first, successor],
+        "the hook fired exactly once per settled task, in settle order"
+    );
+}

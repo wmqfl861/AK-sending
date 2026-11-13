@@ -150,7 +150,7 @@ pub struct SessionRuntime;
 impl SessionRuntime {
     /// Start the scheduler actor (and, when configured, the resident
     /// pairing listener) under the current tokio runtime.
-    pub fn start(config: RuntimeConfig) -> Result<SessionHandle, SessionError> {
+    pub fn start(mut config: RuntimeConfig) -> Result<SessionHandle, SessionError> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(SessionError::NotInRuntime);
         }
@@ -171,6 +171,7 @@ impl SessionRuntime {
             config.listener_enabled,
             config.retry,
             config.shutdown_timeout_ms,
+            config.on_attempt_settled.take(),
         );
         let actor_join = tokio::spawn(actor.run(cmd_rx));
 

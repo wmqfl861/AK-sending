@@ -26,6 +26,10 @@
 | `aae55db` | H3/CR-P3-13 | RFC5737 矩阵网段收尾 + IPv6 SKIP + 200ms 断言收紧（含 task_net 孪生）+ netem 256MiB/RTT + 8MiB 措辞更正 |
 | `84b58d9` | H3/CR-P3-13 | netem runner 随 256MiB 改名同步（`--exact` 过滤器+校验器+fixture）+ 三角防漂移守卫（详见 §4） |
 | `6235bec` | H3/CR-P3-13 | 双栈跳过改用 raw errno（E0599 修复：不存在的 ErrorKind 变体名只在 cfg(unix) 编译路径暴露）——详见 §4 |
+| `4f23127` | H0 docs | 状态表七行回写 + CR-P2-04"8MiB 窗口实证"措辞更正 + 本交接文档（其 netem 二跑暴露 §4 第 3 项） |
+| `6302487` | H3/CR-P3-13 | 校验器接受基线行字面 "-" RTTs 列（netem 二跑红修复，忠实重构验证纪律）——netem 三跑成功 |
+
+批次 I（本交接之后追加，非批次 H 范畴）：`e498fa2`（I2）unix clippy 硬化——c_char 转换债清零 + `scripts/clippy_unix_probe.sh` 本地预警；I1（tls.rs 窗口覆写 + quinn stats 钩子 + bench A/B 臂）另行入库。
 
 ## 2. 关键实现与根因（复核要点对照）
 
@@ -62,15 +66,19 @@
 1. **主 CI run 43410016551**（aae55db）：唯一红 job = Rust ubuntu 的 **Clippy** 步骤。根因：H3 的双栈跳过分支用了**不存在的** `ErrorKind::AddrfamilyNotSupported/ProtocolNotSupported` 变体（E0599）——该代码在 `#[cfg(unix)]` 测试里，Windows（本机+CI）从不编译它所以全绿，ubuntu clippy `--all-targets` 是该路径首次被编译。修复 `6235bec`：改匹配 `libc::EAFNOSUPPORT/EPROTONOSUPPORT` raw errno + `Unsupported` kind。**用 NDK 交叉探针验证**（`cargo clippy --target aarch64-linux-android`——该 target `cfg(unix)` 为真，unix 分支全部编译）：ak-net/ak-session/ak-cli `--all-targets -D warnings` 全干净。探针顺带暴露 ak-ffi 测试 helper 两处 wave-33 旧代码的 `as u8` 恒等转换（aarch64 上 c_char=u8 触发、windows/x86_64-linux 上 c_char=i8 合法）——**非 CI 问题**（没有任何 CI job 对 aarch64-linux 跑 clippy），本批之前即存在，未动。
    其余 11 job 在 aae55db 已全绿，含：**NAT 矩阵（RFC5737 网段 + 三个新案例 late-send-5s/40s、recv-no-lowttl 全部 pass-v4）**、**legacy-signal 首跑**、Flutter 173+、Repository checks 40 行门槛。
 2. **netem-benchmark run 43410016378**（aae55db）：`aae55db` 把 bench 测试改名为 `..._256mib_...`，runner 仍以 `--exact` 调旧名 → cargo 选中零个测试 → runner 按其"NOT-MEASURED 即失败"设计正确判红（不静默跳过）。契约测试当时全绿是因为常量/mock/脚本三方一起漂移（自洽但脱离 bench 源）。修复 `84b58d9`：`--exact` 过滤器、日志校验器（256MiB 前缀+5 列行正则+RTTs 列）、fixture 三方同步 + 新增**三角防漂移守卫**（常量↔runner↔bench 源码，未来改名在 CI step 5 就失败）。40/40 契约测试绿。
+3. **netem 二跑 run 43413205487**（4f23127）：名字已对、测量真实执行，但校验器仍拒——bench 基线行 RTTs 列打印字面 **`"-"`**（无整形、wall/RTT 无定义），84b58d9 的正则只收 `{number}|inf`。修复 `6302487`：RTTs 备选扩为 `{number}|-|inf`，fixture 基线行同步镜像真实输出；**验证纪律升级**——把校验器 heredoc 从 runner 抽出、对照"按 bench println 格式串逐行重构的完整真实输出"（表格三行+主机计数行+参考段）本地实跑通过后才推送。
 
-**tip（6235bec）复验**：<!-- TIP-CI-RESULT -->
-
-- 三振规则：两 gate 各自一振内修复（不同根因、不同 gate）；netem gate 历史上另有 tc argv 两振（不同断言、历史记录在案）。
+**最终结果**：
+- 主 CI：`4f23127` → run **43413205516 全绿**（12/12 job，含 NAT 矩阵三新案例、legacy-signal 首跑、Flutter 173+、40 行状态表门槛、三平台 portability）。
+- netem-benchmark：`6302487` → run **43415588553 成功**——**256 MiB 新口径实测证据落地**（基线/RTT≈100ms/RTT≈200ms 三档 + RTT 数列 + lo/UDP 主机计数；具体数字见该 run 的 step summary 与 `netem-benchmark-6302487-*` artifact）。CR-P2-04 的 8 MiB 收益对照自此有了测量基座（A/B 覆写入口见 §5）。
+- 三振规则：主 CI clippy gate 一振修复（6235bec）；netem gate 两振（84b58d9 名字漂移、6302487 校验器行形）——不同断言、各自根因独立，均已修复并有提交说明可溯。
 
 ## 5. 未完成 / 待所有者 / 下一步
 
-- **tip CI 绿确认**（见 §4 占位）——矩阵三新案例与 legacy-signal 已在 aae55db 证明绿，tip 只需确认 clippy 修复。
-- **netem 256MiB 新口径实测**：由 `84b58d9` 的 path 过滤器自动重触发（与 tip CI 同一推送）；8MiB 收益对照（42 RTT 预期 vs 实测）是 CR-P2-04 的剩余问题。两处不可达（quinn stats 钩子、tls.rs 覆写入口）已留档，需后续批次给接口。
+- **已闭环**：主 CI tip 全绿（run 43413205516）；netem 256MiB 新口径实测落地（run 43415588553 成功，256 MiB/RTT 列/主机计数证据在 run summary 与 artifact）。
+- **批次 I（后续工程，已在途）**：quinn stats 钩子 + tls.rs 窗口覆写入口（`AK_EXP_QUIC_WINDOW_KIB`）+ bench A/B 臂——CR-P2-04 的 8 MiB 收益对照自此可测（对照 run 43415588553 的默认窗基线）。I2：unix 路径 clippy 硬化（`scripts/clippy_unix_probe.sh` 本地预警 + c_char 转换债清零）已入库。
+- **C4 真机清单**（复核修订版前置全部满足后）：两台真实设备跨 NAT 互传；Windows 真机 `IP_TTL` 行为确认（本机单测已验证，真机网络栈下再证一次）；GUI 配对→选文件→迟发送实测（矩阵已模拟 5s/40s 档）。
+- **待所有者**：E5 签名密钥；E6 服务器部署（OPERATIONS §0 + 防火墙关 TCP 7100；CR-P2-13 完成前不停旧进程）；E7 LICENSE；CR-P3-03 域名；CR-P3-05 SSH 密钥。
 - **C4 真机清单**（复核修订版前置全部满足后）：两台真实设备跨 NAT 互传；Windows 真机 `IP_TTL` 行为确认（本机单测已验证，真机网络栈下再证一次）；GUI 配对→选文件→迟发送实测（矩阵已模拟 5s/40s 档）。
 - **待所有者**：E5 签名密钥；E6 服务器部署（OPERATIONS §0 + 防火墙关 TCP 7100；CR-P2-13 完成前不停旧进程）；E7 LICENSE；CR-P3-03 域名；CR-P3-05 SSH 密钥。
 - **建议下一批**（若有）：quinn `Connection::stats()` 的 ak-net/ak-engine 统计钩子 + tls.rs 窗口覆写入口（netem A/B 的两个前置）；矩阵案例若 CI 时长吃紧可拆分 job。

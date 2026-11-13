@@ -84,7 +84,7 @@ void main() {
     expect(find.byKey(const ValueKey('incoming_host')), findsNothing);
   });
 
-  testWidgets('P2-11: the 30 s window closing removes the banner; a '
+  testWidgets('P2-11: the consent window closing removes the banner; a '
       'reject racing the expiry never throws', (tester) async {
     final fake = await pumpApp(tester);
 
@@ -174,5 +174,61 @@ void main() {
     await tester.pump();
     expect(find.text('将保存到：Download/AK-接收'), findsOneWidget,
         reason: '事件缺字段时回退显示当前设置');
+  });
+
+  testWidgets('E2/G4: the pending banner counts down the event\'s window '
+      '(120 s) second by second', (tester) async {
+    final fake = await pumpApp(tester);
+
+    fake.emitIncomingRequest(jobId: 'cd', fileCount: 1, totalBytes: 1);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    // The number comes from the OFFER (the fake defaults to the 120 s
+    // production window) — never a hard-coded UI guess.
+    expect(find.text('剩余 120 秒后自动拒绝'), findsOneWidget,
+        reason: '倒计时必须显示事件携带的窗口秒数');
+
+    // One second later: 119. The ticker is a plain periodic timer, so
+    // fake-time pumping drives it deterministically.
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.text('剩余 119 秒后自动拒绝'), findsOneWidget);
+
+    // Five more seconds: 114.
+    await tester.pump(const Duration(seconds: 5));
+    expect(find.text('剩余 114 秒后自动拒绝'), findsOneWidget);
+
+    // The countdown never removes the banner by itself — the NATIVE
+    // expiry event does (E2: native is the deadline fact source).
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byKey(const ValueKey('incoming_accept_cd')), findsOneWidget);
+    fake.expireIncoming('cd');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('incoming_host')), findsNothing);
+  });
+
+  testWidgets('E2/G4: a scripted shorter window is mirrored; no window on '
+      'the offer shows no countdown', (tester) async {
+    final fake = await pumpApp(tester);
+
+    // A scripted 45 s window (the value the event carries is the truth).
+    fake.emitIncomingRequest(
+        jobId: 'short', fileCount: 1, totalBytes: 1, windowSecs: 45);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('剩余 45 秒后自动拒绝'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.text('剩余 44 秒后自动拒绝'), findsOneWidget);
+
+    // An offer WITHOUT windowSecs (an engine predating the field): the
+    // banner still works, but shows no countdown rather than a guess.
+    fake.emitIncomingRequest(
+        jobId: 'old', fileCount: 1, totalBytes: 1, windowSecs: null);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('incoming_accept_old')), findsOneWidget);
+    expect(find.byKey(const ValueKey('incoming_countdown_old')), findsNothing,
+        reason: '事件无窗口字段时不得显示猜测的倒计时');
   });
 }

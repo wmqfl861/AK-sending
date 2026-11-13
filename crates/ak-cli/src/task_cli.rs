@@ -15,7 +15,7 @@
 //! * `task code-send <PATHS...>` — generate a SENDER-side code, print it,
 //!   wait for the joiner, pair, probe, send the paths, report, disconnect.
 //! * `task code-recv [--out DIR]` — generate a RECEIVER-side code, print
-//!   it, wait, pair, probe, then serve receives behind the 30 s consent
+//!   it, wait, pair, probe, then serve receives behind the 120 s consent
 //!   prompt ([Y/n], timeout declines); one completed task ends the run.
 //! * `task join-send <CODE> <PATHS...>` — join someone's code as the
 //!   sender: redeem (explicit direction), probe, send, disconnect.
@@ -95,9 +95,14 @@ use crate::invite::RegistrySettings;
 // ---------------------------------------------------------------------------
 
 /// Offer-level consent window: the terminal prompt waits this long, then
-/// auto-DECLINES (never auto-accepts). 30 s per the frozen v1 model; the
-/// field is injectable so tests exercise the expiry on a short window.
-pub(crate) const CONSENT_WINDOW: Duration = Duration::from_secs(30);
+/// auto-DECLINES (never auto-accepts). 120 s since the acceptance
+/// decision E2 (review 2026-11-12 §6, batch-F G4) — the frozen v1
+/// model's 30 s was too short for a phone user, and CR-P2-04's QUIC
+/// keep-alive (10 s) plus idle budget (60 s) hold the connection through
+/// the whole wait; the sender-side idle budget rose with it
+/// (`task_net::TASK_SEND_IDLE`, 150 s). The field is injectable so
+/// tests exercise the expiry on a short window.
+pub(crate) const CONSENT_WINDOW: Duration = Duration::from_secs(120);
 
 /// Rate bound of the echo responder's "probe observed from …" diagnostic
 /// line (CR-P1-02 改法第 3 条): a genuinely new source is named at most
@@ -157,7 +162,7 @@ pub(crate) enum TaskCommand {
         registry_fp: Option<String>,
     },
     /// Generate a receiver-side task code and print it, wait for the peer
-    /// to join, then receive behind a 30 s [Y/n] consent prompt into --out.
+    /// to join, then receive behind a 120 s [Y/n] consent prompt into --out.
     /// One completed transfer ends the run (single-task model).
     CodeRecv {
         /// Destination directory (default: current directory).
@@ -213,7 +218,7 @@ pub(crate) enum TaskCommand {
         registry_fp: Option<String>,
     },
     /// Join someone's task code as the RECEIVER: redeem, probe, receive
-    /// behind the 30 s consent prompt into --out, disconnect after one
+    /// behind the 120 s consent prompt into --out, disconnect after one
     /// completed task.
     JoinRecv {
         /// The task code in its canonical AKI1-... form.
@@ -2616,7 +2621,7 @@ mod tests {
         assert_eq!(dir_entry_count(out_a.path()), 0, "still nothing on disk");
     }
 
-    // ---- 4. the 30 s window (injected short): expiry declines ---------
+    // ---- 4. the consent window (injected short; production 120 s): expiry declines ---------
 
     #[tokio::test]
     async fn consent_window_timeout_declines() {

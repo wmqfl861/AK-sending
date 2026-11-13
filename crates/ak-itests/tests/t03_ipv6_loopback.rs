@@ -440,14 +440,17 @@ impl RegistryProc {
 
 /// One end-to-end task-code chain: a `task code-recv` process (optionally
 /// with extra `--advertise` IPs) plus a `task join-send` run, through one
-/// shared registry. Returns the receiver's `receiver bound` and
-/// `advertising` lines, both sides' captured stdout, for the caller's
-/// assertions.
+/// shared registry. `consent_delay` is a REAL wait between the offer
+/// banner and the accept answer (E2/G4's delayed-consent scenario passes
+/// ~90 s; the immediate chains pass `Duration::ZERO`). Returns the
+/// receiver's `receiver bound` and `advertising` lines, both sides'
+/// captured stdout, for the caller's assertions.
 fn run_task_code_chain(
     tag: &str,
     registry: &RegistryProc,
     root: &std::path::Path,
     advertise: &[&str],
+    consent_delay: std::time::Duration,
 ) -> (String, String, String, String) {
     let id_recv = root.join(format!("{tag}-id-recv"));
     let id_send = root.join(format!("{tag}-id-send"));
@@ -512,12 +515,16 @@ fn run_task_code_chain(
     let mut sender = Proc::spawn(&format!("{tag}-send"), &send_args);
 
     // The receiver announces the offer (a newline-terminated line), THEN
-    // asks the consent question; keep feeding a fresh `y` until the
-    // transfer visibly moves on.
+    // asks the consent question; wait out the requested delay (a real
+    // user reading the banner for ~90 s in the E2/G4 scenario), then
+    // keep feeding a fresh `y` until the transfer visibly moves on.
     recv.stdout.wait_for(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
     );
+    if !consent_delay.is_zero() {
+        std::thread::sleep(consent_delay);
+    }
     recv.consent_yes(
         &["[recv]", "task complete", "declined"],
         std::time::Duration::from_secs(40),
@@ -567,8 +574,13 @@ fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
 
     // Chain 1 — derived advertisement: both loopback families present,
     // no link-local, dual-stack bind reported, full transfer completes.
-    let (bound, advertised, _recv_log, sender_log) =
-        run_task_code_chain("t03-derived", &registry, tmp.path(), &[]);
+    let (bound, advertised, _recv_log, sender_log) = run_task_code_chain(
+        "t03-derived",
+        &registry,
+        tmp.path(),
+        &[],
+        std::time::Duration::ZERO,
+    );
     assert!(
         bound.contains("[::]"),
         "the receiver must report the dual-stack wildcard bind: {bound}"
@@ -593,8 +605,13 @@ fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
     // Chain 2 — the IPv6 leg carries the payload: `--advertise ::1`
     // (the unchanged manual escape hatch) leads the list, so the winning
     // candidate is named and it is the v6 loopback.
-    let (_bound2, _advertised2, _recv_log2, sender_log2) =
-        run_task_code_chain("t03-v6lead", &registry, tmp.path(), &["::1"]);
+    let (_bound2, _advertised2, _recv_log2, sender_log2) = run_task_code_chain(
+        "t03-v6lead",
+        &registry,
+        tmp.path(),
+        &["::1"],
+        std::time::Duration::ZERO,
+    );
     assert!(
         sender_log2.contains("[task] connected via [::1]:"),
         "the transfer must name the IPv6 loopback as the carrying path: {sender_log2}"
@@ -602,6 +619,69 @@ fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
     assert!(
         sender_log2.contains("[task] done:"),
         "the v6-led task-code transfer must complete: {sender_log2}"
+    );
+}
+
+/// E2/G4 acceptance (review 2026-11-12 §6, batch-F F5/G4): the consent
+/// window is 120 s, so a receiver who only answers ~90 s after the offer
+/// still completes the transfer — the QUIC data plane must survive the
+/// wait (CR-P2-04's keep-alive 10 s / idle 60 s) and the sender's
+/// engine-level idle budget (`TASK_SEND_IDLE`, 150 s) must not cut the
+/// parked send first.
+///
+/// This is a REAL-TIME test: it genuinely waits 90 s between the offer
+/// banner and the `y` answer (the same "real wait" pattern as
+/// ak-cli's keeper test; tokio time control cannot reach into the two
+/// child processes). Wall time ≈ 95–105 s — CI timeouts must budget for
+/// it. The window text assertion also pins the production 120 s value
+/// through the product path (the prompt prints it).
+#[test]
+fn v1_task_code_path_accepts_90s_after_the_offer_and_still_completes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let registry = RegistryProc::spawn(
+        "t03-late",
+        &tmp.path().join("server"),
+        &tmp.path().join("registry.db"),
+    );
+
+    let started = Instant::now();
+    let (_bound, _advertised, recv_log, sender_log) = run_task_code_chain(
+        "t03-late",
+        &registry,
+        tmp.path(),
+        &[],
+        // The acceptance scenario's "~90 s": comfortably past every
+        // 30 s-era deadline (the old window would have declined at
+        // 30 s), comfortably inside the new 120 s window.
+        std::time::Duration::from_secs(90),
+    );
+    let elapsed = started.elapsed();
+
+    // The wait really happened (a bug that answered instantly would
+    // fail this) and stayed inside the window.
+    assert!(
+        elapsed >= std::time::Duration::from_secs(90),
+        "the delayed consent must have actually waited: {elapsed:?}"
+    );
+
+    // The prompt (a `print!` fragment flushed into the first
+    // newline-terminated line after acceptance) names the production
+    // window — 120 s, not the frozen v1 model's 30 s.
+    assert!(
+        recv_log.contains("declines automatically after 120s"),
+        "the consent prompt must carry the 120 s window: {recv_log}"
+    );
+
+    // Both sides converged to success and the bytes are identical (the
+    // chain asserts exit codes and byte equality itself; these pin the
+    // visible completion lines).
+    assert!(
+        sender_log.contains("[task] done:"),
+        "the sender must finish after the late accept: {sender_log}"
+    );
+    assert!(
+        recv_log.contains("received 1 file(s)"),
+        "the receiver must complete the transfer: {recv_log}"
     );
 }
 
@@ -1199,8 +1279,13 @@ fn probe_round_observes_the_real_advertised_candidates() {
         &tmp.path().join("server"),
         &tmp.path().join("registry.db"),
     );
-    let (bound, advertised, _recv_log, sender_log) =
-        run_task_code_chain("t03-obs", &registry, tmp.path(), &[]);
+    let (bound, advertised, _recv_log, sender_log) = run_task_code_chain(
+        "t03-obs",
+        &registry,
+        tmp.path(),
+        &[],
+        std::time::Duration::ZERO,
+    );
     let real_port = receiver_bound_port(&bound);
 
     // The observed head is one of the receiver's genuinely ADVERTISED

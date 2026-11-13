@@ -104,10 +104,15 @@ use super::{
 /// nothing on fast paths).
 pub const TASK_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 
-/// Idle budget of a task-plane send: must comfortably cover the receiver's
-/// pending-consent window (the sender's offer waits while the peer's user
-/// decides) plus slow-storage source scans on the far end.
-pub const TASK_SEND_IDLE: Duration = Duration::from_secs(120);
+/// Idle budget of a task-plane send (both adapters set the send AND the
+/// receive spec's idle budget to it): must comfortably cover the
+/// receiver's pending-consent window (the sender's offer waits while the
+/// peer's user decides) plus slow-storage source scans on the far end.
+/// 150 s since acceptance E2/G4 (review 2026-11-12 §6): the consent
+/// window rose 30 s → 120 s, and the budget must stay ≥ 150 s so the
+/// window itself never races the idle cut (QUIC keep-alive holds the
+/// connection; this budget is the engine-level frame-idle bound).
+pub const TASK_SEND_IDLE: Duration = Duration::from_secs(150);
 
 /// Brief pause between candidate attempts (the failed attempt's QUIC
 /// endpoint releases its UDP socket asynchronously; both adapters use the

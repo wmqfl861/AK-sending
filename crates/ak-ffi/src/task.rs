@@ -189,8 +189,10 @@
 //!   human decision): every incoming offer mints a pending request id,
 //!   emits an `incoming_request` event attributed to the fingerprint-
 //!   matched connection, and the transfer is held until
-//!   `ak_task_consent` decides, the frozen 30 s window auto-declines
-//!   (a timer task, not a blocked thread), the runtime tears down, or
+//!   `ak_task_consent` decides, the 120 s window auto-declines
+//!   (a timer task, not a blocked thread; the frozen v1 model said
+//!   30 s — raised by acceptance E2/G4, review 2026-11-12 §6), the
+//!   runtime tears down, or
 //!   the connection disconnects. The peer is told over the wire
 //!   (DECLINED semantics); on a decline nothing is written to disk.
 //!   Wave-31 R30-P2-03: the pending insert and the `incoming_request`
@@ -267,9 +269,13 @@ use crate::AkEngine;
 
 /// Offer-level consent window: a pending `incoming_request` holds the
 /// transfer until `ak_task_consent` decides or this window elapses (then
-/// the request auto-declines — never auto-accepts). 30 s per the frozen
-/// v1 model.
-pub(crate) const PENDING_CONSENT_WINDOW: Duration = Duration::from_secs(30);
+/// the request auto-declines — never auto-accepts). 120 s since the
+/// acceptance decision E2 (review 2026-11-12 §6, batch-F G4): the frozen
+/// v1 model's 30 s was too short for a phone user reading the banner,
+/// and CR-P2-04's QUIC keep-alive (10 s) plus idle budget (60 s) now
+/// hold the connection through the whole wait. The event carries the
+/// live value (`windowSecs`) so the UI countdown never guesses.
+pub(crate) const PENDING_CONSENT_WINDOW: Duration = Duration::from_secs(120);
 
 // Every other tunable of the connectivity plane (connect budgets, probe
 // round, STUN query, echo responder, close notify, registry/redeem waits)
@@ -394,7 +400,7 @@ pub(crate) struct TaskConn {
 /// connection (whose disconnect resolves the request, wave-29 P2-07) plus
 /// the deciding half of the oneshot the engine's receive body holds. The
 /// request exists exactly until it is decided: `ak_task_consent`, the
-/// 30 s auto-decline timer, a disconnect of its connection or runtime
+/// 120 s auto-decline timer, a disconnect of its connection or runtime
 /// teardown REMOVE the entry and resolve the channel (dropping the sender
 /// half unparked would fail closed anyway — removing it keeps
 /// `ak_task_consent` honestly `-4` afterwards).
@@ -1028,10 +1034,15 @@ fn register_consent(
             info.total_bytes,
             crate::core::json::quoted(&save_dir.to_string_lossy()),
         ));
+        // E2/G4 (review 2026-11-12 §6): the event carries the window it
+        // was registered with (`windowSecs`) so the UI countdown mirrors
+        // the NATIVE deadline — the fact source per ffi-v2 §8.3 — instead
+        // of hard-coding a guess that would drift on the next change.
+        line.push_str(&format!(",\"windowSecs\":{}", window.as_secs()));
         line.push('}');
         rt.push_event(line);
     }
-    // The frozen 30 s auto-decline: a timer task, never a blocked thread.
+    // The 120 s auto-decline (E2/G4): a timer task, never a blocked thread.
     // Wave-30 P2-11 residual: the expiry is a REQUEST-TERMINAL event, not
     // just a silent resolution — the native source of truth the UI mirror
     // timer only guessed at (`consent_expired`).
@@ -2378,7 +2389,7 @@ pub fn task_disconnect(
         core::hex_encode(conn_id),
     ));
     // Wake this connection's parked consents (P2-07: a disconnect must
-    // resolve its pending offers, not wait out the 30 s window).
+    // resolve its pending offers, not wait out the 120 s window).
     rt.decline_pending_of_conn(conn_id);
     // Abort this connection's in-flight ops and resident tasks (the
     // spawned map holds the resident receiver + probe responder of the
@@ -2552,7 +2563,7 @@ pub fn task_set_save_dir(
 /// `ak_task_consent`: decide one pending `incoming_request` (accept or
 /// decline). The decision removes the entry and resolves the parked
 /// receive through its oneshot; an unknown or already-decided request
-/// (the entry is gone the moment it was decided, auto-declined at the 30 s
+/// (the entry is gone the moment it was decided, auto-declined at the 120 s
 /// window, resolved by a disconnect, or removed at teardown) is `-4`.
 pub fn task_consent(
     engine: &AkEngine,
@@ -3067,7 +3078,7 @@ async fn run_resident_receiver(
                 return;
             }
             Err(EngineError::ConsentDeclined { .. }) => {
-                // The user (or the 30 s window) declined: the pending
+                // The user (or the 120 s window) declined: the pending
                 // entry is resolved, the peer was told over the wire,
                 // nothing landed on disk. Only THIS connection ended —
                 // keep listening, the sender may retry on the same code.
@@ -5252,7 +5263,7 @@ mod task_tests {
         // A accepts; the transfer begins; B disconnects immediately after
         // (the mid-transfer data-plane departure is what the peer can
         // actually observe — a mid-OFFER close is swallowed by the consent
-        // gate's own 30 s window, which declines rather than erroring).
+        // gate's own 120 s window, which declines rather than erroring).
         assert_eq!(
             ak_task_consent(engine_a, owner.as_ptr(), job.as_ptr(), 1),
             0
@@ -6664,7 +6675,7 @@ mod task_tests {
     }
 
     /// P2-11 residual: a pending receive-consent request ends VISIBLY —
-    /// the 30 s window's auto-decline emits `consent_expired`, a
+    /// the 120 s window's auto-decline emits `consent_expired`, a
     /// disconnect of the attributed connection resolves the request and
     /// emits `request_closed`/`disconnected`, and decided requests answer
     /// the frozen `-4`.

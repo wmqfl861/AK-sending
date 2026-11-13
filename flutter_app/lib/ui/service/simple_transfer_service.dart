@@ -155,6 +155,7 @@ class IncomingRequest {
     required this.fileCount,
     required this.totalBytes,
     this.saveDir,
+    this.windowSecs,
   });
 
   final String jobId;
@@ -167,6 +168,14 @@ class IncomingRequest {
   /// the UI shows THIS value as the target. Null = the implementation
   /// lacks the fact; show the service's live `saveDir` instead.
   final String? saveDir;
+
+  /// The consent window THIS request waits on, in whole seconds (E2/G4
+  /// 2026-11-13, additive nullable like [saveDir] before it): the native
+  /// deadline is the fact source, so the UI countdown mirrors this value
+  /// (120 s in the current engine; the frozen v1 model said 30 s). Null =
+  /// the implementation lacks the fact; show no countdown rather than a
+  /// wrong one.
+  final int? windowSecs;
 }
 
 /// The wave-28 minimal transfer service (frozen shape + the wave-29
@@ -209,8 +218,9 @@ abstract class SimpleTransferService {
 
   /// Job ids whose consent request became terminal undecided (wave-29
   /// P2-11, wave-30: driven by NATIVE facts — the engine's
-  /// `consent_expired` event for the 30 s window, and the request's
-  /// connection going away; never a Dart-side timer mirror): the UI
+  /// `consent_expired` event for the consent window (120 s since E2/G4;
+  /// the frozen v1 model said 30 s), and the request's connection going
+  /// away; never a Dart-side timer mirror): the UI
   /// closes their banners. A later decline click on such a job resolves
   /// normally (idempotent).
   Stream<String> get expiredIncomingRequests;

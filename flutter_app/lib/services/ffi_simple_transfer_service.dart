@@ -58,7 +58,8 @@
 ///   [receiveTimeout] — cancels the native task through the disconnect
 ///   path before rejecting (wave-29 P2-10); declines resolve immediately
 ///   and are IDEMPOTENT for an already-expired/decided request
-///   (wave-29 P2-11: the 30 s auto-decline window may have closed first).
+///   (wave-29 P2-11: the auto-decline window — 120 s since E2/G4 — may
+///   have closed first).
 /// * **sendFiles**: resolves with a readable Chinese summary built from
 ///   the engine report (`已发送 N 个文件（formatBytes）`); past
 ///   [sendTimeout] the engine service cancels the native op and the
@@ -101,7 +102,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     bool? isAndroid,
     Future<String> Function()? androidIdentityDir,
     this.receiveTimeout = const Duration(seconds: 180),
-    this.sendTimeout = const Duration(seconds: 120),
+    // E2/G4: a STALL budget that must clear the 120 s consent window
+    // (the wait produces no progress lines) — 150 s, same headroom as
+    // the engine's TASK_SEND_IDLE.
+    this.sendTimeout = const Duration(seconds: 150),
     this.engineOwner,
   })  : _saveDirOverride = saveDir,
         _environment = environment ?? _platformEnvironment,
@@ -260,6 +264,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
             fileCount: request.files,
             totalBytes: request.bytes,
             saveDir: request.saveDir, // P2-06: the request's real target
+            windowSecs: request.windowSecs, // E2/G4: countdown's source
           ));
 
   @override
@@ -282,11 +287,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     if (!decided) {
       if (!accept) {
         // Wave-29 P2-11: a decline of an already-expired/auto-declined
-        // request is IDEMPOTENT — the engine declined it (or the 30 s
+        // request is IDEMPOTENT — the engine declined it (or the consent
         // window did); nothing was received either way.
         return;
       }
-      throw StateError('该请求已失效（可能已被处理或超过 30 秒自动拒绝）。');
+      throw StateError('该请求已失效（可能已被处理或超过 120 秒自动拒绝）。');
     }
     if (!accept) {
       return; // declined: nothing is received, resolve immediately

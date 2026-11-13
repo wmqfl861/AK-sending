@@ -336,12 +336,15 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// Emits an incoming transfer offer. Returns the jobId. The offer
   /// carries its saveDir snapshot (wave-30 P2-06): the current save dir
   /// at OFFER time unless scripted — the receive lands there even if the
-  /// settings change before the user answers.
+  /// settings change before the user answers. The offer also carries the
+  /// consent window it waits on (E2/G4, `windowSecs`): default 120 s,
+  /// scriptable per offer (null = an engine predating the field).
   String emitIncomingRequest({
     String? jobId,
     required int fileCount,
     required int totalBytes,
     String? saveDir,
+    int? windowSecs = 120,
   }) {
     final id = jobId ?? 'job-${_jobSeq += 1}';
     _incomingController.add(IncomingRequest(
@@ -349,12 +352,14 @@ class LocalSimpleTransferService implements SimpleTransferService {
       fileCount: fileCount,
       totalBytes: totalBytes,
       saveDir: saveDir ?? _saveDir,
+      windowSecs: windowSecs,
     ));
     return id;
   }
 
-  /// Simulates the 30 s window closing on [jobId] undecided (wave-29
-  /// P2-11): emits on [SimpleTransferService.expiredIncomingRequests]
+  /// Simulates the consent window closing on [jobId] undecided (wave-29
+  /// P2-11; the production window is 120 s since E2/G4): emits on
+  /// [SimpleTransferService.expiredIncomingRequests]
   /// unless the request was already decided through [consent]. A LATER
   /// decline of an expired job still completes normally (idempotent —
   /// nothing was received either way).

@@ -237,6 +237,7 @@ final class SimpleIncomingRequest {
     required this.files,
     required this.bytes,
     this.saveDir,
+    this.windowSecs,
   });
 
   /// The pending-request id — the [SimpleTransferService.consent] key.
@@ -258,10 +259,17 @@ final class SimpleIncomingRequest {
   /// engine predating the field (fall back to the live [saveDir]).
   final String? saveDir;
 
+  /// The consent window THIS request waits on, in whole seconds (E2/G4,
+  /// the event's `windowSecs` field): the native deadline is the fact
+  /// source, so the UI countdown mirrors this value. Null = an engine
+  /// predating the field (the UI shows no countdown rather than a wrong
+  /// one).
+  final int? windowSecs;
+
   @override
   String toString() =>
       'SimpleIncomingRequest($jobId root=$rootName files=$files bytes=$bytes '
-      'saveDir=$saveDir)';
+      'saveDir=$saveDir windowSecs=$windowSecs)';
 }
 
 /// The result of a successful task-code creation (wave-30 P2-04): the
@@ -831,7 +839,7 @@ final class SimpleTransferService {
 
   /// The sender picks files and sends them over [connId]. Resolves with
   /// the engine's report map (`files`/`bytes`/`peer`); the offer waits
-  /// receiver-side for the 30 s consent window engine-side.
+  /// receiver-side for the 120 s consent window (E2/G4) engine-side.
   ///
   /// Wave-30 P2-10: [timeout] is a STALL budget, not an overall cap —
   /// every `ak_poll_progress` line keyed by this connection (the send
@@ -850,10 +858,17 @@ final class SimpleTransferService {
   /// credit the SAME monotonic ticks; a per-poll baseline would fold the
   /// pump-credited ticks into the new normal and report `false`
   /// forever).
+  ///
+  /// E2/G4: the default stall budget is 150 s — the consent wait itself
+  /// produces NO progress lines (the offer parks while the peer's user
+  /// reads the banner for up to 120 s), so the sender-side budget must
+  /// clear the window the same way the engine's `TASK_SEND_IDLE` (150 s)
+  /// does; the old 120 s default could cancel a send whose receiver was
+  /// still inside a legal window.
   Future<Map<String, dynamic>> sendFiles(
     String connId,
     List<String> paths, {
-    Duration timeout = const Duration(seconds: 120),
+    Duration timeout = const Duration(seconds: 150),
   }) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
@@ -918,7 +933,7 @@ final class SimpleTransferService {
 
   /// Incoming transfer requests (receiver side) — one event per offer,
   /// waiting for [consent]; the engine auto-declines undecided offers
-  /// after its 30 s window. Each request carries its native-side
+  /// after its window (120 s since E2/G4). Each request carries its native-side
   /// `saveDir` snapshot (wave-30 P2-06) — the folder THIS receive will
   /// use, not necessarily the live setting.
   Stream<SimpleIncomingRequest> get incomingRequests =>
@@ -926,7 +941,7 @@ final class SimpleTransferService {
 
   /// Wave-30 P2-11: job ids whose consent request became TERMINAL
   /// undecided — the UI closes/removes their banners. Driven by NATIVE
-  /// facts only (no Dart-side timer mirror of the 30 s window): the
+  /// facts only (no Dart-side timer mirror of the consent window): the
   /// engine's `consent_expired` event, and the request's connection
   /// going data-plane terminal (the engine rejects its pending offers
   /// with the connection). A later decline of such a job resolves as
@@ -963,7 +978,7 @@ final class SimpleTransferService {
 
   /// Decide one pending [SimpleIncomingRequest]. Returns false when the
   /// request is unknown or already decided (including auto-declined by
-  /// the engine's 30 s window — deciding such a request locally is a
+  /// the engine's window — deciding such a request locally is a
   /// no-op).
   Future<bool> consent(String jobId, {required bool accept}) async {
     final runtime = _runtimeOrThrow();
@@ -1663,6 +1678,7 @@ final class SimpleTransferService {
           files: event.files,
           bytes: event.bytes,
           saveDir: event.saveDir, // P2-06: the request's real target
+          windowSecs: event.windowSecs, // E2/G4: the countdown's source
         ));
       }
       return;
@@ -1694,7 +1710,7 @@ final class SimpleTransferService {
       return;
     }
     if (event is TaskConsentExpiredEvent) {
-      // P2-11: the NATIVE 30 s window auto-declined the request — the
+      // P2-11: the NATIVE window (120 s) auto-declined the request — the
       // banner closes on this engine fact, never on a Dart timer mirror.
       _pendingJobs.remove(event.job);
       _recordClosedJob(event.job, event.conn); // R30-P2-03

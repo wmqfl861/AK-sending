@@ -114,6 +114,8 @@ sealed class TaskEvent {
           files: _int(json, 'files'),
           bytes: _int(json, 'bytes'),
           saveDir: _optionalString(json, 'saveDir'),
+          // E2/G4: nullable int — older engines carry no window.
+          windowSecs: _optionalInt(json, 'windowSecs'),
         );
       case 'done':
         return TaskDoneEvent(
@@ -289,6 +291,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
     this.files = 0,
     this.bytes = 0,
     this.saveDir,
+    this.windowSecs,
   });
 
   /// Hex pending-request id (32 chars) — the `ak_task_consent` key.
@@ -310,6 +313,13 @@ final class TaskIncomingRequestEvent extends TaskEvent {
   /// predating the field (callers fall back to the live setting).
   final String? saveDir;
 
+  /// The consent window THIS request was registered with, in whole
+  /// seconds (E2/G4 2026-11-13, wire key `windowSecs`): the native
+  /// deadline is the fact source, so the UI countdown mirrors this value
+  /// instead of hard-coding a guess. Null = an engine predating the
+  /// field (callers show no countdown rather than a wrong one).
+  final int? windowSecs;
+
   @override
   String get name => 'incoming_request';
 
@@ -321,6 +331,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
         'files': files,
         'bytes': bytes,
         if (saveDir != null) 'saveDir': saveDir,
+        if (windowSecs != null) 'windowSecs': windowSecs,
       };
 }
 
@@ -526,6 +537,17 @@ int _int(Map<String, Object?> json, String key) {
   final value = json[key];
   if (value is! int) {
     throw FormatException('任务事件 "$key" 字段缺失或类型错误');
+  }
+  return value;
+}
+
+/// Nullable int field (E2/G4 `windowSecs`): absent on older engines,
+/// type-checked when present.
+int? _optionalInt(Map<String, Object?> json, String key) {
+  final value = json[key];
+  if (value == null) return null;
+  if (value is! int) {
+    throw FormatException('任务事件 "$key" 字段类型错误');
   }
   return value;
 }

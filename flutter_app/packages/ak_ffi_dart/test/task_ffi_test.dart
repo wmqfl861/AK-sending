@@ -355,6 +355,8 @@ void main() {
       expect(events[2], isA<TaskProbeResultEvent>());
       expect(events[3], isA<TaskIncomingRequestEvent>());
       expect((events[3] as TaskIncomingRequestEvent).saveDir, 'D:/inbox');
+      // The pre-E2 shape carries no windowSecs → null (no countdown).
+      expect((events[3] as TaskIncomingRequestEvent).windowSecs, isNull);
       expect(events[4], isA<TaskDoneEvent>());
       expect(events[5], isA<TaskDisconnectedEvent>());
       expect((events[6] as TaskDisconnectedEvent).reason, 'done');
@@ -362,6 +364,34 @@ void main() {
       expect((events[7] as TaskOpSettledEvent).ok, isFalse);
       expect(events[8], isA<TaskConsentExpiredEvent>());
       expect((events[8] as TaskConsentExpiredEvent).job, 'ef' * 16);
+    });
+
+    test('E2/G4: incoming_request carries the consent window '
+        '(windowSecs, 120 s) and round-trips it', () {
+      final event = TaskEvent.fromJson({
+        'event': 'incoming_request',
+        'job': 'ef' * 16,
+        'conn': 'cd' * 16,
+        'root': 'photos',
+        'files': 2,
+        'bytes': 99,
+        'saveDir': 'D:/inbox',
+        'windowSecs': 120,
+      });
+      final incoming = event as TaskIncomingRequestEvent;
+      expect(incoming.windowSecs, 120);
+      expect(incoming.fields['windowSecs'], 120);
+      // A non-int windowSecs is a shape error, not a silent null.
+      expect(
+          () => TaskEvent.fromJson({
+                'event': 'incoming_request',
+                'job': 'ef' * 16,
+                'root': 'photos',
+                'files': 2,
+                'bytes': 99,
+                'windowSecs': '120',
+              }),
+          throwsA(isA<FormatException>()));
     });
 
     test('unknown event names fall forward, broken payloads throw', () {

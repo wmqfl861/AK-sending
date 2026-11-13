@@ -10,7 +10,7 @@
 - **Android 会回收后台应用。** 应用不可见且没有前台服务时，进程进入 cached 态，是内存压力下的回收对象。当前 [AndroidManifest.xml](../../flutter_app/android/app/src/main/AndroidManifest.xml) 只声明了 `INTERNET`，没有任何前台服务，也没有任何进程存活保障。
 - **现状：长传输在后台裸奔。** 用户切后台或锁屏后，长传输随时可能随进程一起被杀；v1 任务码是一次性配对，没有重连/续传机制，进程死亡即任务失败。这正是 CR-P2-05 指出的"长时间传输在 Android 后台很可能被系统终止（没有前台服务）"。
 - **D1 只解决了耗电，没解决存活。** D1 已落地的生命周期观察者（[transfer_lifecycle_observer.dart](../../flutter_app/lib/services/transfer_lifecycle_observer.dart)）在 `paused`/`hidden` 时把事件泵降到 1 s 活动节奏、无任务时完全暂停，回前台立即刷新——它降低了后台功耗，但进程本身仍是 cached 态。本设计补的是另一半：让"有活跃任务"期间的进程不被当后台应用对待。
-- **时长量级（受益上限的边界）。** 接收确认窗口 30 s（`crates/ak-ffi/src/task.rs:242` 的 `PENDING_CONSENT_WINDOW`）；CR-P2-04 之后 QUIC 显式 `keep_alive` 10 s、`max_idle_timeout` 60 s（[tls.rs](../../crates/ak-net/src/tls.rs) `KEEP_ALIVE_INTERVAL`/`MAX_IDLE_TIMEOUT`）。前台服务的意义是让分钟到小时级的传输熬过"应用不可见"；对这些超时本身没有影响。
+- **时长量级（受益上限的边界）。** 接收确认窗口 120 s（E2/G4，2026-11-13 起；`crates/ak-ffi/src/task.rs` 的 `PENDING_CONSENT_WINDOW`，原冻结 v1 模型为 30 s）；CR-P2-04 之后 QUIC 显式 `keep_alive` 10 s、`max_idle_timeout` 60 s（[tls.rs](../../crates/ak-net/src/tls.rs) `KEEP_ALIVE_INTERVAL`/`MAX_IDLE_TIMEOUT`）。前台服务的意义是让分钟到小时级的传输熬过"应用不可见"；对这些超时本身没有影响。
 - **targetSdk 已显式固定 36**（[build.gradle.kts](../../flutter_app/android/app/build.gradle.kts)，CR-P2-03），高于 34/35，下文 Android 14 与 Android 15 的规则对本应用**全部适用**，不存在"暂未触发"的侥幸。
 
 ## 2. 需求
@@ -59,7 +59,7 @@
 
 Android 12（API 31）起，后台应用不能启动前台服务，除非命中豁免（[官方限制页](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)）。豁免包括：从用户可见态切出、用户点了与应用相关的 UI 元素（如通知）、FCM 高优先级消息、精确闹钟、`BOOT_COMPLETED`、用户关闭了该应用的电池优化等。
 
-对本案的结论：**两个自然的启动触发点都发生在前台**——发送端点"发送"、接收端在 30 s 窗口内点"接受"。因此设计硬性规定：服务只在应用前台、由这两个用户动作直接触发启动；v1 没有排队/自动重试任务，不存在"回到后台才发现要传"的路径。接收端尤其注意：必须在**接受动作本身**启动服务（此刻必在前台），不能等 QUIC 建连或首包才启动——那时应用可能已经退到后台，豁免不成立。
+对本案的结论：**两个自然的启动触发点都发生在前台**——发送端点"发送"、接收端在确认窗口（120 s，E2/G4）内点"接受"。因此设计硬性规定：服务只在应用前台、由这两个用户动作直接触发启动；v1 没有排队/自动重试任务，不存在"回到后台才发现要传"的路径。接收端尤其注意：必须在**接受动作本身**启动服务（此刻必在前台），不能等 QUIC 建连或首包才启动——那时应用可能已经退到后台，豁免不成立。
 
 ### 3.5 Doze、App Standby 与电池优化的交互
 
@@ -88,7 +88,7 @@ Android 12（API 31）起，后台应用不能启动前台服务，除非命中�
 
 ### 4.3 启动与停止
 
-- **启动**（均在前台用户动作内，见 3.4）：(a) 接收端用户点"接受"（30 s 窗口内）；(b) 发送端 send-start 提交成功。Dart 在同一动作处理里调用 `channel.start(jobId)`。
+- **启动**（均在前台用户动作内，见 3.4）：(a) 接收端用户点"接受"（确认窗口 120 s 内，E2/G4）；(b) 发送端 send-start 提交成功。Dart 在同一动作处理里调用 `channel.start(jobId)`。
 - **单实例多任务**：一个服务实例持有"活跃 job 集合"；v1 常见是单任务，多任务并存时通知聚合为"N 个任务，总体 x%"。
 - **停止**：job 到达终态（事件来源与 UI 同源）→ `channel.stop(jobId)`；集合清空 → `stopForeground` + `stopSelf`。终态通知转为一条可滑除的完成/失败摘要，不常驻。
 - **启动失败**（如 6 小时预算耗尽抛 `ForegroundServiceStartNotAllowedException`）：异常经 channel 回传 Dart，UI 提示"系统已限制后台传输，请保持应用在前台"；传输本身继续（即现状行为），不静默重试（R4）。

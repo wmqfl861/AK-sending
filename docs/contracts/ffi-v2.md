@@ -441,7 +441,7 @@ int32_t ak_task_set_event_notify(
  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
 {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":null}
 {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
- "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox"}
+ "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox","windowSecs":120}
 {"event":"done","conn":"<32hex>","saveDir":"D:/inbox","files":3,"bytes":123456}
 {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
 {"event":"code_cancelled","code_id":"<32hex>"}
@@ -452,7 +452,7 @@ int32_t ak_task_set_event_notify(
 
 wave-29 增补：`disconnected` 新增 `done` 理由（单传输任务的完成终态——双端连接条目同时收敛，见 §8.4）；`code_cancelled` 在生码方取消一个未被加入的码（`ak_task_disconnect` 按 `code_id`）时发出。
 
-wave-30 增补（复审 R29 修复）：`incoming_request` 携带 `saveDir`（该请求将落盘的真实目标快照，UI 横幅显示用）；`consent_expired` 是同意窗口 30 秒到期的**请求终态事件**（native 为期限事实源，UI 本地计时仅兜底）；`request_closed` 是连接断开驱动 pending 请求终结的终态事件；`handshake_failed` 是单次对端握手失败的有界记录（固定词表，**不代表监听器终结**——接收循环继续）。
+wave-30 增补（复审 R29 修复）：`incoming_request` 携带 `saveDir`（该请求将落盘的真实目标快照，UI 横幅显示用）；`consent_expired` 是同意窗口（120 秒，batchF-G4 修订；原 30 秒）到期的**请求终态事件**（native 为期限事实源，UI 本地计时仅兜底）；`request_closed` 是连接断开驱动 pending 请求终结的终态事件；`handshake_failed` 是单次对端握手失败的有界记录（固定词表，**不代表监听器终结**——接收循环继续）。
 
 wave-31 修订（复审 R30-P3-01）：`handshake_failed` 形状修正为与原生输出一致——`code_id` 为 32hex 任务码 id **字符串**（非整数错误码），且**无 `conn` 字段**（未配对的失败握手没有可归属连接）。
 
@@ -461,6 +461,8 @@ wave-31 修订（复审 R30-P2-02/P2-03、P2-06 残项）：**双方连接事实
 wave-31 实现边界（P2-06）：冻结语义原定"save_dir 在同意决定时刻解析"（接受时从当前设置读取、落盘跟随）。ak-engine 的全部接收入口在入口处（Offer/同意点之前）即绑定 `LocalSaveTarget`，同意应答通道为纯 `oneshot<bool>`，FFI 层无法在决定时刻把新目录传给已进入引擎的接收——本波落地的是 wave-28 原报告允许的替代方案"绑定并展示同一个不可变实际目标"：绑定发生在传输开始（连接接受）时刻，事件与 `done` 展示同一绑定值，事件/横幅与实际落盘**永不错位**；pending 同意期间修改设置对进行中传输无效（对下一个请求生效）。
 
 batchF-G2 增补（2026-11-13，CR-P3-06）：新增 `probe_observed` 事件（发送前置探测轮的观测结论，`conn`/`observed`/`kind`/`phase`/`reachable`/`packets_in`/`elapsed_ms`）——不进入上方枚举块，散文登记见 §8.1 `sender_bind` 段后；探测轮同批提前返回（首个候选回显确认即出）。
+
+batchF-G4 修订（2026-11-13，验收决定 E2——review 2026-11-12 §6）：**同意窗口 30 秒 → 120 秒**（`crates/ak-ffi/src/task.rs` 的 `PENDING_CONSENT_WINDOW`），发送端空闲预算 `task_net::TASK_SEND_IDLE` 相应 120 秒 → **150 秒**（窗口 + 余量；QUIC 层 CR-P2-04 保活 10 秒/空闲 60 秒保证等待期间连接不断）；`incoming_request` 新增 `windowSecs` 字段（整数秒，**事件注册时的实际窗口值**）——native 仍是期限事实源（§8.3 wave-30 注的分工继续成立），UI 倒计时镜像该字段而非硬编码；旧引擎无此字段时 UI 不显示倒计时（不猜测）。本条同时把上文 wave-30 注与 §8.4"接收同意"条目中的"30 秒"读数更正为现值 120 秒。
 
 `ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
 "connections":[{"conn":"<32hex>","role":"sender","state":
@@ -472,7 +474,7 @@ batchF-G2 增补（2026-11-13，CR-P3-06）：新增 `probe_observed` 事件（�
 - **幂等（wave-29 P2-01 修订）**：三个异步 op 均按 `request_id` 幂等——去重判定（查找、冲突拒绝、op id 预留）是**同一临界区内的一次原子受理**，并发同请求得到同一 op id；canonical spec 以 `操作类型|conn_id|spec` 为域，同 id 异操作/异连接/异 spec 一律 `-2`；**已受理请求的重放先返回原 op 与原答案**（即使其连接此后已断开），仅全新请求才做连接存活校验。
 - **接收侧身份准入（wave-29 P1-04 新增）**：接收方常驻接收的 TLS `authorize` 只接受**该码已完成配对的已验证对端公钥指纹**，且仅当该配对连接仍存活；配对完成前一切拨号在 TLS 准入门被拒绝并关闭，**不消耗接收器**（监听继续）。`incoming_request` 归属按 Offer 实际发送方指纹匹配连接（而非仅按监听码查表）；无法归属的 Offer 无提示直接拒绝。
 - **发送**：`ak_task_send` 走既有引擎发送，对端 endpoint 候选按 LAN 优先排序逐个尝试；连接预算沿用 wave-26 P1-01 的 10 秒分拆预算（自引擎 `Connecting` 信号起算，源扫描不计入；连接建立后不再受其约束），候选间短暂停顿后回退；连接后失败不再换址重试。wave-29：整表纯连接级失败（从未建立连接）经短暂停顿后**整体重试**（默认至多 3 轮）——对端配对簿记可能滞后加入方一拍，身份校验不受影响。
-- **接收同意（wave-29 P2-07 修订；wave-31 R30-P2-03 修订）**：Offer 级 `TransferConsent` 为**非阻塞形状**（回调登记 pending oneshot 后立即返回，等待由引擎异步 await，绝不阻塞 Tokio worker）；每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件，挂起直至 `ak_task_consent` 决定、**30 秒窗口自动拒绝**（计时器任务，绝不自动接受）、该连接断开或运行时 teardown（后三者同样以拒绝收场）。**pending 插入、连接存活复查与 `incoming_request` 发布是同一临界区内的一次原子登记**：与连接断开竞争时，要么断开先行——复查见 `disconnected`，Offer 当场拒绝、**不发布任何事件**；要么登记先行——断开的 `request_closed`（同一锁序发布）只能落在 `incoming_request` 之后。迟到 `incoming_request` 在 `request_closed` 之后出现是结构性不可能。决定即移除条目：`ak_task_consent` 对未知/已决定请求返回 `-4`。拒绝经 DECLINED 线上语义告知对端、零字节落盘。
+- **接收同意（wave-29 P2-07 修订；wave-31 R30-P2-03 修订；batchF-G4/E2 修订）**：Offer 级 `TransferConsent` 为**非阻塞形状**（回调登记 pending oneshot 后立即返回，等待由引擎异步 await，绝不阻塞 Tokio worker）；每个入站 Offer 铸一个 pending 请求 id，发 `incoming_request` 事件（batchF-G4 起携带 `windowSecs`＝注册窗口秒数，UI 倒计时镜像之），挂起直至 `ak_task_consent` 决定、**120 秒窗口（batchF-G4/E2 修订；原冻结 v1 模型为 30 秒）自动拒绝**（计时器任务，绝不自动接受）、该连接断开或运行时 teardown（后三者同样以拒绝收场）。**pending 插入、连接存活复查与 `incoming_request` 发布是同一临界区内的一次原子登记**：与连接断开竞争时，要么断开先行——复查见 `disconnected`，Offer 当场拒绝、**不发布任何事件**；要么登记先行——断开的 `request_closed`（同一锁序发布）只能落在 `incoming_request` 之后。迟到 `incoming_request` 在 `request_closed` 之后出现是结构性不可能。决定即移除条目：`ak_task_consent` 对未知/已决定请求返回 `-4`。拒绝经 DECLINED 线上语义告知对端、零字节落盘。
 - **常驻接收（wave-29 P2-05/P2-06 修订；wave-31 P2-06 残项修订）**：一个码绑定一个端口、一个**循环服务**多连接——陌生拨号被拒后续继监听；**拒绝不是任务终态**（同码可重试，再次发送产生新的 `incoming_request`）；**完成是单传输任务终态**（`done` 后双端连接条目收敛为 `disconnected`/`done`，接收器停止）。保存夹为**每次传输开始（连接接受）时的一个不可变绑定**：引擎 `ReceiveSpec` 实际写入的目录、`incoming_request.saveDir` 与 `done.saveDir` 三者携带**同一个绑定值**（事件不再二次读取全局设置，横幅与实际落盘永不错位）；`ak_task_set_save_dir` 对后续任务生效，pending 同意期间的修改对进行中传输无效。
 - **断开（wave-29 P2-03/P2-04 修订）**：`ak_task_disconnect` 幂等，且覆盖**已生成未加入的码**——以 create 结果的 `code_id` 为参数即撤销 registry 注册行、释放接收器/echo 监听并发出 `code_cancelled`（重复取消静默 `AK_OK`；未知 id `-4`）。连接断开时：本侧 `local`，注册中心撤码；**空闲时**（无在传输的 QUIC 连接可供对端感知）额外向已配对对端通告的数据端点发起**认证的 TASK-CLOSE 帧通知**（TLS 钉扎配对指纹、复用既有 Error 帧语义），持有监听的对端立即以 `ByPeer` 收敛为 `disconnected`/`peer`；纯发送侧未绑定数据监听，无法被空闲通知触达，其下次发送连接失败即为诚实结果。同引擎对端另有即时缓存通知。引擎 teardown 对本运行时未撤销的码做**有界尽力撤码**（应用退出不遗留无主 active 行）。
 - **断开原因域（wave-30 修订）**：`disconnected` 的四个理由（`local|peer|receiver_failed|done`）均为**数据面终态**；注册/协调连接断开不产生任何任务终结事件（任务只在数据面链路丢失、对端动作或本地断开时终结），`receiver_failed` 仅由真实数据面链路丢失触发。`ak_task_list` 的 `unreachable`（wave-30 P2-09）= 探测全部失败的如实状态（不再无条件跃迁 connected），终态不被探测结果覆盖。

@@ -185,63 +185,65 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final wide = constraints.maxWidth >= 700;
-          final startupError = widget.startupError ?? _startError;
-          final content = Column(
-            children: [
-              if (startupError != null)
-                _StartupErrorCard(reason: startupError),
-              IncomingRequestsHost(service: widget.service),
-              Expanded(
-                child: IndexedStack(
-                  index: _index,
-                  children: [
-                    HomePage(service: widget.service, picker: widget.picker),
-                    SettingsPage(
-                      service: widget.service,
-                      store: widget.store,
-                      picker: widget.picker,
-                      // G6b: the page is BUILT at startup (IndexedStack)
-                      // but its revision query waits for first selection.
-                      isActive: _index == 1,
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          );
-          if (wide) {
-            return Row(
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 700;
+            final startupError = widget.startupError ?? _startError;
+            final content = Column(
               children: [
-                NavigationRail(
-                  extended: constraints.maxWidth >= 1100,
-                  labelType: constraints.maxWidth >= 1100
-                      ? null
-                      : NavigationRailLabelType.all,
-                  selectedIndex: _index,
-                  onDestinationSelected: (i) => setState(() => _index = i),
-                  destinations: const [
-                    NavigationRailDestination(
-                      icon: Icon(Icons.device_hub_outlined),
-                      selectedIcon: Icon(Icons.device_hub),
-                      label: Text('连接'),
-                    ),
-                    NavigationRailDestination(
-                      icon: Icon(Icons.settings_outlined),
-                      selectedIcon: Icon(Icons.settings),
-                      label: Text('设置'),
-                    ),
-                  ],
+                if (startupError != null)
+                  _StartupErrorCard(reason: startupError),
+                IncomingRequestsHost(service: widget.service),
+                Expanded(
+                  child: IndexedStack(
+                    index: _index,
+                    children: [
+                      HomePage(service: widget.service, picker: widget.picker),
+                      SettingsPage(
+                        service: widget.service,
+                        store: widget.store,
+                        picker: widget.picker,
+                        // G6b: the page is BUILT at startup (IndexedStack)
+                        // but its revision query waits for first selection.
+                        isActive: _index == 1,
+                      ),
+                    ],
+                  ),
                 ),
-                const VerticalDivider(width: 1, thickness: 1),
-                Expanded(child: content),
               ],
             );
-          }
-          return content;
-        },
+            if (wide) {
+              return Row(
+                children: [
+                  NavigationRail(
+                    extended: constraints.maxWidth >= 1100,
+                    labelType: constraints.maxWidth >= 1100
+                        ? null
+                        : NavigationRailLabelType.all,
+                    selectedIndex: _index,
+                    onDestinationSelected: (i) => setState(() => _index = i),
+                    destinations: const [
+                      NavigationRailDestination(
+                        icon: Icon(Icons.device_hub_outlined),
+                        selectedIcon: Icon(Icons.device_hub),
+                        label: Text('连接'),
+                      ),
+                      NavigationRailDestination(
+                        icon: Icon(Icons.settings_outlined),
+                        selectedIcon: Icon(Icons.settings),
+                        label: Text('设置'),
+                      ),
+                    ],
+                  ),
+                  const VerticalDivider(width: 1, thickness: 1),
+                  Expanded(child: content),
+                ],
+              );
+            }
+            return content;
+          },
+        ),
       ),
       bottomNavigationBar: LayoutBuilder(
         builder: (context, constraints) {

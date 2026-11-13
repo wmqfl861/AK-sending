@@ -252,6 +252,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     }
   }
 
+  /// J2: pairing idle expiries pass through the engine service.
+  @override
+  Stream<String> get idleExpiries => _engine.idleExpiries;
+
   @override
   Stream<List<TaskConnection>> get connections => _engine.connections.map(
         (rows) => rows
@@ -613,6 +617,8 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         peerName: _peerNameOf(row),
         role: _uiRole(row.role),
         state: _uiState(row.state),
+        // J2: the idle-budget expiry keeps its own visible copy.
+        idleExpired: row.disconnectReason == 'idle_expired',
       );
 
   /// The zero-identity v1 model carries no peer name: the code's short

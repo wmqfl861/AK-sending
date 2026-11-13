@@ -680,6 +680,22 @@ class FakeAkTaskCalls implements AkTaskCalls {
     });
   }
 
+  /// Emits one `disconnected` event on [runtimeIdHex]'s queue (J2:
+  /// `reason` rides the wire field; `idle_expired` is the idle-budget
+  /// terminal the UI names with its own copy).
+  void emitDisconnected(String runtimeIdHex,
+      {String? connId, required String reason}) {
+    final runtime = runtimes[runtimeIdHex];
+    if (runtime == null) {
+      throw StateError('fake: 未知运行时 $runtimeIdHex');
+    }
+    runtime.events.add(<String, dynamic>{
+      'event': 'disconnected',
+      if (connId != null) 'conn': connId,
+      'reason': reason,
+    });
+  }
+
   /// Emits one `done` event on [runtimeIdHex]'s queue.
   void emitDone(String runtimeIdHex,
       {String? connId, int files = 1, int bytes = 4096}) {

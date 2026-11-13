@@ -226,6 +226,9 @@ class _ThrowingStartService implements SimpleTransferService {
   Stream<List<TaskConnection>> get connections => const Stream.empty();
 
   @override
+  Stream<String> get idleExpiries => const Stream.empty();
+
+  @override
   Stream<IncomingRequest> get incomingRequests => const Stream.empty();
 
   @override

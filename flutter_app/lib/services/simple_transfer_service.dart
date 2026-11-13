@@ -184,6 +184,7 @@ final class SimpleConnection {
       required this.state,
       this.peerEndpoint,
       this.code,
+      this.disconnectReason,
     });
 
     /// Hex connection id (32 chars) — the send/disconnect key.
@@ -201,6 +202,12 @@ final class SimpleConnection {
   final String? peerEndpoint;
 
   final String? code;
+
+  /// J2 (2026-11-13): the `reason` field of the `disconnected` event
+  /// that produced a terminal row (`idle_expired` names the idle-budget
+  /// expiry the UI shows with its own copy); null for rows that went
+  /// terminal any other way (and for engines predating the field).
+  final String? disconnectReason;
 
   @override
   String toString() =>
@@ -743,6 +750,10 @@ final class SimpleTransferService {
       StreamController<SimpleIncomingRequest>.broadcast();
   final StreamController<TaskDoneEvent> _doneController =
       StreamController<TaskDoneEvent>.broadcast();
+  /// J2: fan-out of pairing idle expiries (conn ids) to the UI.
+  final StreamController<String> _idleExpiryController =
+      StreamController<String>.broadcast();
+
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
 
@@ -896,6 +907,7 @@ final class SimpleTransferService {
     _incomingController.close();
     _doneController.close();
     _expiredIncomingController.close();
+    _idleExpiryController.close();
     _healthController.close();
     _progressController.close();
     _transfers.clear();
@@ -1176,6 +1188,9 @@ final class SimpleTransferService {
   /// false from [consent] and is handled idempotently by the adapter.
   Stream<String> get expiredIncomingRequests =>
       _expiredIncomingController.stream;
+
+  /// J2 (2026-11-13): conn ids whose pairing ended by idle expiry.
+  Stream<String> get idleExpiries => _idleExpiryController.stream;
 
   /// Successful transfer completions (either side) with files/bytes.
   /// A `done` also converges its connection row to the terminal
@@ -1937,6 +1952,10 @@ final class SimpleTransferService {
     'peer',
     'receiver_failed',
     'done',
+    // J2 (2026-11-13): the pairing's TOTAL idle budget (10 minutes from
+    // pairing completion, never reset by recovery) ran out — terminal
+    // for the pairing, with a dedicated UI copy.
+    'idle_expired',
   };
 
   /// Converge the row to a TERMINAL state (`disconnected`, or `done` —
@@ -1944,7 +1963,7 @@ final class SimpleTransferService {
   /// bookkeeping of every undecided request that belonged to the
   /// connection (P2-11: the engine rejects pending offers with the
   /// connection; the banner must go, not wait for a native event).
-  void _markTerminal(String connId, String state) {
+  void _markTerminal(String connId, String state, {String? reason}) {
     // Client UI U1: the transfer's progress fold ends with the row.
     _settleTransfer(connId, state);
     final existing = _connections[connId];
@@ -1957,8 +1976,12 @@ final class SimpleTransferService {
       state: state,
       peerEndpoint: existing.peerEndpoint,
       code: existing.code,
+      disconnectReason: reason ?? existing.disconnectReason,
     );
     _notifyConnections();
+    if (reason == 'idle_expired' && !_idleExpiryController.isClosed) {
+      _idleExpiryController.add(connId);
+    }
     _expirePendingJobsOf(connId);
     if (!_connections.values.any((conn) => _stateRank(conn.state) < 2)) {
       _setPhase(SimpleTransferPhase.idle);
@@ -2152,7 +2175,8 @@ final class SimpleTransferService {
         // independent — a still-healthy direct connection stays live.
         return;
       }
-      _markTerminal(conn, event.reason == 'done' ? 'done' : 'disconnected');
+      _markTerminal(conn, event.reason == 'done' ? 'done' : 'disconnected',
+          reason: event.reason);
       return;
     }
     if (event is TaskConsentExpiredEvent) {

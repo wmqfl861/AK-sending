@@ -270,4 +270,68 @@ void main() {
     final context = tester.element(find.byType(NavigationRail));
     expect(Theme.of(context).brightness, Brightness.dark);
   });
+
+  testWidgets('J2: idle expiry keeps its copy after the row is removed '
+      'and disables sending', (tester) async {
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+    addTearDown(fake.dispose);
+    final id = await openSendDetail(tester, fake);
+
+    // Pick without sending so BOTH affordances exist before expiry.
+    await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('pick_files_option')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    final pickFinder = find.byKey(const ValueKey('conn_pick_files_button'));
+    final sendFinder = find.byKey(const ValueKey('conn_send_button'));
+    expect(tester.widget<FilledButton>(pickFinder).onPressed, isNotNull);
+    expect(tester.widget<FilledButton>(sendFinder).onPressed, isNotNull);
+
+    // The real adapter filters terminal rows out. With no row (and no
+    // idleExpired flag to fall back to), only idleExpiries can keep the
+    // dedicated copy alive. Removing that subscription must fail here.
+    fake.expireIdle(id);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(fake.connectionsSnapshot, isEmpty);
+    expect(find.byKey(ValueKey('conn_card_name_$id'), skipOffstage: false),
+        findsNothing);
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.text('配对已闲置过久，请重新配对。'), findsOneWidget);
+    expect(find.text('此连接已断开（对端离开或网络变化）。'), findsNothing);
+    expect(find.byKey(const ValueKey('conn_state_ended')), findsNothing,
+        reason: 'an idle expiry is never a completed transfer');
+    expect(find.byKey(const ValueKey('conn_send_result')), findsNothing);
+    expect(tester.widget<FilledButton>(pickFinder).onPressed, isNull);
+    expect(tester.widget<FilledButton>(sendFinder).onPressed, isNull);
+    expect(fake.sendFilesCalls, 0);
+  });
+
+  test('J2: disposing the fake closes its idle-expiry stream', () async {
+    final fake = LocalSimpleTransferService();
+    var closed = false;
+    final subscription = fake.idleExpiries.listen(
+      (_) {},
+      onDone: () => closed = true,
+    );
+    addTearDown(subscription.cancel);
+
+    fake.dispose();
+    await pumpEventQueue();
+    expect(closed, isTrue);
+  });
+
+  testWidgets('J2: a plain drop keeps the generic copy', (tester) async {
+    final fake = await pumpApp(tester);
+    final id = await openSendDetail(tester, fake);
+
+    fake.disconnect(id);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('此连接已断开（对端离开或网络变化）。'), findsOneWidget);
+    expect(find.text('配对已闲置过久，请重新配对。'), findsNothing);
+  });
 }

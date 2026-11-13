@@ -81,6 +81,7 @@ class TaskConnection {
     required this.peerName,
     required this.role,
     required this.state,
+    this.idleExpired = false,
   });
 
   /// Opaque connection id (also the `sendFiles`/`disconnect` argument).
@@ -93,6 +94,14 @@ class TaskConnection {
   final TaskRole role;
 
   final TaskConnectionState state;
+
+  /// J2 (2026-11-13): this pairing ended because it sat IDLE past the
+  /// engine's total 10-minute budget (`disconnected` event, reason
+  /// `idle_expired`) — a distinct TERMINAL cause the UI names with its
+  /// own copy ("配对已闲置过久，请重新配对"); the row itself is a plain
+  /// `disconnected` one. False on every other cause (and on engines
+  /// predating the reason field).
+  final bool idleExpired;
 }
 
 /// Result of joining a code: ok carries the new connection id; failure
@@ -316,6 +325,15 @@ abstract class SimpleTransferService {
   /// home page) still sees the live list immediately. Each call of this
   /// getter returns an independent stream.
   Stream<List<TaskConnection>> get connections;
+
+  /// J2 (2026-11-13): connection ids whose pairing ended because it sat
+  /// idle past the engine's total budget (`disconnected` event, reason
+  /// `idle_expired`) — one event per expiry. The live `connections`
+  /// snapshot filters terminal rows out, so this stream is how an open
+  /// connection-detail page learns WHICH terminal copy to show
+  /// ("配对已闲置过久，请重新配对"). No replay: the event is consumed by
+  /// whoever listens when it fires.
+  Stream<String> get idleExpiries => const Stream<String>.empty();
 
   /// Incoming transfer offers (jobId/文件数/总字节), one event per offer.
   Stream<IncomingRequest> get incomingRequests;

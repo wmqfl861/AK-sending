@@ -289,6 +289,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _connectionsController.close();
     _incomingController.close();
     _expiredIncomingController.close();
+    _idleExpiryController.close();
     _engineHealthController.close();
     _progressController.close();
   }
@@ -483,8 +484,26 @@ class LocalSimpleTransferService implements SimpleTransferService {
       peerName: _connections[index].peerName,
       role: _connections[index].role,
       state: state,
+      idleExpired: _connections[index].idleExpired,
     );
     _emitConnections();
+  }
+
+  final StreamController<String> _idleExpiryController =
+      StreamController<String>.broadcast();
+
+  /// J2: conn ids whose pairing ended by idle expiry.
+  @override
+  Stream<String> get idleExpiries => _idleExpiryController.stream;
+
+  /// J2 test hook: announce the expiry, then remove [connId] from the
+  /// live list, matching the real adapter's terminal-row filtering. The
+  /// detail page must retain the cause via [idleExpiries], not a row flag.
+  void expireIdle(String connId) {
+    if (!_idleExpiryController.isClosed) {
+      _idleExpiryController.add(connId);
+    }
+    _dropConnection(connId);
   }
 
   void _dropConnection(String connId) {

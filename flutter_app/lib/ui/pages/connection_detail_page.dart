@@ -52,6 +52,12 @@ class ConnectionDetailPage extends StatefulWidget {
 class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   StreamSubscription<List<TaskConnection>>? _sub;
   StreamSubscription<TransferProgress>? _progressSub;
+  StreamSubscription<String>? _idleExpirySub;
+
+  /// J2: this pairing ended by idle expiry (latched from the service's
+  /// `idleExpiries` stream — terminal rows leave the live snapshot, so
+  /// the page learns the CAUSE of the disappearance here).
+  bool _idleExpired = false;
   TaskConnection? _connection;
 
   /// The last row the live list carried for this id: the page's identity
@@ -94,12 +100,20 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       },
       onError: (Object _) {},
     );
+    _idleExpirySub = widget.service.idleExpiries.listen(
+      (connId) {
+        if (!mounted || connId != widget.connectionId) return;
+        setState(() => _idleExpired = true);
+      },
+      onError: (Object _) {},
+    );
   }
 
   @override
   void dispose() {
     _sub?.cancel();
     _progressSub?.cancel();
+    _idleExpirySub?.cancel();
     super.dispose();
   }
 
@@ -327,9 +341,12 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                   Text(
                     ended
                         ? '本次传输已完成，配对随之结束。如需再次传输，请重新配对。'
-                        : connection == null
-                            ? '此连接已断开（对端离开或网络变化）。'
-                            : '方向：${taskRoleLabel(connection.role)}',
+                        : _idleExpired ||
+                                (connection?.idleExpired ?? false)
+                            ? '配对已闲置过久，请重新配对。'
+                            : connection == null
+                                ? '此连接已断开（对端离开或网络变化）。'
+                                : '方向：${taskRoleLabel(connection.role)}',
                     key: const ValueKey('conn_detail_role'),
                     style: theme.textTheme.bodySmall,
                   ),

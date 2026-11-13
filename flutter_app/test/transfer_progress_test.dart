@@ -506,5 +506,72 @@ void main() {
       expect(buildAppTheme(Brightness.dark).colorScheme.brightness,
           Brightness.dark);
     });
+
+    test('J2: idle_expired is terminal and rides the row to the UI', () async {
+      final fake = FakeAkTaskCalls();
+      final pair = await pairedEngines(fake);
+
+      fake.emitDisconnected(fake.runtimes.keys.last,
+          connId: pair.conn, reason: 'idle_expired');
+      pair.sender.pumpEvents();
+      await pumpEventQueue();
+      final row = pair.sender.currentConnections.single;
+      expect(row.state, 'disconnected');
+      expect(row.disconnectReason, 'idle_expired');
+
+      pair.receiver.dispose();
+      pair.sender.dispose();
+
+      // The adapter surfaces the dedicated flag for the UI copy: pair a
+      // fresh sender THROUGH the adapter so its own event pump consumes
+      // the idle_expired event (the queue is per-runtime).
+      final adapter = FfiSimpleTransferService(
+        calls: fake,
+        registry: '127.0.0.1:7200',
+        registryIdHex: regId,
+        idDir: 'C:/ak/u1-adapter',
+        delay: immediate,
+      );
+      adapter.start();
+      final code = (await adapter.createCode(TaskRole.send)).code;
+      final receiver2 = engineService(fake, 'C:/ak/u1-receiver2');
+      final joined = await receiver2.join(code);
+      final conn2 = joined.connId;
+      adapter.engine.pumpEvents();
+      // The adapter's live snapshot filters terminal rows out — the
+      // DEDICATED channel is the idleExpiries stream the detail page
+      // latches. (Emit on every runtime so the assertion cannot depend
+      // on map ordering.)
+      final expired = <String>[];
+      final sub = adapter.idleExpiries.listen(expired.add);
+      for (final id in fake.runtimes.keys) {
+        fake.emitDisconnected(id, connId: conn2, reason: 'idle_expired');
+      }
+      adapter.engine.pumpEvents();
+      await pumpEventQueue();
+      expect(expired, contains(conn2),
+          reason: 'idle_expired must reach the UI contract stream');
+      await sub.cancel();
+      adapter.dispose();
+      receiver2.dispose();
+    });
+
+    test('J2: an unknown disconnect reason still never kills the row',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final pair = await pairedEngines(fake);
+
+      fake.emitDisconnected(fake.runtimes.keys.last,
+          connId: pair.conn, reason: 'registry_link_lost');
+      pair.sender.pumpEvents();
+      await pumpEventQueue();
+      final row = pair.sender.currentConnections.single;
+      expect(row.state, isNot('disconnected'),
+          reason: 'coordination-plane notices stay non-terminal');
+      expect(row.disconnectReason, isNull);
+
+      pair.receiver.dispose();
+      pair.sender.dispose();
+    });
   });
 }

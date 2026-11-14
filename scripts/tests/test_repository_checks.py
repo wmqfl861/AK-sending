@@ -269,5 +269,156 @@ class HandoffConsistencyTests(unittest.TestCase):
         self.assertEqual(checks.handoff_contradiction_issues(handoff, self.HANDOFF), [])
 
 
+class StatusHandoffLinkTests(unittest.TestCase):
+    """K-R6 (REVIEW_2026-11-14-batchK.zh-CN.md §1): CR-P3-20 gates anchor to
+    the handoff docs/STATUS.zh-CN.md actually LINKS to, not the newest
+    HANDOFF-BATCH-* file in docs/. On the reviewed commit STATUS still
+    linked batch J while an unlinked batch K handoff existed, and the
+    filename-based pick validated the wrong document.
+    """
+
+    @staticmethod
+    def _status(link_lines: str, latest_lines: str = "- 无新 run。") -> str:
+        return (
+            "# 项目状态\n\n## 当前状态\n\n- 阶段结论与链接。\n\n"
+            "## 最新验证\n\n" + latest_lines + "\n\n## 交接入口\n\n" + link_lines + "\n"
+        )
+
+    def _write(self, root: Path, name: str, text: str) -> None:
+        (root / "docs").mkdir(parents=True, exist_ok=True)
+        (root / "docs" / name).write_text(text, encoding="utf-8")
+
+    def test_linked_handoff_picks_newest_link_and_strips_anchors(self):
+        # The real STATUS shape: current handoff linked with a §5 anchor,
+        # previous batch kept as history, non-batch handoff docs ignored.
+        status = self._status(
+            "- [K 交接](HANDOFF-BATCH-K-2026-11-14.zh-CN.md) · "
+            "[J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md) · "
+            "[U1 清单](HANDOFF-CLIENT-UI-U1-2026-11-13.zh-CN.md) · "
+            "[HANDOFF](HANDOFF.zh-CN.md)",
+            latest_lines="- 见 [K 交接 §5](HANDOFF-BATCH-K-2026-11-14.zh-CN.md#5-证据表)。",
+        )
+        self.assertEqual(
+            checks.status_linked_handoff(status), "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        )
+
+    def test_link_to_newest_handoff_passes(self):
+        # (a) STATUS links K, K is the newest file (J kept as history) →
+        # resolved to K with no errors.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "# 交接：批次 J\n")
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status(
+                "- [K 交接](HANDOFF-BATCH-K-2026-11-14.zh-CN.md) · "
+                "[J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)"
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(errors, [])
+            self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
+
+    def test_stale_link_while_newer_handoff_exists_fails(self):
+        # (b) Codex's counterexample: STATUS still links J while a newer K
+        # handoff sits unlinked in docs/. The error names both files, and
+        # the returned path stays the LINKED J so run-number checks anchor
+        # to what STATUS actually references.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "# 交接：批次 J\n")
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status("- [J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)")
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("HANDOFF-BATCH-J-2026-11-13.zh-CN.md", errors[0])
+            self.assertIn("HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("update the STATUS link", errors[0])
+            self.assertEqual(path.name, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md")
+
+    def test_link_to_missing_handoff_file_fails(self):
+        # (c) STATUS links a handoff filename that does not exist in docs/
+        # → error, and nothing is returned to validate against.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status("- [K 交接](HANDOFF-BATCH-K-2026-11-13.zh-CN.md)")
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertIsNone(path)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("HANDOFF-BATCH-K-2026-11-13.zh-CN.md", errors[0])
+            self.assertIn("does not exist", errors[0])
+
+    def test_no_handoff_link_while_files_exist_fails(self):
+        # (d) STATUS links no batch handoff at all while handoff files
+        # exist → the newest handoff is unreachable from the status entry
+        # point. The newest file is still returned so the run-number gate
+        # keeps running (the missing-link error already fails the check).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status("- [HANDOFF](HANDOFF.zh-CN.md)")
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("no HANDOFF-BATCH", errors[0])
+            self.assertIn("HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
+
+    def test_no_handoff_files_keeps_fail_closed_error(self):
+        # Pre-K-R6 behavior preserved: a repo with no handoff docs at all
+        # still fails closed (the no-link error only applies when handoff
+        # files exist to be linked).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir(parents=True, exist_ok=True)
+            path, errors = checks.status_handoff_issues(
+                root, self._status("- [HANDOFF](HANDOFF.zh-CN.md)")
+            )
+            self.assertIsNone(path)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("no docs/HANDOFF-BATCH-", errors[0])
+
+    def test_run_numbers_anchored_to_linked_handoff_pass(self):
+        # (e) positive: run ids live in the LINKED J handoff — they pass
+        # even though a newer unlinked K file exists.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "# 交接：批次 J\n\n- 43439835214：十轮全部通过。\n")
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status(
+                "- [J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)",
+                latest_lines="- 十轮：run [43439835214](https://github.com/o/r/actions/runs/43439835214)。",
+            )
+            path, link_errors = checks.status_handoff_issues(root, status)
+            # Stale-link error fires separately; run ids themselves are
+            # clean because they live in the linked handoff.
+            self.assertEqual(len(link_errors), 1)
+            self.assertIn("newer handoff", link_errors[0])
+            runs, errors = checks.handoff_run_number_issues(
+                status, path.read_text(encoding="utf-8"), f"docs/{path.name}"
+            )
+            self.assertEqual((runs, errors), (1, []))
+
+    def test_run_numbers_only_in_newest_unlinked_handoff_fail(self):
+        # (e) negative: the run id exists ONLY in the newest unlinked K
+        # file. Under the old filename-newest anchoring this passed; the
+        # gate now validates against the LINKED J handoff and fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "# 交接：批次 J\n\n- §3.1 无新 run。\n")
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n\n- 43439835214：十轮全部通过。\n")
+            status = self._status(
+                "- [J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)",
+                latest_lines="- 十轮：run [43439835214](https://github.com/o/r/actions/runs/43439835214)。",
+            )
+            path, _ = checks.status_handoff_issues(root, status)
+            self.assertEqual(path.name, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md")
+            runs, errors = checks.handoff_run_number_issues(
+                status, path.read_text(encoding="utf-8"), f"docs/{path.name}"
+            )
+            self.assertEqual(runs, 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("43439835214", errors[0])
+            self.assertIn("HANDOFF-BATCH-J-2026-11-13.zh-CN.md", errors[0])
+
+
 if __name__ == "__main__":
     unittest.main()

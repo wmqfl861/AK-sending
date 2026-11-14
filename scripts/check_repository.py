@@ -57,9 +57,19 @@ COMMIT_PLACEHOLDER = "本提交"
 #      docs/HANDOFF-BATCH-*.zh-CN.md;
 #   b. that handoff must not claim 已核 while still carrying
 #      尚待/待补/仍待/待执行 placeholder wording.
+# K-R6 (REVIEW_2026-11-14-batchK.zh-CN.md §1, 2026-11-14): "the newest
+# handoff" in gates a/b means the handoff docs/STATUS.zh-CN.md actually
+# LINKS to, not merely the newest HANDOFF-BATCH-* file in docs/ — on the
+# reviewed commit STATUS still pointed at batch J while an unlinked batch
+# K handoff existed, and the filename-based pick silently validated the
+# wrong document. The link must exist, point at an existing file, and not
+# be stale (a newer handoff file sitting unlinked in docs/ is drift).
 STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
+# Markdown links `[label](target)`; the capture stops at whitespace or a
+# closing paren, matching the repo-wide link walk in check().
+MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^\s)]+)\)")
 RUN_ID_RE = re.compile(r"\d{9,15}")  # GitHub Actions run ids (currently 11 digits)
 CONFIRMED_RE = re.compile(r"已核")  # also matches "一致性已核"
 PENDING_RE = re.compile(r"尚待|待补|仍待|待执行")
@@ -183,6 +193,17 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
     return rows, errors
 
 
+def _handoff_sort_key(name: str) -> tuple[str, str] | None:
+    """(date, letter) ordering key for a handoff filename, None if not one.
+
+    Shared by the filename scan (latest_handoff) and the STATUS-link scan
+    (status_linked_handoff) so "which handoff is newer" has exactly one
+    definition.
+    """
+    match = HANDOFF_NAME_RE.match(name)
+    return None if match is None else (match.group(2), match.group(1))
+
+
 def latest_handoff(root: Path) -> Path | None:
     """Newest docs/HANDOFF-BATCH-<letter>-<date>.zh-CN.md by (date, letter).
 
@@ -192,13 +213,75 @@ def latest_handoff(root: Path) -> Path | None:
     """
     newest: tuple[tuple[str, str], Path] | None = None
     for path in (root / "docs").glob("HANDOFF-BATCH-*.zh-CN.md"):
-        match = HANDOFF_NAME_RE.match(path.name)
-        if match is None:
+        key = _handoff_sort_key(path.name)
+        if key is None:
             continue
-        key = (match.group(2), match.group(1))
         if newest is None or key > newest[0]:
             newest = (key, path)
     return None if newest is None else newest[1]
+
+
+def status_linked_handoff(status_text: str) -> str | None:
+    """Newest HANDOFF-BATCH-*.zh-CN.md filename that STATUS links to (K-R6).
+
+    STATUS's 交接入口 section indexes the current handoff first and keeps
+    earlier batches as history links, so "the handoff STATUS links to" is
+    the newest batch-handoff link target anywhere on the page. Only the
+    link basename matters — anchors like ``#5-证据表`` are stripped and
+    non-batch handoff docs (HANDOFF.zh-CN.md, HANDOFF-CLIENT-UI-U1-…) do
+    not match HANDOFF_NAME_RE. Returns None when STATUS links to no batch
+    handoff at all — callers fail closed on that.
+    """
+    newest: tuple[tuple[str, str], str] | None = None
+    for link in MARKDOWN_LINK_RE.findall(status_text):
+        name = link.split("#", 1)[0].split("/")[-1]
+        key = _handoff_sort_key(name)
+        if key is None:
+            continue
+        if newest is None or key > newest[0]:
+            newest = (key, name)
+    return None if newest is None else newest[1]
+
+
+def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, list[str]]:
+    """K-R6: resolve the handoff STATUS links to and gate the link itself.
+
+    Returns (handoff path the CR-P3-20 checks must anchor to, errors).
+    Failure modes, all fail-closed:
+    - no HANDOFF-BATCH-* file in docs/ at all (pre-K-R6 behavior kept);
+    - STATUS links no batch handoff while handoff files exist — the newest
+      handoff is unreachable from the status entry point; the newest file
+      is still returned so the run-number gate keeps running;
+    - STATUS links a handoff filename that does not exist in docs/;
+    - STATUS links a handoff that is not the newest file in docs/ (stale
+      link: a newer handoff sits unlinked). The LINKED handoff is returned
+      so run numbers are validated against the document STATUS actually
+      references, never against an unlinked newer file.
+    """
+    newest = latest_handoff(root)
+    if newest is None:
+        return None, [
+            "no docs/HANDOFF-BATCH-*.zh-CN.md found for CR-P3-20 consistency checks"
+        ]
+    linked_name = status_linked_handoff(status_text)
+    if linked_name is None:
+        return newest, [
+            f"{STATUS_DOC}: no HANDOFF-BATCH-*.zh-CN.md link found but handoff files "
+            f"exist — link the current handoff {newest.name}"
+        ]
+    linked_path = newest.parent / linked_name
+    if not linked_path.is_file():
+        return None, [
+            f"{STATUS_DOC}: links to handoff {linked_name} but docs/{linked_name} "
+            "does not exist"
+        ]
+    if linked_name != newest.name:
+        return linked_path, [
+            f"{STATUS_DOC}: links to handoff {linked_name} but newer handoff "
+            f"{newest.name} exists — update the STATUS link or remove the stale "
+            "handoff file"
+        ]
+    return linked_path, []
 
 
 def _section_body(text: str, heading: str) -> list[str] | None:
@@ -333,7 +416,7 @@ def check(root: Path) -> dict:
     )
     for path in markdowns:
         text = path.read_text(encoding="utf-8")
-        for link in re.findall(r"\[[^\]]*\]\(([^\s)]+)\)", text):
+        for link in MARKDOWN_LINK_RE.findall(text):
             if "://" in link or link.startswith(("mailto:", "#")):
                 continue
             target = (path.parent / link.split("#", 1)[0]).resolve()
@@ -362,30 +445,36 @@ def check(root: Path) -> dict:
     except OSError as exc:
         status_rows, status_errors = 0, [f"cannot read {REVIEW_DOC}: {exc}"]
     errors.extend(status_errors)
-    # CR-P3-20: STATUS "最新验证" run ids must be traceable in the newest
-    # HANDOFF-BATCH doc, and that doc must not mix 已核 claims with
-    # 尚待/待补/仍待/待执行 placeholders. Fail closed when either document
-    # cannot be located or read.
+    # CR-P3-20: STATUS "最新验证" run ids must be traceable in the handoff
+    # STATUS actually links to, and that handoff must not mix 已核 claims
+    # with 尚待/待补/仍待/待执行 placeholders. K-R6
+    # (REVIEW_2026-11-14-batchK.zh-CN.md §1): the link itself is gated too —
+    # picking docs/'s newest HANDOFF-BATCH-* by filename silently validated
+    # an unlinked handoff while STATUS still pointed at the previous batch.
+    # Fail closed when either document cannot be located or read.
     latest_runs_checked = 0
     latest_handoff_name: str | None = None
-    newest_handoff = latest_handoff(root)
-    if newest_handoff is None:
-        errors.append(
-            "no docs/HANDOFF-BATCH-*.zh-CN.md found for CR-P3-20 consistency checks"
-        )
+    try:
+        status_text = (root / STATUS_DOC).read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cannot read CR-P3-20 documents: {exc}")
     else:
-        latest_handoff_name = f"docs/{newest_handoff.name}"
-        try:
-            status_text = (root / STATUS_DOC).read_text(encoding="utf-8")
-            handoff_text = newest_handoff.read_text(encoding="utf-8")
-        except OSError as exc:
-            errors.append(f"cannot read CR-P3-20 documents: {exc}")
-        else:
-            latest_runs_checked, run_errors = handoff_run_number_issues(
-                status_text, handoff_text, latest_handoff_name
-            )
-            errors.extend(run_errors)
-            errors.extend(handoff_contradiction_issues(handoff_text, latest_handoff_name))
+        handoff_path, handoff_errors = status_handoff_issues(root, status_text)
+        errors.extend(handoff_errors)
+        if handoff_path is not None:
+            try:
+                handoff_text = handoff_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                errors.append(f"cannot read CR-P3-20 documents: {exc}")
+            else:
+                latest_handoff_name = f"docs/{handoff_path.name}"
+                latest_runs_checked, run_errors = handoff_run_number_issues(
+                    status_text, handoff_text, latest_handoff_name
+                )
+                errors.extend(run_errors)
+                errors.extend(
+                    handoff_contradiction_issues(handoff_text, latest_handoff_name)
+                )
     # Contract consistency vs the frozen docs/contracts (wave-24 advisory
     # add-on, Codex final review #1). Appended call only: any drift or crash
     # reported here is a WARNING, never a gate failure, so every check above

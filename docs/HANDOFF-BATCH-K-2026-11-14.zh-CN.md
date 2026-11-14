@@ -82,6 +82,7 @@
 | dev分支最后CI | `4f604bc` | [43544631036](https://github.com/wmqfl861/AK-sending/actions/runs/43544631036) | 12项成功 |
 | 批次J十轮 | `ad975c0` | [43538159455](https://github.com/wmqfl861/AK-sending/actions/runs/43538159455) | 10/10, 40/40 |
 | netem A/B | `8ef4a07` | [43466913049](https://github.com/wmqfl861/AK-sending/actions/runs/43466913049) | 8MiB 23.0 vs 5.7 MiB/s |
+| **批次K CI** | `579310a` | [43577126893](https://github.com/wmqfl861/AK-sending/actions/runs/43577126893) | **12项常规任务成功**；手动深测skipped |
 
 本地门禁：fmt/clippy/rustdoc/workspace tests 全 exit 0；Python 113/113；契约 5/5。
 

@@ -1,29 +1,30 @@
 # 项目状态
 
-> 更新：2026-11-13（批次 J 进行中，J6 文档准备初稿；最终证据待补）。本页是"当前状态"的**唯一来源**：[README](../README.md) 与 [HANDOFF](HANDOFF.zh-CN.md) 只链接本页，不再各自维护状态叙述；历史波次不在此重复。
+> 更新：2026-11-14（批次 J 事实同步；最终 run 结果仍待补）。本页是"当前状态"的**唯一来源**：[README](../README.md) 与 [HANDOFF](HANDOFF.zh-CN.md) 只链接本页，不再各自维护状态叙述；历史波次不在此重复。
 >
 > 逐项修复进度以 [REVIEW_2026-11-11](REVIEW_2026-11-11.zh-CN.md) 第 7 节状态表为准，本页只记口径与结论。
 
-## 当前状态（2026-11-13，批次 J 进行中）
+## 当前状态（2026-11-14，批次 J 验收进行中）
 
 - **阶段＝批次 J 实施与验收进行中**。此前批次 H/I 在 `97fac96` 上复核通过，附 1 项 P2、5 项 P3（[REVIEW_2026-11-13-batchH](REVIEW_2026-11-13-batchH.zh-CN.md)）；这是历史批次结论，项目层面的"通过审核"仍未达到。
 - **J0、J4 已有对应提交的 CI 证据**：
   - J0：PR #15 已快进合入至 `0a17311`，CI run 43439835214 为 12 success / 1 skipped（手动 release-deep-tests）。
   - J4 / CR-P3-17：`aee55e0` 已推送，隔离树 clippy、ak-session、ak-cli、send_admission_cli 通过；CI run 43444609038 同为 12 success / 1 skipped。钩子按尝试报告结果与 terminal，daemon 仅在终态撤回注册项并打印；两次尝试的回归测试已记录在审核状态表。
-  - 两个 run 的结论只适用于各自提交；不覆盖 J2/J3 在途工作或尚未形成的最终集成提交。
-- **客户端 UI U1 / J1：进行中，尚未验收**。
-  - U1 内容：实时传输进度、一次配对一次传输的正常收尾（CR-P2-16）、连接卡进度、内存"最近传输"、深色模式；契约 ffi-v2 §8.4 U1 修订。
-  - J1 已完成旧/新 Windows DLL 与 Android 双 ABI 构建；Windows 第 1–5、10 项取得同机真实 DLL/CLI 行为证据。第 6 项清空已验证，另以相同配置/身份目录的两个真实进程补验：首进程注入合成历史且不清空，退出后次进程历史为空；两次直接退出码均0。注入只证明内存历史生命周期，不冒充新传输，原 pumpWidget 不作重启证据。
-  - Windows 光栅输出仅见纯底色，第 7 项视觉走查受阻；integration_test 不代替可读性观察。Android 标准 debug APK 已构建安装，第 8/9 项继续验证；普通共享存储写入权限与系统 UI 响应问题尚在排查，未计为通过。
-  - 逐项清单与结果由 J1 维护：[HANDOFF-CLIENT-UI-U1-2026-11-13](HANDOFF-CLIENT-UI-U1-2026-11-13.zh-CN.md)。构建、自动化行为、视觉走查与 C4 真机跨 NAT 分别验收。
-- **J2 / CR-P3-15：代码及本地门禁通过，Linux十轮待验收**。Rust `c60512b`、UI `6e576d6`：单一配对生命周期gate管理活跃发送、绝对截止时间及唯一keeper；倒序失败、无资源到期、取消与UI终态过滤均有回归。最终本地门禁为Rust全仓/格式/clippy/rustdoc通过、契约5/5、Python94、Flutter208、Dart170。J5工具`fb19a01`已入库，最终CI与拒绝后重试连续10轮仍待实跑，不先判本项完成。
-- **J3 / CR-P3-16：已完成于 `8ef4a07`**。精确独立快照完整本地门禁通过；CI run 43466913061 的12项常规任务成功、手动深测跳过，Android双ABI发布库无 AK_EXP_ 步骤实际执行成功；netem run 43466913049 成功，Windows默认DLL本地扫描无 AK_EXP_。后续集成版本另跑对应验证。
-- **CR-P1-07、CR-P1-08：代码达标，验收进行中**。
-  - H/I 复核时的三个新矩阵案例为 6/10，属历史时点；J0/J4 的两个 run 中 late-send-5s、late-send-40s、recv-no-lowttl 均 pass-v4，8 MiB byte-identical。
-  - **J5 尚未执行**：待 J2/J3 最终提交固定后，在独立 CI 内对同一提交顺序跑 10 轮，包含上述三个案例与 J2 新增拒绝后 ≥40 秒重试案例，原有矩阵案例保持通过；不拼接历史 run 凑 10 次。
-  - CR-P1-08 的 Windows IPv4 头 `IP_TTL` 抓包仍未取得，由所有者在 C4 执行；Windows 单测与 Linux 矩阵不能替代。
-- **J6：文档准备中**。本页、审核 §7 与 [批次 J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md) 正在同步；待最终证据到齐后按指定顺序核验，尚未作最终一致性确认。J7 / CR-P3-19 为可选 UDP 缓冲优化，**本轮不实现**，避免扩大变量。
-- **C4：待 J1、J2、J5 实际完成后，由所有者执行**。内容包括两台真实设备跨 NAT 互传、Windows TTL 抓包、GUI 配对后迟发送、拒绝后重试与 U1 真实传输表现。E6 可并行准备，实际 C4 仍需所有者部署及版本/外部连通验证；不把 J1 同机或模拟器测试写成 C4。
+  - 两个 run 的结论只适用于各自提交；后续已推送的集成快照为 `534f145`，对应普通CI因NAT超时取消、十轮首跑失败，详见下表。
+- **客户端 UI U1 / J1：部分验收，未全部通过**。
+  - U1 内容：实时传输进度、正常收尾（CR-P2-16）、连接卡进度、内存最近传输、深色模式。Windows 第 1–5、10 项已取得同机真实 DLL/CLI 行为证据；第 6 项清空及同配置/id-dir 的两个真实 OS 进程重启已补验，两次退出码均 0。首进程注入合成历史，只证明内存生命周期，不冒充新传输。
+  - 第 7 项 Windows 光栅纯底色仍阻塞视觉。Android 标准 main 旧基线亮/暗与生码可用；第 8 项亮色辅助真实传输的三行布局/长名截图通过；第 9 项辅助 8 MiB GUI/FFI→Windows 字节数及 SHA256 一致、CLI 退出 0。FilePickGateway 注入 App 沙箱合成源，系统 SAF 普通路径因 Download 权限拒绝仍未验。
+  - 200 MiB 辅助传输超测试 4 分钟预算未完成；8 MiB 辅助 runner 整体退出 1（漏采速度行），暗色传输未跑，不能把整套 runner 记为通过。
+  - SafeArea `0e1f793`、走查/重启 runner `a9bd53c` 已入库。SafeArea 标准 main 新 APK 构建/安装退出码 0，但复拍首帧期间 emulator 与 services 收到外部 stopped 通知（非执行者发起，来源未知），未重启；Splash 不能作视觉通过证据。自有进程及 17200/17101 无残留，AVD 390dp 覆盖未恢复（原 1080×2400、density420、自动旋转 1 已仓外记录）。
+  - 十项明细保留在 [批次 J 交接 §2.1](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)；原清单见 [U1 交接](HANDOFF-CLIENT-UI-U1-2026-11-13.zh-CN.md)。同机行为、视觉、辅助流程与 C4 真实跨 NAT 分别验收。
+- **J2 / CR-P3-15：代码及最终全量本地门禁通过，Linux矩阵验收受阻**。Rust `c60512b`、闲置 UI `6e576d6` 已入库；本地 Rust 1199 通过/0 失败/8 ignored，fmt/clippy/rustdoc/release 退出码均 0，Python 94/94、契约 5/5、Flutter 208/208、Dart 170/170。J5 工具 `fb19a01` 已入库；固定 `534f145` 的十轮首跑在第一轮超时，完成计数0/10。普通CI的NAT任务也在对称NAT案例等待至超时取消，其余11项常规任务成功。正在修复已复现的矩阵进程生命周期问题，修复后的实际验收尚未完成。
+- **J3 / CR-P3-16：已完成于 `8ef4a07`**。精确独立快照完整本地门禁通过；CI run 43466913061 的 12 项常规任务成功、手动深测跳过，Android 双 ABI 发布库无 AK_EXP_ 步骤实际执行成功；netem run 43466913049 成功，Windows 默认 DLL 本地扫描无 AK_EXP_。后续集成版本另按其 run 验证。
+- **CR-P1-07、CR-P1-08：代码达标，验收进行中，不关闭**。
+  - H/I 复核时三个新案例 6/10 属历史；J0/J4 两 run 的 late-send-5s、late-send-40s、recv-no-lowttl 均 pass-v4、8 MiB byte-identical，不拼接计入本批十轮。
+  - **J5 首轮失败，0/10**：固定 SHA `534f145` 的独立顺序十轮 run 43470613025 已结束，首轮退出124、目标成功0/40，后续轮未运行。失败产物保留，命名空间名称检查无残留。普通CI原始日志确认前三案通过，进入symm-symm后等待至任务取消；新receiver函数包装层的PID/等待与TERM处理缺陷已在无网络Bash实验复现，修复与Linux重验进行中。
+  - CR-P1-08 的 Windows IPv4 头 `IP_TTL` 抓包仍未取得，由所有者在 C4 执行；单测和 Linux 矩阵不能替代。
+- **J6：失败证据回写与最终一致性核验中**。首跑失败和J1部分验收如实保留；STATUS、审核§7及交接§0/§5仍须在修复验收后逐行核对，尚未声明最终一致性完成。J7 / CR-P3-19 本轮不实现。
+- **C4 未就绪：仍待 J1、J2、J5 实际完成后，由所有者执行**。J1 尚有视觉与 Android 流程未过，即使 J2/J5 后续成功也不能宣告 ready；Windows TTL 抓包仍属 C4。E6 可并行准备，实际 C4 仍需所有者部署及版本/外部连通验证。
 - **E1–E4 已决定且各自工程动作有历史证据**：E1 特性隔离/旧 Dart 层删除（1c95d38、fc53613）；E2 确认窗口 120 s（aa7f3af）；E3 文案（e1ba8b1，UPnP 等仍暂不启用）；E4 删除 MANIFEST.sha256（951b44e）。旧 Rust 代码是否彻底删除按一个发布周期后再评估，不是 E6 后自动删除。
 - **待所有者**：E5 签名密钥（正式命名/版本统一与签名验证仍见 CR-P2-02）；E6 服务器部署、防火墙及线上版本核实；E7 LICENSE；CR-P3-03 域名/钉扎轮换；CR-P3-05 SSH 密钥。E5、域名及 SSH 密钥事项不作为新增 C4 前置。
 - **生产服务器**：
@@ -34,7 +35,7 @@
 
 ## 最新验证（CI 与本机，分提交）
 
-以下 J0/J4 结果由集成者逐任务取证后提供，原始日志仓外保存；本次文档准备未重新查询 CI。
+以下结果由集成者通过GitHub逐任务查询、原始日志及脱敏验收产物核实；`534f145`的失败记录保留，修复后的新提交与结果另列。原始日志仓外保存。
 
 | 项 | 提交 | CI run | 已取得结论 |
 |---|---|---|---|
@@ -42,11 +43,13 @@
 | J4 钩子语义 | `aee55e0` | [43444609038](https://github.com/wmqfl861/AK-sending/actions/runs/43444609038) | 12 success；手动 release-deep-tests skipped |
 | J3 特性隔离 | `8ef4a07` | [43466913061](https://github.com/wmqfl861/AK-sending/actions/runs/43466913061) | 12 success；Android双ABI开关字符串检查success；手动深测skipped |
 | J3 netem 特性构建 | `8ef4a07` | [43466913049](https://github.com/wmqfl861/AK-sending/actions/runs/43466913049) | 特权Linux netem任务success，保留模拟定位 |
+| 最终集成首跑 | `534f145` | [43470613069](https://github.com/wmqfl861/AK-sending/actions/runs/43470613069) | 11项常规任务success；NAT任务超时cancelled，整体cancelled；手动深测skipped |
+| J5固定SHA十轮首跑 | `534f145` | [43470613025](https://github.com/wmqfl861/AK-sending/actions/runs/43470613025) | failure，首轮exit124，完成0/10、目标成功0/40；命名空间名称检查无残留，后续轮停止 |
 
-- 两 run 各自成功的 12 项：Rust Ubuntu/Windows、Flutter、Android、audit、deny、checks、legacy-signal、portability×3、NAT 矩阵。release-deep-tests 的 skipped 不记为执行通过。
-- 两 run 原三个新 NAT 案例（late-send-5s、late-send-40s、recv-no-lowttl）均 pass-v4、8 MiB byte-identical；这两次基线证据不计入 J5 固定最终 J2/J3 提交的顺序 10 轮。
+- J0/J4 两 run 各自成功的 12 项：Rust Ubuntu/Windows、Flutter、Android、audit、deny、checks、legacy-signal、portability×3、NAT 矩阵。release-deep-tests 的 skipped 不记为执行通过。
+- J0/J4 两 run 原三个新 NAT 案例（late-send-5s、late-send-40s、recv-no-lowttl）均 pass-v4、8 MiB byte-identical；这些基线证据不计入 J5 固定 `534f145` 的顺序十轮。
 - J4 本机隔离验证：clippy、ak-session、ak-cli、send_admission_cli 通过；详细钩子回归范围见审核 §7 CR-P3-17 行。
-- **未取得最终证据**：J1 完整走查（Windows 视觉受阻，Android 待跑）、J2/J3 最终提交及完整验收、J5 独立 CI 顺序 10 轮、最终集成提交 CI、C4 真机/Windows TTL 抓包、E6 生产迁移。J6 最终核验待这些对应结果如实回写后进行，不将未执行项补成通过。
+- **仍未完成**：J1 Windows视觉、系统SAF普通流程、Android暗色传输及SafeArea修复后标准首页视觉闭环；矩阵脚本修复后的J2/J5十轮与最终集成CI验收；C4真机/WindowsTTL抓包、E6生产迁移。J3自身证据已齐，不再列为WIP，失败及未验结果不补成通过。
 
 以下保留为历史验证，不冒充批次 J 最终结果：
 

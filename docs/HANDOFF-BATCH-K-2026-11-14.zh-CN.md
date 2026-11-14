@@ -1,7 +1,7 @@
 # 交接文档：批次 K（2026-11-14）
 
-> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`。§0–§9 为前序历史，§10 为执行方修复轮二记录，§11 为本次独立复核证据。首轮文档随 `b6296ea` 提交，K2 本地纠正随 `f7dece2` 提交；本次 K3 文档同步仅保留本地。
-> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)，历史见 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md) 与 [K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md)。
+> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`；修复轮三 `3db5259..31cf22c`。§0–§12 为前序记录与执行方声明，§13 为本次独立复核证据。首轮文档随 `b6296ea`、K2 本地纠正随 `f7dece2`、K3 报告及同步随 `e8b621a` 提交；本次 K4 文档同步仅保留本地。
+> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)，历史见 [K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)、[K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md) 与 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md)。
 
 ## 0. 范围与来源
 
@@ -228,7 +228,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 11. 修复轮二独立复核证据（2026-11-15）
 
-被审差异固定为 `f150503..3db5259`，判断与修复要求见 [K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)，每项状态只在审核状态表。本节、K3 报告及本轮入口同步为本地未提交记录。离线 Bash/systemctl/权限模型、CI runner 实际执行和物理设备验收分别记录。
+被审差异固定为 `f150503..3db5259`，判断与修复要求见 [K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)，每项状态只在审核状态表。本节、K3 报告及该轮入口同步出具时为本地未提交记录，随后随 `e8b621a` 入库；本节保留当时的证据。离线 Bash/systemctl/权限模型、CI runner 实际执行和物理设备验收分别记录。
 
 | 本次复核实际执行 | 命令/对象 | 结果与边界 |
 |---|---|---|
@@ -270,19 +270,88 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 12. 修复轮三（K3 复核后的新候选，执行方记录）
 
-[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)（K2-R2 判通过、K2-R5 部分通过）后，执行方修复其剩余四项；复核方本地同步（§11、STATUS、状态表、K2 报告历史注记）与本节代码改动一并提交。
+[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md) 后，执行方提交下列修复声明；复核方本地同步（§11、STATUS、状态表、K2 报告历史注记）与修复代码和本节一并入库。以下保留执行方提交时的记录，新的独立行为证据见 §13，逐项判断只在审核状态表。
 
 | K3 发现 | 修复内容 |
 |---|---|
 | K3-N1（P1） | 新增 `probe_unit`/`stop_unit`：经 `systemctl cat` 三态判定存在/确认缺失/不可判定；确认缺失的 unit 记录「nothing to stop」跳过，存在的 unit 保持 K2-R2 严格停服，不可判定即拒绝。全新安装与 legacy-only 迁移回归：真实生成脚本在缺失 unit 夹具上完成安装+enable+核验（对照 `f7dece2` 同夹具盲停服 exit 5、`f150503` 可完成） |
 | K2-N1 余项（P1） | (a) 部分启动恢复：恢复时对捕获为 active 的 unit 检查现时状态——active 则 `restart`（吃到恢复后的旧文件）、inactive 则 `start`，再以 MainPID→`/proc/<PID>/exe` 核对运行镜像，不匹配报 `RECOVERY INCOMPLETE`；(b) 捕获保留 `is-enabled`/`is-active` 原始输出（不再置空），无法判定即切换前拒绝，恢复按布尔对恢复 enable/disable 与 start/stop；(c) 旧二进制 move-aside 不再 `|| true`：失败保留停服前备份为恢复源，恢复先试 `ak-cli.old-<ts>` 再回退 `cp -a` 备份，两者皆败报 INCOMPLETE，全新安装场景整体回滚新二进制。systemctl stub 升级为有状态（enabled/active/MainPID/running.bin=启动时镜像字节），断言对象为运行镜像而非调用日志；`f7dece2` 基线以同夹具复现三种缺陷各自的行为 |
 | K2-R3 余项（P1） | 每个特权发现探测（cgroup 读取、home 枚举、`priv_exists` 身份/库存在性）不可判定即 exit 3；real_run 决策块对 pid-unknown/非 systemd 占用显式拒绝并单独回归；`/proc/<pid>/cmdline` 输出显式补行尾，无换行夹具经真实 p1+决策块验证 unit 归属正确（`f7dece2` 同夹具字段粘连得出 none-detected） |
-| K2-R4 余项（P2） | 检查器逐链接校验：STATUS 中每个交接形态链接各自解析（去 fragment、拒外部/绝对/越界），当前批次链接必须全部解析到最新交接的规范路径（旧批次链接为历史，仅要求可解析存在）；逐条带行号报错，无首链接短路。反例翻转：规范首链+后续 archive 链（复核复现）旧检查器 exit 0、新代码 exit 1 列出两处行号；顺序颠倒同样失败；断言措辞对齐（通用断链 walk 已拒缺失子目录的目标，专项错误为改进点；基线缺失仅在 git 无法提供时 skip） |
+| K2-R4 余项（P2） | 检查器逐链接校验：STATUS 中每个交接形态链接各自解析（去 fragment、拒外部/绝对/越界），当前批次链接必须全部解析到最新交接的规范路径（旧批次链接为历史，仅要求可解析存在）；逐条带行号报错，无首链接短路。反例翻转：规范首链+后续 archive 链（复核复现）旧检查器 exit 0、新代码 exit 1 列出两处行号；顺序颠倒同样失败；通用断链 walk 已拒缺失子目录的目标，专项错误为改进点。“仅 git 无法提供基线时 skip”的限定适用于 SSH helper；部署 baseline 缺 marker 仍可能 SkipTest，实际核对见 §13 |
 
 ### 修复轮三门禁与提交
 
-本地：两脚本 `bash -n`+自检全过；Python 177/177（部署套件 40，含 K3-N1/K2-N1/K2-R3 回归与 `f9582e5`/`f150503`/`f7dece2` 基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+| 执行方本地门禁 | 对象 | 提交时报告 |
+|---|---|---|
+| Shell | 两脚本 `bash -n` 与自检 | 全过 |
+| Python | 完整套件，含真实 git 基线对照 | 177/177；其中部署套件 40 |
+| 仓库与契约 | `check_repository.py`；`check_contracts.py` | exit 0；5/5 |
+| Rust 变动范围 | Rust 树与已验证链比较 | 无变化；未声称本轮重跑 |
 
 | 提交 | 内容 |
 |---|---|
 | `e8b621a` | K3-N1/K2-N1/K2-R3/K2-R4 修复与回归；复核方文档纠正与执行方本节记录入库 |
+| `31cf22c` | 仅回填实际修复提交号；本次独立复核固定 tip |
+
+## 13. 修复轮三独立复核证据（2026-11-15）
+
+被审差异固定为 `3db5259..31cf22c`。发现、触发与修复要求见 [K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)，每项状态只在审核状态表。本节、K4 报告及入口同步仅保留本地。下表分别记录完整候选门禁、额外反例、API 证据与未执行项；离线 systemctl/权限模型不代表原生 Linux 或生产验收。
+
+| 本次复核实际执行 | 命令/对象 | 结果与边界 |
+|---|---|---|
+| Python 全集 | `python -m unittest discover -s scripts/tests -v`；`31cf22c` | 177 passed，0 failures/errors/skipped，exit 0；311.264s。指定旧 git 基线均实际执行；绿套件不覆盖下表额外反例 |
+| 并行专项 | 部署套件；K2-R3 筛选；checker 套件 | 分别 40/40（265.904s）、10/10（35.058s）、44/44，通过且无 skip；与全集为不同执行，不累计为独立案例数 |
+| 仓库/契约/差异 | `python scripts/check_repository.py`；`python scripts/check_contracts.py`；`git diff --check 3db5259..31cf22c` | 仓库 exit 0、契约 5/5 PASS、差异格式 exit 0；完整 checker 额外反例见下表 |
+| Shell 语法与自检 | 两脚本分别 `bash -n` 与 `--self-test` | 全部 exit 0；cross_nat 使用既有 `git 1e59342` release CLI，仅本地合成数据/解析，无 SSH 或跨网传输 |
+| Rust/Cargo 变动范围 | `git diff --name-only 5beb10a..31cf22c -- crates Cargo.toml Cargo.lock rust-toolchain.toml` | 无差异，exit 0；本机未重复 Rust/Flutter/Dart 全量，tip CI 实际门槛见下表 |
+| 基线提取声明 | 对可读但缺 marker 的合成 baseline 调用部署 `phase_defs` 与 SSH `extract_helper_text` | 部署抛 SkipTest，SSH 抛 AssertionError；不能把后者的限定泛化到全部部署基线。指定实际旧基线均可提取，本轮行为对照有效 |
+| 本地文档同步门槛 | `python scripts/check_repository.py`；`git diff --check` | 同步后均 exit 0；仅新增 K4 报告并同步 STATUS、状态表、交接与 K3 历史归属，代码未修改，文档未提交/推送 |
+
+| 独立追加反例 | 实际执行与结果 | 证据层级 |
+|---|---|---|
+| K3-N1 标准缺失 unit 文案 | 真实 phase456：仓内文案 INSTALL_RC=0；只换成 `No files found for ...` 后候选 INSTALL_RC=5、切换未开始、binary/unit 未安装；同夹具真实 `f150503` INSTALL_RC=0 | 集成者重放；systemd v255 上游源码核对＋离线模型，不是本机原生 systemd |
+| K2-N1 恢复查询无法判断 | disabled/inactive 原态，捕获及切换前查询正常；先启动新 registry 再令 STUN 失败，只让恢复阶段 registry is-active 无输出/exit 1。INSTALL_RC=5、日志 RECOVERY OK；最终 registry disabled 但 active，running.bin 仍 git deadbee 新镜像 | 集成者重放真实 phase456、有状态 systemctl 模型，最终状态与镜像直接读取 |
+| K2-N1 非空未知捕获值 | 已有 stub 输入 SYSTEMCTL_IS_ACTIVE=unknown，真实 phase456 捕获 enabled:unknown 并 INSTALL_RC=0，执行 stop/安装 | 合成边界实验；不声称某真实 systemd 前置必然返回 unknown |
+| K2-R3 标准权限诊断 | 选择性令已有合成身份目录，或其 key/db 的 ls -d 返回标准 cannot access + Permission denied。两变体均 PHASE1_RC=0、decision exit 0，existing registry data dir 为 none-found | 集成者重放真实 phase1＋real_run 实际决策块；工具为离线权限 stub |
+| K2-R3 旧 unit 未进入迁移集合 | 分别令已知旧 unit 的 test -f 权限失败，或 unit 只在 vendor 目录。两变体 phase1 均识别 oldregistry.service 占端口，但 decision exit 0、old registry 为 none-detected、ExecStart 为 none | 集成者重放；机械执行至真实预检决策，不称已执行后续部署 |
+| K2-R4 原混合目标反例 | 两个 git archive 完整树：规范首链/后续 archive，3db5259 exit 0；31cf22c exit 1，点名 STATUS 第 9/13 行；反序候选 exit 1，点名第 5/13 行；历史缺失目标也拒绝 | 集成者重放完整检查器；原顺序问题已有有效修复 |
+| K2-R4 跨行链接回归 | 首个 archive 链接 label 跨行、其他规范链接保留：3db5259 完整 checker exit 1；31cf22c exit 0、passed=true、errors=[]。带 title 的 archive 链接两版均 exit 0，属既有限制 | 完整导出树＋存在的合成 archive 文件；未修改仓内 STATUS 为反例 |
+
+| GitHub API / 引用 | 提交/来源 | 实际结果与边界 |
+|---|---|---|
+| tip CI | `31cf22c0d0583b7794e896aca6564ffd4d5ab0a7`；[43645127728](https://github.com/wmqfl861/AK-sending/actions/runs/43645127728) | run_attempt=1，push，completed/success；13 jobs 中 12 常规 success、1 release-deep-tests skipped。当前 git 凭据读取 run/jobs API，完整 head SHA、head_branch 均匹配 |
+| CI 实际门槛 | 同上 jobs/steps metadata 与固定 tip workflow | Linux/Windows Rust fmt、clippy、workspace/特性测试、rustdoc；Flutter analyze/test、纯 Dart；Android 双 ABI/符号/实验变量泄漏检查及 debug APK；Linux/macOS portability、依赖审计、仓库检查与 NAT netns 模拟均 success。不是生产部署或物理双机证据 |
+| 本地及远端引用 | fetch --prune、ls-remote、branch/worktree、branches API | main/origin/main 均 `d6c71360784e1570720e56028a39f2a80777bb21`；HEAD/开发分支及 origin 对应分支均 `31cf22c0d0583b7794e896aca6564ffd4d5ab0a7`。仅 main 与当前批次两个本地/远端分支，1 个 worktree；本轮未合并、未提交、未推送、未删除分支 |
+
+| 未执行项 | 原因/边界 |
+|---|---|
+| 本机 Rust/Flutter/Dart 全量与平台重建 | 本轮脚本/检查器/文档变更，Rust/Cargo 树无变化；使用已核实 tip CI 的实际门槛，不冒充本机重跑 |
+| Linux 原生 systemd/权限部署、远端 SSH | 本机 Windows，无可用 WSL 发行版；未安装环境或连接生产，使用真实生成脚本的隔离模型 |
+| 物理双机 C4、抓包、release ignored 深载荷 | 本轮未执行；tip CI 手动深测 skipped |
+| shellcheck | 本机命令不可用；已执行 bash 语法、自检和离线行为模型 |
+
+| 仓外材料（均在本机 TEMP） | 内容 |
+|---|---|
+| `AK-review-K4-20261115` | 脱敏 run/jobs/branches JSON、Python 完整测试日志、集成者 recovery/privilege/checker 重放日志；无凭据 |
+| `ak-k4-recovery-repro.py`；`ak-k4-recovery-evidence-lj0gt6pq` | 恢复与首次安装重放脚本、各场景 generator/状态文件/输出、summary.json、上游 systemd v255 源码；全部合成数据 |
+| `ak-k4-privilege-repro.py`；`ak-k4-privilege-evidence-rx1eyxh_` | 真实 phase1/决策块重放、选择性权限与 unit 路径模型、逐案 JSON、summary.json |
+| `ak-k4-checker-replay.py`；`ak-k4-checker-evidence-ec0q812_` | 两版完整导出树及逐场景 JSON；脚本结束时导出树 STATUS 已还原，反例应按 replay 重放，不能以还原后的树代替反例 |
+
+## 14. 修复轮四（K4 复核后的新候选，执行方记录）
+
+[K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)（K2-R2 维持通过、K2-R5 行为证据接受）后，执行方修复其四项余留；复核方本地同步（§13、STATUS、状态表、K3 报告历史注记）与本节代码改动一并提交。
+
+| K4 发现 | 修复内容 |
+|---|---|
+| K3-N1 余留（P1） | `probe_unit` 缺失判定补入 systemd v255 标准诊断 `No files found for <unit>.`（引 upstream `systemctl-util.c` finish 路径；测试 stub 默认诊断同步改为该串）。复核精确夹具（该诊断串的全新安装）在轮四代码 exit 5、新代码完成安装；未识别诊断仍拒绝且零触碰；`f150503` 基线同夹具可完成（复核锚点） |
+| K2-N1 余留（P1） | 新 `qstate` 三态化恢复期查询（active/inactive/不可判定，非零 rc 保留 stdout）；active 分支查询失败走 restart+镜像核验；inactive/absent 分支遇 active-or-不可判定保守 stop 后确认，不可确认即 `RECOVERY INCOMPLETE`——复核序列（disabled/inactive 起步、新 registry 已启动、仅恢复期 registry is-active 查询失败）从「RECOVERY OK+新镜像在跑」翻转为 INCOMPLETE+保守停机；捕获端不支持的值（unknown 等）切换前拒绝 |
+| K2-R3 余留（P1） | `priv_exists` locale 固定（`sudo -n env LC_ALL=C ls -d`）且仅纯 ENOENT 判缺失：`cannot access … Permission denied` 等一律不可判定 exit 3（目录级与 key/db 级夹具从「none-found 放行」翻转为拒绝）；已识别占用 unit 的配置探测改为在 `/etc`、`/run/systemd`、`/run/systemd/transient`、`/usr/lib`、`/lib` 五处 systemd 目录经 `priv_exists` 搜索——探测失败拒绝、找到即入迁移集、识别却无处定位显式 exit 3（占用不再静默脱靶；vendor 目录夹具经真实 p1+决策块绑定 oldregistry） |
+| K2-R4 回归（P2） | 检查器改全文匹配（`finditer` 全文 + 偏移计算行号）：跨行标签与带 CommonMark 标题的链接均被捕获并在起始行报错；复核多行标签 archive 夹具在 `31cf22c` exit 0、新代码 exit 1；带标题 archive 链接同翻；既有单行两序/外部 URL/全规范回归保持 |
+
+### 修复轮四门禁与提交
+
+本地：两脚本 `bash -n`+自检全过；Python 190/190（部署套件 49，含 9 项轮五回归与 `f9582e5`/`f150503`/`f7dece2` 基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮四首个提交，推送后回填哈希） | K3-N1/K2-N1/K2-R3 余留与 K2-R4 回归修复；复核方文档纠正与执行方本节记录入库 |

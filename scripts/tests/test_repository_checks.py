@@ -287,6 +287,12 @@ class StatusHandoffLinkTests(unittest.TestCase):
     link early in STATUS mask archive/ links in 最新验证/交接入口, making the
     result depend on link order. The run-number/contradiction gates anchor
     to the CANONICAL newest handoff.
+
+    K4 (REVIEW_2026-11-15-batchK4.zh-CN.md §1): links are matched over the
+    WHOLE document — the round-4 per-line scan silently skipped a link
+    whose LABEL spans two lines, so a multi-line-label archive link passed
+    the full checker. Optional CommonMark titles are parsed consistently
+    by the shared MARKDOWN_LINK_RE (handoff gate and repo-wide walk).
     """
 
     @staticmethod
@@ -648,6 +654,83 @@ class StatusHandoffLinkTests(unittest.TestCase):
             self.assertIn("external URL", errors[0])
             self.assertIn("https://example.com/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
             self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
+
+    def test_multiline_label_archive_link_fails_at_starting_line(self):
+        # K4 (REVIEW_2026-11-15-batchK4.zh-CN.md §1), the reviewer's exact
+        # fixture: the archive link's LABEL spans two lines (legal
+        # Markdown), the canonical links stay single-line. The round-4
+        # per-LINE scan never matched the multi-line label, so the archive
+        # target passed the full checker (the 3db5259 whole-text max()
+        # checker still rejected this fixture). Whole-text matching now
+        # finds it and reports the link's STARTING line (5).
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = "[" + "K\n交接" + "](archive/" + name + ")"
+        canonical = "[" + "K" + "](" + name + ")"
+        status = (
+            "# 项目状态\n\n## 当前状态\n\n" + archive
+            + "\n\n## 最新验证\n\n" + canonical
+            + "\n\n## 交接入口\n\n" + canonical + "\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:5:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("docs/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(
+                path, root / "docs" / "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+            )
+
+    def test_multiline_label_canonical_link_passes(self):
+        # The healthy counterpart: a multi-line LABEL pointing at the
+        # canonical file is legal and must not trip anything.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        multiline = "[" + "K\n交接" + "](" + name + ")"
+        status = (
+            "# 项目状态\n\n## 当前状态\n\n" + multiline
+            + "\n\n## 最新验证\n\n[" + "K" + "](" + name + ")\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, name, "# 交接：批次 K\n")
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(errors, [])
+            self.assertEqual(path.name, name)
+
+    def test_titled_archive_link_fails(self):
+        # CommonMark inline title `[label](target "title")` — flagged by
+        # the K4 review as a form BOTH the old and round-4 regexes missed
+        # entirely. The shared pattern now parses it consistently with
+        # plain links, so a titled archive link fails naming the target.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            status = self._status(
+                '- [K 交接](archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md "标题")'
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:13:"), errors[0])
+            self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
+
+    def test_titled_canonical_link_passes(self):
+        # A titled link to the canonical handoff is valid Markdown and
+        # must keep passing (single- and double-quoted titles).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+            status = self._status(
+                '- [K 交接](HANDOFF-BATCH-K-2026-11-14.zh-CN.md "标题") · '
+                "[K 交接 §5](HANDOFF-BATCH-K-2026-11-14.zh-CN.md#5-证据表 '另一标题')"
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(errors, [])
             self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
 
 

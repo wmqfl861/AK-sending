@@ -639,6 +639,15 @@ self_test() {
     || fail "an undeterminable key/db existence probe must refuse the preflight (K2-R3)"
   grep -q "sed 's/^/  cmdline: /'; printf" "$WORK/p1.sh" \
     || fail "the cmdline line must be terminated so machine fields stay parseable (K2-R3)"
+  # K 复核 K2-R3 (round 5): 'cannot access ... Permission denied' must be
+  # UNDETERMINABLE (locale pinned), and an identified occupant unit must be
+  # locatable across ALL standard unit dirs or the preflight refuses.
+  grep -q 'env LC_ALL=C ls -d' "$WORK/p1.sh" \
+    || fail "the existence probe must pin the locale so ENOENT matching is deterministic (K2-R3)"
+  grep -q 'usr/lib/systemd/system' "$WORK/p1.sh" \
+    || fail "occupant unit lookup must cover vendor unit dirs (K2-R3)"
+  grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
+    || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
   # INSIDE do_switchover's unified recovery window (they used to run bare).
   grep -q "^  sudo -n tee /etc/systemd/system/ak-registry-server.service >/dev/null <<'REGUNIT' || return 1$" "$WORK/p456.sh" \
@@ -661,6 +670,18 @@ self_test() {
     || fail "a failed binary restore must report INCOMPLETE (K2-N1)"
   grep -q 'RECOVERY INCOMPLETE' "$WORK/p456.sh" \
     || fail "a failed recovery must be loudly reported (K2-N1)"
+  # K 复核 K3-N1 (round 5): systemd v255's standard missing-unit diagnostic
+  # 'No files found for <name>.' (trailing period) must classify as absent.
+  grep -q 'No files found for' "$WORK/p456.sh" \
+    || fail "the v255 missing-unit diagnostic must be recognized as absent (K3-N1)"
+  # K 复核 K2-N1 (round 5): unsupported captured states refuse pre-switch,
+  # and recovery tri-states its is-active queries with CONFIRMED outcomes.
+  grep -q 'unsupported/undeterminable enable-state' "$WORK/p456.sh" \
+    || fail "an unsupported captured state must refuse BEFORE the switchover (K2-N1)"
+  grep -q 'qstate' "$WORK/p456.sh" \
+    || fail "recovery must tri-state its is-active queries (K2-N1)"
+  grep -q 'cannot confirm \$u.service was stopped' "$WORK/p456.sh" \
+    || fail "recovery must CONFIRM stopped units, reporting INCOMPLETE otherwise (K2-N1)"
   # K 复核 K2-R2: phase7 must verify the RUNNING process, not just config.
   grep -q 'systemctl show -p MainPID' "$WORK/p7.sh" \
     || fail "K2-R2: phase7 must resolve each unit's MainPID"
@@ -887,6 +908,25 @@ for u in ak-registry-server ak-stun-server; do
     echo "unit \$u: absent"
   fi
 done
+# priv_exists <path>: privileged existence probe distinguishing
+# exists / absent / cannot-determine ('env LC_ALL=C ls -d' rc + diagnostic
+# text). Defined BEFORE its first use (occupant unit lookup + identity
+# discovery). K 复核 K2-R3 (round 5): round 4 treated ANY 'cannot access'
+# diagnostic as absent, but GNU ls prints 'cannot access ...: Permission
+# denied' for exactly the case that must NEVER read as "no identity". The
+# locale is pinned so the ENOENT text match is deterministic; ONLY a plain
+# ENOENT diagnostic means absent — permission/I-O and every other
+# diagnostic are UNDETERMINABLE (the caller refuses the preflight).
+priv_exists() {
+  local pe_out pe_rc
+  pe_rc=0
+  pe_out=\$(sudo -n env LC_ALL=C ls -d "\$1" 2>&1) || pe_rc=\$?
+  if [ "\$pe_rc" = 0 ]; then echo yes; return 0; fi
+  case "\$pe_out" in
+    *"No such file or directory"*) echo no; return 0 ;;
+    *) printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2; return 2 ;;
+  esac
+}
 # Live listener on the registry port -> authoritative id-dir + old unit name
 # (the existing production unit name is NOT verified per docs §0/§3, so it is
 # discovered from the port, not assumed).
@@ -920,10 +960,28 @@ if [ -n "\$reg_line" ]; then
   # the old unit. Terminate the line explicitly so every machine field in
   # this report starts at column 0.
   [ -n "\${reg_pid:-}" ] && { sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/^/  cmdline: /'; printf '\\n'; } || true
-  if [ -n "\${reg_unit:-}" ] && [ "\$reg_unit" != "ak-registry-server.service" ] && sudo -n test -f "/etc/systemd/system/\$reg_unit" 2>/dev/null; then
-    echo "  old-registry-unit: \$reg_unit"
-    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "/etc/systemd/system/\$reg_unit"
-    sudo -n sed -n 's/^User=/  old-registry-User=/p' "/etc/systemd/system/\$reg_unit"
+  # K 复核 K2-R3 (round 5): an occupant unit IDENTIFIED from its cgroup must
+  # be bound into the migration set. The old single '/etc/systemd/system'
+  # test could not distinguish a permission failure from absence and missed
+  # vendor locations (/usr/lib/systemd/system), silently dropping a
+  # confirmed occupant from the migration. Search every standard unit dir
+  # (distinguishing absent/undeterminable); if the config of an identified
+  # occupant cannot be obtained at all, REFUSE the preflight.
+  if [ -n "\${reg_unit:-}" ] && [ "\$reg_unit" != "ak-registry-server.service" ]; then
+    reg_unit_file=""
+    for ud in /etc/systemd/system /run/systemd/system /run/systemd/transient /usr/lib/systemd/system /lib/systemd/system; do
+      us=\$(priv_exists "\$ud/\$reg_unit") \\
+        || { echo "ERROR: cannot determine whether \$ud/\$reg_unit exists; refusing before any switchover (K2-R3)" >&2; exit 3; }
+      if [ "\$us" = yes ]; then reg_unit_file="\$ud/\$reg_unit"; break; fi
+    done
+    if [ -n "\$reg_unit_file" ]; then
+      echo "  old-registry-unit: \$reg_unit"
+      sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "\$reg_unit_file"
+      sudo -n sed -n 's/^User=/  old-registry-User=/p' "\$reg_unit_file"
+    else
+      echo "ERROR: occupant unit \$reg_unit of port $REGISTRY_PORT/tcp was identified but its unit file cannot be located in any standard directory; refusing before any switchover (K2-R3)" >&2
+      exit 3
+    fi
   fi
 else
   echo "port $REGISTRY_PORT/tcp: free"
@@ -949,21 +1007,11 @@ sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 # K 复核 K2-R3: private identity dirs (root-owned key/db under a private
 # home) read as NONEXISTENT to the bare non-root '[ -e ]' probes, so the
 # identity/database state could silently read "none found".
-# K 复核 K2-R3 (round 4): an existence probe whose FAILURE is indistinguish-
-# able from "absent" is not a probe. priv_exists distinguishes exists /
-# absent / cannot-determine ('ls -d' rc + error text), and ANY cannot-
+# K 复核 K2-R3 (round 4/5): priv_exists (defined above, before the occupant
+# lookup) distinguishes exists / absent / cannot-determine, and ANY cannot-
 # determine answer for a candidate identity path fails the preflight BEFORE
-# a switchover — a blocked 'sudo ls' must never read as "no identity".
-priv_exists() { # path -> prints yes/no; rc 2 = cannot determine
-  local pe_out pe_rc
-  pe_rc=0
-  pe_out=\$(sudo -n ls -d "\$1" 2>&1) || pe_rc=\$?
-  if [ "\$pe_rc" = 0 ]; then echo yes; return 0; fi
-  case "\$pe_out" in
-    *"No such file or directory"*|*"cannot access"*) echo no; return 0 ;;
-    *) printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2; return 2 ;;
-  esac
-}
+# a switchover — a blocked or permission-denied probe must never read as
+# "no identity".
 home_list=\$(sudo -n ls -1 /home 2>/dev/null) \\
   || { echo "ERROR: cannot enumerate /home (sudo -n ls failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
 home_ak_dirs=\$(printf '%s\\n' "\$home_list" | sed 's|^|/home/|; s|\$|/.ak-sending|')
@@ -1163,7 +1211,13 @@ probe_unit() {
   fi
   PU_MSG=\$(sudo -n systemctl cat "\$1.service" 2>&1) || true
   case "\$PU_MSG" in
-    *"could not be found"*|*"not loaded"*|*"No such file"*) PU_EXISTS=absent ;;
+    # The standard diagnostics for a MISSING unit across systemd versions:
+    # v255 systemctl cat prints 'No files found for <name>.'
+    # (systemctl-util.c finish path for LoadState=not-found, trailing
+    # period included); older versions print 'Unit <name> could not be
+    # found.' / 'not loaded'. Anything else (D-Bus/connect/permission
+    # errors) stays UNKNOWN — never absent (K 复核 K3-N1 round 5).
+    *"could not be found"*|*"not loaded"*|*"No such file"*|*"No files found for"*) PU_EXISTS=absent ;;
     *) PU_EXISTS=unknown ;;
   esac
 }
@@ -1196,9 +1250,23 @@ for u in \$SW_UNITS; do
     echo "ERROR: cannot determine the current state of \$u.service (systemctl cat unusable); refusing BEFORE service switchover (K2-N1)" >&2
     exit 5
   fi
-  if [ "\$PU_EXISTS" = exists ] && { [ -z "\$PU_EN" ] || [ -z "\$PU_AC" ]; }; then
-    echo "ERROR: cannot determine the enabled/active state of \$u.service (is-enabled='\$PU_EN' is-active='\$PU_AC'); refusing BEFORE service switchover (K2-N1)" >&2
-    exit 5
+  if [ "\$PU_EXISTS" = exists ]; then
+    # K 复核 K2-N1 (round 5): an unsupported/undeterminable STATE VALUE must
+    # also refuse BEFORE the switchover — round 4 only refused empty output,
+    # so a non-empty 'unknown' was recorded and the switch proceeded with an
+    # unrecoverable state.
+    case "\$PU_EN" in
+      enabled|disabled) : ;;
+      *)
+        echo "ERROR: unsupported/undeterminable enable-state '\$PU_EN' for \$u.service; refusing BEFORE service switchover (K2-N1)" >&2
+        exit 5 ;;
+    esac
+    case "\$PU_AC" in
+      active|inactive|failed) : ;;
+      *)
+        echo "ERROR: unsupported/undeterminable run-state '\$PU_AC' for \$u.service; refusing BEFORE service switchover (K2-N1)" >&2
+        exit 5 ;;
+    esac
   fi
   sw_state="\$sw_state\$u:\$PU_EXISTS:\$PU_EN:\$PU_AC;"
 done
@@ -1252,15 +1320,39 @@ recover_services() {
     fi
   done
   sudo -n systemctl daemon-reload 2>/dev/null || rc=1
+  # qstate <unit>: 0 = active-ish, 1 = inactive-ish, 2 = CANNOT DETERMINE.
+  # K 复核 K2-N1 (round 5): a FAILED is-active query (no stdout, non-zero)
+  # must never be treated as "inactive" — round 4's if/else skipped the stop
+  # for a failed query and left the NEW process running under a RECOVERY OK
+  # banner. Failed queries are handled conservatively below and the FINAL
+  # state is re-confirmed; anything unconfirmable reports INCOMPLETE.
+  qstate() {
+    local qs
+    # Keep the output even on non-zero rc — 'inactive' arrives with rc 3 and
+    # must never be blanked into "cannot determine" (the same clobber bug
+    # the review found in the capture path).
+    qs=\$(sudo -n systemctl is-active "\$1.service" 2>/dev/null) || true
+    case "\$qs" in
+      active|activating|reloading) return 0 ;;
+      inactive|failed|deactivating) return 1 ;;
+      *) return 2 ;;
+    esac
+  }
   for entry in \${sw_state//;/ }; do
     u=\${entry%%:*}; rest=\${entry#*:}; ex=\${rest%%:*}; rest=\${rest#*:}
     en=\${rest%%:*}; ac=\${rest##*:}
     if [ "\$ex" = absent ]; then
       # The unit did not exist before the switch: undo whatever enable/start
-      # this switch performed (probing first — stopping an absent unit is
-      # itself an error on some systemd versions).
-      if sudo -n systemctl is-active "\$u.service" >/dev/null 2>&1; then
+      # this switch performed. Active OR undeterminable -> conservatively
+      # stop, then CONFIRM the unit ended inactive.
+      qstate "\$u"; st=\$?
+      if [ "\$st" != 1 ]; then
         sudo -n systemctl stop "\$u.service" 2>/dev/null || rc=1
+        qstate "\$u"; st2=\$?
+        if [ "\$st2" != 1 ]; then
+          echo "[install] recovery cannot confirm \$u.service ended inactive (query state=\$st2); treating as incomplete" >&2
+          rc=1
+        fi
       fi
       if [ "\$(sudo -n systemctl is-enabled "\$u.service" 2>/dev/null || true)" = enabled ]; then
         sudo -n systemctl disable "\$u.service" >/dev/null 2>&1 || rc=1
@@ -1277,11 +1369,15 @@ recover_services() {
     case "\$ac" in
       active)
         # (a) restart-if-active: 'start' on the still-active NEW process is
-        # a no-op; only 'restart' picks up the restored files.
-        if sudo -n systemctl is-active "\$u.service" >/dev/null 2>&1; then
-          sudo -n systemctl restart "\$u.service" 2>/dev/null || rc=1
-        else
+        # a no-op; only 'restart' picks up the restored files. A FAILED
+        # state query also takes the restart path (restart is correct for
+        # both active and inactive units); the image verification below is
+        # the confirmation.
+        qstate "\$u"; st=\$?
+        if [ "\$st" = 1 ]; then
           sudo -n systemctl start "\$u.service" 2>/dev/null || rc=1
+        else
+          sudo -n systemctl restart "\$u.service" 2>/dev/null || rc=1
         fi
         # Verify the running image of what recovery just (re)started.
         pid=\$(systemctl show -p MainPID --value "\$u.service" 2>/dev/null) || pid=""
@@ -1293,9 +1389,16 @@ recover_services() {
         fi
         ;;
       inactive|failed)
-        # (b) the unit was NOT running before: undo any start of it.
-        if sudo -n systemctl is-active "\$u.service" >/dev/null 2>&1; then
+        # (b) the unit was NOT running before: undo any start of it. Active
+        # OR undeterminable -> conservatively stop, then CONFIRM inactive.
+        qstate "\$u"; st=\$?
+        if [ "\$st" != 1 ]; then
           sudo -n systemctl stop "\$u.service" 2>/dev/null || rc=1
+          qstate "\$u"; st2=\$?
+          if [ "\$st2" != 1 ]; then
+            echo "ERROR: recovery cannot confirm \$u.service was stopped (query state=\$st2); treating as incomplete" >&2
+            rc=1
+          fi
         fi
         ;;
       *)

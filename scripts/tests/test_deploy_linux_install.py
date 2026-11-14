@@ -134,9 +134,9 @@ exit 0
 #   CURRENT unit file, so restarts after file restores pick up restored
 #   content). 'start' on an active unit is a NO-OP, exactly like systemd.
 # Whole-command failures (SYSTEMCTL_FAIL_MATCH [+ _ONCE]) fire BEFORE side
-# effects; per-unit partial failures (SYSTEMCTL_FAIL_UNIT +
-# SYSTEMCTL_FAIL_OPS, e.g. "enable-now stop") fire mid-command so a later
-# unit can fail after earlier units already started.
+# effects; per-unit partial failures (SYSTEMCTL_FAIL_SPEC entries
+# "unit:op[:afterN]") fire mid-command so a later unit can fail after
+# earlier units already started, and later calls can fail after the probes.
 SYSTEMCTL_STUB = r"""#!/usr/bin/env bash
 set -u
 printf 'systemctl %s\n' "$*" >> "$PROBE_DIR/stubs.log"
@@ -161,10 +161,26 @@ if [ -n "${SYSTEMCTL_FAIL_MATCH:-}" ]; then
       ;;
   esac
 fi
-fails_unit() { # op unit -> 0/1: per-unit injection targets this op+unit?
-  [ -z "${SYSTEMCTL_FAIL_UNIT:-}" ] && return 1
-  [ "$2" != "$SYSTEMCTL_FAIL_UNIT" ] && return 1
-  case " ${SYSTEMCTL_FAIL_OPS:-} " in *" $1 "*) return 0 ;; esac
+# Per-unit partial failures: SYSTEMCTL_FAIL_SPEC is a ';'-separated list of
+# unit:op[:afterN] entries (no spaces). afterN (default 0) lets the first N
+# matching calls succeed (e.g. capture + stop probes) and fails every later
+# one (e.g. recovery-phase queries) — multiple entries can combine, e.g.
+# "ak-stun-server.service:enable-now;ak-registry-server.service:is-active:2".
+fails_spec() { # op unit -> 0/1: an injection entry targets this op+unit now?
+  [ -z "${SYSTEMCTL_FAIL_SPEC:-}" ] && return 1
+  for spec in ${SYSTEMCTL_FAIL_SPEC//;/ }; do
+    fu=${spec%%:*}
+    rest=${spec#*:}
+    fop=${rest%%:*}
+    fafter=0
+    case "$rest" in *:*) fafter=${rest#*:} ;; esac
+    [ "$fu" != "$2" ] && continue
+    [ "$fop" != "$1" ] && continue
+    cf="$ST.failcnt.$1.$2"
+    n=$(cat "$cf" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$cf"
+    [ "$n" -ge "$fafter" ] && return 0
+  done
   return 1
 }
 read_execstart() { # unit -> executable from the CURRENT unit file
@@ -186,7 +202,11 @@ u="${!#}"
 case "$1" in
   cat)
     if [ -f "$UNITDIR/$u" ]; then exit 0; fi
-    echo "Unit $u could not be found." >&2
+    # Default: systemd v255's standard missing-unit diagnostic (verified
+    # against upstream systemctl-util.c, LoadState=not-found finish path),
+    # trailing period included. SYSTEMCTL_CAT_MSG overrides the exact text
+    # for fixture variants (classic wording / undeterminable garbage).
+    echo "${SYSTEMCTL_CAT_MSG:-No files found for $u.}" >&2
     exit 1 ;;
   is-active)
     if [ -n "${SYSTEMCTL_IS_ACTIVE:-}" ]; then
@@ -194,12 +214,22 @@ case "$1" in
       [ "$SYSTEMCTL_IS_ACTIVE" = active ] && exit 0
       exit 3
     fi
+    if fails_spec is-active "$u"; then
+      # Query FAILURE: no stdout, non-zero — the round-5 reviewed shape.
+      echo "systemctl stub: forced query failure: is-active $u" >&2
+      exit 1
+    fi
     a=$(cat "$ST/$u.active" 2>/dev/null || true)
     [ -z "$a" ] && a=inactive
     echo "$a"
     [ "$a" = active ] && exit 0
     exit 3 ;;
   is-enabled)
+    if [ -n "${SYSTEMCTL_IS_ENABLED:-}" ]; then
+      echo "$SYSTEMCTL_IS_ENABLED"
+      [ "$SYSTEMCTL_IS_ENABLED" = enabled ] && exit 0
+      exit 1
+    fi
     if [ -f "$ST/$u.enabled" ] && grep -q 1 "$ST/$u.enabled" 2>/dev/null; then
       echo enabled; exit 0
     fi
@@ -221,7 +251,7 @@ case "$1" in
         fi ;;
     esac ;;
   start)
-    if fails_unit start "$u"; then
+    if fails_spec start "$u"; then
       echo "systemctl stub: forced per-unit failure: start $u" >&2
       exit 1
     fi
@@ -230,13 +260,13 @@ case "$1" in
     if is_unit_active "$u"; then exit 0; fi
     stub_start "$u" ;;
   restart)
-    if fails_unit restart "$u"; then
+    if fails_spec restart "$u"; then
       echo "systemctl stub: forced per-unit failure: restart $u" >&2
       exit 1
     fi
     stub_start "$u" ;;
   stop)
-    if fails_unit stop "$u"; then
+    if fails_spec stop "$u"; then
       echo "systemctl stub: forced per-unit failure: stop $u" >&2
       exit 1
     fi
@@ -257,7 +287,7 @@ case "$1" in
       case "$uu" in --*) continue ;; esac
       echo 1 > "$ST/$uu.enabled"
       if [ "$now" = 1 ]; then
-        if fails_unit enable-now "$uu"; then
+        if fails_spec enable-now "$uu"; then
           echo "systemctl stub: forced per-unit failure starting $uu (enabled, not started)" >&2
           exit 1
         fi
@@ -354,7 +384,7 @@ set -u
 args=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*) args+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) args+=("$PROBE_DIR$a") ;;
     *) args+=("$a") ;;
   esac
 done
@@ -369,7 +399,7 @@ for a in "$@"; do case "$a" in -*) ;; *) args+=("$a") ;; esac; done
 mapped=()
 for a in "${args[@]}"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*) mapped+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
     *) mapped+=("$a") ;;
   esac
 done
@@ -402,7 +432,7 @@ fi
 mapped=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*) mapped+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
     *) mapped+=("$a") ;;
   esac
 done
@@ -414,7 +444,7 @@ set -u
 mapped=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*) mapped+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
     *) mapped+=("$a") ;;
   esac
 done
@@ -458,6 +488,12 @@ if [ -n "${LS_FAIL_MATCH:-}" ]; then
       exit 1 ;;
   esac
 fi
+# Real GNU ls permission diagnostic (offline permission model): 'cannot
+# access' + 'Permission denied' — the exact shape round 4 misread as absent.
+if [ -n "${LS_PERMDENY_PATH:-}" ] && [ "${!#}" = "$LS_PERMDENY_PATH" ]; then
+  echo "ls: cannot access '$LS_PERMDENY_PATH': Permission denied" >&2
+  exit 2
+fi
 if [ "${1:-}" = "-1" ] && [ "$2" = "/home" ]; then
   # Model the home listing root would see (foreign users included).
   for e in ${LS_HOME_ENTRIES:-otheruser}; do printf '%s\n' "$e"; done
@@ -466,7 +502,7 @@ fi
 mapped=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*) mapped+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
     *) mapped+=("$a") ;;
   esac
 done
@@ -1074,7 +1110,7 @@ echo "C4=[$c4]"
         # RUNNING image ends on the OLD binary.
         rc, out = self.generate_and_run_p456(
             'make_upgrade_model\n'
-            'export SYSTEMCTL_FAIL_UNIT=ak-stun-server.service SYSTEMCTL_FAIL_OPS="enable-now"\n'
+            'export SYSTEMCTL_FAIL_SPEC=ak-stun-server.service:enable-now\n'
             'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=5", out)
@@ -1093,7 +1129,7 @@ echo "C4=[$c4]"
         # got enabled and STOP what got started.
         rc, out = self.generate_and_run_p456(
             'make_disabled_inactive_model\n'
-            'export SYSTEMCTL_FAIL_UNIT=ak-stun-server.service SYSTEMCTL_FAIL_OPS="enable-now"\n'
+            'export SYSTEMCTL_FAIL_SPEC=ak-stun-server.service:enable-now\n'
             'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=5", out)
@@ -1172,6 +1208,182 @@ echo "C4=[$c4]"
         for unit in ("ak-registry-server.service", "ak-stun-server.service"):
             self.assertEqual((etc / unit).read_text(encoding="utf-8"),
                              (backup / unit).read_text(encoding="utf-8"))
+
+    # -- K3-N1 (round 5): systemd v255's standard missing-unit diagnostic ----
+    def test_k3n1_v255_missing_unit_message_completes_fresh_install(self):
+        # The reviewer verified 'No files found for <name>.' (trailing
+        # period) against upstream systemd v255 systemctl-util.c; round 4's
+        # pattern set did not include it, so the real generated install
+        # refused to switch on a FRESH box. With the exact v255 fixture
+        # string the install must complete.
+        rc, out = self.generate_and_run_p456(
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "INSTALL_RC=$?"\n',
+            run_env={"SYSTEMCTL_CAT_MSG": "No files found for ak-registry-server.service."})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertEqual(p456_out.count("not present; nothing to stop (K3-N1)"), 2, p456_out)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_STUB, "the fresh install must complete")
+
+    def test_k3n1_undeterminable_cat_message_refuses_before_switchover(self):
+        # A cat diagnostic that is NOT a known missing-unit message (e.g. a
+        # D-Bus error) must stay UNKNOWN: refuse before anything is touched.
+        rc, out = self.generate_and_run_p456(
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "INSTALL_RC=$?"\n',
+            run_env={"SYSTEMCTL_CAT_MSG": "systemctl: D-Bus connection error (stub)"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=5", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("systemctl cat unusable", p456_out)
+        self.assertNotIn("not present; nothing to stop", p456_out)
+        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists(),
+                         "nothing may be installed when existence is undeterminable")
+        self.assertNotIn("systemctl stop", self.stubs_log())
+
+    # -- K2-N1 (round 5): a FAILED recovery query is never "inactive" ---------
+    def test_k2n1_recovery_query_failure_reports_incomplete_never_new_ok(self):
+        # The reviewer's exact scenario: both units disabled/inactive;
+        # capture and stop probes succeed; enable --now starts the NEW
+        # registry and STUN fails; ONLY the registry's recovery-phase
+        # is-active query fails (no stdout, non-zero — afterN=2 lets the
+        # capture + stop probes pass). Round 4 read the failed query as
+        # "inactive", skipped the stop and printed RECOVERY OK while the NEW
+        # process kept running. Now: conservative stop + CONFIRM, and an
+        # unconfirmable state reports RECOVERY INCOMPLETE — never NEW+OK.
+        rc, out = self.generate_and_run_p456(
+            'make_disabled_inactive_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+            run_env={"SYSTEMCTL_FAIL_SPEC":
+                     "ak-stun-server.service:enable-now;"
+                     "ak-registry-server.service:is-active:2"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("RECOVERY INCOMPLETE", p456_out)
+        self.assertNotIn("RECOVERY OK", p456_out,
+                         "a failed state query must never be reported as recovery success")
+        # The switch HAD started the registry on the NEW binary; the failed
+        # query must not leave it running: conservative stop + confirm.
+        self.assertEqual(self.unit_state("ak-registry-server.service", "active"), "inactive",
+                         "the conservatively-stopped registry must end inactive")
+        self.assertNotEqual(self.unit_running_bin("ak-registry-server.service"), AK_CLI_STUB,
+                            "the NEW image must not be left running")
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD)
+        self.assertEqual(self.unit_state("ak-registry-server.service", "enabled"), "0")
+
+    def test_k2n1_capture_rejects_unsupported_state_values(self):
+        # Round 4 only refused EMPTY capture outputs; a non-empty 'unknown'
+        # was recorded and the switch proceeded with an unrecoverable state.
+        for override, expected in (
+                ("SYSTEMCTL_IS_ENABLED", "enable-state"),
+                ("SYSTEMCTL_IS_ACTIVE", "run-state")):
+            with self.subTest(override=override):
+                rc, out = self.generate_and_run_p456(
+                    'make_upgrade_model\n'
+                    'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+                    run_env={override: "unknown"})
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=5", out)
+                p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+                self.assertIn(f"unsupported/undeterminable {expected}", p456_out)
+                self.assertNotIn("systemctl stop", self.stubs_log(),
+                                 "the refusal must happen BEFORE any stop")
+
+    # -- K2-R3 (round 5a): Permission denied is UNDETERMINABLE, never absent --
+    def test_k2r3_permission_denied_dir_probe_refuses(self):
+        # Real GNU ls diagnostic shape: 'cannot access ...: Permission
+        # denied' for the EXISTING private dir — round 4 matched 'cannot
+        # access' as absent and the deploy continued with none-found.
+        self.make_private_discovery_model()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'LS_PERMDENY_PATH="/home/otheruser/.ak-sending" bash "$PROBE_DIR/p1.sh" '
+            '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("cannot determine existence of /home/otheruser/.ak-sending", p1_out)
+        self.assertIn("Permission denied", p1_out)
+        self.assertNotIn("registry-data:", p1_out,
+                         "an existing identity must never read as none-found")
+
+    def test_k2r3_permission_denied_key_probe_refuses(self):
+        self.make_private_discovery_model()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'LS_PERMDENY_PATH="/home/otheruser/.ak-sending/registry.key" '
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("ERROR: cannot probe /home/otheruser/.ak-sending/registry.key", p1_out)
+        self.assertIn("Permission denied", p1_out)
+        self.assertNotIn("registry-data:", p1_out)
+
+    # -- K2-R3 (round 5b): identified occupant must reach the migration set ---
+    def test_k2r3_legacy_unit_in_vendor_dir_flows_into_migration_decision(self):
+        # The old unit lives under /usr/lib/systemd/system (vendor dir),
+        # not /etc/systemd/system: discovery must still find it, and the
+        # REAL decision block must bind it into the migration set.
+        self.make_private_discovery_model()
+        (self.probe / "etc" / "systemd" / "system" / "oldregistry.service").unlink()
+        vendor = self.probe / "usr" / "lib" / "systemd" / "system"
+        vendor.mkdir(parents=True, exist_ok=True)
+        (vendor / "oldregistry.service").write_text(
+            "[Unit]\nDescription=vendor-dir legacy registry\n\n[Service]\n"
+            "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
+            "--id-dir /home/otheruser/.ak-sending\n\n[Install]\nWantedBy=multi-user.target\n",
+            encoding="utf-8", newline="\n")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("port 17200/tcp: in use (pid 4242, unit oldregistry.service)", p1_out)
+        self.assertRegex(p1_out, r"(?m)^  old-registry-unit: oldregistry\.service$")
+        self.assertIn("  ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /home/otheruser/.ak-sending", p1_out)
+        # Full chain: the real decision block keeps the identified occupant.
+        block = self.decision_block(self.text, "the current script")
+        rc, out = self.run_decision(block, p1_out, "driver-decision-vendor.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("registry-port occupant unit: oldregistry", out)
+        self.assertIn("old registry unit 'oldregistry.service' will be stopped", out)
+
+    def test_k2r3_legacy_unit_config_probe_failure_refuses(self):
+        # The unit file exists but the privileged probe on it is denied:
+        # undeterminable -> refusal; the occupant stays identified in the
+        # output (never silently dropped from the migration set).
+        self.make_private_discovery_model()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'LS_PERMDENY_PATH="/etc/systemd/system/oldregistry.service" '
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("port 17200/tcp: in use (pid 4242, unit oldregistry.service)", p1_out)
+        self.assertIn("ERROR: cannot determine whether /etc/systemd/system/oldregistry.service "
+                      "exists", p1_out)
+        self.assertNotIn("old-registry-unit:", p1_out)
+
+    def test_k2r3_identified_occupant_without_unit_file_refuses(self):
+        # cgroup identifies oldregistry.service but NO standard dir holds its
+        # file: the migration target cannot be bound -> refusal (fail-closed),
+        # never a silent empty migration set.
+        self.make_private_discovery_model()
+        (self.probe / "etc" / "systemd" / "system" / "oldregistry.service").unlink()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("port 17200/tcp: in use (pid 4242, unit oldregistry.service)", p1_out)
+        self.assertIn("was identified but its unit file cannot be located", p1_out)
 
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
@@ -1286,7 +1498,7 @@ echo "C4=[$c4]"
         self.assertIn("sudo -n ss -lunp", log)
         self.assertIn("sudo -n cat /proc/4242/cgroup", log)
         self.assertIn("sudo -n ls -1 /home", log)
-        self.assertIn("sudo -n ls -d /home/otheruser/.ak-sending/registry.key", log)
+        self.assertIn("sudo -n env LC_ALL=C ls -d /home/otheruser/.ak-sending/registry.key", log)
         n_ss = len([l for l in log.splitlines() if l.startswith("ss ")])
         n_sudo_ss = len([l for l in log.splitlines() if l.startswith("sudo -n ss ")])
         self.assertEqual(n_ss, n_sudo_ss,
@@ -1486,8 +1698,12 @@ class BaselineContrastTests(ProbeHarness):
                          "the round-3 candidate never reached the install step")
 
     def test_k3n1_round2_candidate_completes_the_same_fresh_install(self):
+        # Under the EXACT systemd v255 missing-unit diagnostic the reviewer
+        # verified, the round-2 candidate still completes (its stop failures
+        # were swallowed) while the round-3/4 candidates aborted.
         rc, out, _ = self.run_baseline_p456(
-            PREV3_REV, self.P456_ENV_PREBUILT, "p456prev3")
+            PREV3_REV, self.P456_ENV_PREBUILT, "p456prev3",
+            run_env={"SYSTEMCTL_CAT_MSG": "No files found for ak-registry-server.service."})
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out,
                       "the round-2 candidate completed the same fresh fixture (reviewer anchor)")
@@ -1497,8 +1713,7 @@ class BaselineContrastTests(ProbeHarness):
     def test_k2n1_round3_partial_start_keeps_new_binary_running(self):
         rc, out, p456_out = self.run_baseline_p456(
             PREV_REV, self.P456_ENV_PREBUILT, "p456prev",
-            run_env={"SYSTEMCTL_FAIL_UNIT": "ak-stun-server.service",
-                     "SYSTEMCTL_FAIL_OPS": "enable-now"},
+            run_env={"SYSTEMCTL_FAIL_SPEC": "ak-stun-server.service:enable-now"},
             models="make_upgrade_model\n")
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=5", out)
@@ -1514,8 +1729,7 @@ class BaselineContrastTests(ProbeHarness):
     def test_k2n1_round3_disabled_inactive_not_restored(self):
         rc, out, p456_out = self.run_baseline_p456(
             PREV_REV, self.P456_ENV_PREBUILT, "p456prev",
-            run_env={"SYSTEMCTL_FAIL_UNIT": "ak-stun-server.service",
-                     "SYSTEMCTL_FAIL_OPS": "enable-now"},
+            run_env={"SYSTEMCTL_FAIL_SPEC": "ak-stun-server.service:enable-now"},
             models="make_disabled_inactive_model\n")
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=5", out)

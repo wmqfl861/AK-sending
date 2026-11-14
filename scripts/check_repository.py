@@ -78,9 +78,16 @@ COMMIT_PLACEHOLDER = "本提交"
 STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
-# Markdown links `[label](target)`; the capture stops at whitespace or a
-# closing paren, matching the repo-wide link walk in check().
-MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^\s)]+)\)")
+# Markdown inline links `[label](target)` with an optional CommonMark
+# title (`[label](target "title")`). The target capture stops at
+# whitespace or a closing paren. The pattern is matched over the WHOLE
+# document — `[^\]]*` labels legally span lines, and a per-line scan
+# silently skips multi-line labels (K4 review §1). Both the repo-wide
+# link walk in check() and the STATUS handoff gate use this one pattern,
+# so every supported link form is parsed consistently.
+MARKDOWN_LINK_RE = re.compile(
+    r"\[[^\]]*\]\(([^\s)]+)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)"
+)
 # Windows drive-letter targets (`C:\…`, `C:/…`) are absolute jumps, not
 # relative links, even though they contain no `://`.
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -281,6 +288,13 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
     are history: they must still resolve to existing local files, but they
     are not compared against the current handoff.
 
+    K4 (REVIEW_2026-11-15-batchK4.zh-CN.md §1): links are matched over the
+    WHOLE document — Markdown labels legally span lines, and the previous
+    per-line scan silently skipped a multi-line-label archive link. The
+    optional CommonMark link title is parsed consistently by every
+    MARKDOWN_LINK_RE consumer (handoff gate and repo-wide walk alike).
+    Each failing link is reported with its STARTING line number.
+
     Returns (canonical newest handoff path the CR-P3-20 checks must anchor
     to, errors). The run-number/contradiction gates always anchor to the
     canonical doc — with all current-batch links gated to it, the actual
@@ -308,54 +322,58 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
     saw_handoff_link = False
     saw_current_batch_link = False
     highest: tuple[tuple[str, str], str] | None = None
-    # Per-line matching so every error carries the STATUS line number of
-    # the offending link (labels do not span lines in this repository).
-    for lineno, line in enumerate(status_text.splitlines(), 1):
-        for link in MARKDOWN_LINK_RE.findall(line):
-            name = link.split("#", 1)[0].replace("\\", "/").split("/")[-1]
-            key = _handoff_sort_key(name)
-            if key is None:
-                continue
-            saw_handoff_link = True
-            if highest is None or key > highest[0]:
-                highest = (key, name)
-            if key == newest_key:
-                saw_current_batch_link = True
-            loc = f"{STATUS_DOC}:{lineno}"
-            resolved, kind = _resolve_status_link(root, link)
-            if kind == "external":
-                errors.append(
-                    f"{loc}: handoff link {link} is an external URL — handoff "
-                    f"links must resolve to local files under docs/ (current "
-                    f"handoff: docs/{newest.name})"
-                )
-                continue
-            if kind == "absolute":
-                errors.append(
-                    f"{loc}: handoff link {link} is an absolute path — link "
-                    f"handoffs relative to docs/ (current handoff: docs/{newest.name})"
-                )
-                continue
-            if kind == "escape":
-                errors.append(
-                    f"{loc}: handoff link {link} escapes docs/ — link handoffs "
-                    f"inside docs/ (current handoff: docs/{newest.name})"
-                )
-                continue
-            if not resolved.is_file():
-                errors.append(
-                    f"{loc}: handoff link {link} resolves to "
-                    f"{resolved.relative_to(root).as_posix()}, which does not "
-                    "exist as a file"
-                )
-                continue
-            if key == newest_key and resolved.resolve() != canonical:
-                errors.append(
-                    f"{loc}: handoff link {link} resolves to "
-                    f"{resolved.relative_to(root).as_posix()} but the current "
-                    f"handoff is docs/{newest.name} — every current-batch link "
-                    "must resolve to that exact file (update the STATUS link)"
-                )
+    # Whole-text matching (K4 review §1): finditer over the full document
+    # finds every link — including labels that legally span lines, which a
+    # per-line scan silently skipped. The line number for each error comes
+    # from the match's start offset, so a multi-line label is reported at
+    # its starting line.
+    for match in MARKDOWN_LINK_RE.finditer(status_text):
+        link = match.group(1)
+        lineno = status_text.count("\n", 0, match.start()) + 1
+        name = link.split("#", 1)[0].replace("\\", "/").split("/")[-1]
+        key = _handoff_sort_key(name)
+        if key is None:
+            continue
+        saw_handoff_link = True
+        if highest is None or key > highest[0]:
+            highest = (key, name)
+        if key == newest_key:
+            saw_current_batch_link = True
+        loc = f"{STATUS_DOC}:{lineno}"
+        resolved, kind = _resolve_status_link(root, link)
+        if kind == "external":
+            errors.append(
+                f"{loc}: handoff link {link} is an external URL — handoff "
+                f"links must resolve to local files under docs/ (current "
+                f"handoff: docs/{newest.name})"
+            )
+            continue
+        if kind == "absolute":
+            errors.append(
+                f"{loc}: handoff link {link} is an absolute path — link "
+                f"handoffs relative to docs/ (current handoff: docs/{newest.name})"
+            )
+            continue
+        if kind == "escape":
+            errors.append(
+                f"{loc}: handoff link {link} escapes docs/ — link handoffs "
+                f"inside docs/ (current handoff: docs/{newest.name})"
+            )
+            continue
+        if not resolved.is_file():
+            errors.append(
+                f"{loc}: handoff link {link} resolves to "
+                f"{resolved.relative_to(root).as_posix()}, which does not "
+                "exist as a file"
+            )
+            continue
+        if key == newest_key and resolved.resolve() != canonical:
+            errors.append(
+                f"{loc}: handoff link {link} resolves to "
+                f"{resolved.relative_to(root).as_posix()} but the current "
+                f"handoff is docs/{newest.name} — every current-batch link "
+                "must resolve to that exact file (update the STATUS link)"
+            )
     if not saw_handoff_link:
         return newest, errors + [
             f"{STATUS_DOC}: no HANDOFF-BATCH-*.zh-CN.md link found but handoff "

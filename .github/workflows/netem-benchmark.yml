@@ -1,13 +1,13 @@
 # G8 only. Do not fold this into CI/release-deep-tests or the NAT matrix.
-# A workflow that exists only on a dev branch cannot rely on workflow_dispatch
-# being available: GitHub requires its definition on the default branch. The
-# narrow push trigger bootstraps this job without changing main. Once a run
-# exists, an integrator can re-run that run for the SAME source revision.
+# 2026-11-14: the definition now lives on main (the repository keeps main
+# only; batch work happens on short-lived dev/** branches cut from main), so
+# workflow_dispatch is available; the narrow push trigger re-runs the
+# evidence when the benchmark's inputs change on main or a dev/** branch.
 name: G8 netem benchmark
 
 on:
   push:
-    branches: [dev/review-fixes-20261111]
+    branches: [main, "dev/**"]
     paths:
       - .github/workflows/netem-benchmark.yml
       - scripts/run_netem_benchmark.sh
@@ -28,7 +28,7 @@ permissions:
 jobs:
   netem-benchmark:
     name: Privileged Linux netem (loopback simulation, not real devices)
-    if: github.ref == 'refs/heads/dev/review-fixes-20261111'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev/')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:

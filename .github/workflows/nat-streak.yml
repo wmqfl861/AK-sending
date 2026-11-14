@@ -4,7 +4,9 @@ name: NAT streak (10 full rounds)
 
 on:
   push:
-    branches: [dev/review-fixes-20261111]
+    # 2026-11-14: the repository keeps main only; batch work happens on
+    # short-lived dev/** branches cut from main (see docs/STATUS.zh-CN.md).
+    branches: [main, "dev/**"]
     paths:
       - .github/workflows/nat-streak.yml
       - scripts/run_nat_streak.py
@@ -25,7 +27,7 @@ concurrency:
 jobs:
   nat-streak:
     name: Ten consecutive NAT matrices (simulation)
-    if: github.ref == 'refs/heads/dev/review-fixes-20261111'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev/')
     runs-on: ubuntu-latest
     # A full round includes the ~228s symmetric expected-failure case and the
     # >=40s decline retry. Bound each round at 15m (+30s kill grace); leave build

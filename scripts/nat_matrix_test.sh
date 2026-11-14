@@ -194,16 +194,99 @@ PIDS_REG="" PIDS_STUN="" PIDS_KIDS=""
 NS_A=akalice NS_B=akbob NS_R1=akr1 NS_R2=akr2 NS_CORE=akcore NS_SVC=aksvc
 NS_INET=akinet
 ALL_NS=("$NS_A" "$NS_B" "$NS_R1" "$NS_R2" "$NS_CORE" "$NS_SVC" "$NS_INET")
-cleanup() {
-  for pid in $PIDS_KIDS $PIDS_STUN $PIDS_REG; do
-    kill "$pid" 2>/dev/null || true
+OWNED_NS=()
+CLEANED_UP=0
+
+# Wait only after a tracked process has exited. In particular, never wait on
+# a pipeline whose untracked stdin feeder can keep the job alive indefinitely.
+stop_pids() {
+  local pid attempt remaining=""
+  for pid in "$@"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
   done
-  for ns in "${ALL_NS[@]}"; do
-    ip netns del "$ns" 2>/dev/null || true
+  for ((attempt=0; attempt<20; attempt++)); do
+    remaining=""
+    for pid in "$@"; do
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+      kill -0 "$pid" 2>/dev/null && remaining="$remaining $pid"
+    done
+    [[ -n "$remaining" ]] || break
+    sleep 0.1
   done
-  rm -rf "$WORK" 2>/dev/null || true
+  for pid in $remaining; do kill -KILL "$pid" 2>/dev/null || true; done
+  for ((attempt=0; attempt<20; attempt++)); do
+    remaining=""
+    for pid in "$@"; do
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+      kill -0 "$pid" 2>/dev/null && remaining="$remaining $pid"
+    done
+    [[ -n "$remaining" ]] || break
+    sleep 0.1
+  done
+  for pid in "$@"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
+  done
+  [[ -z "$remaining" ]]
 }
-trap cleanup EXIT INT TERM
+
+# Auxiliary workers launch external commands asynchronously so TERM interrupts
+# wait immediately. Only their own child jobs are reaped, never sibling jobs.
+finish_worker() {
+  local pid
+  trap - EXIT
+  trap '' INT TERM
+  local children
+  children="$(jobs -pr)"
+  for pid in $children; do kill -KILL "$pid" 2>/dev/null || true; done
+  for pid in $children; do wait "$pid" 2>/dev/null || true; done
+}
+
+worker_command() {
+  "$@" &
+  wait "$!"
+}
+
+stop_case_children() {
+  stop_pids $PIDS_KIDS || { log "FAIL: case child cleanup exceeded its bound"; return 1; }
+  PIDS_KIDS=""
+}
+
+delete_owned_ns() {
+  local ns="$1" owned found=0 pids
+  local keep=()
+  for owned in "${OWNED_NS[@]}"; do
+    [[ "$owned" != "$ns" ]] || found=1
+  done
+  [[ "$found" -eq 1 ]] || return 0
+  pids="$(ip netns pids "$ns")" || return 1
+  stop_pids $pids || return 1
+  pids="$(ip netns pids "$ns")" || return 1
+  [[ -z "$pids" ]] || return 1
+  ip netns del "$ns" || return 1
+  for owned in "${OWNED_NS[@]}"; do
+    [[ "$owned" == "$ns" ]] || keep+=("$owned")
+  done
+  OWNED_NS=("${keep[@]}")
+}
+
+cleanup() {
+  [[ "$CLEANED_UP" -eq 0 ]] || return 0
+  CLEANED_UP=1
+  local ns failed=0
+  stop_case_children || failed=1
+  stop_pids $PIDS_STUN $PIDS_REG || failed=1
+  PIDS_STUN="" PIDS_REG=""
+  for ns in "${OWNED_NS[@]}"; do
+    delete_owned_ns "$ns" || { log "FAIL: namespace cleanup failed for $ns"; failed=1; }
+  done
+  rm -rf "$WORK" 2>/dev/null || failed=1
+  return "$failed"
+}
+trap 'cleanup_rc=$?; trap - EXIT; trap "" INT TERM; cleanup || cleanup_rc=1; exit "$cleanup_rc"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # 3. Topology builders.
@@ -244,7 +327,11 @@ dump_conntrack() {
   done
 }
 
-make_ns() { ip netns add "$1" && ip -n "$1" link set lo up; }
+make_ns() {
+  ip netns add "$1" || return 1
+  OWNED_NS+=("$1")
+  ip -n "$1" link set lo up
+}
 
 link_ns() { # link_ns <ns-a> <if-a> <ns-b> <if-b>
   ip link add "$2" type veth peer name "$4"
@@ -268,9 +355,9 @@ wait_iface_gone() { # wait_iface_gone <ns> <iface> [budget-deciseconds]
 build_core() {
   # The core bridge, the "public internet" routed hop and the services
   # namespace live for the whole run.
-  make_ns "$NS_CORE"
-  make_ns "$NS_SVC"
-  make_ns "$NS_INET"
+  make_ns "$NS_CORE" || return 1
+  make_ns "$NS_SVC" || return 1
+  make_ns "$NS_INET" || return 1
   ip -n "$NS_CORE" link add akbr0 type bridge
   ip -n "$NS_CORE" link set akbr0 up
   link_ns "$NS_SVC" svc-to-c "$NS_CORE" c-to-svc
@@ -299,8 +386,9 @@ build_core() {
 #  the routers additionally get ip6tables FORWARD DROP in case_pass.
 build_case_topology() {
   local use_v6="$1"
+  stop_case_children || return 1
   for ns in "$NS_A" "$NS_B" "$NS_R1" "$NS_R2"; do
-    ip netns del "$ns" 2>/dev/null || true
+    delete_owned_ns "$ns" || return 1
   done
   # Wait for the asynchronous veth teardown (see wait_iface_gone): the
   # core/inet-side peers of the deleted routers' links must be gone
@@ -691,28 +779,31 @@ count_text() {
 #   * every wait is BOUNDED (300 s each): a dead receiver ends the feeder
 #     (its stdin then reads EOF and the CLI fail-closed declines) instead
 #     of leaking an infinite loop past the case.
-decline_first_feeder() { # decline_first_feeder <recv.log> — runs as a pipe stage
+decline_first_feeder() { # owns the consent pipe and its polling children
+  trap finish_worker EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   local log="$1" waited=0
   local bound=1500  # 300 s in 0.2 s polls
   while [[ "$(count_text "$log" 'accept? \[Y/n\]')" -lt 1 ]]; do
-    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+    worker_command sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
   done
-  sleep 0.6
+  worker_command sleep 0.6
   printf 'n\n'
   # The first decline must actually LAND (the receiver prints its
   # "offer declined; still listening" line) before the second wait
   # starts — the scenario needs a real first rejection, not a lost one.
   waited=0
   while ! grep -q 'offer declined' "$log" 2>/dev/null; do
-    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+    worker_command sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
   done
   waited=0
   while [[ "$(count_text "$log" 'accept? \[Y/n\]')" -lt 2 ]]; do
-    sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
+    worker_command sleep 0.2; waited=$((waited + 1)); [[ $waited -lt $bound ]] || exit 0
   done
-  sleep 0.6
+  worker_command sleep 0.6
   printf 'y\n'
-  yes
+  exec yes
 }
 
 # CR-P3-15 retry-evidence audit (integration review of batch J): parse
@@ -776,18 +867,23 @@ run_case() {
   # unquoted word-split by design: "VAR=VAL" or empty) rides ahead of the
   # namespace exec.
   run_receiver() { # stdin = the consent feed; env prefix word-splits by design
-    env $recv_env ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
+    exec env $recv_env ip netns exec "$NS_A" "$CLI" --id-dir "$case_dir/id-alice" task code-recv \
         --out "$case_dir/out" \
         --server "203.0.113.10:$REG_PORT" --registry-fp "$REG_FP" \
         --stun "203.0.113.10:$STUN_PORT" \
         >"$case_dir/recv.log" 2>&1
   }
+  local feed_fd feed_pid
   if [[ "$recv_feed" == "decline-first" ]]; then
-    decline_first_feeder "$case_dir/recv.log" | run_receiver &
+    exec {feed_fd}< <(decline_first_feeder "$case_dir/recv.log")
   else
-    yes | run_receiver &
+    exec {feed_fd}< <(exec yes)
   fi
+  feed_pid=$!
+  PIDS_KIDS="$PIDS_KIDS $feed_pid"
+  run_receiver <&"$feed_fd" &
   local recv_pid=$!
+  exec {feed_fd}<&-
   PIDS_KIDS="$PIDS_KIDS $recv_pid"
   wait_for_text "$case_dir/recv.log" "AKI1-" 120 \
     || { log "FAIL [$case_name]: receiver never printed a code"; return 1; }
@@ -809,16 +905,21 @@ run_case() {
   # post-mortem dump after a 240s case sees nothing. Sample both routers
   # every 5s while the sender runs; on failure fail_case shows the last
   # snapshot, on success the samples are discarded.
-  ( while kill -0 "$send_pid" 2>/dev/null; do
-      printf '=== %s
-' "$(date -u +%H:%M:%S)" >>"$case_dir/conntrack-live.log"
+  (
+    trap finish_worker EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while kill -0 "$send_pid" 2>/dev/null; do
+      printf '=== %(%H:%M:%S)T\n' -1 >>"$case_dir/conntrack-live.log"
       for ns in "$NS_R1" "$NS_R2"; do
-        printf -- '--- %s
-' "$ns" >>"$case_dir/conntrack-live.log"
-        ip netns exec "$ns" sh -c 'command -v conntrack >/dev/null 2>&1 && conntrack -L -p udp 2>/dev/null || grep -a "udp" /proc/net/nf_conntrack 2>/dev/null' >>"$case_dir/conntrack-live.log" 2>&1
+        printf -- '--- %s\n' "$ns" >>"$case_dir/conntrack-live.log"
+        worker_command ip netns exec "$ns" sh -c 'if command -v conntrack >/dev/null 2>&1; then exec conntrack -L -p udp 2>/dev/null; else exec grep -a "udp" /proc/net/nf_conntrack 2>/dev/null; fi' >>"$case_dir/conntrack-live.log" 2>&1
       done
-      sleep 5
-    done ) &
+      worker_command command sleep 5
+    done
+  ) &
+  local sampler_pid=$!
+  PIDS_KIDS="$PIDS_KIDS $sampler_pid"
 
   # Bounded wait for the sender to exit (fail cases legitimately take ~2
   # minutes of bounded retries; pass cases seconds; a hang is never OK).
@@ -827,8 +928,8 @@ run_case() {
     sleep 0.1; waited=$((waited + 1))
   done
   if kill -0 "$send_pid" 2>/dev/null; then
-    kill "$send_pid" 2>/dev/null
     log "FAIL [$case_name]: sender did not finish within 240s (hang — never acceptable)"
+    stop_case_children || true
     return 1
   fi
   wait "$send_pid"
@@ -843,12 +944,12 @@ run_case() {
     sleep 0.2; rwait=$((rwait + 1))
   done
   if kill -0 "$recv_pid" 2>/dev/null; then
-    kill "$recv_pid" 2>/dev/null
-    wait "$recv_pid" 2>/dev/null
+    stop_pids "$recv_pid" || { log "FAIL [$case_name]: receiver cleanup exceeded its bound"; return 1; }
     log "note [$case_name]: receiver teardown exceeded 30s and was killed (slow teardown or hang — not judged as a controlled exit)"
   else
     wait "$recv_pid" 2>/dev/null || true
   fi
+  stop_case_children || return 1
 
   local send_log="$case_dir/send.log" recv_log="$case_dir/recv.log"
   if [[ "$expect" == "pass-v4" || "$expect" == "pass-v6" ]]; then
@@ -955,7 +1056,13 @@ case_pass() { # case_pass <name> <desc> <r1-mode> <r2-mode> <v6:0|1> <expect> [s
   # mode claims before any product result counts.
   fixture_check "$NS_A" "$r1" || { log "FAIL [$name]: r1 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
   fixture_check "$NS_B" "$r2" || { log "FAIL [$name]: r2 fixture invalid"; dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
-  run_case "$name" "$expect" "$sender_env" "$recv_env" "$recv_feed" || { dump_conntrack; FAILURES=$((FAILURES + 1)); return; }
+  run_case "$name" "$expect" "$sender_env" "$recv_env" "$recv_feed" || {
+    stop_case_children || exit 1
+    dump_conntrack
+    FAILURES=$((FAILURES + 1))
+    return
+  }
+  stop_case_children || exit 1
 }
 
 build_core || { log "FAIL: core topology setup failed (kernel refusing namespaces/bridges?)"; exit 1; }

@@ -9,6 +9,8 @@ on:
       - .github/workflows/nat-streak.yml
       - scripts/run_nat_streak.py
       - scripts/tests/test_nat_streak.py
+      - scripts/nat_matrix_test.sh
+      - scripts/tests/test_nat_matrix_lifecycle.py
   workflow_dispatch:
 
 permissions:
@@ -44,6 +46,8 @@ jobs:
           key: nat-streak
       - name: Coordinator boundary tests (no real sudo or network)
         run: python -B -m unittest discover -s scripts/tests -p test_nat_streak.py -v
+      - name: Matrix process lifecycle tests (no real sudo or network)
+        run: python -B -m unittest discover -s scripts/tests -p test_nat_matrix_lifecycle.py -v
       - name: Matrix shell syntax
         run: bash -n scripts/nat_matrix_test.sh
       - name: Build once as runner user, then ten full matrices

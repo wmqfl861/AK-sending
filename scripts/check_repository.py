@@ -70,6 +70,11 @@ COMMIT_PLACEHOLDER = "本提交"
 # only the basename let STATUS link archive/<same-name> (or an external
 # URL with the same basename) while the checker validated the unlinked
 # docs/ copy.
+# K3 (REVIEW_2026-11-15-batchK3.zh-CN.md §1, 2026-11-15): EVERY
+# current-batch link is validated, not just a max()/first-picked one —
+# a canonical link early in STATUS must not mask archive/ or external
+# targets later on the page, and the CR-P3-20 gates always anchor to
+# the canonical newest handoff.
 STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
@@ -261,90 +266,110 @@ def _resolve_status_link(root: Path, link: str) -> tuple[Path | None, str | None
 
 
 def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, list[str]]:
-    """K-R6 + K2-R4: resolve the handoff STATUS links to and gate the link.
+    """K-R6 + K2-R4 + K3: resolve EVERY handoff link STATUS carries and gate it.
 
-    STATUS's 交接入口 section indexes the current handoff first and keeps
-    earlier batches as history links, so "the handoff STATUS links to" is
-    the newest batch-handoff link target anywhere on the page (non-batch
-    handoff docs like HANDOFF.zh-CN.md do not match HANDOFF_NAME_RE). Every
-    batch-handoff link must resolve, relative to STATUS's own directory
-    (docs/), to an existing local file; the newest such link must resolve
-    to EXACTLY the newest HANDOFF-BATCH-* file in docs/ (canonical path
-    comparison), otherwise the checker would validate a different document
-    than the one STATUS links (K2-R4: STATUS linking
-    archive/HANDOFF-BATCH-K-… or an external URL with the same basename
-    used to pass while the unlinked docs/ copy was checked).
+    STATUS indexes the current handoff from several sections (当前状态,
+    最新验证, 交接入口) and keeps earlier batches as history links, so the
+    page legitimately contains several HANDOFF-BATCH-* links. K3
+    (REVIEW_2026-11-15-batchK3.zh-CN.md §1): EVERY link naming the CURRENT
+    batch (same date+letter as the newest docs/HANDOFF-BATCH-* file) must
+    resolve — relative to STATUS's own directory (docs/), fragment
+    stripped, no absolute jumps or .. escapes — to EXACTLY that canonical
+    file. Selecting one candidate by max()/first-wins let a canonical link
+    early in STATUS mask archive/ or external links later on the page, so
+    the check result depended on link order. Links naming older batches
+    are history: they must still resolve to existing local files, but they
+    are not compared against the current handoff.
 
-    Returns (handoff path the CR-P3-20 checks must anchor to, errors).
-    Failure modes, all fail-closed:
+    Returns (canonical newest handoff path the CR-P3-20 checks must anchor
+    to, errors). The run-number/contradiction gates always anchor to the
+    canonical doc — with all current-batch links gated to it, the actual
+    entry point IS that file. Failure modes, all fail-closed:
     - no HANDOFF-BATCH-* file in docs/ at all (pre-K-R6 behavior kept);
-    - STATUS links no batch handoff while handoff files exist — the newest
-      handoff is unreachable from the status entry point; the newest file
-      is still returned so the run-number gate keeps running;
-    - a batch-handoff link that is an external URL (reported distinctly —
-      external URLs can never satisfy the current-handoff anchoring), an
-      absolute jump, a path escaping docs/, or a target that is not an
-      existing file;
-    - the newest valid link resolves to a different file than the newest
-      handoff (stale link, or same basename in another directory). The
-      LINKED file is returned so run numbers are validated against the
-      document STATUS actually references, never against an unlinked file.
+    - STATUS links no batch handoff while handoff files exist, or links
+      only older batches while a newer handoff file exists (stale entry
+      point) — the canonical file is still returned so the run-number
+      gate keeps running;
+    - any handoff link that is an external URL (reported distinctly —
+      external URLs can never satisfy the anchoring), an absolute jump, a
+      path escaping docs/, or a target that is not an existing file;
+    - any current-batch link resolving to a different file than the
+      canonical newest handoff (archive/ copy, renamed/moved file). Each
+      failing link is reported with its STATUS line number.
     """
     newest = latest_handoff(root)
     if newest is None:
         return None, [
             "no docs/HANDOFF-BATCH-*.zh-CN.md found for CR-P3-20 consistency checks"
         ]
+    canonical = newest.resolve()
+    newest_key = _handoff_sort_key(newest.name)
     errors: list[str] = []
-    candidates: list[tuple[tuple[str, str], Path]] = []
-    for link in MARKDOWN_LINK_RE.findall(status_text):
-        name = link.split("#", 1)[0].replace("\\", "/").split("/")[-1]
-        key = _handoff_sort_key(name)
-        if key is None:
-            continue
-        resolved, kind = _resolve_status_link(root, link)
-        if kind == "external":
-            errors.append(
-                f"{STATUS_DOC}: handoff link {link} is an external URL — the current "
-                f"handoff must be the local file docs/{newest.name}"
-            )
-            continue
-        if kind == "absolute":
-            errors.append(
-                f"{STATUS_DOC}: handoff link {link} is an absolute path — link the "
-                f"current handoff relative to docs/ as {newest.name}"
-            )
-            continue
-        if kind == "escape":
-            errors.append(
-                f"{STATUS_DOC}: handoff link {link} escapes docs/ — link the current "
-                f"handoff inside docs/ as {newest.name}"
-            )
-            continue
-        if not resolved.is_file():
-            errors.append(
-                f"{STATUS_DOC}: handoff link {link} resolves to "
-                f"{resolved.relative_to(root).as_posix()}, which does not exist "
-                "as a file"
-            )
-            continue
-        candidates.append((key, resolved))
-    if not candidates:
-        if not errors:
-            return newest, [
-                f"{STATUS_DOC}: no HANDOFF-BATCH-*.zh-CN.md link found but handoff "
-                f"files exist — link the current handoff {newest.name}"
-            ]
-        return None, errors
-    _, linked = max(candidates, key=lambda candidate: candidate[0])
-    if linked.resolve() != newest.resolve():
-        errors.append(
-            f"{STATUS_DOC}: handoff link resolves to "
-            f"{linked.relative_to(root).as_posix()} but the newest handoff is "
-            f"docs/{newest.name} — update the STATUS link to that exact file "
-            "(or move/remove the stale file)"
-        )
-    return linked, errors
+    saw_handoff_link = False
+    saw_current_batch_link = False
+    highest: tuple[tuple[str, str], str] | None = None
+    # Per-line matching so every error carries the STATUS line number of
+    # the offending link (labels do not span lines in this repository).
+    for lineno, line in enumerate(status_text.splitlines(), 1):
+        for link in MARKDOWN_LINK_RE.findall(line):
+            name = link.split("#", 1)[0].replace("\\", "/").split("/")[-1]
+            key = _handoff_sort_key(name)
+            if key is None:
+                continue
+            saw_handoff_link = True
+            if highest is None or key > highest[0]:
+                highest = (key, name)
+            if key == newest_key:
+                saw_current_batch_link = True
+            loc = f"{STATUS_DOC}:{lineno}"
+            resolved, kind = _resolve_status_link(root, link)
+            if kind == "external":
+                errors.append(
+                    f"{loc}: handoff link {link} is an external URL — handoff "
+                    f"links must resolve to local files under docs/ (current "
+                    f"handoff: docs/{newest.name})"
+                )
+                continue
+            if kind == "absolute":
+                errors.append(
+                    f"{loc}: handoff link {link} is an absolute path — link "
+                    f"handoffs relative to docs/ (current handoff: docs/{newest.name})"
+                )
+                continue
+            if kind == "escape":
+                errors.append(
+                    f"{loc}: handoff link {link} escapes docs/ — link handoffs "
+                    f"inside docs/ (current handoff: docs/{newest.name})"
+                )
+                continue
+            if not resolved.is_file():
+                errors.append(
+                    f"{loc}: handoff link {link} resolves to "
+                    f"{resolved.relative_to(root).as_posix()}, which does not "
+                    "exist as a file"
+                )
+                continue
+            if key == newest_key and resolved.resolve() != canonical:
+                errors.append(
+                    f"{loc}: handoff link {link} resolves to "
+                    f"{resolved.relative_to(root).as_posix()} but the current "
+                    f"handoff is docs/{newest.name} — every current-batch link "
+                    "must resolve to that exact file (update the STATUS link)"
+                )
+    if not saw_handoff_link:
+        return newest, errors + [
+            f"{STATUS_DOC}: no HANDOFF-BATCH-*.zh-CN.md link found but handoff "
+            f"files exist — link the current handoff {newest.name}"
+        ]
+    if not saw_current_batch_link:
+        # Stale entry point (K-R6): the accumulated per-link errors (a
+        # missing older-batch target, …) stay alongside this one.
+        return newest, errors + [
+            f"{STATUS_DOC}: links handoff up to {highest[1]} but the current "
+            f"handoff is docs/{newest.name} — update the STATUS link to that "
+            "exact file"
+        ]
+    return newest, errors
 
 
 def _section_body(text: str, heading: str) -> list[str] | None:
@@ -514,7 +539,10 @@ def check(root: Path) -> dict:
     # (REVIEW_2026-11-14-batchK.zh-CN.md §1): the link itself is gated too —
     # picking docs/'s newest HANDOFF-BATCH-* by filename silently validated
     # an unlinked handoff while STATUS still pointed at the previous batch.
-    # Fail closed when either document cannot be located or read.
+    # K3 (REVIEW_2026-11-15-batchK3.zh-CN.md §1): every current-batch link
+    # is gated to the canonical newest file, and the run/contradiction
+    # gates anchor to that canonical doc. Fail closed when either document
+    # cannot be located or read.
     latest_runs_checked = 0
     latest_handoff_name: str | None = None
     try:

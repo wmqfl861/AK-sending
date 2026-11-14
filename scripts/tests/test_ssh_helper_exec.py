@@ -367,8 +367,14 @@ class OldHelperFromGitTests(unittest.TestCase):
     The inline OLD_PATTERN_HELPER negative control above proves the harness
     can fail; these tests prove the OLD SHIPPED CODE itself fails the same
     way (exit 255, no output transferred) on both the delayed-output and the
-    empty-output scenarios, while the current helpers pass them. A missing
-    baseline skips the contrast (no fabricated old behavior)."""
+    empty-output scenarios, while the current helpers pass them.
+
+    Skip scope is EXACTLY an unreadable git revision (K3 review §2:
+    "missing markers do not universally skip"): when `git show` cannot
+    produce the baseline script the contrast is skipped rather than
+    fabricated, but a baseline that IS readable yet lacks the helper
+    heredoc markers fails extraction with an AssertionError — it is never
+    skipped."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="ak-ssh-old-helper-test-")

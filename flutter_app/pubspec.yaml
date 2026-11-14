@@ -66,6 +66,11 @@ dev_dependencies:
   integration_test:
     sdk: flutter
 
+  # K1 auxiliary walkthrough runner computes SHA-256 for synthetic-file
+  # verification (already a transitive dependency; declared here because
+  # `depend_on_referenced_packages` requires direct imports to be listed).
+  crypto: ^3.0.0
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your

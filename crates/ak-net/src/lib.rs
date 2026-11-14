@@ -1201,6 +1201,13 @@ pub mod holepunch {
     ///   LATER candidate does NOT end the round (the round's job is
     ///   ordering the dial list; the head confirming is the one outcome
     ///   where further observation cannot change the order's leader);
+    /// * the exit can never fire before this side has SENT at least one
+    ///   probe burst: the shared loop sends its first burst before it
+    ///   ever polls the socket, so a confirmation that was already
+    ///   buffered when the round started is consumed only after that
+    ///   burst went out (CR-P3-21, review 2026-11-14 §4) — a peer
+    ///   running a plain probe round in parallel is thus guaranteed to
+    ///   observe our probe before we bail;
     /// * with no confirmation the window still runs to its deadline —
     ///   callers that only learn reachability from the report keep the
     ///   full-window semantics verbatim.
@@ -1211,6 +1218,28 @@ pub mod holepunch {
         duration: Duration,
     ) -> io::Result<PunchReport> {
         probe_round(socket, candidates, interval, duration, true).await
+    }
+
+    /// One send burst: one probe datagram to every dialable candidate.
+    /// Used for the round's first beat (sent before the loop polls the
+    /// socket, CR-P3-21) and for every subsequent ticker beat. Returns
+    /// the fatal error, if any; transient per-candidate errors skip
+    /// just that candidate.
+    async fn send_burst(
+        socket: &tokio::net::UdpSocket,
+        packet: &[u8],
+        dialable: &[Dialable],
+        report: &mut PunchReport,
+    ) -> io::Result<()> {
+        for candidate in dialable {
+            match socket.send_to(packet, candidate.send).await {
+                Ok(_) => report.packets_sent += 1,
+                Err(e) if transient_udp_error(&e) => continue,
+                Err(e) if undialable_candidate(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// The one probe-loop body both public entry points share
@@ -1254,22 +1283,38 @@ pub mod holepunch {
                 }
             })
             .collect();
-        let mut send_ticker = tokio::time::interval(interval);
+        let mut send_ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         send_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buffer = [0u8; 1500];
         let mut report = PunchReport::default();
+        // CR-P3-21 (review 2026-11-14 §4): the FIRST beat is sent up
+        // front, before the loop ever polls the socket. Relying on the
+        // ticker's first tick was not enough: on tokio 1.54 the coarse
+        // time driver fires a fresh interval's first tick only at the
+        // next driver advance (~5 ms out, not at t=0), so with a peer
+        // probe already buffered the receive branch was ready first and
+        // could confirm the head candidate and break the early-exit
+        // round before this side had sent a single packet. Sending the
+        // first burst here makes "at least one probe round goes out
+        // before the early exit can return" structural; the
+        // `interval_at(now + interval, ..)` ticker below supplies every
+        // subsequent beat with no double burst.
+        send_burst(socket, &packet, &dialable, &mut report).await?;
         loop {
+            // `biased;` pins the poll order to the source order below —
+            // deadline, then send tick, then receive — so simultaneous
+            // readiness is always arbitrated send-first: window expiry
+            // wins all ties, and the send cadence is never postponed by
+            // packet pressure. The receive branch cannot be starved by
+            // the tick: a fired tick is not ready again until the next
+            // interval boundary, so buffered packets drain between
+            // beats.
             tokio::select! {
+                biased;
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = send_ticker.tick() => {
-                    for candidate in &dialable {
-                        match socket.send_to(&packet, candidate.send).await {
-                            Ok(_) => report.packets_sent += 1,
-                            Err(e) if transient_udp_error(&e) => continue,
-                            Err(e) if undialable_candidate(&e) => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    send_burst(socket, &packet, &dialable, &mut report).await?;
                 }
                 received = socket.recv_from(&mut buffer) => {
                     let (len, source) = match received {
@@ -3101,6 +3146,86 @@ mod tests {
             a_report.elapsed < Duration::from_millis(200),
             "the early exit did not return within the 200 ms acceptance bound: {:?}",
             a_report.elapsed
+        );
+    }
+
+    /// CR-P3-21 (review 2026-11-14 §4): the early-exit round never
+    /// returns on a confirmation alone — it must have SENT at least one
+    /// probe burst first. Deterministic reproduction of the race that
+    /// made `holepunch_probe_early_exit_returns_after_first_confirmation`
+    /// flaky: the peer's probe packet is already sitting in OUR socket
+    /// buffer when the round starts, which is exactly the state in
+    /// which the old round could act on the receive branch before its
+    /// first send (the ticker's first tick fires only at the timer
+    /// driver's next advance, so the buffered packet was ready first)
+    /// and break with `packets_sent == 0` — the peer's concurrent plain
+    /// round then never saw our probe. Pre-buffering here is a verified
+    /// precondition, not a timing assumption: the echo side is spawned
+    /// first and `peek_from` (which does not consume) resolves only
+    /// once one of its probe packets is actually queued; the round's
+    /// pre-loop first burst then guarantees our probe went out before
+    /// that buffered confirmation is processed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holepunch_probe_early_exit_still_sends_at_least_one_probe_when_confirmation_is_pre_buffered(
+    ) {
+        let a = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind a");
+        let b = tokio::net::UdpSocket::bind(loopback_addr())
+            .await
+            .expect("bind b");
+        let a_addr = a.local_addr().expect("addr a");
+        let b_addr = b.local_addr().expect("addr b");
+
+        // The echo responder, started FIRST: its plain round fires a
+        // burst at t≈0 and every 25 ms after. Wait until one of B's
+        // probe packets is verifiably queued in A's receive buffer —
+        // the pre-buffered confirmation the old unbiased select! could
+        // act on before ever sending.
+        let b_task = tokio::spawn(async move {
+            holepunch::probe(
+                &b,
+                &[a_addr],
+                Duration::from_millis(25),
+                Duration::from_millis(2000),
+            )
+            .await
+        });
+        let mut peek = [0u8; 1500];
+        let (peeked, from) = a.peek_from(&mut peek).await.expect("peer probe queued");
+        assert_eq!(from, b_addr, "unexpected peek source");
+        assert!(
+            holepunch::is_probe_packet(&peek[..peeked]),
+            "queued packet is not a probe: {peeked} bytes from {from}"
+        );
+
+        let window = Duration::from_millis(1500);
+        let a_report =
+            holepunch::probe_with_early_exit(&a, &[b_addr], Duration::from_millis(25), window)
+                .await
+                .expect("probe a");
+        b_task.abort();
+
+        // The pre-buffered confirmation did drive the early exit (well
+        // inside the window, 500 ms of scheduler-jitter slack) ...
+        assert!(
+            a_report.reachable.contains(&b_addr),
+            "B not reachable: {a_report:?}"
+        );
+        assert!(
+            a_report.packets_received > 0,
+            "A received no peer probes: {a_report:?}"
+        );
+        assert!(
+            a_report.elapsed + Duration::from_millis(500) < window,
+            "the early exit did not fire: {a_report:?}"
+        );
+        // ... and the round sent at least one full probe burst BEFORE
+        // returning — the CR-P3-21 guarantee (the old code randomly
+        // returned here with packets_sent == 0).
+        assert!(
+            a_report.packets_sent > 0,
+            "early exit returned before any probe was sent: {a_report:?}"
         );
     }
 

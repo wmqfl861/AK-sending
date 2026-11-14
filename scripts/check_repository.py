@@ -49,6 +49,29 @@ STATUS_ROW_PREFIXES = ("| CR-", "| R36", "| E", "| wave-36")
 STATUS_TABLE_COLUMNS = 5
 COMMIT_PLACEHOLDER = "本提交"
 
+# CR-P3-20 (REVIEW_2026-11-14-batchJ.zh-CN.md §4, 2026-11-14): each fact is
+# written in exactly one place — per-item status only in the section-7 table,
+# run numbers/counts only in the current batch handoff, STATUS only stage
+# conclusions plus a one-line-per-run "最新验证" index. Mechanical gates:
+#   a. every run id in STATUS's "最新验证" must also appear in the newest
+#      docs/HANDOFF-BATCH-*.zh-CN.md;
+#   b. that handoff must not claim 已核 while still carrying
+#      尚待/待补/仍待/待执行 placeholder wording.
+STATUS_DOC = "docs/STATUS.zh-CN.md"
+LATEST_VERIFICATION_HEADING = "## 最新验证"
+HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
+RUN_ID_RE = re.compile(r"\d{9,15}")  # GitHub Actions run ids (currently 11 digits)
+CONFIRMED_RE = re.compile(r"已核")  # also matches "一致性已核"
+PENDING_RE = re.compile(r"尚待|待补|仍待|待执行")
+# Quoted spans are excluded before matching (quoting someone, or instructions
+# like "write 'X' only after ..." are not claims). Unpaired quotes simply
+# stay on the line; the error message keeps line numbers and excerpts for
+# human review, so this stays a tripwire rather than a verdict.
+QUOTED_SPAN_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (r"“[^”]*”", r"「[^」]*」", r"『[^』]*』", r'"[^"]*"')
+)
+
 EXPECTED_ARCHITECTURE = {
     "schema_version": 1,
     "project": "AK-sending",
@@ -160,6 +183,108 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
     return rows, errors
 
 
+def latest_handoff(root: Path) -> Path | None:
+    """Newest docs/HANDOFF-BATCH-<letter>-<date>.zh-CN.md by (date, letter).
+
+    Batch letters within one date (e.g. G/H/J all 2026-11-13) break the tie
+    chronologically. Returns None when no handoff matches — callers fail
+    closed on that.
+    """
+    newest: tuple[tuple[str, str], Path] | None = None
+    for path in (root / "docs").glob("HANDOFF-BATCH-*.zh-CN.md"):
+        match = HANDOFF_NAME_RE.match(path.name)
+        if match is None:
+            continue
+        key = (match.group(2), match.group(1))
+        if newest is None or key > newest[0]:
+            newest = (key, path)
+    return None if newest is None else newest[1]
+
+
+def _section_body(text: str, heading: str) -> list[str] | None:
+    """Lines of the first `##` section whose title starts with `heading`."""
+    lines = text.splitlines()
+    start: int | None = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith(heading):
+            start = i
+        elif start is not None and line.startswith("## "):
+            end = i
+            break
+    if start is None:
+        return None
+    return lines[start + 1:end]
+
+
+def _excerpt(line: str, word: str, width: int = 24) -> str:
+    """Short excerpt of the original line around `word` for error messages."""
+    pos = line.find(word)
+    if pos < 0:
+        return line.strip()[:2 * width]
+    lo = max(0, pos - width)
+    hi = min(len(line), pos + len(word) + width)
+    return f"'{'…' if lo > 0 else ''}{line[lo:hi].strip()}{'…' if hi < len(line) else ''}'"
+
+
+def handoff_run_number_issues(
+    status_text: str, handoff_text: str, handoff_name: str
+) -> tuple[int, list[str]]:
+    """CR-P3-20 check a: STATUS "最新验证" run ids must exist in the handoff.
+
+    Run numbers and counts live only in the current batch handoff's evidence
+    tables (AGENTS.md "同一事实只写一处"), so every run id indexed by STATUS's
+    "最新验证" section must be findable in the newest HANDOFF-BATCH document.
+    Run ids are bare 9–15 digit runs, which covers both the ``[43439835214]``
+    and plain ``43439835214`` forms (and the digits inside run URLs, which
+    are the same number). Fails closed when the section is missing.
+    """
+    body = _section_body(status_text, LATEST_VERIFICATION_HEADING)
+    if body is None:
+        return 0, [f"{STATUS_DOC}: '{LATEST_VERIFICATION_HEADING[3:]}' section not found"]
+    run_ids = set(RUN_ID_RE.findall("\n".join(body)))
+    handoff_run_ids = set(RUN_ID_RE.findall(handoff_text))
+    errors = [
+        f"{STATUS_DOC}: run {run_id} listed in '{LATEST_VERIFICATION_HEADING[3:]}' "
+        f"but not found in latest handoff {handoff_name}"
+        for run_id in sorted(run_ids - handoff_run_ids)
+    ]
+    return len(run_ids), errors
+
+
+def handoff_contradiction_issues(handoff_text: str, handoff_name: str) -> list[str]:
+    """CR-P3-20 check b: newest handoff must not mix 已核 with pending words.
+
+    A direct (non-quoted) "已核"/"一致性已核" claim and a direct
+    尚待/待补/仍待/待执行 placeholder must not coexist in the same document —
+    that combination is exactly the fifth drift CR-P3-20 caught. Occurrences
+    inside quotes (quoting someone, or "only write X after ..." instructions)
+    are ignored. Errors carry line numbers plus original excerpts so a human
+    can confirm or waive them.
+    """
+    confirmed: list[str] = []
+    pending: list[str] = []
+    for lineno, line in enumerate(handoff_text.splitlines(), 1):
+        visible = line
+        for pattern in QUOTED_SPAN_PATTERNS:
+            visible = pattern.sub("", visible)
+        for match in CONFIRMED_RE.finditer(visible):
+            confirmed.append(f"{handoff_name}:{lineno}: {_excerpt(line, match.group(0))}")
+        for match in PENDING_RE.finditer(visible):
+            pending.append(f"{handoff_name}:{lineno}: {_excerpt(line, match.group(0))}")
+    if not (confirmed and pending):
+        return []
+    extra_confirmed = len(confirmed) - 3
+    extra_pending = len(pending) - 3
+    return [
+        f"{handoff_name}: '已核' claim coexists with pending wording "
+        "(尚待/待补/仍待/待执行) — 已核 at " + "; ".join(confirmed[:3])
+        + (f" (+{extra_confirmed} more)" if extra_confirmed > 0 else "")
+        + " — pending at " + "; ".join(pending[:3])
+        + (f" (+{extra_pending} more)" if extra_pending > 0 else "")
+    ]
+
+
 def check(root: Path) -> dict:
     errors: list[str] = []
     required = [
@@ -237,6 +362,30 @@ def check(root: Path) -> dict:
     except OSError as exc:
         status_rows, status_errors = 0, [f"cannot read {REVIEW_DOC}: {exc}"]
     errors.extend(status_errors)
+    # CR-P3-20: STATUS "最新验证" run ids must be traceable in the newest
+    # HANDOFF-BATCH doc, and that doc must not mix 已核 claims with
+    # 尚待/待补/仍待/待执行 placeholders. Fail closed when either document
+    # cannot be located or read.
+    latest_runs_checked = 0
+    latest_handoff_name: str | None = None
+    newest_handoff = latest_handoff(root)
+    if newest_handoff is None:
+        errors.append(
+            "no docs/HANDOFF-BATCH-*.zh-CN.md found for CR-P3-20 consistency checks"
+        )
+    else:
+        latest_handoff_name = f"docs/{newest_handoff.name}"
+        try:
+            status_text = (root / STATUS_DOC).read_text(encoding="utf-8")
+            handoff_text = newest_handoff.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"cannot read CR-P3-20 documents: {exc}")
+        else:
+            latest_runs_checked, run_errors = handoff_run_number_issues(
+                status_text, handoff_text, latest_handoff_name
+            )
+            errors.extend(run_errors)
+            errors.extend(handoff_contradiction_issues(handoff_text, latest_handoff_name))
     # Contract consistency vs the frozen docs/contracts (wave-24 advisory
     # add-on, Codex final review #1). Appended call only: any drift or crash
     # reported here is a WARNING, never a gate failure, so every check above
@@ -261,6 +410,8 @@ def check(root: Path) -> dict:
         "local_links_checked": checked_links,
         "rust_test_cases_present_not_executed": rust_tests,
         "review_status_table_rows_checked": status_rows,
+        "status_latest_verification_runs_checked": latest_runs_checked,
+        "latest_handoff_checked": latest_handoff_name,
         "banned_dependency_scan": "clean" if not violations else violations,
         "network_tests_executed": False,
         "contract_consistency_warning": contract_consistency,

@@ -167,5 +167,107 @@ class ReviewStatusTableTests(unittest.TestCase):
         self.assertIn("not found", errors[0])
 
 
+class HandoffConsistencyTests(unittest.TestCase):
+    """CR-P3-20: STATUS "最新验证" run ids vs the newest HANDOFF-BATCH doc.
+
+    Every test calls the real check functions on real (temporary) files or
+    the real text-parsing helpers — nothing is mocked.
+    """
+
+    HANDOFF = "docs/HANDOFF-BATCH-J-2026-11-13.zh-CN.md"
+
+    @staticmethod
+    def _status(latest_lines: str) -> str:
+        return (
+            "# 项目状态\n\n## 当前状态\n\n- 阶段结论与链接。\n\n"
+            "## 最新验证\n\n" + latest_lines + "\n\n## 交接入口\n\n- 链接。\n"
+        )
+
+    def _write(self, root: Path, name: str, text: str) -> None:
+        (root / "docs").mkdir(parents=True, exist_ok=True)
+        (root / "docs" / name).write_text(text, encoding="utf-8")
+
+    def test_latest_handoff_picks_newest_date_then_letter(self):
+        # Real temp files: newest date wins; within one date the later batch
+        # letter wins (G/H/J all 2026-11-13 → J).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "HANDOFF-BATCH-F-2026-11-12.zh-CN.md", "F")
+            self._write(root, "HANDOFF-BATCH-G-2026-11-13.zh-CN.md", "G")
+            self._write(root, "HANDOFF-BATCH-H-2026-11-13.zh-CN.md", "H")
+            self._write(root, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "J")
+            self.assertEqual(
+                checks.latest_handoff(root).name, "HANDOFF-BATCH-J-2026-11-13.zh-CN.md"
+            )
+
+    def test_missing_handoff_directory_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(checks.latest_handoff(Path(tmp)))
+
+    def test_status_runs_present_and_no_contradiction_pass(self):
+        status = self._status(
+            "- NAT 十轮：run [43439835214](https://github.com/o/r/actions/runs/43439835214)，"
+            "10/10 轮通过。\n- 普通 CI 43538159415 同 SHA 全绿。"
+        )
+        handoff = (
+            "# 交接文档：批次 J\n\n"
+            "## 3.1 run 表\n\n"
+            "- 43439835214：十轮全部通过。\n"
+            "- 43538159415：CI 全绿。\n"
+        )
+        runs_checked, errors = checks.handoff_run_number_issues(status, handoff, self.HANDOFF)
+        self.assertEqual((runs_checked, errors), (2, []))
+        self.assertEqual(checks.handoff_contradiction_issues(handoff, self.HANDOFF), [])
+
+    def test_status_run_missing_from_handoff_fails(self):
+        status = self._status("- main CI run [43558234099](https://github.com/o/r/actions/runs/43558234099) 全部成功。")
+        handoff = "# 交接文档：批次 J\n\n- §3.1 只有 43439835214。\n"
+        runs_checked, errors = checks.handoff_run_number_issues(status, handoff, self.HANDOFF)
+        self.assertEqual(runs_checked, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("43558234099", errors[0])
+        self.assertIn(self.HANDOFF, errors[0])
+        self.assertIn("最新验证", errors[0])
+
+    def test_status_without_latest_verification_section_fails_closed(self):
+        runs_checked, errors = checks.handoff_run_number_issues(
+            "# 项目状态\n\n## 当前状态\n\n- 结论。\n", "# 交接文档：批次 J\n", self.HANDOFF
+        )
+        self.assertEqual(runs_checked, 0)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("not found", errors[0])
+
+    def test_confirmed_claim_plus_pending_word_fails(self):
+        # The exact CR-P3-20 shape: §0 claims "一致性已核" while §4 still
+        # says evidence is 尚待补齐. Error must cite both line numbers and
+        # original excerpts for human review.
+        handoff = (
+            "# 交接文档：批次 J\n\n"
+            "- **J6 三者一致性已核**：STATUS → §7 → 本文逐行对照完成。\n"
+            "- 目前失败证据已开始回写，修复后 run 与对应提交尚待补齐。\n"
+        )
+        errors = checks.handoff_contradiction_issues(handoff, self.HANDOFF)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("已核", errors[0])
+        self.assertIn("尚待", errors[0])
+        self.assertIn(f"{self.HANDOFF}:3:", errors[0])
+        self.assertIn(f"{self.HANDOFF}:4:", errors[0])
+        self.assertIn("一致性已核", errors[0])
+        self.assertIn("尚待补齐", errors[0])
+
+    def test_quoted_occurrences_do_not_trip(self):
+        # Quoting speech or the "only write X later" instruction itself is
+        # not a claim: both keywords sit inside quotes → no violation.
+        handoff = (
+            "# 交接文档：批次 J\n\n"
+            "- 规则：核对完成后再写“三者一致性已核”，不提前宣称“尚待补齐”已解决。\n"
+        )
+        self.assertEqual(checks.handoff_contradiction_issues(handoff, self.HANDOFF), [])
+
+    def test_pending_word_alone_does_not_trip(self):
+        handoff = "# 交接文档：批次 J\n\n- §5：J1 视觉走查仍待执行。\n"
+        self.assertEqual(checks.handoff_contradiction_issues(handoff, self.HANDOFF), [])
+
+
 if __name__ == "__main__":
     unittest.main()

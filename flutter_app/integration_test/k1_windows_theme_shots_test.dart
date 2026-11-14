@@ -26,8 +26,16 @@
 // The consent prompt of the CLI is HELD until the awaiting-consent shot has
 // been taken (the CLI drops answers typed before its prompt read loop starts,
 // so consent is only written after the prompt was observed).
+//
+// K 复核 K-R4/K-R5: the transferring/verifying shots are counted PER STATE
+// (a round that samples neither, or only one, FAILS — the exported PNGs are
+// re-checked on disk too), and the local-endpoint guard validates the
+// EFFECTIVE endpoints (runtime environment over compiled defines — the
+// invite plane's precedence), handing the same verified values to the app
+// bootstrap and the CLI peer.
 import 'dart:convert' show utf8;
 import 'dart:io' show File, FileMode, IOSink, Platform, Process;
+import 'dart:typed_data' show Uint8List;
 import 'dart:ui' show ImageByteFormat;
 
 import 'package:flutter/material.dart'
@@ -47,6 +55,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
 import 'package:ak_sending_app/main.dart' as app;
+import 'package:ak_sending_app/services/connection_diagnostics.dart'
+    show ConnectionDiagnosticsLog;
 import 'package:ak_sending_app/ui/app.dart' show AkSendingApp;
 import 'package:ak_sending_app/ui/service/file_pick_gateway.dart'
     show FilePickGateway, PickedEntry;
@@ -64,10 +74,94 @@ const _shots = String.fromEnvironment('AK_K1_SHOTS');
 const _logPath = String.fromEnvironment('AK_K1_LOG');
 const _registryAddr = String.fromEnvironment('AK_REGISTRY_ADDR');
 const _stunAddr = String.fromEnvironment('AK_STUN_ADDR');
-// The registry pin rides the process environment, like the J1 runner.
-final _registryId = String.fromEnvironment('AK_REGISTRY_ID') != ''
-    ? String.fromEnvironment('AK_REGISTRY_ID')
-    : Platform.environment['AK_REGISTRY_ID'] ?? '';
+const _registryIdCompiled = String.fromEnvironment('AK_REGISTRY_ID');
+
+// ---------------------------------------------------------------------------
+// K 复核 K-R5 guard helpers (pure; the companion unit tests live in
+// test/k1_runner_guards_test.dart and import this file so they cannot
+// drift from the runner's own guard).
+// ---------------------------------------------------------------------------
+
+/// The same-machine endpoints this walkthrough may talk to (loopback
+/// only — anything else must fail the run).
+const k1ExpectedRegistryAddr = '127.0.0.1:17200';
+const k1ExpectedStunAddr = '127.0.0.1:17101';
+
+/// Runtime environment first, then the compiled `--dart-define` value —
+/// EXACTLY the invite plane's precedence (`FfiSimpleTransferService`'s
+/// `_envOrCompiled`: the trimmed runtime value wins when non-empty; an
+/// unset, empty or whitespace-only one falls through to the trimmed
+/// compiled value; both-empty is null). Keep in sync with the service's
+/// resolution — the runner's guard is only honest while this mirrors it.
+String? k1EnvOrCompiled(
+    Map<String, String> environment, String key, String compiled) {
+  final fromEnv = environment[key]?.trim();
+  if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+  final trimmed = compiled.trim();
+  return trimmed.isEmpty ? null : trimmed;
+}
+
+/// The endpoints the app under test will ACTUALLY dial (K 复核 K-R5):
+/// the per-key [k1EnvOrCompiled] results. A null [stunAddr] means the
+/// invite plane falls back to its PRODUCTION default inside the service
+/// — never a local value; null [registryAddr]/[registryIdHex] means
+/// `start()` would refuse to boot at all.
+final class K1EffectiveEndpoints {
+  const K1EffectiveEndpoints(
+      this.registryAddr, this.stunAddr, this.registryIdHex);
+
+  final String? registryAddr;
+  final String? stunAddr;
+  final String? registryIdHex;
+}
+
+/// Resolves [K1EffectiveEndpoints] from the same two tiers the app
+/// reads: the process environment and the compiled defines.
+K1EffectiveEndpoints k1ResolveEffectiveEndpoints(
+    {required Map<String, String> environment,
+    required String compiledRegistryAddr,
+    required String compiledStunAddr,
+    required String compiledRegistryId}) {
+  return K1EffectiveEndpoints(
+    k1EnvOrCompiled(environment, 'AK_REGISTRY_ADDR', compiledRegistryAddr),
+    k1EnvOrCompiled(environment, 'AK_STUN_ADDR', compiledStunAddr),
+    k1EnvOrCompiled(environment, 'AK_REGISTRY_ID', compiledRegistryId),
+  );
+}
+
+/// K 复核 K-R5 guard predicate: names every reason the EFFECTIVE
+/// endpoints are not the intended local ones (empty list = the run dials
+/// exactly the loopback registry/STUN with a 64-hex pin). The runner
+/// fails on ANY finding BEFORE the app boots or the CLI spawns —
+/// including the review's counterexample: a verified compiled local
+/// value silently shadowed by an inherited non-local runtime value.
+List<String> k1LocalEndpointFindings(K1EffectiveEndpoints effective) {
+  final findings = <String>[];
+  if (effective.registryAddr != k1ExpectedRegistryAddr) {
+    findings.add('AK_REGISTRY_ADDR 生效值=${effective.registryAddr ?? "(未配置)"}'
+        '，应为 $k1ExpectedRegistryAddr');
+  }
+  if (effective.stunAddr != k1ExpectedStunAddr) {
+    // null 时应用回退内置生产默认 STUN —— 同样不是本地值。
+    findings.add('AK_STUN_ADDR 生效值='
+        '${effective.stunAddr ?? "(未配置，应用回退生产默认)"}'
+        '，应为 $k1ExpectedStunAddr');
+  }
+  final pin = effective.registryIdHex;
+  if (pin == null || pin.length != 64) {
+    findings.add('AK_REGISTRY_ID 生效钉扎长度=${pin?.length ?? 0}，应为 64');
+  }
+  return findings;
+}
+
+/// The effective endpoints of THIS process (runtime env over the
+/// compiled defines): what the guard asserts, what the app bootstrap is
+/// handed and what the CLI peer dials — one resolution, three uses.
+final _effective = k1ResolveEffectiveEndpoints(
+    environment: Platform.environment,
+    compiledRegistryAddr: _registryAddr,
+    compiledStunAddr: _stunAddr,
+    compiledRegistryId: _registryIdCompiled);
 
 IOSink? _evidenceSink;
 
@@ -162,6 +256,71 @@ Future<void> _shot(WidgetTester tester, String name) async {
   _log('SHOT|$name|bytes=${data.lengthInBytes}|path-outside-repo');
 }
 
+/// K 复核 K-R4: per-state export bookkeeping for the two SAMPLED shots
+/// (transferring/verifying). The pre-fix single flag was INITIALIZED to
+/// false and reset after the verifying shot, so a sampling pass that
+/// skipped both states and jumped straight to the result card still
+/// satisfied the final `expect(flag, isFalse)` while the run claimed a
+/// complete shot set. These counters only ever move UP on a real
+/// export, so there is no reset path back to "nothing captured";
+/// [missingStates] names whatever was not captured and the runner fails
+/// on ANY missing state.
+class K1ShotCoverage {
+  int _transferringShots = 0;
+  int _verifyingShots = 0;
+
+  /// Exported transferring shots so far (>= 1 required for the round).
+  int get transferringShots => _transferringShots;
+
+  /// Exported verifying shots so far (>= 1 required for the round).
+  int get verifyingShots => _verifyingShots;
+
+  /// Whether the transferring percent+rate state was captured at least
+  /// once (also the sampling loop's once-only latch).
+  bool get hasTransferring => _transferringShots > 0;
+
+  /// Whether the verifying state was captured at least once.
+  bool get hasVerifying => _verifyingShots > 0;
+
+  /// Count one exported `win-<theme>-02-transferring` shot.
+  void recordTransferringShot() => _transferringShots++;
+
+  /// Count one exported `win-<theme>-03-verifying` shot.
+  void recordVerifyingShot() => _verifyingShots++;
+
+  /// The sampled states with ZERO exports (empty iff both captured) —
+  /// the message names exactly what the round is missing.
+  List<String> missingStates() => [
+        if (!hasTransferring) 'transferring',
+        if (!hasVerifying) 'verifying',
+      ];
+
+  /// True iff [missingStates] is empty — what the runner asserts on
+  /// BEFORE the run may claim a complete shot set.
+  bool get isComplete => missingStates().isEmpty;
+}
+
+/// K 复核 K-R4「并检查目标文件」: the coverage counters prove the two
+/// SAMPLED states were reached; this re-checks the actual PNGs on disk
+/// (the exported set lives in AK_K1_SHOTS outside the repository) before
+/// the run may claim the complete six-shot set — including the two
+/// conditional shots, so an export that never landed fails HERE.
+void _requireRoundShotFiles(String mode) {
+  const names = [
+    '01-awaiting-consent',
+    '02-transferring',
+    '03-verifying',
+    '04-completed',
+    '05-failed',
+    '06-recent-transfers',
+  ];
+  for (final name in names) {
+    final file = File('$_shots/win-$mode-$name.png');
+    expect(file.existsSync() && file.lengthSync() > 0, isTrue,
+        reason: 'K 复核 K-R4: 截图文件缺失或为空 win-$mode-$name.png');
+  }
+}
+
 /// CLI receiver whose consent is held until [consent] is called; the stdout
 /// listener flags the moment the `[Y/n]` prompt actually appeared (answers
 /// that arrive before the prompt's read loop are dropped by the CLI).
@@ -186,12 +345,15 @@ class _HeldCli {
 }
 
 Future<_HeldCli> _spawnHeldCli(String code, String outDir) async {
+  // K 复核 K-R5: the CLI peer dials the SAME verified EFFECTIVE
+  // endpoints the app bootstrap was handed — never the raw compiled
+  // defines, which an inherited runtime variable could have overridden.
   final full = <String>[
     '--id-dir', '$_work/cli-id-$outDir',
     'task', 'join-recv', code, '--out', '$_work/$outDir',
-    '--server', _registryAddr,
-    '--registry-fp', _registryId,
-    '--stun', _stunAddr,
+    '--server', _effective.registryAddr!,
+    '--registry-fp', _effective.registryIdHex!,
+    '--stun', _effective.stunAddr!,
   ];
   _log('cli> ak-cli task join-recv <code> --out $outDir');
   final p = await Process.start(_cliPath, full);
@@ -258,9 +420,15 @@ void main() {
   testWidgets('K1 windows theme shots ($_theme)', (tester) async {
     // Fail closed: never fall back to production endpoints.
     expect(_theme, anyOf('light', 'dark'), reason: 'AK_K1_THEME must be light or dark');
-    expect(_registryAddr, '127.0.0.1:17200', reason: 'local registry required');
-    expect(_stunAddr, '127.0.0.1:17101', reason: 'local stun required');
-    expect(_registryId.length, 64, reason: 'local registry pin required');
+    // K 复核 K-R5: guard the EFFECTIVE endpoints, not the compiled ones —
+    // the app reads the runtime environment BEFORE the compiled defines,
+    // so asserting the compiled locals alone let an inherited non-local
+    // runtime AK_REGISTRY_ADDR/AK_STUN_ADDR/AK_REGISTRY_ID silently
+    // redirect the app while the guard still passed. Any finding fails
+    // the run before the app boots or the CLI is spawned.
+    final findings = k1LocalEndpointFindings(_effective);
+    expect(findings, isEmpty,
+        reason: 'K 复核 K-R5: 生效端点非本地：${findings.join('；')}');
     expect(_work, isNotEmpty, reason: 'AK_K1_WORK required');
     expect(_shots, isNotEmpty, reason: 'AK_K1_SHOTS required');
     expect(Platform.environment['AK_DIAG_STAGE'] ?? '', isEmpty,
@@ -269,8 +437,49 @@ void main() {
       expect(Platform.environment[key], isNotEmpty, reason: '$key required');
     }
 
+    // K1R self-contained fixtures (2026-11-14 rerun finding): the picker
+    // hands the engine paths under AK_K1_WORK, but nothing guaranteed the
+    // files EXISTED — an externally pre-created fixture was silently
+    // assumed, and a wiped work dir turned every candidate's transfer
+    // into "storage error: path not found" while pairing/probing all
+    // stayed green. Create the deterministic synthetic files here so the
+    // run is reproducible from an empty work dir. No user data.
+    final synth = <String, int>{
+      'synthetic_k1_200mib.bin': 200 * 1024 * 1024,
+      'synthetic_k1_small.bin': 5 * 1024 * 1024,
+    };
+    final chunk = Uint8List(1024 * 1024);
+    for (var i = 0; i < chunk.length; i++) {
+      chunk[i] = (i * 31 + (i >> 8) * 17 + 11) & 255;
+    }
+    for (final entry in synth.entries) {
+      final f = File('$_work/${entry.key}');
+      if (!f.existsSync() || f.lengthSync() != entry.value) {
+        final sink = f.openWrite();
+        for (var written = 0;
+            written < entry.value;
+            written += chunk.length) {
+          sink.add(chunk);
+        }
+        await sink.flush();
+        await sink.close();
+        _log('SYNTH_CREATED|${entry.key}|${entry.value} bytes');
+      }
+    }
+
     final picker = K1Picker();
-    final bootstrap = app.bootstrapAppService();
+    // K 复核 K-R5「将同一份已验证配置传给应用和 CLI」: the verified
+    // effective values ride the bootstrap's environment seam (the invite
+    // plane's WINNING tier), so the app dials exactly what the guard
+    // above asserted — the CLI peer gets the same strings. Every other
+    // process variable (AK_FFI_DLL, AK_ID_DIR, …) passes through the
+    // copy unchanged, keeping the production bootstrap intact.
+    final verifiedEnvironment = Map<String, String>.of(Platform.environment)
+      ..['AK_REGISTRY_ADDR'] = _effective.registryAddr!
+      ..['AK_REGISTRY_ID'] = _effective.registryIdHex!
+      ..['AK_STUN_ADDR'] = _effective.stunAddr!;
+    final bootstrap =
+        app.bootstrapAppService(environment: () => verifiedEnvironment);
     _log('bootstrap: service=${bootstrap.service != null} '
         'error=${bootstrap.error ?? '-'}');
     expect(bootstrap.service, isNotNull,
@@ -307,44 +516,86 @@ void main() {
       await _openDetail(tester);
       await _pickAndSend(tester, picker);
 
+      // K1R diagnostics (2026-11-14 rerun): two light rounds timed out
+      // here with the CLI fully paired/probed but no app-side state ever
+      // visible; log every status-text change so the evidence shows where
+      // the app-side send actually went (connecting → … → failure).
+      var lastStatus = '';
+      var lastResult = '';
       final awaiting = await _waitFor(
           tester,
-          () => (_textOf(tester, const ValueKey('conn_send_progress_status')) ??
-                  '')
-              .contains('等待对方点「接受」'),
+          () {
+            final status = _textOf(
+                    tester, const ValueKey('conn_send_progress_status')) ??
+                '';
+            if (status != lastStatus) {
+              lastStatus = status;
+              _log('SEND_STATUS|$mode|status=$status');
+            }
+            final result =
+                _textOf(tester, const ValueKey('conn_send_result')) ?? '';
+            if (result != lastResult) {
+              lastResult = result;
+              _log('SEND_RESULT|$mode|$result');
+            }
+            final error =
+                _textOf(tester, const ValueKey('conn_send_error')) ?? '';
+            if (error.isNotEmpty && error != lastResult) {
+              _log('SEND_ERROR|$mode|$error');
+            }
+            return status.contains('等待对方点「接受」');
+          },
           // Same-machine multi-path hole punching occasionally needs far
           // longer than the first pairing (observed: light round connected
           // in ~9s, the next pairing was still exchanging probes at 60s).
           const Duration(seconds: 150));
+      // K1R diagnostics: the engine's own connect/probe/disconnect facts
+      // (recorded at event time) — names the disconnect/handshake reason
+      // when the wait above fails instead of leaving an empty status.
+      for (final line in ConnectionDiagnosticsLog.shared.lines) {
+        _log('DIAG|$mode|$line');
+      }
       expect(awaiting, isTrue, reason: 'awaiting-consent status never showed');
       await tester.pump(const Duration(milliseconds: 300));
       await _shot(tester, 'win-$mode-01-awaiting-consent');
       _log('STATE|$mode|awaiting-consent|${_textOf(tester, const ValueKey('conn_send_progress_status'))}');
       await cli.consent('y');
 
-      var verifyingShot = false;
+      final coverage = K1ShotCoverage();
       final transferDeadline = DateTime.now().add(const Duration(seconds: 240));
       while (DateTime.now().isBefore(transferDeadline)) {
         await tester.pump(const Duration(milliseconds: 120));
         final status =
             _textOf(tester, const ValueKey('conn_send_progress_status')) ?? '';
         final rate = _textOf(tester, const ValueKey('conn_send_progress_rate')) ?? '';
-        if (status.contains('%') && rate.isNotEmpty && !verifyingShot) {
+        if (status.contains('%') && rate.isNotEmpty && !coverage.hasTransferring) {
           // A percent line with a live average-speed line: the readability
           // state the J1 walkthrough could not capture.
           await _shot(tester, 'win-$mode-02-transferring');
           _log('STATE|$mode|transferring|$status|$rate');
-          verifyingShot = true; // reused flag: transferring shot taken
+          coverage.recordTransferringShot();
         }
-        if (status.contains('等待对方校验') && verifyingShot) {
+        if (status.contains('等待对方校验') && coverage.hasTransferring) {
           await _shot(tester, 'win-$mode-03-verifying');
           _log('STATE|$mode|verifying|$status');
-          verifyingShot = false;
+          coverage.recordVerifyingShot();
           break;
         }
         if (tester.any(find.byKey(const ValueKey('conn_send_result')))) break;
       }
-      expect(verifyingShot, isFalse, reason: 'verifying state not reached');
+      // K 复核 K-R4: the round is only complete when BOTH sampled states
+      // were actually captured. The pre-fix flag was initialized false and
+      // reset after the verifying shot, so a pass that sampled neither
+      // state (straight to the result card) used to satisfy a flag
+      // assertion here; the counters cannot reset, and any missing state
+      // is named and FAILS the run before it may claim the shot set.
+      final missingShots = coverage.missingStates();
+      expect(missingShots, isEmpty,
+          reason: 'K 复核 K-R4: 未采到状态：${missingShots.join('、')}'
+              '（transferring=${coverage.transferringShots}，'
+              'verifying=${coverage.verifyingShots}）');
+      _log('COVERAGE|$mode|transferring=${coverage.transferringShots}'
+          '|verifying=${coverage.verifyingShots}');
 
       final completed = await _waitFor(tester,
           () => tester.any(find.byKey(const ValueKey('conn_send_result'))),
@@ -402,6 +653,11 @@ void main() {
       expect(hist1, contains('完成'));
       await tester.pump(const Duration(milliseconds: 400));
       await _shot(tester, 'win-$mode-06-recent-transfers');
+      // K 复核 K-R4: the round's DONE claim below is only made after all
+      // six exported PNGs (the two sampled ones included) exist non-empty
+      // on disk — the counters prove the states were reached, this proves
+      // the files arrived.
+      _requireRoundShotFiles(mode);
       _log('ROUND_DONE|$mode');
     }
     tester.platformDispatcher.clearPlatformBrightnessTestValue();

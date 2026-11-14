@@ -64,14 +64,18 @@
 # What a full run does (each phase prints "[deploy] phase N/7"):
 #   1. preflight: SSH backend, sudo, arch/os, existing-install discovery
 #      (units, --id-dir, registry data, UDP <stun-port> occupant)
-#   2. upload: `git archive` tarball of <commit> (or --binary) to /tmp
+#   2. upload: `git archive` tarball of <commit> to /tmp; with --binary the
+#      prebuilt ak-cli goes to a DISTINCT /tmp staging path and must pass
+#      version + sha256 + executable checks BEFORE any service is stopped
+#      (K 复核 K-R1)
 #   3. build ON THE SERVER: apt build deps + rustup if missing +
 #      AK_GIT_SHA=<sha> cargo build --locked --release -p ak-cli;
 #      version line must contain "git <sha>" or the deploy aborts
 #   4. install: backup ak-cli + registry.key + registry.db to
 #      /opt/ak-sending/backup-<ts>/, install binary to /opt/ak-sending/ak-cli,
 #      system user `akreg`, data dir /opt/ak-sending/data (existing identity
-#      and database are preserved, never deleted)
+#      and database are preserved, never deleted); a failed binary switchover
+#      restarts the stopped services (best-effort) before aborting (K 复核 K-R1)
 #   5. systemd: ak-registry-server.service + ak-stun-server.service
 #      (templates from docs/OPERATIONS.zh-CN.md §0/§3); a legacy
 #      signal-server holding UDP <stun-port> is stopped+disabled with a
@@ -79,7 +83,9 @@
 #   6. firewall: ufw allow <registry-port>/tcp + <stun-port>/udp when ufw is
 #      active; otherwise prints the cloud security-group checklist
 #   7. verify: units active, journal version lines, listening sockets,
-#      --version recorded, registry id exported to /opt/ak-sending/registry-id
+#      --version recorded, the RUNNING units' live executable + revision must
+#      match the deployed artifact (K 复核 K-R2), registry id exported to
+#      /opt/ak-sending/registry-id
 #
 # Exit code 0 = success (or self-test PASS).
 
@@ -238,7 +244,9 @@ Usage:
   ssh_helper.py put  <host> <port> <user> <passfile> <local> <remote>
 Exit status = remote exit status (254 usage error, 255 connection failure).
 """
+import os
 import sys
+import time
 
 import paramiko
 
@@ -269,6 +277,55 @@ def connect(argv):
     return client
 
 
+def run_command(client, command):
+    """Execute `command` and drain BOTH streams (K 复核 K-R3).
+
+    exec_command(..., timeout=0) is NON-blocking in paramiko, so the previous
+    "timeout=0 then read immediately" flow raised TimeoutError whenever the
+    remote output (or EOF) had not arrived yet. This variant uses blocking
+    channel semantics (timeout=None) plus a recv_ready/recv_stderr_ready
+    polling loop, so delayed output, empty output and stderr-heavy commands
+    all complete. An idle budget (AK_SSH_IDLE_TIMEOUT seconds, default 1800;
+    reset on every progress) bounds the wait so a hung remote still fails.
+    Keep this function identical in the other script's embedded helper
+    (single source, verified by scripts/tests/test_ssh_helper_exec.py).
+    """
+    _, stdout, stderr = client.exec_command(command, timeout=None)
+    channel = stdout.channel
+    out = bytearray()
+    err = bytearray()
+    idle_budget = float(os.environ.get("AK_SSH_IDLE_TIMEOUT", "1800"))
+    deadline = time.monotonic() + idle_budget
+    while not channel.exit_status_ready():
+        drained = False
+        while channel.recv_ready():
+            chunk = channel.recv(65536)
+            if chunk:
+                out.extend(chunk)
+                drained = True
+        while channel.recv_stderr_ready():
+            chunk = channel.recv_stderr(65536)
+            if chunk:
+                err.extend(chunk)
+                drained = True
+        if drained:
+            deadline = time.monotonic() + idle_budget
+            continue
+        if channel.closed:
+            break
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"no output/exit status for {idle_budget:g}s: {command[:80]!r}"
+            )
+        time.sleep(0.05)
+    # Data arrives before the exit status; drain whatever is left.
+    while channel.recv_ready():
+        out.extend(channel.recv(65536))
+    while channel.recv_stderr_ready():
+        err.extend(channel.recv_stderr(65536))
+    return channel.recv_exit_status(), bytes(out), bytes(err)
+
+
 def main() -> int:
     if len(sys.argv) < 6:
         print(__doc__, file=sys.stderr)
@@ -278,10 +335,7 @@ def main() -> int:
     try:
         if mode == "exec":
             command = sys.stdin.read()
-            _, stdout, stderr = client.exec_command(command, timeout=0)
-            out = stdout.read()
-            err = stderr.read()
-            status = stdout.channel.recv_exit_status()
+            status, out, err = run_command(client, command)
             sys.stdout.buffer.write(out)
             sys.stdout.buffer.flush()
             sys.stderr.buffer.write(err)
@@ -378,6 +432,33 @@ remote_script() { # local-script-path
 }
 
 # ---------------------------------------------------------------------------
+# Registry ExecStart composition (K 复核 K-R2)
+# ---------------------------------------------------------------------------
+# Compose the registry unit's ExecStart from an existing one ("" = fresh
+# install). The ARGUMENTS (identity/database paths, --port, ...) are preserved
+# verbatim, but the EXECUTABLE is always rewritten to the freshly installed
+# and verified $REMOTE_BIN. Preserving the whole old line verbatim let a unit
+# keep running e.g. /usr/local/bin/ak-cli while the phase-7 version check ran
+# the NEW path and the deploy reported a successful upgrade it never made.
+compose_registry_exec() { # existing-exec-or-empty
+  local old_exe old_args
+  if [ -z "$1" ]; then
+    printf '%s\n' "$REMOTE_BIN registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA"
+    return 0
+  fi
+  old_exe=${1%% *}                 # first token = the old executable
+  old_args=${1#"$old_exe"}         # remainder = arguments, kept verbatim
+  if [ "$old_exe" != "$REMOTE_BIN" ]; then
+    warn "existing unit executable '$old_exe' is replaced by the newly installed $REMOTE_BIN (arguments preserved; K 复核 K-R2)"
+  fi
+  if printf '%s' "$old_args" | grep -q -- '--id-dir'; then
+    printf '%s\n' "$REMOTE_BIN$old_args"
+  else
+    printf '%s\n' "$REMOTE_BIN$old_args --id-dir $REMOTE_DATA"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # systemd unit templates (docs/OPERATIONS.zh-CN.md §0/§3). Ports filled at
 # write time; the registry unit always pins --id-dir for path determinism.
 # ---------------------------------------------------------------------------
@@ -433,7 +514,7 @@ EOF
 self_test() {
   local sub
 
-  echo "[self-test] s1/6 argument parsing"
+  echo "[self-test] s1/8 argument parsing"
   sub=0; bash "$0" --self-test --nope >/dev/null 2>&1 || sub=$?
   [ "$sub" -eq 2 ] || fail "unknown option should exit 2, got $sub"
   sub=0; bash "$0" --self-test --ssh-port abc >/dev/null 2>&1 || sub=$?
@@ -444,7 +525,7 @@ self_test() {
   [ "$sub" -eq 0 ] || fail "--help should exit 0, got $sub"
   echo "[self-test]   4 validation sub-cases behaved"
 
-  echo "[self-test] s2/6 unit templates"
+  echo "[self-test] s2/8 unit templates"
   local reg_unit stun_unit
   reg_unit=$(registry_unit_body "$REMOTE_BIN registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA")
   printf '%s' "$reg_unit" | grep -q "^ExecStart=$REMOTE_BIN registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA$" \
@@ -461,7 +542,7 @@ self_test() {
   fi
   echo "[self-test]   templates match the OPERATIONS §0/§3 shapes"
 
-  echo "[self-test] s3/6 git archive of the pinned commit"
+  echo "[self-test] s3/8 git archive of the pinned commit"
   ( cd "$ROOT" && git archive --format=tar.gz -o "$WORK/selftest-src.tar.gz" HEAD ) \
     || fail "git archive failed (not a git checkout?)"
   [ -s "$WORK/selftest-src.tar.gz" ] || fail "archive is empty"
@@ -473,7 +554,7 @@ self_test() {
     || fail "archive must contain crates/ak-cli"
   echo "[self-test]   $(printf '%s\n' "$listing" | wc -l | tr -d ' ') files, Cargo.toml + crates present"
 
-  echo "[self-test] s4/6 version sha extraction"
+  echo "[self-test] s4/8 version sha extraction"
   # Global on purpose: write_phase3 embeds it when s6 generates the build
   # script, mirroring how real_run sets it before any phase runs.
   SHORT_SHA=$( cd "$ROOT" && git rev-parse --short HEAD )
@@ -484,7 +565,7 @@ self_test() {
   [ -n "$PREBUILT" ] && [ ! -f "$PREBUILT" ] \
     && fail "--binary not found: $PREBUILT"
 
-  echo "[self-test] s5/6 ssh helper compiles"
+  echo "[self-test] s5/8 ssh helper compiles"
   write_ssh_helper
   PYTHON=$(command -v python || command -v python3 || true)
   if [ -n "$PYTHON" ] && "$PYTHON" -c 'import paramiko' >/dev/null 2>&1; then
@@ -495,7 +576,7 @@ self_test() {
     echo "[self-test]   paramiko not installed locally (password backend would need: pip install paramiko)"
   fi
 
-  echo "[self-test] s6/6 generated remote phase scripts parse"
+  echo "[self-test] s6/8 generated remote phase scripts parse"
   local exec_stub="/opt/ak-sending/ak-cli registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA"
   TS=selftest BUILD_DIR=/tmp/ak-deploy-build-selftest PREBUILT_MODE=0 \
     REGISTRY_EXEC="$exec_stub" REG_RW=$REMOTE_DATA \
@@ -530,6 +611,183 @@ self_test() {
   grep -q '^for u in ak-registry-server ak-stun-server oldregistry oldsignal; do$' "$WORK/p456.sh" \
     || fail "unit-backup loop must bake the discovered old/legacy unit names"
   echo "[self-test]   phase1/3/456/7 generated + bash -n clean"
+
+  echo "[self-test] s7/8 ssh helper drains a fake channel (K 复核 K-R3)"
+  # A fake paramiko package (PYTHONPATH shadows any real install) whose
+  # channel only replaces the network: output and the exit status appear
+  # AFTER a delay, and timeout=0 reads raise TimeoutError exactly like
+  # paramiko's non-blocking mode — the K-R3 failure mode. The OLD helper
+  # (exec_command(timeout=0) + immediate read) exits 255 on the delayed
+  # case; the current helper must return the remote status and drain both
+  # streams. The empty-output case must also complete cleanly.
+  if [ -n "$PYTHON" ]; then
+    mkdir -p "$WORK/fakepkg"
+    cat > "$WORK/fakepkg/paramiko.py" <<'FAKEPY'
+import os
+import time
+
+DELAY = float(os.environ.get("AK_FAKE_DELAY", "0"))
+EMPTY = os.environ.get("AK_FAKE_EMPTY", "") == "1"
+STATUS = int(os.environ.get("AK_FAKE_STATUS", "0"))
+
+
+class AutoAddPolicy:
+    pass
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.timeout = None
+        self.closed = False
+        self._start = time.monotonic()
+        self._out = [] if EMPTY else [b"fake-stdout-after-delay\n"]
+        self._err = [] if EMPTY else [b"fake-stderr-after-delay\n"]
+
+    def _ready(self):
+        return (time.monotonic() - self._start) >= DELAY
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def recv_ready(self):
+        return self._ready() and bool(self._out)
+
+    def recv_stderr_ready(self):
+        return self._ready() and bool(self._err)
+
+    def exit_status_ready(self):
+        return self._ready() and not self._out and not self._err
+
+    def recv(self, size):
+        while True:
+            if self._out and self._ready():
+                return self._out.pop(0)
+            if self._ready():
+                return b""
+            if self.timeout == 0:
+                raise TimeoutError("non-blocking recv with no data (paramiko timeout=0)")
+            time.sleep(0.02)
+
+    def recv_stderr(self, size):
+        while True:
+            if self._err and self._ready():
+                return self._err.pop(0)
+            if self._ready():
+                return b""
+            if self.timeout == 0:
+                raise TimeoutError("non-blocking recv_stderr with no data (paramiko timeout=0)")
+            time.sleep(0.02)
+
+    def recv_exit_status(self):
+        while not self._ready():
+            time.sleep(0.02)
+        return STATUS
+
+
+class _FakeFile:
+    def __init__(self, channel, is_stderr):
+        self.channel = channel
+        self._stderr = is_stderr
+
+    def read(self):
+        buffer = bytearray()
+        while True:
+            if self._stderr:
+                data = self.channel.recv_stderr(65536)
+            else:
+                data = self.channel.recv(65536)
+            if not data:
+                break
+            buffer.extend(data)
+        return bytes(buffer)
+
+
+class SSHClient:
+    def set_missing_host_key_policy(self, policy):
+        pass
+
+    def connect(self, **kwargs):
+        pass
+
+    def get_transport(self):
+        return None
+
+    def exec_command(self, command, timeout=None):
+        channel = _FakeChannel()
+        channel.settimeout(timeout)
+        return None, _FakeFile(channel, False), _FakeFile(channel, True)
+
+    def close(self):
+        pass
+FAKEPY
+    printf 'dummy\n' > "$WORK/fakepass"
+    if command -v cygpath >/dev/null 2>&1; then
+      # Windows Python cannot resolve MSYS /tmp paths inside PYTHONPATH.
+      FAKEPKG=$(cygpath -w "$WORK/fakepkg")
+    else
+      FAKEPKG=$WORK/fakepkg
+    fi
+    local sub out
+    sub=0
+    out=$(PYTHONPATH="$FAKEPKG" AK_FAKE_DELAY=0.4 AK_FAKE_STATUS=7 \
+      "$PYTHON" "$WORK/ssh_helper.py" exec 127.0.0.1 22 ubuntu "$WORK/fakepass" \
+      <<< 'true' 2> "$WORK/fake-exec.err") || sub=$?
+    [ "$sub" -eq 7 ] || fail "fake-channel exec must return the remote status (got $sub; stderr: $(tail -1 "$WORK/fake-exec.err" 2>/dev/null))"
+    [ "$out" = "fake-stdout-after-delay" ] || fail "fake-channel exec lost the delayed stdout (got: '$out')"
+    grep -q 'fake-stderr-after-delay' "$WORK/fake-exec.err" \
+      || fail "fake-channel exec did not drain the delayed stderr"
+    sub=0
+    out=$(PYTHONPATH="$FAKEPKG" AK_FAKE_DELAY=0.3 AK_FAKE_EMPTY=1 \
+      "$PYTHON" "$WORK/ssh_helper.py" exec 127.0.0.1 22 ubuntu "$WORK/fakepass" \
+      <<< 'true' 2> /dev/null) || sub=$?
+    [ "$sub" -eq 0 ] || fail "empty-output command must complete cleanly through the helper (got $sub)"
+    [ -z "$out" ] || fail "empty-output command must produce no stdout (got: '$out')"
+    echo "[self-test]   delayed (exit 7) + empty-output commands completed via the embedded helper"
+  else
+    echo "[self-test]   no python available; helper drain harness skipped"
+  fi
+
+  echo "[self-test] s8/8 K-R1/K-R2 install logic (staging, recovery, ExecStart)"
+  # K 复核 K-R2: compose_registry_exec must keep the old line's ARGUMENTS but
+  # rewrite the EXECUTABLE to the install path (execution, not greps).
+  local c
+  c=$(compose_registry_exec "/usr/local/bin/ak-cli registry-server --port 7200 --id-dir /var/lib/ak-legacy")
+  [ "$c" = "$REMOTE_BIN registry-server --port 7200 --id-dir /var/lib/ak-legacy" ] \
+    || fail "K-R2: ExecStart executable must be rewritten to $REMOTE_BIN with arguments preserved (got: $c)"
+  c=$(compose_registry_exec "/usr/local/bin/ak-cli registry-server --port 7200")
+  [ "$c" = "$REMOTE_BIN registry-server --port 7200 --id-dir $REMOTE_DATA" ] \
+    || fail "K-R2: a preserved line lacking --id-dir must get it appended (got: $c)"
+  c=$(compose_registry_exec "")
+  [ "$c" = "$REMOTE_BIN registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA" ] \
+    || fail "K-R2: fresh ExecStart malformed (got: $c)"
+  c=$(compose_registry_exec "$REMOTE_BIN registry-server --port 7300 --id-dir /elsewhere")
+  [ "$c" = "$REMOTE_BIN registry-server --port 7300 --id-dir /elsewhere" ] \
+    || fail "K-R2: an already-correct ExecStart must pass through unchanged (got: $c)"
+  # K 复核 K-R1: the prebuilt phase456 must bake a DISTINCT staging source,
+  # refuse source == destination before any stop, and carry the recovery
+  # path (behavioral proof runs in scripts/tests/test_deploy_linux_install.py).
+  local stage_dir="/tmp/ak-deploy-staging-selftest2"
+  TS=selftest2 BUILD_DIR= PREBUILT_MODE=1 \
+    STAGING_DIR=$stage_dir STAGED_BIN=$stage_dir/ak-cli SHORT_SHA=$SHORT_SHA \
+    REGISTRY_EXEC="$exec_stub" REG_RW=$REMOTE_DATA \
+    LEGACY_UNIT= OLD_REGISTRY_UNIT= DATA_SOURCE_DIR= CLOSE_7100=0 \
+    write_phase456 "$WORK/p456b.sh"
+  bash -n "$WORK/p456b.sh" || fail "generated prebuilt p456b.sh is not valid bash"
+  grep -q "&& SRC_BIN=$stage_dir/ak-cli\$" "$WORK/p456b.sh" \
+    || fail "K-R1: prebuilt mode must take the binary from the staging path"
+  grep -q 'install -m 0755 "$SRC_BIN" /opt/ak-sending/ak-cli.new' "$WORK/p456b.sh" \
+    || fail "K-R1: install step must copy from the staging source to ak-cli.new"
+  [ "$stage_dir/ak-cli" != "/opt/ak-sending/ak-cli.new" ] \
+    || fail "K-R1: staging path must differ from the install destination"
+  grep -q 'install source equals the install destination' "$WORK/p456b.sh" \
+    || fail "K-R1: same-file guard missing from the install script"
+  grep -q 'refusing BEFORE service switchover' "$WORK/p456b.sh" \
+    || fail "K-R1: pre-switchover version gate missing from the install script"
+  grep -q 'recover_services' "$WORK/p456b.sh" \
+    || fail "K-R1: service-recovery path missing from the install script"
+  grep -q 'systemctl show -p ExecStart' "$WORK/p7.sh" \
+    || fail "K-R2: phase7 must verify the running units' live executable"
+  echo "[self-test]   staging source != destination, guards + recovery baked, ExecStart rewrite verified"
 
   echo "[self-test] PASS (nothing was contacted, nothing was deployed)"
   exit 0
@@ -600,6 +858,23 @@ for d in $REMOTE_DATA /home/*/.ak-sending /root/.ak-sending; do
     echo "registry-data: \$d (key:\$([ -e \$d/registry.key ] && echo yes || echo no) db:\$([ -e \$d/registry.db ] && echo yes || echo no))"
   fi
 done
+# K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
+# prove NOW — before anything is stopped — that the install path is usable
+# through exactly that path (read-only mounts or restricted sudoers must
+# abort in preflight, never mid-deploy). Read-only probes; mutate nothing.
+if [ -d $REMOTE_BASE ]; then
+  if sudo -n test -w $REMOTE_BASE 2>/dev/null; then
+    echo "install-path: $REMOTE_BASE writable via sudo"
+  else
+    echo "ERROR: sudo -n cannot write $REMOTE_BASE (read-only mount or restricted sudoers?)"
+  fi
+else
+  if sudo -n test -w \$(dirname $REMOTE_BASE) 2>/dev/null; then
+    echo "install-path: $REMOTE_BASE absent; creatable via sudo (parent writable)"
+  else
+    echo "ERROR: sudo -n cannot create $REMOTE_BASE (parent not sudo-writable)"
+  fi
+fi
 command -v ufw >/dev/null 2>&1 && echo "ufw: \$(ufw status 2>/dev/null | head -1)" || echo "ufw: absent"
 echo "disk-free /opt: \$(df -h /opt 2>/dev/null | tail -1 | awk '{print \$4}')"
 exit 0
@@ -640,16 +915,34 @@ EOF
 # Phase 4+5+6: install, systemd, firewall (root via sudo -n). Env:
 # SHORT_SHA, TS, REGISTRY_PORT, STUN_PORT, plus deployment decisions
 # (REGISTRY_EXEC, LEGACY_UNIT, DATA_SOURCE_DIR, CLOSE_7100, KEEP_BUILD_DIR,
-# BUILD_DIR/PREBUILT_MODE).
+# BUILD_DIR/PREBUILT_MODE, STAGING_DIR/STAGED_BIN for --binary).
 write_phase456() { # out-file ...
   cat > "$1" <<EOF
 set -eu
 TS=$TS
+SHORT_SHA=$SHORT_SHA
 BUILD_DIR=${BUILD_DIR:-}
 PREBUILT_MODE=${PREBUILT_MODE:-0}
+STAGING_DIR=${STAGING_DIR:-}
+STAGED_BIN=${STAGED_BIN:-}
 SRC_BIN=\$BUILD_DIR/target/release/ak-cli
-[ "\$PREBUILT_MODE" = 1 ] && SRC_BIN=$REMOTE_BASE/ak-cli.new
-[ -x "\$SRC_BIN" ] || { echo "ERROR: built binary not found at \$SRC_BIN" >&2; exit 5; }
+[ "\$PREBUILT_MODE" = 1 ] && SRC_BIN=${STAGED_BIN:-}
+[ -n "\$SRC_BIN" ] && [ -x "\$SRC_BIN" ] || { echo "ERROR: source binary not found/executable at \${SRC_BIN:-<unset>}" >&2; exit 5; }
+# K 复核 K-R1: the install source must be a DIFFERENT file from the install
+# destination used below ($REMOTE_BASE/ak-cli.new). The old --binary flow
+# uploaded straight to ak-cli.new and then ran install ak-cli.new ->
+# ak-cli.new ("are the same file") AFTER the services were already stopped.
+[ "\$SRC_BIN" != "$REMOTE_BASE/ak-cli.new" ] || { echo "ERROR: install source equals the install destination (\$SRC_BIN); refusing before any service is stopped" >&2; exit 5; }
+if [ "\$PREBUILT_MODE" = 1 ]; then
+  # K 复核 K-R1: re-verify the staged binary's version right before anything
+  # is stopped (phase 2 checked at upload time; this closes the gap between
+  # upload and switchover).
+  V=\$( "\$SRC_BIN" --version 2>&1 || true )
+  case "\$V" in
+    *"git $SHORT_SHA"*) : ;;
+    *) echo "ERROR: staged binary version is '\$V' (want 'git $SHORT_SHA'); refusing BEFORE service switchover" >&2; exit 5 ;;
+  esac
+fi
 
 # --- service user + directories ------------------------------------------
 if ! id -u $SERVICE_USER >/dev/null 2>&1; then
@@ -688,20 +981,49 @@ sudo -n chown -R $SERVICE_USER:$SERVICE_USER $REMOTE_DATA
 sudo -n chmod 700 $REMOTE_DATA
 [ -f $REMOTE_DATA/registry.key ] && sudo -n chmod 600 $REMOTE_DATA/registry.key
 
-# --- install the new binary ------------------------------------------------
-sudo -n systemctl stop ak-registry-server.service 2>/dev/null || true
-sudo -n systemctl stop ak-stun-server.service 2>/dev/null || true
+# --- install the new binary (K 复核 K-R1) ------------------------------------
+# Everything above only read state or created new files. From the first
+# systemctl stop until enable --now this script owns STOPPED services: with
+# plain set -e, ANY failure in between would exit and leave the services down
+# (that is exactly how the old same-file install failure stranded the box).
+# do_switchover therefore runs under an explicit if ! guard with per-step
+# error returns, and every failure calls recover_services FIRST (best-effort
+# restart of what was stopped, previous binary restored when it was already
+# moved away) before exiting non-zero.
 OLD_REGISTRY_UNIT=${OLD_REGISTRY_UNIT:-}
-if [ -n "\$OLD_REGISTRY_UNIT" ] && [ "\$OLD_REGISTRY_UNIT" != "ak-registry-server.service" ]; then
-  echo "[install] stopping old registry unit \$OLD_REGISTRY_UNIT (replaced by ak-registry-server.service; unit file kept in \$BACKUP)"
-  sudo -n systemctl stop "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
-  sudo -n systemctl disable "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+recover_services() {
+  echo "[install] switchover failed; recovering services (best-effort, previous state)" >&2
+  if [ ! -f $REMOTE_BIN ] && [ -f $REMOTE_BASE/ak-cli.old-\$TS ]; then
+    echo "[install] restoring previous binary from ak-cli.old-\$TS" >&2
+    sudo -n mv $REMOTE_BASE/ak-cli.old-\$TS $REMOTE_BIN 2>/dev/null || true
+  fi
+  sudo -n rm -f $REMOTE_BASE/ak-cli.new 2>/dev/null || true
+  if [ -n "\$OLD_REGISTRY_UNIT" ] && [ "\$OLD_REGISTRY_UNIT" != "ak-registry-server.service" ]; then
+    sudo -n systemctl start "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+  else
+    sudo -n systemctl start ak-registry-server.service 2>/dev/null || true
+  fi
+  sudo -n systemctl start ak-stun-server.service 2>/dev/null || true
+}
+do_switchover() {
+  sudo -n systemctl stop ak-registry-server.service 2>/dev/null || true
+  sudo -n systemctl stop ak-stun-server.service 2>/dev/null || true
+  if [ -n "\$OLD_REGISTRY_UNIT" ] && [ "\$OLD_REGISTRY_UNIT" != "ak-registry-server.service" ]; then
+    echo "[install] stopping old registry unit \$OLD_REGISTRY_UNIT (replaced by ak-registry-server.service; unit file kept in \$BACKUP)"
+    sudo -n systemctl stop "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+    sudo -n systemctl disable "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+  fi
+  sudo -n install -m 0755 "\$SRC_BIN" $REMOTE_BASE/ak-cli.new || return 1
+  [ -f $REMOTE_BIN ] && sudo -n mv $REMOTE_BIN $REMOTE_BASE/ak-cli.old-\$TS || true
+  sudo -n mv $REMOTE_BASE/ak-cli.new $REMOTE_BIN || return 1
+  sudo -n chmod 755 $REMOTE_BIN || return 1
+  echo "[install] installed: $REMOTE_BIN (\$($REMOTE_BIN --version 2>&1 || echo version-unreadable))"
+}
+if ! do_switchover; then
+  recover_services
+  echo "ERROR: binary switchover failed; recovery attempted (see lines above; backup in \$BACKUP)" >&2
+  exit 5
 fi
-sudo -n install -m 0755 "\$SRC_BIN" $REMOTE_BASE/ak-cli.new
-[ -f $REMOTE_BIN ] && sudo -n mv $REMOTE_BIN $REMOTE_BASE/ak-cli.old-\$TS
-sudo -n mv $REMOTE_BASE/ak-cli.new $REMOTE_BIN
-sudo -n chmod 755 $REMOTE_BIN
-echo "[install] installed: $REMOTE_BIN (\$($REMOTE_BIN --version 2>&1 || echo version-unreadable))"
 
 # --- §0 step 2: retire a legacy signal-server that owns UDP $STUN_PORT ----
 LEGACY_UNIT=${LEGACY_UNIT:-}
@@ -771,6 +1093,9 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: a
 else
   echo "[firewall] ufw absent or inactive — open in the CLOUD SECURITY GROUP: TCP $REGISTRY_PORT, UDP $STUN_PORT (Tencent console); §6 also recommends closing public TCP 7100 there"
 fi
+# K 复核 K-R1: the /tmp staging upload is temporary; removed on success
+# (kept on failure together with \$BACKUP for forensics).
+[ "\$PREBUILT_MODE" = 1 ] && [ -n "\$STAGING_DIR" ] && rm -rf "\$STAGING_DIR" 2>/dev/null || true
 exit 0
 EOF
 }
@@ -796,6 +1121,22 @@ echo "tcp $REGISTRY_PORT + udp $STUN_PORT listening"
 echo "--- versions (record in the deploy ticket) ---"
 $REMOTE_BIN registry-server --version
 $REMOTE_BIN stun-server --version
+# K 复核 K-R2: prove the RUNNING services execute the deployed binary. An
+# old unit's ExecStart used to be preserved verbatim, so systemd could keep
+# running e.g. /usr/local/bin/ak-cli while the lines above checked the NEW
+# path and the deploy reported success. systemctl show exposes each unit's
+# live executable; its path AND its --version must match the deploy.
+for u in ak-registry-server ak-stun-server; do
+  live_exe=\$(systemctl show -p ExecStart \$u.service 2>/dev/null | head -1 | sed -n 's/^ExecStart={[ ]*path=\\([^;]*\\).*/\\1/p' | sed 's/[[:space:]]*\$//')
+  [ -n "\$live_exe" ] || { echo "ERROR: cannot determine the live ExecStart executable of \$u (systemctl show; K-R2)" >&2; exit 6; }
+  [ "\$live_exe" = "$REMOTE_BIN" ] || { echo "ERROR: \$u runs \$live_exe but this deploy installed $REMOTE_BIN (K-R2 stale executable)" >&2; exit 6; }
+  live_ver=\$(\$live_exe --version 2>&1)
+  case "\$live_ver" in
+    *"git $SHORT_SHA"*) : ;;
+    *) echo "ERROR: \$u runs \$live_exe reporting '\$live_ver' (want 'git $SHORT_SHA'; K-R2)" >&2; exit 6 ;;
+  esac
+  echo "unit \$u runs \$live_exe (\$live_ver)"
+done
 # Export the registry pin (public hex; §5) for scripts/cross_nat_test.sh.
 PIN=\$(journalctl -u ak-registry-server.service --since '-5 min' --no-pager 2>/dev/null | sed -n 's/.*registry id (pin with --registry-fp): \\([0-9a-f]\\{64\\}\\).*/\\1/p' | tail -1)
 if [ -n "\$PIN" ]; then
@@ -900,17 +1241,37 @@ real_run() {
   TS=$(date +%Y%m%d-%H%M%S)
   BUILD_DIR="/tmp/ak-deploy-build-$TS"
   PREBUILT_MODE=0
+  STAGING_DIR=""
+  STAGED_BIN=""
   if [ -n "$PREBUILT" ]; then
     PREBUILT_MODE=1
-    remote_run_quiet "sudo -n install -d -m 0755 '$REMOTE_BASE'" || fail "cannot create $REMOTE_BASE"
-    remote_put "$PREBUILT" "$REMOTE_BASE/ak-cli.new" \
+    # K 复核 K-R1: upload the prebuilt binary to a DISTINCT staging path under
+    # /tmp. The old flow uploaded straight to $REMOTE_BASE/ak-cli.new and the
+    # install step then ran `install ak-cli.new -> ak-cli.new` (source ==
+    # destination, GNU install refuses) AFTER the services were already
+    # stopped. All checks below run on the STAGED file, before any service is
+    # touched; phase456 re-verifies right before the switchover.
+    STAGING_DIR="/tmp/ak-deploy-staging-$TS"
+    STAGED_BIN="$STAGING_DIR/ak-cli"
+    remote_run_quiet "mkdir -p '$STAGING_DIR' && chmod 700 '$STAGING_DIR'" \
+      || fail "cannot create remote staging dir $STAGING_DIR"
+    remote_put "$PREBUILT" "$STAGED_BIN" \
       || fail "upload of prebuilt binary failed"
-    local pv
-    pv=$(remote_run_quiet "$REMOTE_BASE/ak-cli.new --version" || true)
+    remote_run_quiet "chmod 0755 '$STAGED_BIN'" \
+      || fail "cannot set 0755 on the staged binary"
+    remote_run_quiet "test -x '$STAGED_BIN'" \
+      || fail "staged binary is not executable on the server"
+    local pv local_sha rsha
+    pv=$(remote_run_quiet "'$STAGED_BIN' --version" || true)
     case "$pv" in
-      *"git $SHORT_SHA"*) note "prebuilt binary verified: $pv" ;;
+      *"git $SHORT_SHA"*) note "staged binary version verified: $pv" ;;
       *) fail "prebuilt binary version mismatch (want 'git $SHORT_SHA', got: $pv)" ;;
     esac
+    local_sha=$(sha256sum "$PREBUILT" | cut -d' ' -f1 | tr 'A-F' 'a-f')
+    rsha=$(remote_run_quiet "sha256sum '$STAGED_BIN' 2>/dev/null" | cut -d' ' -f1 | tr -d '\r\n' | tr 'A-F' 'a-f' || true)
+    [ "$rsha" = "$local_sha" ] \
+      || fail "staged binary sha256 mismatch (local $local_sha, remote ${rsha:-none}) — upload corrupted?"
+    note "staged at $STAGED_BIN (sha256 ${local_sha:0:16}...); checks done BEFORE service switchover"
   else
     remote_run_quiet "rm -rf '$BUILD_DIR' && mkdir -p '$BUILD_DIR'" \
       || fail "cannot prepare remote build dir"
@@ -934,22 +1295,14 @@ real_run() {
   fi
 
   # ---- deployment decisions for phase 4-6 ----------------------------------
-  # Registry ExecStart: preserve an existing unit's arguments (docs §3 note:
-  # never silently change --id-dir/--db-path). If the existing unit lacks an
-  # explicit --id-dir, normalize to $REMOTE_DATA (with data migration below).
-  REGISTRY_EXEC=""
-  if [ -n "$existing_exec" ]; then
-    if printf '%s' "$existing_exec" | grep -q -- '--id-dir'; then
-      REGISTRY_EXEC=$existing_exec
-      note "preserving existing registry ExecStart: $REGISTRY_EXEC"
-    else
-      REGISTRY_EXEC="$existing_exec --id-dir $REMOTE_DATA"
-      note "existing ExecStart lacked --id-dir; appending $REMOTE_DATA: $REGISTRY_EXEC"
-    fi
-  else
-    REGISTRY_EXEC="$REMOTE_BIN registry-server --port $REGISTRY_PORT --id-dir $REMOTE_DATA"
-    note "fresh registry ExecStart: $REGISTRY_EXEC"
-  fi
+  # Registry ExecStart (K 复核 K-R2): compose_registry_exec preserves the
+  # existing unit's ARGUMENTS (identity/database paths, port) but rewrites
+  # the EXECUTABLE to the newly installed+verified $REMOTE_BIN — the old
+  # verbatim-preserve let systemd keep running /usr/local/bin/ak-cli while
+  # the phase-7 check ran the new path. If the existing unit lacks an
+  # explicit --id-dir, it is normalized to $REMOTE_DATA (data migration below).
+  REGISTRY_EXEC=$(compose_registry_exec "${existing_exec:-}")
+  note "registry ExecStart for the new unit: $REGISTRY_EXEC"
   # Data source for identity/db migration: the existing data dir found in
   # preflight, unless it IS the standard layout already.
   DATA_SOURCE_DIR=""
@@ -987,6 +1340,8 @@ real_run() {
     || fail "journal missing the stun responder startup line"
   grep -q 'listening' "$WORK/phase7.log" \
     || fail "sockets not listening after start"
+  grep -q "unit ak-registry-server runs $REMOTE_BIN" "$WORK/phase7.log" \
+    || fail "phase 7 did not verify the RUNNING registry executable against the deployed binary (K-R2)"
 
   local pin
   pin=$(sed -n 's/^registry id (pin with --registry-fp): \([0-9a-f]\{64\}\)$/\1/p' "$WORK/phase7.log" | tail -1)

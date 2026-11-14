@@ -308,9 +308,60 @@ Usage: ssh_helper.py <host> <port> <user> <passfile>
 The command is read from stdin. Exit status = remote exit status
 (254 usage error, 255 connection/exec failure).
 """
+import os
 import sys
+import time
 
 import paramiko
+
+
+def run_command(client, command):
+    """Execute `command` and drain BOTH streams (K 复核 K-R3).
+
+    exec_command(..., timeout=0) is NON-blocking in paramiko, so the previous
+    "timeout=0 then read immediately" flow raised TimeoutError whenever the
+    remote output (or EOF) had not arrived yet. This variant uses blocking
+    channel semantics (timeout=None) plus a recv_ready/recv_stderr_ready
+    polling loop, so delayed output, empty output and stderr-heavy commands
+    all complete. An idle budget (AK_SSH_IDLE_TIMEOUT seconds, default 1800;
+    reset on every progress) bounds the wait so a hung remote still fails.
+    Keep this function identical in the other script's embedded helper
+    (single source, verified by scripts/tests/test_ssh_helper_exec.py).
+    """
+    _, stdout, stderr = client.exec_command(command, timeout=None)
+    channel = stdout.channel
+    out = bytearray()
+    err = bytearray()
+    idle_budget = float(os.environ.get("AK_SSH_IDLE_TIMEOUT", "1800"))
+    deadline = time.monotonic() + idle_budget
+    while not channel.exit_status_ready():
+        drained = False
+        while channel.recv_ready():
+            chunk = channel.recv(65536)
+            if chunk:
+                out.extend(chunk)
+                drained = True
+        while channel.recv_stderr_ready():
+            chunk = channel.recv_stderr(65536)
+            if chunk:
+                err.extend(chunk)
+                drained = True
+        if drained:
+            deadline = time.monotonic() + idle_budget
+            continue
+        if channel.closed:
+            break
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"no output/exit status for {idle_budget:g}s: {command[:80]!r}"
+            )
+        time.sleep(0.05)
+    # Data arrives before the exit status; drain whatever is left.
+    while channel.recv_ready():
+        out.extend(channel.recv(65536))
+    while channel.recv_stderr_ready():
+        err.extend(channel.recv_stderr(65536))
+    return channel.recv_exit_status(), bytes(out), bytes(err)
 
 
 def main() -> int:
@@ -341,10 +392,7 @@ def main() -> int:
         transport = client.get_transport()
         if transport is not None:
             transport.set_keepalive(30)
-        _, stdout, stderr = client.exec_command(command, timeout=0)
-        out = stdout.read()
-        err = stderr.read()
-        status = stdout.channel.recv_exit_status()
+        status, out, err = run_command(client, command)
         sys.stdout.buffer.write(out)
         sys.stdout.buffer.flush()
         sys.stderr.buffer.write(err)
@@ -496,12 +544,47 @@ make_workspace() {
 }
 
 # ---------------------------------------------------------------------------
+# Run summary (K 复核 STUN-label)
+# ---------------------------------------------------------------------------
+# The summary must state what actually happened: a run with --skip-doctor
+# never executed the STUN gate, so the evidence line labels it SKIPPED —
+# never "passed". print_summary renders the recorded per-step results
+# (PASS/FAIL/SKIPPED) plus the final RESULT line from the real flags.
+stun_gate_label() {
+  if [ "$SKIP_DOCTOR" -eq 1 ]; then
+    printf '%s\n' 'SKIPPED (--skip-doctor)'
+  else
+    printf '%s\n' 'ok'
+  fi
+}
+
+print_summary() {
+  local line name status overall=PASS
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=${line%%:*}; status=${line##*:}
+    printf '[cross-nat]   %-42s %s\n' "$name" "$status"
+    case "$status" in
+      PASS|SKIPPED) ;;
+      *) overall=FAIL ;;
+    esac
+  done <<< "$RESULTS"
+  if [ "$overall" = PASS ]; then
+    note "RESULT: PASS (registry pairing + STUN gate $(stun_gate_label) + real-NAT direct QUIC transfer sha256-verified)"
+    return 0
+  fi
+  FAILED=1
+  note "RESULT: FAIL (workspace and remote work dir kept for debugging)" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # --self-test: offline gate (no server, no SSH, no transfer)
 # ---------------------------------------------------------------------------
 self_test() {
   local sub
 
-  step "s1/7 argument parsing + validation"
+  step "s1/9 argument parsing + validation"
   sub=0; bash "$0" --self-test --definitely-not-an-option >/dev/null 2>&1 || sub=$?
   [ "$sub" -eq 2 ] || fail "unknown option should exit 2, got $sub"
   sub=0; bash "$0" --self-test --size-mb abc >/dev/null 2>&1 || sub=$?
@@ -514,12 +597,12 @@ self_test() {
   [ "$sub" -eq 0 ] || fail "--help should exit 0, got $sub"
   note "5 validation sub-cases behaved"
 
-  step "s2/7 locate ak-cli + version"
+  step "s2/9 locate ak-cli + version"
   locate_binary
   note "binary: $AK_BIN"
   note "version: $("$AK_BIN" --version 2>&1)"
 
-  step "s3/7 identity generation + fingerprint parse"
+  step "s3/9 identity generation + fingerprint parse"
   mkdir -p "$WORK/id"
   "$AK_BIN" --id-dir "$WORK/id" keygen > "$LOGS/keygen.log" 2>&1
   local fp
@@ -527,7 +610,7 @@ self_test() {
   [ ${#fp} -eq 64 ] || fail "keygen fingerprint missing (see $LOGS/keygen.log)"
   note "fingerprint parsed: ${fp:0:16}... (64 hex ok)"
 
-  step "s4/7 payload creation + sha256"
+  step "s4/9 payload creation + sha256"
   local bytes=$((SIZE_MB * 1024 * 1024)) digest
   head -c "$bytes" /dev/urandom > "$WORK/payload.bin"
   [ "$(wc -c < "$WORK/payload.bin" | tr -d ' ')" -eq "$bytes" ] \
@@ -536,7 +619,7 @@ self_test() {
   [ ${#digest} -eq 64 ] || fail "sha256 digest malformed: $digest"
   note "$WORK/payload.bin: $SIZE_MB MiB random, sha256 ${digest:0:16}... (64 hex ok)"
 
-  step "s5/7 candidate/invite parsers against fixtures"
+  step "s5/9 candidate/invite parsers against fixtures"
   printf '%s\n' \
     '{"type":"listening","addr":"0.0.0.0:53112","port":53112,"fingerprint":"ab","name":"n","mdns":true,"candidates":["103.236.80.135:53112", "192.168.1.100:53112", "[2001:db8::a]:53112"]}' \
     > "$LOGS/fix-ndjson.log"
@@ -572,7 +655,7 @@ self_test() {
   [ "$mapped" = "203.0.113.9:54321" ] || fail "reflexive-address parse failed: '$mapped'"
   note "doctor reflexive-address parse: $mapped"
 
-  step "s6/7 ssh backend detection + helper compile"
+  step "s6/9 ssh backend detection + helper compile"
   detect_ssh_backend
   case "$SSH_BACKEND" in
     openssh)  note "ssh backend: openssh (key auth)" ;;
@@ -588,13 +671,174 @@ self_test() {
       ;;
   esac
 
-  step "s7/7 failure-scene retention"
+  step "s7/9 failure-scene retention"
   local sub_rc=0 sub_out
   sub_out=$(bash "$0" --self-test --binary /nonexistent/ak-cli 2>&1) || sub_rc=$?
   [ "$sub_rc" -ne 0 ] || fail "bad --binary should exit non-zero"
   printf '%s' "$sub_out" | grep -q 'workspace kept' \
     || fail "non-zero exit must keep the workspace; tail: $(printf '%s' "$sub_out" | tail -2 | tr '\n' ' ')"
   note "nested failing run (exit $sub_rc): workspace kept as required"
+
+  step "s8/9 summary honesty: STUN label follows --skip-doctor (K 复核 STUN-label)"
+  local lbl sum_rc=0
+  SKIP_DOCTOR=1
+  lbl=$(stun_gate_label)
+  [ "$lbl" = "SKIPPED (--skip-doctor)" ] || fail "skip label wrong: '$lbl'"
+  RESULTS=$'0/6 preflight:PASS\n1/6 NAT gate (stun):SKIPPED\n2/6 local identity + invite code:PASS\n3/6 remote receiver paired + listening:PASS\n4/6 candidate extraction:PASS\n5/6 Windows -> Linux transfer:PASS\n'
+  print_summary > "$LOGS/summary-skip.log" 2>&1 || sum_rc=$?
+  [ "$sum_rc" -eq 0 ] || fail "an all-pass run with a skipped STUN gate must still be PASS overall"
+  grep -q '1/6 NAT gate (stun) *SKIPPED' "$LOGS/summary-skip.log" \
+    || fail "the summary table must show the STUN gate as SKIPPED"
+  grep -q 'STUN gate SKIPPED (--skip-doctor)' "$LOGS/summary-skip.log" \
+    || fail "the RESULT line must label the STUN gate SKIPPED"
+  grep -q 'STUN gate ok' "$LOGS/summary-skip.log" \
+    && fail "a skipped run must not claim 'STUN gate ok'"
+  SKIP_DOCTOR=0
+  lbl=$(stun_gate_label)
+  [ "$lbl" = "ok" ] || fail "run label wrong: '$lbl'"
+  RESULTS=$'0/6 preflight:PASS\n1/6 NAT gate (stun):PASS\n2/6 local identity + invite code:PASS\n3/6 remote receiver paired + listening:PASS\n4/6 candidate extraction:PASS\n5/6 Windows -> Linux transfer:PASS\n'
+  print_summary > "$LOGS/summary-run.log" 2>&1 || sum_rc=$?
+  [ "$sum_rc" -eq 0 ] || fail "the doctor-run summary must be PASS"
+  grep -q 'STUN gate ok' "$LOGS/summary-run.log" \
+    || fail "the run RESULT line must label the STUN gate ok"
+  grep -q 'SKIPPED' "$LOGS/summary-run.log" \
+    && fail "a doctor run must not mention SKIPPED"
+  RESULTS=""
+  note "summary labels: skip -> 'SKIPPED (--skip-doctor)', run -> 'ok' (table + RESULT line)"
+
+  step "s9/9 ssh helper drains a fake channel (K 复核 K-R3)"
+  # Same fake-paramiko harness as scripts/deploy_linux.sh s7: the channel
+  # only replaces the network; output/exit status appear AFTER a delay and
+  # timeout=0 reads raise TimeoutError like paramiko's non-blocking mode.
+  # The OLD helper (exec_command(timeout=0) + immediate read) exits 255 on
+  # the delayed case; the current helper must return the remote status and
+  # drain both streams; an empty-output command must complete cleanly.
+  if [ -n "$PYTHON" ]; then
+    mkdir -p "$WORK/fakepkg"
+    cat > "$WORK/fakepkg/paramiko.py" <<'FAKEPY'
+import os
+import time
+
+DELAY = float(os.environ.get("AK_FAKE_DELAY", "0"))
+EMPTY = os.environ.get("AK_FAKE_EMPTY", "") == "1"
+STATUS = int(os.environ.get("AK_FAKE_STATUS", "0"))
+
+
+class AutoAddPolicy:
+    pass
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.timeout = None
+        self.closed = False
+        self._start = time.monotonic()
+        self._out = [] if EMPTY else [b"fake-stdout-after-delay\n"]
+        self._err = [] if EMPTY else [b"fake-stderr-after-delay\n"]
+
+    def _ready(self):
+        return (time.monotonic() - self._start) >= DELAY
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def recv_ready(self):
+        return self._ready() and bool(self._out)
+
+    def recv_stderr_ready(self):
+        return self._ready() and bool(self._err)
+
+    def exit_status_ready(self):
+        return self._ready() and not self._out and not self._err
+
+    def recv(self, size):
+        while True:
+            if self._out and self._ready():
+                return self._out.pop(0)
+            if self._ready():
+                return b""
+            if self.timeout == 0:
+                raise TimeoutError("non-blocking recv with no data (paramiko timeout=0)")
+            time.sleep(0.02)
+
+    def recv_stderr(self, size):
+        while True:
+            if self._err and self._ready():
+                return self._err.pop(0)
+            if self._ready():
+                return b""
+            if self.timeout == 0:
+                raise TimeoutError("non-blocking recv_stderr with no data (paramiko timeout=0)")
+            time.sleep(0.02)
+
+    def recv_exit_status(self):
+        while not self._ready():
+            time.sleep(0.02)
+        return STATUS
+
+
+class _FakeFile:
+    def __init__(self, channel, is_stderr):
+        self.channel = channel
+        self._stderr = is_stderr
+
+    def read(self):
+        buffer = bytearray()
+        while True:
+            if self._stderr:
+                data = self.channel.recv_stderr(65536)
+            else:
+                data = self.channel.recv(65536)
+            if not data:
+                break
+            buffer.extend(data)
+        return bytes(buffer)
+
+
+class SSHClient:
+    def set_missing_host_key_policy(self, policy):
+        pass
+
+    def connect(self, **kwargs):
+        pass
+
+    def get_transport(self):
+        return None
+
+    def exec_command(self, command, timeout=None):
+        channel = _FakeChannel()
+        channel.settimeout(timeout)
+        return None, _FakeFile(channel, False), _FakeFile(channel, True)
+
+    def close(self):
+        pass
+FAKEPY
+    printf 'dummy\n' > "$WORK/fakepass"
+    if command -v cygpath >/dev/null 2>&1; then
+      # Windows Python cannot resolve MSYS /tmp paths inside PYTHONPATH.
+      FAKEPKG=$(cygpath -w "$WORK/fakepkg")
+    else
+      FAKEPKG=$WORK/fakepkg
+    fi
+    local sub out
+    sub=0
+    out=$(PYTHONPATH="$FAKEPKG" AK_FAKE_DELAY=0.4 AK_FAKE_STATUS=7 \
+      "$PYTHON" "$WORK/ssh_helper.py" 127.0.0.1 22 ubuntu "$WORK/fakepass" \
+      <<< 'true' 2> "$LOGS/fake-exec.err") || sub=$?
+    [ "$sub" -eq 7 ] || fail "fake-channel exec must return the remote status (got $sub; stderr: $(tail -1 "$LOGS/fake-exec.err" 2>/dev/null))"
+    [ "$out" = "fake-stdout-after-delay" ] || fail "fake-channel exec lost the delayed stdout (got: '$out')"
+    grep -q 'fake-stderr-after-delay' "$LOGS/fake-exec.err" \
+      || fail "fake-channel exec did not drain the delayed stderr"
+    sub=0
+    out=$(PYTHONPATH="$FAKEPKG" AK_FAKE_DELAY=0.3 AK_FAKE_EMPTY=1 \
+      "$PYTHON" "$WORK/ssh_helper.py" 127.0.0.1 22 ubuntu "$WORK/fakepass" \
+      <<< 'true' 2> /dev/null) || sub=$?
+    [ "$sub" -eq 0 ] || fail "empty-output command must complete cleanly through the helper (got $sub)"
+    [ -z "$out" ] || fail "empty-output command must produce no stdout (got: '$out')"
+    note "delayed (exit 7) + empty-output commands completed via the embedded helper"
+  else
+    printf '[cross-nat]   WARNING: no python; helper drain harness skipped\n' >&2
+  fi
 
   note "PASS: self-test (no server contacted, no SSH, no transfer)"
   exit 0
@@ -649,6 +893,8 @@ real_run() {
   step "1/6 NAT gate: doctor --stun $SERVER_HOST:$STUN_PORT"
   if [ "$SKIP_DOCTOR" -eq 1 ]; then
     note "skipped (--skip-doctor)"
+    # K 复核 STUN-label: the run summary must not claim a passed STUN gate.
+    record "1/6 NAT gate (stun)" SKIPPED
   else
     "$AK_BIN" doctor --stun "$(fmt_endpoint "$SERVER_HOST" "$STUN_PORT")" \
       > "$LOGS/doctor.log" 2>&1 || true
@@ -791,21 +1037,12 @@ real_run() {
 
   # -- step 6: summary -----------------------------------------------------------
   step "6/6 summary"
-  local line name status overall=PASS
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    name=${line%%:*}; status=${line##*:}
-    printf '[cross-nat]   %-42s %s\n' "$name" "$status"
-    [ "$status" = PASS ] || overall=FAIL
-  done <<< "$RESULTS"
-  if [ "$overall" = PASS ]; then
-    note "RESULT: PASS (registry pairing + STUN gate + real-NAT direct QUIC transfer sha256-verified)"
+  # K 复核 STUN-label: print_summary derives the STUN-gate wording from the
+  # actual --skip-doctor flag (SKIPPED) instead of always claiming a pass.
+  if print_summary; then
     exit 0
-  else
-    FAILED=1
-    note "RESULT: FAIL (workspace and remote work dir kept for debugging)" >&2
-    exit 1
   fi
+  exit 1
 }
 
 # ---------------------------------------------------------------------------

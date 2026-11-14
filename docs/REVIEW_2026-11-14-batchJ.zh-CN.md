@@ -33,9 +33,9 @@
 - **新发现 CR-P3-20**：记录与事实不一致，第五次。执行方写了"J6 三者一致性已核"，但交接 §2.2 末条、§3.1、§4、§5、§6 仍是十轮重跑之前的内容；STATUS 头部写"最终 run 结果仍待补"，并说 CR-P1-07/08"不关闭"，与状态表的"已完成"相反。本轮已由我更正；改法改为机械校验，并把同一事实只写在一处（第 4 节）。
 - **合并与清理**（第 5 节）：
   - main 由 `88c77e0` 快进到本轮复核提交，没有强推；
-  - 7 个远端分支逐个确认已全部包含在 main 中后删除；
+  - 7 个远端分支逐个确认已全部包含在 main 中（删除不会丢失任何提交）。**但删除被本会话的 git 代理拒绝**（HTTP 403，策略拒绝）；按规则不重试、不换途径绕过，改由本地 agent 在 K0 执行，或所有者在 GitHub 页面删除（第 5 节有逐条命令）。
   - 两个证据工作流原本只认 `dev/review-fixes-20261111`，已改为 main 和 `dev/**`，否则分支删除后就再也不会运行。
-  - 今后的规则：仓库只保留 main；每批在从 main 切出的短期 `dev/…` 分支上做，复核通过后合入 main，再删除该分支。
+  - 今后的规则：仓库只保留 main；每批在从 main 切出的短期 `dev/…` 分支上做，复核通过后由复核方快进合入 main，再由执行方删除该分支。
 - **判定**：
   - 批次 J 通过，main 现在是已复核的最新状态；
   - **main 不是发布版**，项目层面的"通过审核"仍待批次 K1（走查余项）与 C4 真机；
@@ -175,9 +175,9 @@
 - 合并前核对：`88c77e0` 是 `4f604bc` 的祖先；main 没有分支保护，也没有规则集。
 - PR #11（`review/claude-20261111 → main`）的头提交 `a78d449` 早已在开发分支里，main 快进后 PR 的内容全部包含在 main 中。合入后 PR 的状态见第 7 节。
 
-**删除的远端分支**：每个分支都先用 `git merge-base --is-ancestor <分支> main` 确认是 main 的祖先、没有独有提交，然后才删除。
+**待删除的远端分支**：每个分支都已用 `git merge-base --is-ancestor origin/<分支> origin/main` 确认是 main 的祖先、没有独有提交（main = `dc8a91b`）。
 
-| 分支 | 删除前的头提交 | 说明 |
+| 分支 | 头提交 | 说明 |
 |---|---|---|
 | `dev/review-fixes-20261111` | `4f604bc` | 审核修复轮开发分支（批次 A–J） |
 | `dev/local-parallel` | `88c77e0` | 与旧 main 同一提交 |
@@ -187,7 +187,28 @@
 | `review/claude-batchg-20261113` | `cf80f19` | PR #14，已合入 |
 | `review/claude-batchh-ui-20261113` | `0a17311` | PR #15，已合入 |
 
-仓库没有标签，没有其他远端分支。所有提交仍可从 main 到达，分支删除没有丢失任何内容。
+仓库没有标签，也没有其他远端分支。这些分支的所有提交都能从 main 到达，删除不会丢失内容。
+
+**删除被拒绝** [已执行]：
+- 对每个分支执行 `git push origin --delete <分支>`，均返回 `error: RPC failed; HTTP 403 ... The requested URL returned error: 403`，随后打印 `Everything up-to-date`，远端分支仍在。
+- 我的脚本在看到说明之前自动重试过，每个分支 3 次，之后停止。会话的代理说明要求策略拒绝不重试、不绕路；AGENTS.md 也要求"出现权限拒绝时……不寻找其他身份绕过权限"。所以我**没有**改用 GitHub API 等其他途径删除。
+- 推送 main（快进）本身成功，说明被拒绝的只是删除这一种操作。
+
+**留给本地 agent（K0）或所有者执行的删除**（逐条先核对再删）：
+
+```
+git fetch --prune origin
+for b in dev/review-fixes-20261111 dev/local-parallel review/claude-20261111 \
+         review/claude-acceptance-20261112 review/claude-batchf-20261112 \
+         review/claude-batchg-20261113 review/claude-batchh-ui-20261113; do
+  git merge-base --is-ancestor "origin/$b" origin/main \
+    && git push origin --delete "$b" \
+    || echo "跳过 $b：不是 main 的祖先或删除失败，原样报告"
+done
+git fetch --prune origin && git branch -r
+```
+
+也可以在 GitHub 网页的 Branches 页面逐个删除；GitHub 会提示哪些分支已合并。
 
 **为适配只保留 main 而改的代码**：
 - `.github/workflows/nat-streak.yml` 与 `netem-benchmark.yml` 原先的推送触发和运行条件只认 `dev/review-fixes-20261111`，分支删除后这两个证据工作流就再也不会运行。
@@ -197,7 +218,7 @@
 **今后的分支规则**（已写进 STATUS 与 HANDOFF）：
 - 仓库只保留 main；
 - 每批工作从 main 切出 `dev/batch-<字母>-<日期>`，推送后 CI 自动运行（`dev/**`）；
-- 复核通过后由集成者快进合入 main，再删除该分支；
+- 复核通过后由复核方快进合入 main，再由执行方删除该分支（复核方的会话不能删除远端分支，见上）；
 - 不强推。
 
 ---
@@ -217,7 +238,16 @@
 
 ## 7. 推送与 CI
 
-推送顺序、提交号与 main 上的 CI 结果在合并后补记（下一个文档提交）。
+- **推送**：`git push origin HEAD:refs/heads/main` 执行成功，`88c77e0..dc8a91b` 是快进，没有用 `--force`。
+  - `dc8a91b` 包含本文、审核文档第 4.5/7 节、STATUS、HANDOFF、AGENTS.md 的分支规则，以及两个工作流改动。
+  - 随后的补记提交（本节所在提交，见 `git log`）记录了：删除被拒、提交号、本节 CI 结果。
+- **PR #11**：main 快进后，GitHub 自动把它标记为已合并（merged_at 2026-11-14T04:45:40Z，合并提交即它的头提交 `a78d449`）。PR #12–#15 早已合入。
+- **分支删除**：被拒绝（HTTP 403），7 个分支保留，由 K0 删除，见第 5 节。
+- **main 上的 CI**（`dc8a91b`）：
+  - [已执行] CI run [43558234099](https://github.com/wmqfl861/AK-sending/actions/runs/43558234099)：12 项常规任务全部成功，包括 Rust ubuntu/windows、Flutter、Android、NAT 矩阵、legacy-signal、audit、deny、checks、portability×3；手动深测按设计跳过。
+  - [已执行] netem run [43558234106](https://github.com/wmqfl861/AK-sending/actions/runs/43558234106)：成功。这是工作流改为跟随 main 之后在 main 上的第一次运行。
+  - NAT 十轮 run [43558234150](https://github.com/wmqfl861/AK-sending/actions/runs/43558234150)：写本节时仍在运行（约 60 分钟），结果以 Actions 页面为准，由 K0 记入批次 K 交接。
+  - 旧 main（`88c77e0`）最后一次 CI（run 42952799527）是失败的，现已被上面的 run 取代。
 
 ---
 
@@ -225,7 +255,7 @@
 
 | 项 | 内容 | 依赖 | 验收 |
 |---|---|---|---|
-| K0 | 本地仓库切到 main：`git fetch --prune`，切换到 main 并 `git pull --ff-only`，删除本地旧分支与多余的 worktree；从 main 切出 `dev/batch-k-<日期>` 再开始工作 | — | `git branch -a` 只有 main 与本批分支；`git worktree list` 只有主目录 |
+| K0 | 删除第 5 节列出的 7 个远端分支（逐个先核对是 main 的祖先）；本地仓库切到 main：`git fetch --prune`，切换到 main 并 `git pull --ff-only`，删除本地旧分支与多余的 worktree；从 main 切出 `dev/batch-k-<日期>` 再开始工作 | — | `git branch -a` 只有 main 与本批分支；`git worktree list` 只有主目录 |
 | K1 | J1 余项（见下方说明） | K0 | 逐条"通过 / 不通过 / 现象"，与 J1 表同格式 |
 | K2 | CR-P3-20：去重（STATUS 短版、状态只在 §7、run 号只在交接）+ `check_repository.py` 机械校验与单测 | K0 | 见 CR-P3-20 验收 |
 | K3 | CR-P3-21：探测早退至少先发一轮再返回，修好不稳定测试 | K0 | 见 CR-P3-21 验收 |

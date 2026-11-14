@@ -25,7 +25,8 @@
 - **分支（2026-11-14 起）**：
   - 仓库只保留 main，main 是已复核的最新状态，**不是发布版**；
   - 每批在从 main 切出的 `dev/batch-<字母>-<日期>` 上工作，推送后 CI 自动运行；
-  - 复核通过后由复核方快进合入 main，并删除该分支；不强推。
+  - 复核通过后由复核方快进合入 main，再由执行方删除该分支；不强推。
+  - 2026-11-14 合并时，7 个旧分支（均已包含在 main 中）因复核方会话的 git 代理拒绝删除（HTTP 403）而暂时保留，由本地 agent 在 K0 删除，命令见 [批次 J 复核](REVIEW_2026-11-14-batchJ.zh-CN.md) 第 5 节。
 - **待所有者**：
   - E5 签名密钥；E6 服务器部署、防火墙与线上版本核实；E7 LICENSE；
   - CR-P3-03 域名与钉扎轮换；CR-P3-05 SSH 密钥。
@@ -40,7 +41,7 @@
 
 ## 最新验证
 
-- main 合并后 CI：运行中，结果补记在 [批次 J 复核](REVIEW_2026-11-14-batchJ.zh-CN.md) 第 7 节。
+- main（`dc8a91b`）：CI run [43558234099](https://github.com/wmqfl861/AK-sending/actions/runs/43558234099) 12 项常规任务全部成功；netem run [43558234106](https://github.com/wmqfl861/AK-sending/actions/runs/43558234106) 成功；NAT 十轮 run [43558234150](https://github.com/wmqfl861/AK-sending/actions/runs/43558234150) 推送时仍在运行，结果由 K0 记入批次 K 交接。
 - 开发分支最后一次 CI：run [43544631036](https://github.com/wmqfl861/AK-sending/actions/runs/43544631036)（`4f604bc`），12 项常规任务成功，手动深测按设计跳过。
 - NAT 十轮：run [43538159455](https://github.com/wmqfl861/AK-sending/actions/runs/43538159455)（`ad975c0`），10/10 轮、40/40 目标案例 pass-v4（模拟）。
 - netem A/B：run [43466913049](https://github.com/wmqfl861/AK-sending/actions/runs/43466913049)（`8ef4a07`），RTT≈200 ms 下 8 MiB 窗口 23.0 MiB/s，默认窗口 5.7 MiB/s（回环加人工时延）。

@@ -17,13 +17,13 @@
   - 200 MiB 辅助传输超测试 4 分钟预算未完成；8 MiB 辅助 runner 整体退出 1（漏采速度行），暗色传输未跑，不能把整套 runner 记为通过。
   - SafeArea `0e1f793`、走查/重启 runner `a9bd53c` 已入库。SafeArea 标准 main 新 APK 构建/安装退出码 0，但复拍首帧期间 emulator 与 services 收到外部 stopped 通知（非执行者发起，来源未知），未重启；Splash 不能作视觉通过证据。自有进程及 17200/17101 无残留，AVD 390dp 覆盖未恢复（原 1080×2400、density420、自动旋转 1 已仓外记录）。
   - 十项明细保留在 [批次 J 交接 §2.1](HANDOFF-BATCH-J-2026-11-13.zh-CN.md)；原清单见 [U1 交接](HANDOFF-CLIENT-UI-U1-2026-11-13.zh-CN.md)。同机行为、视觉、辅助流程与 C4 真实跨 NAT 分别验收。
-- **J2 / CR-P3-15：代码及最终全量本地门禁通过，Linux矩阵验收受阻**。Rust `c60512b`、闲置 UI `6e576d6` 已入库；本地 Rust 1199 通过/0 失败/8 ignored，fmt/clippy/rustdoc/release 退出码均 0，Python 94/94、契约 5/5、Flutter 208/208、Dart 170/170。J5 工具 `fb19a01` 已入库；固定 `534f145` 的十轮首跑在第一轮超时，完成计数0/10。普通CI的NAT任务也在对称NAT案例等待至超时取消，其余11项常规任务成功。正在修复已复现的矩阵进程生命周期问题，修复后的实际验收尚未完成。
+- **J2 / CR-P3-15：已完成**。Rust `c60512b`、闲置 UI `6e576d6`、矩阵修复 `593b473` 已入库；最终快照本地全量门禁通过（Rust 1199/0/8、fmt/clippy/rustdoc、契约5/5、Python105/105、Flutter208/208、Dart170/170）。**J5 十轮验收于 `ad975c0` 达成**：run 43538159455 十轮全部通过（10/10 轮、40/40 目标案例 pass-v4），`decline-retry-40s` 每轮实测重试间隔 40000–40001ms、字节一致；普通 CI 43538159415 同时全绿（12 项成功/1 手动跳过）。首轮 534f145 的失败保留为历史时点。
 - **J3 / CR-P3-16：已完成于 `8ef4a07`**。精确独立快照完整本地门禁通过；CI run 43466913061 的 12 项常规任务成功、手动深测跳过，Android 双 ABI 发布库无 AK_EXP_ 步骤实际执行成功；netem run 43466913049 成功，Windows 默认 DLL 本地扫描无 AK_EXP_。后续集成版本另按其 run 验证。
 - **CR-P1-07、CR-P1-08：代码达标，验收进行中，不关闭**。
   - H/I 复核时三个新案例 6/10 属历史；J0/J4 两 run 的 late-send-5s、late-send-40s、recv-no-lowttl 均 pass-v4、8 MiB byte-identical，不拼接计入本批十轮。
-  - **J5 首轮失败，0/10**：固定 SHA `534f145` 的独立顺序十轮 run 43470613025 已结束，首轮退出124、目标成功0/40，后续轮未运行。失败产物保留，命名空间名称检查无残留。普通CI原始日志确认前三案通过，进入symm-symm后等待至任务取消；新receiver函数包装层的PID/等待与TERM处理缺陷已在无网络Bash实验复现，修复与Linux重验进行中。
+  - **J5 十轮验收达成**：`ad975c0` 的独立 run 43538159455 全部通过（10/10 轮、40/40 目标案例 pass-v4、`decline-retry-40s` 每轮实测 40000–40001ms、字节一致、命名空间清理零残留）。首轮 `534f145` 的 43470613025 失败保留为修复前历史；修复 `593b473` 的进程生命周期回归 11/11 通过。
   - CR-P1-08 的 Windows IPv4 头 `IP_TTL` 抓包仍未取得，由所有者在 C4 执行；单测和 Linux 矩阵不能替代。
-- **J6：失败证据回写与最终一致性核验中**。首跑失败和J1部分验收如实保留；STATUS、审核§7及交接§0/§5仍须在修复验收后逐行核对，尚未声明最终一致性完成。J7 / CR-P3-19 本轮不实现。
+- **J6：三者一致性已核**。STATUS 当前状态＋最新验证 → 审核 §7 每行 → 交接 §0/§5 逐行对照完成。J7 / CR-P3-19 本轮不实现。
 - **C4 未就绪：仍待 J1、J2、J5 实际完成后，由所有者执行**。J1 尚有视觉与 Android 流程未过，即使 J2/J5 后续成功也不能宣告 ready；Windows TTL 抓包仍属 C4。E6 可并行准备，实际 C4 仍需所有者部署及版本/外部连通验证。
 - **E1–E4 已决定且各自工程动作有历史证据**：E1 特性隔离/旧 Dart 层删除（1c95d38、fc53613）；E2 确认窗口 120 s（aa7f3af）；E3 文案（e1ba8b1，UPnP 等仍暂不启用）；E4 删除 MANIFEST.sha256（951b44e）。旧 Rust 代码是否彻底删除按一个发布周期后再评估，不是 E6 后自动删除。
 - **待所有者**：E5 签名密钥（正式命名/版本统一与签名验证仍见 CR-P2-02）；E6 服务器部署、防火墙及线上版本核实；E7 LICENSE；CR-P3-03 域名/钉扎轮换；CR-P3-05 SSH 密钥。E5、域名及 SSH 密钥事项不作为新增 C4 前置。
@@ -43,8 +43,10 @@
 | J4 钩子语义 | `aee55e0` | [43444609038](https://github.com/wmqfl861/AK-sending/actions/runs/43444609038) | 12 success；手动 release-deep-tests skipped |
 | J3 特性隔离 | `8ef4a07` | [43466913061](https://github.com/wmqfl861/AK-sending/actions/runs/43466913061) | 12 success；Android双ABI开关字符串检查success；手动深测skipped |
 | J3 netem 特性构建 | `8ef4a07` | [43466913049](https://github.com/wmqfl861/AK-sending/actions/runs/43466913049) | 特权Linux netem任务success，保留模拟定位 |
-| 最终集成首跑 | `534f145` | [43470613069](https://github.com/wmqfl861/AK-sending/actions/runs/43470613069) | 11项常规任务success；NAT任务超时cancelled，整体cancelled；手动深测skipped |
-| J5固定SHA十轮首跑 | `534f145` | [43470613025](https://github.com/wmqfl861/AK-sending/actions/runs/43470613025) | failure，首轮exit124，完成0/10、目标成功0/40；命名空间名称检查无残留，后续轮停止 |
+| 修复后集成CI | `ad975c0` | [43538159415](https://github.com/wmqfl861/AK-sending/actions/runs/43538159415) | 12项常规任务success；手动深测skipped |
+| **J5十轮验收** | `ad975c0` | [43538159455](https://github.com/wmqfl861/AK-sending/actions/runs/43538159455) | **10/10轮全部通过、40/40目标pass-v4；decline-retry每轮实测≥40s；零残留** |
+| 首跑（修复前） | `534f145` | [43470613025](https://github.com/wmqfl861/AK-sending/actions/runs/43470613025) | failure，0/10（历史时点，保留为修复前记录） |
+| 集成首跑（修复前） | `534f145` | [43470613069](https://github.com/wmqfl861/AK-sending/actions/runs/43470613069) | cancelled（历史时点） |
 
 - J0/J4 两 run 各自成功的 12 项：Rust Ubuntu/Windows、Flutter、Android、audit、deny、checks、legacy-signal、portability×3、NAT 矩阵。release-deep-tests 的 skipped 不记为执行通过。
 - J0/J4 两 run 原三个新 NAT 案例（late-send-5s、late-send-40s、recv-no-lowttl）均 pass-v4、8 MiB byte-identical；这些基线证据不计入 J5 固定 `534f145` 的顺序十轮。

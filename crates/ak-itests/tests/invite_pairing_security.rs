@@ -788,6 +788,18 @@ async fn revoke_after_pairing_preserves_books_and_admits_further_sends() {
         "--registry-fp",
         &fp,
     ]);
+    // CI-flake fix (run 43601899282, job 132468237206): wait for the
+    // OWNER's listening line BEFORE the redeemer exists. Listening is
+    // emitted only after identity load -> shared registry TLS connect ->
+    // the --pairing orchestrator adopted the persisted code -> receiver
+    // bind, so the redeemer's 90 s redeem window
+    // (PairingOrchestrator::with_defaults, not adjustable from the CLI)
+    // then covers only the pairing flow itself, not the owner's cold
+    // start on a loaded runner. Same slow-runner class as the
+    // run-43273272597 ceiling raise: harness ordering only, no semantic
+    // assertion touched.
+    let a_listening = a_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(180));
+    let a_fp = json_string(&a_listening, "fingerprint").expect("a fingerprint");
     let mut b_daemon = Proc::spawn(&[
         "daemon",
         "--id-dir",
@@ -813,10 +825,6 @@ async fn revoke_after_pairing_preserves_books_and_admits_further_sends() {
     let b_port =
         u16::try_from(json_number(&b_listening, "port").expect("b port")).expect("port fits u16");
     let b_fp = json_string(&b_listening, "fingerprint").expect("b fingerprint");
-    // Same ceiling logic: the waiter returns instantly once the line is
-    // buffered, so this only matters on genuinely slow startups.
-    let a_listening = a_daemon.wait_stdout("\"type\":\"listening\"", Duration::from_secs(180));
-    let a_fp = json_string(&a_listening, "fingerprint").expect("a fingerprint");
 
     // One real transfer through the paired chain.
     let payload: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 251) as u8).collect();

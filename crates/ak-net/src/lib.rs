@@ -1201,13 +1201,14 @@ pub mod holepunch {
     ///   LATER candidate does NOT end the round (the round's job is
     ///   ordering the dial list; the head confirming is the one outcome
     ///   where further observation cannot change the order's leader);
-    /// * the exit can never fire before this side has SENT at least one
-    ///   probe burst: the shared loop sends its first burst before it
-    ///   ever polls the socket, so a confirmation that was already
-    ///   buffered when the round started is consumed only after that
-    ///   burst went out (CR-P3-21, review 2026-11-14 §4) — a peer
-    ///   running a plain probe round in parallel is thus guaranteed to
-    ///   observe our probe before we bail;
+    /// * the exit can never fire before this side has ATTEMPTED to send at
+    ///   least one probe burst: the shared loop sends its first burst
+    ///   before it ever polls the socket, so a confirmation that was
+    ///   already buffered when the round started is consumed only after
+    ///   that burst went out (CR-P3-21, review 2026-11-14 §4) — a peer
+    ///   running a plain probe round in parallel gets our first burst
+    ///   before we bail, modulo UDP loss and transient send errors this
+    ///   side skips over;
     /// * with no confirmation the window still runs to its deadline —
     ///   callers that only learn reachability from the report keep the
     ///   full-window semantics verbatim.

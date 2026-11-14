@@ -123,7 +123,7 @@ Linux 部署脚本与公网测试脚本存在安装、旧版本路径、Paramiko
 | `c42bbf8` | K1：辅助 runner 速率行条件判定/流程重置/checkpoint 护栏；新增系统 SAF 混合驱动 runner |
 | （文档提交） | 本交接 §6/§7、STATUS、审核状态表修复轮行与 K 复核文档入库 |
 
-修复轮最终提交 CI：`b6296ea` run [43627058493](https://github.com/wmqfl861/AK-sending/actions/runs/43627058493) ——12 项常规任务全部 success（含 Windows workspace、Flutter gate、Repository checks），1 项手动 release 深测按设计 skipped。
+修复轮最终提交 CI：代码候选 `b6296ea` run [43627058493](https://github.com/wmqfl861/AK-sending/actions/runs/43627058493)——12 项常规任务全部 success（含 Windows workspace、Flutter gate、Repository checks），1 项手动 release 深测按设计 skipped；其后的 run 号记录提交 `9797c1b`（仅文档 2 行）run [43629054632](https://github.com/wmqfl861/AK-sending/actions/runs/43629054632) 同样整体 success。本行所在的再次记录提交亦为纯文档（Repository checks 本地 exit 0），不改代码与证据事实。
 
 修复轮本地门禁（新候选）：fmt/clippy/rustdoc exit 0；Rust workspace 1200 passed、0 failed、8 ignored（与被审快照的本地复跑一致）；Flutter analyze 零问题、单测全过（含新增 12 项 runner guard）；`check_repository.py` exit 0（STATUS 链接 K 交接）；契约 5/5；Python 135/135；两脚本 `bash -n`+自检全过。最终 CI run 号推送后由复核或执行方按流程补记。
 

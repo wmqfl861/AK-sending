@@ -63,7 +63,11 @@
 #
 # What a full run does (each phase prints "[deploy] phase N/7"):
 #   1. preflight: SSH backend, sudo, arch/os, existing-install discovery
-#      (units, --id-dir, registry data, UDP <stun-port> occupant)
+#      (units, --id-dir, registry data, UDP <stun-port> occupant). The remote
+#      script runs as the NON-ROOT SSH user, so EVERY read-only discovery
+#      probe (ss occupancy, /proc pid resolution, unit files, identity dirs)
+#      goes through the verified `sudo -n` path; occupancy that cannot be
+#      determined aborts BEFORE any switchover (K 复核 K2-R3)
 #   2. upload: `git archive` tarball of <commit> to /tmp; with --binary the
 #      prebuilt ak-cli goes to a DISTINCT /tmp staging path and must pass
 #      version + sha256 + executable checks BEFORE any service is stopped
@@ -74,18 +78,24 @@
 #   4. install: backup ak-cli + registry.key + registry.db to
 #      /opt/ak-sending/backup-<ts>/, install binary to /opt/ak-sending/ak-cli,
 #      system user `akreg`, data dir /opt/ak-sending/data (existing identity
-#      and database are preserved, never deleted); a failed binary switchover
-#      restarts the stopped services (best-effort) before aborting (K 复核 K-R1)
+#      and database are preserved, never deleted)
 #   5. systemd: ak-registry-server.service + ak-stun-server.service
 #      (templates from docs/OPERATIONS.zh-CN.md §0/§3); a legacy
 #      signal-server holding UDP <stun-port> is stopped+disabled with a
-#      rollback note (§0 migration step 2); TCP 7100 stay-open reminder
+#      rollback note (§0 migration step 2); TCP 7100 stay-open reminder.
+#      The WHOLE switchover (first stop through enable --now) is one
+#      protected unit: before anything is stopped the previous binary, unit
+#      files and each unit's enabled/active state are saved, and ANY failure
+#      restores the runnable old configuration and REPORTS the recovery
+#      outcome (K 复核 K2-N1; stop failures are never swallowed, K 复核 K2-R2)
 #   6. firewall: ufw allow <registry-port>/tcp + <stun-port>/udp when ufw is
 #      active; otherwise prints the cloud security-group checklist
 #   7. verify: units active, journal version lines, listening sockets,
-#      --version recorded, the RUNNING units' live executable + revision must
-#      match the deployed artifact (K 复核 K-R2), registry id exported to
-#      /opt/ak-sending/registry-id
+#      --version recorded, AND the RUNNING process itself verified per unit:
+#      MainPID resolved, its actual executable read via /proc/<PID>/exe
+#      (sudo readlink) and compared to the deployed binary — ExecStart is
+#      only configuration and is checked separately (K 复核 K-R2/K2-R2);
+#      registry id exported to /opt/ak-sending/registry-id
 #
 # Exit code 0 = success (or self-test PASS).
 
@@ -608,8 +618,35 @@ self_test() {
   grep -q 'oldregistry' "$WORK/p456.sh" || fail "old registry unit replace step missing"
   # The unit-backup loop must BAKE the discovered names (remote $vars would be
   # unset at loop time and the old unit files would never be backed up).
-  grep -q '^for u in ak-registry-server ak-stun-server oldregistry oldsignal; do$' "$WORK/p456.sh" \
-    || fail "unit-backup loop must bake the discovered old/legacy unit names"
+  grep -q '^SW_UNITS="ak-registry-server ak-stun-server oldregistry oldsignal"$' "$WORK/p456.sh" \
+    || fail "SW_UNITS must bake the discovered old/legacy unit names"
+  # K 复核 K2-R3: phase1 discovery must run through sudo -n and fail clearly
+  # when occupancy cannot be determined (behavioral proof in the Python suite).
+  grep -q 'sudo -n ss -ltnp' "$WORK/p1.sh" \
+    || fail "phase1 must probe TCP occupancy through sudo -n (K2-R3)"
+  grep -q 'sudo -n ss -lunp' "$WORK/p1.sh" \
+    || fail "phase1 must probe UDP occupancy through sudo -n (K2-R3)"
+  grep -q 'cannot determine TCP listeners' "$WORK/p1.sh" \
+    || fail "phase1 must fail clearly when occupancy is undeterminable (K2-R3)"
+  # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
+  # INSIDE do_switchover's unified recovery window (they used to run bare).
+  grep -q "^  sudo -n tee /etc/systemd/system/ak-registry-server.service >/dev/null <<'REGUNIT' || return 1$" "$WORK/p456.sh" \
+    || fail "the first unit write must be inside do_switchover's recovery window (K2-N1)"
+  grep -q "^  sudo -n tee /etc/systemd/system/ak-stun-server.service >/dev/null <<'STUNUNIT' || return 1$" "$WORK/p456.sh" \
+    || fail "the second unit write must be inside do_switchover's recovery window (K2-N1)"
+  grep -q 'sudo -n systemctl daemon-reload || return 1' "$WORK/p456.sh" \
+    || fail "daemon-reload must be inside do_switchover's recovery window (K2-N1)"
+  grep -q 'sudo -n systemctl enable --now ak-registry-server.service ak-stun-server.service || return 1' "$WORK/p456.sh" \
+    || fail "enable --now must be inside do_switchover's recovery window (K2-N1)"
+  grep -q 'systemctl stop ak-registry-server.service || return 1' "$WORK/p456.sh" \
+    || fail "a stop failure must abort into recovery, never be swallowed (K2-R2)"
+  grep -q 'RECOVERY INCOMPLETE' "$WORK/p456.sh" \
+    || fail "a failed recovery must be loudly reported (K2-N1)"
+  # K 复核 K2-R2: phase7 must verify the RUNNING process, not just config.
+  grep -q 'systemctl show -p MainPID' "$WORK/p7.sh" \
+    || fail "K2-R2: phase7 must resolve each unit's MainPID"
+  grep -q 'sudo -n readlink "/proc/\$pid/exe"' "$WORK/p7.sh" \
+    || fail "K2-R2: phase7 must read the running process's executable via /proc/<PID>/exe"
   echo "[self-test]   phase1/3/456/7 generated + bash -n clean"
 
   echo "[self-test] s7/8 ssh helper drains a fake channel (K 复核 K-R3)"
@@ -747,7 +784,7 @@ FAKEPY
     echo "[self-test]   no python available; helper drain harness skipped"
   fi
 
-  echo "[self-test] s8/8 K-R1/K-R2 install logic (staging, recovery, ExecStart)"
+  echo "[self-test] s8/8 K-R1/K2-N1/K2-R2 install logic (staging, unified recovery, ExecStart/MainPID)"
   # K 复核 K-R2: compose_registry_exec must keep the old line's ARGUMENTS but
   # rewrite the EXECUTABLE to the install path (execution, not greps).
   local c
@@ -784,10 +821,14 @@ FAKEPY
   grep -q 'refusing BEFORE service switchover' "$WORK/p456b.sh" \
     || fail "K-R1: pre-switchover version gate missing from the install script"
   grep -q 'recover_services' "$WORK/p456b.sh" \
-    || fail "K-R1: service-recovery path missing from the install script"
+    || fail "K-R1/K2-N1: service-recovery path missing from the install script"
+  grep -q 'RECOVERY OK' "$WORK/p456b.sh" \
+    || fail "K2-N1: recovery must report its outcome"
   grep -q 'systemctl show -p ExecStart' "$WORK/p7.sh" \
-    || fail "K-R2: phase7 must verify the running units' live executable"
-  echo "[self-test]   staging source != destination, guards + recovery baked, ExecStart rewrite verified"
+    || fail "K-R2: phase7 must check the units' configured executable"
+  grep -q 'systemctl show -p MainPID' "$WORK/p7.sh" \
+    || fail "K2-R2: phase7 must verify the RUNNING process via MainPID + /proc/<PID>/exe"
+  echo "[self-test]   staging source != destination, unified-recovery + outcome report baked, ExecStart/MainPID verified"
 
   echo "[self-test] PASS (nothing was contacted, nothing was deployed)"
   exit 0
@@ -811,13 +852,17 @@ echo "os: \$(uname -s) \$(uname -m)"
 echo "sudo: \$(sudo -n true >/dev/null 2>&1 && echo passwordless-ok || echo NEEDS-PASSWORD)"
 command -v gcc >/dev/null 2>&1 && echo "gcc: \$(gcc --version | head -1)" || echo "gcc: missing"
 command -v cargo >/dev/null 2>&1 && echo "cargo: \$(cargo --version)" || echo "cargo: missing (rustup will be installed)"
-[ -x $REMOTE_BIN ] && echo "existing-binary: yes" || echo "existing-binary: no"
-[ -x $REMOTE_BIN ] && echo "existing-version: \$($REMOTE_BIN --version 2>&1 || echo unreadable)"
+sudo -n test -x $REMOTE_BIN 2>/dev/null && echo "existing-binary: yes" || echo "existing-binary: no"
+sudo -n test -x $REMOTE_BIN 2>/dev/null && echo "existing-version: \$($REMOTE_BIN --version 2>&1 || echo unreadable)"
 for u in ak-registry-server ak-stun-server; do
-  if [ -f /etc/systemd/system/\$u.service ]; then
+  # K 复核 K2-R3: this script runs as the NON-ROOT SSH user; unit files under
+  # /etc/systemd/system may live in restricted trees, so the existence probe
+  # and the reads go through the verified sudo path like every other
+  # discovery probe in this phase.
+  if sudo -n test -f /etc/systemd/system/\$u.service 2>/dev/null; then
     echo "unit \$u: present"
-    sed -n 's/^ExecStart=/  ExecStart=/p' /etc/systemd/system/\$u.service
-    sed -n 's/^User=/  User=/p' /etc/systemd/system/\$u.service
+    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' /etc/systemd/system/\$u.service
+    sudo -n sed -n 's/^User=/  User=/p' /etc/systemd/system/\$u.service
     systemctl is-active \$u.service >/dev/null 2>&1 && echo "  active: yes" || echo "  active: no"
   else
     echo "unit \$u: absent"
@@ -826,36 +871,56 @@ done
 # Live listener on the registry port -> authoritative id-dir + old unit name
 # (the existing production unit name is NOT verified per docs §0/§3, so it is
 # discovered from the port, not assumed).
-reg_line=\$(ss -ltnp 2>/dev/null | grep -E "[:.]$REGISTRY_PORT\b" | head -1 || true)
+# K 复核 K2-R3: a NON-ROOT 'ss -p' cannot see other users' PIDs, so the old
+# bare probes reported "pid unknown / not-a-systemd-unit" for a foreign-user
+# registry and the deploy refused (or missed) a migratable old service. All
+# three occupancy probes now read ONE sudo-captured snapshot per family; if
+# occupancy CANNOT be determined the phase FAILS here — before any
+# switchover — instead of misreporting the ports as free.
+ss_tcp=\$(sudo -n ss -ltnp 2>/dev/null) \
+  || { echo "ERROR: cannot determine TCP listeners (sudo -n ss failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
+ss_udp=\$(sudo -n ss -lunp 2>/dev/null) \
+  || { echo "ERROR: cannot determine UDP sockets (sudo -n ss failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
+reg_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E "[:.]$REGISTRY_PORT\b" | head -1 || true)
 if [ -n "\$reg_line" ]; then
   reg_pid=\$(printf '%s' "\$reg_line" | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p')
-  reg_unit=\$( [ -n "\${reg_pid:-}" ] && awk -F/ '{print \$NF}' /proc/\$reg_pid/cgroup 2>/dev/null | grep '\\.service\$' | tail -1 || true)
+  reg_unit=\$( [ -n "\${reg_pid:-}" ] && sudo -n cat /proc/\$reg_pid/cgroup 2>/dev/null | awk -F/ '{print \$NF}' | grep '\\.service\$' | tail -1 || true)
   echo "port $REGISTRY_PORT/tcp: in use (pid \${reg_pid:-unknown}, unit \${reg_unit:-not-a-systemd-unit})"
-  [ -n "\${reg_pid:-}" ] && tr '\\0' ' ' < /proc/\$reg_pid/cmdline 2>/dev/null | sed 's/^/  cmdline: /' || true
-  if [ -n "\${reg_unit:-}" ] && [ "\$reg_unit" != "ak-registry-server.service" ] && [ -f "/etc/systemd/system/\$reg_unit" ]; then
+  [ -n "\${reg_pid:-}" ] && sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/^/  cmdline: /' || true
+  if [ -n "\${reg_unit:-}" ] && [ "\$reg_unit" != "ak-registry-server.service" ] && sudo -n test -f "/etc/systemd/system/\$reg_unit" 2>/dev/null; then
     echo "  old-registry-unit: \$reg_unit"
-    sed -n 's/^ExecStart=/  ExecStart=/p' "/etc/systemd/system/\$reg_unit"
-    sed -n 's/^User=/  old-registry-User=/p' "/etc/systemd/system/\$reg_unit"
+    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "/etc/systemd/system/\$reg_unit"
+    sudo -n sed -n 's/^User=/  old-registry-User=/p' "/etc/systemd/system/\$reg_unit"
   fi
 else
   echo "port $REGISTRY_PORT/tcp: free"
 fi
 # Live listener on the STUN port -> the §0 conflict check.
-stun_line=\$(ss -lunp 2>/dev/null | grep -E "[:.]$STUN_PORT\\b" | head -1 || true)
+stun_line=\$(printf '%s\\n' "\$ss_udp" | grep -E "[:.]$STUN_PORT\\b" | head -1 || true)
 if [ -n "\$stun_line" ]; then
   stun_pid=\$(printf '%s' "\$stun_line" | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p')
-  stun_unit=\$( [ -n "\${stun_pid:-}" ] && awk -F/ '{print \$NF}' /proc/\$stun_pid/cgroup 2>/dev/null | grep '\\.service\$' | tail -1 || true)
+  stun_unit=\$( [ -n "\${stun_pid:-}" ] && sudo -n cat /proc/\$stun_pid/cgroup 2>/dev/null | awk -F/ '{print \$NF}' | grep '\\.service\$' | tail -1 || true)
   echo "port $STUN_PORT/udp: in use (pid \${stun_pid:-unknown}, unit \${stun_unit:-not-a-systemd-unit})"
-  [ -n "\${stun_pid:-}" ] && tr '\\0' ' ' < /proc/\$stun_pid/cmdline 2>/dev/null | sed 's/^/  cmdline: /' || true
+  [ -n "\${stun_pid:-}" ] && sudo -n cat /proc/\$stun_pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/^/  cmdline: /' || true
 else
   echo "port $STUN_PORT/udp: free"
 fi
-sig_line=\$(ss -ltnp 2>/dev/null | grep -E '[:.]7100\b' | head -1 || true)
+sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 [ -n "\$sig_line" ] && echo "port 7100/tcp (legacy signal): in use" || echo "port 7100/tcp (legacy signal): free"
 # Registry identity/database discovery (never modified in this phase).
-for d in $REMOTE_DATA /home/*/.ak-sending /root/.ak-sending; do
-  if [ -e "\$d/registry.key" ] || [ -e "\$d/registry.db" ]; then
-    echo "registry-data: \$d (key:\$([ -e \$d/registry.key ] && echo yes || echo no) db:\$([ -e \$d/registry.db ] && echo yes || echo no))"
+# K 复核 K2-R3: private identity dirs (root-owned key/db under a private
+# home) read as NONEXISTENT to the bare non-root '[ -e ]' probes, so the
+# identity/database state could silently read "none found". Enumerate the
+# homes and probe key/db existence through sudo; a dir that is genuinely
+# absent still reports nothing (passwordless sudo was verified above).
+home_ak_dirs=\$(sudo -n ls -1 /home 2>/dev/null | sed 's|^|/home/|; s|\$|/.ak-sending|' || true)
+for d in $REMOTE_DATA /root/.ak-sending \$home_ak_dirs; do
+  if sudo -n test -d "\$d" 2>/dev/null; then
+    k=no; sudo -n test -e "\$d/registry.key" 2>/dev/null && k=yes
+    db=no; sudo -n test -e "\$d/registry.db" 2>/dev/null && db=yes
+    if [ "\$k" = yes ] || [ "\$db" = yes ]; then
+      echo "registry-data: \$d (key:\$k db:\$db)"
+    fi
   fi
 done
 # K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
@@ -875,7 +940,9 @@ else
     echo "ERROR: sudo -n cannot create $REMOTE_BASE (parent not sudo-writable)"
   fi
 fi
-command -v ufw >/dev/null 2>&1 && echo "ufw: \$(ufw status 2>/dev/null | head -1)" || echo "ufw: absent"
+# K 复核 K2-R3: 'ufw status' is a read-only discovery probe that needs root;
+# non-root it fails and would misreport the firewall as absent.
+command -v ufw >/dev/null 2>&1 && echo "ufw: \$(sudo -n ufw status 2>/dev/null | head -1)" || echo "ufw: absent"
 echo "disk-free /opt: \$(df -h /opt 2>/dev/null | tail -1 | awk '{print \$4}')"
 exit 0
 EOF
@@ -953,25 +1020,46 @@ sudo -n install -d -m 0755 -o $SERVICE_USER -g $SERVICE_USER $REMOTE_BASE $REMOT
 
 # --- backup current state (§3 step 1; the only rollback path across a
 # --- schema migration, §4) ------------------------------------------------
+# K 复核 K2-N1: EVERYTHING the unified recovery may need is saved HERE, i.e.
+# BEFORE the first systemctl stop — previous binary, previous unit files and
+# (step 1 of do_switchover) each unit's enabled/active state. SW_UNITS bakes
+# the discovered old/legacy unit NAMES at generation time (remote \$vars would
+# be unset at loop time and the old unit files would never be backed up);
+# \$u/\$f are the only remote variables in this section.
+SW_UNITS="ak-registry-server ak-stun-server${OLD_REGISTRY_UNIT:+ $OLD_REGISTRY_UNIT}${LEGACY_UNIT:+ $LEGACY_UNIT}"
 BACKUP=$REMOTE_BASE/backup-\$TS
 sudo -n install -d -m 0700 -o $SERVICE_USER -g $SERVICE_USER "\$BACKUP"
-[ -f $REMOTE_BIN ] && sudo -n cp -a $REMOTE_BIN "\$BACKUP/ak-cli" && echo "[install] backup: binary -> \$BACKUP/ak-cli"
+# K 复核 K2-R3: every existence probe below runs through sudo -n. This script
+# runs as the NON-ROOT SSH user; a private tree (root-owned binary, private
+# identity dir) must read as EXISTING to the deploy, never silently absent.
+# K 复核 K2-N1: recovery below DEPENDS on these backups — a failed backup
+# aborts BEFORE any service is stopped (a silent backup failure would make
+# the later recovery worthless).
+if sudo -n test -f $REMOTE_BIN 2>/dev/null; then
+  sudo -n cp -a $REMOTE_BIN "\$BACKUP/ak-cli" \
+    || { echo "ERROR: cannot back up binary $REMOTE_BIN to \$BACKUP; refusing BEFORE service switchover" >&2; exit 5; }
+  echo "[install] backup: binary -> \$BACKUP/ak-cli"
+fi
 for f in registry.key registry.db; do
-  [ -f "$REMOTE_DATA/\$f" ] && sudo -n cp -a "$REMOTE_DATA/\$f" "\$BACKUP/\$f" && echo "[install] backup: \$f -> \$BACKUP/\$f"
+  if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
+    sudo -n cp -a "$REMOTE_DATA/\$f" "\$BACKUP/\$f" \
+      || { echo "ERROR: cannot back up \$f to \$BACKUP; refusing BEFORE service switchover" >&2; exit 5; }
+    echo "[install] backup: \$f -> \$BACKUP/\$f"
+  fi
 done
-# Unit files that are about to be replaced/retired are backed up verbatim.
-# The old/legacy unit NAMES are baked in at generation time (they are simple
-# unit names, no quoting hazards); \$u is the only remote variable here.
-for u in ak-registry-server ak-stun-server${OLD_REGISTRY_UNIT:+ $OLD_REGISTRY_UNIT}${LEGACY_UNIT:+ $LEGACY_UNIT}; do
-  [ -f "/etc/systemd/system/\$u.service" ] && sudo -n cp -a "/etc/systemd/system/\$u.service" "\$BACKUP/\$u.service" \
-    && echo "[install] backup: unit \$u.service -> \$BACKUP"
+for u in \$SW_UNITS; do
+  if sudo -n test -f "/etc/systemd/system/\$u.service" 2>/dev/null; then
+    sudo -n cp -a "/etc/systemd/system/\$u.service" "\$BACKUP/\$u.service" \
+      || { echo "ERROR: cannot back up unit \$u.service to \$BACKUP; refusing BEFORE service switchover" >&2; exit 5; }
+    echo "[install] backup: unit \$u.service -> \$BACKUP"
+  fi
 done
 
 # --- preserve/migrate registry identity + database ------------------------
 DATA_SOURCE=${DATA_SOURCE_DIR:-}
 if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ]; then
   for f in registry.key registry.db; do
-    if [ -f "\$DATA_SOURCE/\$f" ] && [ ! -f "$REMOTE_DATA/\$f" ]; then
+    if sudo -n test -f "\$DATA_SOURCE/\$f" 2>/dev/null && ! sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
       sudo -n cp -a "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f"
       echo "[install] migrated identity/db: \$DATA_SOURCE/\$f -> $REMOTE_DATA/\$f (source kept)"
     fi
@@ -979,67 +1067,120 @@ if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ]; then
 fi
 sudo -n chown -R $SERVICE_USER:$SERVICE_USER $REMOTE_DATA
 sudo -n chmod 700 $REMOTE_DATA
-[ -f $REMOTE_DATA/registry.key ] && sudo -n chmod 600 $REMOTE_DATA/registry.key
+sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null && sudo -n chmod 600 $REMOTE_DATA/registry.key
 
-# --- install the new binary (K 复核 K-R1) ------------------------------------
+# --- service switchover under UNIFIED failure recovery (K 复核 K2-N1) --------
 # Everything above only read state or created new files. From the first
-# systemctl stop until enable --now this script owns STOPPED services: with
-# plain set -e, ANY failure in between would exit and leave the services down
-# (that is exactly how the old same-file install failure stranded the box).
-# do_switchover therefore runs under an explicit if ! guard with per-step
-# error returns, and every failure calls recover_services FIRST (best-effort
-# restart of what was stopped, previous binary restored when it was already
-# moved away) before exiting non-zero.
+# systemctl stop until enable --now this script owns STOPPED services.
+# K 复核 K2-N1: the previous repair protected ONLY the binary install — its
+# recovery branch ended before the legacy stop, the unit writes, the
+# daemon-reload and the enable --now, which kept running bare under set -e.
+# A failure at the FIRST unit write therefore left both services stopped
+# with nothing started again (the review reproduced exactly that against the
+# real generated install script). The ENTIRE switchover now lives inside
+# do_switchover behind an 'if !' guard, and ANY failure in it runs
+# recover_services first: previous binary back, previous unit files back,
+# daemon-reload, re-enable/re-start what was enabled/active before.
 OLD_REGISTRY_UNIT=${OLD_REGISTRY_UNIT:-}
+LEGACY_UNIT=${LEGACY_UNIT:-}
+sw_state=""
 recover_services() {
-  echo "[install] switchover failed; recovering services (best-effort, previous state)" >&2
-  if [ ! -f $REMOTE_BIN ] && [ -f $REMOTE_BASE/ak-cli.old-\$TS ]; then
-    echo "[install] restoring previous binary from ak-cli.old-\$TS" >&2
-    sudo -n mv $REMOTE_BASE/ak-cli.old-\$TS $REMOTE_BIN 2>/dev/null || true
+  # K 复核 K2-N1: restore a runnable OLD configuration and REPORT the
+  # outcome — a failed recovery is reported loudly, never silently
+  # swallowed. (The old code had no recovery at all; the pre-K2 repair only
+  # restored the binary, and only when the destination was missing.)
+  local rc=0 u en ac entry rest
+  echo "[install] switchover failed; RECOVERING previous service state (captured: \$sw_state)" >&2
+  if [ -f $REMOTE_BASE/ak-cli.old-\$TS ]; then
+    echo "[install] recovery: previous binary ak-cli.old-\$TS -> $REMOTE_BIN" >&2
+    sudo -n mv -f $REMOTE_BASE/ak-cli.old-\$TS $REMOTE_BIN 2>/dev/null || rc=1
   fi
   sudo -n rm -f $REMOTE_BASE/ak-cli.new 2>/dev/null || true
-  if [ -n "\$OLD_REGISTRY_UNIT" ] && [ "\$OLD_REGISTRY_UNIT" != "ak-registry-server.service" ]; then
-    sudo -n systemctl start "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+  for u in \$SW_UNITS; do
+    if sudo -n test -f "\$BACKUP/\$u.service" 2>/dev/null; then
+      sudo -n cp -a "\$BACKUP/\$u.service" "/etc/systemd/system/\$u.service" 2>/dev/null || rc=1
+    fi
+  done
+  # Fresh-install rollback: when NO previous unit file existed for the two
+  # managed units, remove whatever this failed switchover had already
+  # written, so the disk returns to the pre-deploy state.
+  for u in ak-registry-server ak-stun-server; do
+    if ! sudo -n test -f "\$BACKUP/\$u.service" 2>/dev/null \\
+       && sudo -n test -f "/etc/systemd/system/\$u.service" 2>/dev/null; then
+      sudo -n rm -f "/etc/systemd/system/\$u.service" 2>/dev/null || rc=1
+    fi
+  done
+  sudo -n systemctl daemon-reload 2>/dev/null || rc=1
+  for entry in \${sw_state//;/ }; do
+    u=\${entry%%:*}; rest=\${entry#*:}; en=\${rest%%:*}; ac=\${rest##*:}
+    if [ "\$en" = enabled ]; then
+      sudo -n systemctl enable "\$u.service" >/dev/null 2>&1 || rc=1
+    fi
+    if [ "\$ac" = active ]; then
+      sudo -n systemctl start "\$u.service" 2>/dev/null || rc=1
+    fi
+  done
+  if [ "\$rc" = 0 ]; then
+    echo "[install] RECOVERY OK: previous units restored, re-enabled/re-started what was enabled/active before (state: \$sw_state)" >&2
   else
-    sudo -n systemctl start ak-registry-server.service 2>/dev/null || true
+    echo "ERROR: RECOVERY INCOMPLETE — services may still be down; manual restore required from \$BACKUP (captured state: \$sw_state)" >&2
   fi
-  sudo -n systemctl start ak-stun-server.service 2>/dev/null || true
+  return "\$rc"
 }
 do_switchover() {
-  sudo -n systemctl stop ak-registry-server.service 2>/dev/null || true
-  sudo -n systemctl stop ak-stun-server.service 2>/dev/null || true
-  if [ -n "\$OLD_REGISTRY_UNIT" ] && [ "\$OLD_REGISTRY_UNIT" != "ak-registry-server.service" ]; then
+  # NOTE: this function is invoked via 'if ! do_switchover', so set -e is
+  # SUSPENDED for its whole body — every step therefore carries an explicit
+  # '|| return 1'; a bare failing step would otherwise be silently ignored,
+  # which is worse than aborting into recovery.
+  # 1) capture each affected unit's enabled/active state BEFORE any stop
+  #    (K 复核 K2-N1: recovery restarts exactly what was running before).
+  sw_state=""
+  for u in \$SW_UNITS; do
+    en=\$(sudo -n systemctl is-enabled "\$u.service" 2>/dev/null) || en=""
+    [ -n "\$en" ] || en=unknown
+    ac=\$(sudo -n systemctl is-active "\$u.service" 2>/dev/null) || ac=""
+    [ -n "\$ac" ] || ac=unknown
+    sw_state="\$sw_state\$u:\$en:\$ac;"
+  done
+  echo "[install] switchover begins; captured unit state: \$sw_state"
+  # 2) stop. K 复核 K2-R2: a stop failure is NOT swallowed. The old code
+  #    '|| true'd it, kept deploying, and enable --now then no-opped on the
+  #    still-active old process (running the OLD inode) while the disk path
+  #    already reported the new version. Now any stop failure returns 1 and
+  #    the unified recovery re-asserts the previous state before aborting.
+  sudo -n systemctl stop ak-registry-server.service || return 1
+  sudo -n systemctl stop ak-stun-server.service || return 1
+  if [ -n "\$OLD_REGISTRY_UNIT" ]; then
     echo "[install] stopping old registry unit \$OLD_REGISTRY_UNIT (replaced by ak-registry-server.service; unit file kept in \$BACKUP)"
-    sudo -n systemctl stop "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
+    sudo -n systemctl stop "\$OLD_REGISTRY_UNIT" || return 1
     sudo -n systemctl disable "\$OLD_REGISTRY_UNIT" 2>/dev/null || true
   fi
+  # §0 step 2: retire a legacy signal-server that owns UDP $STUN_PORT. The
+  # handover belongs INSIDE the protected window (K 复核 K2-N1): outside it,
+  # a later failure could leave the legacy unit stopped with nothing owning
+  # the port.
+  if [ -n "\$LEGACY_UNIT" ]; then
+    echo "[install] stopping legacy unit \$LEGACY_UNIT (UDP $STUN_PORT handover to stun-server; §0)"
+    sudo -n systemctl stop "\$LEGACY_UNIT" || return 1
+    sudo -n systemctl disable "\$LEGACY_UNIT" 2>/dev/null || true
+    echo "[install] rollback for this step = systemctl stop ak-stun-server && systemctl start \$LEGACY_UNIT"
+  fi
+  # 3) binary swap (K 复核 K-R1: staging source != destination, verified
+  #    above BEFORE anything was stopped).
   sudo -n install -m 0755 "\$SRC_BIN" $REMOTE_BASE/ak-cli.new || return 1
   [ -f $REMOTE_BIN ] && sudo -n mv $REMOTE_BIN $REMOTE_BASE/ak-cli.old-\$TS || true
   sudo -n mv $REMOTE_BASE/ak-cli.new $REMOTE_BIN || return 1
   sudo -n chmod 755 $REMOTE_BIN || return 1
   echo "[install] installed: $REMOTE_BIN (\$($REMOTE_BIN --version 2>&1 || echo version-unreadable))"
-}
-if ! do_switchover; then
-  recover_services
-  echo "ERROR: binary switchover failed; recovery attempted (see lines above; backup in \$BACKUP)" >&2
-  exit 5
-fi
-
-# --- §0 step 2: retire a legacy signal-server that owns UDP $STUN_PORT ----
-LEGACY_UNIT=${LEGACY_UNIT:-}
-if [ -n "\$LEGACY_UNIT" ]; then
-  echo "[install] stopping legacy unit \$LEGACY_UNIT (UDP $STUN_PORT handover to stun-server; §0)"
-  sudo -n systemctl stop "\$LEGACY_UNIT"
-  sudo -n systemctl disable "\$LEGACY_UNIT" 2>/dev/null || true
-  echo "[install] rollback for this step = systemctl stop ak-stun-server && systemctl start \$LEGACY_UNIT"
-fi
-
-# --- systemd units ----------------------------------------------------------
-# Unit bodies are inlined as single-level quoted heredocs: every \$-free var
-# below is expanded at GENERATION time (this outer heredoc is unquoted), so
-# the remote script writes the final text verbatim. Never nest \$(...) or
-# \$(cat <<...) here — the outer heredoc would execute it locally.
-sudo -n tee /etc/systemd/system/ak-registry-server.service >/dev/null <<'REGUNIT'
+  # 4) unit writes. K 复核 K2-N1: these used to run BARE under set -e AFTER
+  #    the recovery branch had already ended — a failure at the FIRST unit
+  #    write left both services stopped with nothing started again.
+  #    Unit bodies are inlined as single-level quoted heredocs: every \$-free
+  #    var below is expanded at GENERATION time (this outer heredoc is
+  #    unquoted), so the remote script writes the final text verbatim. Never
+  #    nest \$(...) or \$(cat <<...) here — the outer heredoc would execute it
+  #    locally.
+  sudo -n tee /etc/systemd/system/ak-registry-server.service >/dev/null <<'REGUNIT' || return 1
 [Unit]
 Description=AK-sending v2 pairing registry (coordination only, ADR-001)
 After=network-online.target
@@ -1059,7 +1200,7 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 REGUNIT
-sudo -n tee /etc/systemd/system/ak-stun-server.service >/dev/null <<'STUNUNIT'
+  sudo -n tee /etc/systemd/system/ak-stun-server.service >/dev/null <<'STUNUNIT' || return 1
 [Unit]
 Description=AK-sending standalone STUN responder (binding only, ADR-001)
 After=network-online.target
@@ -1078,12 +1219,24 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 STUNUNIT
-echo "[install] units written: ak-registry-server.service (ReadWritePaths=$REG_RW), ak-stun-server.service"
-sudo -n systemctl daemon-reload
-sudo -n systemctl enable --now ak-registry-server.service ak-stun-server.service
+  echo "[install] units written: ak-registry-server.service (ReadWritePaths=$REG_RW), ak-stun-server.service"
+  # 5) reload + start (still inside the protected window; enable --now does
+  #    NOT restart an already-active unit, which is why step 2 must not
+  #    tolerate stop failures — K 复核 K2-R2).
+  sudo -n systemctl daemon-reload || return 1
+  sudo -n systemctl enable --now ak-registry-server.service ak-stun-server.service || return 1
+  return 0
+}
+if ! do_switchover; then
+  recover_services || true
+  echo "ERROR: service switchover failed; recovery attempted (outcome reported above; backup in \$BACKUP)" >&2
+  exit 5
+fi
 
 # --- firewall (§6): TCP $REGISTRY_PORT + UDP $STUN_PORT ---------------------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+# K 复核 K2-R3: 'ufw status' needs root; probed through sudo like every
+# other read-only discovery so an inactive firewall is not silently assumed.
+if command -v ufw >/dev/null 2>&1 && sudo -n ufw status 2>/dev/null | grep -q 'Status: active'; then
   sudo -n ufw allow $REGISTRY_PORT/tcp comment 'ak-registry TLS'
   sudo -n ufw allow $STUN_PORT/udp comment 'ak-stun'
   echo "[firewall] ufw: allowed $REGISTRY_PORT/tcp + $STUN_PORT/udp"
@@ -1121,21 +1274,40 @@ echo "tcp $REGISTRY_PORT + udp $STUN_PORT listening"
 echo "--- versions (record in the deploy ticket) ---"
 $REMOTE_BIN registry-server --version
 $REMOTE_BIN stun-server --version
-# K 复核 K-R2: prove the RUNNING services execute the deployed binary. An
-# old unit's ExecStart used to be preserved verbatim, so systemd could keep
-# running e.g. /usr/local/bin/ak-cli while the lines above checked the NEW
-# path and the deploy reported success. systemctl show exposes each unit's
-# live executable; its path AND its --version must match the deploy.
+# K 复核 K-R2/K2-R2: prove the RUNNING PROCESS executes the deployed binary.
+# ExecStart is only the unit's CONFIGURATION: the old check read that
+# configured path and ran --version on it, while an old process (stop
+# failure swallowed, then enable --now no-opping on the still-active unit)
+# kept running the OLD inode — the disk path reported the new version and
+# both install and verify exited 0 in exactly that state (reviewed
+# counterexample). The decisive proof is per unit: resolve MainPID, read the
+# process's actual executable via /proc/<PID>/exe (sudo readlink: the unit
+# runs as the dedicated service user and this script's SSH user cannot
+# readlink another user's /proc/<PID>/exe), and compare it to the deployed
+# binary.
 for u in ak-registry-server ak-stun-server; do
+  # (a) configuration sanity: what the unit is CONFIGURED to run, and the
+  #     version that configured file reports.
   live_exe=\$(systemctl show -p ExecStart \$u.service 2>/dev/null | head -1 | sed -n 's/^ExecStart={[ ]*path=\\([^;]*\\).*/\\1/p' | sed 's/[[:space:]]*\$//')
-  [ -n "\$live_exe" ] || { echo "ERROR: cannot determine the live ExecStart executable of \$u (systemctl show; K-R2)" >&2; exit 6; }
-  [ "\$live_exe" = "$REMOTE_BIN" ] || { echo "ERROR: \$u runs \$live_exe but this deploy installed $REMOTE_BIN (K-R2 stale executable)" >&2; exit 6; }
+  [ -n "\$live_exe" ] || { echo "ERROR: cannot determine the configured ExecStart executable of \$u (systemctl show; K-R2)" >&2; exit 6; }
+  [ "\$live_exe" = "$REMOTE_BIN" ] || { echo "ERROR: \$u is configured to run \$live_exe but this deploy installed $REMOTE_BIN (K-R2 stale configuration)" >&2; exit 6; }
   live_ver=\$(\$live_exe --version 2>&1)
   case "\$live_ver" in
     *"git $SHORT_SHA"*) : ;;
-    *) echo "ERROR: \$u runs \$live_exe reporting '\$live_ver' (want 'git $SHORT_SHA'; K-R2)" >&2; exit 6 ;;
+    *) echo "ERROR: \$u is configured for \$live_exe reporting '\$live_ver' (want 'git $SHORT_SHA'; K-R2)" >&2; exit 6 ;;
   esac
-  echo "unit \$u runs \$live_exe (\$live_ver)"
+  # (b) running-process proof (K 复核 K2-R2): MainPID + /proc/<PID>/exe.
+  pid=\$(systemctl show -p MainPID --value \$u.service 2>/dev/null)
+  case "\$pid" in
+    ''|0) echo "ERROR: \$u has no MainPID; cannot attribute a running process to this deploy (K2-R2)" >&2; exit 6 ;;
+  esac
+  exe=\$(sudo -n readlink "/proc/\$pid/exe" 2>/dev/null) \\
+    || { echo "ERROR: cannot read /proc/\$pid/exe of \$u via sudo (K2-R2 running-process check)" >&2; exit 6; }
+  case "\$exe" in
+    *' (deleted)') echo "ERROR: \$u MainPID \$pid executes a DELETED binary (\$exe) — not the freshly deployed file (K2-R2)" >&2; exit 6 ;;
+  esac
+  [ "\$exe" = "$REMOTE_BIN" ] || { echo "ERROR: \$u MainPID \$pid executes \$exe, not the deployed $REMOTE_BIN (K2-R2 running-process mismatch — an old process still on the old inode?)" >&2; exit 6; }
+  echo "unit \$u runs \$live_exe (verified: MainPID \$pid /proc exe -> \$exe)"
 done
 # Export the registry pin (public hex; §5) for scripts/cross_nat_test.sh.
 PIN=\$(journalctl -u ak-registry-server.service --since '-5 min' --no-pager 2>/dev/null | sed -n 's/.*registry id (pin with --registry-fp): \\([0-9a-f]\\{64\\}\\).*/\\1/p' | tail -1)

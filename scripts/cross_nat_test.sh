@@ -544,17 +544,31 @@ make_workspace() {
 }
 
 # ---------------------------------------------------------------------------
-# Run summary (K 复核 STUN-label)
+# Run summary (K 复核 STUN-label, K2 复核 summary honesty)
 # ---------------------------------------------------------------------------
 # The summary must state what actually happened: a run with --skip-doctor
 # never executed the STUN gate, so the evidence line labels it SKIPPED —
 # never "passed". print_summary renders the recorded per-step results
 # (PASS/FAIL/SKIPPED) plus the final RESULT line from the real flags.
+# K2-R5: the RESULT line must also keep the transfer claim to what was
+# observed. Without the STUN doctor there is no NAT mapping observation
+# (the script permits LAN debugging), so a skipped run claims only the
+# direct QUIC transfer + sha256 equality over the observed path; the
+# "real-NAT" wording is reserved for runs whose doctor actually observed
+# the reflexive mapping.
 stun_gate_label() {
   if [ "$SKIP_DOCTOR" -eq 1 ]; then
     printf '%s\n' 'SKIPPED (--skip-doctor)'
   else
     printf '%s\n' 'ok'
+  fi
+}
+
+transfer_claim() {
+  if [ "$SKIP_DOCTOR" -eq 1 ]; then
+    printf '%s\n' 'direct QUIC transfer sha256-verified over the observed path (no NAT observation)'
+  else
+    printf '%s\n' 'real-NAT direct QUIC transfer sha256-verified'
   fi
 }
 
@@ -570,7 +584,7 @@ print_summary() {
     esac
   done <<< "$RESULTS"
   if [ "$overall" = PASS ]; then
-    note "RESULT: PASS (registry pairing + STUN gate $(stun_gate_label) + real-NAT direct QUIC transfer sha256-verified)"
+    note "RESULT: PASS (registry pairing + STUN gate $(stun_gate_label) + $(transfer_claim))"
     return 0
   fi
   FAILED=1
@@ -679,11 +693,14 @@ self_test() {
     || fail "non-zero exit must keep the workspace; tail: $(printf '%s' "$sub_out" | tail -2 | tr '\n' ' ')"
   note "nested failing run (exit $sub_rc): workspace kept as required"
 
-  step "s8/9 summary honesty: STUN label follows --skip-doctor (K 复核 STUN-label)"
+  step "s8/9 summary honesty: STUN label follows --skip-doctor (K 复核 STUN-label, K2 复核 transfer claim)"
   local lbl sum_rc=0
   SKIP_DOCTOR=1
   lbl=$(stun_gate_label)
   [ "$lbl" = "SKIPPED (--skip-doctor)" ] || fail "skip label wrong: '$lbl'"
+  lbl=$(transfer_claim)
+  [ "$lbl" = 'direct QUIC transfer sha256-verified over the observed path (no NAT observation)' ] \
+    || fail "skip transfer claim wrong: '$lbl'"
   RESULTS=$'0/6 preflight:PASS\n1/6 NAT gate (stun):SKIPPED\n2/6 local identity + invite code:PASS\n3/6 remote receiver paired + listening:PASS\n4/6 candidate extraction:PASS\n5/6 Windows -> Linux transfer:PASS\n'
   print_summary > "$LOGS/summary-skip.log" 2>&1 || sum_rc=$?
   [ "$sum_rc" -eq 0 ] || fail "an all-pass run with a skipped STUN gate must still be PASS overall"
@@ -691,20 +708,29 @@ self_test() {
     || fail "the summary table must show the STUN gate as SKIPPED"
   grep -q 'STUN gate SKIPPED (--skip-doctor)' "$LOGS/summary-skip.log" \
     || fail "the RESULT line must label the STUN gate SKIPPED"
+  grep -q 'direct QUIC transfer sha256-verified over the observed path' "$LOGS/summary-skip.log" \
+    || fail "the skip RESULT line must state what IS backed: direct transfer + sha256 equality"
+  grep -q 'real-NAT' "$LOGS/summary-skip.log" \
+    && fail "a skipped-doctor run must not claim real-NAT verification (K2 summary honesty)"
   grep -q 'STUN gate ok' "$LOGS/summary-skip.log" \
     && fail "a skipped run must not claim 'STUN gate ok'"
   SKIP_DOCTOR=0
   lbl=$(stun_gate_label)
   [ "$lbl" = "ok" ] || fail "run label wrong: '$lbl'"
+  lbl=$(transfer_claim)
+  [ "$lbl" = 'real-NAT direct QUIC transfer sha256-verified' ] \
+    || fail "run transfer claim wrong: '$lbl'"
   RESULTS=$'0/6 preflight:PASS\n1/6 NAT gate (stun):PASS\n2/6 local identity + invite code:PASS\n3/6 remote receiver paired + listening:PASS\n4/6 candidate extraction:PASS\n5/6 Windows -> Linux transfer:PASS\n'
   print_summary > "$LOGS/summary-run.log" 2>&1 || sum_rc=$?
   [ "$sum_rc" -eq 0 ] || fail "the doctor-run summary must be PASS"
   grep -q 'STUN gate ok' "$LOGS/summary-run.log" \
     || fail "the run RESULT line must label the STUN gate ok"
+  grep -q 'real-NAT direct QUIC transfer sha256-verified' "$LOGS/summary-run.log" \
+    || fail "the doctor-run RESULT line must keep the full real-NAT claim"
   grep -q 'SKIPPED' "$LOGS/summary-run.log" \
     && fail "a doctor run must not mention SKIPPED"
   RESULTS=""
-  note "summary labels: skip -> 'SKIPPED (--skip-doctor)', run -> 'ok' (table + RESULT line)"
+  note "summary labels: skip -> 'SKIPPED (--skip-doctor)' + observed-path claim, run -> 'ok' + real-NAT claim (table + RESULT line)"
 
   step "s9/9 ssh helper drains a fake channel (K 复核 K-R3)"
   # Same fake-paramiko harness as scripts/deploy_linux.sh s7: the channel
@@ -1037,8 +1063,10 @@ real_run() {
 
   # -- step 6: summary -----------------------------------------------------------
   step "6/6 summary"
-  # K 复核 STUN-label: print_summary derives the STUN-gate wording from the
-  # actual --skip-doctor flag (SKIPPED) instead of always claiming a pass.
+  # K 复核 STUN-label / K2 复核 transfer claim: print_summary derives both
+  # the STUN-gate wording and the transfer claim from the actual
+  # --skip-doctor flag (SKIPPED + observed-path claim) instead of always
+  # claiming a passed gate over a real NAT.
   if print_summary; then
     exit 0
   fi

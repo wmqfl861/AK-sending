@@ -10,11 +10,22 @@ exec_command() return, the OLD helper (timeout=0 + immediate read) exited
 streams and return the remote exit status. An empty-output command must also
 complete. The helpers stay single-sourced: the run_command body embedded in
 both scripts must remain identical.
+
+K2 复核 K2-R5 honesty rules for this suite:
+- the old-pattern exit-255 behavior is asserted through the SAME harness as
+  a negative control (test_old_zero_timeout_pattern_fails_on_this_harness),
+  not by a fake-only witness that passed regardless of the helpers;
+- the mocked stdio exposes BOTH the text interface (print diagnostics) and
+  .buffer (byte output), so a helper diagnostic can never crash the mock
+  and turn a behavioral result into a harness AttributeError;
+- extraction/structure gaps surface as explicit assertion failures naming
+  the missing piece, never as ValueError setup crashes.
 """
 from __future__ import annotations
 
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -26,15 +37,74 @@ DEPLOY = ROOT / "scripts/deploy_linux.sh"
 CROSS = ROOT / "scripts/cross_nat_test.sh"
 HEREDOC_START = "<<'PYEOF'"
 HEREDOC_END = "\nPYEOF"
+# The original batch-K baseline whose helpers are EXECUTED as the old-code
+# proof (K 复核 K2-R5: run the old script's actual code, not a paraphrase).
+BASE_REV = "f9582e5"
+
+# The pre-fix helper pattern (f9582e5): exec_command(timeout=0) followed by
+# an immediate stdout.read(). Kept verbatim in shape so the negative control
+# exercises the reviewed old behavior, not a paraphrase of it.
+OLD_PATTERN_HELPER = '''
+import sys
+
+import paramiko
 
 
-def extract_helper(script: Path) -> str:
-    """Return the ssh_helper.py source embedded in `script`'s heredoc."""
-    text = script.read_text(encoding="utf-8")
+def main() -> int:
+    command = sys.stdin.read()
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(hostname="127.0.0.1", port=22, username="ubuntu",
+                   password="dummy", look_for_keys=False, allow_agent=False)
+    try:
+        _, stdout, stderr = client.exec_command(command, timeout=0)
+        out = stdout.read()
+        err = stderr.read()
+        status = stdout.channel.recv_exit_status()
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(err)
+        sys.stderr.buffer.flush()
+        return status
+    except Exception as exc:  # noqa: BLE001 - reported verbatim to the caller
+        print(f"[ssh-helper] exec failed: {exc}", file=sys.stderr)
+        return 255
+    finally:
+        client.close()
+'''
+
+
+def git_show(rev: str, path: str) -> str:
+    """Return `git show rev:path` text, or "" when the revision is absent."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{rev}:{path}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def extract_helper_text(text: str, origin: str = "script") -> str:
+    """Return the ssh_helper.py source embedded in a script's heredoc text."""
+    for marker in ("write_ssh_helper() {", HEREDOC_START, HEREDOC_END):
+        if marker not in text:
+            raise AssertionError(
+                f"{origin} embeds no ssh helper heredoc (missing {marker!r}) "
+                "— nothing to behavior-test"
+            )
     fn = text.index("write_ssh_helper() {")
     begin = text.index(HEREDOC_START, fn) + len(HEREDOC_START) + 1
     end = text.index(HEREDOC_END, begin)
     return text[begin:end]
+
+
+def extract_helper(script: Path) -> str:
+    """Return the ssh_helper.py source embedded in `script`'s heredoc."""
+    return extract_helper_text(script.read_text(encoding="utf-8"), script.name)
 
 
 class FakeClock:
@@ -153,13 +223,13 @@ def fake_paramiko_module():
     return module
 
 
-def load_helper(script: Path, scenario) -> dict:
-    """Exec the REAL embedded helper with paramiko faked and time on the
-    scenario's fake clock (no real waiting, no network)."""
+def exec_helper_source(source: str, origin: str, scenario) -> dict:
+    """Exec helper `source` with paramiko faked and time on the scenario's
+    fake clock (no real waiting, no network)."""
     FakeSSHClient.scenario = scenario
     namespace = {"__name__": "ssh_helper_under_test"}
     with mock.patch.dict(sys.modules, {"paramiko": fake_paramiko_module()}):
-        exec(compile(extract_helper(script), str(script), "exec"), namespace)
+        exec(compile(source, origin, "exec"), namespace)
     clock = scenario["clock"]
     namespace["time"] = types.SimpleNamespace(
         monotonic=clock.monotonic, sleep=clock.sleep
@@ -167,15 +237,30 @@ def load_helper(script: Path, scenario) -> dict:
     return namespace
 
 
+def load_helper(script: Path, scenario) -> dict:
+    """Exec the REAL embedded helper with paramiko faked and time on the
+    scenario's fake clock (no real waiting, no network)."""
+    return exec_helper_source(extract_helper(script), str(script), scenario)
+
+
 def call_exec_mode(namespace, passfile: Path, with_exec_arg: bool):
     out_buffer, err_buffer = io.BytesIO(), io.BytesIO()
     argv = ["ssh_helper.py"] + (["exec"] if with_exec_arg else [])
     argv += ["127.0.0.1", "22", "ubuntu", str(passfile)]
+    # TextIOWrapper over one BytesIO exposes BOTH the text interface
+    # (print(..., file=sys.stderr) diagnostics) and .buffer (the helper's
+    # byte output). K2-R5: a SimpleNamespace(buffer=...) mock crashed with
+    # AttributeError the moment a helper printed a diagnostic, mixing mock
+    # failures into old-code results instead of clean behavior failures.
+    stdout = io.TextIOWrapper(out_buffer, encoding="utf-8")
+    stderr = io.TextIOWrapper(err_buffer, encoding="utf-8")
     with mock.patch.object(sys, "argv", argv), \
             mock.patch.object(sys, "stdin", io.StringIO("true")), \
-            mock.patch.object(sys, "stdout", types.SimpleNamespace(buffer=out_buffer)), \
-            mock.patch.object(sys, "stderr", types.SimpleNamespace(buffer=err_buffer)):
+            mock.patch.object(sys, "stdout", stdout), \
+            mock.patch.object(sys, "stderr", stderr):
         status = namespace["main"]()
+        stdout.flush()
+        stderr.flush()
     return status, out_buffer.getvalue(), err_buffer.getvalue()
 
 
@@ -228,17 +313,25 @@ class SshHelperDrainTests(unittest.TestCase):
                 self.assertEqual(out, b"")
                 self.assertEqual(err, b"")
 
-    def test_zero_timeout_immediate_read_raises_on_this_fake_channel(self):
-        # Witness that the fake reproduces the reviewed failure mode: the OLD
-        # pattern (exec_command(timeout=0) then an immediate read) raises,
-        # which made both OLD helpers return 255. Run against the reverted
-        # helper, test_delayed_output_completes... fails with status 255.
-        scenario = self.scenario()
-        client = FakeSSHClient()
-        FakeSSHClient.scenario = scenario
-        _, stdout, _ = client.exec_command("true", timeout=0)
-        with self.assertRaises(TimeoutError):
-            stdout.read()
+    def test_old_zero_timeout_pattern_fails_on_this_harness(self):
+        # Negative control (K2-R5): drive the OLD pre-fix helper pattern —
+        # exec_command(timeout=0) plus an immediate stdout.read() — through
+        # the SAME fake-paramiko harness the real helpers are tested with.
+        # It must exit 255 without transferring the delayed output. This
+        # proves the harness reproduces the reviewed failure mode (so the
+        # current helpers' passes are meaningful) and can itself fail: if
+        # the fake channel stopped raising on timeout=0, the old pattern
+        # would complete and this control would fail. It replaces a former
+        # "witness" that exercised only the fake channel object and passed
+        # regardless of which helper was embedded.
+        namespace = exec_helper_source(
+            OLD_PATTERN_HELPER, "old-pattern-helper.py", self.scenario()
+        )
+        status, out, err = call_exec_mode(
+            namespace, self.passfile, with_exec_arg=False)
+        self.assertEqual(status, 255)
+        self.assertEqual(out, b"")
+        self.assertIn(b"[ssh-helper] exec failed", err)
 
     def test_helpers_never_pass_a_zero_timeout(self):
         for script, _ in self.scripts:
@@ -251,12 +344,83 @@ class SshHelperDrainTests(unittest.TestCase):
     def test_run_command_is_single_sourced_between_both_scripts(self):
         def run_command_body(script):
             source = extract_helper(script)
+            # K2-R5: a missing run_command is a behavioral gap (the K-R3
+            # drain helper is absent), reported as a readable assertion —
+            # not a ValueError setup crash mixed into the results.
+            if "def run_command(" not in source:
+                self.fail(
+                    f"{script.name} embeds no run_command() — the K-R3 "
+                    "blocking-drain helper is missing"
+                )
             start = source.index("def run_command(")
             end = source.index("\ndef ", start + 1)
             return source[start:end]
 
         self.assertEqual(run_command_body(DEPLOY), run_command_body(CROSS),
                          "the embedded run_command must stay identical in both scripts")
+
+
+class OldHelperFromGitTests(unittest.TestCase):
+    """K 复核 K2-R5 old-code proof: EXECUTE the helper ACTUALLY embedded in
+    the git baseline f9582e5 (extracted via `git show`), not a paraphrase.
+
+    The inline OLD_PATTERN_HELPER negative control above proves the harness
+    can fail; these tests prove the OLD SHIPPED CODE itself fails the same
+    way (exit 255, no output transferred) on both the delayed-output and the
+    empty-output scenarios, while the current helpers pass them. A missing
+    baseline skips the contrast (no fabricated old behavior)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ak-ssh-old-helper-test-")
+        self.addCleanup(tmp.cleanup)
+        self.passfile = Path(tmp.name) / "passfile"
+        self.passfile.write_text("dummy-password\n", encoding="utf-8")
+
+    def baseline_helper(self, script: Path) -> str:
+        text = git_show(BASE_REV, f"scripts/{script.name}")
+        if not text:
+            self.skipTest(f"git baseline {BASE_REV} not available locally; "
+                          "cannot run the old-code contrast honestly")
+        return extract_helper_text(text, f"{script.name}@{BASE_REV}")
+
+    def scenario(self, **overrides):
+        scenario = {
+            "clock": FakeClock(),
+            "delay": 5.0,
+            "out": [b"delayed stdout\n"],
+            "err": [b"delayed stderr\n"],
+            "status": 7,
+        }
+        scenario.update(overrides)
+        return scenario
+
+    def test_baseline_helpers_fail_on_delayed_output_with_255(self):
+        for script, with_exec_arg in ((DEPLOY, True), (CROSS, False)):
+            with self.subTest(script=script.name):
+                source = self.baseline_helper(script)
+                # The baseline really shipped the reviewed buggy call.
+                self.assertIn("exec_command(command, timeout=0)", source)
+                namespace = exec_helper_source(
+                    source, f"{script.name}@{BASE_REV}", self.scenario())
+                status, out, err = call_exec_mode(
+                    namespace, self.passfile, with_exec_arg)
+                self.assertEqual(status, 255,
+                                 "the baseline helper must exit 255 on delayed output")
+                self.assertEqual(out, b"")
+                self.assertIn(b"[ssh-helper]", err)
+
+    def test_baseline_helpers_fail_on_empty_output_with_255(self):
+        for script, with_exec_arg in ((DEPLOY, True), (CROSS, False)):
+            with self.subTest(script=script.name):
+                source = self.baseline_helper(script)
+                namespace = exec_helper_source(
+                    source, f"{script.name}@{BASE_REV}",
+                    self.scenario(out=[], err=[], status=0))
+                status, _, _ = call_exec_mode(
+                    namespace, self.passfile, with_exec_arg)
+                self.assertEqual(status, 255,
+                                 "even an empty-output command failed through the "
+                                 "baseline helper (timeout=0 + immediate read)")
 
 
 if __name__ == "__main__":

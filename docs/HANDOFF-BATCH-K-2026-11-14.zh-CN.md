@@ -1,7 +1,7 @@
 # 交接文档：批次 K（2026-11-14）
 
-> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`；修复轮三 `3db5259..31cf22c`；修复轮四 `31cf22c..a8bb3b9`；修复轮五 `a8bb3b9..9c2d3bd`；修复轮六 `9c2d3bd..e286513`；修复轮七 `e286513..12a71c9`。§0–§20 为前序记录与执行方声明，§21 为本次独立复核证据。首轮文档随 `b6296ea`、K2 本地纠正随 `f7dece2`、K3 报告及同步随 `e8b621a`、K4 报告及同步随 `46473fc`、K5 报告及同步随 `e8f811d`、K6 报告及同步随 `bb1f673`、K7 报告及同步随 `514cb87` 提交；本次 K8 文档同步仅保留本地。
-> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)，历史见 [K7 复核](REVIEW_2026-11-15-batchK7.zh-CN.md)、[K6 复核](REVIEW_2026-11-15-batchK6.zh-CN.md)、[K5 复核](REVIEW_2026-11-15-batchK5.zh-CN.md)、[K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)、[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)、[K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md) 与 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md)。
+> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`；修复轮三 `3db5259..31cf22c`；修复轮四 `31cf22c..a8bb3b9`；修复轮五 `a8bb3b9..9c2d3bd`；修复轮六 `9c2d3bd..e286513`；修复轮七 `e286513..12a71c9`；修复轮八 `12a71c9..ccd8fb2`。§0–§22 为前序记录与执行方声明，§23 为本次独立复核证据。首轮文档随 `b6296ea`、K2 本地纠正随 `f7dece2`、K3 报告及同步随 `e8b621a`、K4 报告及同步随 `46473fc`、K5 报告及同步随 `e8f811d`、K6 报告及同步随 `bb1f673`、K7 报告及同步随 `514cb87`、K8 报告及同步随 `7e8bfb2` 提交；本次 K9 文档同步仅保留本地。
+> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)，历史见 [K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)、[K7 复核](REVIEW_2026-11-15-batchK7.zh-CN.md)、[K6 复核](REVIEW_2026-11-15-batchK6.zh-CN.md)、[K5 复核](REVIEW_2026-11-15-batchK5.zh-CN.md)、[K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)、[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)、[K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md) 与 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md)。
 
 ## 0. 范围与来源
 
@@ -585,7 +585,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 21. 修复轮七独立复核证据（2026-11-15）
 
-被审差异固定为 `e286513..12a71c9`。发现、输入与修复要求见 [K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)，逐项状态只在审核状态表。本节、K8 报告及入口同步仅保留本地，未修改被审代码。下列“专项”为并行只读复核，“集成者”为主复核者；实际执行、源码旁证与未执行验收分别记录。
+被审差异固定为 `e286513..12a71c9`。发现、输入与修复要求见 [K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)，逐项状态只在审核状态表。本节、K8 报告及入口同步出具时仅保留本地，随后由执行方在 `7e8bfb2` 提交；当次复核未修改被审代码。下列“专项”为并行只读复核，“集成者”为主复核者；实际执行、源码旁证与未执行验收分别记录。
 
 | 本地门禁 | 命令/来源 | 实际结果与边界 |
 |---|---|---|
@@ -640,7 +640,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 |---|---|
 | K2-R3 余项（P1，默认值不等价） | `reg_args_agree` 改为**有效值比较含默认**：`--db-path` 缺省侧代入 `<有效 id-dir>/registry.db`（引 `registry_db_path()` main.rs:3777/3792）；`--id-dir` 默认依赖环境（HOME），单侧缺省无法自 argv 推导 → rc 2 拒绝，双侧缺省共享默认放行；`--port`（7200）/`--bind`（0.0.0.0）常量默认代入。返回契约 0/1/2，占位块区分「无法建立」与「实质分歧」均 exit 3。复核夹具（运行侧缺省 db=registry.db、配置显式 new.db）从轮八「双阶段 exit 0 选 new.db」翻转为 phase1/决策双拒绝；显式缺省、双侧缺省、等价拼写真、`bb1f673` 基线选错五组回归齐备 |
 | 非阻断纠正 1（尖括号目标换行） | 共享正则角括号分支改为**完全禁止换行**（CommonMark 0.31.2 目标定义）；含换行的角括号交接形态由容忍式兜底整体捕获并显式拒绝（携带未截断目标）；空行角括号从「静默放行」补为显式拒绝；范围注释改为精确表述（目标：空格可、换行不可；标题：换行可、空行不可） |
-| 非阻断纠正 2（链接计数） | 口径链补齐：233=`9c2d3bd`、242=`e286513`、251=`12a71c9`、工作树=258，两代正则同树计数一致 |
+| 非阻断纠正 2（链接计数） | 执行方当时记录的口径链：233=`9c2d3bd`、242=`e286513`、251=`12a71c9`、K8 本地同步时工作树=258，两代正则同树计数一致。该工作树时点不代表本轮固定候选，K9 的固定树复测见 §23 |
 
 ### 修复轮八门禁与提交
 
@@ -649,3 +649,69 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `7e8bfb2` | K2-R3 有效值默认比较与 K8 两条非阻断纠正；复核方文档同步与执行方本节记录入库 |
+
+## 23. 修复轮八独立复核证据（2026-11-15）
+
+被审差异固定为 `12a71c9..ccd8fb2`。发现、可复现输入与修复要求见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)，逐项状态只在审核状态表。本节、K9 报告及入口同步仅保留本地，未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；静态核对、离线模型与未执行的真实环境验收分别记录。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；两脚本分别 `--self-test` | 集成者全部 exit 0；隔离工具与本地合成数据，没有 SSH 或部署；cross_nat 使用既有 release 工具，不代表本轮源码重建或真实跨网 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 集成者 232/232，unittest 计时 699.340 秒，exit 0；无 failure/error/skip，含部署 75 项（含本轮新增回归及真实 git 基线）与 checker 64 项 |
+| 检查器专项 | `python -m unittest discover -s scripts/tests -p test_repository_checks.py` | 专项 64/64，0.363 秒，exit 0，无 skip；不与全集重复计为新增案例 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定候选均 exit 0，契约 5/5；完整 checker 记录本地链接 260。契约工具自身是 advisory exit 0，已另核所有项目实际 PASS |
+| Rust 本机门禁 | `cargo fmt --all -- --check`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`cargo test --locked --workspace`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps` | Windows 本机全部 exit 0；测试日志累计 1200 passed、0 failed、8 ignored，含文档测试，测试命令耗时 575.922 秒；ignored 未被算作执行 |
+| 实现变动范围 | `git diff --name-only 12a71c9..ccd8fb2 -- crates Cargo.toml Cargo.lock rust-toolchain.toml flutter_app ak_ffi_dart .github` | 无差异；平台验证使用本行固定候选的 CI，不用旧构建冒充新构建 |
+| 报告原文最小复现 | 从 K9 报告 PowerShell 代码块原样提取 Python 并执行 | exit 0；两个输入均 phase1/decision=0/0，增添无关 root 数据使真实迁移源由 otheruser home 改为 root，与正文一致 |
+| 文档收尾 | `git diff --check`；完整仓库检查 | 本地同步后均 exit 0；当前工作树 267 个本地链接，区别于原始 tip。仅新增 K9 报告并修改交接、状态表、STATUS、K8 历史归属，不提交或推送 |
+
+| 行为 / 源码核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| K8 精确数据库输入 | 显式 id-dir 相同，运行省略 db，配置 new.db：候选 phase1/decision=3/1，无 CHOSEN 输出、报 materially disagrees；`12a71c9` 与 `bb1f673` 均 0/0、选择 new.db | 集成者独立重放真实 phase1/preflight/phase456 decisions/compose；完整 runner 共 7 案，含下面的对照，不安装或打开数据库 |
+| 默认数据库对照 | 仅将运行默认库显式化的冲突仍拒绝；双方隐式、运行隐式/配置显式等价默认、相反方向等价默认均 0/0 并保留原库语义 | 专项每版 11 案、两版共 22 案，另涵盖身份单侧默认、显式 db、bind；真实 NUL 参数逐项写入，不只是 substring 断言 |
+| 返回契约和常量默认 | 实际生成函数的 10 组直接调用：全隐式与显式常量默认双向 rc 0；有效 port/bind 不同 rc 1；单侧身份隐式双向及身份未知时单侧 db 显式 rc 2；最终占用者 caller 对 1/2 都 exit 3、消息不同 | 专项提取真实生成函数执行；CLI `main.rs:709`、`:638`、`:3777`、`:3792` 与 server_v2/config.rs:166 作为默认值源码依据 |
+| K9-N1 新迁移来源反例 | 旧 unit 的 User/HOME 及运行 environ 明确为 otheruser、无 USERPROFILE，双方 argv 均无 id-dir/db。仅增加无关 root 合成 key/db，候选 0/0、CHOSEN_DATA_SOURCE 从 `/home/otheruser/.ak-sending` 变为 `/root/.ak-sending`，两案新 ExecStart 都补 REMOTE_DATA | 集成者候选/`12a71c9` 共 4 案；专项候选/`12a71c9`/`bb1f673` 共 6 案，各自独立执行真实配置选择。运行默认值相同，不以环境差异猜测制造反例；只证明选错来源，未执行安装 |
+| 检查器完整 CLI | 从 git 导出 `12a71c9`、`ccd8fb2`，每树 16 案共 32 次完整 checker；候选 angle LF/CR/CRLF/空行/仅空白空行及 fragment 换行均 exit 1，定位 STATUS:9 并携带完整目标；合法 canonical/fragment/三种多行 title 均 exit 0，archive-space 仍拒绝 | 专项独立构造输入与完整树执行。旧版 LF-fragment/blank-fragment/blank-path 的静默通过确已翻转。CR/CRLF 经 Path.read_text 通用换行归一化，无孤立 CR 逃逸 |
+| 固定树链接计数 | 四代 regex 对同树均相等：`9c2d3bd` local/all=233/314；`e286513`=242/329；`12a71c9`=251/341；`ccd8fb2`=260/352。原始完整 checker 也确认前一候选 local=251、当前候选 local=260 | 专项四树×四代计数。§22 的工作树=258 仅属于 §21 的 K8 本地同步时点，不是本轮固定 tip；本轮文档收尾后的工作树另记 |
+| 非阻断说明 | deploy_linux.sh:987–988 残留“不比较缺省值”；checker docstring:368/371 残留“所有 handoff 形态均不忽略/同语法”泛称；完整 bind 端点的等价拼写可能保守误拒绝 | 静态核对＋实际函数调用；未据此另列代码阻断。CommonMark 0.31.2 官方 spec.txt 已只读核对，目标禁 line endings、title 禁 blank line |
+| 既有行为 | K3-N1 首次安装与 absent+active 拒绝；K2-N1 恢复；K2-R2 stop/实际映像；K2-R5 诚实摘要与 git 旧阶段对照 | 全集和 Shell 自检覆盖；不扩大成所有真实 systemd/权限场景均验证 |
+| 提交和同步归属 | `7e8bfb2` 纳入 K8 报告、§21/§22、STATUS/状态表/K7 归属；`ccd8fb2` 仅交接 1 行、状态表 2 行哈希回填 | `git show` 与 numstat 实查；候选残留“K8 仅本地”及旧入口已在本轮本地同步纠正，不改历史判决 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `ccd8fb246dc96aaa3fd21233946327fa04171170`；[43676620488](https://github.com/wmqfl861/AK-sending/actions/runs/43676620488) | 使用当前 git 凭据读取 run/jobs API，首次 in_progress，轮询至 completed/success。run_attempt=1，head_branch=dev/batch-k-20261114；13 jobs 中 12 常规 success、1 release-deep-tests skipped；完成更新时间 2026-11-15T04:37:17Z |
+| CI 实际门槛 | 同上 jobs/steps metadata 与固定 tip workflow | Linux/Windows fmt、clippy、workspace/特性测试、严格 rustdoc；Flutter analyze/test 与纯 Dart；Android FFI 双 ABI/符号检查、debug APK；Linux/macOS portability、cargo audit/deny、仓库检查、legacy signal、NAT netns 模拟均 success；未见 failure/cancelled step，不计作物理双机或生产部署 |
+| 远端引用 | `git fetch --prune origin`；`git ls-remote --heads origin` | 只有 main=`d6c71360784e1570720e56028a39f2a80777bb21`、dev/batch-k-20261114=`ccd8fb246dc96aaa3fd21233946327fa04171170`；收尾再次读取一致。REJECTED 分支不删除 |
+| 本地引用与工作树 | `git branch -avv`；`git worktree list --porcelain`；`git status --short --branch` | 当前批次分支在固定 tip，main 留在 d6c7136，只有主工作树；仅本地 K9 报告、交接、状态表、STATUS、K8 归属文档修改，没有提交、合并、推送或代码改动 |
+
+| 未执行 / 限制 | 本轮事实 |
+|---|---|
+| Linux 原生 systemd/权限部署、远端 SSH、物理双机 C4、生产抓包 | Windows 本机仅运行真实生成脚本的离线模型，没有连接生产服务；合成环境/文件不等于原生 Linux 验证 |
+| 本机 Flutter/Dart、Android/Linux/macOS 平台重建 | 本轮未改这些实现；实际平台门槛采用完整 SHA 匹配的最终 CI；本机 PATH 未发现 flutter/dart |
+| 手动 release deep tests | push workflow 的该 job skipped，本机本轮未重跑 ignored release suite；不将未执行项记作通过 |
+| shellcheck | 本机 PATH 未发现命令；Bash 语法、自检和离线模型不冒充 shellcheck |
+
+| 仓外材料（本机 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k9-review-gqhi1ztk/ci_query.py`、`run-43676620488.json`、`jobs-43676620488.json` | 当前 git 凭据只读 API 查询与最终 run/jobs；凭据只留进程内，不写材料 |
+| `ak-k9-review-gqhi1ztk/run_gates.py` 及 `*-results.json`、`*.log` | 集成者 Python、仓库、契约、Bash 与 Rust 门禁日志 |
+| `ak-k9-review-gqhi1ztk/replay_defaults.py`、`replay_identity.py` 及各 summary/阶段文件 | 集成者默认数据库原输入与等价对照、双隐式身份迁移来源反例和 git 基线 |
+| `ak-k9-review-gqhi1ztk/report_repro.py`、`report-repro.log` | 从 K9 报告原文提取、实际执行的最小复现 |
+| `ak-review-k9-defaults` | 专项三个 runner、默认参数 matrix.json、implicit-id-root-matrix.json、直接函数结果与完整阶段输出 |
+| `ak-k9-checker-independent.py`、`ak-k9-checker-independent-vmnb7zod`、`ak-k9-commonmark-spec.txt` | 专项完整导出树、逐案输入/JSON、跨树/正则计数、官方规范只读旁证 |
+
+## 24. 修复轮九（K9 复核后的新候选，执行方记录）
+
+[K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)（K8 默认值反例判通过；新发现 K9-N1）后，执行方完成修复；复核方本地同步（§23、STATUS、状态表、K8 历史归属、链接计数 ccd8fb2=260）与本节代码改动一并提交。
+
+| K9 发现 | 修复内容 |
+|---|---|
+| K9-N1（P1） | 迁移源绑定运行实例身份：phase1 在占位者配置交叉核对后推导并输出 `runtime-id-dir`——有效 ExecStart 显式 `--id-dir` 优先；否则按 CLI 默认链（USERPROFILE→HOME，引 main.rs `id_dir()`）取自运行 `/proc/<PID>/environ` 并与 unit 合并 `Environment=`/`UnsetEnvironment=` 交叉核对（矛盾/不可读/双缺失即 exit 3，`.` 回退会依赖不可知工作目录故拒绝）；决策块迁移源选择改为 runtime-id-dir（有占位者）→ 唯一枚举候选（无占位者）→ 多候选无占位者拒绝，`head -1` 与枚举顺序彻底移出选择路径。复核翻转夹具（无关 `/root/.ak-sending` 存在与否）两次均选 `/home/otheruser/.ak-sending`；显式 id-dir 抗诱饵、无占位者单候选可选/多候选拒绝、环境证据缺失拒绝、`12a71c9` 基线同夹具选 `/root` 共七组回归；K8 已通过的等价/冲突回归全保 |
+
+### 修复轮九门禁与提交
+
+本地：`bash -n`+自检全过；Python 239/239（部署套件 82，含 7 项轮十回归与跨六版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮九首个提交，推送后回填哈希） | K9-N1 运行身份绑定迁移源；复核方文档同步与执行方本节记录入库 |

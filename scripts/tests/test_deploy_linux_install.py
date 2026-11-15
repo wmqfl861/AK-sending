@@ -75,6 +75,8 @@ PREV6_REV = "e8f811d"  # round-6 candidate (K6 findings: absent-file +
                         # running process passed, drop-in overrides ignored)
 PREV7_REV = "bb1f673"  # round-7 candidate (K7 findings: cmdline read
                         # failure skipped the cross-check, --db-path uncompared)
+PREV8_REV = "12a71c9"  # round-8 candidate (K9 finding: migration source
+                        # picked by enumeration order, not runtime identity)
 
 SUDO_STUB = r"""#!/usr/bin/env bash
 set -u
@@ -909,7 +911,9 @@ class ProbeHarness(unittest.TestCase):
     def make_private_discovery_model(self, occupant: str = "oldregistry.service",
                                      vendor: bool = False, main_exec: str | None = None,
                                      dropin: list[str] | None = None,
-                                     cmdline_extra: str = ""):
+                                     cmdline_extra: str = "",
+                                     unit_service_lines: list[str] | None = None,
+                                     environ: bytes | None = None):
         """K2-R3 OFFLINE permission model: a registry port held by ANOTHER
         USER's process (pid only visible to root) plus a PRIVATE identity
         directory under a foreign home. /proc/<pid>/cmdline deliberately has
@@ -947,15 +951,44 @@ class ProbeHarness(unittest.TestCase):
         unit_dir.mkdir(parents=True, exist_ok=True)
         exec_tail = main_exec or ("/opt/ak-sending/ak-cli registry-server --port 17200 "
                                   "--id-dir /home/otheruser/.ak-sending")
+        service_block = "[Service]\n"
+        if unit_service_lines:
+            service_block += "".join(line + "\n" for line in unit_service_lines)
         (unit_dir / occupant).write_text(
-            "[Unit]\nDescription=foreign-user registry\n\n[Service]\n"
+            "[Unit]\nDescription=foreign-user registry\n\n" + service_block +
             f"ExecStart={exec_tail}\n\n[Install]\nWantedBy=multi-user.target\n",
             encoding="utf-8", newline="\n")
+        if environ is not None:
+            (self.probe / "proc" / "4242" / "environ").write_bytes(environ)
         if dropin is not None:
             dropin_dir = self.probe / "etc" / "systemd" / "system" / f"{occupant}.d"
             dropin_dir.mkdir(parents=True, exist_ok=True)
             (dropin_dir / "override.conf").write_text(
                 "".join(line + "\n" for line in dropin), encoding="utf-8", newline="\n")
+
+    K9_BASE = "/opt/ak-sending/ak-cli registry-server --port 17200"
+
+    def _make_k9_runtime_identity_fixture(self, root_decoy: bool):
+        """The K9 reviewer's exact fixture: an identified oldregistry.service
+        with User=otheruser, Environment=HOME=/home/otheruser,
+        UnsetEnvironment=USERPROFILE, an argv-precise NUL cmdline (NO
+        --id-dir on either side), /proc/4242/environ carrying HOME and no
+        USERPROFILE, and the real key/db under /home/otheruser/.ak-sending.
+        Optionally adds an UNRELATED /root/.ak-sending with its own key/db."""
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "Environment=HOME=/home/otheruser",
+                                "UnsetEnvironment=USERPROFILE"],
+            environ=b"HOME=/home/otheruser\0USER=otheruser\0")
+        if root_decoy:
+            root = self.probe / "root" / ".ak-sending"
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "registry.key").write_text("unrelated-synthetic-root-key",
+                                               encoding="utf-8")
+            (root / "registry.db").write_text("unrelated-synthetic-root-db",
+                                              encoding="utf-8")
 
     def assert_recovery_restored_old_state(self, out: str):
         """Shared K2-N1 assertions: old binary + old unit BYTES back on disk,
@@ -1951,6 +1984,132 @@ echo "C4=[$c4]"
         self.assertTrue(exec_line, out)
         self.assertIn("/var/lib/ak-legacy/registry.db", exec_line[0])
 
+    # -- K9-N1: the migration source binds to the RUNTIME identity -------------
+    K9_BASE = "/opt/ak-sending/ak-cli registry-server --port 17200"
+
+    def test_k9n1_runtime_identity_source_without_decoy(self):
+        # Regression (a): no decoy — the runtime-established identity is
+        # /home/otheruser/.ak-sending (main.rs id_dir(): HOME + /.ak-sending).
+        self._make_k9_runtime_identity_fixture(root_decoy=False)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k9a.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/otheruser/.ak-sending", out)
+
+    def test_k9n1_runtime_identity_source_survives_root_decoy(self):
+        # Regression (b) — the reviewer's flip case: the SAME running
+        # service, plus one unrelated /root/.ak-sending. Rounds <= 9 picked
+        # /root/.ak-sending by enumeration order; the runtime identity
+        # stays the migration source.
+        self._make_k9_runtime_identity_fixture(root_decoy=True)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        # Enumeration REPORTS both (root first — the old flip order) ...
+        self.assertIn("registry-data: /root/.ak-sending (key:yes db:yes)", p1_out)
+        self.assertIn("registry-data: /home/otheruser/.ak-sending (key:yes db:yes)", p1_out)
+        # ... but the runtime identity decides.
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k9b.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/otheruser/.ak-sending", out,
+                      "an unrelated root decoy must not flip the migration source")
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/root/.ak-sending", out)
+
+    def test_k9n1_explicit_id_dir_wins_over_decoys(self):
+        # Regression (c): explicit --id-dir in the EFFECTIVE ExecStart is
+        # the runtime source, decoys notwithstanding.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-legacy",
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        root = self.probe / "root" / ".ak-sending"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "registry.key").write_text("unrelated-synthetic-root-key", encoding="utf-8")
+        (root / "registry.db").write_text("unrelated-synthetic-root-db", encoding="utf-8")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  runtime-id-dir: /var/lib/ak-legacy$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k9c.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/var/lib/ak-legacy", out)
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/root/.ak-sending", out)
+
+    def test_k9n1_no_occupant_single_candidate_selected(self):
+        # Regression (d): no identified occupant + exactly ONE candidate
+        # identity dir (fresh install with legacy data) — that dir is used.
+        root = self.probe / "root" / ".ak-sending"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "registry.key").write_text("legacy-root-key", encoding="utf-8")
+        (root / "registry.db").write_text("legacy-root-db", encoding="utf-8")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'SS_EMPTY=1 bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("port 17200/tcp: free", p1_out)
+        self.assertIn("registry-data: /root/.ak-sending (key:yes db:yes)", p1_out)
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k9d.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/root/.ak-sending", out)
+
+    def test_k9n1_no_occupant_multiple_candidates_refuse(self):
+        # Regression (e): no identified occupant + multiple candidate dirs —
+        # unresolvable fresh-install ambiguity: refuse instead of head -1.
+        for d in ("root/.ak-sending", "home/otheruser/.ak-sending"):
+            cand = self.probe / d
+            cand.mkdir(parents=True, exist_ok=True)
+            (cand / "registry.key").write_text("synthetic-key", encoding="utf-8")
+            (cand / "registry.db").write_text("synthetic-db", encoding="utf-8")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'SS_EMPTY=1 bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertEqual(p1_out.count("registry-data:"), 2, p1_out)
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k9e.sh")
+        self.assertNotEqual(
+            rc, 0, "multiple unbound identity dirs must refuse, not head -1:\n" + out)
+        self.assertIn("multiple identity directories", out)
+        self.assertIn("no identified occupant", out)
+        self.assertNotIn("CHOSEN_", out)
+
+    def test_k9n1_missing_runtime_env_evidence_refuses(self):
+        # Regression (f): occupant with no explicit --id-dir and NO
+        # HOME/USERPROFILE evidence anywhere (unit has neither User=-based
+        # home info nor Environment=HOME; the runtime environ carries
+        # neither variable) — the CLI default would fall back to the
+        # unknowable working directory: refuse before any switchover.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            environ=b"PATH=/usr/bin\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("neither USERPROFILE nor HOME", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -2520,6 +2679,31 @@ class BaselineContrastTests(ProbeHarness):
         self.assertIn("/home/otheruser/.ak-sending/new.db", exec_line[0],
                       "the round-7 candidate chose the configured new.db over the "
                       "running default registry.db (the defect)")
+
+    def test_k9n1_round8_candidate_root_decoy_flips_migration_source(self):
+        # K9-review contrast (g): the reviewer's exact fixture (b) against
+        # the round-8 candidate (12a71c9) — its decision takes the FIRST
+        # enumerated registry-data line, so the unrelated /root/.ak-sending
+        # flips the migration source while the running service is unchanged.
+        self._make_k9_runtime_identity_fixture(root_decoy=True)
+        text = self.baseline_text(PREV8_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev8.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1prev8.sh" > "$PROBE_DIR/p1prev8.out" 2>&1; echo "RUN_RC=$?"\n'
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV8_REV) + BOX_MODELS, body,
+                                  name="driver-prev8-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev8.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev8-decision.sh", text=text,
+            origin=f"the {PREV8_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/root/.ak-sending", out,
+                      "the round-8 candidate flipped the migration source to the "
+                      "unrelated root decoy (the defect)")
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/home/otheruser/.ak-sending", out)
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

@@ -667,6 +667,13 @@ self_test() {
     || fail "an omitted --db-path must compare as <effective id-dir>/registry.db (K2-R3)"
   grep -q 'cannot be established from its arguments' "$WORK/p1.sh" \
     || fail "an environment-dependent default on one side only must refuse (K2-R3)"
+  # K 复核 K9-N1: the identified occupant's RUNTIME identity dir must be
+  # derived and reported; the migration source binds to it, never to
+  # directory-enumeration order.
+  grep -q 'runtime-id-dir' "$WORK/p1.sh" \
+    || fail "the occupant's runtime identity dir must be derived and reported (K9-N1)"
+  grep -q 'to derive the default identity dir' "$WORK/p1.sh" \
+    || fail "missing runtime environment evidence must refuse (K9-N1)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -976,16 +983,16 @@ effective_execstart() {
     || { echo "ERROR: cannot read the effective configuration of \$1 (systemctl cat failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
   printf '%s\\n' "\$ec_cat" | awk '/^ExecStart=/ { v = substr(\$0, 11); if (v == "") { n = 0; split("", L) } else { L[++n] = v } } END { for (i = 1; i <= n; i++) print L[i] }'
 }
-# reg_args_agree <exec-line> <cmdline-line>: 0 when the RELEVANT arguments
-# of the configured ExecStart do not MATERIALLY disagree with the running
-# instance's cmdline. The compared surface is 'ak-cli registry-server's
-# actual argument surface (verified against crates/ak-cli/src/main.rs): the
-# global --id-dir (identity dir: registry.key plus the default db location)
-# and the subcommand's --db-path select DATA/IDENTITY LOCATIONS (K 复核
-# K2-R3 round 8: --db-path used to be missing, so a configured new.db was
-# chosen over the running old.db); --port and --bind select the LISTEN
-# surface (occupancy-relevant). Values absent from the cmdline are not
-# compared — the process may rely on defaults.
+# reg_args_agree <exec-line> <cmdline-line>: 0 when the EFFECTIVE values of
+# the configured ExecStart and the running cmdline AGREE (defaults derived;
+# see the rc contract inside). The compared surface is 'ak-cli
+# registry-server's actual argument surface (verified against
+# crates/ak-cli/src/main.rs): the global --id-dir (identity dir:
+# registry.key plus the default db location) and the subcommand's
+# --db-path select DATA/IDENTITY LOCATIONS (K 复核 K2-R3 round 8:
+# --db-path used to be missing, so a configured new.db was chosen over the
+# running old.db); --port and --bind select the LISTEN surface
+# (occupancy-relevant).
 reg_args_agree() {
   # K 复核 K2-R3 (round 9): compare EFFECTIVE values, DEFAULTS INCLUDED —
   # round 8 compared an explicit value only when the RUNNING side spelled
@@ -1179,7 +1186,55 @@ REG_EFF_H
         exit 3
       fi
       echo "  ExecStart=\$reg_pick"
-      sudo -n env LC_ALL=C systemctl cat "\$reg_unit" 2>/dev/null | sed -n 's/^User=/  old-registry-User=/p' | tail -1
+      reg_cat2=\$(sudo -n env LC_ALL=C systemctl cat "\$reg_unit" 2>/dev/null) || true
+      printf '%s\\n' "\$reg_cat2" | sed -n 's/^User=/  old-registry-User=/p' | tail -1
+      # K 复核 K9-N1: derive the RUNTIME-ESTABLISHED identity dir of the
+      # identified occupant — the migration source must be bound to the
+      # running service, NEVER to directory-enumeration order. Explicit
+      # --id-dir in the EFFECTIVE ExecStart wins; otherwise the CLI default
+      # (main.rs id_dir(): USERPROFILE, else HOME, else '.') applies, taken
+      # from the RUNTIME /proc/<PID>/environ and cross-checked against the
+      # unit's merged Environment=/UnsetEnvironment= directives. Missing or
+      # contradictory evidence refuses BEFORE any switchover.
+      reg_rt_id=\$(printf '%s\\n' "\$reg_pick" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+      if [ -z "\$reg_rt_id" ]; then
+        reg_env=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | tr '\\0' '\\n' || true)
+        if [ -z "\$reg_env" ]; then
+          echo "ERROR: no runtime environment evidence (unreadable /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+        ev_up=\$(printf '%s\\n' "\$reg_env" | sed -n 's/^USERPROFILE=\\(.*\\)\$/\\1/p' | head -1)
+        ev_home=\$(printf '%s\\n' "\$reg_env" | sed -n 's/^HOME=\\(.*\\)\$/\\1/p' | head -1)
+        ue_up=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^Environment=\"\\?USERPROFILE=\\(.*\\)\$/\\1/p' | tail -1 | sed 's/^\"//; s/\"\$//')
+        ue_home=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^Environment=\"\\?HOME=\\(.*\\)\$/\\1/p' | tail -1 | sed 's/^\"//; s/\"\$//')
+        uu_up=\$(printf '%s\\n' "\$reg_cat2" | grep -c '^UnsetEnvironment=.*USERPROFILE' || true)
+        uu_home=\$(printf '%s\\n' "\$reg_cat2" | grep -c '^UnsetEnvironment=.*HOME' || true)
+        if [ -n "\$ue_up" ] && [ "\$ue_up" != "\$ev_up" ]; then
+          echo "ERROR: \$reg_unit sets USERPROFILE='\$ue_up' but its runtime environ reports '\$ev_up'; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+        if [ -n "\$ue_home" ] && [ "\$ue_home" != "\$ev_home" ]; then
+          echo "ERROR: \$reg_unit sets HOME='\$ue_home' but its runtime environ reports '\$ev_home'; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+        if [ "\$uu_up" != 0 ] && [ -n "\$ev_up" ]; then
+          echo "ERROR: \$reg_unit unsets USERPROFILE but its runtime environ still carries it; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+        if [ "\$uu_home" != 0 ] && [ -n "\$ev_home" ]; then
+          echo "ERROR: \$reg_unit unsets HOME but its runtime environ still carries it; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+        if [ -n "\$ev_up" ]; then
+          reg_rt_id="\$ev_up/.ak-sending"
+        elif [ -n "\$ev_home" ]; then
+          reg_rt_id="\$ev_home/.ak-sending"
+        else
+          echo "ERROR: neither USERPROFILE nor HOME in the runtime environ of \$reg_unit (and no explicit --id-dir); the CLI default would fall back to the unknowable working directory; refusing before any switchover (K9-N1)" >&2
+          exit 3
+        fi
+      fi
+      echo "  runtime-id-dir: \$reg_rt_id"
     else
       echo "ERROR: occupant unit \$reg_unit of port $REGISTRY_PORT/tcp was identified but its unit file cannot be located in any standard directory; refusing before any switchover (K2-R3)" >&2
       exit 3
@@ -1893,7 +1948,25 @@ real_run() {
     fail "the SSH user needs passwordless sudo for install steps (sudo -n true failed)"
   fi
   local existing_data="" legacy_unit="" existing_exec="" old_registry_unit=""
-  existing_data=$(sed -n 's/^registry-data: \(.*\) (key:.*/\1/p' "$WORK/phase1.log" | head -1)
+  # K 复核 K9-N1: the migration source is the RUNTIME-ESTABLISHED identity
+  # of the identified occupant (phase1's runtime-id-dir: explicit --id-dir
+  # of the effective ExecStart, else the environment-derived CLI default) —
+  # NEVER the first enumerated directory. Directory enumeration only
+  # REPORTS candidates: with NO identified occupant, exactly one candidate
+  # may be selected (fresh install with legacy data); multiple candidates
+  # are unresolvable ambiguity (refuse instead of head -1).
+  runtime_id=$(sed -n 's/^  runtime-id-dir: \(.*\)$/\1/p' "$WORK/phase1.log" | head -1)
+  data_candidates=$(sed -n 's/^registry-data: \(.*\) (key:.*/\1/p' "$WORK/phase1.log")
+  n_candidates=$(printf '%s\n' "$data_candidates" | grep -c . || true)
+  if [ -n "$runtime_id" ]; then
+    existing_data=$runtime_id
+  elif [ "$n_candidates" = 1 ]; then
+    existing_data=$(printf '%s\n' "$data_candidates" | head -1)
+  elif [ "$n_candidates" -gt 1 ]; then
+    fail "multiple identity directories found with no identified occupant to bind the migration source ($(printf '%s ' $data_candidates)); resolve manually and re-run"
+  else
+    existing_data=""
+  fi
   # Live old unit's ExecStart is dumped AFTER the standard-unit loop, so the
   # last match wins (the live process is the authoritative argument source).
   existing_exec=$(sed -n "s/^  ExecStart=\(.*registry-server.*\)$/\1/p" "$WORK/phase1.log" | tail -1)

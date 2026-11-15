@@ -82,7 +82,10 @@ PREV10_REV = "1fad0a2"  # round-11 candidate (K12 findings: LF truncation,
 PREV10_PRE_REV = "09fceb6"  # round-10 tip (pre-move key chmod: set -e caught it)
 PREV11_REV = "0b41201"
 PREV12_REV = "943a346"
-PREV13_REV = "f425256"  # round-14 tip (K15 findings: environ fail-open
+PREV13_REV = "f425256"
+PREV14_REV = "0602f92"  # round-15 tip (K16 findings: partial-snapshot
+                         # acceptance, extraction-error-as-absent, bracket
+                         # db rewrite no-op)  # round-14 tip (K15 findings: environ fail-open
                          # verification reads, relative --db-path unbound)  # round-13 tip (K14 findings: fail-open second cwd
                          # read, relative --id-dir unbound to running cwd)  # round-12 tip (K13 findings: cwd byte fidelity,
                          # generated-script path re-interpretation)  # round-9 candidate (K10 findings: environ parsing
@@ -512,6 +515,20 @@ fi
 exec "@REAL_CHMOD@" "$@"
 """
 
+GREP_STUB = r"""#!/usr/bin/env bash
+# K10-N1 (round 17) model: GREP_EXTRACT_VAR makes the extraction grep for
+# that variable ('grep -za -m1 ^VAR= file') exit 2 with no stdout — a TOOL
+# ERROR that must never be read as variable-absent. Everything else passes
+# through to the real grep.
+if [ "${1:-}" = -za ] && [ "${2:-}" = -m1 ] && [ -n "${GREP_EXTRACT_VAR:-}" ] \
+   && [ "$3" = "^${GREP_EXTRACT_VAR}=" ]; then
+  printf 'REVIEW_GREP_EXTRACT_ERROR=2\n' >> "$PROBE_DIR/stubs.log"
+  echo "grep stub: forced extraction error for $GREP_EXTRACT_VAR" >&2
+  exit 2
+fi
+exec "@REAL_GREP@" "$@"
+"""
+
 MV_STUB = r"""#!/usr/bin/env bash
 set -u
 printf 'mv %s\n' "$*" >> "$PROBE_DIR/stubs.log"
@@ -540,6 +557,14 @@ if [ "$*" = /proc/4242/environ ]; then
   if [ -n "${ENV_READ_FAIL_FROM:-}" ] && [ "$n" -ge "$ENV_READ_FAIL_FROM" ]; then
     printf 'ENV_READ_FAILED_%s\n' "$n" >> "$PROBE_DIR/stubs.log"
     exit 1
+  fi
+  # K10-N1 (round 17) model: emit the FIRST complete record, then fail —
+  # tee succeeds on partial output, so only the READER's rc reveals the
+  # truncation (PIPESTATUS[0] guard).
+  if [ "${ENV_PARTIAL_FAIL:-0}" = 1 ]; then
+    printf 'REVIEW_CAT_PARTIAL_ERROR=74\n' >> "$PROBE_DIR/stubs.log"
+    printf 'HOME=/home/otheruser\0'
+    exit 74
   fi
 fi
 if [ -n "${CAT_FAIL_MATCH:-}" ]; then
@@ -611,6 +636,14 @@ case "$target" in
       fi
       : > "$PROBE_DIR/cwd-read-once"
     fi
+    # K10-N1 (round 17) model: emit a COMPLETE value, THEN fail — tee
+    # succeeds on the output, so only the reader's rc (PIPESTATUS[0])
+    # reveals the failed read.
+    if [ "${CWD_OUTPUT_THEN_FAIL:-0}" = 1 ]; then
+      printf '/home/runtime-old\n'
+      printf 'CWD_NONZERO_WITH_OUTPUT\n' >> "$PROBE_DIR/stubs.log"
+      exit 1
+    fi
     if [ -n "${PROC_CWD_RAW_FILE:-}" ]; then
       cat "$PROC_CWD_RAW_FILE"
       printf '\n'
@@ -673,6 +706,7 @@ STUBS = {
     "sed": SED_STUB, "readlink": READLINK_STUB, "ls": LS_STUB, "mv": MV_STUB,
     "cmp": CMP_STUB,
     "chmod": CHMOD_STUB,
+    "grep": GREP_STUB,
 }
 _REAL_TOOLS = {}
 
@@ -847,7 +881,7 @@ class ProbeHarness(unittest.TestCase):
             stub = self.probe / "bin" / name
             stub.write_text(body, encoding="utf-8", newline="\n")
             stub.chmod(0o755)
-        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp", "chmod"):
+        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp", "chmod", "grep"):
             real = _posix_tool(tool)
             self.assertTrue(real, f"real {tool} is required for the stubs")
             stub = self.probe / "bin" / tool
@@ -1208,6 +1242,36 @@ class ProbeHarness(unittest.TestCase):
             con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
             con.commit()
             con.close()
+
+    def _make_k16_env_fixture(self, profile: bytes):
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "EnvironmentFile=/etc/default/oldregistry"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=" + profile
+                    + b"\0USER=otheruser\0")
+        envf = self.probe / "etc/default/oldregistry"
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_bytes(b'HOME=/home/otheruser\nUSERPROFILE="' + profile + b'"\n')
+        for d, marker in (("home/runtime-real/.ak-sending", "runtime-real"),
+                          ("home/otheruser/.ak-sending", "fallback-decoy")):
+            dd = self.probe / d
+            dd.mkdir(parents=True, exist_ok=True)
+            for name in ("registry.key", "registry.db"):
+                (dd / name).write_text(f"{marker}-{name}", encoding="utf-8")
+
+    def _make_k17_db_fixture(self, dbpath: str):
+        identity = "/home/otheruser/.ak-sending"
+        args = "--port 17200 --id-dir " + identity + " --db-path " + dbpath
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        (self.probe / identity.lstrip("/") / "registry.key").write_text(
+            "same-synthetic-identity", encoding="utf-8")
 
     def _make_k14_relative_fixture(self, identity: str):
         """Unit + argv both carry '--id-dir <identity>'; the running cwd is
@@ -3041,7 +3105,8 @@ echo "C4=[$c4]"
         self.assertIn("RUN_RC=3", out,
                       "any evidence unavailability must refuse, never skip")
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
-        self.assertIn("no runtime environment evidence", p1_out)
+        self.assertIn("a partial snapshot is not evidence", p1_out)
+        self.assertIn("reader rc=1", p1_out)
         self.assertNotIn("runtime-id-dir:", p1_out)
         # And nothing migrated anywhere.
         self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
@@ -3138,6 +3203,122 @@ echo "C4=[$c4]"
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
         self.assertIn("RELATIVE --db-path", p1_out)
         self.assertNotIn("runtime-id-dir:", p1_out)
+
+    # -- K10-N1 (round 17): the READER's rc is evidence -------------------------
+    def test_k10n1_cat_partial_output_then_fail_refuses(self):
+        # Reviewer fixture: cat emits the FIRST complete HOME record and
+        # THEN exits 74 — tee succeeds, so the old snapshot check accepted
+        # the INCOMPLETE file, the missing USERPROFILE record let the chain
+        # fall back to HOME and migrate the decoy. PIPESTATUS[0] refuses.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'ENV_PARTIAL_FAIL=1 bash "$PROBE_DIR/p1.sh" '
+            + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a partial snapshot from a failed reader must refuse")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("reader rc=74", p1_out)
+        self.assertIn("a partial snapshot is not evidence", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        # Nothing was migrated and nothing copied.
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
+        self.assertNotIn("systemctl stop", self.stubs_log())
+
+    def test_k10n1_cat_ordinary_control_still_succeeds(self):
+        # The ordinary control on the SAME fixture: the true runtime-real
+        # source is selected and migrated.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-real/\.ak-sending$")
+
+    def test_k10n1_cwd_output_then_fail_refuses(self):
+        # The same pipe shape on the cwd capture: readlink emits the full
+        # value and THEN fails — accepted before, refused by PIPESTATUS[0].
+        # Fixture: empty USERPROFILE (relative base) forces the cwd read.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "Environment=HOME=/home/otheruser",
+                                "Environment=USERPROFILE="],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'CWD_OUTPUT_THEN_FAIL=1 bash "$PROBE_DIR/p1.sh" '
+            + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a cwd read that emitted a value then failed must refuse")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("reader rc=1", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        self.assertIn("CWD_NONZERO_WITH_OUTPUT", self.stubs_log())
+
+    def test_k10n1_grep_extraction_error_refuses_not_absent(self):
+        # Reviewer fixture: USERPROFILE IS present in the snapshot, but its
+        # extraction grep exits 2 (tool error, no stdout). The round-16
+        # 'continue' read the ERROR as variable-absent -> HOME fallback ->
+        # decoy migrated. The rc triage refuses instead.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EXTRACT_VAR=USERPROFILE bash "$PROBE_DIR/p1.sh" '
+            + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a grep tool error must refuse, never read as absent")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("cannot determine the presence of USERPROFILE", p1_out)
+        self.assertIn("refusing rather than treat an error as variable-absent", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
+
+    # -- K15-N1 (round 17): bracket filenames cannot silently no-op -------------
+    def test_k15n1_bracket_db_filename_refuses(self):
+        # 'db[1].sqlite' is a LEGAL filename whose brackets are PATTERN
+        # syntax in ${var//.../} — the round-16 rewrite silently no-opped
+        # while the log claimed success, leaving a cwd-dependent unit.
+        # Policy (stated in the script comment): the whitelist discipline
+        # applies to the db argument BEFORE any rewrite — bracket bytes are
+        # not bake-safe, so this REFUSES.
+        self._make_k17_db_fixture("home/otheruser/.ak-sending/db[1].sqlite")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)  # phase1 passes (brackets are env-faithful)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k17br.sh")
+        self.assertNotEqual(
+            rc, 0,
+            "a bracket db argument must refuse in the decision: " + out)
+        self.assertIn("cannot bake faithfully into the generated unit", out)
+        self.assertNotIn("CHOSEN_", out)
+
+    def test_k15n1_ordinary_relative_db_rewrite_verified(self):
+        # Control: an ordinary whitelisted relative db still rewrites, and
+        # the RESULT-verification confirms the absolute form landed.
+        self._make_k17_db_fixture("state/registry.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k17ord.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertIn("--db-path /home/runtime-old/state/registry.db", exec_line)
+        self.assertNotIn("--db-path state/registry.db", exec_line + " ")
 
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
@@ -4042,6 +4223,81 @@ class BaselineContrastTests(ProbeHarness):
                       "the round-14 tip kept the RELATIVE db form (the defect)")
         self.assertNotIn("WorkingDirectory=", unit)
         self.assertNotIn("/home/runtime-old", unit)
+
+    def test_k10n1_round15_tip_accepts_partial_snapshot(self):
+        # K16-review contrast: 0602f92 on the cat partial-then-fail fixture —
+        # tee's success masks the reader's 74, the incomplete snapshot loses
+        # the USERPROFILE record and the whole chain migrates the HOME decoy.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        text = self.baseline_text(PREV14_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev14.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'ENV_PARTIAL_FAIL=1 bash "$PROBE_DIR/p1prev14.sh" '
+            + '> "$PROBE_DIR/p1prev14.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV14_REV) + BOX_MODELS,
+                                  body, name="driver-prev14-part.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-15 tip accepted the partial snapshot (the defect)")
+        p1_out = (self.probe / "p1prev14.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$",
+                         "the round-15 tip fell back to HOME off the partial snapshot")
+        self.assertIn("REVIEW_CAT_PARTIAL_ERROR=74", self.stubs_log())
+
+    def test_k10n1_round15_tip_extraction_error_as_absent(self):
+        # K16-review contrast: 0602f92 on the extraction-error fixture —
+        # its '|| true' + empty-continue read the grep ERROR as
+        # variable-absent and fell back to HOME. (f425256 refused the same
+        # input via the byte-count comparison.)
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        text = self.baseline_text(PREV14_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev14g.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EXTRACT_VAR=USERPROFILE bash "$PROBE_DIR/p1prev14g.sh" '
+            + '> "$PROBE_DIR/p1prev14g.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV14_REV) + BOX_MODELS,
+                                  body, name="driver-prev14-grep.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-15 tip read the extraction error as absent (the defect)")
+        p1_out = (self.probe / "p1prev14g.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+        self.assertIn("REVIEW_GREP_EXTRACT_ERROR=2", self.stubs_log())
+
+    def test_k15n1_round15_tip_bracket_db_rewrite_noop(self):
+        # K16-review contrast: 0602f92 on the bracket db fixture — the
+        # ${var//pattern/} substitution treats '[1]' as a pattern class, the
+        # rewrite silently no-ops, the LOG claims success and the generated
+        # unit keeps the cwd-dependent relative argument.
+        self._make_k17_db_fixture("home/otheruser/.ak-sending/db[1].sqlite")
+        text = self.baseline_text(PREV14_REV)
+        args = ("--port 17200 --id-dir /home/otheruser/.ak-sending "
+                "--db-path home/otheruser/.ak-sending/db[1].sqlite")
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'REGISTRY_EXEC="$REMOTE_BIN registry-server ' + args + '"' + chr(10)
+            + 'runtime_cwd=/home/runtime-old' + chr(10)
+            + 'REG_RW="/home/otheruser/.ak-sending"' + chr(10)
+            + 'rel_db="home/otheruser/.ak-sending/db[1].sqlite"' + chr(10)
+            + 'abs_db="$runtime_cwd/$rel_db"' + chr(10)
+            + 'REGISTRY_EXEC=${REGISTRY_EXEC//--db-path $rel_db/--db-path $abs_db}' + chr(10)
+            + 'REGISTRY_EXEC=${REGISTRY_EXEC//--db-path=$rel_db/--db-path=$abs_db}' + chr(10)
+            + 'printf "AFTER_REWRITE=%s\n" "$REGISTRY_EXEC"' + chr(10)
+        )
+        rc, out = self.run_driver("", body, name="driver-prev14-br.sh")
+        self.assertEqual(rc, 0, out)
+        after = [l for l in out.splitlines() if l.startswith("AFTER_REWRITE=")][0]
+        self.assertIn("db[1].sqlite", after)
+        self.assertNotIn("/home/runtime-old/home/otheruser/.ak-sending/db[1].sqlite",
+                         after,
+                         "the round-15 tip's pattern substitution silently no-opped "
+                         "on the bracket filename (the defect)")
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

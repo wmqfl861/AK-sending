@@ -1110,3 +1110,70 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `0d58853` | K10-N1 environ 单快照与 K15-N1 相对 db 绝对化；复核方文档同步与执行方本节记录入库 |
+
+
+## 37. 修复轮十五独立复核证据（2026-11-16）
+
+被审范围固定为 `f425256..0602f92`，实现提交 `0d58853`，完整 tip 为 `0602f9270ae38fd9a6070c762b3c5a9214d4401a`。输入、机制和可重放代码见 [K16 复核](REVIEW_2026-11-16-batchK16.zh-CN.md)，逐项裁决只在审核状态表。本节、K16、STATUS、状态表及 K15 历史归属补注仅本地同步，没有修改被审实现。“专项”为并行只读审查，“主复核”为独立重放。环境为 Windows、Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1。文档日期按本轮指定日期，GitHub UTC 时间按实际响应记录。
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 280/280，0 failure/error/skip；unittest 1398.147 秒、runner 1398.672 秒。部署 123（当前 94、历史对照 29），NAT lifecycle 11、NAT streak 51、netem 24、repository checker 64、SSH helper 7。全集一次执行通过、无重试或补跑；实现固定为 0602f92，评审文档同步另行检查。 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 初始固定 tip 均 exit 0；86 md/309 local links，契约 5/5。文档同步后的结果另列，不混计。 |
+| Shell | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；各自 `--self-test` | 均 exit 0；真实生成脚本语法和隔离模型，无 SSH 或生产连接。 |
+| Rust 本机门槛 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows 均 exit 0。测试含 doctest：1200 passed、0 failed、8 ignored，596.672 秒；fmt 4.109 秒、clippy 28.172 秒、rustdoc 20.469 秒、Windows build 34.625 秒。ignored 不算执行。 |
+| 实现范围 | `git diff --exit-code f425256..0602f92 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | exit 0、无差异；实现变化仅部署 Shell 与 Python 模型，另有文档同步。 |
+| 文档收尾 | 仓库检查、契约、`git diff --check`；报告代码与实际 runner 比较/compile；被审实现与引用核验 | 最终同步检查均 exit 0：87 md/314 local links、契约 5/5、diff 无空白错误；报告两个 Python 代码块与实际 runner 逐字一致且 compile 通过，两位专项只读复核无必要纠正。被审实现 diff 为空，仅五份评审相关文档变更，未提交。 |
+
+| 行为与对照 | 实际输入 / 结果 | 证据层级 |
+|---|---|---|
+| K15 原 environ 反例 | 主复核按原报告重建普通、稳定尾 LF、仅第四读失败后恢复、从第四读起持续失败、f425256 窄失败对照，共 5 案 | 当前特殊字节案 phase1=3，均只读一次且不 stop；普通全链 0；f425256 全链 0，失败标记实际触发并复制前缀诱饵。原输入没有换成首次读失败。专项另用 ENV_READ_FAIL_FROM=4 的精确当前/基线 2 案重放，结论一致。 |
+| 快照读取状态 | USERPROFILE=/home/runtime-real，HOME=/home/otheruser；cat 只输出真实 HOME 首记录后 exit 74 | 当前与 f425256 均 phase1/decision/install=0，真实复制 fallback-decoy key/db；当前 ENV_READ_1 且无 ENV_READ_2。普通控制复制 runtime-real；专项完整输出后 exit 74 也被接受。 |
+| 提取失败与旧版拒绝 | 完整快照，只有 USERPROFILE 提取 grep 返回 2、无 stdout | 当前全链 0，真实复制 HOME 诱饵；f425256 phase1=3、不 stop/无目标 key。0d58853 新增空值 continue 的回归。首次 runner 错把旧版也预期为放行，实际输出推翻该预期；只修正 runner 断言后补跑旧版与余下控制，产品代码未改。 |
+| 已知存在变量与 tee 控制 | 字节证据 grep 错误且无输出；tee 部分写后 exit 74 | 当前分别 phase1=3 与 74，均无 stop、无安装。专项 environ 共 11 个唯一场景及精确原场景 2 案最终断言通过；主复核新故障及控制共 7 个唯一场景通过（初次 4 案，修正预期后补跑 3 案），不记为全集门槛重试。 |
+| 原普通 DB 完整链 | 相对 home/otheruser/.ak-sending/registry.db、运行 cwd=/home/runtime-old、同身份 SQLite 真假对象；tip 相对、tip 绝对、f425256 相对 | 主复核 3 案均 phase1/decision/install=0。当前相对改为原对象绝对路径且 RWP 扩展覆盖目录，marker=runtime-real；baseline 相对保留、marker=new-cwd-decoy；绝对控制对象保持。 |
+| 方括号 DB 完整链 | 同结构，文件名改为 db[1].sqlite；tip、f425256、tip 绝对控制 | 专项与主复核各 3 案通过断言。当前/基线全链 0，却保留相对 DB 并选择 new-cwd-decoy；绝对控制为 runtime-real。当前 cwd 仅读一次，日志虽称 rewritten，真实 unit 仍相对；诱饵父目录在 RWP 内。 |
+| cwd 读取失败状态 | 新 DB cwd 分支 readlink 输出完整绝对路径+LF 后 exit 1，与无 stdout 的失败控制 | 专项与主复核都实际执行；主复核 2 案通过断言。有输出故障全链 0、cwd 读一次、有失败标记；无输出在 phase1=3 拒绝。完整路径输出案只证明退出码丢失，不单独声称错库。 |
+| 扩展路径矩阵 | 相对/绝对 id 与 DB、等号参数、cwd 不可读/尾 LF、环境相对/空身份基值 | 专项 12 案及逐案结果断言通过；显式混合输入正确且单读。环境相对/空身份+相对 DB 在 decision 保守拒绝，未作阻断；绝对 DB 未补外部 RWP 的旧行为仅记边界。 |
+| 历史归属 | `git show/diff 0d58853`；`git show 0602f92` | K15 报告与同步、执行方 §36 已由 0d58853 入库；0602f92 仅交接一行哈希回填。本轮补 K15 出具时点注记，不改历史裁决。 |
+
+| GitHub / Git | 固定对象 / 命令 | API / 引用结果 |
+|---|---|---|
+| tip CI | `0602f9270ae38fd9a6070c762b3c5a9214d4401a`；[43738252816](https://github.com/wmqfl861/AK-sending/actions/runs/43738252816) | 当前 git 凭据直接查询 run/jobs API，首次已 completed/success；head_branch=dev/batch-k-20261114，attempt=1，updated_at=2026-11-15T17:10:29Z。专项查询 2026-11-15T17:13:19.250329Z；主复核独立再查 2026-11-15T17:25:17.915632Z。13 jobs：12 常规 success、1 手动 release-deep skipped；121 常规步骤均 success，全部 job head_sha 逐项匹配。 |
+| CI 门槛边界 | 固定 SHA 的 workflow 与完整 jobs/steps JSON | Linux/Windows Rust；fmt/clippy/rustdoc；Flutter analyze/test、Dart；Android 双 ABI FFI/符号/debug APK；Linux/macOS portability；audit/deny、repository、legacy signal、NAT netns 模型完成。不等于生产部署或物理双机；portability 的 check 不当作应用构建。 |
+| 权限 | 同一 git 凭据与 GitHub API | 未遇权限拒绝；凭据仅查询进程内存，不输出、不写入文件，不切换身份。 |
+| 远端引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；行为验证后再次读取 | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=0602f9270ae38fd9a6070c762b3c5a9214d4401a，复读一致；没有调用 merge、push 或分支删除。 |
+| 本地引用 | `git worktree list --porcelain`、status/diff | 只有主工作树；批次分支为固定 tip，main 保持 d6c7136。仅评审文档本地同步，不创建提交。 |
+
+| 未执行 / 边界 | 本轮事实 |
+|---|---|
+| 生产、Linux 原生 systemd/权限、物理双机 C4、抓包 | 均未执行。Shell 生成与执行、临时文件 cp/cmp/SQLite 为真实本机操作；proc/systemctl/权限及失败为 Windows Bash 离线模型。未另启原生 registry CLI；K15 原生验证不冒充本轮新执行。 |
+| 本机 Flutter/Dart、Android/Linux/macOS 重建 | Flutter/Dart 不在 PATH；使用固定 tip CI 证据，本机没有这些平台重建。 |
+| shellcheck、手动 release ignored 深测 | 本机 shellcheck 未发现；本轮未执行 release ignored suite，CI 对应手动任务 skipped，不能计为通过。 |
+| 绝对 DB 外部目录、特殊路径 | 已执行对象解析与生成 unit 检查；未把 RWP 缺少外部目录、Unix 用户权限或 systemd 特殊展开扩成未经行为验证的故障结论。 |
+
+| 仓外材料（TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k16-gates-rdlgqzsc` | 首次本机门槛日志/commands/exit/durations、专项 GitHub run/jobs JSON 与审计汇总。 |
+| `ak-k16-review-ojv4c8p3` | 主复核元数据、独立 CI 完整审计、按 K15 重建的 env/DB runner；env-errors、db-brackets、cwd-status 子目录保留实际 runner、生成脚本、输出、unit、stubs、合成文件及结果。 |
+| `ak-k16-prior-env-6ot3_b_8`、`ak-k16-prior-db-imiedz0c` | 主复核 K15 原环境 5 案、普通 DB 3 案完整链原始证据。 |
+| `ak-k16-environ-review-x__cqp8n` | environ 专项 11 案、exact-k15 子目录原精确输入 2 案；最初基线预期修正记录与最终完整结果。 |
+| `ak-k16-path-review-826nvjg4` | 路径专项 12 案矩阵及逐案验证、方括号 3 案、所有实际生成脚本/日志/unit/SQLite。 |
+
+## 38. 修复轮十六（K16 复核后的新候选，执行方记录）
+
+[K16 复核](REVIEW_2026-11-16-batchK16.zh-CN.md)（十六审原任务被平台内容过滤中断后以 QA 框架重派完成；三项 P1：读取者退出码、提取错误误当缺失回归、方括号文件名）后，执行方完成修复；复核方本地同步（§37、STATUS、状态表、K15 历史归属）与本节代码改动一并提交。
+
+| K16 发现 | 修复内容 |
+|---|---|
+| 快照捕获忽略读取者退出码（P1） | 所有 `cat|tee`/`readlink|tee` 捕获在管道后立即记录 `PIPESTATUS[0]`（读取者 rc），守卫为 rc≠0 或空值或零字节即拒绝（「部分快照不是证据」）——先输出后失败的读取者不再被 tee 的成功掩盖。复核夹具（cat 输出首条 HOME 记录后 exit 74）从「确认 HOME 回退+拷贝诱饵」翻转为拒绝；cwd 读取同形夹具翻转；普通控制保持；`0602f92` 基线接受部分快照 |
+| 提取错误误当变量缺失（P1，回归） | 存在性 grep 以 errexit 安全形式运行并**triage rc**：0/1 为合法（匹配/真缺失→缺记录链输入），其余（rc 2 等工具错误）拒绝「cannot determine the presence」——空值 continue 仅跟随 triage 后的 rc=1。复核夹具（快照健康含 USERPROFILE、仅其提取 grep 报错）从「回退 HOME 拷诱饵」翻转为拒绝；真缺失与健康控制保持；`0602f92` 基线把错误当缺失 |
+| 方括号文件名绕过 db 绝对化（P1） | `${var//pattern/}`（`[1]` 即模式语法）换为**纯字符串操作改写**（`%%`/`#` 前后缀切分 + `abs_db="${runtime_cwd%/}/${rel_db#./}"` 拼接）并**验证改写结果**（未出现绝对形即拒绝）；改写前 db 参数先过 K13-N1 白名单——方括号等 bake 不能忠实承载的字节直接拒绝（策略注释写明）。复核夹具（`db[1].sqlite`）从「日志称已改写、unit 仍相对形」翻转为拒绝；普通相对名改写并验证；绝对控制保持；`0602f92` 基线模式替换静默无效 |
+
+### 修复轮十六门禁与提交
+
+本地：`bash -n`+自检全过；Python 289/289（部署套件 132，含 7 项轮十七回归+1 项断言更新与跨十四版基线）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十六首个提交，推送后回填哈希） | PIPESTATUS 读取者守卫、grep rc triage、纯字符串 db 改写+白名单；复核方文档同步与执行方本节记录入库 |

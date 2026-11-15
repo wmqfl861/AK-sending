@@ -672,7 +672,7 @@ self_test() {
   # directory-enumeration order.
   grep -q 'runtime-id-dir' "$WORK/p1.sh" \
     || fail "the occupant's runtime identity dir must be derived and reported (K9-N1)"
-  grep -q 'to derive the default identity dir' "$WORK/p1.sh" \
+  grep -q 'a partial snapshot is not evidence' "$WORK/p1.sh" \
     || fail "missing runtime environment evidence must refuse (K9-N1)"
   # K 复核 K10-N1: environ is parsed STRICTLY on NUL records with the FULL
   # value kept; a set-but-empty USERPROFILE does NOT fall back to HOME
@@ -710,6 +710,22 @@ self_test() {
     || fail "a relative --db-path must trigger the RUNNING-cwd capture (K15-N1)"
   grep -q 'cannot be bound to the running instance' "$0" \
     || fail "a relative --db-path without a captured cwd must refuse (K15-N1)"
+  # K 复核 K10-N1 (round 17): the READER's rc is evidence (PIPESTATUS[0]
+  # through cat|tee / readlink|tee); a partial output with a failed reader
+  # refuses, and a grep tool ERROR is never read as variable-absent.
+  grep -q 'PIPESTATUS' "$WORK/p1.sh" \
+    || fail "the snapshot reader's exit status must be checked through the pipe (K10-N1)"
+  grep -q 'env_reader_rc' "$WORK/p1.sh" \
+    || fail "the environ reader rc must be captured via PIPESTATUS (K10-N1)"
+  grep -q 'refusing rather than treat an error as variable-absent' "$WORK/p1.sh" \
+    || fail "a grep tool error must refuse, never read as variable-absent (K10-N1)"
+  # K 复核 K15-N1 (round 17): the db rewrite is bracket-safe (plain string
+  # ops + result verification) and the whitelist pre-check covers the
+  # db argument.
+  grep -q 'the --db-path rewrite did not take' "$0" \
+    || fail "the db rewrite must verify the RESULT, not the statement (K15-N1)"
+  grep -q 'cannot bake faithfully into the generated unit' "$0" \
+    || fail "non-whitelisted db arguments must refuse before the rewrite (K15-N1)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1266,11 +1282,19 @@ REG_EFF_H
         # prefix directory through the whole chain (reviewer reproduction).
         # Any evidence unavailability = refusal, never a skip.
         reg_env_raw=\$(mktemp /tmp/ak-env-bytes.XXXXXX)
+        # K 复核 K10-N1 (round 17): the READER's exit status must be part
+        # of the evidence — 'cat | tee' succeeds on tee alone, so a cat that
+        # emits the first complete record and THEN fails produced an
+        # INCOMPLETE snapshot that was accepted (the missing USERPROFILE
+        # record let the chain fall back to HOME and migrate a decoy).
+        # PIPESTATUS[0] captures the reader's status through the pipe; ANY
+        # non-zero reader status refuses, even with (partial) output.
         sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | tee "\$reg_env_raw" >/dev/null
+        env_reader_rc=\${PIPESTATUS[0]}
         env_bytes=\$(wc -c < "\$reg_env_raw")
-        if [ "\$env_bytes" = 0 ]; then
+        if [ "\$env_reader_rc" != 0 ] || [ "\$env_bytes" = 0 ]; then
           rm -f "\$reg_env_raw"
-          echo "ERROR: no runtime environment evidence (unreadable/empty /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
+          echo "ERROR: the runtime environment read of /proc/\$reg_pid/environ failed (reader rc=\$env_reader_rc, \$env_bytes bytes) — a partial snapshot is not evidence; refusing before any switchover (K10-N1)" >&2
           exit 3
         fi
         # K 复核 K10-N1 (round 13): extract the FIRST matching NUL record
@@ -1280,6 +1304,26 @@ REG_EFF_H
         # Command substitution keeps every byte of the record except its
         # NUL terminator; values carrying bytes this line-based pipeline
         # cannot transport are REFUSED, never truncated-then-confirmed.
+        # K 复核 K10-N1 (round 17): grep rc is triaged — 0 = matched, 1 =
+        # genuinely NO match (a legitimate absent-record chain input), 2+ =
+        # TOOL ERROR on the snapshot: an error must never be read as
+        # variable-absent (that regression let the chain fall back to HOME
+        # and migrate the decoy).
+        # The rc capture must not trip set -e: run inside an if context and
+        # read \$? explicitly (a bare failing grep would exit the phase).
+        ev_up_rc=0
+        grep -za -m1 '^USERPROFILE=' "\$reg_env_raw" >/dev/null 2>&1 || ev_up_rc=\$?
+        ev_home_rc=0
+        grep -za -m1 '^HOME=' "\$reg_env_raw" >/dev/null 2>&1 || ev_home_rc=\$?
+        for re_stat in "\$ev_up_rc:USERPROFILE" "\$ev_home_rc:HOME"; do
+          case "\$re_stat" in
+            0:*|1:*) : ;;
+            *)
+              rm -f "\$reg_env_raw"
+              echo "ERROR: cannot determine the presence of \${re_stat#*:} in the runtime environ of \$reg_unit (grep rc=\${re_stat%%:*}); refusing rather than treat an error as variable-absent (K10-N1)" >&2
+              exit 3 ;;
+          esac
+        done
         ev_up_rec=\$(grep -za -m1 '^USERPROFILE=' "\$reg_env_raw" || true)
         ev_home_rec=\$(grep -za -m1 '^HOME=' "\$reg_env_raw" || true)
         for re_var in USERPROFILE HOME; do
@@ -1288,9 +1332,9 @@ REG_EFF_H
           else
             re_val="\$ev_home_rec"
           fi
-          # An ABSENT record is a legitimate chain input (only PRESENT
-          # records are verified; a PRESENT-but-empty record is the
-          # non-empty string 'VAR=' and still verifies below).
+          # An ABSENT record (rc=1, triaged above) is a legitimate chain
+          # input; only PRESENT records are verified (a PRESENT-but-empty
+          # record is the non-empty string 'VAR=' and still verifies below).
           [ -n "\$re_val" ] || continue
           case "\$re_val" in
             *\$'\n'*|*' '*|*'	'*)
@@ -1384,11 +1428,15 @@ REG_EFF_H
             # check.
             reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
             sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+            reg_cwd_reader_rc=\${PIPESTATUS[0]}
             reg_cwd=\$(cat "\$reg_cwd_raw")
             cwd_tool_bytes=\$(wc -c < "\$reg_cwd_raw")
             rm -f "\$reg_cwd_raw"
-            if [ -z "\$reg_cwd" ] || [ "\$cwd_tool_bytes" -eq 0 ]; then
-              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit — the byte-evidence read returned nothing; refusing before any switchover (K10-N1)" >&2
+            # K 复核 K10-N1 (round 17): the READER's rc is evidence — a readlink
+            # that emits a full value and THEN fails produced accepted output
+            # through tee's success. Any non-zero reader status refuses.
+            if [ "\$reg_cwd_reader_rc" != 0 ] || [ -z "\$reg_cwd" ] || [ "\$cwd_tool_bytes" -eq 0 ]; then
+              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit — the read failed (reader rc=\$reg_cwd_reader_rc) or returned nothing; refusing before any switchover (K10-N1)" >&2
               exit 3
             fi
             case "\$reg_cwd" in
@@ -1428,11 +1476,13 @@ REG_EFF_H
           reg_rel_orig="\$reg_rt_id"
           reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
           sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+          reg_cwd_reader_rc=\${PIPESTATUS[0]}
           reg_cwd=\$(cat "\$reg_cwd_raw")
           reg_cwd_bytes=\$(wc -c < "\$reg_cwd_raw")
           rm -f "\$reg_cwd_raw"
-          if [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
-            echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --id-dir '\$reg_rel_orig' of \$reg_unit; refusing before any switchover (K14-N1)" >&2
+          # K 复核 K10-N1 (round 17): reader rc through the pipe — see above.
+          if [ "\$reg_cwd_reader_rc" != 0 ] || [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
+            echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --id-dir '\$reg_rel_orig' of \$reg_unit — the read failed (reader rc=\$reg_cwd_reader_rc) or returned nothing; refusing before any switchover (K14-N1)" >&2
             exit 3
           fi
           case "\$reg_cwd" in
@@ -1466,11 +1516,13 @@ REG_EFF_H
           if [ -z "\${reg_cwd:-}" ]; then
             reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
             sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+            reg_cwd_reader_rc=\${PIPESTATUS[0]}
             reg_cwd=\$(cat "\$reg_cwd_raw")
             reg_cwd_bytes=\$(wc -c < "\$reg_cwd_raw")
             rm -f "\$reg_cwd_raw"
-            if [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
-              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --db-path '\$reg_db_arg' of \$reg_unit; refusing before any switchover (K15-N1)" >&2
+            # K 复核 K10-N1 (round 17): reader rc through the pipe — see above.
+            if [ "\$reg_cwd_reader_rc" != 0 ] || [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
+              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --db-path '\$reg_db_arg' of \$reg_unit — the read failed (reader rc=\$reg_cwd_reader_rc) or returned nothing; refusing before any switchover (K15-N1)" >&2
               exit 3
             fi
             case "\$reg_cwd" in
@@ -2461,12 +2513,37 @@ real_run() {
     case "$rel_db" in
       /*|'') : ;;
       *)
+        # K 复核 K13-N1 whitelist discipline applied to the db argument
+        # BEFORE any rewrite: the value is baked into the generated script
+        # and unit, so bytes outside [A-Za-z0-9/._-] (e.g. the legal
+        # filename 'db[1].sqlite') REFUSE here — they are exactly the
+        # pattern/shell-significant class the round-16 pattern-substitution
+        # rewrite silently no-opped on (K15-N1 round 17).
+        case "$rel_db" in
+          *[!A-Za-z0-9/._-]*)
+            fail "the --db-path argument '$rel_db' contains bytes this deploy cannot bake faithfully into the generated unit; resolve it to a whitelisted absolute path and re-run (K15-N1)" ;;
+        esac
         if [ -z "${runtime_cwd:-}" ]; then
           fail "the effective ExecStart carries a RELATIVE --db-path '$rel_db' but the running cwd was not captured; the database object cannot be bound to the running instance; resolve it to an absolute path and re-run (K15-N1)"
         fi
-        abs_db="$runtime_cwd/$rel_db"
-        REGISTRY_EXEC=${REGISTRY_EXEC//--db-path $rel_db/--db-path $abs_db}
-        REGISTRY_EXEC=${REGISTRY_EXEC//--db-path=$rel_db/--db-path=$abs_db}
+        # K 复核 K15-N1 (round 17): the rewrite uses PLAIN STRING OPS (no
+        # ${var//pattern/} — brackets in the filename are pattern syntax and
+        # made the substitution silently no-op while the log claimed a
+        # rewrite). Split the line at the argument boundary and rebuild.
+        abs_db="${runtime_cwd%/}/${rel_db#./}"
+        re_prefix=${REGISTRY_EXEC%%--db-path*}
+        re_suffix=${REGISTRY_EXEC#*--db-path}
+        re_sep=${re_suffix%%[! =]*}          # the separator (' ' or '=') that followed --db-path
+        re_suffix=${re_suffix#"$re_sep"}
+        re_suffix=${re_suffix#"$rel_db"}      # strip ONLY the literal argument
+        REGISTRY_EXEC="${re_prefix}--db-path${re_sep}${abs_db}${re_suffix}"
+        # Verify the RESULT, not the statement: the argument actually
+        # replaced, no relative form left anywhere in the composed line.
+        case "$REGISTRY_EXEC" in
+          *"--db-path${re_sep}${abs_db}"*) : ;;
+          *)
+            fail "the --db-path rewrite did not take (composed line still carries the relative argument); refusing rather than generate a cwd-dependent unit (K15-N1)" ;;
+        esac
         note "relative --db-path '$rel_db' rewritten to the RUNNING-resolved $abs_db (K15-N1)"
         # ReadWritePaths must cover the RESOLVED db object's directory when
         # it lies outside the identity dir (re-derived from the absolute

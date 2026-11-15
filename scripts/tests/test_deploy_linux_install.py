@@ -71,6 +71,8 @@ PREV3_REV = "f150503"  # round-2 candidate (K2 findings)
 BASE_REV = "f9582e5"   # original batch-K baseline (K findings)
 PREV5_REV = "46473fc"  # round-5 candidate (K5 findings: unanchored absence,
                        # deactivating-as-stopped, standard-name exclusion)
+PREV6_REV = "e8f811d"  # round-6 candidate (K6 findings: absent-file +
+                        # running process passed, drop-in overrides ignored)
 
 SUDO_STUB = r"""#!/usr/bin/env bash
 set -u
@@ -216,12 +218,31 @@ is_unit_active() { [ "$(cat "$ST/$1.active" 2>/dev/null || true)" = active ]; }
 u="${!#}"
 case "$1" in
   cat)
-    # Unit files live in any standard dir (vendor installs included).
+    # systemctl cat emits the MERGED unit: main fragment first, then every
+    # drop-in in precedence order (so /etc overrides come last). '# path'
+    # comment headers separate the files, exactly like the real tool.
+    found=""
     if [ -z "${SYSTEMCTL_CAT_FORCE_FAIL:-}" ]; then
       for ud in "$PROBE_DIR/etc/systemd/system" "$PROBE_DIR/run/systemd/system" \
                 "$PROBE_DIR/usr/lib/systemd/system" "$PROBE_DIR/lib/systemd/system"; do
-        if [ -f "$ud/$u" ]; then exit 0; fi
+        if [ -f "$ud/$u" ]; then found="$ud/$u"; break; fi
       done
+    fi
+    if [ -n "$found" ]; then
+      echo "# $found"
+      while IFS= read -r cl || [ -n "$cl" ]; do echo "$cl"; done < "$found"
+      for ddn in "$PROBE_DIR/usr/lib/systemd/system/$u.d" \
+                 "$PROBE_DIR/lib/systemd/system/$u.d" \
+                 "$PROBE_DIR/run/systemd/system/$u.d" \
+                 "$PROBE_DIR/etc/systemd/system/$u.d"; do
+        [ -d "$ddn" ] || continue
+        for df in "$ddn"/*.conf; do
+          [ -f "$df" ] || continue
+          echo "# $df"
+          while IFS= read -r cl || [ -n "$cl" ]; do echo "$cl"; done < "$df"
+        done
+      done
+      exit 0
     fi
     # Default: systemd v255's standard missing-unit diagnostic (verified
     # against upstream systemctl-util.c, LoadState=not-found finish path),
@@ -644,6 +665,16 @@ make_disabled_inactive_model() {
   rm -f "$ST/4242.exe" "$ST/4243.exe"
   echo "MODEL=disabled+inactive(units exist)"
 }
+make_deleted_unit_files_model() {
+  # Round-7 fixture: both services KEEP running (active, MainPID, old image)
+  # while their unit FILES are gone — cat naturally answers v255's
+  # 'No files found for <unit>.', is-enabled 'not-found'-class, is-active
+  # 'active'. systemd keeps running units after file deletion.
+  make_upgrade_model
+  rm -f "$PROBE_DIR/etc/systemd/system/ak-registry-server.service"
+  rm -f "$PROBE_DIR/etc/systemd/system/ak-stun-server.service"
+  echo "MODEL=running units whose unit FILES were deleted"
+}
 make_legacy_only_model() {
   mkdir -p "$PROBE_DIR/etc/systemd/system"
   cat > "$PROBE_DIR/etc/systemd/system/oldsignal.service" <<LUNIT
@@ -874,14 +905,19 @@ class ProbeHarness(unittest.TestCase):
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def make_private_discovery_model(self, occupant: str = "oldregistry.service",
-                                     vendor: bool = False):
+                                     vendor: bool = False, main_exec: str | None = None,
+                                     dropin: list[str] | None = None,
+                                     cmdline_extra: str = ""):
         """K2-R3 OFFLINE permission model: a registry port held by ANOTHER
         USER's process (pid only visible to root) plus a PRIVATE identity
         directory under a foreign home. /proc/<pid>/cmdline deliberately has
         NO trailing newline, exactly like Linux. `occupant` names the unit
         the cgroup resolves to; `vendor` places that unit file under
-        /usr/lib/systemd/system instead of /etc/systemd/system (round 6:
-        vendor-dir standard-named units are upgrade inputs too)."""
+        /usr/lib/systemd/system instead of /etc/systemd/system (round 6);
+        `main_exec` replaces the main fragment's ExecStart tail; `dropin`
+        writes /etc/systemd/system/<unit>.d/override.conf with those lines
+        (round 7 drop-in semantics); `cmdline_extra` appends arguments to
+        the running instance's cmdline."""
         proc = self.probe / "proc"
         (proc / "4242").mkdir(parents=True, exist_ok=True)
         (proc / "4243").mkdir(parents=True, exist_ok=True)
@@ -889,7 +925,10 @@ class ProbeHarness(unittest.TestCase):
                                               encoding="utf-8", newline="\n")
         (proc / "4243" / "cgroup").write_text("0::/system.slice/oldsignal.service\n",
                                               encoding="utf-8", newline="\n")
-        (proc / "4242" / "cmdline").write_bytes(b"/opt/ak-sending/ak-cli\0registry-server\0")
+        cmdline = b"/opt/ak-sending/ak-cli\0registry-server\0"
+        if cmdline_extra:
+            cmdline += cmdline_extra.encode() + b"\0"
+        (proc / "4242" / "cmdline").write_bytes(cmdline)
         home = self.probe / "home" / "otheruser" / ".ak-sending"
         home.mkdir(parents=True, exist_ok=True)
         (home / "registry.key").write_text("private-key-bytes", encoding="utf-8")
@@ -899,11 +938,17 @@ class ProbeHarness(unittest.TestCase):
         else:
             unit_dir = self.probe / "etc" / "systemd" / "system"
         unit_dir.mkdir(parents=True, exist_ok=True)
+        exec_tail = main_exec or ("/opt/ak-sending/ak-cli registry-server --port 17200 "
+                                  "--id-dir /home/otheruser/.ak-sending")
         (unit_dir / occupant).write_text(
             "[Unit]\nDescription=foreign-user registry\n\n[Service]\n"
-            "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
-            "--id-dir /home/otheruser/.ak-sending\n\n[Install]\nWantedBy=multi-user.target\n",
+            f"ExecStart={exec_tail}\n\n[Install]\nWantedBy=multi-user.target\n",
             encoding="utf-8", newline="\n")
+        if dropin is not None:
+            dropin_dir = self.probe / "etc" / "systemd" / "system" / f"{occupant}.d"
+            dropin_dir.mkdir(parents=True, exist_ok=True)
+            (dropin_dir / "override.conf").write_text(
+                "".join(line + "\n" for line in dropin), encoding="utf-8", newline="\n")
 
     def assert_recovery_restored_old_state(self, out: str):
         """Shared K2-N1 assertions: old binary + old unit BYTES back on disk,
@@ -1618,6 +1663,128 @@ echo "C4=[$c4]"
         self.assertIn("unit ak-stun-server: absent", p1_out)
         self.assertIn("port 17200/tcp: free", p1_out)
 
+    # -- K3-N1 (round 7): absent unit FILE + running process is NOT fresh ----
+    def test_k3n1_deleted_unit_file_with_running_process_refuses(self):
+        # The reviewer's fixture: the unit files are deleted (between phase1
+        # and phase456 + daemon-reload) while both services keep running —
+        # cat naturally answers v255's 'No files found for <unit>.',
+        # is-enabled reports not-found-class state, is-active 'active' with
+        # the MainPID alive on the OLD image. Rounds <= 6 printed 'nothing
+        # to stop', installed the new disk image and exited 0 with the
+        # original process untouched. Now: refusal BEFORE the switchover,
+        # disk and old process untouched.
+        rc, out = self.generate_and_run_p456(
+            'make_deleted_unit_files_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out,
+                      "a running service whose unit file is gone must never be treated "
+                      "as a fresh install")
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("absent but its run state is 'active'", p456_out)
+        self.assertIn("no recoverable pre-state", p456_out)
+        self.assertNotIn("nothing to stop", p456_out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD, "the disk must stay on the old binary")
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active",
+                             f"the running {unit} must be untouched")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD)
+
+    # -- K2-R3 (round 7): drop-in overrides and the running-cmdline cross-check
+    AK_DEFAULT = "/opt/ak-sending/ak-cli registry-server --port 17200 --id-dir /var/lib/ak-default"
+    AK_LEGACY = "/opt/ak-sending/ak-cli registry-server --port 17200 --id-dir /var/lib/ak-legacy"
+
+    def _run_p1_and_config(self, name: str):
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8") \
+            if (self.probe / "p1.out").exists() else ""
+        return rc, out, p1_out
+
+    def test_k2r3_dropin_clear_override_selects_legacy_id_dir(self):
+        # The reviewer's exact fixture: main fragment (vendor dir) carries
+        # --id-dir /var/lib/ak-default; a legal /etc drop-in CLEARS ExecStart
+        # and re-sets it to /var/lib/ak-legacy; the running cmdline carries
+        # ak-legacy. Rounds <= 6 read only the main file and chose
+        # ak-default with an empty migration source.
+        self.make_private_discovery_model(
+            vendor=True, main_exec=self.AK_DEFAULT,
+            dropin=["[Service]", "ExecStart=", f"ExecStart={self.AK_LEGACY}"],
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        rc, out, p1_out = self._run_p1_and_config("dropin-clear")
+        self.assertIn("RUN_RC=0", out)
+        self.assertRegex(p1_out, r"(?m)^  old-registry-unit: oldregistry\.service$")
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*--id-dir /var/lib/ak-legacy$")
+        self.assertNotRegex(p1_out, r"(?m)^  ExecStart=.*ak-default$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-dropin.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("/var/lib/ak-legacy", exec_line[0])
+        self.assertIn("CHOSEN_RW=/var/lib/ak-legacy", out)
+
+    def test_k2r3_main_file_only_with_matching_cmdline_unchanged(self):
+        # Inverse of the drop-in case: a single main-file ExecStart whose
+        # relevant args MATCH the running cmdline flows through unchanged.
+        self.make_private_discovery_model(
+            cmdline_extra="--port 17200 --id-dir /home/otheruser/.ak-sending")
+        rc, out, p1_out = self._run_p1_and_config("main-only")
+        self.assertIn("RUN_RC=0", out)
+        self.assertRegex(p1_out,
+                         r"(?m)^  ExecStart=/opt/ak-sending/ak-cli registry-server "
+                         r"--port 17200 --id-dir /home/otheruser/\.ak-sending$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-mainonly.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--id-dir /home/otheruser/.ak-sending",
+                      [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0])
+
+    def test_k2r3_dropin_append_resolved_by_running_cmdline(self):
+        # A drop-in WITHOUT the clearing line legally APPENDS: two effective
+        # entries. The running cmdline resolves exactly one (ak-legacy).
+        self.make_private_discovery_model(
+            vendor=True, main_exec=self.AK_DEFAULT,
+            dropin=["[Service]", f"ExecStart={self.AK_LEGACY}"],
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        rc, out, p1_out = self._run_p1_and_config("dropin-append")
+        self.assertIn("RUN_RC=0", out)
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*--id-dir /var/lib/ak-legacy$")
+        self.assertNotRegex(p1_out, r"(?m)^  ExecStart=.*ak-default$")
+
+    def test_k2r3_dropin_append_ambiguous_refuses(self):
+        # Same two entries but the running cmdline matches NEITHER: the
+        # effective config cannot be determined -> refusal before any
+        # switchover.
+        self.make_private_discovery_model(
+            vendor=True, main_exec=self.AK_DEFAULT,
+            dropin=["[Service]", f"ExecStart={self.AK_LEGACY}"],
+            cmdline_extra="--port 17200 --id-dir /var/lib/elsewhere")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("2 effective ExecStart entries", p1_out)
+        self.assertIn("does not resolve exactly one", p1_out)
+
+    def test_k2r3_effective_config_disagreeing_with_cmdline_refuses(self):
+        # Single unambiguous config entry that MATERIALLY disagrees with the
+        # running instance (configured ak-default, running ak-legacy).
+        self.make_private_discovery_model(
+            main_exec=self.AK_DEFAULT,
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("materially disagrees with the running cmdline", p1_out)
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -2066,6 +2233,62 @@ class BaselineContrastTests(ProbeHarness):
         self.assertTrue(exec_line, out)
         self.assertNotIn("/var/lib/ak-legacy", exec_line[0],
                          "the round-5 candidate dropped the legacy identity dir")
+        self.assertNotIn("CHOSEN_RW=/var/lib/ak-legacy", out)
+
+    # -- K6-review contrasts: the round-6 candidate (e8f811d) exhibits the
+    #    two round-7 defects under the same fixtures; the current tree
+    #    passes them (fail-to-pass witnesses).
+    def test_k3n1_round6_candidate_deleted_files_silent_pass(self):
+        # Reviewer repro against the round-6 candidate: unit files deleted
+        # while both services keep running -> 'nothing to stop' x2, new disk
+        # installed, install exits 0, original process untouched.
+        rc, out, p456_out = self.run_baseline_p456(
+            PREV6_REV, self.P456_ENV_PREBUILT, "p456prev6",
+            models="make_deleted_unit_files_model\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-6 candidate silently succeeded (the defect)")
+        self.assertEqual(p456_out.count("not present; nothing to stop"), 2, p456_out)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_STUB, "new disk image installed")
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active",
+                             "the original processes kept running")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD)
+
+    def test_k2r3_round6_candidate_dropin_loses_legacy_dir(self):
+        # Reviewer repro against the round-6 candidate: only the MAIN file
+        # is read, so the drop-in's clearing override is ignored and the
+        # real config selection picks /var/lib/ak-default.
+        self.make_private_discovery_model(
+            vendor=True,
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-default",
+            dropin=["[Service]", "ExecStart=",
+                    "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
+                    "--id-dir /var/lib/ak-legacy"],
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        text = self.baseline_text(PREV6_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev6.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1prev6.sh" > "$PROBE_DIR/p1prev6.out" 2>&1; echo "RUN_RC=$?"\n'
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV6_REV) + BOX_MODELS, body,
+                                  name="driver-prev6-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev6.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*ak-default$",
+                         "the round-6 candidate read only the main fragment")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev6-decision.sh", text=text,
+            origin=f"the {PREV6_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("/var/lib/ak-default", exec_line[0],
+                      "the round-6 candidate chose the wrong identity dir (the defect)")
+        self.assertIn("CHOSEN_RW=/var/lib/ak-default", out)
         self.assertNotIn("CHOSEN_RW=/var/lib/ak-legacy", out)
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit

@@ -299,6 +299,14 @@ class StatusHandoffLinkTests(unittest.TestCase):
     whitespace/newlines between "(" and the destination (example 510) —
     an archive entry written in those forms used to bypass the complete
     checker with errors=[].
+
+    K6 (REVIEW_2026-11-15-batchK6.zh-CN.md §1): titles may span LINES
+    (only blank lines inside are forbidden, per the 0.31.2 link-title
+    definition) — excluding newlines from quoted titles was a round-6
+    regression that silently dropped a legal archive link. Entries the
+    gate cannot parse at all (blank-line titles, links hidden inside
+    another link's title) are explicitly rejected; angle-bracket
+    destinations are unwrapped in both consumers.
     """
 
     @staticmethod
@@ -819,6 +827,138 @@ class StatusHandoffLinkTests(unittest.TestCase):
                 "# 项目状态\n\n## 当前状态\n\n" + paren
                 + "\n\n## 最新验证\n\n" + newline
                 + "\n\n## 交接入口\n\n" + space + " · " + padded + "\n"
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(errors, [])
+            self.assertEqual(path.name, name)
+
+    # -- K6 (REVIEW_2026-11-15-batchK6.zh-CN.md §1): CommonMark 0.31.2
+    # titles may span lines (only blank lines inside are forbidden). The
+    # round-6 regex excluded newlines from quoted titles — a regression
+    # that made a legal multiline-title archive link pass the complete
+    # checker with errors=[]. Entries the gate cannot parse at all are
+    # now rejected explicitly, never silently ignored.
+
+    def test_multiline_dq_title_archive_link_fails(self):
+        # The reviewer's exact fixture: a newline inside the double-quoted
+        # title. The a8bb3b9 (round-5) checker rejected this; the 9c2d3bd
+        # (round-6) checker silently ignored it.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](archive/" + name + ' "handoff\nevidence")'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_multiline_sq_title_archive_link_fails(self):
+        # Single-quoted multiline title reproduces identically.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](archive/" + name + " 'handoff\nevidence')"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_multiline_paren_title_archive_link_fails(self):
+        # Decision for parenthesized multiline titles: PARSE them like the
+        # quoted forms (no blank lines, no parens inside) — the archive
+        # entry gets the normal every-current-batch-link error.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](archive/" + name + " (handoff\nevidence))"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_blank_line_title_archive_link_rejected(self):
+        # Decision for titles containing a BLANK line (illegal per the
+        # 0.31.2 link-title definition): the full pattern cannot parse
+        # the entry, and the gate REJECTS it explicitly instead of
+        # silently ignoring it.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](archive/" + name + ' "x\n\ny")'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("not a supported/parseable Markdown inline link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_angle_bracket_archive_fails_and_canonical_passes(self):
+        # Angle-bracket destinations are now unwrapped by both consumers:
+        # <archive/…> fails like the bare form; <canonical> passes.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            archive = chr(91) + "K](<archive/" + name + ">)"
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertEqual(path.name, name)
+            canonical = chr(91) + "K](<" + name + ">)"
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(canonical))
+            self.assertEqual(errors, [])
+            self.assertEqual(path.name, name)
+
+    def test_link_hidden_inside_another_title_rejected(self):
+        # Backstop: an archive link written INSIDE another link's parsed
+        # title region cannot be matched by the full pattern on its own —
+        # the gate reports the hidden entry instead of ignoring it.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            hidden = (chr(91) + "K](" + name + ' "see '
+                      + chr(91) + "J](archive/" + name + ') now")')
+            status = (
+                "# 项目状态\n\n## 当前状态\n\n" + chr(91) + "K](" + name + ")"
+                + "\n\n## 最新验证\n\n" + hidden
+                + "\n\n## 交接入口\n\n" + chr(91) + "K](" + name + ")\n"
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("not a supported/parseable Markdown inline link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_canonical_multiline_title_variants_pass(self):
+        # Canonical destinations with multiline titles in all three forms
+        # keep passing.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, name, "# 交接：批次 K\n")
+            status = (
+                "# 项目状态\n\n## 当前状态\n\n"
+                + chr(91) + "K](" + name + ' "a\nb")'
+                + "\n\n## 最新验证\n\n" + chr(91) + "K](" + name + " 'c\nd')"
+                + "\n\n## 交接入口\n\n" + chr(91) + "K](" + name + " (e\nf))"
+                + "\n"
             )
             path, errors = checks.status_handoff_issues(root, status)
             self.assertEqual(errors, [])

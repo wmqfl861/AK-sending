@@ -648,6 +648,13 @@ self_test() {
     || fail "occupant unit lookup must cover vendor unit dirs (K2-R3)"
   grep -q 'find_unit_file' "$WORK/p1.sh" \
     || fail "unit discovery (managed AND occupant) must use the all-directory lookup (K2-R3)"
+  # K 复核 K2-R3 (round 7): the EFFECTIVE config (drop-ins included, empty
+  # 'ExecStart=' clearing) must be derived from systemctl cat's merged view
+  # and cross-checked against the running cmdline.
+  grep -q 'effective_execstart' "$WORK/p1.sh" \
+    || fail "config derivation must use the merged main+drop-in view (K2-R3)"
+  grep -q 'reg_args_agree' "$WORK/p1.sh" \
+    || fail "the chosen config must be cross-checked against the running cmdline (K2-R3)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -680,6 +687,12 @@ self_test() {
     || fail "the v255 missing-unit diagnostic must be recognized as absent, ANCHORED on the unit name (K3-N1)"
   grep -q 'inactive|failed) return 1' "$WORK/p456.sh" \
     || fail "qstate must treat ONLY final states as stopped; transitional states are undeterminable (K2-N1)"
+  # K 复核 K3-N1 (round 7): a missing unit FILE with a running process is
+  # NOT a fresh install — capture AND stop must refuse.
+  grep -q 'absent but its run state' "$WORK/p456.sh" \
+    || fail "capture must cross-check absent files against the run state (K3-N1)"
+  grep -q 'refusing to skip its stop' "$WORK/p456.sh" \
+    || fail "stop_unit must refuse to skip a running unit whose file is gone (K3-N1)"
   # K 复核 K2-N1 (round 5): unsupported captured states refuse pre-switch,
   # and recovery tri-states its is-active queries with CONFIRMED outcomes.
   grep -q 'unsupported/undeterminable enable-state' "$WORK/p456.sh" \
@@ -933,6 +946,38 @@ find_unit_file() {
   done
   return 1
 }
+# effective_execstart <unit.service>: echo the EFFECTIVE ExecStart entries of
+# the unit — the MERGED view of the main fragment plus drop-ins as systemd
+# loads them (unit.c loads fragments first, then drop-ins; load-fragment.c
+# treats an EMPTY 'ExecStart=' as clearing the command list, later entries
+# otherwise append). systemctl cat emits exactly that merged view (main
+# first, then drop-ins in precedence order), so parse it here. K 复核 K2-R3
+# (round 7): reading only the MAIN file let a legal drop-in override
+# ('ExecStart=' + re-set with different --id-dir) be silently ignored and
+# the deploy re-pointed the identity to the wrong directory. Refuses (exit
+# 3) when the merged config cannot be read or carries no ExecStart at all;
+# MULTIPLE surviving entries are returned for the caller to resolve against
+# the running instance (or refuse).
+effective_execstart() {
+  local ec_cat
+  ec_cat=\$(sudo -n env LC_ALL=C systemctl cat "\$1" 2>/dev/null) \\
+    || { echo "ERROR: cannot read the effective configuration of \$1 (systemctl cat failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
+  printf '%s\\n' "\$ec_cat" | awk '/^ExecStart=/ { v = substr(\$0, 11); if (v == "") { n = 0; split("", L) } else { L[++n] = v } } END { for (i = 1; i <= n; i++) print L[i] }'
+}
+# reg_args_agree <exec-line> <cmdline-line>: 0 when the relevant arguments
+# (port, --id-dir) of the configured ExecStart do not MATERIALLY disagree
+# with the running instance's cmdline (arguments absent from the cmdline are
+# not compared — the process may rely on defaults).
+reg_args_agree() {
+  local a_id b_id a_port b_port
+  a_id=\$(printf '%s\\n' "\$1" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+  b_id=\$(printf '%s\\n' "\$2" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+  a_port=\$(printf '%s\\n' "\$1" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
+  b_port=\$(printf '%s\\n' "\$2" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
+  if [ -n "\$b_id" ] && [ "\$a_id" != "\$b_id" ]; then return 1; fi
+  if [ -n "\$b_port" ] && [ "\$a_port" != "\$b_port" ]; then return 1; fi
+  return 0
+}
 for u in ak-registry-server ak-stun-server; do
   # K 复核 K2-R3 (round 6): the managed units are looked up across ALL
   # standard directories (rounds <= 5 checked only /etc/systemd/system, so a
@@ -947,8 +992,16 @@ for u in ak-registry-server ak-stun-server; do
   fi
   if [ -n "\$u_file" ]; then
     echo "unit \$u: present"
-    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "\$u_file"
-    sudo -n sed -n 's/^User=/  User=/p' "\$u_file"
+    # K 复核 K2-R3 (round 7): the EFFECTIVE config (main + drop-ins, with
+    # the empty-'ExecStart=' clearing semantics), not just the main file.
+    u_eff=\$(effective_execstart "\$u.service")
+    u_n=\$(printf '%s\\n' "\$u_eff" | grep -c . || true)
+    if [ "\$u_n" != 1 ]; then
+      echo "ERROR: \$u.service has \$u_n effective ExecStart entries (drop-ins?) and no running instance resolves them here; refusing before any switchover (K2-R3)" >&2
+      exit 3
+    fi
+    echo "  ExecStart=\$u_eff"
+    sudo -n env LC_ALL=C systemctl cat "\$u.service" 2>/dev/null | sed -n 's/^User=/  User=/p' | tail -1
     systemctl is-active \$u.service >/dev/null 2>&1 && echo "  active: yes" || echo "  active: no"
   else
     echo "unit \$u: absent"
@@ -985,17 +1038,26 @@ if [ -n "\$reg_line" ]; then
   # NUL->space conversion therefore joined the next machine field onto the
   # cmdline line and real_run's anchored '^  old-registry-unit:' parser lost
   # the old unit. Terminate the line explicitly so every machine field in
-  # this report starts at column 0.
-  [ -n "\${reg_pid:-}" ] && { sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/^/  cmdline: /'; printf '\\n'; } || true
-  # K 复核 K2-R3 (round 5/6): an occupant unit IDENTIFIED from its cgroup
+  # this report starts at column 0. The captured cmdline is ALSO the running
+  # instance's authoritative argument list for the cross-check below.
+  reg_cmdline=""
+  if [ -n "\${reg_pid:-}" ]; then
+    reg_cmdline=\$(sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' || true)
+  fi
+  [ -n "\$reg_cmdline" ] && { printf '%s\\n' "\$reg_cmdline" | sed 's/^/  cmdline: /'; printf '\\n'; } || true
+  # K 复核 K2-R3 (round 5/6/7): an occupant unit IDENTIFIED from its cgroup
   # must be bound into the migration set — INCLUDING the standard name
   # ak-registry-server.service (round 5 excluded it, so a vendor-dir install
   # of the standard-named unit lost its --id-dir and the deploy silently
   # re-pointed the identity). Locate the unit file across every standard
-  # directory; the config read feeds real_run's ExecStart/--id-dir decisions
-  # regardless of the unit's name. The old-registry-unit FIELD stays limited
-  # to non-standard names (the standard-named unit is already in the managed
-  # stop/backup set). Unlocatable or undeterminable -> REFUSE.
+  # directory; the EFFECTIVE configuration (main + drop-ins, empty
+  # 'ExecStart=' clearing, later entries appending — round 7) feeds
+  # real_run's ExecStart/--id-dir decisions regardless of the unit's name,
+  # cross-checked against the RUNNING cmdline (port/--id-dir). The
+  # old-registry-unit FIELD stays limited to non-standard names (the
+  # standard-named unit is already in the managed stop/backup set).
+  # Unlocatable, undeterminable, ambiguous or materially disagreeing
+  # configs -> REFUSE.
   if [ -n "\${reg_unit:-}" ]; then
     reg_rc=0
     reg_unit_file=\$(find_unit_file "\$reg_unit") || reg_rc=\$?
@@ -1005,8 +1067,38 @@ if [ -n "\$reg_line" ]; then
     fi
     if [ -n "\$reg_unit_file" ]; then
       [ "\$reg_unit" != "ak-registry-server.service" ] && echo "  old-registry-unit: \$reg_unit"
-      sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "\$reg_unit_file"
-      sudo -n sed -n 's/^User=/  old-registry-User=/p' "\$reg_unit_file"
+      reg_eff=\$(effective_execstart "\$reg_unit")
+      reg_n=\$(printf '%s\\n' "\$reg_eff" | grep -c . || true)
+      reg_pick=""
+      if [ "\$reg_n" = 1 ]; then
+        reg_pick="\$reg_eff"
+      elif [ "\$reg_n" -gt 1 ]; then
+        # Multiple surviving entries (no clearing drop-in): resolve against
+        # the RUNNING cmdline; anything but a unique match refuses.
+        reg_hits=0
+        while IFS= read -r re_e; do
+          [ -n "\$re_e" ] || continue
+          if reg_args_agree "\$re_e" "\$reg_cmdline"; then
+            reg_pick="\$re_e"
+            reg_hits=\$((reg_hits + 1))
+          fi
+        done <<REG_EFF_H
+\$reg_eff
+REG_EFF_H
+        if [ "\$reg_hits" != 1 ]; then
+          echo "ERROR: \$reg_unit has \$reg_n effective ExecStart entries (no clearing drop-in) and the running cmdline does not resolve exactly one; refusing before any switchover (K2-R3)" >&2
+          exit 3
+        fi
+      else
+        echo "ERROR: \$reg_unit has no effective ExecStart; refusing before any switchover (K2-R3)" >&2
+        exit 3
+      fi
+      if [ -n "\$reg_cmdline" ] && ! reg_args_agree "\$reg_pick" "\$reg_cmdline"; then
+        echo "ERROR: the effective ExecStart of \$reg_unit materially disagrees with the running cmdline (configured '\$reg_pick' vs running '\$reg_cmdline'); refusing before any switchover (K2-R3)" >&2
+        exit 3
+      fi
+      echo "  ExecStart=\$reg_pick"
+      sudo -n env LC_ALL=C systemctl cat "\$reg_unit" 2>/dev/null | sed -n 's/^User=/  old-registry-User=/p' | tail -1
     else
       echo "ERROR: occupant unit \$reg_unit of port $REGISTRY_PORT/tcp was identified but its unit file cannot be located in any standard directory; refusing before any switchover (K2-R3)" >&2
       exit 3
@@ -1267,7 +1359,19 @@ stop_unit() {
     exists)
       sudo -n systemctl stop "\$1.service" || return 1 ;;
     absent)
-      echo "[install] unit \$1.service not present; nothing to stop (K3-N1)" ;;
+      # K 复核 K3-N1 (round 7): a missing unit FILE does not mean a stopped
+      # service — systemd keeps running units after their file is deleted
+      # (upstream unit_exists treats a not-found unit as existing unless it
+      # is also inactive). Skipping the stop of a unit whose run state is
+      # active/transitional/undeterminable would leave its process running
+      # through the whole switchover.
+      case "\$PU_AC" in
+        inactive|failed)
+          echo "[install] unit \$1.service not present; nothing to stop (K3-N1)" ;;
+        *)
+          echo "[install] the unit file for \$1.service is absent but the service reports '\$PU_AC'; refusing to skip its stop (K3-N1)" >&2
+          return 1 ;;
+      esac ;;
     *)
       echo "[install] cannot determine whether \$1.service exists; refusing to switch blind (K3-N1)" >&2
       return 1 ;;
@@ -1299,6 +1403,17 @@ for u in \$SW_UNITS; do
       active|inactive|failed) : ;;
       *)
         echo "ERROR: unsupported/undeterminable run-state '\$PU_AC' for \$u.service; refusing BEFORE service switchover (K2-N1)" >&2
+        exit 5 ;;
+    esac
+  else
+    # K 复核 K3-N1 (round 7): absent FILE + active (or transitional or
+    # undeterminable) run state is NOT a fresh install — a running process
+    # whose unit file is gone has no recoverable pre-state; refuse BEFORE
+    # anything is touched. Only absent + inactive may proceed.
+    case "\$PU_AC" in
+      inactive|failed) : ;;
+      *)
+        echo "ERROR: the unit file for \$u.service is absent but its run state is '\$PU_AC' (a deleted unit file does not stop a running service); no recoverable pre-state; refusing BEFORE service switchover (K3-N1)" >&2
         exit 5 ;;
     esac
   fi

@@ -78,15 +78,22 @@ COMMIT_PLACEHOLDER = "本提交"
 STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
-# Markdown inline links `[label](target)` with an optional CommonMark
-# title (`[label](target "title")`). The target capture stops at
-# whitespace or a closing paren. The pattern is matched over the WHOLE
-# document — `[^\]]*` labels legally span lines, and a per-line scan
-# silently skips multi-line labels (K4 review §1). Both the repo-wide
-# link walk in check() and the STATUS handoff gate use this one pattern,
-# so every supported link form is parsed consistently.
+# Markdown inline links per the CommonMark destination+title grammar
+# (spec 0.31.2 examples 505/510): `[label]( dest "title" )` — optional
+# whitespace (including newlines) after "(", a bare destination (stops at
+# whitespace or an unescaped paren), optional whitespace, an optional
+# title in double quotes, single quotes OR bare parentheses, optional
+# whitespace, ")". Deliberately out of scope (noted, not silently
+# assumed): angle-bracket `<…>` destinations, backslash escapes, nested
+# parens inside a parenthesized title, titles containing newlines, and
+# whitespace between "]" and "(" (too close to prose like "array[0] (…)").
+# The pattern is matched over the WHOLE document — `[^\]]*` labels
+# legally span lines, and a per-line scan silently skips multi-line
+# labels (K4 review §1). Both the repo-wide link walk in check() and the
+# STATUS handoff gate use this one pattern, so every supported link form
+# is parsed consistently.
 MARKDOWN_LINK_RE = re.compile(
-    r"\[[^\]]*\]\(([^\s)]+)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)"
+    r"\[[^\]]*\]\(\s*([^\s)]+)(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?\s*\)"
 )
 # Windows drive-letter targets (`C:\…`, `C:/…`) are absolute jumps, not
 # relative links, even though they contain no `://`.
@@ -290,10 +297,13 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
 
     K4 (REVIEW_2026-11-15-batchK4.zh-CN.md §1): links are matched over the
     WHOLE document — Markdown labels legally span lines, and the previous
-    per-line scan silently skipped a multi-line-label archive link. The
-    optional CommonMark link title is parsed consistently by every
-    MARKDOWN_LINK_RE consumer (handoff gate and repo-wide walk alike).
-    Each failing link is reported with its STARTING line number.
+    per-line scan silently skipped a multi-line-label archive link. Each
+    failing link is reported with its STARTING line number. K5
+    (REVIEW_2026-11-15-batchK5.zh-CN.md §1): the shared pattern covers the
+    CommonMark destination+title grammar — titles in double quotes, single
+    quotes or bare parentheses, and optional whitespace (including
+    newlines) between "(" and the destination — for every MARKDOWN_LINK_RE
+    consumer (handoff gate and repo-wide walk alike).
 
     Returns (canonical newest handoff path the CR-P3-20 checks must anchor
     to, errors). The run-number/contradiction gates always anchor to the

@@ -69,6 +69,8 @@ BASH = shutil.which("bash")
 PREV_REV = "f7dece2"   # round-3 candidate (K3-N1 / K2-N1 round-4 findings)
 PREV3_REV = "f150503"  # round-2 candidate (K2 findings)
 BASE_REV = "f9582e5"   # original batch-K baseline (K findings)
+PREV5_REV = "46473fc"  # round-5 candidate (K5 findings: unanchored absence,
+                       # deactivating-as-stopped, standard-name exclusion)
 
 SUDO_STUB = r"""#!/usr/bin/env bash
 set -u
@@ -143,6 +145,12 @@ printf 'systemctl %s\n' "$*" >> "$PROBE_DIR/stubs.log"
 ST="$PROBE_DIR/systemctl-state"
 mkdir -p "$ST" 2>/dev/null || true
 UNITDIR="$PROBE_DIR/etc/systemd/system"
+# Whole-daemon failure (e.g. the standard D-Bus ENOENT diagnostic): every
+# invocation fails with this message and rc 1 (K3-N1 round-6 model).
+if [ -n "${SYSTEMCTL_FAIL_ALL_MSG:-}" ]; then
+  echo "$SYSTEMCTL_FAIL_ALL_MSG" >&2
+  exit 1
+fi
 if [ -n "${SYSTEMCTL_FAIL_MATCH:-}" ]; then
   case "$*" in
     *"$SYSTEMCTL_FAIL_MATCH"*)
@@ -191,7 +199,14 @@ stub_start() { # unit: record pid + the RUNNING image this start produced
   pid=$(( $(cat "$ST/nextpid" 2>/dev/null || echo 5000) + 1 ))
   echo "$pid" > "$ST/nextpid"
   echo "$pid" > "$ST/$uu.pid"
-  echo active > "$ST/$uu.active"
+  # Optional transitional-start model (K2-N1 round 6): a unit left
+  # 'deactivating' keeps its MainPID and running image, exactly like a real
+  # stop-in-progress service.
+  if [ -n "${SYSTEMCTL_START_STATE_UNIT:-}" ] && [ "$uu" = "$SYSTEMCTL_START_STATE_UNIT" ]; then
+    echo "${SYSTEMCTL_START_STATE:-active}" > "$ST/$uu.active"
+  else
+    echo active > "$ST/$uu.active"
+  fi
   exe=$(read_execstart "$uu")
   printf '%s\n' "$exe" > "$ST/$pid.exe"
   printf '%s\n' "$exe" > "$ST/$uu.running"
@@ -201,12 +216,25 @@ is_unit_active() { [ "$(cat "$ST/$1.active" 2>/dev/null || true)" = active ]; }
 u="${!#}"
 case "$1" in
   cat)
-    if [ -f "$UNITDIR/$u" ]; then exit 0; fi
+    # Unit files live in any standard dir (vendor installs included).
+    if [ -z "${SYSTEMCTL_CAT_FORCE_FAIL:-}" ]; then
+      for ud in "$PROBE_DIR/etc/systemd/system" "$PROBE_DIR/run/systemd/system" \
+                "$PROBE_DIR/usr/lib/systemd/system" "$PROBE_DIR/lib/systemd/system"; do
+        if [ -f "$ud/$u" ]; then exit 0; fi
+      done
+    fi
     # Default: systemd v255's standard missing-unit diagnostic (verified
     # against upstream systemctl-util.c, LoadState=not-found finish path),
-    # trailing period included. SYSTEMCTL_CAT_MSG overrides the exact text
-    # for fixture variants (classic wording / undeterminable garbage).
-    echo "${SYSTEMCTL_CAT_MSG:-No files found for $u.}" >&2
+    # trailing period included. SYSTEMCTL_CAT_MSG overrides the text — '%s'
+    # is replaced with the unit name (use it for per-unit fixtures); a text
+    # without '%s' is used verbatim for every unit (bus errors).
+    # SYSTEMCTL_CAT_FORCE_FAIL makes cat fail even for EXISTING units (a
+    # daemon/query failure on a live box).
+    msg="${SYSTEMCTL_CAT_MSG:-No files found for %s.}"
+    case "$msg" in
+      *%s*) echo "${msg%%%s*}$u${msg#*%s}" >&2 ;;
+      *) echo "$msg" >&2 ;;
+    esac
     exit 1 ;;
   is-active)
     if [ -n "${SYSTEMCTL_IS_ACTIVE:-}" ]; then
@@ -367,6 +395,7 @@ SS_STUB = r"""#!/usr/bin/env bash
 set -u
 printf 'ss %s\n' "$*" >> "$PROBE_DIR/stubs.log"
 if [ -n "${SS_FAIL:-}" ]; then echo "ss stub: forced failure" >&2; exit 1; fi
+if [ -n "${SS_EMPTY:-}" ]; then exit 0; fi
 if [ "${AK_VIA_SUDO:-}" = 1 ]; then
   echo 'LISTEN 0 0 0.0.0.0:17200 0.0.0.0:* users:(("ak-cli",pid=4242,fd=3))'
   echo 'UNCONN 0 0 0.0.0.0:17101 0.0.0.0:* users:(("ak-cli",pid=4243,fd=3))'
@@ -730,6 +759,47 @@ class ProbeHarness(unittest.TestCase):
             '  # ---- phase 2: upload',
             origin=origin, skip_if_missing=True)
 
+    def decisions_block(self, text: str, origin: str) -> str:
+        """real_run's phase 4-6 configuration decisions (compose_registry_exec
+        call, DATA_SOURCE_DIR, REG_RW) — executed together with the decision
+        block so an identified occupant's config flows into the CHOSEN
+        values (K 复核 K2-R3 round 6)."""
+        return self.section(
+            text,
+            '  # ---- deployment decisions for phase 4-6',
+            '  # ---- phase 4/5/6: install + systemd + firewall',
+            origin=origin, skip_if_missing=True)
+
+    def run_decision_and_config(self, phase1_log: str, name: str,
+                                text: str | None = None,
+                                origin: str = "the current script"):
+        """Execute the REAL decision block + phase-4-6 decisions +
+        compose_registry_exec against a phase1 report, echoing the CHOSEN
+        configuration (the reviewer's config-selection repro chain)."""
+        text = text if text is not None else self.text
+        compose = self.section(text, "compose_registry_exec() {",
+                               "# systemd unit templates",
+                               origin=origin, skip_if_missing=True)
+        body = (
+            compose + "\n"
+            'WORK="$PROBE_DIR"\n'
+            'KEEP_LEGACY_SIGNAL=0\n'
+            'CHECK_ONLY=0\n'
+            'deploy_decision() {\n'
+            + self.decision_block(text, origin)
+            + self.decisions_block(text, origin)
+            + '\n\necho "CHOSEN_EXEC=$REGISTRY_EXEC"\n'
+            'echo "CHOSEN_DATA_SOURCE=${DATA_SOURCE_DIR:-}"\n'
+            'echo "CHOSEN_RW=$REG_RW"\n'
+            'echo "CHOSEN_OLD_REGISTRY=${OLD_REGISTRY_UNIT:-}"\n'
+            '}\n'
+            'echo "DECISION_BEGIN"\n'
+            'deploy_decision\n'
+            'echo "DECISION_DONE"\n'
+        )
+        (self.probe / "phase1.log").write_text(phase1_log, encoding="utf-8", newline="\n")
+        return self.run_driver("", body, name=name)
+
     def run_driver(self, definitions: str, body: str, env: dict | None = None,
                    name: str = "driver.sh", timeout: float = 60):
         driver = self.probe / name
@@ -803,15 +873,19 @@ class ProbeHarness(unittest.TestCase):
         path = self.probe / "systemctl-state" / f"{unit}.running.bin"
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
-    def make_private_discovery_model(self):
+    def make_private_discovery_model(self, occupant: str = "oldregistry.service",
+                                     vendor: bool = False):
         """K2-R3 OFFLINE permission model: a registry port held by ANOTHER
         USER's process (pid only visible to root) plus a PRIVATE identity
         directory under a foreign home. /proc/<pid>/cmdline deliberately has
-        NO trailing newline, exactly like Linux."""
+        NO trailing newline, exactly like Linux. `occupant` names the unit
+        the cgroup resolves to; `vendor` places that unit file under
+        /usr/lib/systemd/system instead of /etc/systemd/system (round 6:
+        vendor-dir standard-named units are upgrade inputs too)."""
         proc = self.probe / "proc"
         (proc / "4242").mkdir(parents=True, exist_ok=True)
         (proc / "4243").mkdir(parents=True, exist_ok=True)
-        (proc / "4242" / "cgroup").write_text("0::/system.slice/oldregistry.service\n",
+        (proc / "4242" / "cgroup").write_text(f"0::/system.slice/{occupant}\n",
                                               encoding="utf-8", newline="\n")
         (proc / "4243" / "cgroup").write_text("0::/system.slice/oldsignal.service\n",
                                               encoding="utf-8", newline="\n")
@@ -820,9 +894,12 @@ class ProbeHarness(unittest.TestCase):
         home.mkdir(parents=True, exist_ok=True)
         (home / "registry.key").write_text("private-key-bytes", encoding="utf-8")
         (home / "registry.db").write_text("private-db-bytes", encoding="utf-8")
-        etc = self.probe / "etc" / "systemd" / "system"
-        etc.mkdir(parents=True, exist_ok=True)
-        (etc / "oldregistry.service").write_text(
+        if vendor:
+            unit_dir = self.probe / "usr" / "lib" / "systemd" / "system"
+        else:
+            unit_dir = self.probe / "etc" / "systemd" / "system"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / occupant).write_text(
             "[Unit]\nDescription=foreign-user registry\n\n[Service]\n"
             "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
             "--id-dir /home/otheruser/.ak-sending\n\n[Install]\nWantedBy=multi-user.target\n",
@@ -1218,7 +1295,7 @@ echo "C4=[$c4]"
         # string the install must complete.
         rc, out = self.generate_and_run_p456(
             'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "INSTALL_RC=$?"\n',
-            run_env={"SYSTEMCTL_CAT_MSG": "No files found for ak-registry-server.service."})
+            run_env={"SYSTEMCTL_CAT_MSG": "No files found for %s."})
         self.assertEqual(rc, 0, out)
         self.assertIn("INSTALL_RC=0", out)
         p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
@@ -1366,8 +1443,10 @@ echo "C4=[$c4]"
         self.assertIn("RUN_RC=3", out)
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
         self.assertIn("port 17200/tcp: in use (pid 4242, unit oldregistry.service)", p1_out)
-        self.assertIn("ERROR: cannot determine whether /etc/systemd/system/oldregistry.service "
-                      "exists", p1_out)
+        self.assertIn("ERROR: cannot determine whether oldregistry.service exists", p1_out)
+        self.assertIn("cannot determine existence of /etc/systemd/system/oldregistry.service",
+                      p1_out)
+        self.assertIn("Permission denied", p1_out)
         self.assertNotIn("old-registry-unit:", p1_out)
 
     def test_k2r3_identified_occupant_without_unit_file_refuses(self):
@@ -1384,6 +1463,160 @@ echo "C4=[$c4]"
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
         self.assertIn("port 17200/tcp: in use (pid 4242, unit oldregistry.service)", p1_out)
         self.assertIn("was identified but its unit file cannot be located", p1_out)
+
+    # -- K3-N1 (round 6): the standard D-Bus ENOENT diagnostic is NOT absence --
+    BUS_ENOENT = "Failed to connect to bus: No such file or directory"
+
+    def test_k3n1_bus_enoent_cat_only_never_exits_install_success(self):
+        # Reviewer repro (b): ONLY systemctl cat fails with the standard bus
+        # diagnostic; everything else works. Round 5 matched the bare
+        # 'No such file' substring, classified the EXISTING enabled/active
+        # units as absent, skipped EVERY stop and exited 0 with a new disk
+        # under still-running old processes. Now: refusal, nothing touched.
+        rc, out = self.generate_and_run_p456(
+            'make_upgrade_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+            run_env={"SYSTEMCTL_CAT_MSG": self.BUS_ENOENT,
+                     "SYSTEMCTL_CAT_FORCE_FAIL": "1"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out,
+                      "an undeterminable unit state must never exit install success")
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("systemctl cat unusable", p456_out)
+        self.assertNotIn("nothing to stop", p456_out)
+        log = self.stubs_log()
+        self.assertNotIn("systemctl stop", log, "no service may be touched")
+        # The box is untouched: old binary, old running image.
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD)
+        self.assertEqual(self.unit_running_bin("ak-registry-server.service"), AK_CLI_OLD)
+        self.assertEqual(self.unit_state("ak-registry-server.service", "active"), "active")
+
+    def test_k3n1_bus_enoent_on_all_calls_refuses_before_switchover(self):
+        # Reviewer repro (a): EVERY systemctl call fails with the bus
+        # diagnostic. Round 5 captured absent:: and installed binary/units
+        # before dying at daemon-reload into recovery; the refusal must come
+        # BEFORE anything is touched.
+        rc, out = self.generate_and_run_p456(
+            'make_upgrade_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+            run_env={"SYSTEMCTL_FAIL_ALL_MSG": self.BUS_ENOENT})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("systemctl cat unusable", p456_out)
+        self.assertNotIn("nothing to stop", p456_out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD, "no binary may be installed on a dead systemd")
+
+    def test_k3n1_bus_enoent_cat_plus_reload_failure_no_silent_success(self):
+        # cat fails with the bus diagnostic AND daemon-reload is broken: the
+        # outcome must be a loud refusal/recovery — never a silent success.
+        rc, out = self.generate_and_run_p456(
+            'make_upgrade_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+            run_env={"SYSTEMCTL_CAT_MSG": self.BUS_ENOENT,
+                     "SYSTEMCTL_CAT_FORCE_FAIL": "1",
+                     "SYSTEMCTL_FAIL_MATCH": "daemon-reload"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out)
+        self.assertNotIn("RUN_RC=0", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        self.assertIn("systemctl cat unusable", p456_out)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD)
+
+    # -- K2-N1 (round 6): transitional states are UNDETERMINABLE ---------------
+    def test_k2n1_deactivating_unit_never_recovery_ok_with_new_image(self):
+        # Reviewer repro: disabled/inactive pre-state; enable --now starts
+        # the NEW registry, STUN fails, and the registry is left mid-stop
+        # ('deactivating', MainPID alive, NEW image). Round 5 classified
+        # deactivating as stopped, skipped the stop and printed RECOVERY OK
+        # with the new process still running. Now: conservative stop +
+        # CONFIRM — the unit ends verified-inactive with no NEW image.
+        rc, out = self.generate_and_run_p456(
+            'make_disabled_inactive_model\n'
+            'bash "$PROBE_DIR/p456.sh" > "$PROBE_DIR/p456.out" 2>&1; echo "RUN_RC=$?"\n',
+            run_env={"SYSTEMCTL_FAIL_SPEC": "ak-stun-server.service:enable-now",
+                     "SYSTEMCTL_START_STATE_UNIT": "ak-registry-server.service",
+                     "SYSTEMCTL_START_STATE": "deactivating"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out)
+        p456_out = (self.probe / "p456.out").read_text(encoding="utf-8")
+        # The unit must NOT be left deactivating with the NEW image while
+        # recovery claims success.
+        self.assertNotEqual(self.unit_state("ak-registry-server.service", "active"),
+                            "deactivating")
+        self.assertNotEqual(self.unit_running_bin("ak-registry-server.service"),
+                            AK_CLI_STUB,
+                            "the NEW image must not survive recovery")
+        self.assertEqual(self.unit_state("ak-registry-server.service", "active"), "inactive",
+                         "recovery must conservatively stop and CONFIRM the final state")
+        self.assertEqual(self.unit_state("ak-registry-server.service", "pid"), "",
+                         "the stopped unit must have no live MainPID")
+        # Recovery may only report OK for the CONFIRMED outcome.
+        self.assertIn("RECOVERY OK", p456_out)
+
+    # -- K2-R3 (round 6): standard-named vendor unit keeps its identity --------
+    def test_k2r3_standard_named_vendor_unit_keeps_legacy_id_dir(self):
+        # The reviewer's fixture: the port occupant IS ak-registry-server.service,
+        # its unit file lives ONLY under /usr/lib/systemd/system and carries
+        # --id-dir /var/lib/ak-legacy. Round 5 excluded the standard name
+        # from the all-dir lookup, so the config was dropped and the deploy
+        # silently re-pointed the identity to the default dir.
+        self.make_private_discovery_model(occupant="ak-registry-server.service",
+                                          vendor=True)
+        vendor_unit = (self.probe / "usr" / "lib" / "systemd" / "system"
+                       / "ak-registry-server.service")
+        vendor_unit.write_text(
+            "[Unit]\nDescription=vendor-dir standard registry\n\n[Service]\n"
+            "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
+            "--id-dir /var/lib/ak-legacy\n\n[Install]\nWantedBy=multi-user.target\n",
+            encoding="utf-8", newline="\n")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("unit ak-registry-server: present", p1_out)
+        self.assertNotIn("unit ak-registry-server: absent", p1_out)
+        self.assertIn("port 17200/tcp: in use (pid 4242, unit ak-registry-server.service)",
+                      p1_out)
+        # Standard-named occupant: config read (feeds existing_exec), no
+        # old-registry-unit FIELD (it is already in the managed set).
+        self.assertNotIn("old-registry-unit:", p1_out)
+        self.assertRegex(
+            p1_out, r"(?m)^  ExecStart=/opt/ak-sending/ak-cli registry-server "
+                    r"--port 17200 --id-dir /var/lib/ak-legacy$")
+        # Full config-selection chain: the REAL decision + phase-4/6
+        # decisions + compose_registry_exec keep the legacy identity dir.
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-stdvendor.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("DECISION_DONE", out)
+        self.assertIn("existing registry ExecStart: /opt/ak-sending/ak-cli "
+                      "registry-server --port 17200 --id-dir /var/lib/ak-legacy", out)
+        self.assertIn("existing ak-registry-server unit will be upgraded", out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("--id-dir /var/lib/ak-legacy", exec_line[0],
+                      "the legacy identity dir must survive config selection")
+        self.assertIn("CHOSEN_RW=/var/lib/ak-legacy", out,
+                      "ReadWritePaths must keep pointing at the legacy identity dir")
+
+    def test_k2r3_standard_named_absent_fresh_install_unchanged(self):
+        # Inverse: no occupant, no unit anywhere -> plain absent, no
+        # discovery side effects (fresh install semantics unchanged).
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'SS_EMPTY=1 bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("unit ak-registry-server: absent", p1_out)
+        self.assertIn("unit ak-stun-server: absent", p1_out)
+        self.assertIn("port 17200/tcp: free", p1_out)
 
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
@@ -1703,7 +1936,7 @@ class BaselineContrastTests(ProbeHarness):
         # were swallowed) while the round-3/4 candidates aborted.
         rc, out, _ = self.run_baseline_p456(
             PREV3_REV, self.P456_ENV_PREBUILT, "p456prev3",
-            run_env={"SYSTEMCTL_CAT_MSG": "No files found for ak-registry-server.service."})
+            run_env={"SYSTEMCTL_CAT_MSG": "No files found for %s."})
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out,
                       "the round-2 candidate completed the same fresh fixture (reviewer anchor)")
@@ -1757,6 +1990,83 @@ class BaselineContrastTests(ProbeHarness):
                          AK_CLI_STUB, "the round-3 recovery left the NEW binary installed")
         for unit in ("ak-registry-server.service", "ak-stun-server.service"):
             self.assertEqual(self.unit_running_bin(unit), AK_CLI_STUB)
+
+    # -- K5-review contrasts: the round-5 candidate (46473fc) exhibits the
+    #    three round-6 defects under the same fixtures; the current tree
+    #    passes them (fail-to-pass witnesses).
+    BUS_ENOENT = "Failed to connect to bus: No such file or directory"
+
+    def test_k3n1_round5_candidate_bus_enoent_silent_install_success(self):
+        # Reviewer repro (b) against the round-5 candidate: only cat fails
+        # with the standard bus diagnostic -> everything "absent", no stops,
+        # install exits 0 with a new disk under still-running old processes.
+        rc, out, p456_out = self.run_baseline_p456(
+            PREV5_REV, self.P456_ENV_PREBUILT, "p456prev5",
+            run_env={"SYSTEMCTL_CAT_MSG": self.BUS_ENOENT,
+                     "SYSTEMCTL_CAT_FORCE_FAIL": "1"},
+            models="make_upgrade_model\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-5 candidate silently succeeded (the defect)")
+        self.assertEqual(p456_out.count("not present; nothing to stop"), 2, p456_out)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_STUB, "new disk image installed")
+        self.assertEqual(self.unit_running_bin("ak-registry-server.service"), AK_CLI_OLD,
+                         "the old process kept running the old image")
+
+    def test_k2n1_round5_candidate_deactivating_recovery_ok_with_new_image(self):
+        # Reviewer repro against the round-5 candidate: deactivating was
+        # classified as stopped -> RECOVERY OK while the unit is still
+        # deactivating with its MainPID alive on the NEW image.
+        rc, out, p456_out = self.run_baseline_p456(
+            PREV5_REV, self.P456_ENV_PREBUILT, "p456prev5",
+            run_env={"SYSTEMCTL_FAIL_SPEC": "ak-stun-server.service:enable-now",
+                     "SYSTEMCTL_START_STATE_UNIT": "ak-registry-server.service",
+                     "SYSTEMCTL_START_STATE": "deactivating"},
+            models="make_disabled_inactive_model\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=5", out)
+        self.assertIn("RECOVERY OK", p456_out,
+                      "the round-5 candidate claimed recovery success (the defect)")
+        self.assertEqual(self.unit_state("ak-registry-server.service", "active"),
+                         "deactivating")
+        self.assertEqual(self.unit_state("ak-registry-server.service", "pid"), "5001")
+        self.assertEqual(self.unit_running_bin("ak-registry-server.service"),
+                         AK_CLI_STUB, "the NEW image kept running")
+
+    def test_k2r3_round5_candidate_standard_vendor_unit_loses_id_dir(self):
+        # Reviewer repro against the round-5 candidate: the standard-named
+        # vendor unit's config never reaches the decision, and the real
+        # config selection re-points the identity to the default dir.
+        self.make_private_discovery_model(occupant="ak-registry-server.service",
+                                          vendor=True)
+        (self.probe / "usr" / "lib" / "systemd" / "system"
+         / "ak-registry-server.service").write_text(
+            "[Unit]\nDescription=vendor-dir standard registry\n\n[Service]\n"
+            "ExecStart=/opt/ak-sending/ak-cli registry-server --port 17200 "
+            "--id-dir /var/lib/ak-legacy\n\n[Install]\nWantedBy=multi-user.target\n",
+            encoding="utf-8", newline="\n")
+        text = self.baseline_text(PREV5_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev5.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1prev5.sh" > "$PROBE_DIR/p1prev5.out" 2>&1; echo "RUN_RC=$?"\n'
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV5_REV) + BOX_MODELS, body,
+                                  name="driver-prev5-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev5.out").read_text(encoding="utf-8")
+        self.assertIn("unit ak-registry-server: absent", p1_out,
+                      "the round-5 candidate missed the vendor-dir standard unit")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev5-decision.sh", text=text,
+            origin=f"the {PREV5_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertNotIn("/var/lib/ak-legacy", exec_line[0],
+                         "the round-5 candidate dropped the legacy identity dir")
+        self.assertNotIn("CHOSEN_RW=/var/lib/ak-legacy", out)
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

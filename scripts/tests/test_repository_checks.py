@@ -293,6 +293,12 @@ class StatusHandoffLinkTests(unittest.TestCase):
     whose LABEL spans two lines, so a multi-line-label archive link passed
     the full checker. Optional CommonMark titles are parsed consistently
     by the shared MARKDOWN_LINK_RE (handoff gate and repo-wide walk).
+
+    K5 (REVIEW_2026-11-15-batchK5.zh-CN.md §1): the shared regex also
+    covers bare PARENTHESIZED titles (spec example 505) and legal
+    whitespace/newlines between "(" and the destination (example 510) —
+    an archive entry written in those forms used to bypass the complete
+    checker with errors=[].
     """
 
     @staticmethod
@@ -732,6 +738,91 @@ class StatusHandoffLinkTests(unittest.TestCase):
             path, errors = checks.status_handoff_issues(root, status)
             self.assertEqual(errors, [])
             self.assertEqual(path.name, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md")
+
+    # -- K5 (REVIEW_2026-11-15-batchK5.zh-CN.md §1): the CommonMark
+    # destination+title grammar the shared regex must support — bare
+    # parenthesized titles (spec example 505) and whitespace/newlines
+    # between "(" and the destination (example 510).
+
+    def _k5_status(self, archive_link: str) -> str:
+        """Reviewer's fixture shape: canonical 当前状态/交接入口, the
+        varied archive link in 最新验证 (starting line 9)."""
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        canonical = chr(91) + "K](" + name + ")"
+        return (
+            "# 项目状态\n\n## 当前状态\n\n" + canonical
+            + "\n\n## 最新验证\n\n" + archive_link
+            + "\n\n## 交接入口\n\n" + canonical + "\n"
+        )
+
+    def test_paren_title_archive_link_fails(self):
+        # The reviewer's exact fixture: a parenthesized (unquoted) title —
+        # `[K](archive/<name> (handoff evidence))` — was missed by the
+        # round-5 regex (and the repo-wide walk), letting an archive entry
+        # pass the complete checker with errors=[].
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](archive/" + name + " (handoff evidence))"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_newline_before_destination_archive_link_fails(self):
+        # Spec example 510 form: a newline between "(" and the destination
+        # is legal Markdown — the link still starts (and is reported) at
+        # line 9.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](\n  archive/" + name + ")"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_space_before_destination_archive_link_fails(self):
+        # Spec example 510 form: a space between "(" and the destination.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K]( archive/" + name + ")"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_canonical_variants_of_k5_forms_pass(self):
+        # The healthy counterparts: canonical destinations written in the
+        # new forms (paren title, newline before dest, space before dest,
+        # whitespace around a quoted title) all keep passing.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        paren = chr(91) + "K](" + name + " (handoff))"
+        newline = chr(91) + "K](\n  " + name + ")"
+        space = chr(91) + "K]( " + name + ")"
+        padded = chr(91) + 'K]( ' + name + ' "标题" )'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, name, "# 交接：批次 K\n")
+            status = (
+                "# 项目状态\n\n## 当前状态\n\n" + paren
+                + "\n\n## 最新验证\n\n" + newline
+                + "\n\n## 交接入口\n\n" + space + " · " + padded + "\n"
+            )
+            path, errors = checks.status_handoff_issues(root, status)
+            self.assertEqual(errors, [])
+            self.assertEqual(path.name, name)
 
 
 if __name__ == "__main__":

@@ -646,6 +646,8 @@ self_test() {
     || fail "the existence probe must pin the locale so ENOENT matching is deterministic (K2-R3)"
   grep -q 'usr/lib/systemd/system' "$WORK/p1.sh" \
     || fail "occupant unit lookup must cover vendor unit dirs (K2-R3)"
+  grep -q 'find_unit_file' "$WORK/p1.sh" \
+    || fail "unit discovery (managed AND occupant) must use the all-directory lookup (K2-R3)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -670,10 +672,14 @@ self_test() {
     || fail "a failed binary restore must report INCOMPLETE (K2-N1)"
   grep -q 'RECOVERY INCOMPLETE' "$WORK/p456.sh" \
     || fail "a failed recovery must be loudly reported (K2-N1)"
-  # K 复核 K3-N1 (round 5): systemd v255's standard missing-unit diagnostic
-  # 'No files found for <name>.' (trailing period) must classify as absent.
-  grep -q 'No files found for' "$WORK/p456.sh" \
-    || fail "the v255 missing-unit diagnostic must be recognized as absent (K3-N1)"
+  # K 复核 K3-N1 (round 5/6): systemd v255's standard missing-unit
+  # diagnostic must classify as absent — but ONLY when it NAMES the unit;
+  # bus errors like 'Failed to connect to bus: No such file or directory'
+  # must stay undeterminable.
+  grep -q 'No files found for \$1.service' "$WORK/p456.sh" \
+    || fail "the v255 missing-unit diagnostic must be recognized as absent, ANCHORED on the unit name (K3-N1)"
+  grep -q 'inactive|failed) return 1' "$WORK/p456.sh" \
+    || fail "qstate must treat ONLY final states as stopped; transitional states are undeterminable (K2-N1)"
   # K 复核 K2-N1 (round 5): unsupported captured states refuse pre-switch,
   # and recovery tri-states its is-active queries with CONFIRMED outcomes.
   grep -q 'unsupported/undeterminable enable-state' "$WORK/p456.sh" \
@@ -894,29 +900,15 @@ command -v gcc >/dev/null 2>&1 && echo "gcc: \$(gcc --version | head -1)" || ech
 command -v cargo >/dev/null 2>&1 && echo "cargo: \$(cargo --version)" || echo "cargo: missing (rustup will be installed)"
 sudo -n test -x $REMOTE_BIN 2>/dev/null && echo "existing-binary: yes" || echo "existing-binary: no"
 sudo -n test -x $REMOTE_BIN 2>/dev/null && echo "existing-version: \$($REMOTE_BIN --version 2>&1 || echo unreadable)"
-for u in ak-registry-server ak-stun-server; do
-  # K 复核 K2-R3: this script runs as the NON-ROOT SSH user; unit files under
-  # /etc/systemd/system may live in restricted trees, so the existence probe
-  # and the reads go through the verified sudo path like every other
-  # discovery probe in this phase.
-  if sudo -n test -f /etc/systemd/system/\$u.service 2>/dev/null; then
-    echo "unit \$u: present"
-    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' /etc/systemd/system/\$u.service
-    sudo -n sed -n 's/^User=/  User=/p' /etc/systemd/system/\$u.service
-    systemctl is-active \$u.service >/dev/null 2>&1 && echo "  active: yes" || echo "  active: no"
-  else
-    echo "unit \$u: absent"
-  fi
-done
 # priv_exists <path>: privileged existence probe distinguishing
 # exists / absent / cannot-determine ('env LC_ALL=C ls -d' rc + diagnostic
-# text). Defined BEFORE its first use (occupant unit lookup + identity
-# discovery). K 复核 K2-R3 (round 5): round 4 treated ANY 'cannot access'
-# diagnostic as absent, but GNU ls prints 'cannot access ...: Permission
-# denied' for exactly the case that must NEVER read as "no identity". The
-# locale is pinned so the ENOENT text match is deterministic; ONLY a plain
-# ENOENT diagnostic means absent — permission/I-O and every other
-# diagnostic are UNDETERMINABLE (the caller refuses the preflight).
+# text). Defined BEFORE its first use (unit discovery + identity probing).
+# K 复核 K2-R3 (round 5): round 4 treated ANY 'cannot access' diagnostic as
+# absent, but GNU ls prints 'cannot access ...: Permission denied' for
+# exactly the case that must NEVER read as "no identity". The locale is
+# pinned so the ENOENT text match is deterministic; ONLY a plain ENOENT
+# diagnostic means absent — permission/I-O and every other diagnostic are
+# UNDETERMINABLE (the caller refuses the preflight).
 priv_exists() {
   local pe_out pe_rc
   pe_rc=0
@@ -927,6 +919,41 @@ priv_exists() {
     *) printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2; return 2 ;;
   esac
 }
+# find_unit_file <unit.service>: echo the first existing unit-file path across
+# the standard systemd directories. rc 0 = found (path on stdout), rc 1 =
+# confirmed absent EVERYWHERE, rc 2 = a probe was undeterminable (priv_exists
+# already printed why). K 复核 K2-R3 (round 6): existence must never be
+# assumed from a single directory — a vendor-dir /usr/lib install of the
+# STANDARD-NAMED unit is a legitimate upgrade input, not a fresh install.
+find_unit_file() {
+  local fud fus
+  for fud in /etc/systemd/system /run/systemd/system /run/systemd/transient /usr/lib/systemd/system /lib/systemd/system; do
+    fus=\$(priv_exists "\$fud/\$1") || return 2
+    if [ "\$fus" = yes ]; then printf '%s\\n' "\$fud/\$1"; return 0; fi
+  done
+  return 1
+}
+for u in ak-registry-server ak-stun-server; do
+  # K 复核 K2-R3 (round 6): the managed units are looked up across ALL
+  # standard directories (rounds <= 5 checked only /etc/systemd/system, so a
+  # standard-named unit under /usr/lib/systemd/system read as "absent" and
+  # its identity arguments were silently dropped from the migration).
+  # Probe failures refuse; only a confirmed absent-everywhere is "absent".
+  u_rc=0
+  u_file=\$(find_unit_file "\$u.service") || u_rc=\$?
+  if [ "\$u_rc" = 2 ]; then
+    echo "ERROR: cannot determine whether \$u.service exists; refusing before any switchover (K2-R3)" >&2
+    exit 3
+  fi
+  if [ -n "\$u_file" ]; then
+    echo "unit \$u: present"
+    sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "\$u_file"
+    sudo -n sed -n 's/^User=/  User=/p' "\$u_file"
+    systemctl is-active \$u.service >/dev/null 2>&1 && echo "  active: yes" || echo "  active: no"
+  else
+    echo "unit \$u: absent"
+  fi
+done
 # Live listener on the registry port -> authoritative id-dir + old unit name
 # (the existing production unit name is NOT verified per docs §0/§3, so it is
 # discovered from the port, not assumed).
@@ -960,22 +987,24 @@ if [ -n "\$reg_line" ]; then
   # the old unit. Terminate the line explicitly so every machine field in
   # this report starts at column 0.
   [ -n "\${reg_pid:-}" ] && { sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/^/  cmdline: /'; printf '\\n'; } || true
-  # K 复核 K2-R3 (round 5): an occupant unit IDENTIFIED from its cgroup must
-  # be bound into the migration set. The old single '/etc/systemd/system'
-  # test could not distinguish a permission failure from absence and missed
-  # vendor locations (/usr/lib/systemd/system), silently dropping a
-  # confirmed occupant from the migration. Search every standard unit dir
-  # (distinguishing absent/undeterminable); if the config of an identified
-  # occupant cannot be obtained at all, REFUSE the preflight.
-  if [ -n "\${reg_unit:-}" ] && [ "\$reg_unit" != "ak-registry-server.service" ]; then
-    reg_unit_file=""
-    for ud in /etc/systemd/system /run/systemd/system /run/systemd/transient /usr/lib/systemd/system /lib/systemd/system; do
-      us=\$(priv_exists "\$ud/\$reg_unit") \\
-        || { echo "ERROR: cannot determine whether \$ud/\$reg_unit exists; refusing before any switchover (K2-R3)" >&2; exit 3; }
-      if [ "\$us" = yes ]; then reg_unit_file="\$ud/\$reg_unit"; break; fi
-    done
+  # K 复核 K2-R3 (round 5/6): an occupant unit IDENTIFIED from its cgroup
+  # must be bound into the migration set — INCLUDING the standard name
+  # ak-registry-server.service (round 5 excluded it, so a vendor-dir install
+  # of the standard-named unit lost its --id-dir and the deploy silently
+  # re-pointed the identity). Locate the unit file across every standard
+  # directory; the config read feeds real_run's ExecStart/--id-dir decisions
+  # regardless of the unit's name. The old-registry-unit FIELD stays limited
+  # to non-standard names (the standard-named unit is already in the managed
+  # stop/backup set). Unlocatable or undeterminable -> REFUSE.
+  if [ -n "\${reg_unit:-}" ]; then
+    reg_rc=0
+    reg_unit_file=\$(find_unit_file "\$reg_unit") || reg_rc=\$?
+    if [ "\$reg_rc" = 2 ]; then
+      echo "ERROR: cannot determine whether \$reg_unit exists; refusing before any switchover (K2-R3)" >&2
+      exit 3
+    fi
     if [ -n "\$reg_unit_file" ]; then
-      echo "  old-registry-unit: \$reg_unit"
+      [ "\$reg_unit" != "ak-registry-server.service" ] && echo "  old-registry-unit: \$reg_unit"
       sudo -n sed -n 's/^ExecStart=/  ExecStart=/p' "\$reg_unit_file"
       sudo -n sed -n 's/^User=/  old-registry-User=/p' "\$reg_unit_file"
     else
@@ -1205,19 +1234,24 @@ probe_unit() {
   # disabled/inactive pre-states; K 复核 K2-N1 round 4).
   PU_EN=\$(sudo -n systemctl is-enabled "\$1.service" 2>/dev/null) || true
   PU_AC=\$(sudo -n systemctl is-active "\$1.service" 2>/dev/null) || true
-  if sudo -n systemctl cat "\$1.service" >/dev/null 2>&1; then
-    PU_EXISTS=exists
-    return 0
-  fi
-  PU_MSG=\$(sudo -n systemctl cat "\$1.service" 2>&1) || true
+    if sudo -n env LC_ALL=C systemctl cat "\$1.service" >/dev/null 2>&1; then
+      PU_EXISTS=exists
+      return 0
+    fi
+  PU_MSG=\$(sudo -n env LC_ALL=C systemctl cat "\$1.service" 2>&1) || true
   case "\$PU_MSG" in
-    # The standard diagnostics for a MISSING unit across systemd versions:
-    # v255 systemctl cat prints 'No files found for <name>.'
-    # (systemctl-util.c finish path for LoadState=not-found, trailing
-    # period included); older versions print 'Unit <name> could not be
-    # found.' / 'not loaded'. Anything else (D-Bus/connect/permission
-    # errors) stays UNKNOWN — never absent (K 复核 K3-N1 round 5).
-    *"could not be found"*|*"not loaded"*|*"No such file"*|*"No files found for"*) PU_EXISTS=absent ;;
+    # ONLY diagnostics that name THIS unit classify as absent (K 复核 K3-N1
+    # round 6). Round 5 matched bare substrings, so systemd's standard bus
+    # error 'Failed to connect to bus: No such file or directory' matched
+    # *"No such file"* and a persistent D-Bus failure read as "unit absent"
+    # — the install then skipped every stop (or ran to recovery) with the
+    # state undeterminable. Known per-unit shapes: v255 systemctl cat prints
+    # 'No files found for <name>.' (systemctl-util.c, LoadState=not-found);
+    # classic prints 'Unit <name> could not be found.'; stop/cat on a
+    # not-loaded unit prints '<name> is not loaded' / 'Unit <name> not
+    # loaded'. Connection/permission/daemon errors never carry the unit
+    # name and stay UNKNOWN (refusal).
+    *"No files found for \$1.service"*|*"Unit \$1.service could not be found"*|*"\$1.service is not loaded"*|*"Unit \$1.service not loaded"*) PU_EXISTS=absent ;;
     *) PU_EXISTS=unknown ;;
   esac
 }
@@ -1331,10 +1365,17 @@ recover_services() {
     # Keep the output even on non-zero rc — 'inactive' arrives with rc 3 and
     # must never be blanked into "cannot determine" (the same clobber bug
     # the review found in the capture path).
+    # K 复核 K2-N1 (round 6): ONLY the FINAL states count. Transitional
+    # states (activating/reloading/deactivating) prove nothing — a
+    # 'deactivating' unit still has its MainPID alive (systemd maps the
+    # whole stop path to UNIT_DEACTIVATING), and round 5 classified it as
+    # stopped, so recovery skipped the stop and printed RECOVERY OK with the
+    # NEW image still running. Transitional/unknown => UNDETERMINABLE: the
+    # callers take the conservative stop(+confirm)/restart path.
     qs=\$(sudo -n systemctl is-active "\$1.service" 2>/dev/null) || true
     case "\$qs" in
-      active|activating|reloading) return 0 ;;
-      inactive|failed|deactivating) return 1 ;;
+      active) return 0 ;;
+      inactive|failed) return 1 ;;
       *) return 2 ;;
     esac
   }

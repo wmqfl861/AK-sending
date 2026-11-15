@@ -307,6 +307,14 @@ class StatusHandoffLinkTests(unittest.TestCase):
     gate cannot parse at all (blank-line titles, links hidden inside
     another link's title) are explicitly rejected; angle-bracket
     destinations are unwrapped in both consumers.
+
+    K7 (REVIEW_2026-11-15-batchK7.zh-CN.md §1): <…> destinations may
+    contain SPACES (and newlines) — the angle form is parsed inside the
+    shared destination grammar (post-hoc unwrapping of a
+    whitespace-stopped token missed `<archive space/…>` entirely), the
+    backstop uses the same grammar so its rejections carry the
+    untruncated destination, and the wrapper is unwrapped before the
+    fragment is stripped.
     """
 
     @staticmethod
@@ -962,6 +970,93 @@ class StatusHandoffLinkTests(unittest.TestCase):
             )
             path, errors = checks.status_handoff_issues(root, status)
             self.assertEqual(errors, [])
+            self.assertEqual(path.name, name)
+
+    # -- K7 (REVIEW_2026-11-15-batchK7.zh-CN.md §1): CommonMark permits
+    # SPACES inside <…> destinations. Both the full pattern (bare class
+    # stops at whitespace) and the backstop (truncated token "archive")
+    # missed `[K](<archive space/…>)` entirely — the angle form is now
+    # parsed inside the shared destination grammar, the backstop uses
+    # the same grammar, and the wrapper is unwrapped before the fragment
+    # is stripped.
+
+    def _write_handoff_space_pair(self, root: Path) -> None:
+        """docs/ canonical + a same-name copy under `docs/archive space/`."""
+        self._write(root, "HANDOFF-BATCH-K-2026-11-14.zh-CN.md", "# 交接：批次 K\n")
+        spaced = root / "docs" / "archive space"
+        spaced.mkdir(parents=True, exist_ok=True)
+        (spaced / "HANDOFF-BATCH-K-2026-11-14.zh-CN.md").write_text(
+            "# 交接：批次 K（archive space 副本）\n", encoding="utf-8"
+        )
+
+    def test_angle_space_archive_link_fails(self):
+        # The reviewer's exact fixture: an angle destination containing a
+        # SPACE pointing at a real separate copy under docs/archive
+        # space/. The full pattern now captures the destination whole and
+        # fails at the entry's line, naming the resolved path.
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](<archive space/" + name + ">)"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_space_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("archive space/HANDOFF-BATCH-K-2026-11-14.zh-CN.md", errors[0])
+            self.assertIn("every current-batch link", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_angle_canonical_and_fragment_pass(self):
+        # Healthy counterparts: an angle-wrapped canonical destination
+        # passes, and the wrapper is unwrapped BEFORE the fragment is
+        # stripped — `<name#anchor>` resolves to name, not `<name` (the
+        # boundary the K7 review noted on the walk).
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, name, "# 交接：批次 K\n")
+            for link in (chr(91) + "K](<" + name + ">)",
+                         chr(91) + "K](<" + name + "#5-证据表>)"):
+                with self.subTest(link=link):
+                    path, errors = checks.status_handoff_issues(
+                        root, self._k5_status(link))
+                    self.assertEqual(errors, [])
+                    self.assertEqual(path.name, name)
+
+    def test_angle_newline_destination_is_parsed_strictly(self):
+        # A newline inside <…> is legal CommonMark whitespace, but it is
+        # NOT a space: the resolved path contains a literal newline, no
+        # such file exists, and the gate fails with a definite
+        # does-not-exist error at the entry's line (previously the entry
+        # was silently missed).
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](<archive\nspace/" + name + ">)"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_space_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("does not exist", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_backstop_rejects_angle_space_with_blank_line_title(self):
+        # Backstop fidelity: a VALID angle-with-space destination plus an
+        # unparseable (blank-line) title is rejected naming the
+        # UNTRUNCATED destination — not "archive".
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](<archive space/" + name + '> "x\n\ny")'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_space_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("<archive space/HANDOFF-BATCH-K-2026-11-14.zh-CN.md>", errors[0])
+            self.assertIn("not a supported/parseable Markdown inline link", errors[0])
             self.assertEqual(path.name, name)
 
 

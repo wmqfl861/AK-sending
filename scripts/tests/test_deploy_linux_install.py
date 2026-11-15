@@ -73,6 +73,8 @@ PREV5_REV = "46473fc"  # round-5 candidate (K5 findings: unanchored absence,
                        # deactivating-as-stopped, standard-name exclusion)
 PREV6_REV = "e8f811d"  # round-6 candidate (K6 findings: absent-file +
                         # running process passed, drop-in overrides ignored)
+PREV7_REV = "bb1f673"  # round-7 candidate (K7 findings: cmdline read
+                        # failure skipped the cross-check, --db-path uncompared)
 
 SUDO_STUB = r"""#!/usr/bin/env bash
 set -u
@@ -1785,6 +1787,74 @@ echo "C4=[$c4]"
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
         self.assertIn("materially disagrees with the running cmdline", p1_out)
 
+    def test_k2r3_cmdline_read_failure_fails_closed(self):
+        # Reviewer repro (round 8): SAME disagreeing fixture as above, but
+        # ONLY the cmdline READ fails (the cmdline file, occupant, cgroup
+        # and old data all still present). Round 7 treated the empty string
+        # as "no evidence available" and SKIPPED the cross-check, so both
+        # phase1 and the config chain exited 0 selecting ak-default. The
+        # cmdline of an identified occupant is not optional evidence: an
+        # unreadable/empty read must FAIL CLOSED.
+        self.make_private_discovery_model(
+            main_exec=self.AK_DEFAULT,
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'CAT_FAIL_MATCH="/proc/4242/cmdline" bash "$PROBE_DIR/p1.sh" '
+            '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a failed cmdline read must never turn into a silent pass")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("unreadable or empty", p1_out)
+        self.assertIn("config cross-check has no evidence", p1_out)
+        self.assertNotRegex(p1_out, r"(?m)^  ExecStart=")
+        # The single-variable contrast (readable cmdline) refuses with the
+        # DISAGREEMENT message instead — covered by
+        # test_k2r3_effective_config_disagreeing_with_cmdline_refuses.
+
+    def test_k2r3_db_path_disagreement_refuses(self):
+        # Reviewer repro (round 8): port and --id-dir MATCH, but the
+        # configured --db-path (new.db) disagrees with the running instance
+        # (old.db). Round 7's compared set lacked --db-path, so the chain
+        # selected new.db. reg_args_agree now covers the full data/identity
+        # surface (--id-dir, --db-path) plus the listen surface.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-legacy --db-path /var/lib/ak-legacy/new.db",
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy "
+                          "--db-path /var/lib/ak-legacy/old.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("materially disagrees with the running cmdline", p1_out)
+
+    def test_k2r3_db_path_consistent_config_kept(self):
+        # The consistent control from the review: config and running
+        # instance both use old.db — accepted, and the real decision +
+        # config chain KEEPS old.db (never new.db).
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-legacy --db-path /var/lib/ak-legacy/old.db",
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy "
+                          "--db-path /var/lib/ak-legacy/old.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*--db-path /var/lib/ak-legacy/old\.db$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-dbpath.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("/var/lib/ak-legacy/old.db", exec_line[0])
+        self.assertNotIn("new.db", exec_line[0])
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -2290,6 +2360,37 @@ class BaselineContrastTests(ProbeHarness):
                       "the round-6 candidate chose the wrong identity dir (the defect)")
         self.assertIn("CHOSEN_RW=/var/lib/ak-default", out)
         self.assertNotIn("CHOSEN_RW=/var/lib/ak-legacy", out)
+
+    # -- K7-review contrast: the round-7 candidate (bb1f673) fail-OPENED the
+    #    cross-check when the cmdline read failed (and never compared
+    #    --db-path); the current tree refuses both inputs.
+    def test_k2r3_round7_candidate_cmdline_read_failure_selects_wrong_dir(self):
+        # Reviewer repro against the round-7 candidate: only the cmdline
+        # read fails; the disagreeing disk config (ak-default) is chosen
+        # through the REAL phase1 -> decision -> config chain.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-default",
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        text = self.baseline_text(PREV7_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev7.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'CAT_FAIL_MATCH="/proc/4242/cmdline" bash "$PROBE_DIR/p1prev7.sh" '
+            '> "$PROBE_DIR/p1prev7.out" 2>&1; echo "RUN_RC=$?"\n'
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV7_REV) + BOX_MODELS, body,
+                                  name="driver-prev7-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-7 candidate passed phase1 despite the failed read (the defect)")
+        p1_out = (self.probe / "p1prev7.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*ak-default$")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev7-decision.sh", text=text,
+            origin=f"the {PREV7_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_RW=/var/lib/ak-default", out,
+                      "the round-7 candidate selected the wrong identity dir (the defect)")
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

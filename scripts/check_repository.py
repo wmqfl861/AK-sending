@@ -79,20 +79,24 @@ STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
 # Markdown inline links per the CommonMark destination+title grammar
-# (spec 0.31.2 examples 505/510): `[label]( dest "title" )` — optional
-# whitespace (including newlines) after "(", a bare destination (stops at
-# whitespace or an unescaped paren), optional whitespace, an optional
-# title in double quotes, single quotes OR bare parentheses, optional
-# whitespace, ")". Per the 0.31.2 link-title definition titles may span
-# lines; only BLANK lines inside a title are forbidden, so every title
-# form is `first-line (NEWLINE non-empty-line)*` with no trailing
-# newline (K6 review §1 — excluding newlines from quoted titles was a
-# regression that silently dropped a legal archive link). Angle-bracket
-# `<dest>` destinations are captured with their wrapper and unwrapped by
-# _angle_stripped in both consumers. Still out of scope for the FULL
-# pattern (and therefore rejected by the handoff gate's
-# HANDOFF_LINK_PREFIX_RE backstop below instead of silently ignored):
-# backslash escapes, nested parens inside a parenthesized title, titles
+# (spec 0.31.2 examples 505/510, link-destination definition): `[label](
+# dest "title" )` — optional whitespace (including newlines) after "(",
+# a destination that is EITHER a bare run of non-whitespace non-paren
+# characters OR a complete `<…>` form whose content may contain spaces
+# and newlines (only blank lines are forbidden, mirroring the title
+# treatment; no "<", ">" inside), optional whitespace, an optional title
+# in double quotes, single quotes OR bare parentheses, optional
+# whitespace, ")". Titles may span lines per the 0.31.2 link-title
+# definition; only BLANK lines inside a title are forbidden, so every
+# title form is `first-line (NEWLINE non-empty-line)*` with no trailing
+# newline (K6 review §1). The angle destination is parsed IN the pattern
+# (K7 review §1: post-hoc unwrapping of a whitespace-stopped bare token
+# missed `<archive space/…>` entirely); the captured group keeps the
+# angle wrapper and _link_destination unwraps it BEFORE stripping the
+# fragment for every consumer. Still out of scope for the FULL pattern
+# (and therefore rejected by the handoff gate's HANDOFF_LINK_PREFIX_RE
+# backstop below instead of silently ignored): backslash escapes, nested
+# parens inside a parenthesized title, titles or angle destinations
 # containing blank lines, and whitespace between "]" and "(" (too close
 # to prose like "array[0] (…)" to parse as a link). The pattern is
 # matched over the WHOLE document — `[^\]]*` labels legally span lines,
@@ -101,7 +105,8 @@ HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN
 # use this one pattern, so every supported link form is parsed
 # consistently.
 MARKDOWN_LINK_RE = re.compile(
-    r"\[[^\]]*\]\(\s*([^\s)]+)"
+    r"\[[^\]]*\]\(\s*"
+    r"(<[^<>\n]*(?:\n[^<>\n]+)*>|[^\s)]+)"
     r"(?:\s+(?:"
     r"\"[^\"\n]*(?:\n[^\"\n]+)*\""
     r"|'[^'\n]*(?:\n[^'\n]+)*'"
@@ -109,18 +114,22 @@ MARKDOWN_LINK_RE = re.compile(
     r"))?"
     r"\s*\)"
 )
-# Fail-closed backstop for the STATUS handoff gate (K5/K6 reviews §1): a
-# construct that looks like a handoff link — "](" followed by an
-# optionally angle-bracketed path token — but that MARKDOWN_LINK_RE
-# cannot parse IN FULL (blank line inside a title, angle-bracket
-# destination, backslash escapes, or a link hidden inside another link's
-# parsed title region) is reported as an unparsed handoff entry rather
-# than silently skipped. Coverage rule: a prefix whose start lies inside
-# a successfully parsed link's label/destination region is part of that
-# link, not a separate entry; "]" cannot occur inside the label and the
-# bare destination contains no parens, so anything after the destination
-# end is title/body text, where a "](" handoff token is a hidden entry.
-HANDOFF_LINK_PREFIX_RE = re.compile(r"\[[^\]]*\]\(\s*<?([^\s)>]+)>?")
+# Fail-closed backstop for the STATUS handoff gate (K5/K6/K7 reviews
+# §1): a construct that looks like a handoff link — "](" followed by a
+# destination in the SAME grammar as MARKDOWN_LINK_RE (angle-wrapped
+# destinations are captured whole, spaces included) — but that
+# MARKDOWN_LINK_RE cannot parse IN FULL (blank line inside a title,
+# backslash escapes, or a link hidden inside another link's parsed title
+# region) is reported as an unparsed handoff entry with its UNTRUNCATED
+# destination, never silently skipped. Coverage rule: a prefix whose
+# start lies inside a successfully parsed link's label/destination
+# region is part of that link, not a separate entry; "]" cannot occur
+# inside the label and a bare destination contains no parens, so
+# anything after the destination end is title/body text, where a "]("
+# handoff token is a hidden entry.
+HANDOFF_LINK_PREFIX_RE = re.compile(
+    r"\[[^\]]*\]\(\s*(<[^<>\n]*(?:\n[^<>\n]+)*>|[^\s)>]+)"
+)
 # Windows drive-letter targets (`C:\…`, `C:/…`) are absolute jumps, not
 # relative links, even though they contain no `://`.
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -275,32 +284,33 @@ def latest_handoff(root: Path) -> Path | None:
     return None if newest is None else newest[1]
 
 
-def _angle_stripped(destination: str) -> str:
-    """Strip one CommonMark angle-bracket wrapper: `<dest>` → `dest`.
+def _link_destination(link: str) -> str:
+    """Full local destination of a captured link token.
 
-    A bare destination cannot contain whitespace; `<…>` destinations are
-    the legal way to write one that does (or just to delimit it). Only a
-    leading "<" paired with a trailing ">" is treated as the wrapper.
+    The angle wrapper is removed BEFORE the fragment is stripped —
+    `<dest#anchor>` must unwrap to `dest#anchor`, never keep a leading
+    "<" after the split (K7 review §1 notes that boundary) — then the
+    "#fragment" goes away. A bare destination is returned unchanged.
     """
-    if destination.startswith("<") and destination.endswith(">"):
-        return destination[1:-1]
-    return destination
+    if link.startswith("<") and link.endswith(">"):
+        link = link[1:-1]
+    return link.split("#", 1)[0]
 
 
 def _resolve_status_link(root: Path, link: str) -> tuple[Path | None, str | None]:
     """Resolve one STATUS link target against STATUS's own directory (docs/).
 
-    The fragment is stripped, an angle-bracket destination wrapper is
-    unwrapped, backslashes are normalized to "/", ""/"." segments dropped
-    and ".." segments popped lexically — so the result is the file the
-    link actually names, never a basename-only guess. Absolute jumps
-    (leading "/", leading "\\", Windows drive letters) and any ".." that
-    pops above docs/ are rejected; external URLs ("://" or mailto:) can
-    never resolve to a local file. Returns (resolved_path, None) or
-    (None, error_kind) with error_kind in {"external", "absolute",
-    "escape"} — callers report each kind distinctly.
+    The angle wrapper (if any) is unwrapped and the fragment stripped,
+    backslashes are normalized to "/", ""/"." segments dropped and ".."
+    segments popped lexically — so the result is the file the link
+    actually names, never a basename-only guess. Absolute jumps (leading
+    "/", leading "\\", Windows drive letters) and any ".." that pops
+    above docs/ are rejected; external URLs ("://" or mailto:) can never
+    resolve to a local file. Returns (resolved_path, None) or (None,
+    error_kind) with error_kind in {"external", "absolute", "escape"} —
+    callers report each kind distinctly.
     """
-    target = _angle_stripped(link.split("#", 1)[0])
+    target = _link_destination(link)
     if "://" in link or link.startswith("mailto:"):
         return None, "external"
     if target.startswith(("/", "\\")) or WINDOWS_DRIVE_RE.match(target):
@@ -347,7 +357,12 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
     blank lines inside a title are forbidden, per the 0.31.2 link-title
     definition), and a handoff-shaped entry the pattern cannot parse in
     full is explicitly rejected by the HANDOFF_LINK_PREFIX_RE backstop —
-    nothing handoff-shaped is silently ignored.
+    nothing handoff-shaped is silently ignored. K7
+    (REVIEW_2026-11-15-batchK7.zh-CN.md §1): `<…>` destinations are
+    parsed inside the shared pattern (spaces included), the backstop
+    uses the same destination grammar so its rejections carry the
+    UNTRUNCATED destination, and the wrapper is unwrapped before the
+    fragment is stripped.
 
     Returns (canonical newest handoff path the CR-P3-20 checks must anchor
     to, errors). The run-number/contradiction gates always anchor to the
@@ -387,7 +402,7 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
         link = match.group(1)
         lineno = status_text.count("\n", 0, match.start()) + 1
         parsed_dest_regions.append((match.start(), match.end(1)))
-        name = _angle_stripped(link.split("#", 1)[0]).replace("\\", "/").split("/")[-1]
+        name = _link_destination(link).replace("\\", "/").split("/")[-1]
         key = _handoff_sort_key(name)
         if key is None:
             continue
@@ -443,7 +458,7 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
                for start, dest_end in parsed_dest_regions):
             continue
         token = prefix.group(1)
-        name = token.split("#", 1)[0].replace("\\", "/").split("/")[-1]
+        name = _link_destination(token).replace("\\", "/").split("/")[-1]
         key = _handoff_sort_key(name)
         if key is None:
             continue
@@ -613,8 +628,9 @@ def check(root: Path) -> dict:
             if "://" in link or link.startswith(("mailto:", "#")):
                 continue
             # Angle-bracket destinations are unwrapped exactly like the
-            # STATUS handoff gate unwraps them (one shared grammar).
-            target = (path.parent / _angle_stripped(link.split("#", 1)[0])).resolve()
+            # STATUS handoff gate unwraps them (one shared grammar;
+            # unwrap happens before the fragment is stripped).
+            target = (path.parent / _link_destination(link)).resolve()
             if not target.is_relative_to(root.resolve()) or not target.exists():
                 errors.append(f"broken/outside local link in {path.relative_to(root)}: {link}")
             checked_links += 1

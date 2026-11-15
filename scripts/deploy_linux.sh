@@ -655,6 +655,13 @@ self_test() {
     || fail "config derivation must use the merged main+drop-in view (K2-R3)"
   grep -q 'reg_args_agree' "$WORK/p1.sh" \
     || fail "the chosen config must be cross-checked against the running cmdline (K2-R3)"
+  # K 复核 K2-R3 (round 8): the cross-check must FAIL CLOSED when the
+  # cmdline cannot be read, and the compared surface must cover the
+  # data/identity flags (--id-dir, --db-path) plus the listen surface.
+  grep -q 'unreadable or empty' "$WORK/p1.sh" \
+    || fail "an unreadable running cmdline must refuse instead of skipping the cross-check (K2-R3)"
+  grep -q 'for re_arg in --id-dir --db-path --port --bind' "$WORK/p1.sh" \
+    || fail "the compared argument surface must include --db-path and the listen flags (K2-R3)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -964,18 +971,23 @@ effective_execstart() {
     || { echo "ERROR: cannot read the effective configuration of \$1 (systemctl cat failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
   printf '%s\\n' "\$ec_cat" | awk '/^ExecStart=/ { v = substr(\$0, 11); if (v == "") { n = 0; split("", L) } else { L[++n] = v } } END { for (i = 1; i <= n; i++) print L[i] }'
 }
-# reg_args_agree <exec-line> <cmdline-line>: 0 when the relevant arguments
-# (port, --id-dir) of the configured ExecStart do not MATERIALLY disagree
-# with the running instance's cmdline (arguments absent from the cmdline are
-# not compared — the process may rely on defaults).
+# reg_args_agree <exec-line> <cmdline-line>: 0 when the RELEVANT arguments
+# of the configured ExecStart do not MATERIALLY disagree with the running
+# instance's cmdline. The compared surface is 'ak-cli registry-server's
+# actual argument surface (verified against crates/ak-cli/src/main.rs): the
+# global --id-dir (identity dir: registry.key plus the default db location)
+# and the subcommand's --db-path select DATA/IDENTITY LOCATIONS (K 复核
+# K2-R3 round 8: --db-path used to be missing, so a configured new.db was
+# chosen over the running old.db); --port and --bind select the LISTEN
+# surface (occupancy-relevant). Values absent from the cmdline are not
+# compared — the process may rely on defaults.
 reg_args_agree() {
-  local a_id b_id a_port b_port
-  a_id=\$(printf '%s\\n' "\$1" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
-  b_id=\$(printf '%s\\n' "\$2" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
-  a_port=\$(printf '%s\\n' "\$1" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
-  b_port=\$(printf '%s\\n' "\$2" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
-  if [ -n "\$b_id" ] && [ "\$a_id" != "\$b_id" ]; then return 1; fi
-  if [ -n "\$b_port" ] && [ "\$a_port" != "\$b_port" ]; then return 1; fi
+  local a b re_arg
+  for re_arg in --id-dir --db-path --port --bind; do
+    a=\$(printf '%s\\n' "\$1" | sed -n "s/.*\$re_arg[= ]\\([^ ]*\\).*/\\1/p")
+    b=\$(printf '%s\\n' "\$2" | sed -n "s/.*\$re_arg[= ]\\([^ ]*\\).*/\\1/p")
+    if [ -n "\$b" ] && [ "\$a" != "\$b" ]; then return 1; fi
+  done
   return 0
 }
 for u in ak-registry-server ak-stun-server; do
@@ -1042,6 +1054,10 @@ if [ -n "\$reg_line" ]; then
   # instance's authoritative argument list for the cross-check below.
   reg_cmdline=""
   if [ -n "\${reg_pid:-}" ]; then
+    # NOTE (K 复核 K2-R3 round 8): the '|| true' cannot distinguish a read
+    # failure from a short read (tr succeeds on empty input either way) —
+    # EMPTINESS is the failure signal for a live service, and the occupant
+    # block below refuses on an empty cmdline (fail closed).
     reg_cmdline=\$(sudo -n cat /proc/\$reg_pid/cmdline 2>/dev/null | tr '\\0' ' ' || true)
   fi
   [ -n "\$reg_cmdline" ] && { printf '%s\\n' "\$reg_cmdline" | sed 's/^/  cmdline: /'; printf '\\n'; } || true
@@ -1066,6 +1082,16 @@ if [ -n "\$reg_line" ]; then
       exit 3
     fi
     if [ -n "\$reg_unit_file" ]; then
+      # K 复核 K2-R3 (round 8): the running cmdline is NOT optional
+      # evidence. A live service's /proc/<PID>/cmdline is never empty
+      # (argv[0] alone guarantees content), so an empty read means the
+      # probe FAILED — round 7 skipped the cross-check in exactly that
+      # case and a read failure silently selected the wrong config. The
+      # cross-check FAILS CLOSED here instead.
+      if [ -z "\$reg_cmdline" ]; then
+        echo "ERROR: the running cmdline of \$reg_unit (pid \${reg_pid:-?}) is unreadable or empty; the config cross-check has no evidence; refusing before any switchover (K2-R3)" >&2
+        exit 3
+      fi
       [ "\$reg_unit" != "ak-registry-server.service" ] && echo "  old-registry-unit: \$reg_unit"
       reg_eff=\$(effective_execstart "\$reg_unit")
       reg_n=\$(printf '%s\\n' "\$reg_eff" | grep -c . || true)
@@ -1093,7 +1119,9 @@ REG_EFF_H
         echo "ERROR: \$reg_unit has no effective ExecStart; refusing before any switchover (K2-R3)" >&2
         exit 3
       fi
-      if [ -n "\$reg_cmdline" ] && ! reg_args_agree "\$reg_pick" "\$reg_cmdline"; then
+      # K 复核 K2-R3 (round 8): unconditional — the cmdline was verified
+      # non-empty above, and a failed read already refused.
+      if ! reg_args_agree "\$reg_pick" "\$reg_cmdline"; then
         echo "ERROR: the effective ExecStart of \$reg_unit materially disagrees with the running cmdline (configured '\$reg_pick' vs running '\$reg_cmdline'); refusing before any switchover (K2-R3)" >&2
         exit 3
       fi
@@ -1409,7 +1437,9 @@ for u in \$SW_UNITS; do
     # K 复核 K3-N1 (round 7): absent FILE + active (or transitional or
     # undeterminable) run state is NOT a fresh install — a running process
     # whose unit file is gone has no recoverable pre-state; refuse BEFORE
-    # anything is touched. Only absent + inactive may proceed.
+    # anything is touched. Only absent plus a confirmed inactive-or-failed
+    # run state may proceed (a 'failed' unit has no live process; systemd
+    # reports both as not-running for this purpose).
     case "\$PU_AC" in
       inactive|failed) : ;;
       *)

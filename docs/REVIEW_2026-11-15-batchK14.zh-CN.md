@@ -193,3 +193,5 @@ print("EVIDENCE_DIR=" + str(outdir))
 `b4b4ca1` 已提交 K13 报告、交接 §31、STATUS、状态表、K12 历史归属与执行方 §32；`943a346` 只回填哈希。本轮补明 K13 同步“当时本地、随后入库”的历史归属，新增 K14 与交接 §33，并同步当前入口与状态表。文档归属更正不是拒绝依据。
 
 Rust、依赖和 workflow 在修复区间无差异。固定 tip CI、本机门槛与隔离行为模型分别记录于交接。没有生产 SSH、部署、物理双机或抓包；cwd/proc/systemctl/权限是 Windows Git Bash 模型，Windows 未创建含 LF 的 Linux cwd。真实 Shell 执行、临时文件 cp/cmp 与 unit 写入不等于原生 Linux 部署验收。ADR-001、无 relay/隐藏代理回退及原始字节约束不变。
+
+归属补注（K15 复核，2026-11-15）：本报告及交接 §33、STATUS、状态表、K13 历史归属在出具时只保留本地，随后由执行方在 `d38cb01` 一并提交。本文“仅本地”指原出具时点；当前复核见 [K15](REVIEW_2026-11-15-batchK15.zh-CN.md)。

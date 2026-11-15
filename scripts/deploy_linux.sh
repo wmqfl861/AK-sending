@@ -697,6 +697,19 @@ self_test() {
   # cwd; the generated unit carries absolute identity paths only.
   grep -q 'RELATIVE --id-dir' "$WORK/p1.sh" \
     || fail "a relative --id-dir must resolve against the RUNNING cwd before reporting (K14-N1)"
+  # K 复核 K10-N1 (round 16): environ is ONE tee-captured snapshot; every
+  # count comes from the file, and a known-present variable's missing
+  # evidence refuses (never the old '-gt 0' skip).
+  grep -q 'tee "\$reg_env_raw"' "$WORK/p1.sh" \
+    || fail "environ evidence must come from ONE tee-captured snapshot (K10-N1)"
+  grep -q 'byte evidence is unavailable' "$WORK/p1.sh" \
+    || fail "a present variable with missing byte evidence must refuse, never skip (K10-N1)"
+  # K 复核 K15-N1: a relative --db-path is cwd-bound; phase1 captures the
+  # cwd and the decisions re-derive absolute paths + ReadWritePaths.
+  grep -q 'RELATIVE --db-path' "$WORK/p1.sh" \
+    || fail "a relative --db-path must trigger the RUNNING-cwd capture (K15-N1)"
+  grep -q 'cannot be bound to the running instance' "$0" \
+    || fail "a relative --db-path without a captured cwd must refuse (K15-N1)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1244,35 +1257,61 @@ REG_EFF_H
         # records and '^' anchors per record, so an embedded newline can
         # never start a variable. Presence is the RECORD's presence — a
         # set-but-EMPTY variable is PRESENT with an empty value.
-        env_bytes=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | wc -c || true)
+        # K 复核 K10-N1 (round 16): read /proc/<PID>/environ ONCE into a
+        # temp file (sudo cat | tee) and derive EVERYTHING from that single
+        # snapshot — the total byte count, the per-variable extraction and
+        # the per-variable byte-evidence counts. The old code re-read /proc
+        # four times; a failing VERIFICATION read produced wc -c 0 and the
+        # '-gt 0' guard skipped the fidelity check, confirming a truncated
+        # prefix directory through the whole chain (reviewer reproduction).
+        # Any evidence unavailability = refusal, never a skip.
+        reg_env_raw=\$(mktemp /tmp/ak-env-bytes.XXXXXX)
+        sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | tee "\$reg_env_raw" >/dev/null
+        env_bytes=\$(wc -c < "\$reg_env_raw")
         if [ "\$env_bytes" = 0 ]; then
+          rm -f "\$reg_env_raw"
           echo "ERROR: no runtime environment evidence (unreadable/empty /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
         # K 复核 K10-N1 (round 13): extract the FIRST matching NUL record
-        # VERBATIM — 'grep -z -m1' limits to the first matching RECORD (a
-        # following 'head -n 1' re-truncated values at the first embedded
-        # LF and confirmed a DIFFERENT directory). Command substitution
-        # keeps every byte of the record except its NUL terminator; values
-        # carrying bytes this line-based pipeline cannot transport are
-        # REFUSED, never truncated-then-confirmed.
-        ev_up_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za -m1 '^USERPROFILE=' || true)
-        ev_home_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za -m1 '^HOME=' || true)
+        # VERBATIM from the SNAPSHOT — 'grep -z -m1' limits to the first
+        # matching RECORD (a following 'head -n 1' re-truncated values at
+        # the first embedded LF and confirmed a DIFFERENT directory).
+        # Command substitution keeps every byte of the record except its
+        # NUL terminator; values carrying bytes this line-based pipeline
+        # cannot transport are REFUSED, never truncated-then-confirmed.
+        ev_up_rec=\$(grep -za -m1 '^USERPROFILE=' "\$reg_env_raw" || true)
+        ev_home_rec=\$(grep -za -m1 '^HOME=' "\$reg_env_raw" || true)
         for re_var in USERPROFILE HOME; do
-          eval "re_val=\\\$\$( [ "\$re_var" = USERPROFILE ] && printf ev_up_rec || printf ev_home_rec)"
+          if [ "\$re_var" = USERPROFILE ]; then
+            re_val="\$ev_up_rec"
+          else
+            re_val="\$ev_home_rec"
+          fi
+          # An ABSENT record is a legitimate chain input (only PRESENT
+          # records are verified; a PRESENT-but-empty record is the
+          # non-empty string 'VAR=' and still verifies below).
+          [ -n "\$re_val" ] || continue
           case "\$re_val" in
             *\$'\n'*|*' '*|*'	'*)
+              rm -f "\$reg_env_raw"
               echo "ERROR: the runtime \$re_var of \$reg_unit contains a byte (newline/space/tab) this deploy's line-based evidence cannot carry faithfully; refusing rather than confirm a truncated path (K10-N1)" >&2
               exit 3 ;;
           esac
-          re_grep_bytes=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -zao -m1 "^\${re_var}=.*" | wc -c || true)
+          # Byte evidence FROM THE SNAPSHOT FILE — no further /proc read
+          # exists whose failure could open this check. The variable is
+          # KNOWN PRESENT (its record was extracted above), so a missing/
+          # empty count is unavailability of evidence: refuse, never skip.
+          re_grep_bytes=\$(grep -zao -m1 "^\${re_var}=.*" "\$reg_env_raw" | wc -c)
           re_bash_bytes=\$(printf '%s' "\$re_val" | wc -c)
-          if [ "\$re_grep_bytes" -gt 0 ] \\
-             && [ "\$((re_grep_bytes - 1))" != "\$re_bash_bytes" ]; then
-            echo "ERROR: the runtime \$re_var of \$reg_unit lost trailing bytes (newline) on its way into this script; refusing rather than confirm a truncated path (K10-N1)" >&2
-            exit 3
+          if [ "\$re_grep_bytes" -eq 0 ] \\
+             || [ "\$((re_grep_bytes - 1))" != "\$re_bash_bytes" ]; then
+              rm -f "\$reg_env_raw"
+              echo "ERROR: the runtime \$re_var of \$reg_unit lost trailing bytes (newline) or its byte evidence is unavailable; refusing rather than confirm a truncated path (K10-N1)" >&2
+              exit 3
           fi
         done
+        rm -f "\$reg_env_raw"
         # The CLI's exact default chain (main.rs id_dir(), verified against
         # the source): var_os("USERPROFILE").or_else(var_os("HOME")) —
         # Some("") does NOT fall back to HOME; an empty value yields the
@@ -1411,7 +1450,46 @@ REG_EFF_H
               echo "ERROR: the RUNNING working directory of \$reg_unit is not absolute ('\$reg_cwd') while resolving the RELATIVE --id-dir '\$reg_rel_orig'; refusing before any switchover (K14-N1)" >&2
               exit 3 ;;
           esac
+          echo "  runtime-cwd: \$reg_cwd"
           echo "  note: relative --id-dir '\$reg_rel_orig' resolved against the RUNNING cwd to \$reg_rt_id (K14-N1)" >&2 ;;
+      esac
+      # K 复核 K15-N1: a RELATIVE --db-path in the effective ExecStart is
+      # cwd-dependent exactly like a relative --id-dir (the CLI hands the
+      # raw path to Connection::open). When one is present and no cwd was
+      # captured yet (the identity itself was absolute), read the RUNNING
+      # cwd now (same single-read discipline) and report it so the config
+      # selection can absolutize the db object against it.
+      reg_db_arg=\$(printf '%s\\n' "\$reg_pick" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
+      case "\$reg_db_arg" in
+        /*|'') : ;;
+        *)
+          if [ -z "\${reg_cwd:-}" ]; then
+            reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
+            sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+            reg_cwd=\$(cat "\$reg_cwd_raw")
+            reg_cwd_bytes=\$(wc -c < "\$reg_cwd_raw")
+            rm -f "\$reg_cwd_raw"
+            if [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
+              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --db-path '\$reg_db_arg' of \$reg_unit; refusing before any switchover (K15-N1)" >&2
+              exit 3
+            fi
+            case "\$reg_cwd" in
+              *\$'\n'*|*' '*|*'	'*)
+                echo "ERROR: the RUNNING working directory of \$reg_unit contains a byte this deploy's evidence cannot carry faithfully while resolving the RELATIVE --db-path '\$reg_db_arg'; refusing before any switchover (K15-N1)" >&2
+                exit 3 ;;
+            esac
+            if [ "\$((reg_cwd_bytes - 1))" != "\$(printf '%s' "\$reg_cwd" | wc -c)" ]; then
+              echo "ERROR: the byte evidence of the RUNNING working directory of \$reg_unit is unavailable or lost bytes while resolving the RELATIVE --db-path '\$reg_db_arg'; refusing before any switchover (K15-N1)" >&2
+              exit 3
+            fi
+            case "\$reg_cwd" in
+              /*) : ;;
+              *)
+                echo "ERROR: the RUNNING working directory of \$reg_unit is not absolute while resolving the RELATIVE --db-path '\$reg_db_arg'; refusing before any switchover (K15-N1)" >&2
+                exit 3 ;;
+            esac
+            echo "  runtime-cwd: \$reg_cwd"
+          fi ;;
       esac
       echo "  runtime-id-dir: \$reg_rt_id"
     else
@@ -2181,6 +2259,10 @@ real_run() {
   # may be selected (fresh install with legacy data); multiple candidates
   # are unresolvable ambiguity (refuse instead of head -1).
   runtime_id=$(sed -n 's/^  runtime-id-dir: \(.*\)$/\1/p' "$WORK/phase1.log" | head -1)
+  # K 复核 K15-N1: the RUNNING cwd phase1 captured while resolving a
+  # relative identity path — the same anchor a relative --db-path must
+  # resolve against (empty when no cwd was consulted).
+  runtime_cwd=$(sed -n 's/^  runtime-cwd: \(.*\)$/\1/p' "$WORK/phase1.log" | head -1)
   data_candidates=$(sed -n 's/^registry-data: \(.*\) (key:.*/\1/p' "$WORK/phase1.log")
   n_candidates=$(printf '%s\n' "$data_candidates" | grep -c . || true)
   if [ -n "$runtime_id" ]; then
@@ -2344,13 +2426,19 @@ real_run() {
   # as an unresolved conflict.
   REMOTE_DATA_PREOWNED=0
   [ -n "$runtime_id" ] && [ "$runtime_id" = "$REMOTE_DATA" ] && REMOTE_DATA_PREOWNED=1
-  # K 复核 K14-N1: the generated unit carries ABSOLUTE identity paths ONLY.
-  # A relative --id-dir meant <running-cwd>/... for the RUNNING instance;
+  # K 复核 K14-N1/K15-N1: the generated unit carries ABSOLUTE identity AND
+  # data paths ONLY (--id-dir, --db-path, ReadWritePaths). A relative
+  # --id-dir or --db-path meant <running-cwd>/... for the RUNNING instance;
   # keeping it relative in the new unit (or ReadWritePaths) would make it
-  # resolve against the NEW unit's own cwd and silently change the identity.
-  # phase1 already resolved the runtime identity to an absolute dir; rewrite
-  # a relative --id-dir argument and a relative REG_RW to that same absolute
-  # source. (Policy: absolute paths only — no WorkingDirectory= guessing.)
+  # resolve against the NEW unit's own cwd (the '/' default for system
+  # services) and silently point at a DIFFERENT database object — the CLI
+  # hands the raw db_path to Connection::open (main.rs:3792, store.rs:397),
+  # so a relative db object is cwd-dependent exactly like the identity dir.
+  # phase1 captured the running cwd while resolving the identity; rewrite a
+  # relative --id-dir/--db-path argument and a relative REG_RW to the
+  # RUNNING-resolved absolute paths, and re-derive ReadWritePaths from the
+  # final absolute objects. (Policy: ALL identity/data paths absolute in
+  # generated units — no WorkingDirectory= guessing, no relative args.)
   if [ -n "$runtime_id" ]; then
     case "$REG_RW" in
       /*) : ;;
@@ -2364,6 +2452,31 @@ real_run() {
         REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir $rel_id/--id-dir $runtime_id}
         REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir=$rel_id/--id-dir=$runtime_id}
         note "relative --id-dir '$rel_id' rewritten to the RUNNING-resolved $runtime_id (K14-N1)" ;;
+    esac
+    # K 复核 K15-N1: a relative --db-path resolves against the SAME running
+    # cwd phase1 captured (baked as RUNTIME_CWD by write_phase1; absent when
+    # the identity was absolute and no cwd was consulted -> refuse, the db
+    # object cannot be bound).
+    rel_db=$(printf '%s\n' "$REGISTRY_EXEC" | sed -n 's/.*--db-path[= ]\([^ ]*\).*/\1/p' | head -1)
+    case "$rel_db" in
+      /*|'') : ;;
+      *)
+        if [ -z "${runtime_cwd:-}" ]; then
+          fail "the effective ExecStart carries a RELATIVE --db-path '$rel_db' but the running cwd was not captured; the database object cannot be bound to the running instance; resolve it to an absolute path and re-run (K15-N1)"
+        fi
+        abs_db="$runtime_cwd/$rel_db"
+        REGISTRY_EXEC=${REGISTRY_EXEC//--db-path $rel_db/--db-path $abs_db}
+        REGISTRY_EXEC=${REGISTRY_EXEC//--db-path=$rel_db/--db-path=$abs_db}
+        note "relative --db-path '$rel_db' rewritten to the RUNNING-resolved $abs_db (K15-N1)"
+        # ReadWritePaths must cover the RESOLVED db object's directory when
+        # it lies outside the identity dir (re-derived from the absolute
+        # object, never from the raw relative argument).
+        abs_db_dir=${abs_db%/*}
+        case "$abs_db_dir" in
+          "$REG_RW") : ;;
+          *) REG_RW="$REG_RW $abs_db_dir"
+             note "ReadWritePaths extended to cover the resolved db object: $REG_RW (K15-N1)" ;;
+        esac ;;
     esac
   fi
 

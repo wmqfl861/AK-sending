@@ -81,7 +81,9 @@ PREV10_REV = "1fad0a2"  # round-11 candidate (K12 findings: LF truncation,
                          # config-cwd resolution, swallowed key chmod)
 PREV10_PRE_REV = "09fceb6"  # round-10 tip (pre-move key chmod: set -e caught it)
 PREV11_REV = "0b41201"
-PREV12_REV = "943a346"  # round-13 tip (K14 findings: fail-open second cwd
+PREV12_REV = "943a346"
+PREV13_REV = "f425256"  # round-14 tip (K15 findings: environ fail-open
+                         # verification reads, relative --db-path unbound)  # round-13 tip (K14 findings: fail-open second cwd
                          # read, relative --id-dir unbound to running cwd)  # round-12 tip (K13 findings: cwd byte fidelity,
                          # generated-script path re-interpretation)  # round-9 candidate (K10 findings: environ parsing
                         # semantics, destination conflicts skipped)  # round-8 candidate (K9 finding: migration source
@@ -526,6 +528,20 @@ exec "@REAL_MV@" "$@"
 CAT_STUB = r"""#!/usr/bin/env bash
 set -u
 printf 'cat %s\n' "$*" >> "$PROBE_DIR/stubs.log"
+# K10-N1 (round 16) reviewer model: count every /proc/<pid>/environ read
+# (ENV_READ_n markers); ENV_READ_FAIL_FROM makes every read from the Nth
+# onward fail (a failing verification read used to skip the fidelity check).
+if [ "$*" = /proc/4242/environ ]; then
+  n=0
+  [ ! -f "$PROBE_DIR/env-read-count" ] || read -r n < "$PROBE_DIR/env-read-count"
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$PROBE_DIR/env-read-count"
+  printf 'ENV_READ_%s\n' "$n" >> "$PROBE_DIR/stubs.log"
+  if [ -n "${ENV_READ_FAIL_FROM:-}" ] && [ "$n" -ge "$ENV_READ_FAIL_FROM" ]; then
+    printf 'ENV_READ_FAILED_%s\n' "$n" >> "$PROBE_DIR/stubs.log"
+    exit 1
+  fi
+fi
 if [ -n "${CAT_FAIL_MATCH:-}" ]; then
   case "$*" in
     *"$CAT_FAIL_MATCH"*)
@@ -1147,6 +1163,51 @@ class ProbeHarness(unittest.TestCase):
             f'echo "INSTALL_RC=$?"\n'
         )
         return self.generate_and_run_p456(body, run_env=run_env)
+
+    def _make_k15_env_fixture(self, tail_lf: bool):
+        profile = b"/home/otheruser" + (b"\x0a" if tail_lf else b"")
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "EnvironmentFile=/etc/default/oldregistry"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=" + profile
+                    + b"\0USER=otheruser\0")
+        envf = self.probe / "etc/default/oldregistry"
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_bytes(b'HOME=/home/otheruser\nUSERPROFILE="' + profile + b'"\n')
+        prefix = self.probe / "home/otheruser/.ak-sending"
+        prefix.mkdir(parents=True, exist_ok=True)
+        for name in ("registry.key", "registry.db"):
+            (prefix / name).write_text(f"env-prefix-decoy-{name}", encoding="utf-8")
+
+    def _make_k15_db_fixture(self, dbpath: str):
+        identity = "/home/otheruser/.ak-sending"
+        args = "--port 17200 --id-dir " + identity + " --db-path " + dbpath
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        (self.probe / identity.lstrip("/") / "registry.key").write_text(
+            "same-synthetic-identity", encoding="utf-8")
+        # Two REAL SQLite objects with distinct markers (the reviewer's
+        # shape): the true object under the running cwd, the decoy under /
+        # (the new unit's default cwd).
+        import sqlite3
+        for location, marker in (
+                ("/home/runtime-old/" + dbpath, "runtime-real"),
+                ("/" + dbpath, "new-cwd-decoy")):
+            db = self.probe / location.lstrip("/")
+            db.parent.mkdir(parents=True, exist_ok=True)
+            if db.exists():
+                db.unlink()
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE review_marker(value TEXT)")
+            con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
+            con.commit()
+            con.close()
 
     def _make_k14_relative_fixture(self, identity: str):
         """Unit + argv both carry '--id-dir <identity>'; the running cwd is
@@ -2949,6 +3010,135 @@ echo "C4=[$c4]"
         self.assertIn("refusing before any switchover", p1_out)
         self.assertNotIn("runtime-id-dir:", p1_out)
 
+    # -- K10-N1 (round 16): ONE environ snapshot; no fail-open read --------
+    def test_k10n1_environ_read_exactly_once(self):
+        # Reviewer requirement (b): /proc/<PID>/environ is read EXACTLY
+        # ONCE (the single tee-captured snapshot). The old design read it
+        # four times.
+        self._make_k15_env_fixture(tail_lf=False)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        self.assertIn("ENV_READ_1", self.stubs_log())
+        self.assertNotIn("ENV_READ_2", self.stubs_log(),
+                         "/proc/4242/environ must be read EXACTLY once")
+
+    def test_k10n1_environ_verification_read_failure_refuses(self):
+        # Reviewer fixture (a): real trailing-LF USERPROFILE; under the old
+        # design ONLY the 4th (verification) read failed and the '-gt 0'
+        # guard skipped the check — the whole chain succeeded off the
+        # truncated prefix decoy. With the single-snapshot design there is
+        # no verification read of /proc at all; the failing read (modeled
+        # by ENV_READ_FAIL_FROM=1 failing the FIRST/ONLY read) refuses.
+        self._make_k15_env_fixture(tail_lf=True)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'ENV_READ_FAIL_FROM=1 bash "$PROBE_DIR/p1.sh" '
+            + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "any evidence unavailability must refuse, never skip")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("no runtime environment evidence", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        # And nothing migrated anywhere.
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
+
+    def test_k10n1_environ_tail_lf_stable_control_refuses(self):
+        # Control (c): all reads succeed, stable trailing LF -> refuse via
+        # the snapshot's byte count.
+        self._make_k15_env_fixture(tail_lf=True)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("lost trailing bytes", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
+    # -- K15-N1: a relative --db-path binds to the RUNNING cwd ------------------
+    def test_k15n1_relative_db_path_absolutized_in_unit(self):
+        # Reviewer fixture: relative --db-path 'home/otheruser/.ak-sending/
+        # registry.db' with running cwd /home/runtime-old. The generated
+        # unit must carry the RESOLVED ABSOLUTE db object (and ReadWritePaths
+        # covering it), never the cwd-dependent relative form.
+        rel = "home/otheruser/.ak-sending/registry.db"
+        self._make_k15_db_fixture(rel)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  runtime-cwd: /home/runtime-old$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k15rel.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertIn("--db-path /home/runtime-old/" + rel, exec_line)
+        rw_line = [l for l in out.splitlines() if l.startswith("CHOSEN_RW=")][0]
+        self.assertIn("/home/runtime-old/home/otheruser/.ak-sending", rw_line,
+                      "ReadWritePaths must cover the RESOLVED db object")
+        # The real generated unit (CHOSEN values baked).
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
+            + 'REG_RW="/home/runtime-old/home/otheruser/.ak-sending '
+            + '/home/otheruser/.ak-sending" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=/home/otheruser/.ak-sending CLOSE_7100=0 '
+            + 'REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456k15rel.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456k15rel.sh" > "$PROBE_DIR/p456k15rel.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.generate_and_run_p456(body)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        self.assertIn("--db-path /home/runtime-old/" + rel, unit)
+        self.assertNotRegex(unit, r"--db-path " + re.escape(rel) + r"(\s|$)")
+        self.assertIn("/home/runtime-old/home/otheruser/.ak-sending", unit)
+
+    def test_k15n1_absolute_db_path_control_unchanged(self):
+        # Control: the absolute db argument keeps the original object.
+        rel = "home/otheruser/.ak-sending/registry.db"
+        self._make_k15_db_fixture("/home/runtime-old/" + rel)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k15abs.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertIn("--db-path /home/runtime-old/" + rel, exec_line)
+
+    def test_k15n1_relative_db_path_unreadable_cwd_refuses(self):
+        # Relative db with an unreadable running cwd: refuse before any
+        # switchover (the db object cannot be bound).
+        rel = "home/otheruser/.ak-sending/registry.db"
+        self._make_k15_db_fixture(rel)
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=unreadable" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("RELATIVE --db-path", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -3790,6 +3980,68 @@ class BaselineContrastTests(ProbeHarness):
                          "dequoted-wrong-registry.key",
                          "the executing shell de-quoted the path and copied "
                          "the OTHER directory's bytes")
+
+    def test_k10n1_round14_tip_environ_verification_read_fail_open(self):
+        # K15-review contrast: f425256 on the reviewer's exact fixture (real
+        # trailing-LF USERPROFILE, ONLY the 4th/verification environ read
+        # failing). The old 4-read design skipped the check on wc -c 0 and
+        # the whole chain confirmed the truncated prefix dir.
+        self._make_k15_env_fixture(tail_lf=True)
+        text = self.baseline_text(PREV13_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev13.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'ENV_READ_FAIL_FROM=4 bash "$PROBE_DIR/p1prev13.sh" '
+            + '> "$PROBE_DIR/p1prev13.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV13_REV) + BOX_MODELS,
+                                  body, name="driver-prev13-env.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-14 tip skipped the check (the defect)")
+        p1_out = (self.probe / "p1prev13.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$",
+                         "the round-14 tip confirmed the TRUNCATED dir")
+        markers = [m for m in self.stubs_log().splitlines()
+                   if m.startswith("ENV_")]
+        self.assertIn("ENV_READ_FAILED_4", markers,
+                      "the injected 4th-read failure really fired")
+
+    def test_k15n1_round14_tip_relative_db_path_keeps_relative_form(self):
+        # K15-review contrast: f425256 on the relative-db fixture — its
+        # generated unit PRESERVES the relative --db-path with no
+        # WorkingDirectory, so the new service would open the decoy object
+        # under its default cwd (/).
+        rel = "home/otheruser/.ak-sending/registry.db"
+        self._make_k15_db_fixture(rel)
+        text = self.baseline_text(PREV13_REV)
+        args = "--port 17200 --id-dir /home/otheruser/.ak-sending --db-path " + rel
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="$REMOTE_BIN registry-server ' + args + '" ' + chr(10)
+            + 'REG_RW="/home/otheruser/.ak-sending" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=/home/otheruser/.ak-sending CLOSE_7100=0 '
+            + 'REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456prev13db.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456prev13db.sh" > "$PROBE_DIR/p456prev13db.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV13_REV) + BOX_MODELS,
+                                  body, name="driver-prev13-db.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        exec_line = [l for l in unit.splitlines() if l.startswith("ExecStart=")][0]
+        self.assertIn("--db-path " + rel, exec_line,
+                      "the round-14 tip kept the RELATIVE db form (the defect)")
+        self.assertNotIn("WorkingDirectory=", unit)
+        self.assertNotIn("/home/runtime-old", unit)
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

@@ -1042,3 +1042,71 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `d38cb01` | K10-N1 单次读取取证与 K14-N1 相对 id-dir 运行解析；复核方文档同步与执行方本节记录入库 |
+
+## 35. 修复轮十四独立复核证据（2026-11-15）
+
+被审差异固定为 `943a346..f425256`，实现提交 `d38cb01`，完整 tip 为 `f42525632c743c575b9b150f267cea69ab3b3275`。输入、机制和可复现 runner 见 [K15 复核](REVIEW_2026-11-15-batchK15.zh-CN.md)，逐项裁决只在审核状态表。本节、K15、STATUS、状态表及 K14 历史归属补注仅本地同步；没有修改被审代码。“专项”为并行只读审查，“主复核”为集成者独立重放。环境为 Windows、Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1；门槛三路并行总墙钟 1264.112 秒。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；两脚本各 `--self-test` | 均 exit 0；deploy 生成真实阶段脚本验语法，cross-NAT 使用隔离 fake-channel 自检；无 SSH/生产连接 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 272/272，0 failure/error/skip，unittest 1263.224 秒；部署115（当前88、历史对照27），NAT lifecycle 11、NAT streak 51、netem 24、repository checker 64、SSH helper 7。均首次执行通过，没有重试或补跑；源码固定为f425256，文档同步与行为验证分开 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 初始固定 f425256 工作树均 exit 0，契约 5/5 PASS；85 md/local links=301。文档同步后的结果另见本表文档收尾，不混计 |
+| Rust 本机门槛 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows 均 exit 0。测试 1200 passed、0 failed、8 ignored，含 doctest，565.803 秒；fmt 4.089 秒、clippy 29.238 秒、rustdoc 19.102 秒、实际 Windows build 35.303 秒。ignored 不算执行 |
+| 实现范围 | `git diff --exit-code 943a346..f425256 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 无差异、exit 0；实现改动仅部署脚本与 Python 测试，另有文档同步 |
+| 报告 runner | 主复核独立执行 env、DB 完整链与 native-DB runner | 均 exit 0；env 五案全部断言通过；DB 三案 phase1/decision/install 全部 0，断言路径对象与 SQLite marker；原生 CLI 四次启动均实际监听并已终止。没有修改生产源码 |
+| 文档收尾 | 同步后仓库检查、契约、`git diff --check`；报告代码与实际 runner 比较/compile；实现与引用复核 | 均exit 0；工作树86 md/local links=308，契约5/5 PASS。报告三份代码与主复核实际runner逐字一致且compile通过。实现diff为空，仅K15报告、交接、状态表、STATUS、K14历史补注共五份文档本地变更，未提交 |
+
+| 行为 / 来源核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| 原 cwd 单读修复 | cwd 尾 LF＋第二读失败注入、稳定尾 LF、内嵌 LF、普通 cwd、empty USERPROFILE runtime cwd、不可读 cwd | 专项六项通过，67.735 秒；注入例 phase1=3，只查询一次 cwd，`CWD_FAIL_ON_SECOND` 的第二次失败未触发。字节与计数从同一临时文件取；不扩大到任意非零返回且有 stdout 组合 |
+| environ 验证读失败 | USERPROFILE 值带尾 LF；仅第四次 cat 失败且无 stdout，第五次 HOME 验证读恢复 | 专项与主复核各自五案通过断言：当前及943a346窄反例 phase1/decision/install=0，目标真实字节为 env-prefix-decoy-registry.key/.db；稳定尾 LF phase1=3且无stop/目标key；普通控制全链0；第4/5读均失败的持续控制也错源。生产 decision→compose→生成→安装同一 Bash，值不经 caller 再解释 |
+| 原相对身份路径与绝对/拒绝控制 | 当前 `--id-dir state`、绝对 id、不可读 cwd、943a346 相对 id baseline；另重建 K13 quoted baseline | 专项五项全部通过，76.655 秒。当前相对 id 的 key/db 为 runtime-real，新 unit 的 id-dir/RWP 均绝对；历史相对 id 为 deploy-cwd-decoy。不可读 cwd 在 phase1 拒绝 |
+| K13 baseline 生成边界 | 文件原样传入引号值，历史版本 write_phase456 生成，历史脚本安装 | 生成源码明确保留 `DATA_SOURCE=/home/oth'er'user/.ak-sending`；INSTALL_RC=0，目标 key/db 都为 dequoted-wrong。该重建测试覆盖生成→安装，不扩大为历史 phase1/decision 执行 |
+| 相对 DB 的完整 Shell 链 | id=/home/otheruser/.ak-sending；db=home/otheruser/.ak-sending/registry.db；running cwd=/home/runtime-old；当前、943a346与绝对 DB 控制 | 专项三案88.938秒；主复核独立三案83.062秒；phase1/decision/install均0。相对案生成 unit 无WorkingDirectory，新对象父目录等于ReadWritePaths，SQLite marker由runtime-real对象转为new-cwd-decoy对象；绝对控制保持runtime-real；真实复制key为同一合成值，systemctl为模型 |
+| 当前原生 Windows CLI 数据库对象 | 复制已构建 `target/debug/ak-cli.exe` 至 TEMP；版本明确 git f425256；同一绝对身份目录，切换两个 TEMP cwd；仅 `--bind 127.0.0.1 --port 0` | 专项与主复核各四次真实启动，均监听，所有自行启动进程均已终止。初始化后原相对库schema3/marker=runtime-real/invite_count=1；新cwd相对库schema3/marker=new-cwd-decoy/invite_count=0；绝对控制回原库count=1；key SHA前后相同。二进制SHA256=0ee7186a29515fe23f985f3099f150cc48d78e0316996f0265a9abe76cb0218d；不等于Linux systemd部署 |
+| 初步原生控制 | 主复核另执行简单 registry.db 相对参数、另一cwd和绝对控制 | 三次真实loopback启动，另一cwd新建schema3库且无原marker，绝对控制保留marker；均已终止。最终报告采用上行可写诱饵夹具，不把初步例扩大为Linux根目录可写 |
+| 文档来源 | `git show/diff d38cb01`、`git show f425256` | K14同步与执行方§34已入库；f425256仅交接一行哈希回填。本轮补K14出具时点历史归属；文档来源更正不是拒绝原因 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `f42525632c743c575b9b150f267cea69ab3b3275`；[43722690171](https://github.com/wmqfl861/AK-sending/actions/runs/43722690171) | 当前git凭据直接查询run/jobs API，从in_progress等到completed/success；head_branch=dev/batch-k-20261114，attempt=1，更新完成时间2026-11-15T14:21:36Z；最终完整API读取2026-11-15T14:26:26Z。13 jobs中12常规success、1手动release-deep-tests skipped，121常规步骤全部success；每个常规job head_sha逐项断言匹配 |
+| CI实际门槛 | 固定SHA的workflow与完整jobs/steps JSON | Linux/Windows Rust workspace及特性测试、fmt/clippy/rustdoc；Flutter analyze/test与纯Dart；Android双ABI FFI/符号/debug APK；Linux/macOS portability；audit/deny、仓库检查、legacy signal、NAT netns模拟均完成。不等于生产部署或物理双机 |
+| API与权限 | 相同git凭据与GitHub API | 本轮未遇权限拒绝；凭据只在查询进程内存，未输出或落盘，没有切换身份 |
+| 远端引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；收尾再次读取 | 初始main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=f42525632c743c575b9b150f267cea69ab3b3275。收尾再次读取仍一致，远端保留main和本批次分支；没有调用merge、push或分支删除 |
+| 本地引用 | `git worktree list --porcelain`、状态与diff核对 | 只有主工作树；当前批次分支为固定tip，main保持d6c7136。本轮仅复核文档本地同步，不创建提交 |
+
+| 未执行 / 边界 | 本轮事实 |
+|---|---|
+| Linux原生cwd/权限/systemd部署、生产SSH、物理双机C4、抓包 | proc/cwd/systemctl与权限为Windows Bash隔离模型；Windows未创建含LF真实目录。Shell真实执行、临时文件cp/cmp/SQLite与Windows真实CLI启动分别记录，不称Linux部署验证 |
+| 本机Flutter/Dart、Android/Linux/macOS重建 | PATH未发现Flutter/Dart；本机未重建这些平台，采用固定SHA当前CI证据。portability为cargo check，不当成完整应用构建 |
+| shellcheck | PATH未发现，未执行；Bash语法和模型不替代shellcheck |
+| 手动release深测 | 本轮未运行ignored release suite；push CI手动job skipped，不计通过 |
+| 数据库与恢复边界 | 原晚事务提交和故障恢复回归继续保留；新反例只证明路径对象与数据库数据改变，不扩大为任意崩溃、中断事务或journal恢复证明 |
+
+| 仓外材料（本机TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k15-review-ccd3b390` | GitHub查询与审计脚本、完整run/jobs JSON、ci-final-audit.json、主复核三份报告runner及执行日志、文档生成/同步脚本；凭据仅查询进程内存 |
+| `ak-k15-gates-b0faa4f6cf2d458c93f8a1e046d74092` | 本机各门槛完整首次执行日志、环境与实际耗时/退出码汇总 |
+| `ak-k15-env-evidence-11pe44mr` | 主复核环境五案完整生成脚本/driver/日志/stub/unit及复制字节、results.json |
+| `ak-k15-db-path-rwp-zt3xjuks`、`ak-k15-native-db-rwp-9384go13` | 主复核DB三案完整模型与SQLite、四次真实CLI启动日志与数据库/身份材料（仅仓外）、results.json |
+| `ak-k15-cwd-review-go4_e1d6`、`ak-k15-env-evidence-z_ipjhpt` | cwd专项六项测试及环境专项五案完整链证据 |
+| `ak-k15-identity-review-5hr2ui43`、`ak-k15-db-path-rwp-k6oeer16`、`ak-k15-native-db-rwp-z7xzzw2u` | 身份/K13专项五项、相对DB三案及原生四次CLI启动证据 |
+| `ak-k15-native-db-yfkgne7o` | 主复核初步registry.db相对路径原生控制，三个已终止实例 |
+
+## 36. 修复轮十五（K15 复核后的新候选，执行方记录）
+
+[K15 复核](REVIEW_2026-11-15-batchK15.zh-CN.md)（K14-N1 判关闭、cwd 二读夹具判修复；K10-N1 维持：environ 验证读 fail-open；新发现 K15-N1 相对 `--db-path`）后，执行方完成修复；复核方本地同步（§35、STATUS、状态表、K14 历史归属）与本节代码改动一并提交。
+
+| K15 发现 | 修复内容 |
+|---|---|
+| K10-N1 余项（P1） | environ **单次快照**：`cat /proc/<PID>/environ | tee "$reg_env_raw"` 读一次落临时文件，总字节、逐变量提取（`grep -za -m1` 于文件）、逐变量字节证据计数全部取自该快照——不存在可失败的后续 `/proc` 读取；已知存在变量的零计数=「证据不可得」拒绝（缺记录仍为合法链输入显式跳过），`-gt 0` 跳过删除。复核夹具（真实尾 LF USERPROFILE+仅第 4 读失败注入）从「全链成功拷贝前缀诱饵」翻转为拒绝；stub 标记证明 environ 恰读一次；尾 LF/EXTRA/普通控制保持；`f425256` 基线（注入标记真实触发）exit 0 确认截断目录 |
+| K15-N1（P1） | 相对 `--db-path` 绝对化：phase1 在有效 ExecStart 含相对 db 参数且尚未捕获 cwd 时以同纪律读运行 cwd 并输出 `runtime-cwd`；决策策略注释明确「--id-dir/--db-path/ReadWritePaths 生成 unit 全绝对」——相对 db 改写为 `<runtime_cwd>/<rel>`（无 cwd 拒绝），ReadWritePaths 由解析后绝对库对象**重推导**（越出身份目录时扩展），绝不沿用原始相对参数。复核夹具（相对 db+运行 cwd+真实 SQLite 标记）生成 unit 全绝对且 ReadWritePaths 覆盖真对象；绝对参数控制不变；cwd 不可读拒绝；`f425256` 基线保留相对形且无运行 cwd——原缺陷 |
+
+### 修复轮十五门禁与提交
+
+本地：`bash -n`+自检全过；Python 280/280（部署套件 123，含 8 项轮十六回归与跨十三版基线）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十五首个提交，推送后回填哈希） | K10-N1 environ 单快照与 K15-N1 相对 db 绝对化；复核方文档同步与执行方本节记录入库 |

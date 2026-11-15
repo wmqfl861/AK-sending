@@ -718,7 +718,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 25. 修复轮九独立复核证据（2026-11-15）
 
-被审差异固定为 `ccd8fb2..806ea6c`。发现与可复现输入见 [K10 复核](REVIEW_2026-11-15-batchK10.zh-CN.md)，逐项状态只在审核状态表。本节、K10 报告及入口同步仅保留本地，未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、离线模型和平台 CI 分别记录。
+被审差异固定为 `ccd8fb2..806ea6c`。发现与可复现输入见 [K10 复核](REVIEW_2026-11-15-batchK10.zh-CN.md)，逐项状态只在审核状态表。本节、K10 报告及入口同步出具时仅保留本地，随后由执行方在 `a50bb1a` 提交；复核未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、离线模型和平台 CI 分别记录。
 
 | 本机验证 | 实际命令 / 范围 | 结果与边界 |
 |---|---|---|
@@ -780,3 +780,68 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `a50bb1a` | K10-N1/N2 修复；复核方文档同步与执行方本节记录入库 |
+
+## 27. 修复轮十独立复核证据（2026-11-15）
+
+被审差异固定为 `806ea6c..09fceb6`。发现与完整可复现输入见 [K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)，逐项状态只在审核状态表。本节、K11 报告及入口同步仅保留本地；复核未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、隔离模型、SQLite 事务和平台 CI 分别记录。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；两脚本各 `--self-test` | 均 exit 0；隔离工具与合成数据，没有 SSH 或部署。cross-NAT 自检使用已有本地 release 工具，不代表本轮 release 重建或公网传输 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 249/249，864.496 秒，exit 0，无 failure/error/skip；部署套件 92，含本轮 K10 回归/对照 10 项，真实 git BaselineContrastTests 20 项均实际执行；repository checker 64 项 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py`；集成者在 `git archive 09fceb6` 完整导出树执行 checker | 均 exit 0；契约 5/5 实际 PASS，未只凭 advisory 退出码。固定导出树 66 md/local links=276；同步前工作树 81 md/local links=276（含本机忽略目录文档），两者区分记录 |
+| Rust 本机门禁 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows / rustc 1.99.1 均 exit 0；测试 1200 passed、0 failed、8 ignored，含 doctest，549.297 秒。ignored 未计作执行；本轮确实完成 Windows workspace 构建，Rust 门禁日志未见 warning/error 编译诊断 |
+| 实现变动范围 | `git diff --name-only 806ea6c..09fceb6 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 无差异；本轮实现变动只在部署脚本、其 Python 测试与文档 |
+| 报告原文复现 | 从 K11 报告 PowerShell 代码块原样提取 Python 并运行 | 集成者 exit 0；5 案完整执行：LF 变量和 cwd 差异均错选并成功安装；schema clean 保持 active/1；当前与旧候选 late-commit 均来源 revoked/2、目标 active/1。runner 成功不代表这些部署行为通过 |
+| 文档收尾 | `git diff --check`；同步后 `python scripts/check_repository.py` | 本地同步后均 exit 0；最终工作树 82 md/local links=281，区别于固定 tip。本轮仅新增 K11 报告，同步交接、状态表、STATUS 和 K10 历史归属，不提交或推送 |
+
+| 行为 / 源码核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| K10 报告原输入对照 | 原报告代码分别以 806ea6c / 09fceb6 重放，输入不变：空 USERPROFILE 从 HOME 翻转至 WorkingDirectory；EXTRA 内 LF 从错误 root 翻转至 HOME；目标 decoy 从安装 0 翻转为 5，字节保留且新 unit 不存在；空目标正确复制 | 集成者执行真实 phase1、decision 和由决策值生成的 phase456；只为预期拒绝补充“新 unit 不存在”的输出处理 |
+| K10-N1 原新增回归 | 三项提交内环境回归逐名执行 | 专项 3/3，32.374 秒，exit 0；包含缺 WorkingDirectory 拒绝。不与全集重复计为新增案例 |
+| 实际变量含 LF | USERPROFILE=/home/otheruser 加值内 LF+suffix 或值尾 LF；EnvironmentFile 注入 | 专项和集成者各自执行真实完整链，phase1/decision/install 均 0，错误 prefix 来源被复制。Rust 默认链摘录以 rustc --edition 2024 编译，LF 保留、空值得到相对 .ak-sending。Windows 无 LF 文件名落盘，正确 Linux 路径依 CLI 字节语义判定 |
+| cwd 配置/运行不一致 | unit WorkingDirectory=/home/configured-new，运行 cwd 模型=/home/runtime-old，USERPROFILE 为空；两目录放不同合成数据 | 专项和集成者各自完整链均 0，目标为 configured-decoy；readlink stub 单独控制 exit 0 返回 runtime-old，实际部署未查询 cwd。未运行原生 systemd |
+| EnvironmentFile 语义旁证 | 官方 systemd.exec 文档；两个合成单引号多行配置；Bash source 后逐字输出 NUL 记录 | 官方允许单引号值跨多行；模型原始 environ 与加载控制精确相同。Bash 仅作相同单引号语义旁证，不冒充 systemd 启动 |
+| K10-N2 专项 | differing / identical / clean-copy / corrupt-copy / fresh-dirty / in-place 与真实 806ea6c baseline | 当前六项和正确类名下 baseline 均通过。首次专项命令把 baseline 方法错列在 DeployInstallTests，产生 loader error；改用 BaselineContrastTests 后通过，属于复核命令定位错误，不是候选产品失败 |
+| 复制后、停服前提交 | 真实 SQLite 普通表先作交错控制；进一步使用 store.rs 的五条真实 DDL、schema v3 和合成邀请记录，在 systemctl stop 入口且旧服务仍 active 时提交撤销字段更新 | 专项与集成者各自执行完整链。当前与 806ea6c 的 clean 均 source/target=active/1；late 均 source=revoked/2、target=active/1，安装均 0。当前输出 cmp-verified 后仍丢失最终状态；未启动真实 registry 或协议 revoke |
+| 提交与历史归属 | `git show/diff a50bb1a`、`git show 09fceb6`；fixture argv 检查 | a50bb1a 纳入 K10 文档同步；09fceb6 为交接/状态表各一行哈希回填。fixture 已逐参数分隔；本轮也显式写 NUL argv。残留“K10 仅本地”与旧下一步本地纠正 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `09fceb64a2fb729fc8dbf0d0c20c64abcec67045`；[43687011227](https://github.com/wmqfl861/AK-sending/actions/runs/43687011227) | 当前 git 凭据直接读取 run/jobs API，从 in_progress 等待至 completed/success；head_branch=dev/batch-k-20261114，run_attempt=1；13 jobs 中 12 常规 success、1 手动 release-deep-tests skipped；完成更新时间 2026-11-15T07:00:10Z |
+| CI 实际门槛 | 同上 jobs/steps metadata 与固定 tip workflow | 所有 job 的完整 head SHA 匹配；全部常规 steps success，无 failure/cancelled/未完成步骤。Linux/Windows Rust、特性测试、fmt/clippy/rustdoc，Flutter analyze/test、纯 Dart，Android 双 ABI FFI/符号验证/debug APK，Linux/macOS portability，audit/deny、仓库检查、legacy signal、NAT netns 模拟均 success；不等于生产或物理双机 |
+| 远端引用 | 初始 `git fetch --prune origin`；收尾 `git ls-remote --heads origin` | 只有 main=d6c71360784e1570720e56028a39f2a80777bb21、dev/batch-k-20261114=09fceb64a2fb729fc8dbf0d0c20c64abcec67045；未调用合并、推送或删除 |
+| 本地引用与工作树 | `git branch -avv`；`git worktree list --porcelain`；`git status --short --branch` | main 留在 d6c7136，批次分支仍在固定 tip，只有主工作树；仅五个文档变化（含新增 K11），没有提交、合并、推送或被审代码改动 |
+
+| 未执行 / 限制 | 本轮事实 |
+|---|---|
+| Linux 原生 systemd/权限部署、远端 SSH、物理双机 C4、生产抓包 | 本机只执行真实生成脚本的隔离模型，没有连接生产；真实 SQLite 文件/事务加模型服务状态不等于原生 Linux 或真实协议验证 |
+| 本机 Flutter/Dart、Android/Linux/macOS 平台重建 | 本轮未改相关实现；实际平台门槛采用完整 SHA 匹配的最终 CI，不以旧产物冒充当前构建 |
+| 手动 release deep tests | push workflow 的该 job skipped；本机未重跑 ignored release suite，不计作已执行或通过 |
+| shellcheck / Flutter / Dart 本机命令 | PATH 未发现 shellcheck、flutter、dart；对应本机检查未执行。Bash 语法、自检及模型不等于 shellcheck |
+
+| 仓外材料（本机 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-review-k11-09fceb6` | 集成者 query_ci.py、run/jobs JSON、固定导出树、K10 原报告双版本重放、专项脚本独立重跑日志、K11 原文重放脚本/日志和收尾检查；凭据只在查询进程内存 |
+| `ak-k11-review-gates-t828lwck` | 本机全量门禁日志、summary.json、suite_counts.json、metadata.json |
+| `ak-k11-environ-review.py`；`ak-k11-environ-review-ffbxwrf3` / `ak-k11-environ-review-drhx6qtj` | 专项 / 集成者完整运行目录模型、真实生成脚本、阶段输出、unit 和 stub 日志 |
+| `ak-k11-environ-support.py`；`ak-k11-id-dir.rs` / `.exe`；`ak-k11-systemd-exec.html` | EnvironmentFile 与 cwd readlink 控制、Rust 默认链摘录编译、官方语义留档 |
+| `ak-k11-destination-runner.py`；`ak-k11-destination-review-o2aj8t95` / `ak-k11-destination-review-5np0yg57` | 专项 / 集成者 clean、decoy、普通 SQLite 晚提交控制及所有实际产物 |
+| `ak-k11-registry-revoke.py`；`ak-k11-registry-revoke-09fceb6-57ofrnle` / `ak-k11-registry-revoke-806ea6c-nxercc5y` | 专项真实 schema 的当前/基线 clean 与晚提交对照 |
+| `ak-k11-registry-revoke-09fceb6-q42pdfyk` / `ak-k11-registry-revoke-806ea6c-3wkd5l36` | 集成者独立重跑真实 schema 当前/基线对照，含 SQLite、unit、脚本、日志与 summary.json |
+
+## 28. 修复轮十一（K11 复核后的新候选，执行方记录）
+
+[K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)（K10-N1/N2 双双判通过）后，执行方修复其唯一新发现；复核方本地同步（§27、STATUS、状态表、K10 历史归属）与本节代码改动一并提交。
+
+| K11 发现 | 修复内容 |
+|---|---|
+| K11-N1（P1，数据库 TOCTOU） | 切换顺序重排：停服（既有捕获/备份/stop 语义不变）→**静默源的最终身份/库迁移**（K10-N2 规则不变：一致保留、不一致拒绝、拷贝后 cmp 校验并记录 `cmp-verified post-stop`、全新脏目标拒绝、原位放行；一切拒绝经 `recover_services` 恢复服务而非裸退）→二进制替换→unit 写入→reload+enable，全程统一恢复窗口。复核场景以真实 schema-v3 SQLite（DDL 取自 store.rs）重建：停服钩子在旧服务仍 active 时执行复核的真实提交（revoked/revision 2），断言调用顺序 `stop → cp → cmp` 且目标库内容达 `("revoked", 2)`；`806ea6c` 基线同夹具目标停留 `("active", 1)`——原缺陷。停服后拷贝损坏/目标不一致等拒绝路径均断言服务已恢复运行 |
+
+### 修复轮十一门禁与提交
+
+本地：`bash -n`+自检全过；Python 251/251（部署套件 94，含 2 新增+3 重构回归与跨八版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十一首个提交，推送后回填哈希） | K11-N1 停服后静默迁移；复核方文档同步与执行方本节记录入库 |

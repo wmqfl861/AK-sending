@@ -1482,50 +1482,15 @@ for u in \$SW_UNITS; do
 done
 
 # --- preserve/migrate registry identity + database ------------------------
-# K 复核 K10-N2: destination conflicts are resolved BEFORE the switchover.
-# The old code copied only when the destination file was ABSENT — an
-# unrelated registry.key/registry.db already under $REMOTE_DATA silently
-# survived and the new service was switched onto it (INSTALL_RC=0).
-# Rules now: with a runtime-established migration source, an existing
-# destination file must be BYTE-IDENTICAL to it (else refuse; never
-# overwrite without an explicit decision); copies are cmp-verified. With NO
-# source expected (true fresh install — not an in-place upgrade whose
-# runtime identity already IS $REMOTE_DATA, flagged by REMOTE_DATA_PREOWNED),
-# ANY pre-existing identity/db file under $REMOTE_DATA is a conflict the
-# operator must resolve.
+# K 复核 K11-N1: the FINAL migration capture runs AFTER the services are
+# stopped (inside do_switchover below) so the source is quiescent. The old
+# order copied+cmp'd key/db while the old registry was still running — a
+# commit landing after the copy but before the stop left the target on a
+# STALE database revision and the install still exited 0. Directory
+# preparation and the pre-stop backups above stay as-is; only the
+# copy/cmp/conflict decisions moved into the stop window, where any failure
+# flows through recover_services exactly like the other post-stop failures.
 DATA_SOURCE=${DATA_SOURCE_DIR:-}
-if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ]; then
-  for f in registry.key registry.db; do
-    if sudo -n test -f "\$DATA_SOURCE/\$f" 2>/dev/null; then
-      if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
-        if sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
-          echo "[install] destination \$f already byte-identical to the runtime source; keeping it (K10-N2)"
-        else
-          echo "ERROR: $REMOTE_DATA/\$f already exists and DIFFERS from the runtime identity source \$DATA_SOURCE/\$f; refusing BEFORE service switchover — resolve manually (never silently enable unrelated identity bytes; K10-N2)" >&2
-          exit 5
-        fi
-      else
-        sudo -n cp -a "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" \\
-          || { echo "ERROR: cannot copy \$f from \$DATA_SOURCE; refusing BEFORE service switchover (K10-N2)" >&2; exit 5; }
-        if ! sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
-          echo "ERROR: copied \$f does not match its runtime source (cmp failed); refusing BEFORE service switchover (K10-N2)" >&2
-          exit 5
-        fi
-        echo "[install] migrated identity/db: \$DATA_SOURCE/\$f -> $REMOTE_DATA/\$f (cmp-verified; source kept)"
-      fi
-    fi
-  done
-elif [ -z "\$DATA_SOURCE" ] && [ "\${REMOTE_DATA_PREOWNED:-0}" != 1 ]; then
-  for f in registry.key registry.db; do
-    if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
-      echo "ERROR: fresh install found an existing \$f under $REMOTE_DATA — an existing identity cannot be silently replaced or reused; refusing BEFORE service switchover (K10-N2)" >&2
-      exit 5
-    fi
-  done
-fi
-sudo -n chown -R $SERVICE_USER:$SERVICE_USER $REMOTE_DATA
-sudo -n chmod 700 $REMOTE_DATA
-sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null && sudo -n chmod 600 $REMOTE_DATA/registry.key
 
 # --- service switchover under UNIFIED failure recovery (K 复核 K2-N1) --------
 # Everything above only read state or created new files. From the first
@@ -1830,7 +1795,48 @@ do_switchover() {
     sudo -n systemctl disable "\$LEGACY_UNIT" 2>/dev/null || true
     echo "[install] rollback for this step = systemctl stop ak-stun-server && systemctl start \$LEGACY_UNIT"
   fi
-  # 2) binary swap (K 复核 K-R1: staging source != destination, verified
+  # 2) FINAL identity/db migration from the QUIESCED source (K 复核 K11-N1:
+  #     everything that could still write the old database is now stopped —
+  #     a commit landing while the service ran is INCLUDED in this copy).
+  #     K 复核 K10-N2 rules unchanged: byte-identical keeps, differing
+  #     refuses (never silently enable unrelated bytes), copies are
+  #     cmp-verified, and a no-source fresh install onto existing key/db
+  #     refuses. Every refusal now happens with the services STOPPED, so it
+  #     returns 1 into recover_services (services restored) instead of
+  #     exiting with them down.
+  if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ]; then
+    for f in registry.key registry.db; do
+      if sudo -n test -f "\$DATA_SOURCE/\$f" 2>/dev/null; then
+        if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
+          if sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
+            echo "[install] destination \$f already byte-identical to the runtime source; keeping it (K10-N2)"
+          else
+            echo "ERROR: $REMOTE_DATA/\$f already exists and DIFFERS from the runtime identity source \$DATA_SOURCE/\$f (never silently enable unrelated identity bytes; K10-N2)" >&2
+            return 1
+          fi
+        else
+          sudo -n cp -a "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" \\
+            || { echo "ERROR: cannot copy \$f from \$DATA_SOURCE (K10-N2)" >&2; return 1; }
+          if ! sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
+            echo "ERROR: copied \$f does not match its runtime source (cmp failed; K10-N2)" >&2
+            return 1
+          fi
+          echo "[install] migrated identity/db: \$DATA_SOURCE/\$f -> $REMOTE_DATA/\$f (cmp-verified post-stop; source kept)"
+        fi
+      fi
+    done
+  elif [ -z "\$DATA_SOURCE" ] && [ "\${REMOTE_DATA_PREOWNED:-0}" != 1 ]; then
+    for f in registry.key registry.db; do
+      if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
+        echo "ERROR: fresh install found an existing \$f under $REMOTE_DATA — an existing identity cannot be silently replaced or reused (K10-N2)" >&2
+        return 1
+      fi
+    done
+  fi
+  sudo -n chown -R $SERVICE_USER:$SERVICE_USER $REMOTE_DATA || return 1
+  sudo -n chmod 700 $REMOTE_DATA || return 1
+  sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null && sudo -n chmod 600 $REMOTE_DATA/registry.key
+  # 3) binary swap (K 复核 K-R1: staging source != destination, verified
   #    above BEFORE anything was stopped). K 复核 K2-N1(c): the move-aside
   #    of the previous binary must not be '|| true'd away — if the rename
   #    fails, say so and keep relying on the pre-stop backup below.
@@ -1843,7 +1849,7 @@ do_switchover() {
   sudo -n mv $REMOTE_BASE/ak-cli.new $REMOTE_BIN || return 1
   sudo -n chmod 755 $REMOTE_BIN || return 1
   echo "[install] installed: $REMOTE_BIN (\$($REMOTE_BIN --version 2>&1 || echo version-unreadable))"
-  # 3) unit writes. K 复核 K2-N1: these used to run BARE under set -e AFTER
+  # 4) unit writes. K 复核 K2-N1: these used to run BARE under set -e AFTER
   #    the recovery branch had already ended — a failure at the FIRST unit
   #    write left both services stopped with nothing started again.
   #    Unit bodies are inlined as single-level quoted heredocs: every \$-free
@@ -1891,7 +1897,7 @@ StandardError=journal
 WantedBy=multi-user.target
 STUNUNIT
   echo "[install] units written: ak-registry-server.service (ReadWritePaths=$REG_RW), ak-stun-server.service"
-  # 4) reload + start (still inside the protected window; enable --now does
+  # 5) reload + start (still inside the protected window; enable --now does
   #    NOT restart an already-active unit, which is why step 2 must not
   #    tolerate stop failures — K 复核 K2-R2).
   sudo -n systemctl daemon-reload || return 1

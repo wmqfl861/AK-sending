@@ -321,6 +321,13 @@ case "$1" in
     fi
     stub_start "$u" ;;
   stop)
+    # K11-N1 model hook: run at STOP ENTRY (service still active, writes
+    # still possible) — models a real commit landing while the old service
+    # runs. '@PROBE_DIR@' in the command is substituted with the probe path.
+    if [ -n "${SYSTEMCTL_STOP_HOOK:-}" ] && [ "$u" = "${SYSTEMCTL_STOP_HOOK_UNIT:-}" ]; then
+      hook_cmd=${SYSTEMCTL_STOP_HOOK//@PROBE_DIR@/$PROBE_DIR}
+      eval "$hook_cmd" || exit 1
+    fi
     if fails_spec stop "$u"; then
       echo "systemctl stub: forced per-unit failure: stop $u" >&2
       exit 1
@@ -1035,6 +1042,60 @@ class ProbeHarness(unittest.TestCase):
         (dest / "registry.key").write_text("unrelated-target-key", encoding="utf-8")
         (dest / "registry.db").write_text("unrelated-target-db", encoding="utf-8")
         return dest
+
+    def _make_sqlite_runtime_source(self):
+        """The K11 reviewer's fixture: a real schema-v3 SQLite source
+        database — the DDL is extracted from
+        crates/ak-signal/src/server_v2/store.rs exactly as the review did —
+        holding one active/revision=1 invite code, plus the registry.key."""
+        import sqlite3
+        store = (ROOT / "crates/ak-signal/src/server_v2/store.rs").read_text(encoding="utf-8")
+        ddl = re.findall(r'const DDL_[A-Z_]+: &str = "(.*?)";', store, re.S)
+        self.assertGreaterEqual(len(ddl), 1, "store.rs DDL constants not found")
+        src = self.probe / "home" / "otheruser" / ".ak-sending"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "registry.key").write_text("private-key-bytes", encoding="utf-8")
+        db = src / "registry.db"
+        con = sqlite3.connect(db)
+        try:
+            con.executescript(chr(10).join(ddl))
+            con.execute("PRAGMA user_version=3")
+            con.execute(
+                "INSERT INTO invite_codes (lookup_digest,code_id,owner_device_id,"
+                "created_unix_ms,state,revision,create_request_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (b"d" * 32, b"c" * 16, b"o" * 32, 1, "active", 1, b"r" * 16))
+            con.commit()
+        finally:
+            con.close()
+        return db
+
+    def _write_late_commit_hook(self):
+        """The review's real late commit: revoke the invite code and bump the
+        revision, executed by the systemctl stub at STOP ENTRY (the old
+        service still active). The database path travels as an ARGUMENT so
+        MSYS converts it for the native Python; chr(10) keeps this source
+        free of escape-sequence hazards."""
+        nl = chr(10)
+        hook = self.probe / "late_commit.py"
+        hook.write_text(
+            "import sqlite3, sys" + nl
+            + "with sqlite3.connect(sys.argv[1]) as c:" + nl
+            + "    c.execute(\"UPDATE invite_codes SET state='revoked', "
+            "revision=revision+1 WHERE code_id=? AND revision=1 AND "
+            "state='active'\", (b'c'*16,))" + nl
+            + "print('LATE_COMMIT=revoked')" + nl,
+            encoding="utf-8", newline="\n")
+        return ("python @PROBE_DIR@/late_commit.py"
+                " @PROBE_DIR@/home/otheruser/.ak-sending/registry.db")
+
+    def _db_rows(self, path):
+        import sqlite3
+        con = sqlite3.connect(path)
+        try:
+            return con.execute("SELECT state, revision FROM invite_codes").fetchall()
+        finally:
+            con.close()
 
     def assert_recovery_restored_old_state(self, out: str):
         """Shared K2-N1 assertions: old binary + old unit BYTES back on disk,
@@ -2238,11 +2299,15 @@ echo "C4=[$c4]"
 
     # -- K10-N2: destination identity/db conflicts refuse before switchover ---
     def _run_k10_install(self, data_source: str, preowned: str, name: str,
-                         run_env: dict | None = None):
+                         run_env: dict | None = None, old_registry: str = "",
+                         models: str = ""):
         """Generate + run phase456 with the decision-derived inputs baked
         (REGISTRY_EXEC/REG_RW/DATA_SOURCE_DIR/REMOTE_DATA_PREOWNED exactly as
-        real_run would bake them for the K9 runtime fixture)."""
+        real_run would bake them for the K9 runtime fixture). `models` is a
+        bash-side box-model preamble (e.g. 'make_upgrade_model' + newline)."""
         body = (
+            models
+            + 
             'mkdir -p "$PROBE_DIR/staging"\n'
             'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"\n'
             'chmod +x "$PROBE_DIR/staging/ak-cli"\n'
@@ -2250,7 +2315,7 @@ echo "C4=[$c4]"
             'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
             'SHORT_SHA=deadbee '
             'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $REMOTE_DATA" '
-            'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            f'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT={old_registry} '
             f'DATA_SOURCE_DIR={data_source} CLOSE_7100=0 REMOTE_DATA_PREOWNED={preowned} '
             f'write_phase456 "$PROBE_DIR/{name}.sh" || {{ echo GEN_FAILED; exit 90; }}\n'
             f'bash "$PROBE_DIR/{name}.sh" > "$PROBE_DIR/{name}.out" 2>&1; '
@@ -2261,23 +2326,37 @@ echo "C4=[$c4]"
     def test_k10n2_differing_destination_refuses(self):
         # Reviewer repro (a): the K9 runtime fixture plus an UNRELATED
         # registry.key/registry.db under $REMOTE_DATA. Round 10 skipped the
-        # copy, exited 0 and enabled the unrelated bytes; now it refuses
-        # BEFORE the switchover with the destination untouched.
+        # copy, exited 0 and enabled the unrelated bytes. Since K11-N1 the
+        # conflict is detected AFTER the stops, so the refusal goes THROUGH
+        # RECOVERY: the data bytes stay untouched, no switch happens, and
+        # the stopped services are restored and running again.
         self._make_runtime_source()
-        self._make_destination_decoy()
         rc, out = self._run_k10_install(
-            "/home/otheruser/.ak-sending", "0", "p456k10a")
+            "/home/otheruser/.ak-sending", "0", "p456k10a",
+            models="make_upgrade_model\n"
+            'printf unrelated-target-key > "$REMOTE_DATA/registry.key"\n'
+            'printf unrelated-target-db > "$REMOTE_DATA/registry.db"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("INSTALL_RC=5", out)
         out456 = (self.probe / "p456k10a.out").read_text(encoding="utf-8")
         self.assertIn("DIFFERS from the runtime identity source", out456)
         self.assertIn("never silently enable unrelated identity bytes", out456)
+        # Data bytes untouched and no service switch ('untouched' refers to
+        # the data and the switch — directory setup and backups may exist).
         dest = self.probe / "opt-ak" / "data"
         self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
                          "unrelated-target-key", "the refusal must not overwrite")
-        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists(),
-                         "no service switchover may run after the refusal")
-        self.assertNotIn("systemctl stop", self.stubs_log())
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD, "no service switchover may run after the refusal")
+        # The stops DID happen (conflict is evaluated post-stop) — so the
+        # refusal must have gone through recovery with services restored.
+        log = self.stubs_log()
+        self.assertIn("systemctl stop ak-registry-server.service", log)
+        self.assertIn("RECOVERY OK", out456)
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active",
+                             f"{unit} must be running again after the recovery")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD)
 
     def test_k10n2_identical_destination_proceeds(self):
         # Repro (b): destination byte-identical to the runtime source —
@@ -2298,34 +2377,86 @@ echo "C4=[$c4]"
                          "private-key-bytes")
 
     def test_k10n2_clean_destination_copies_and_verifies(self):
-        # Repro (c): clean destination — the migration copies and cmp-
-        # verifies; the destination ends with the runtime source's bytes.
+        # Repro (c): clean destination — the migration copies (post-stop,
+        # quiesced) and cmp-verifies; the destination ends with the runtime
+        # source's bytes.
         self._make_runtime_source()
         rc, out = self._run_k10_install(
             "/home/otheruser/.ak-sending", "0", "p456k10c")
         self.assertEqual(rc, 0, out)
         self.assertIn("INSTALL_RC=0", out)
         out456 = (self.probe / "p456k10c.out").read_text(encoding="utf-8")
-        self.assertIn("cmp-verified", out456)
+        self.assertIn("cmp-verified post-stop", out456)
         dest = self.probe / "opt-ak" / "data"
         self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
                          "private-key-bytes")
         self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
                          "private-db-bytes")
 
-    def test_k10n2_corrupted_copy_refuses(self):
-        # Repro (c) corruption control: a copy that lands differing bytes
-        # (CP_CORRUPT_MATCH corrupts the destination after the copy) must
-        # fail the cmp verification and refuse before the switchover.
+    def test_k10n2_corrupted_copy_refuses_and_recovers(self):
+        # K11-N1 regression (b): a post-stop copy that lands differing bytes
+        # (CP_CORRUPT_MATCH corrupts the destination after the copy) fails
+        # the cmp verification and flows through recovery — the stopped
+        # services are restored and running on the OLD configuration.
         self._make_runtime_source()
         rc, out = self._run_k10_install(
             "/home/otheruser/.ak-sending", "0", "p456k10c2",
-            run_env={"CP_CORRUPT_MATCH": "registry.key"})
+            run_env={"CP_CORRUPT_MATCH": "registry.key"},
+            models="make_upgrade_model\n"
+            'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("INSTALL_RC=5", out)
         out456 = (self.probe / "p456k10c2.out").read_text(encoding="utf-8")
-        self.assertIn("does not match its runtime source (cmp failed)", out456)
-        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists())
+        self.assertIn("does not match its runtime source (cmp failed", out456)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD, "no switch happens after a failed copy")
+        self.assertIn("RECOVERY OK", out456)
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD,
+                             "recovery must restart the services on the old image")
+
+    # -- K11-N1: the final migration runs against the QUIESCED source --------
+    def test_k11n1_late_commit_included_in_post_stop_copy(self):
+        # Reviewer repro (a): the review's real-schema commit (revoke the
+        # invite, bump the revision) lands at STOP ENTRY — while the old
+        # service still runs. Under the pre-K11 order the copy had already
+        # happened and the target stayed one revision behind (INSTALL_RC=0
+        # with a stale database). Now the copy runs AFTER the stops, so the
+        # commit is INCLUDED: the target database ends at revoked/revision 2.
+        # The stub call ORDER is asserted directly: stop old-registry ->
+        # cp (from the runtime source) -> cmp.
+        db = self._make_sqlite_runtime_source()
+        hook = self._write_late_commit_hook()
+        rc, out = self._run_k10_install(
+            "/home/otheruser/.ak-sending", "0", "p456k11a",
+            run_env={"SYSTEMCTL_STOP_HOOK": hook,
+                     "SYSTEMCTL_STOP_HOOK_UNIT": "oldregistry.service"},
+            old_registry="oldregistry",
+            models="make_upgrade_model\n"
+            'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n'
+            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        out456 = (self.probe / "p456k11a.out").read_text(encoding="utf-8")
+        self.assertIn("LATE_COMMIT=revoked", out456)
+        self.assertIn("cmp-verified post-stop", out456)
+        # CALL ORDER: the stop (with its embedded commit) precedes the
+        # migration copy and its cmp.
+        log = self.stubs_log()
+        stop_old = self.log_line(log, "systemctl stop oldregistry.service")
+        cp_line = self.log_line(log, "cp -a /home/otheruser/")
+        cmp_line = self.log_line(log, "cmp -s /home/otheruser/")
+        self.assertLess(stop_old, cp_line,
+                        "the migration copy must run AFTER the old service stopped")
+        self.assertLess(cp_line, cmp_line, "the copy must be cmp-verified")
+        # DATABASE CONTENT: source and target are both at the committed
+        # revision — the new service's default database (main.rs registry_db_path)
+        # is the TARGET, so it must not be one revision behind.
+        self.assertEqual(self._db_rows(db), [("revoked", 2)])
+        self.assertEqual(self._db_rows(self.probe / "opt-ak" / "data" / "registry.db"),
+                         [("revoked", 2)],
+                         "the target database must include the late commit")
 
     def test_k10n2_fresh_install_onto_existing_identity_refuses(self):
         # Repro (d): NO migration source expected (fresh install) and the
@@ -2339,6 +2470,9 @@ echo "C4=[$c4]"
         self.assertIn("fresh install found an existing", out456)
         self.assertIn("cannot be silently replaced or reused", out456)
         self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists())
+        # Fresh stops are no-ops (units absent); the post-stop refusal still
+        # completes the (empty) recovery and reports its outcome.
+        self.assertIn("RECOVERY OK", out456)
 
     def test_k10n2_inplace_upgrade_keeps_own_data(self):
         # Control: REMOTE_DATA_PREOWNED=1 (the identified occupant's runtime
@@ -2974,6 +3108,39 @@ class BaselineContrastTests(ProbeHarness):
                          "unrelated-target-db")
         self.assertTrue((self.probe / "opt-ak" / "ak-cli").exists(),
                         "the round-9 candidate switched the services onto them")
+
+    def test_k11n1_round9_candidate_misses_late_commit(self):
+        # K11-review contrast (e): the reviewer's exact commit-in-interval
+        # scenario against the round-9 candidate (806ea6c) — its migration
+        # copy runs BEFORE the stops, so the commit landing at stop entry
+        # (while the service still runs) is NOT in the target: the install
+        # succeeds and the new unit's default database stays one revision
+        # behind (active/revision 1 vs the source's revoked/revision 2).
+        db = self._make_sqlite_runtime_source()
+        hook = self._write_late_commit_hook()
+        env_mode = (
+            'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            'STAGING_DIR="$STAGING_DIR" STAGED_BIN="$STAGED_BIN" SHORT_SHA=deadbee '
+            'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $REMOTE_DATA" '
+            'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT=oldregistry '
+            'DATA_SOURCE_DIR=/home/otheruser/.ak-sending CLOSE_7100=0 '
+        )
+        rc, out, p456_out = self.run_baseline_p456(
+            PREV9_REV, env_mode, "p456prev9late",
+            run_env={"SYSTEMCTL_STOP_HOOK": hook,
+                     "SYSTEMCTL_STOP_HOOK_UNIT": "oldregistry.service"},
+            models="make_upgrade_model\n"
+            'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n'
+            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-9 candidate succeeded with a stale target (the defect)")
+        self.assertEqual(self._db_rows(db), [("revoked", 2)],
+                         "the source carries the late commit")
+        self.assertEqual(self._db_rows(self.probe / "opt-ak" / "data" / "registry.db"),
+                         [("active", 1)],
+                         "the round-9 candidate's target missed the late commit "
+                         "(the exact reviewed TOCTOU)")
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

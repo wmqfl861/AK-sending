@@ -75,7 +75,9 @@ PREV6_REV = "e8f811d"  # round-6 candidate (K6 findings: absent-file +
                         # running process passed, drop-in overrides ignored)
 PREV7_REV = "bb1f673"  # round-7 candidate (K7 findings: cmdline read
                         # failure skipped the cross-check, --db-path uncompared)
-PREV8_REV = "12a71c9"  # round-8 candidate (K9 finding: migration source
+PREV8_REV = "12a71c9"
+PREV9_REV = "806ea6c"  # round-9 candidate (K10 findings: environ parsing
+                        # semantics, destination conflicts skipped)  # round-8 candidate (K9 finding: migration source
                         # picked by enumeration order, not runtime identity)
 
 SUDO_STUB = r"""#!/usr/bin/env bash
@@ -457,7 +459,31 @@ for a in "${args[@]}"; do
     *) mapped+=("$a") ;;
   esac
 done
-exec "@REAL_CP@" -a "${mapped[@]}"
+"@REAL_CP@" -a "${mapped[@]}" || exit 1
+# CP_CORRUPT_MATCH: after a successful copy whose args match, corrupt the
+# DESTINATION bytes — models a mid-copy corruption the cmp-verify must catch.
+if [ -n "${CP_CORRUPT_MATCH:-}" ]; then
+  case "$*" in
+    *"$CP_CORRUPT_MATCH"*)
+      printf 'corrupted-by-stub\n' >> "${mapped[$(( ${#mapped[@]} - 1 ))]}"
+      echo "cp stub: corrupted destination for $*" >&2 ;;
+  esac
+fi
+exit 0
+"""
+
+CMP_STUB = r"""#!/usr/bin/env bash
+set -u
+printf 'cmp %s
+' "$*" >> "$PROBE_DIR/stubs.log"
+mapped=()
+for a in "$@"; do
+  case "$a" in
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
+    *) mapped+=("$a") ;;
+  esac
+done
+exec "@REAL_CMP@" "${mapped[@]}"
 """
 
 MV_STUB = r"""#!/usr/bin/env bash
@@ -569,6 +595,7 @@ STUBS = {
     "uname": UNAME_STUB, "journalctl": JOURNALCTL_STUB, "ss": SS_STUB,
     "sleep": SLEEP_STUB, "test": TEST_STUB, "cp": CP_STUB, "cat": CAT_STUB,
     "sed": SED_STUB, "readlink": READLINK_STUB, "ls": LS_STUB, "mv": MV_STUB,
+    "cmp": CMP_STUB,
 }
 _REAL_TOOLS = {}
 
@@ -709,7 +736,8 @@ COMPOSED="$(compose_registry_exec '/usr/local/bin/ak-cli registry-server --port 
 echo "COMPOSED=$COMPOSED"
 TS=t12345 BUILD_DIR= PREBUILT_MODE=1 STAGING_DIR="$STAGING_DIR" STAGED_BIN="$STAGED_BIN" \
   REGISTRY_EXEC="$COMPOSED" REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT= \
-  DATA_SOURCE_DIR= CLOSE_7100=0 write_phase456 "$PROBE_DIR/p456.sh" || { echo GEN_FAILED; exit 90; }
+  DATA_SOURCE_DIR= CLOSE_7100=0 REMOTE_DATA_PREOWNED=1 \
+  write_phase456 "$PROBE_DIR/p456.sh" || { echo GEN_FAILED; exit 90; }
 '''
 
 
@@ -742,7 +770,7 @@ class ProbeHarness(unittest.TestCase):
             stub = self.probe / "bin" / name
             stub.write_text(body, encoding="utf-8", newline="\n")
             stub.chmod(0o755)
-        for tool in ("cp", "cat", "sed", "ls", "mv"):
+        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp"):
             real = _posix_tool(tool)
             self.assertTrue(real, f"real {tool} is required for the stubs")
             stub = self.probe / "bin" / tool
@@ -937,8 +965,12 @@ class ProbeHarness(unittest.TestCase):
         # fixture must state what the instance actually runs).
         if not cmdline_extra:
             cmdline_extra = "--port 17200 --id-dir /home/otheruser/.ak-sending"
+        # Argv-precise: every whitespace-separated argument becomes its own
+        # NUL-terminated argv token, exactly like a real exec (the reviewer's
+        # fidelity correction — one token per argument, never one blob).
         cmdline = b"/opt/ak-sending/ak-cli\0registry-server\0"
-        cmdline += cmdline_extra.encode() + b"\0"
+        for tok in cmdline_extra.split():
+            cmdline += tok.encode() + b"\0"
         (proc / "4242" / "cmdline").write_bytes(cmdline)
         home = self.probe / "home" / "otheruser" / ".ak-sending"
         home.mkdir(parents=True, exist_ok=True)
@@ -989,6 +1021,20 @@ class ProbeHarness(unittest.TestCase):
                                                encoding="utf-8")
             (root / "registry.db").write_text("unrelated-synthetic-root-db",
                                               encoding="utf-8")
+
+    def _make_runtime_source(self):
+        src = self.probe / "home" / "otheruser" / ".ak-sending"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "registry.key").write_text("private-key-bytes", encoding="utf-8")
+        (src / "registry.db").write_text("private-db-bytes", encoding="utf-8")
+        return src
+
+    def _make_destination_decoy(self):
+        dest = self.probe / "opt-ak" / "data"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "registry.key").write_text("unrelated-target-key", encoding="utf-8")
+        (dest / "registry.db").write_text("unrelated-target-db", encoding="utf-8")
+        return dest
 
     def assert_recovery_restored_old_state(self, out: str):
         """Shared K2-N1 assertions: old binary + old unit BYTES back on disk,
@@ -2110,6 +2156,202 @@ echo "C4=[$c4]"
         self.assertIn("neither USERPROFILE nor HOME", p1_out)
         self.assertNotIn("runtime-id-dir:", p1_out)
 
+    # -- K10-N1: environ existence semantics and NUL-record boundaries --------
+    def test_k10n1_empty_userprofile_resolves_working_directory(self):
+        # Reviewer repro (a): USERPROFILE is PRESENT but EMPTY with
+        # HOME=/home/otheruser and WorkingDirectory=/var/lib/oldregistry.
+        # The CLI (main.rs id_dir(): var_os().or_else()) treats Some("") as
+        # NO fallback — the identity is the RELATIVE .ak-sending under the
+        # working directory, i.e. /var/lib/oldregistry/.ak-sending. Round 10
+        # treated the empty variable as absent and wrongly selected HOME.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/var/lib/oldregistry",
+                                "Environment=HOME=/home/otheruser",
+                                "Environment=USERPROFILE="],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
+        legacy = self.probe / "var/lib/oldregistry/.ak-sending"
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / "registry.key").write_text("wd-key", encoding="utf-8")
+        (legacy / "registry.db").write_text("wd-db", encoding="utf-8")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /var/lib/oldregistry/\.ak-sending$")
+        self.assertNotIn("runtime-id-dir: /home/otheruser", p1_out)
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k10a.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/var/lib/oldregistry/.ak-sending", out)
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/home/otheruser", out)
+
+    def test_k10n1_empty_userprofile_without_working_directory_refuses(self):
+        # Same empty-USERPROFILE input but NO absolute WorkingDirectory in
+        # the unit: the cwd is undeterminable — refuse rather than guess.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "Environment=HOME=/home/otheruser",
+                                "Environment=USERPROFILE="],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("working directory cannot be established", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
+    def test_k10n1_environ_value_with_newline_not_fabricated(self):
+        # Reviewer repro (b): EXTRA's VALUE contains '\nUSERPROFILE=/root'.
+        # There is NO USERPROFILE variable. Round 10's NUL->LF conversion
+        # fabricated one and selected /root/.ak-sending. NUL-record parsing
+        # keeps the newline inside the value: HOME wins, never /root.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "Environment=HOME=/home/otheruser",
+                                'Environment="EXTRA=hello\\nUSERPROFILE=/root"'],
+            environ=b"HOME=/home/otheruser\0EXTRA=hello\nUSERPROFILE=/root\0"
+                    b"USER=otheruser\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+        self.assertNotIn("/root/.ak-sending", p1_out)
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k10b.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/otheruser/.ak-sending", out)
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/root/.ak-sending", out)
+
+    # -- K10-N2: destination identity/db conflicts refuse before switchover ---
+    def _run_k10_install(self, data_source: str, preowned: str, name: str,
+                         run_env: dict | None = None):
+        """Generate + run phase456 with the decision-derived inputs baked
+        (REGISTRY_EXEC/REG_RW/DATA_SOURCE_DIR/REMOTE_DATA_PREOWNED exactly as
+        real_run would bake them for the K9 runtime fixture)."""
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"\n'
+            'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"\n'
+            'chmod +x "$PROBE_DIR/staging/ak-cli"\n'
+            'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            'SHORT_SHA=deadbee '
+            'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $REMOTE_DATA" '
+            'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            f'DATA_SOURCE_DIR={data_source} CLOSE_7100=0 REMOTE_DATA_PREOWNED={preowned} '
+            f'write_phase456 "$PROBE_DIR/{name}.sh" || {{ echo GEN_FAILED; exit 90; }}\n'
+            f'bash "$PROBE_DIR/{name}.sh" > "$PROBE_DIR/{name}.out" 2>&1; '
+            f'echo "INSTALL_RC=$?"\n'
+        )
+        return self.generate_and_run_p456(body, run_env=run_env)
+
+    def test_k10n2_differing_destination_refuses(self):
+        # Reviewer repro (a): the K9 runtime fixture plus an UNRELATED
+        # registry.key/registry.db under $REMOTE_DATA. Round 10 skipped the
+        # copy, exited 0 and enabled the unrelated bytes; now it refuses
+        # BEFORE the switchover with the destination untouched.
+        self._make_runtime_source()
+        self._make_destination_decoy()
+        rc, out = self._run_k10_install(
+            "/home/otheruser/.ak-sending", "0", "p456k10a")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=5", out)
+        out456 = (self.probe / "p456k10a.out").read_text(encoding="utf-8")
+        self.assertIn("DIFFERS from the runtime identity source", out456)
+        self.assertIn("never silently enable unrelated identity bytes", out456)
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "unrelated-target-key", "the refusal must not overwrite")
+        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists(),
+                         "no service switchover may run after the refusal")
+        self.assertNotIn("systemctl stop", self.stubs_log())
+
+    def test_k10n2_identical_destination_proceeds(self):
+        # Repro (b): destination byte-identical to the runtime source —
+        # provably the same data; proceed without copying.
+        self._make_runtime_source()
+        dest = self.probe / "opt-ak" / "data"
+        dest.mkdir(parents=True, exist_ok=True)
+        for f, text in (("registry.key", "private-key-bytes"),
+                        ("registry.db", "private-db-bytes")):
+            (dest / f).write_text(text, encoding="utf-8")
+        rc, out = self._run_k10_install(
+            "/home/otheruser/.ak-sending", "0", "p456k10b")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        out456 = (self.probe / "p456k10b.out").read_text(encoding="utf-8")
+        self.assertIn("already byte-identical to the runtime source", out456)
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "private-key-bytes")
+
+    def test_k10n2_clean_destination_copies_and_verifies(self):
+        # Repro (c): clean destination — the migration copies and cmp-
+        # verifies; the destination ends with the runtime source's bytes.
+        self._make_runtime_source()
+        rc, out = self._run_k10_install(
+            "/home/otheruser/.ak-sending", "0", "p456k10c")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        out456 = (self.probe / "p456k10c.out").read_text(encoding="utf-8")
+        self.assertIn("cmp-verified", out456)
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "private-key-bytes")
+        self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
+                         "private-db-bytes")
+
+    def test_k10n2_corrupted_copy_refuses(self):
+        # Repro (c) corruption control: a copy that lands differing bytes
+        # (CP_CORRUPT_MATCH corrupts the destination after the copy) must
+        # fail the cmp verification and refuse before the switchover.
+        self._make_runtime_source()
+        rc, out = self._run_k10_install(
+            "/home/otheruser/.ak-sending", "0", "p456k10c2",
+            run_env={"CP_CORRUPT_MATCH": "registry.key"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=5", out)
+        out456 = (self.probe / "p456k10c2.out").read_text(encoding="utf-8")
+        self.assertIn("does not match its runtime source (cmp failed)", out456)
+        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists())
+
+    def test_k10n2_fresh_install_onto_existing_identity_refuses(self):
+        # Repro (d): NO migration source expected (fresh install) and the
+        # destination already holds key/db — a conflict the operator must
+        # resolve; refusing, never silently reusing.
+        self._make_destination_decoy()
+        rc, out = self._run_k10_install("", "0", "p456k10d")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=5", out)
+        out456 = (self.probe / "p456k10d.out").read_text(encoding="utf-8")
+        self.assertIn("fresh install found an existing", out456)
+        self.assertIn("cannot be silently replaced or reused", out456)
+        self.assertFalse((self.probe / "opt-ak" / "ak-cli").exists())
+
+    def test_k10n2_inplace_upgrade_keeps_own_data(self):
+        # Control: REMOTE_DATA_PREOWNED=1 (the identified occupant's runtime
+        # identity IS $REMOTE_DATA) — the destination data is its own; no
+        # refusal, nothing copied over it.
+        self._make_destination_decoy()
+        rc, out = self._run_k10_install("", "1", "p456k10e")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "unrelated-target-key")
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -2704,6 +2946,34 @@ class BaselineContrastTests(ProbeHarness):
                       "the round-8 candidate flipped the migration source to the "
                       "unrelated root decoy (the defect)")
         self.assertNotIn("CHOSEN_DATA_SOURCE=/home/otheruser/.ak-sending", out)
+
+    def test_k10n2_round9_candidate_keeps_unrelated_destination(self):
+        # K10-review contrast (e): the reviewer's destination fixture (a)
+        # against the round-9 candidate (806ea6c) — the correct runtime
+        # source is selected, but its install skips the copy because the
+        # destination files exist, exits 0 and enables the unrelated bytes.
+        self._make_runtime_source()
+        self._make_destination_decoy()
+        env_mode = (
+            'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            'STAGING_DIR="$STAGING_DIR" STAGED_BIN="$STAGED_BIN" SHORT_SHA=deadbee '
+            'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $REMOTE_DATA" '
+            'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            'DATA_SOURCE_DIR=/home/otheruser/.ak-sending CLOSE_7100=0 '
+        )
+        rc, out, p456_out = self.run_baseline_p456(
+            PREV9_REV, env_mode, "p456prev9")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-9 candidate silently succeeded (the defect)")
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "unrelated-target-key",
+                         "the round-9 candidate kept the unrelated destination bytes")
+        self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
+                         "unrelated-target-db")
+        self.assertTrue((self.probe / "opt-ak" / "ak-cli").exists(),
+                        "the round-9 candidate switched the services onto them")
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

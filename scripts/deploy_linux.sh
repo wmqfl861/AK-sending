@@ -674,6 +674,13 @@ self_test() {
     || fail "the occupant's runtime identity dir must be derived and reported (K9-N1)"
   grep -q 'to derive the default identity dir' "$WORK/p1.sh" \
     || fail "missing runtime environment evidence must refuse (K9-N1)"
+  # K 复核 K10-N1: environ is parsed STRICTLY on NUL records; a set-but-empty
+  # USERPROFILE does NOT fall back to HOME (Some("")); a relative base binds
+  # to the unit's absolute WorkingDirectory or refuses.
+  grep -q "grep -za '^USERPROFILE='" "$WORK/p1.sh" \
+    || fail "environ variables must be read as NUL records, never fabricated from values (K10-N1)"
+  grep -q 'WorkingDirectory' "$WORK/p1.sh" \
+    || fail "a relative identity base must resolve against the unit working directory (K10-N1)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -902,6 +909,17 @@ FAKEPY
     || fail "K-R1/K2-N1: service-recovery path missing from the install script"
   grep -q 'RECOVERY OK' "$WORK/p456b.sh" \
     || fail "K2-N1: recovery must report its outcome"
+  # K 复核 K10-N2: destination identity/db conflicts are resolved BEFORE the
+  # switchover — differ/keep-unrelated must refuse, copies are cmp-verified,
+  # and a no-source fresh install onto existing key/db refuses.
+  grep -q 'cmp -s "\$DATA_SOURCE/\$f"' "$WORK/p456.sh" \
+    || fail "existing destination identity/db must be cmp-checked against the runtime source (K10-N2)"
+  grep -q 'never silently enable unrelated identity bytes' "$WORK/p456.sh" \
+    || fail "differing destination bytes must refuse before the switchover (K10-N2)"
+  grep -q 'cmp-verified' "$WORK/p456.sh" \
+    || fail "copied identity/db must be cmp-verified (K10-N2)"
+  grep -q 'an existing identity cannot be silently replaced or reused' "$WORK/p456.sh" \
+    || fail "a fresh install onto existing identity files must refuse (K10-N2)"
   grep -q 'systemctl show -p ExecStart' "$WORK/p7.sh" \
     || fail "K-R2: phase7 must check the units' configured executable"
   grep -q 'systemctl show -p MainPID' "$WORK/p7.sh" \
@@ -1198,41 +1216,86 @@ REG_EFF_H
       # contradictory evidence refuses BEFORE any switchover.
       reg_rt_id=\$(printf '%s\\n' "\$reg_pick" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
       if [ -z "\$reg_rt_id" ]; then
-        reg_env=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | tr '\\0' '\\n' || true)
-        if [ -z "\$reg_env" ]; then
-          echo "ERROR: no runtime environment evidence (unreadable /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
+        # K 复核 K10-N1: parse /proc/<PID>/environ STRICTLY on NUL records —
+        # a blanket NUL->LF conversion fabricated variables out of values
+        # that embed newlines ('EXTRA=hello\nUSERPROFILE=/root' produced a
+        # phantom USERPROFILE). grep -z treats the input as NUL-separated
+        # records and '^' anchors per record, so an embedded newline can
+        # never start a variable. Presence is the RECORD's presence — a
+        # set-but-EMPTY variable is PRESENT with an empty value.
+        env_bytes=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | wc -c || true)
+        if [ "\$env_bytes" = 0 ]; then
+          echo "ERROR: no runtime environment evidence (unreadable/empty /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
-        ev_up=\$(printf '%s\\n' "\$reg_env" | sed -n 's/^USERPROFILE=\\(.*\\)\$/\\1/p' | head -1)
-        ev_home=\$(printf '%s\\n' "\$reg_env" | sed -n 's/^HOME=\\(.*\\)\$/\\1/p' | head -1)
+        ev_up_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za '^USERPROFILE=' | head -n 1)
+        ev_home_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za '^HOME=' | head -n 1)
+        # The CLI's exact default chain (main.rs id_dir(), verified against
+        # the source): var_os("USERPROFILE").or_else(var_os("HOME")) —
+        # Some("") does NOT fall back to HOME; an empty value yields the
+        # RELATIVE PathBuf::from("").join(".ak-sending") = ".ak-sending",
+        # resolved against the process working directory. Only var ABSENCE
+        # walks the chain; the final fallback is "." (also relative).
+        ev_base=""
+        if [ -n "\$ev_up_rec" ]; then
+          ev_base="\${ev_up_rec#USERPROFILE=}"
+        elif [ -n "\$ev_home_rec" ]; then
+          ev_base="\${ev_home_rec#HOME=}"
+        fi
+        ev_up=\${ev_up_rec#USERPROFILE=}
+        ev_home=\${ev_home_rec#HOME=}
+        # Cross-check against the unit's own single-assignment
+        # Environment=/UnsetEnvironment= directives (K9-N1).
         ue_up=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^Environment=\"\\?USERPROFILE=\\(.*\\)\$/\\1/p' | tail -1 | sed 's/^\"//; s/\"\$//')
         ue_home=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^Environment=\"\\?HOME=\\(.*\\)\$/\\1/p' | tail -1 | sed 's/^\"//; s/\"\$//')
         uu_up=\$(printf '%s\\n' "\$reg_cat2" | grep -c '^UnsetEnvironment=.*USERPROFILE' || true)
         uu_home=\$(printf '%s\\n' "\$reg_cat2" | grep -c '^UnsetEnvironment=.*HOME' || true)
-        if [ -n "\$ue_up" ] && [ "\$ue_up" != "\$ev_up" ]; then
-          echo "ERROR: \$reg_unit sets USERPROFILE='\$ue_up' but its runtime environ reports '\$ev_up'; refusing before any switchover (K9-N1)" >&2
-          exit 3
+        if [ -n "\$ue_up" ] || [ "\$uu_up" != 0 ]; then
+          # USERPROFILE is unit-managed: its configured value/absence must
+          # match what the process actually runs with.
+          if [ "\$uu_up" != 0 ] && [ -n "\$ev_up_rec" ]; then
+            echo "ERROR: \$reg_unit unsets USERPROFILE but its runtime environ still carries it; refusing before any switchover (K9-N1)" >&2
+            exit 3
+          fi
+          if [ -n "\$ue_up" ] && [ "\$ue_up" != "\$ev_up" ]; then
+            echo "ERROR: \$reg_unit sets USERPROFILE='\$ue_up' but its runtime environ reports '\$ev_up'; refusing before any switchover (K9-N1)" >&2
+            exit 3
+          fi
         fi
         if [ -n "\$ue_home" ] && [ "\$ue_home" != "\$ev_home" ]; then
           echo "ERROR: \$reg_unit sets HOME='\$ue_home' but its runtime environ reports '\$ev_home'; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
-        if [ "\$uu_up" != 0 ] && [ -n "\$ev_up" ]; then
-          echo "ERROR: \$reg_unit unsets USERPROFILE but its runtime environ still carries it; refusing before any switchover (K9-N1)" >&2
-          exit 3
-        fi
-        if [ "\$uu_home" != 0 ] && [ -n "\$ev_home" ]; then
+        if [ "\$uu_home" != 0 ] && [ -n "\$ev_home_rec" ]; then
           echo "ERROR: \$reg_unit unsets HOME but its runtime environ still carries it; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
-        if [ -n "\$ev_up" ]; then
-          reg_rt_id="\$ev_up/.ak-sending"
-        elif [ -n "\$ev_home" ]; then
-          reg_rt_id="\$ev_home/.ak-sending"
-        else
-          echo "ERROR: neither USERPROFILE nor HOME in the runtime environ of \$reg_unit (and no explicit --id-dir); the CLI default would fall back to the unknowable working directory; refusing before any switchover (K9-N1)" >&2
+        if [ -z "\$ev_up_rec" ] && [ -z "\$ev_home_rec" ]; then
+          echo "ERROR: neither USERPROFILE nor HOME in the runtime environ of \$reg_unit (and no explicit --id-dir); the CLI default falls back to the working directory, which cannot be established; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
+        case "\$ev_base" in
+          /*)
+            reg_rt_id="\$ev_base/.ak-sending" ;;
+          *)
+            # K 复核 K10-N1(a): an empty or RELATIVE base resolves against
+            # the process working directory — the unit's WorkingDirectory=
+            # ('-' ignore-missing prefix stripped). Without an absolute
+            # WorkingDirectory the cwd is undeterminable -> REFUSE rather
+            # than guess another directory.
+            reg_wd=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^WorkingDirectory=-\\{0,1\\}\\(.*\\)\$/\\1/p' | tail -1)
+            case "\$reg_wd" in
+              /*)
+                if [ -n "\$ev_base" ]; then
+                  reg_rt_id="\$reg_wd/\$ev_base/.ak-sending"
+                else
+                  reg_rt_id="\$reg_wd/.ak-sending"
+                fi ;;
+              *)
+                echo "ERROR: the identity-dir default of \$reg_unit resolves RELATIVELY (base '\$ev_base' per the CLI's USERPROFILE/HOME chain) and the working directory cannot be established from the unit (no absolute WorkingDirectory=); refusing before any switchover (K10-N1)" >&2
+                exit 3 ;;
+            esac ;;
+        esac
       fi
       echo "  runtime-id-dir: \$reg_rt_id"
     else
@@ -1352,6 +1415,7 @@ TS=$TS
 SHORT_SHA=$SHORT_SHA
 BUILD_DIR=${BUILD_DIR:-}
 PREBUILT_MODE=${PREBUILT_MODE:-0}
+REMOTE_DATA_PREOWNED=${REMOTE_DATA_PREOWNED:-0}
 STAGING_DIR=${STAGING_DIR:-}
 STAGED_BIN=${STAGED_BIN:-}
 SRC_BIN=\$BUILD_DIR/target/release/ak-cli
@@ -1418,12 +1482,44 @@ for u in \$SW_UNITS; do
 done
 
 # --- preserve/migrate registry identity + database ------------------------
+# K 复核 K10-N2: destination conflicts are resolved BEFORE the switchover.
+# The old code copied only when the destination file was ABSENT — an
+# unrelated registry.key/registry.db already under $REMOTE_DATA silently
+# survived and the new service was switched onto it (INSTALL_RC=0).
+# Rules now: with a runtime-established migration source, an existing
+# destination file must be BYTE-IDENTICAL to it (else refuse; never
+# overwrite without an explicit decision); copies are cmp-verified. With NO
+# source expected (true fresh install — not an in-place upgrade whose
+# runtime identity already IS $REMOTE_DATA, flagged by REMOTE_DATA_PREOWNED),
+# ANY pre-existing identity/db file under $REMOTE_DATA is a conflict the
+# operator must resolve.
 DATA_SOURCE=${DATA_SOURCE_DIR:-}
 if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ]; then
   for f in registry.key registry.db; do
-    if sudo -n test -f "\$DATA_SOURCE/\$f" 2>/dev/null && ! sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
-      sudo -n cp -a "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f"
-      echo "[install] migrated identity/db: \$DATA_SOURCE/\$f -> $REMOTE_DATA/\$f (source kept)"
+    if sudo -n test -f "\$DATA_SOURCE/\$f" 2>/dev/null; then
+      if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
+        if sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
+          echo "[install] destination \$f already byte-identical to the runtime source; keeping it (K10-N2)"
+        else
+          echo "ERROR: $REMOTE_DATA/\$f already exists and DIFFERS from the runtime identity source \$DATA_SOURCE/\$f; refusing BEFORE service switchover — resolve manually (never silently enable unrelated identity bytes; K10-N2)" >&2
+          exit 5
+        fi
+      else
+        sudo -n cp -a "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" \\
+          || { echo "ERROR: cannot copy \$f from \$DATA_SOURCE; refusing BEFORE service switchover (K10-N2)" >&2; exit 5; }
+        if ! sudo -n cmp -s "\$DATA_SOURCE/\$f" "$REMOTE_DATA/\$f" 2>/dev/null; then
+          echo "ERROR: copied \$f does not match its runtime source (cmp failed); refusing BEFORE service switchover (K10-N2)" >&2
+          exit 5
+        fi
+        echo "[install] migrated identity/db: \$DATA_SOURCE/\$f -> $REMOTE_DATA/\$f (cmp-verified; source kept)"
+      fi
+    fi
+  done
+elif [ -z "\$DATA_SOURCE" ] && [ "\${REMOTE_DATA_PREOWNED:-0}" != 1 ]; then
+  for f in registry.key registry.db; do
+    if sudo -n test -f "$REMOTE_DATA/\$f" 2>/dev/null; then
+      echo "ERROR: fresh install found an existing \$f under $REMOTE_DATA — an existing identity cannot be silently replaced or reused; refusing BEFORE service switchover (K10-N2)" >&2
+      exit 5
     fi
   done
 fi
@@ -2099,10 +2195,16 @@ real_run() {
   OLD_REGISTRY_UNIT=${old_registry_unit:-}
   [ "$LEGACY_UNIT" = "ak-stun-server" ] && LEGACY_UNIT=""
   [ "$OLD_REGISTRY_UNIT" = "ak-registry-server" ] && OLD_REGISTRY_UNIT=""
+  # K 复核 K10-N2: an identified occupant whose runtime identity dir already
+  # IS $REMOTE_DATA makes the destination data its OWN (in-place upgrade);
+  # only a NO-occupant fresh install treats pre-existing destination key/db
+  # as an unresolved conflict.
+  REMOTE_DATA_PREOWNED=0
+  [ -n "$runtime_id" ] && [ "$runtime_id" = "$REMOTE_DATA" ] && REMOTE_DATA_PREOWNED=1
 
   # ---- phase 4/5/6: install + systemd + firewall ----------------------------
   phase "4-6/7 install, systemd, firewall"
-  write_phase456 "$WORK/phase456.sh"
+  REMOTE_DATA_PREOWNED=$REMOTE_DATA_PREOWNED write_phase456 "$WORK/phase456.sh"
   remote_script "$WORK/phase456.sh" | tee "$WORK/phase456.log" \
     || fail "install phase failed (see $WORK/phase456.log)"
 

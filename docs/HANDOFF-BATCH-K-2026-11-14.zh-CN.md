@@ -1,7 +1,7 @@
 # 交接文档：批次 K（2026-11-14）
 
-> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`；修复轮三 `3db5259..31cf22c`；修复轮四 `31cf22c..a8bb3b9`；修复轮五 `a8bb3b9..9c2d3bd`；修复轮六 `9c2d3bd..e286513`；修复轮七 `e286513..12a71c9`；修复轮八 `12a71c9..ccd8fb2`。§0–§22 为前序记录与执行方声明，§23 为本次独立复核证据。首轮文档随 `b6296ea`、K2 本地纠正随 `f7dece2`、K3 报告及同步随 `e8b621a`、K4 报告及同步随 `46473fc`、K5 报告及同步随 `e8f811d`、K6 报告及同步随 `bb1f673`、K7 报告及同步随 `514cb87`、K8 报告及同步随 `7e8bfb2` 提交；本次 K9 文档同步仅保留本地。
-> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)，历史见 [K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)、[K7 复核](REVIEW_2026-11-15-batchK7.zh-CN.md)、[K6 复核](REVIEW_2026-11-15-batchK6.zh-CN.md)、[K5 复核](REVIEW_2026-11-15-batchK5.zh-CN.md)、[K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)、[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)、[K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md) 与 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md)。
+> 分支：`dev/batch-k-20261114`。首轮范围 `d6c7136..f9582e5`；修复轮一 `f9582e5..f150503`；修复轮二 `f150503..3db5259`；修复轮三 `3db5259..31cf22c`；修复轮四 `31cf22c..a8bb3b9`；修复轮五 `a8bb3b9..9c2d3bd`；修复轮六 `9c2d3bd..e286513`；修复轮七 `e286513..12a71c9`；修复轮八 `12a71c9..ccd8fb2`；修复轮九 `ccd8fb2..806ea6c`。§0–§24 为前序记录与执行方声明，§25 为本次独立复核证据。首轮文档随 `b6296ea`、K2 本地纠正随 `f7dece2`、K3 报告及同步随 `e8b621a`、K4 报告及同步随 `46473fc`、K5 报告及同步随 `e8f811d`、K6 报告及同步随 `bb1f673`、K7 报告及同步随 `514cb87`、K8 报告及同步随 `7e8bfb2`、K9 报告及同步随 `e03a44f` 提交；本次 K10 文档同步仅保留本地。
+> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次的证据表；当前发现见 [K10 复核](REVIEW_2026-11-15-batchK10.zh-CN.md)，历史见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)、[K8 复核](REVIEW_2026-11-15-batchK8.zh-CN.md)、[K7 复核](REVIEW_2026-11-15-batchK7.zh-CN.md)、[K6 复核](REVIEW_2026-11-15-batchK6.zh-CN.md)、[K5 复核](REVIEW_2026-11-15-batchK5.zh-CN.md)、[K4 复核](REVIEW_2026-11-15-batchK4.zh-CN.md)、[K3 复核](REVIEW_2026-11-15-batchK3.zh-CN.md)、[K2 复核](REVIEW_2026-11-15-batchK2.zh-CN.md) 与 [K 首轮复核](REVIEW_2026-11-14-batchK.zh-CN.md)。
 
 ## 0. 范围与来源
 
@@ -652,7 +652,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 23. 修复轮八独立复核证据（2026-11-15）
 
-被审差异固定为 `12a71c9..ccd8fb2`。发现、可复现输入与修复要求见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)，逐项状态只在审核状态表。本节、K9 报告及入口同步仅保留本地，未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；静态核对、离线模型与未执行的真实环境验收分别记录。
+被审差异固定为 `12a71c9..ccd8fb2`。发现、可复现输入与修复要求见 [K9 复核](REVIEW_2026-11-15-batchK9.zh-CN.md)，逐项状态只在审核状态表。本节、K9 报告及入口同步出具时仅保留本地，随后由执行方在 `e03a44f` 提交；复核未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；静态核对、离线模型与未执行的真实环境验收分别记录。
 
 | 本机验证 | 实际命令 / 范围 | 结果与边界 |
 |---|---|---|
@@ -710,8 +710,73 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ### 修复轮九门禁与提交
 
-本地：`bash -n`+自检全过；Python 239/239（部署套件 82，含 7 项轮十回归与跨六版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+执行方提交时声明：`bash -n`+自检全过；Python 239/239（部署套件 82，含 7 项 K9-N1 新回归与跨六版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。独立复核对上述实现、fixture 和门禁声明的核验见 §25，不以本节声明替代。
 
 | 提交 | 内容 |
 |---|---|
 | `e03a44f` | K9-N1 运行身份绑定迁移源；复核方文档同步与执行方本节记录入库 |
+
+## 25. 修复轮九独立复核证据（2026-11-15）
+
+被审差异固定为 `ccd8fb2..806ea6c`。发现与可复现输入见 [K10 复核](REVIEW_2026-11-15-batchK10.zh-CN.md)，逐项状态只在审核状态表。本节、K10 报告及入口同步仅保留本地，未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、离线模型和平台 CI 分别记录。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`；`bash scripts/deploy_linux.sh --self-test` | 集成者均 exit 0；隔离工具与合成数据，没有 SSH 或部署 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 集成者 239/239，786.636 秒，exit 0，无 failure/error/skip；含部署 82 项及真实 git 基线 |
+| 新增回归专项 | 新增当前树测试及 `12a71c9` 对照逐名执行 | 专项 7/7，72.035 秒，exit 0；不与全集重复计为新增案例 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定 tip 完整导出树及集成者工作树检查均 exit 0；契约 5 项实际 PASS，未只根据 advisory exit 0 判定 |
+| Rust 本机门禁 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows / rustc 1.99.1 本机全部 exit 0；测试日志累计 1200 passed、0 failed、8 ignored，含文档测试；ignored 未计作执行；workspace 构建为本轮实际构建 |
+| 实现变动范围 | `git diff --name-only ccd8fb2..806ea6c -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 无差异；本轮修复只改部署脚本、其 Python 测试与文档；平台证据采用当前完整 SHA 的 CI |
+| 报告原文复现 | 从 K10 报告 PowerShell 代码块原样提取 Python 并执行 | 集成者 exit 0；4 案均 phase1/decision=0/0，空 USERPROFILE 错选 HOME，值内 LF 错选 root；目标对照安装均 0，但有 decoy 时保留无关 key/db，新 unit 指向目标 |
+| 文档收尾 | `git diff --check`；完整仓库检查 | 本地同步后均 exit 0；工作树 local links=274，区别于固定 tip。仅新增 K10 报告并同步交接、状态表、STATUS、K9 历史归属；不提交或推送 |
+
+| 行为 / 源码核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| K9 精确来源翻转 | 逐参数 NUL argv，User/HOME 明确、UnsetEnvironment=USERPROFILE；current 无/有 root decoy 均选择 home；`12a71c9` 同 decoy 仍选 root | 集成者及专项各自重放真实 phase1/preflight/phase456 decisions/compose；普通 HOME 修复与新增缺陷分开判断 |
+| K10-N1 空值 | USERPROFILE 存在但为空、HOME 已知、WorkingDirectory=/var/lib/oldregistry：脚本 phase1/decision=0/0 并选 HOME；CLI 实际默认依赖 cwd | 专项与集成者各自重放；Rust 默认链逐字摘录以 rustc 编译，absent/empty/nonempty 3 案均 exit 0，empty 输出 Some("") 与相对 .ak-sending |
+| K10-N1 NUL 边界 | environ 的 EXTRA 值内含 LF+USERPROFILE=/root，实际无 USERPROFILE 记录：脚本 0/0 并选 root | 专项真实链与集成者重跑，报告原文再验证；NUL 原始记录与 unit 输入保留在仓外材料 |
+| K10-N2 实际目标数据 | 正确 home 来源不变，仅增减 REMOTE_DATA decoy：真实配置选择均正确，实际生成安装脚本均成功；无 decoy 复制 private-key/db，有 decoy 保留 unrelated-target-key/db；新 unit 均指向 REMOTE_DATA | 专项与集成者独立执行 actual phase456；专项追加 enabled+active/PID/合成 unit 的一致状态模型后结果不变，报告原文也用该状态。未运行真实 registry/SQLite |
+| 目标冲突历史归属 | `ccd8fb2` 目标 decoy 的 phase1/decision 也 0/0，旧枚举本来就选目标，CHOSEN_DATA_SOURCE 为空 | 专项真实旧 git 脚本对照；属于既有缺口，不归为本轮引入 |
+| fixture 精度 | 新 helper 原始 argv 为 `[ak-cli, registry-server, "--port 17200"]`，独立复核覆盖为逐参数 NUL 后重放 | 静态定位测试 :940–942/:974/:980 加原始 bytes 实查；纠正“argv-precise”声明，不据此撤回精确重放的通过结果 |
+| unit 环境交叉检查边界 | 多赋值 Environment 行中的 HOME 与 runtime 不同，仍 0/0；行首匹配遗漏后续赋值 | 专项已执行；runtime 来源本身仍正确，不单列 P1；不能宣称完整 merged 指令语义均覆盖 |
+| 固定树链接与契约 | 完整导出树：ccd8fb2 64 md/local 260，806ea6c 65 md/local 268，checker 均 exit 0、契约各 5 PASS；五版 regex 对同树计数一致：233/314、242/329、251/341、260/352、268/361（local/all） | 专项 5 树×5 regex；树依次 9c2d3bd/e286513/12a71c9/ccd8fb2/806ea6c。§23 的 267 是当时本地同步工作树，不是本轮固定 tip |
+| 提交与注释 | e03a44f 纳入 K9 同步；806ea6c 仅交接/状态表各 1 行哈希回填；reg_args_agree 头注释已准确更新 | git diff/show 与源码机械核对；K9“仅本地”残留、本轮入口和下一步在本地同步纠正 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `806ea6cc1a23db7b0dd56b38e8857483063c69a5`；[43681408648](https://github.com/wmqfl861/AK-sending/actions/runs/43681408648) | 当前 git 凭据直接读取 run/jobs API，从 in_progress 等待至 completed/success；head_branch=dev/batch-k-20261114，run_attempt=1；13 jobs 中 12 常规 success、1 手动 release-deep-tests skipped；完成更新时间 2026-11-15T05:45:49Z |
+| CI 实际门槛 | 同上 jobs/steps metadata 与固定 tip workflow | Linux/Windows fmt、clippy、workspace/特性测试、严格 rustdoc；Flutter analyze/test 与纯 Dart；Android FFI 双 ABI/符号检查及 debug APK；Linux/macOS portability、cargo audit/deny、仓库检查、legacy signal、NAT netns 模拟均 success；逐项核对无 failure/cancelled/未完成步骤。不等于物理双机或生产部署 |
+| 远端引用 | `git fetch --prune origin`；收尾 `git ls-remote --heads origin` | 前后均只有 main=d6c71360784e1570720e56028a39f2a80777bb21、dev/batch-k-20261114=806ea6cc1a23db7b0dd56b38e8857483063c69a5；REJECTED 分支保留，未调用合并、推送或删除 |
+| 本地引用与工作树 | `git branch -avv`；`git worktree list --porcelain`；`git status --short --branch` | 批次分支在固定 tip，main 留在 d6c7136，只有主工作树；K10 报告、交接、状态表、STATUS 与 K9 历史归属本地同步，没有提交、合并、推送或代码改动 |
+
+| 未执行 / 限制 | 本轮事实 |
+|---|---|
+| Linux 原生 systemd/权限部署、远端 SSH、物理双机 C4、生产抓包 | Windows 本机只执行真实生成脚本的离线模型，没有连接生产；合成 key/db 及进程状态不等于原生 Linux 验证 |
+| 本机 Flutter/Dart、Android/Linux/macOS 平台重建 | 本轮未改这些实现；实际平台门槛采用完整 SHA 匹配的最终 CI，不拿旧产物冒充当前构建 |
+| 手动 release deep tests | push workflow 的该 job skipped，本机未重跑 ignored release suite；不计作执行或通过 |
+| shellcheck | 本机 PATH 未发现命令，未执行；同次 PATH 核对也未发现 flutter/dart。Bash 语法、自检和离线模型不等于 shellcheck |
+
+| 仓外材料（本机 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-review-k10-806ea6c` | 集成者 run/jobs JSON、脚本/Rust 门禁日志与 JSON、root 来源/目标对照、报告原文 `report-repro.py`/log；凭据只在进程内，不写材料 |
+| `ak-review-k10-runtime-806ea6c` | 专项运行环境原始 fixture、真实阶段输出及 Rust 默认链摘录编译 runner/log |
+| `ak-k10-fixture-audit.py`/log、`ak-k10-target-active-audit.py`/log | 专项精确 root-decoy/git 基线、实际安装有/无目标 decoy、active 状态补齐与前一候选对照 |
+| `ak-k10-doc-audit-uzqwmg_0` | 完整导出树、checker 输出 JSON 与固定树计数材料 |
+
+## 26. 修复轮十（K10 复核后的新候选，执行方记录）
+
+[K10 复核](REVIEW_2026-11-15-batchK10.zh-CN.md)（K9 翻转反例判修复、K8 维持通过）后，执行方修复其两项新发现；复核方本地同步（§25、STATUS、状态表、K9 历史归属）与本节代码改动一并提交。
+
+| K10 发现 | 修复内容 |
+|---|---|
+| K10-N1（P1） | 环境解析改 NUL 记录级（`grep -za '^VAR='`，`^` 按记录锚定）：值内嵌换行不再伪造变量（复核 EXTRA 夹具中 `/root` 不再出现）；空值语义按 `id_dir()` 源码精确镜像——`Some("")` 不回退 HOME，空/相对基目录产出相对 `.ak-sending` 并由 unit `WorkingDirectory=`（去 `-` 前缀）解析，无绝对 WorkingDirectory 即拒绝。复核夹具（USERPROFILE 置空+HOME+WorkingDirectory）从误选 HOME 翻转为 `/var/lib/oldregistry/.ak-sending`；同输入缺 WorkingDirectory 拒绝；内嵌换行夹具不再选出 `/root` |
+| K10-N2（P1） | 目标身份/库冲突在切换前处理：有迁移源时目标已存文件须与源 `cmp -s` 字节一致——一致保留（记录）、不一致 exit 5 拒绝（「绝不静默启用无关身份字节」）、缺失则拷贝并 cmp 校验（拷贝损坏拒绝）；无源预期时真全新安装遇目标已有 key/db 拒绝，`REMOTE_DATA_PREOWNED`（占位者运行 id-dir 即目标）原位升级放行自有数据。复核夹具（K9 源+目标无关字节）从 `INSTALL_RC=0` 无关字节上线翻转为 exit 5 全不动；一致保留、拷贝校验、损坏拒绝、全新脏目标拒绝、原位升级、`806ea6c` 基线放行共十组回归 |
+
+### 修复轮十门禁与提交
+
+本地：`bash -n`+自检全过；Python 249/249（部署套件 92，含 10 项轮十一回归与跨八版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十首个提交，推送后回填哈希） | K10-N1/N2 修复；复核方文档同步与执行方本节记录入库 |

@@ -80,7 +80,9 @@ PREV9_REV = "806ea6c"
 PREV10_REV = "1fad0a2"  # round-11 candidate (K12 findings: LF truncation,
                          # config-cwd resolution, swallowed key chmod)
 PREV10_PRE_REV = "09fceb6"  # round-10 tip (pre-move key chmod: set -e caught it)
-PREV11_REV = "0b41201"  # round-12 tip (K13 findings: cwd byte fidelity,
+PREV11_REV = "0b41201"
+PREV12_REV = "943a346"  # round-13 tip (K14 findings: fail-open second cwd
+                         # read, relative --id-dir unbound to running cwd)  # round-12 tip (K13 findings: cwd byte fidelity,
                          # generated-script path re-interpretation)  # round-9 candidate (K10 findings: environ parsing
                         # semantics, destination conflicts skipped)  # round-8 candidate (K9 finding: migration source
                         # picked by enumeration order, not runtime identity)
@@ -583,6 +585,16 @@ case "$target" in
   # itself ends in, or contains, LF bytes (the line-based map cannot
   # express that).
   /proc/[0-9]*/cwd)
+    # K10-N1 (round 15) reviewer model: the FIRST cwd read succeeds, the
+    # SECOND fails (marker-file based). Under the single-read fix the second
+    # read never happens, so the injected failure can never open the check.
+    if [ "${CWD_FAIL_ON_SECOND:-0}" = 1 ]; then
+      if [ -f "$PROBE_DIR/cwd-read-once" ]; then
+        printf 'review-cwd-second-read-failed\n' >> "$PROBE_DIR/stubs.log"
+        exit 1
+      fi
+      : > "$PROBE_DIR/cwd-read-once"
+    fi
     if [ -n "${PROC_CWD_RAW_FILE:-}" ]; then
       cat "$PROC_CWD_RAW_FILE"
       printf '\n'
@@ -1135,6 +1147,26 @@ class ProbeHarness(unittest.TestCase):
             f'echo "INSTALL_RC=$?"\n'
         )
         return self.generate_and_run_p456(body, run_env=run_env)
+
+    def _make_k14_relative_fixture(self, identity: str):
+        """Unit + argv both carry '--id-dir <identity>'; the running cwd is
+        /home/runtime-old. The TRUE source (runtime-real-*) lives under
+        /home/runtime-old/state; the DEPLOYMENT-cwd decoy (deploy-cwd-decoy-*)
+        lives under the probe root's state/ — the wrong source rounds <= 14
+        copied."""
+        args = "--port 17200 --id-dir " + identity
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        for rel, tag in (("home/runtime-old/state", "runtime-real"),
+                         ("state", "deploy-cwd-decoy")):
+            d = self.probe / rel
+            d.mkdir(parents=True, exist_ok=True)
+            for name in ("registry.key", "registry.db"):
+                (d / name).write_text(f"{tag}-{name}", encoding="utf-8")
 
     def _make_k13_cwd_fixture(self, cwd_bytes: bytes):
         """Empty USERPROFILE + HOME set; runtime cwd comes from a RAW-BYTES
@@ -2795,6 +2827,128 @@ echo "C4=[$c4]"
         self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
                          "unrelated-target-key")
 
+    # -- K10-N1 (round 15): the cwd byte evidence cannot fail open -------------
+    def test_k10n1_second_cwd_read_failure_cannot_skip_validation(self):
+        # Reviewer fixture: cwd bytes '/home/runtime-old\n' (trailing LF);
+        # the FIRST read succeeds, a hypothetical SECOND (count) read fails.
+        # Rounds <= 14 read twice and skipped validation when the count read
+        # failed (wc -c 0 -> '-gt 0' guard passed). The single-read capture
+        # makes the second read nonexistent: the tail-LF loss is detected
+        # from the SAME tee'd bytes and phase1 refuses — the injected
+        # second-read failure never fires.
+        raw = self._make_k13_cwd_fixture(b"/home/runtime-old\x0a")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'CWD_FAIL_ON_SECOND=1 PROC_CWD_RAW_FILE="$PROBE_DIR/cwd-bytes" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "the byte-fidelity check must refuse, never skip")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("shows lost trailing bytes", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        # Exactly ONE cwd read happened (the marker proves the first ran);
+        # the injected second-read failure never fired because there is no
+        # second read.
+        log = self.stubs_log()
+        self.assertNotIn("review-cwd-second-read-failed", log)
+        self.assertTrue((self.probe / "cwd-read-once").exists())
+
+    def test_k10n1_all_reads_succeed_control_still_refuses_tail_lf(self):
+        # Control: the stable tail-LF input (no failure injection) still
+        # refuses via the same single-read evidence.
+        raw = self._make_k13_cwd_fixture(b"/home/runtime-old\x0a")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_RAW_FILE="$PROBE_DIR/cwd-bytes" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("shows lost trailing bytes", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
+    # -- K14-N1: an explicit RELATIVE --id-dir binds to the RUNNING cwd --------
+    def _k14_full_chain(self, name: str):
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, f"driver-decision-{name}.sh")
+        return p1_out, rc, out
+
+    def test_k14n1_relative_id_dir_resolves_running_cwd(self):
+        # Reviewer fixture: --id-dir state with running cwd /home/runtime-old.
+        # The chain must select /home/runtime-old/state (runtime-real bytes)
+        # — NEVER the deployment cwd's decoy — and the generated unit must
+        # carry ABSOLUTE identity paths only.
+        self._make_k14_relative_fixture("state")
+        p1_out, rc, out = self._k14_full_chain("k14rel")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-old/state$")
+        self.assertIn("readlink /proc/4242/cwd", self.stubs_log(),
+                      "the RUNNING cwd must actually be queried")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/runtime-old/state", out)
+        self.assertIn("CHOSEN_RW=/home/runtime-old/state", out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertIn("--id-dir /home/runtime-old/state", exec_line)
+        self.assertNotIn("--id-dir state ", exec_line + " ")
+        # Execute the real install with the CHOSEN (absolute) values baked,
+        # exactly as real_run would from this decision's output.
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee '
+            + 'REGISTRY_EXEC="' + chosen_exec + '" '
+            + 'REG_RW=/home/runtime-old/state LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=/home/runtime-old/state CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 '
+            + 'write_phase456 "$PROBE_DIR/p456k14rel.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456k14rel.sh" > "$PROBE_DIR/p456k14rel.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.generate_and_run_p456(body)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "runtime-real-registry.key",
+                         "the TRUE running source's bytes must land")
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        self.assertIn("--id-dir /home/runtime-old/state", unit)
+        self.assertNotRegex(unit, r"--id-dir state(\s|$)")
+        self.assertIn("ReadWritePaths=/home/runtime-old/state", unit)
+
+    def test_k14n1_absolute_id_dir_control_unchanged(self):
+        # Control: the absolute argument selects the same true source.
+        self._make_k14_relative_fixture("/home/runtime-old/state")
+        p1_out, rc, out = self._k14_full_chain("k14abs")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-old/state$")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/runtime-old/state", out)
+
+    def test_k14n1_relative_id_dir_unreadable_cwd_refuses(self):
+        # Relative --id-dir but the running cwd cannot be read: refuse.
+        self._make_k14_relative_fixture("state")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=unreadable" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("RELATIVE --id-dir", p1_out)
+        self.assertIn("refusing before any switchover", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -3520,6 +3674,123 @@ class BaselineContrastTests(ProbeHarness):
                          r"(?m)^  runtime-id-dir: /home/configured-new/\.ak-sending$",
                          "the round-11 candidate trusted the config cwd (the defect)")
 
+    def _run_baseline_install_chain(self, rev: str, data_source: str,
+                                    registry_exec: str, reg_rw: str,
+                                    name: str, cwd_map: bool = True):
+        """Run the BASELINE's own decision-derived install: its write_phase456
+        extracted from git, with the decision values baked exactly as the
+        baseline real_run would bake them."""
+        text = self.baseline_text(rev)
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + registry_exec + '" ' + chr(10)
+            + 'REG_RW="' + reg_rw + '" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=' + data_source + ' CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/' + name + '.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + ('PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+               if cwd_map else '')
+            + 'bash "$PROBE_DIR/' + name + '.sh" > "$PROBE_DIR/' + name
+            + '.out" 2>&1; echo "INSTALL_RC=$?"' + chr(10)
+        )
+        return self.run_driver(self.phase_defs(text, rev) + BOX_MODELS, body,
+                               name=f"driver-{rev[:7]}-{name}.sh")
+
+    def test_k14n1_round13_tip_relative_id_dir_copies_decoy(self):
+        # K14-review contrast: 943a346 (and identically 0b41201) on the
+        # reviewer's exact relative-'state' fixture — the baseline reports
+        # 'runtime-id-dir: state' verbatim (its own phase1 never queries the
+        # running cwd for an EXPLICIT --id-dir) and its install copies the
+        # DEPLOYMENT-cwd decoy with exit 0.
+        self._make_k14_relative_fixture("state")
+        # The baseline's own phase1 (verbatim relative report).
+        text = self.baseline_text(PREV12_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev12.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev12.sh" > "$PROBE_DIR/p1prev12.out" 2>&1; '
+            + 'echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV12_REV) + BOX_MODELS,
+                                  body, name="driver-prev12-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev12.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  runtime-id-dir: state$",
+                         "the baseline reported the relative id-dir verbatim")
+        self.assertNotIn("readlink /proc/4242/cwd", self.stubs_log())
+        # The baseline's own decision values (verbatim relative) through the
+        # BASELINE's generator + install.
+        rc, out = self._run_baseline_install_chain(
+            PREV12_REV, "state",
+            "$REMOTE_BIN registry-server --port 17200 --id-dir state",
+            "state", "p456prev12rel")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out,
+                      "the baseline installed from the decoy (the defect)")
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "deploy-cwd-decoy-registry.key",
+                         "the baseline copied the DEPLOYMENT-cwd decoy's bytes")
+
+    def test_k13n1_round12_tip_quoted_path_copies_wrong_dir(self):
+        # K14-review precision rebuild: the baseline generation boundary is
+        # exercised for real — the verbatim quoted CHOSEN value travels via a
+        # FILE (cat preserves every byte; passing it through the caller
+        # shell would strip the quotes before the generator ever ran), the
+        # BASELINE's own write_phase456 generates, and the BASELINE's own
+        # install script executes the baked 'DATA_SOURCE=...' line where the
+        # quote becomes shell syntax.
+        q = chr(39)
+        profile = "/home/oth" + q + "er" + q + "user"
+        self._make_k13_quoted_fixture(profile)
+        dequoted = self.probe / "home" / "otheruser" / ".ak-sending"
+        dequoted.mkdir(parents=True, exist_ok=True)
+        for name in ("registry.key", "registry.db"):
+            (dequoted / name).write_text(f"dequoted-wrong-{name}", encoding="utf-8")
+        # The verbatim source path in a file (byte-preserving transport).
+        (self.probe / "ds-verbatim.txt").write_text(
+            profile + "/.ak-sending", encoding="utf-8", newline="\n")
+        text = self.baseline_text(PREV11_REV)
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'DS_V=$(cat "$PROBE_DIR/ds-verbatim.txt")' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $DS_V" ' + chr(10)
+            + 'REG_RW="$DS_V" LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR="$DS_V" CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456prev11q.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'grep -n "^DATA_SOURCE=" "$PROBE_DIR/p456prev11q.sh" '
+            + '| sed "s/^/GEN_DATA_SOURCE_LINE: /"' + chr(10)
+            + 'bash "$PROBE_DIR/p456prev11q.sh" > "$PROBE_DIR/p456prev11q.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV11_REV) + BOX_MODELS,
+                                  body, name="driver-prev11-q2.sh")
+        self.assertEqual(rc, 0, out)
+        # The generated source really carries the raw quoted bytes (the
+        # generation boundary is exercised, not the caller shell).
+        self.assertIn("GEN_DATA_SOURCE_LINE:", out)
+        gen_line = [l for l in out.splitlines()
+                    if l.startswith("GEN_DATA_SOURCE_LINE:")][0]
+        self.assertIn(q, gen_line,
+                      "the generated script must still carry the quote byte")
+        self.assertIn("INSTALL_RC=0", out,
+                      "the baseline install exited 0 from the wrong dir (the defect)")
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "dequoted-wrong-registry.key",
+                         "the executing shell de-quoted the path and copied "
+                         "the OTHER directory's bytes")
+
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod
         # failure — INSTALL_RC=0, the new binary enabled, no recovery —
@@ -3579,52 +3850,6 @@ class BaselineContrastTests(ProbeHarness):
         self.assertRegex(p1_out,
                          r"(?m)^  runtime-id-dir: /home/runtime-old/\.ak-sending$")
 
-    def test_k13n1_round12_tip_quoted_path_copies_wrong_dir(self):
-        # K13-review contrast (b): 0b41201 (and identically 1fad0a2) on the
-        # quote fixture — preflight/decision keep the verbatim path, the
-        # generated script re-interprets it, and the install copies the
-        # DE-QUOTED directory's data with exit 0.
-        q = chr(39)
-        profile = "/home/oth" + q + "er" + q + "user"
-        self._make_k13_quoted_fixture(profile)
-        # The de-quoted directory holds DIFFERENT data (the wrong source).
-        dequoted = self.probe / "home" / "otheruser" / ".ak-sending"
-        dequoted.mkdir(parents=True, exist_ok=True)
-        for name in ("registry.key", "registry.db"):
-            (dequoted / name).write_text(f"dequoted-wrong-{name}", encoding="utf-8")
-        text = self.baseline_text(PREV11_REV)
-        body = (
-            'write_phase1 "$PROBE_DIR/p1prev11q.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
-            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/configured-new" '
-            + 'bash "$PROBE_DIR/p1prev11q.sh" > "$PROBE_DIR/p1prev11q.out" 2>&1; '
-            + 'echo "RUN_RC=$?"' + chr(10)
-        )
-        rc, out = self.run_driver(self.phase_defs(text, PREV11_REV) + BOX_MODELS,
-                                  body, name="driver-prev11-q.sh")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("RUN_RC=0", out)
-        p1_out = (self.probe / "p1prev11q.out").read_text(encoding="utf-8")
-        rc, out = self.run_decision_and_config(
-            p1_out, "driver-prev11q-decision.sh", text=text,
-            origin=f"the {PREV11_REV} baseline")
-        self.assertEqual(rc, 0, out)  # the round-12 tip decision passed the quoted path
-        self.assertIn("CHOSEN_DATA_SOURCE=" + profile + "/.ak-sending", out)
-        # Bake the decision-derived values into the BASELINE generator and
-        # execute its own install script: the quote becomes shell syntax.
-        # (The true quoted dir and the de-quoted decoy already exist from
-        # the fixture setup above — no bash-side model needed.)
-        rc, out = self._run_k10_install(
-            profile + "/.ak-sending", "0", "p456prev11q")
-        self.assertEqual(rc, 0, out)
-        self.assertIn("INSTALL_RC=0", out)  # the round-12 tip installed from the wrong dir
-        dest = self.probe / "opt-ak" / "data"
-        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
-                         "dequoted-wrong-registry.key",
-                         "the copied bytes came from the DE-QUOTED directory")
-
-    # -- K2-N1: baselines leave the box stopped and broken at the first unit
-    #    write. The old code has no (reaching) recovery; the NEW tests above
-    #    assert recovery EXISTS.
     def _assert_unmitigated_unit_write_failure(self, rc, out, p456_out):
         self.assertEqual(rc, 0, out)  # the driver harness itself must succeed
         self.assertIn("RUN_RC=1", out)

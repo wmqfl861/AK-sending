@@ -915,7 +915,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 31. 修复轮十二独立复核证据（2026-11-15）
 
-被审差异固定为 `1fad0a2..0b41201`，实现提交 `a5a5ad6`，完整 tip 为 `0b41201778ece5a9310bc97f24370444c39d3335`。发现、输入及可复现脚本见 [K13 复核](REVIEW_2026-11-15-batchK13.zh-CN.md)，逐项状态只在审核状态表。本节与 K13、STATUS、状态表、K12 历史归属补注仅本地同步；不修改被审代码。“专项”为并行只读审查，“集成者”为主复核者。本机为 Windows 11、Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1；门槛三路并行总墙钟 1102.614 秒。
+被审差异固定为 `1fad0a2..0b41201`，实现提交 `a5a5ad6`，完整 tip 为 `0b41201778ece5a9310bc97f24370444c39d3335`。发现、输入及可复现脚本见 [K13 复核](REVIEW_2026-11-15-batchK13.zh-CN.md)，逐项状态只在审核状态表。本节与 K13、STATUS、状态表、K12 历史归属补注出具时仅本地同步；随后由执行方在 `b4b4ca1` 提交。原复核未修改被审代码。“专项”为并行只读审查，“集成者”为主复核者。本机为 Windows 11、Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1；门槛三路并行总墙钟 1102.614 秒。
 
 | 本机验证 | 实际命令 / 范围 | 结果与边界 |
 |---|---|---|
@@ -977,3 +977,68 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `b4b4ca1` | K10-N1 cwd 字节守卫与 K13-N1 bake 白名单守卫；复核方文档同步与执行方本节记录入库 |
+
+## 33. 修复轮十三独立复核证据（2026-11-15）
+
+被审差异固定为 `0b41201..943a346`，实现提交 `b4b4ca1`，完整 tip 为 `943a346316b488449ca51d762f26b3f41f04d9f6`。发现、输入与可复现脚本见 [K14 复核](REVIEW_2026-11-15-batchK14.zh-CN.md)，逐项裁决只在审核状态表。本节、K14、STATUS、状态表及 K13 历史归属补注仅本地同步；不修改被审代码。“专项”为并行只读审查，“集成者”为主复核者。本机为 Windows、Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1；门槛三路并行总墙钟 1198.930 秒。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；两脚本各 `--self-test` | 均 exit 0；deploy 生成实际阶段脚本并验语法，cross-NAT 执行隔离 fake-channel 自检；无 SSH/生产连接 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 266/266，0 failure/error/skip，unittest 1198.395 秒；部署 109（当前 83、历史对照 26），NAT lifecycle 11、NAT streak 51、netem 24、repository checker 64、SSH helper 7。全部首次执行通过，无补跑；quoted baseline 的证据范围另在下表限定 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py`；另在 `git archive 943a346` 固定导出树执行两者 | 均 exit 0，契约实际 5/5 PASS；固定树 69 md/local links=293；工作树与固定树不混计 |
+| Rust 本机门槛 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows 均 exit 0；测试 1200 passed、0 failed、8 ignored，含 doctest，575.930 秒；fmt 4.005 秒、clippy 30.867 秒、rustdoc 18.836 秒、实际 Windows build 35.369 秒。ignored 不计为执行 |
+| 实现范围 | `git diff --exit-code 0b41201..943a346 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 无差异、exit 0；实现改动仅部署脚本与 Python 测试，另有文档同步 |
+| 报告 runner | 集成者实际执行 `repro-k14.py` | 五案全部断言通过、exit 0：稳定尾 LF 拒绝、cwd 二读失败错源、相对参数当前/基线错源、绝对参数正确复制；报告内代码与实际 runner 逐字比较且 compile 通过；完整 phase1/phase456/stub/unit 与两份落盘字节保留仓外 |
+| 文档收尾 | 同步后 `python scripts/check_repository.py`、`git diff --check`；报告代码与实际 runner 比较/compile；实现 diff 与最终引用复核 | 均 exit 0；工作树 85 md/local links=300，契约 5/5 PASS；报告与 runner 逐字一致。实现 diff 为空，只有 K14 报告、交接、状态表、STATUS、K13 历史补注本地改动，未提交 |
+
+| 行为 / 来源核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| 原 K10 cwd 提交内回归 | 尾 LF、内嵌 LF、普通 cwd、empty USERPROFILE runtime cwd、不可读 cwd、0b41201 尾 LF baseline | 专项六项全通过，70.522 秒；stable LF 拒绝与普通控制有效，baseline phase1 确认截断目录 |
+| K10 cwd 二读失败 | 同尾 LF 原始字节；只让第二次 readlink exit 1/无 stdout | 专项 ordinary/stable-tail/failure 三案：普通全链 0；稳定尾 LF phase1=3；二读失败 phase1/decision/install=0，实际目标为 `cwd-prefix-decoy-registry.key` / `cwd-prefix-decoy-registry.db`。集成者独立 runner 重放稳定拒绝与二读失败错源，结果一致；proc/systemctl 为模型 |
+| K13 真实跨生成器边界 | 当前引号、字面美元、普通来源；0b41201 引号 baseline | 专项真实 decision→compose→各版本 write_phase456→安装：当前特殊路径 decision=1，无 CHOSEN/无目标 key；普通全链 0/正确字节；baseline 生成源码保留引号，执行后实际复制去引号目录。提交内四项 K13 测试另执行通过，121.819 秒 |
+| K13 提交内 baseline 的限定 | 机械运行 quoted baseline 并检查 driver、生成源码、self.text；比较两版生成块 | 单项通过，但 caller 已剥引号，且 helper 使用当前文本；两版 write_phase456 块逐字相同。测试不能单独证明声称的重新解释边界，独立真实 baseline 链已补证；不把证据限定当作新生产 P1 |
+| K14 显式相对身份参数 | unit+NUL argv 均 --id-dir state、运行 cwd=/home/runtime-old，部署 cwd 下设不同字节的 state | 专项当前与0b41201均 phase1/decision/install=0，未查询cwd，真实 cp/cmp 得到 `deploy-cwd-decoy-registry.key` / `deploy-cwd-decoy-registry.db`；绝对参数控制复制 runtime-real。集成者独立三案重放一致；新 unit 无 WorkingDirectory 且 RWP 相对，模型启动成功不代表 Linux systemd 实际成功 |
+| 文档来源 | `git show/diff b4b4ca1`、`git show 943a346` | K13 同步与执行方 §32 已入库；943a346 仅两文件各一行哈希回填。本轮补 K13 出具时点的历史归属；文档来源更正不作为拒绝原因 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `943a346316b488449ca51d762f26b3f41f04d9f6`；[43711823220](https://github.com/wmqfl861/AK-sending/actions/runs/43711823220) | 当前 git 凭据直接查 run/jobs API，从 in_progress 等到 completed/success；head_branch=dev/batch-k-20261114，attempt=1，完成更新时间 2026-11-15T12:15:31Z；最终完整 API 读取 2026-11-15T12:17:53Z。13 jobs 中 12 常规 success、1 手动 release-deep-tests skipped；所有常规步骤 success，每个 job head_sha 匹配 |
+| CI 实际门槛 | 固定 SHA 的 workflow 与完整 jobs/steps JSON | Linux/Windows Rust workspace/特性测试、fmt/clippy/rustdoc；Flutter analyze/test、纯 Dart；Android 双 ABI FFI/符号/debug APK；Linux/macOS portability；audit/deny、仓库检查、legacy signal、NAT netns 模拟均完成。不等于生产或物理双机 |
+| API 读取重试 | 同一 git 凭据与相同 GitHub API | 首次 IncompleteRead，后续两次响应读超时；改用完整 JSON 读取与 Connection: close 后取得 run/jobs。没有权限拒绝、换身份或绕过权限；失败响应不作 CI 结论 |
+| 远端引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；收尾再次读取 | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=943a346316b488449ca51d762f26b3f41f04d9f6，收尾仍一致。未调用 merge、push 或分支删除 |
+| 本地引用 | `git worktree list --porcelain`；本轮状态与 diff 核对 | 只有主工作树；当前批次分支在固定tip，main保持d6c7136；本轮仅复核文档本地同步，不创建提交 |
+
+| 未执行 / 边界 | 本轮事实 |
+|---|---|
+| Linux 原生 cwd/权限/systemd 部署、生产 SSH、物理双机 C4、抓包 | proc/cwd/systemctl 为 Windows Bash 隔离模型；尾 LF 目录未在 Windows 落盘。真实临时文件 cp/cmp/生成脚本执行不称为 Linux 真机验证 |
+| 本机 Flutter/Dart、Android/Linux/macOS 重建 | PATH 未发现 Flutter/Dart；本机未重建这些平台，采用固定 SHA 的当前 CI 证据 |
+| shellcheck | PATH 未发现，未执行；Bash 语法与模型不代替 shellcheck |
+| 手动 release 深测 | 本轮未运行 ignored release suite；push CI 的手动 job skipped，不计通过 |
+| 数据库与恢复边界 | 全集保留既有正常事务/故障恢复模型，不扩为任意崩溃、中断事务或 journal 恢复证明 |
+
+| 仓外材料（本机 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k14-review-rwa660b5` | query-ci.py、首次/最终完整 run/jobs JSON、ci-final-audit.json、固定导出树与门槛日志、精确测试计数、报告 runner；凭据仅查询进程内存 |
+| `ak-k14-counterexamples-dwyavui0` | 集成者报告 runner 的五案结果、phase1/phase456、driver、日志/stub、新 unit；错误与正确落盘字节均已断言 |
+| `ak-k14-cwd-review-4q42aq_k` | cwd 专项三案 runner/JSON、生产生成脚本/决策/stub 与输出；二读失败、stable尾 LF与普通控制 |
+| `ak-k14-baked-review-kb1dbfow`、`ak-k14-baked-review-2j5jc7qq` | 路径专项六案与绝对参数控制完整 probe 树；真实 baseline 引号链、当前拒绝及普通/相对参数对照 |
+| `ak-k14-docs-audit-2wif36sv` | 提交内 quoted baseline 单项的 caller、生成源码、phase1/decision/安装日志，记录其证据边界 |
+
+## 34. 修复轮十四（K14 复核后的新候选，执行方记录）
+
+[K14 复核](REVIEW_2026-11-15-batchK14.zh-CN.md)（K13-N1 判关闭；K10-N1 维持：cwd 验证读失败 fail-open；新发现 K14-N1 显式相对 `--id-dir` 丢失 cwd 语义）后，执行方完成修复；复核方本地同步（§33、STATUS、状态表、K13 历史归属）与本节代码改动一并提交。
+
+| K14 发现 | 修复内容 |
+|---|---|
+| K10-N1 余项（P1） | cwd **单次读取**取证：`readlink | tee "$reg_cwd_raw"` 捕获值与字节证据同源（tee 落临时文件，值与 `wc -c` 均取自该文件），不再存在可失败的第二次读取；空值/零字节拒绝、不可传输字节拒绝、计数不匹配拒绝——`-gt 0` 跳过路径删除。复核夹具（尾 LF cwd、首读成功次读失败注入）从截断目录成功翻转为 exit 3，stub 日志证明注入的第二次失败根本未被触发（已无第二次读取）；全成功尾 LF 与普通 cwd 控制保持 |
+| K14-N1（P1） | 相对 `--id-dir` 以**运行 cwd** 解析：phase1 对显式或环境推导的 `reg_rt_id` 任何相对值经同一单次读取字节保真纪律的 `/proc/<PID>/cwd` 解析为绝对目录再报告；决策策略明确——**生成 unit 只携带绝对身份路径**（相对 `REG_RW` 与 ExecStart 相对 `--id-dir` 参数均改写为运行解析的绝对目录并记录日志，不做 WorkingDirectory 猜测）。复核夹具（`--id-dir state`+运行 cwd，真源在 `/home/runtime-old/state`、部署 cwd 有诱饵）从「报 `state` 原样+拷贝部署 cwd 诱饵」翻转为绝对解析+真源字节+生成 unit 全绝对路径；绝对参数控制不变；cwd 不可读拒绝；`943a346` 基线复现拷贝诱饵 |
+| 基线对照测试重建（复核精度注记） | K13 引号路径基线对照重建：verbatim CHOSEN 值经**文件**传递（调用方 shell 不触碰任何字节）、**基线自身**的 write_phase456（git 提取）生成并打印生成源证明引号字节穿越生成边界、**基线自身**安装脚本执行——INSTALL_RC=0 且目的地为去引号目录的错误字节，对照在真实基线生成边界上成立 |
+
+### 修复轮十四门禁与提交
+
+本地：`bash -n`+自检全过；Python 272/272（部署套件 115，含 6 项轮十五回归+1 项重建对照与跨十二版基线）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十四首个提交，推送后回填哈希） | K10-N1 单次读取取证与 K14-N1 相对 id-dir 运行解析；复核方文档同步与执行方本节记录入库 |

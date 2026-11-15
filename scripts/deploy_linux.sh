@@ -687,10 +687,16 @@ self_test() {
     || fail "a relative identity base must resolve against the RUNNING process cwd (K10-N1)"
   grep -q 'chmod 600 .*registry\.key || return 1' "$WORK/p456.sh" \
     || fail "a key-chmod failure on an existing key must enter the unified recovery (K12-N1)"
-  # K 复核 K10-N1 (round 14): the cwd value gets the same byte-fidelity
-  # discipline (emitting-tool byte count + untransportable-byte refusal).
-  grep -q 'the RUNNING working directory of \$reg_unit lost trailing bytes' "$WORK/p1.sh" \
+  # K 复核 K10-N1 (round 14/15): the cwd value gets the same byte-fidelity
+  # discipline (single-read tee capture + untransportable-byte refusal).
+  grep -q 'shows lost trailing bytes' "$WORK/p1.sh" \
     || fail "a cwd that loses trailing bytes must refuse, not confirm a truncated dir (K10-N1)"
+  grep -q 'tee "\$reg_cwd_raw"' "$WORK/p1.sh" \
+    || fail "the cwd byte evidence must come from the SAME single read (tee at capture time), never a second read that can fail open (K10-N1)"
+  # K 复核 K14-N1: a relative explicit --id-dir resolves against the RUNNING
+  # cwd; the generated unit carries absolute identity paths only.
+  grep -q 'RELATIVE --id-dir' "$WORK/p1.sh" \
+    || fail "a relative --id-dir must resolve against the RUNNING cwd before reporting (K14-N1)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1328,18 +1334,32 @@ REG_EFF_H
             # tool's byte count with the captured length (trailing-LF loss
             # -> refuse), and refuse values containing bytes the line-based
             # pipeline cannot transport. Never truncate-then-confirm.
-            reg_cwd=\$(sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null) \\
-              || { echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit; refusing before any switchover (K10-N1)" >&2; exit 3; }
+            # K 复核 K10-N1 (round 15): read the cwd ONCE and derive BOTH the
+            # value and its byte evidence from that single read — the bytes
+            # are tee'd into a temp file at capture time. The old code read
+            # twice; a failing second (count) read produced wc -c 0 and the
+            # '-gt 0' guard SKIPPED validation, confirming a truncated path
+            # (reviewer reproduction). Any unavailability of the byte
+            # evidence — zero bytes or a count mismatch — REFUSES, never
+            # skips; there is no second read whose failure could open the
+            # check.
+            reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
+            sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+            reg_cwd=\$(cat "\$reg_cwd_raw")
+            cwd_tool_bytes=\$(wc -c < "\$reg_cwd_raw")
+            rm -f "\$reg_cwd_raw"
+            if [ -z "\$reg_cwd" ] || [ "\$cwd_tool_bytes" -eq 0 ]; then
+              echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit — the byte-evidence read returned nothing; refusing before any switchover (K10-N1)" >&2
+              exit 3
+            fi
             case "\$reg_cwd" in
               *\$'\n'*|*' '*|*'	'*)
                 echo "ERROR: the RUNNING working directory of \$reg_unit contains a byte (newline/space/tab) this deploy's line-based evidence cannot carry faithfully; refusing rather than confirm a truncated path (K10-N1)" >&2
                 exit 3 ;;
             esac
-            cwd_tool_bytes=\$(sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | wc -c || true)
             cwd_bash_bytes=\$(printf '%s' "\$reg_cwd" | wc -c)
-            if [ "\$cwd_tool_bytes" -gt 0 ] \\
-               && [ "\$((cwd_tool_bytes - 1))" != "\$cwd_bash_bytes" ]; then
-              echo "ERROR: the RUNNING working directory of \$reg_unit lost trailing bytes (newline) on its way into this script; refusing rather than confirm a truncated path (K10-N1)" >&2
+            if [ "\$((cwd_tool_bytes - 1))" != "\$cwd_bash_bytes" ]; then
+              echo "ERROR: the byte evidence of the RUNNING working directory of \$reg_unit shows lost trailing bytes (newline); refusing rather than confirm a truncated path (K10-N1)" >&2
               exit 3
             fi
             case "\$reg_cwd" in
@@ -1355,6 +1375,44 @@ REG_EFF_H
             esac ;;
         esac
       fi
+      # K 复核 K14-N1 (round 15): an EXPLICIT RELATIVE --id-dir has the same
+      # cwd dependence as the env-derived default — 'state' means
+      # <running-cwd>/state for the RUNNING instance, while the install
+      # script would resolve it against ITS OWN cwd (the deployment cwd) and
+      # migrate a decoy. Resolve every relative runtime identity against the
+      # RUNNING cwd (single read, same byte-fidelity discipline) and report
+      # the ABSOLUTE dir; the new unit gets absolute paths only (real_run
+      # rewrites the relative argument — no WorkingDirectory= guessing).
+      case "\$reg_rt_id" in
+        /*) : ;;
+        *)
+          reg_rel_orig="\$reg_rt_id"
+          reg_cwd_raw=\$(mktemp /tmp/ak-cwd-bytes.XXXXXX)
+          sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | tee "\$reg_cwd_raw" >/dev/null
+          reg_cwd=\$(cat "\$reg_cwd_raw")
+          reg_cwd_bytes=\$(wc -c < "\$reg_cwd_raw")
+          rm -f "\$reg_cwd_raw"
+          if [ -z "\$reg_cwd" ] || [ "\$reg_cwd_bytes" -eq 0 ]; then
+            echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the RELATIVE --id-dir '\$reg_rel_orig' of \$reg_unit; refusing before any switchover (K14-N1)" >&2
+            exit 3
+          fi
+          case "\$reg_cwd" in
+            *\$'\n'*|*' '*|*'	'*)
+              echo "ERROR: the RUNNING working directory of \$reg_unit contains a byte (newline/space/tab) this deploy's line-based evidence cannot carry faithfully while resolving the RELATIVE --id-dir '\$reg_rel_orig'; refusing before any switchover (K14-N1)" >&2
+              exit 3 ;;
+          esac
+          if [ "\$((reg_cwd_bytes - 1))" != "\$(printf '%s' "\$reg_cwd" | wc -c)" ]; then
+            echo "ERROR: the byte evidence of the RUNNING working directory of \$reg_unit is unavailable or lost bytes while resolving the RELATIVE --id-dir '\$reg_rel_orig'; refusing before any switchover (K14-N1)" >&2
+            exit 3
+          fi
+          case "\$reg_cwd" in
+            /*) reg_rt_id="\$reg_cwd/\$reg_rel_orig" ;;
+            *)
+              echo "ERROR: the RUNNING working directory of \$reg_unit is not absolute ('\$reg_cwd') while resolving the RELATIVE --id-dir '\$reg_rel_orig'; refusing before any switchover (K14-N1)" >&2
+              exit 3 ;;
+          esac
+          echo "  note: relative --id-dir '\$reg_rel_orig' resolved against the RUNNING cwd to \$reg_rt_id (K14-N1)" >&2 ;;
+      esac
       echo "  runtime-id-dir: \$reg_rt_id"
     else
       echo "ERROR: occupant unit \$reg_unit of port $REGISTRY_PORT/tcp was identified but its unit file cannot be located in any standard directory; refusing before any switchover (K2-R3)" >&2
@@ -2286,6 +2344,28 @@ real_run() {
   # as an unresolved conflict.
   REMOTE_DATA_PREOWNED=0
   [ -n "$runtime_id" ] && [ "$runtime_id" = "$REMOTE_DATA" ] && REMOTE_DATA_PREOWNED=1
+  # K 复核 K14-N1: the generated unit carries ABSOLUTE identity paths ONLY.
+  # A relative --id-dir meant <running-cwd>/... for the RUNNING instance;
+  # keeping it relative in the new unit (or ReadWritePaths) would make it
+  # resolve against the NEW unit's own cwd and silently change the identity.
+  # phase1 already resolved the runtime identity to an absolute dir; rewrite
+  # a relative --id-dir argument and a relative REG_RW to that same absolute
+  # source. (Policy: absolute paths only — no WorkingDirectory= guessing.)
+  if [ -n "$runtime_id" ]; then
+    case "$REG_RW" in
+      /*) : ;;
+      ?*) REG_RW=$runtime_id
+           note "relative identity dir rewritten to the RUNNING-resolved absolute path: REG_RW=$REG_RW (K14-N1)" ;;
+    esac
+    rel_id=$(printf '%s\n' "$REGISTRY_EXEC" | sed -n 's/.*--id-dir[= ]\([^ ]*\).*/\1/p' | head -1)
+    case "$rel_id" in
+      /*|'') : ;;
+      *)
+        REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir $rel_id/--id-dir $runtime_id}
+        REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir=$rel_id/--id-dir=$runtime_id}
+        note "relative --id-dir '$rel_id' rewritten to the RUNNING-resolved $runtime_id (K14-N1)" ;;
+    esac
+  fi
 
   # ---- phase 4/5/6: install + systemd + firewall ----------------------------
   phase "4-6/7 install, systemd, firewall"

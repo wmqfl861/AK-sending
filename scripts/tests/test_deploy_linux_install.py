@@ -927,9 +927,14 @@ class ProbeHarness(unittest.TestCase):
                                               encoding="utf-8", newline="\n")
         (proc / "4243" / "cgroup").write_text("0::/system.slice/oldsignal.service\n",
                                               encoding="utf-8", newline="\n")
+        # Default argv mirrors the default unit's own arguments — the
+        # running instance was started by that unit (round 9: the
+        # cross-check compares EFFECTIVE values, defaults included, so the
+        # fixture must state what the instance actually runs).
+        if not cmdline_extra:
+            cmdline_extra = "--port 17200 --id-dir /home/otheruser/.ak-sending"
         cmdline = b"/opt/ak-sending/ak-cli\0registry-server\0"
-        if cmdline_extra:
-            cmdline += cmdline_extra.encode() + b"\0"
+        cmdline += cmdline_extra.encode() + b"\0"
         (proc / "4242" / "cmdline").write_bytes(cmdline)
         home = self.probe / "home" / "otheruser" / ".ak-sending"
         home.mkdir(parents=True, exist_ok=True)
@@ -1613,7 +1618,8 @@ echo "C4=[$c4]"
         # from the all-dir lookup, so the config was dropped and the deploy
         # silently re-pointed the identity to the default dir.
         self.make_private_discovery_model(occupant="ak-registry-server.service",
-                                          vendor=True)
+                                          vendor=True,
+                                          cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
         vendor_unit = (self.probe / "usr" / "lib" / "systemd" / "system"
                        / "ak-registry-server.service")
         vendor_unit.write_text(
@@ -1855,6 +1861,96 @@ echo "C4=[$c4]"
         self.assertIn("/var/lib/ak-legacy/old.db", exec_line[0])
         self.assertNotIn("new.db", exec_line[0])
 
+    # -- K2-R3 (round 9): EFFECTIVE values, defaults included ------------------
+    def test_k2r3_runtime_default_db_vs_configured_explicit_refuses(self):
+        # Reviewer repro (a): the running instance has NO explicit --db-path
+        # (its effective db is the id-dir's registry.db, per ak-cli's
+        # registry_db_path()); the unit config explicitly sets new.db.
+        # Round 8 skipped the comparison because the running side omitted
+        # the flag, so phase1+decision both passed and new.db was chosen.
+        # Effective-value comparison now refuses BOTH stages.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /home/otheruser/.ak-sending "
+                      "--db-path /home/otheruser/.ak-sending/new.db",
+            cmdline_extra="--port 17200 --id-dir /home/otheruser/.ak-sending")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a runtime default db must compare against a configured explicit db")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("materially disagrees with the running cmdline", p1_out)
+        self.assertNotRegex(p1_out, r"(?m)^  ExecStart=.*new\.db$")
+        # The decision on the refused report fails too (no CHOSEN config).
+        block = self.decision_block(self.text, "the current script")
+        rc, out = self.run_decision(block, p1_out, "driver-decision-r9.sh")
+        self.assertNotEqual(rc, 0,
+                            "the decision must refuse on a phase1 ERROR report:\n" + out)
+        self.assertNotIn("CHOSEN_", out)
+
+    def test_k2r3_explicit_runtime_default_db_still_refuses(self):
+        # Reviewer single-variable control (b): spelling the ALREADY-
+        # EFFECTIVE runtime value out explicitly keeps refusing (this
+        # worked in round 8; it must keep working with defaults derived).
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /home/otheruser/.ak-sending "
+                      "--db-path /home/otheruser/.ak-sending/new.db",
+            cmdline_extra="--port 17200 --id-dir /home/otheruser/.ak-sending "
+                          "--db-path /home/otheruser/.ak-sending/registry.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("materially disagrees with the running cmdline", p1_out)
+
+    def test_k2r3_both_sides_implicit_db_passes(self):
+        # Control (c): BOTH sides omit --db-path with the same explicit
+        # id-dir — both effective dbs are <id-dir>/registry.db; accepted,
+        # and the config chain carries no --db-path (default semantics).
+        self.make_private_discovery_model(
+            cmdline_extra="--port 17200 --id-dir /home/otheruser/.ak-sending")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out, r"(?m)^  ExecStart=.*--id-dir /home/otheruser/\.ak-sending$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-r9c.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertNotIn("--db-path", exec_line[0])
+
+    def test_k2r3_equivalent_default_spellings_pass(self):
+        # Control (d): equivalent defaults with different explicit
+        # spellings — runtime --id-dir X with an IMPLICIT db (effective
+        # X/registry.db) vs config --id-dir X with an EXPLICIT X/registry.db
+        # — agree and pass, keeping the explicit spelling in CHOSEN_EXEC.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /var/lib/ak-legacy "
+                      "--db-path /var/lib/ak-legacy/registry.db",
+            cmdline_extra="--port 17200 --id-dir /var/lib/ak-legacy")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  ExecStart=.*--db-path /var/lib/ak-legacy/registry\.db$")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-r9d.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("/var/lib/ak-legacy/registry.db", exec_line[0])
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -1961,7 +2057,8 @@ echo "C4=[$c4]"
         # K2-R3(b): the cmdline line is TERMINATED — the machine field
         # 'old-registry-unit' must start at column 0 on its OWN line even
         # though /proc/<pid>/cmdline has no trailing newline.
-        self.assertRegex(p1_out, r"(?m)^  cmdline: /opt/ak-sending/ak-cli registry-server *$")
+        self.assertRegex(p1_out, r"(?m)^  cmdline: /opt/ak-sending/ak-cli registry-server "
+                         r"--port 17200 --id-dir /home/otheruser/\.ak-sending *$")
         self.assertRegex(p1_out, r"(?m)^  old-registry-unit: oldregistry\.service$")
         log = self.stubs_log()
         self.assertIn("sudo -n ss -ltnp", log)
@@ -2391,6 +2488,38 @@ class BaselineContrastTests(ProbeHarness):
         self.assertEqual(rc, 0, out)
         self.assertIn("CHOSEN_RW=/var/lib/ak-default", out,
                       "the round-7 candidate selected the wrong identity dir (the defect)")
+
+    def test_k2r3_round7_candidate_runtime_default_db_selects_new_db(self):
+        # K8-review contrast (e): the reviewer's exact default-db fixture —
+        # the running instance relies on the id-dir's default registry.db
+        # while the unit config explicitly sets new.db. The round-7
+        # candidate compared only EXPLICIT running flags, so both stages
+        # passed and new.db was chosen; the current tree refuses.
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server --port 17200 "
+                      "--id-dir /home/otheruser/.ak-sending "
+                      "--db-path /home/otheruser/.ak-sending/new.db",
+            cmdline_extra="--port 17200 --id-dir /home/otheruser/.ak-sending")
+        text = self.baseline_text(PREV7_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev7b.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1prev7b.sh" > "$PROBE_DIR/p1prev7b.out" 2>&1; echo "RUN_RC=$?"\n'
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV7_REV) + BOX_MODELS, body,
+                                  name="driver-prev7b-p1.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-7 candidate passed phase1 on the default-db conflict (the defect)")
+        p1_out = (self.probe / "p1prev7b.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev7b-decision.sh", text=text,
+            origin=f"the {PREV7_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")]
+        self.assertTrue(exec_line, out)
+        self.assertIn("/home/otheruser/.ak-sending/new.db", exec_line[0],
+                      "the round-7 candidate chose the configured new.db over the "
+                      "running default registry.db (the defect)")
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

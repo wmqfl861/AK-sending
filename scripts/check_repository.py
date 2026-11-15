@@ -79,34 +79,36 @@ STATUS_DOC = "docs/STATUS.zh-CN.md"
 LATEST_VERIFICATION_HEADING = "## 最新验证"
 HANDOFF_NAME_RE = re.compile(r"^HANDOFF-BATCH-([A-Z])-(\d{4}-\d{2}-\d{2})\.zh-CN\.md$")
 # Markdown inline links per the CommonMark destination+title grammar
-# (spec 0.31.2 examples 505/510, link-destination definition): `[label](
-# dest "title" )` — optional whitespace (including newlines) after "(",
-# a destination that is EITHER a bare run of non-whitespace non-paren
-# characters OR a complete `<…>` form whose content may contain spaces
-# and newlines (only blank lines are forbidden, mirroring the title
-# treatment; no "<", ">" inside), optional whitespace, an optional title
-# in double quotes, single quotes OR bare parentheses, optional
-# whitespace, ")". Titles may span lines per the 0.31.2 link-title
-# definition; only BLANK lines inside a title are forbidden, so every
-# title form is `first-line (NEWLINE non-empty-line)*` with no trailing
-# newline (K6 review §1). The angle destination is parsed IN the pattern
-# (K7 review §1: post-hoc unwrapping of a whitespace-stopped bare token
-# missed `<archive space/…>` entirely); the captured group keeps the
-# angle wrapper and _link_destination unwraps it BEFORE stripping the
-# fragment for every consumer. Still out of scope for the FULL pattern
-# (and therefore rejected by the handoff gate's HANDOFF_LINK_PREFIX_RE
-# backstop below instead of silently ignored): backslash escapes, nested
-# parens inside a parenthesized title, titles or angle destinations
-# containing blank lines, and whitespace between "]" and "(" (too close
-# to prose like "array[0] (…)" to parse as a link). The pattern is
-# matched over the WHOLE document — `[^\]]*` labels legally span lines,
-# and a per-line scan silently skips multi-line labels (K4 review §1).
-# Both the repo-wide link walk in check() and the STATUS handoff gate
-# use this one pattern, so every supported link form is parsed
-# consistently.
+# (spec 0.31.2 examples 505/510, link-destination/-title definitions):
+# `[label]( dest "title" )` — optional whitespace (including newlines)
+# after "(", a destination that is EITHER a bare run of non-whitespace
+# non-paren characters OR a complete `<…>` form. Angle destinations may
+# contain SPACES but NO LINE ENDINGS ("contains no line endings",
+# 0.31.2 link-destination definition) and no "<", ">" — the K8 review
+# correction; newlines inside <…> are NOT a legal link. TITLES, by
+# contrast, may span lines (0.31.2 link-title definition); only BLANK
+# lines inside a title are forbidden, so every title form is
+# `first-line (NEWLINE non-empty-line)*` with no trailing newline (K6
+# review §1). The angle destination is parsed IN the pattern (K7 review
+# §1: post-hoc unwrapping of a whitespace-stopped bare token missed
+# `<archive space/…>` entirely); the captured group keeps the angle
+# wrapper and _link_destination unwraps it BEFORE stripping the fragment
+# for every consumer. Still out of scope for the FULL pattern: backslash
+# escapes, nested parens inside a parenthesized title, blank lines
+# inside a title, any line ending inside an angle destination, and
+# whitespace between "]" and "(" (too close to prose like "array[0] (…)"
+# to parse as a link). Handoff-shaped entries in most of those forms are
+# rejected by the HANDOFF_LINK_PREFIX_RE backstop below — except forms
+# whose destination cannot even be tokenized (e.g. an unclosed "<" with
+# no matching ">"), which remain unmatched; no claim is made that every
+# unparsed form is rejected. The pattern is matched over the WHOLE
+# document — `[^\]]*` labels legally span lines, and a per-line scan
+# silently skips multi-line labels (K4 review §1). Both the repo-wide
+# link walk in check() and the STATUS handoff gate use this one pattern,
+# so every supported link form is parsed consistently.
 MARKDOWN_LINK_RE = re.compile(
     r"\[[^\]]*\]\(\s*"
-    r"(<[^<>\n]*(?:\n[^<>\n]+)*>|[^\s)]+)"
+    r"(<[^<>\n]*>|[^\s)]+)"
     r"(?:\s+(?:"
     r"\"[^\"\n]*(?:\n[^\"\n]+)*\""
     r"|'[^'\n]*(?:\n[^'\n]+)*'"
@@ -114,21 +116,27 @@ MARKDOWN_LINK_RE = re.compile(
     r"))?"
     r"\s*\)"
 )
-# Fail-closed backstop for the STATUS handoff gate (K5/K6/K7 reviews
-# §1): a construct that looks like a handoff link — "](" followed by a
-# destination in the SAME grammar as MARKDOWN_LINK_RE (angle-wrapped
-# destinations are captured whole, spaces included) — but that
-# MARKDOWN_LINK_RE cannot parse IN FULL (blank line inside a title,
-# backslash escapes, or a link hidden inside another link's parsed title
-# region) is reported as an unparsed handoff entry with its UNTRUNCATED
-# destination, never silently skipped. Coverage rule: a prefix whose
-# start lies inside a successfully parsed link's label/destination
-# region is part of that link, not a separate entry; "]" cannot occur
-# inside the label and a bare destination contains no parens, so
-# anything after the destination end is title/body text, where a "]("
-# handoff token is a hidden entry.
+# Fail-closed backstop for the STATUS handoff gate (K5–K8 reviews §1):
+# a construct that looks like a handoff link — "](" followed by a
+# destination token — but that MARKDOWN_LINK_RE cannot parse IN FULL is
+# reported as an unparsed handoff entry with its UNTRUNCATED
+# destination, never silently skipped. The angle alternative here is
+# deliberately TOLERANT (`<[^<>]*>`: newlines and blank lines included,
+# unlike the spec-strict full pattern): any line ending inside an angle
+# destination is illegal per CommonMark (K8 correction) and thus never
+# full-parsed, so the backstop is what captures such entries — spaces,
+# single newlines or blank lines — whole and rejects them. Other caught
+# forms: blank line inside a title, backslash escapes, or a link hidden
+# inside another link's parsed title. Forms whose destination cannot
+# even be tokenized (an unclosed "<" with no matching ">") remain
+# unmatched — no claim that every unparsed form is rejected. Coverage
+# rule: a prefix whose start lies inside a successfully parsed link's
+# label/destination region is part of that link, not a separate entry;
+# "]" cannot occur inside the label and a bare destination contains no
+# parens, so anything after the destination end is title/body text,
+# where a "](" handoff token is a hidden entry.
 HANDOFF_LINK_PREFIX_RE = re.compile(
-    r"\[[^\]]*\]\(\s*(<[^<>\n]*(?:\n[^<>\n]+)*>|[^\s)>]+)"
+    r"\[[^\]]*\]\(\s*(<[^<>]*>|[^\s)>]+)"
 )
 # Windows drive-letter targets (`C:\…`, `C:/…`) are absolute jumps, not
 # relative links, even though they contain no `://`.
@@ -362,7 +370,13 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
     parsed inside the shared pattern (spaces included), the backstop
     uses the same destination grammar so its rejections carry the
     UNTRUNCATED destination, and the wrapper is unwrapped before the
-    fragment is stripped.
+    fragment is stripped. K8 (REVIEW_2026-11-15-batchK8.zh-CN.md §2,
+    nonblocking correction): angle destinations may contain spaces but
+    NO line endings ("contains no line endings", 0.31.2
+    link-destination definition — spanning non-blank lines is a TITLE
+    property); the full pattern forbids newlines in <…> and the
+    tolerant-angle backstop explicitly rejects handoff-shaped entries
+    whose angle destination contains any line ending.
 
     Returns (canonical newest handoff path the CR-P3-20 checks must anchor
     to, errors). The run-number/contradiction gates always anchor to the
@@ -470,11 +484,11 @@ def status_handoff_issues(root: Path, status_text: str) -> tuple[Path | None, li
         lineno = status_text.count("\n", 0, prefix.start()) + 1
         errors.append(
             f"{STATUS_DOC}:{lineno}: handoff-shaped entry pointing at {token} "
-            "is not a supported/parseable Markdown inline link (blank line "
-            "inside the title, angle-bracket destination, escape sequence, "
-            f"or hidden inside another link's title) — rejected instead of "
-            f"silently ignored; write the current handoff as "
-            f"[label]({newest.name})"
+            "is not a supported/parseable Markdown inline link (a line "
+            "ending inside the angle destination, blank line inside the "
+            "title or angle destination, escape sequence, or hidden inside "
+            f"another link's title) — rejected instead of silently "
+            f"ignored; write the current handoff as [label]({newest.name})"
         )
     if not saw_handoff_link:
         return newest, errors + [

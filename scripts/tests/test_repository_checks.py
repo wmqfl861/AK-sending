@@ -309,12 +309,18 @@ class StatusHandoffLinkTests(unittest.TestCase):
     destinations are unwrapped in both consumers.
 
     K7 (REVIEW_2026-11-15-batchK7.zh-CN.md §1): <…> destinations may
-    contain SPACES (and newlines) — the angle form is parsed inside the
-    shared destination grammar (post-hoc unwrapping of a
-    whitespace-stopped token missed `<archive space/…>` entirely), the
-    backstop uses the same grammar so its rejections carry the
-    untruncated destination, and the wrapper is unwrapped before the
-    fragment is stripped.
+    contain SPACES — the angle form is parsed inside the shared
+    destination grammar (post-hoc unwrapping of a whitespace-stopped
+    token missed `<archive space/…>` entirely), and the wrapper is
+    unwrapped before the fragment is stripped.
+
+    K8 (REVIEW_2026-11-15-batchK8.zh-CN.md §2, nonblocking correction):
+    angle destinations may contain NO line endings ("contains no line
+    endings", 0.31.2 link-destination definition — spanning non-blank
+    lines is a TITLE property, not a destination property). The full
+    pattern forbids newlines in <…>; handoff-shaped entries with any
+    line ending inside the angle destination are explicitly rejected by
+    the tolerant-angle backstop naming the untruncated destination.
     """
 
     @staticmethod
@@ -1024,12 +1030,14 @@ class StatusHandoffLinkTests(unittest.TestCase):
                     self.assertEqual(errors, [])
                     self.assertEqual(path.name, name)
 
-    def test_angle_newline_destination_is_parsed_strictly(self):
-        # A newline inside <…> is legal CommonMark whitespace, but it is
-        # NOT a space: the resolved path contains a literal newline, no
-        # such file exists, and the gate fails with a definite
-        # does-not-exist error at the entry's line (previously the entry
-        # was silently missed).
+    def test_angle_newline_destination_rejected_by_backstop(self):
+        # K8 correction: an angle destination containing a newline is NOT
+        # a legal CommonMark link ("contains no line endings", 0.31.2
+        # link-destination definition) — spanning non-blank lines is a
+        # TITLE property. The round-8 full pattern wrongly parsed this
+        # form; now the full pattern rejects newlines in <…> and the
+        # tolerant-angle backstop explicitly rejects the entry naming its
+        # UNTRUNCATED destination.
         name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
         archive = chr(91) + "K](<archive\nspace/" + name + ">)"
         with tempfile.TemporaryDirectory() as tmp:
@@ -1039,7 +1047,27 @@ class StatusHandoffLinkTests(unittest.TestCase):
                 root, self._k5_status(archive))
             self.assertEqual(len(errors), 1, errors)
             self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
-            self.assertIn("does not exist", errors[0])
+            self.assertIn("<archive\nspace/HANDOFF-BATCH-K-2026-11-14.zh-CN.md>", errors[0])
+            self.assertIn("not a supported/parseable Markdown inline link", errors[0])
+            self.assertIn("line ending inside the angle destination", errors[0])
+            self.assertEqual(path.name, name)
+
+    def test_angle_blank_line_destination_rejected_by_backstop(self):
+        # Blank line inside an angle destination is equally illegal; the
+        # tolerant-angle backstop captures it whole and rejects it (the
+        # K8 review noted the candidate could not previously guarantee
+        # rejecting blank-line angle forms).
+        name = "HANDOFF-BATCH-K-2026-11-14.zh-CN.md"
+        archive = chr(91) + "K](<archive\n\nspace/" + name + ">)"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_handoff_space_pair(root)
+            path, errors = checks.status_handoff_issues(
+                root, self._k5_status(archive))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertTrue(errors[0].startswith(f"{checks.STATUS_DOC}:9:"), errors[0])
+            self.assertIn("<archive\n\nspace/HANDOFF-BATCH-K-2026-11-14.zh-CN.md>", errors[0])
+            self.assertIn("not a supported/parseable Markdown inline link", errors[0])
             self.assertEqual(path.name, name)
 
     def test_backstop_rejects_angle_space_with_blank_line_title(self):

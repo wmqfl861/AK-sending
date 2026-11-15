@@ -660,8 +660,13 @@ self_test() {
   # data/identity flags (--id-dir, --db-path) plus the listen surface.
   grep -q 'unreadable or empty' "$WORK/p1.sh" \
     || fail "an unreadable running cmdline must refuse instead of skipping the cross-check (K2-R3)"
-  grep -q 'for re_arg in --id-dir --db-path --port --bind' "$WORK/p1.sh" \
-    || fail "the compared argument surface must include --db-path and the listen flags (K2-R3)"
+  # K 复核 K2-R3 (round 9): EFFECTIVE values, defaults included — the
+  # db-path default must be derived from the effective id-dir, and an
+  # unestablishable environment-dependent default must refuse.
+  grep -q 'a_db="\$a_id/registry.db"' "$WORK/p1.sh" \
+    || fail "an omitted --db-path must compare as <effective id-dir>/registry.db (K2-R3)"
+  grep -q 'cannot be established from its arguments' "$WORK/p1.sh" \
+    || fail "an environment-dependent default on one side only must refuse (K2-R3)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -982,12 +987,52 @@ effective_execstart() {
 # surface (occupancy-relevant). Values absent from the cmdline are not
 # compared — the process may rely on defaults.
 reg_args_agree() {
-  local a b re_arg
-  for re_arg in --id-dir --db-path --port --bind; do
-    a=\$(printf '%s\\n' "\$1" | sed -n "s/.*\$re_arg[= ]\\([^ ]*\\).*/\\1/p")
-    b=\$(printf '%s\\n' "\$2" | sed -n "s/.*\$re_arg[= ]\\([^ ]*\\).*/\\1/p")
-    if [ -n "\$b" ] && [ "\$a" != "\$b" ]; then return 1; fi
-  done
+  # K 复核 K2-R3 (round 9): compare EFFECTIVE values, DEFAULTS INCLUDED —
+  # round 8 compared an explicit value only when the RUNNING side spelled
+  # the flag out, so a running instance relying on the default db location
+  # was silently switched to a configured --db-path pointing elsewhere.
+  # Defaults verified against ak-cli itself (crates/ak-cli/src/main.rs):
+  #   --db-path : <effective --id-dir>/registry.db  (registry_db_path());
+  #               main.rs:3792 uses it when db_path is None.
+  #   --id-dir  : <USERPROFILE|HOME>/.ak-sending (id_dir(), main.rs:709) —
+  #               ENV-DEPENDENT: an omitted side's effective value cannot
+  #               be established from its arguments alone.
+  #   --port    : constant 7200 (ak-signal DEFAULT_V2_PORT).
+  #   --bind    : constant 0.0.0.0 (resolve_listen_addr default).
+  # rc 0 = agree; rc 1 = materially differ; rc 2 = an effective value's
+  # actual source cannot be established (one side relies on an
+  # environment-dependent default the other side does not share).
+  local a_id b_id a_db b_db a_port b_port a_bind b_bind
+  a_id=\$(printf '%s\\n' "\$1" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+  b_id=\$(printf '%s\\n' "\$2" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+  if [ "\$a_id" != "\$b_id" ]; then
+    if [ -z "\$a_id" ] || [ -z "\$b_id" ]; then
+      printf '%s\\n' "[preflight] the effective --id-dir of one side relies on the service environment and cannot be established from its arguments (configured '\$1' vs running '\$2')" >&2
+      return 2
+    fi
+    return 1
+  fi
+  a_db=\$(printf '%s\\n' "\$1" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
+  b_db=\$(printf '%s\\n' "\$2" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
+  if [ -z "\$a_db" ] && [ -n "\$a_id" ]; then a_db="\$a_id/registry.db"; fi
+  if [ -z "\$b_db" ] && [ -n "\$b_id" ]; then b_db="\$b_id/registry.db"; fi
+  if [ "\$a_db" != "\$b_db" ]; then
+    if [ -z "\$a_db" ] || [ -z "\$b_db" ]; then
+      printf '%s\\n' "[preflight] the effective --db-path of one side relies on the service-environment default and cannot be established (configured '\$1' vs running '\$2')" >&2
+      return 2
+    fi
+    return 1
+  fi
+  a_port=\$(printf '%s\\n' "\$1" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
+  b_port=\$(printf '%s\\n' "\$2" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
+  if [ -z "\$a_port" ]; then a_port=7200; fi
+  if [ -z "\$b_port" ]; then b_port=7200; fi
+  if [ "\$a_port" != "\$b_port" ]; then return 1; fi
+  a_bind=\$(printf '%s\\n' "\$1" | sed -n 's/.*--bind[= ]\\([^ ]*\\).*/\\1/p')
+  b_bind=\$(printf '%s\\n' "\$2" | sed -n 's/.*--bind[= ]\\([^ ]*\\).*/\\1/p')
+  if [ -z "\$a_bind" ]; then a_bind=0.0.0.0; fi
+  if [ -z "\$b_bind" ]; then b_bind=0.0.0.0; fi
+  if [ "\$a_bind" != "\$b_bind" ]; then return 1; fi
   return 0
 }
 for u in ak-registry-server ak-stun-server; do
@@ -1119,9 +1164,17 @@ REG_EFF_H
         echo "ERROR: \$reg_unit has no effective ExecStart; refusing before any switchover (K2-R3)" >&2
         exit 3
       fi
-      # K 复核 K2-R3 (round 8): unconditional — the cmdline was verified
-      # non-empty above, and a failed read already refused.
-      if ! reg_args_agree "\$reg_pick" "\$reg_cmdline"; then
+      # K 复核 K2-R3 (round 8/9): unconditional — the cmdline was verified
+      # non-empty above, and a failed read already refused. rc 2 = an
+      # effective value's source cannot be established (environment-
+      # dependent default); rc 1 = material disagreement. Both refuse.
+      rag_rc=0
+      reg_args_agree "\$reg_pick" "\$reg_cmdline" || rag_rc=\$?
+      if [ "\$rag_rc" = 2 ]; then
+        echo "ERROR: the effective configuration of \$reg_unit cannot be established against the running cmdline (an effective value relies on an environment-dependent default); refusing before any switchover (K2-R3)" >&2
+        exit 3
+      fi
+      if [ "\$rag_rc" = 1 ]; then
         echo "ERROR: the effective ExecStart of \$reg_unit materially disagrees with the running cmdline (configured '\$reg_pick' vs running '\$reg_cmdline'); refusing before any switchover (K2-R3)" >&2
         exit 3
       fi

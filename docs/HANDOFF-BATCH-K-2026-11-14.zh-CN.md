@@ -1176,4 +1176,4 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 | 提交 | 内容 |
 |---|---|
-| （修复轮十六首个提交，推送后回填哈希） | PIPESTATUS 读取者守卫、grep rc triage、纯字符串 db 改写+白名单；复核方文档同步与执行方本节记录入库 |
+| `f2574cb` | PIPESTATUS 读取者守卫、grep rc triage、纯字符串 db 改写+白名单；复核方文档同步与执行方本节记录入库 |

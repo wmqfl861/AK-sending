@@ -76,7 +76,10 @@ PREV6_REV = "e8f811d"  # round-6 candidate (K6 findings: absent-file +
 PREV7_REV = "bb1f673"  # round-7 candidate (K7 findings: cmdline read
                         # failure skipped the cross-check, --db-path uncompared)
 PREV8_REV = "12a71c9"
-PREV9_REV = "806ea6c"  # round-9 candidate (K10 findings: environ parsing
+PREV9_REV = "806ea6c"
+PREV10_REV = "1fad0a2"  # round-11 candidate (K12 findings: LF truncation,
+                         # config-cwd resolution, swallowed key chmod)
+PREV10_PRE_REV = "09fceb6"  # round-10 tip (pre-move key chmod: set -e caught it)  # round-9 candidate (K10 findings: environ parsing
                         # semantics, destination conflicts skipped)  # round-8 candidate (K9 finding: migration source
                         # picked by enumeration order, not runtime identity)
 
@@ -481,8 +484,7 @@ exit 0
 
 CMP_STUB = r"""#!/usr/bin/env bash
 set -u
-printf 'cmp %s
-' "$*" >> "$PROBE_DIR/stubs.log"
+printf 'cmp %s\n' "$*" >> "$PROBE_DIR/stubs.log"
 mapped=()
 for a in "$@"; do
   case "$a" in
@@ -491,6 +493,17 @@ for a in "$@"; do
   esac
 done
 exec "@REAL_CMP@" "${mapped[@]}"
+"""
+
+CHMOD_STUB = r"""#!/usr/bin/env bash
+set -u
+printf 'chmod %s\n' "$*" >> "$PROBE_DIR/stubs.log"
+# K12-N1 model: only the PRIVATE-KEY chmod fails; everything else behaves.
+if [ "${FAIL_KEY_CHMOD:-0}" = 1 ] && [ "$1" = 600 ] && [ "${@: -1}" = "$PROBE_DIR/opt-ak/data/registry.key" ]; then
+  echo "chmod stub: forced key permission failure" >&2
+  exit 1
+fi
+exec "@REAL_CHMOD@" "$@"
 """
 
 MV_STUB = r"""#!/usr/bin/env bash
@@ -560,6 +573,23 @@ case "$target" in
       exit 0
     fi
     ;;
+  # K10-N1(b) round 13: the RUNNING process's actual working directory
+  # (PROC_CWD_MAP="/proc/<pid>/cwd=<abs path>"; a mapping of 'unreadable'
+  # makes the read fail like a denied /proc read would).
+  /proc/[0-9]*/cwd)
+    if [ -n "${PROC_CWD_MAP:-}" ]; then
+      while IFS='=' read -r k v; do
+        if [ "$k" = "$target" ]; then
+          if [ "$v" = "unreadable" ]; then
+            echo "readlink stub: forced cwd read failure" >&2
+            exit 1
+          fi
+          printf '%s\n' "$v"
+          exit 0
+        fi
+      done <<< "$PROC_CWD_MAP"
+    fi
+    ;;
 esac
 echo "readlink stub: no mapping for $target" >&2
 exit 1
@@ -603,6 +633,7 @@ STUBS = {
     "sleep": SLEEP_STUB, "test": TEST_STUB, "cp": CP_STUB, "cat": CAT_STUB,
     "sed": SED_STUB, "readlink": READLINK_STUB, "ls": LS_STUB, "mv": MV_STUB,
     "cmp": CMP_STUB,
+    "chmod": CHMOD_STUB,
 }
 _REAL_TOOLS = {}
 
@@ -777,7 +808,7 @@ class ProbeHarness(unittest.TestCase):
             stub = self.probe / "bin" / name
             stub.write_text(body, encoding="utf-8", newline="\n")
             stub.chmod(0o755)
-        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp"):
+        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp", "chmod"):
             real = _posix_tool(tool)
             self.assertTrue(real, f"real {tool} is required for the stubs")
             stub = self.probe / "bin" / tool
@@ -1079,7 +1110,9 @@ class ProbeHarness(unittest.TestCase):
         nl = chr(10)
         hook = self.probe / "late_commit.py"
         hook.write_text(
-            "import sqlite3, sys" + nl
+            "import pathlib, sqlite3, sys" + nl
+            + "assert pathlib.Path(sys.argv[2]).read_text().strip() == 'active', "
+            "'commit landed after the service went inactive'" + nl
             + "with sqlite3.connect(sys.argv[1]) as c:" + nl
             + "    c.execute(\"UPDATE invite_codes SET state='revoked', "
             "revision=revision+1 WHERE code_id=? AND revision=1 AND "
@@ -1087,7 +1120,8 @@ class ProbeHarness(unittest.TestCase):
             + "print('LATE_COMMIT=revoked')" + nl,
             encoding="utf-8", newline="\n")
         return ("python @PROBE_DIR@/late_commit.py"
-                " @PROBE_DIR@/home/otheruser/.ak-sending/registry.db")
+                " @PROBE_DIR@/home/otheruser/.ak-sending/registry.db"
+                " @PROBE_DIR@/systemctl-state/oldregistry.service.active")
 
     def _db_rows(self, path):
         import sqlite3
@@ -2218,57 +2252,103 @@ echo "C4=[$c4]"
         self.assertNotIn("runtime-id-dir:", p1_out)
 
     # -- K10-N1: environ existence semantics and NUL-record boundaries --------
-    def test_k10n1_empty_userprofile_resolves_working_directory(self):
-        # Reviewer repro (a): USERPROFILE is PRESENT but EMPTY with
-        # HOME=/home/otheruser and WorkingDirectory=/var/lib/oldregistry.
-        # The CLI (main.rs id_dir(): var_os().or_else()) treats Some("") as
-        # NO fallback — the identity is the RELATIVE .ak-sending under the
-        # working directory, i.e. /var/lib/oldregistry/.ak-sending. Round 10
-        # treated the empty variable as absent and wrongly selected HOME.
+    def test_k10n1_empty_userprofile_resolves_runtime_cwd_not_config(self):
+        # K12-review fixture (b): USERPROFILE is PRESENT but EMPTY; the unit's
+        # CONFIG WorkingDirectory points at /home/configured-new while the
+        # RUNNING process's actual cwd (/proc/4242/cwd) is /home/runtime-old
+        # — a started-then-edited unit is a legitimate state. Rounds <= 12
+        # resolved the relative .ak-sending against the CONFIG value and
+        # picked the configured decoy; the runtime cwd is the only evidence
+        # bound to the running instance.
         self.make_private_discovery_model(
             main_exec=self.K9_BASE,
             cmdline_extra="--port 17200",
             unit_service_lines=["User=otheruser",
-                                "WorkingDirectory=/var/lib/oldregistry",
+                                "WorkingDirectory=/home/configured-new",
                                 "Environment=HOME=/home/otheruser",
                                 "Environment=USERPROFILE="],
             environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
-        legacy = self.probe / "var/lib/oldregistry/.ak-sending"
-        legacy.mkdir(parents=True, exist_ok=True)
-        (legacy / "registry.key").write_text("wd-key", encoding="utf-8")
-        (legacy / "registry.db").write_text("wd-db", encoding="utf-8")
+        for rel, tag in (("home/runtime-old", "runtime-real"),
+                         ("home/configured-new", "configured-decoy")):
+            d = self.probe / rel / ".ak-sending"
+            d.mkdir(parents=True, exist_ok=True)
+            for name in ("registry.key", "registry.db"):
+                (d / name).write_text(f"{tag}-{name}", encoding="utf-8")
         rc, out = self.generate_and_run_p456(
             'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
             'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
         self.assertRegex(p1_out,
-                         r"(?m)^  runtime-id-dir: /var/lib/oldregistry/\.ak-sending$")
-        self.assertNotIn("runtime-id-dir: /home/otheruser", p1_out)
+                         r"(?m)^  runtime-id-dir: /home/runtime-old/\.ak-sending$")
+        self.assertNotIn("runtime-id-dir: /home/configured-new", p1_out)
+        self.assertIn("readlink /proc/4242/cwd", self.stubs_log(),
+                      "the RUNNING cwd must actually be queried")
         rc, out = self.run_decision_and_config(p1_out, "driver-decision-k10a.sh")
         self.assertEqual(rc, 0, out)
-        self.assertIn("CHOSEN_DATA_SOURCE=/var/lib/oldregistry/.ak-sending", out)
-        self.assertNotIn("CHOSEN_DATA_SOURCE=/home/otheruser", out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/runtime-old/.ak-sending", out)
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/home/configured-new", out)
 
-    def test_k10n1_empty_userprofile_without_working_directory_refuses(self):
-        # Same empty-USERPROFILE input but NO absolute WorkingDirectory in
-        # the unit: the cwd is undeterminable — refuse rather than guess.
+    def test_k10n1_empty_userprofile_unreadable_cwd_refuses(self):
+        # Same relative-base input but the runtime cwd cannot be read
+        # (PROC_CWD_MAP marks it unreadable): refuse rather than fall back to
+        # the config WorkingDirectory or HOME.
         self.make_private_discovery_model(
             main_exec=self.K9_BASE,
             cmdline_extra="--port 17200",
             unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/configured-new",
                                 "Environment=HOME=/home/otheruser",
                                 "Environment=USERPROFILE="],
             environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
         rc, out = self.generate_and_run_p456(
             'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'PROC_CWD_MAP="/proc/4242/cwd=unreadable" '
             'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=3", out)
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
-        self.assertIn("working directory cannot be established", p1_out)
+        self.assertIn("cannot read the RUNNING working directory", p1_out)
         self.assertNotIn("runtime-id-dir:", p1_out)
+
+    def test_k10n1_value_with_embedded_lf_refuses_untruncated(self):
+        # K12-review fixture (a): a REAL USERPROFILE variable whose value
+        # contains an embedded LF ('/home/otheruser\nsuffix'). The CLI's
+        # var_os -> PathBuf -> join keeps the LF byte (reviewer verified by
+        # compiling main.rs:709-716), so the true identity dir is
+        # '/home/otheruser\nsuffix/.ak-sending'. Rounds <= 12 truncated at
+        # the LF and CONFIRMED '/home/otheruser/.ak-sending' — a different
+        # directory. This pipeline's evidence is line-based, so the honest
+        # behavior is to REFUSE the untransportable value, never
+        # truncate-then-confirm.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "EnvironmentFile=/etc/default/oldregistry"],
+            environ=b"HOME=/home/otheruser\0"
+                    b"USERPROFILE=/home/otheruser\nsuffix\0USER=otheruser\0")
+        envf = self.probe / "etc/default/oldregistry"
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_text("HOME=/home/otheruser\nUSERPROFILE='/home/otheruser\nsuffix'\n"
+                        "USER=otheruser\n", encoding="utf-8", newline="\n")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
+            'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n')
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "an LF-bearing path value must refuse, not confirm a "
+                      "truncated directory")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("cannot carry faithfully", p1_out)
+        self.assertNotRegex(p1_out, r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending")
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        # The truncated directory must never reach the config selection.
+        block = self.decision_block(self.text, "the current script")
+        rc, out = self.run_decision(block, p1_out, "driver-decision-k12lf.sh")
+        self.assertNotEqual(rc, 0, out)
 
     def test_k10n1_environ_value_with_newline_not_fabricated(self):
         # Reviewer repro (b): EXTRA's VALUE contains '\nUSERPROFILE=/root'.
@@ -2435,7 +2515,12 @@ echo "C4=[$c4]"
             old_registry="oldregistry",
             models="make_upgrade_model\n"
             'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n'
-            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n')
+            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n'
+            'echo 1 > "$PROBE_DIR/systemctl-state/oldregistry.service.enabled"\n'
+            'echo active > "$PROBE_DIR/systemctl-state/oldregistry.service.active"\n'
+            'echo 4242 > "$PROBE_DIR/systemctl-state/oldregistry.service.pid"\n'
+            'printf "%s\n" "$REMOTE_BIN" > "$PROBE_DIR/systemctl-state/4242.exe"\n'
+            'cp "$REMOTE_BIN" "$PROBE_DIR/systemctl-state/oldregistry.service.running.bin"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("INSTALL_RC=0", out)
         out456 = (self.probe / "p456k11a.out").read_text(encoding="utf-8")
@@ -2457,6 +2542,54 @@ echo "C4=[$c4]"
         self.assertEqual(self._db_rows(self.probe / "opt-ak" / "data" / "registry.db"),
                          [("revoked", 2)],
                          "the target database must include the late commit")
+
+    def test_k12n1_key_chmod_failure_enters_recovery(self):
+        # K12-N1: ONLY the private-key chmod fails (everything else normal),
+        # on an upgrade model where the key EXISTS. The old 'A && B' form
+        # inside do_switchover swallowed the failure (INSTALL_RC=0, new
+        # binary enabled, no recovery); now it returns 1 into the unified
+        # recovery: nonzero install result, services restored and running
+        # the OLD image.
+        rc, out = self._run_k10_install(
+            "", "1", "p456k12a",
+            run_env={"FAIL_KEY_CHMOD": "1"},
+            models="make_upgrade_model" + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=5", out,
+                      "a swallowed key-chmod failure must not exit success")
+        out456 = (self.probe / "p456k12a.out").read_text(encoding="utf-8")
+        self.assertIn("chmod stub: forced key permission failure", out456)
+        self.assertIn("RECOVERY OK", out456)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_OLD, "recovery must restore the old binary")
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active",
+                             f"{unit} must be running again after the recovery")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD)
+
+    def test_k12n1_key_chmod_success_control_proceeds(self):
+        # The no-injection control: the same model with a working chmod
+        # completes the upgrade normally.
+        rc, out = self._run_k10_install(
+            "", "1", "p456k12b",
+            models="make_upgrade_model" + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                         AK_CLI_STUB)
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_STUB)
+
+    def test_k12n1_fresh_install_without_key_skips_chmod(self):
+        # The key-ABSENT branch stays skipped: a fresh install (no key) never
+        # runs the key chmod and completes even with the injection armed.
+        rc, out = self._run_k10_install("", "0", "p456k12c",
+                                        run_env={"FAIL_KEY_CHMOD": "1"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        log = self.stubs_log()
+        self.assertNotIn("chmod 600", log,
+                         "the key chmod must not run when no key exists")
 
     def test_k10n2_fresh_install_onto_existing_identity_refuses(self):
         # Repro (d): NO migration source expected (fresh install) and the
@@ -3131,7 +3264,12 @@ class BaselineContrastTests(ProbeHarness):
                      "SYSTEMCTL_STOP_HOOK_UNIT": "oldregistry.service"},
             models="make_upgrade_model\n"
             'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n'
-            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n')
+            'printf "[Service]\nExecStart=/opt/ak-sending/ak-cli registry-server --port 17200\n" > "$PROBE_DIR/etc/systemd/system/oldregistry.service"\n'
+            'echo 1 > "$PROBE_DIR/systemctl-state/oldregistry.service.enabled"\n'
+            'echo active > "$PROBE_DIR/systemctl-state/oldregistry.service.active"\n'
+            'echo 4242 > "$PROBE_DIR/systemctl-state/oldregistry.service.pid"\n'
+            'printf "%s\n" "$REMOTE_BIN" > "$PROBE_DIR/systemctl-state/4242.exe"\n'
+            'cp "$REMOTE_BIN" "$PROBE_DIR/systemctl-state/oldregistry.service.running.bin"\n')
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out,
                       "the round-9 candidate succeeded with a stale target (the defect)")
@@ -3141,6 +3279,109 @@ class BaselineContrastTests(ProbeHarness):
                          [("active", 1)],
                          "the round-9 candidate's target missed the late commit "
                          "(the exact reviewed TOCTOU)")
+
+    def test_k10n1_round11_candidate_truncates_lf_value(self):
+        # K12-review contrast (a): the round-11 candidate (1fad0a2) on the
+        # real-LF-value fixture — its 'head -n 1' truncates USERPROFILE at
+        # the LF and CONFIRMS /home/otheruser/.ak-sending.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "EnvironmentFile=/etc/default/oldregistry"],
+            environ=b"HOME=/home/otheruser\0"
+                    b"USERPROFILE=/home/otheruser\nsuffix\0USER=otheruser\0")
+        envf = self.probe / "etc/default/oldregistry"
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_text("HOME=/home/otheruser\nUSERPROFILE='/home/otheruser\nsuffix'\n"
+                        "USER=otheruser\n", encoding="utf-8", newline="\n")
+        text = self.baseline_text(PREV10_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev10.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1prev10.sh" > "$PROBE_DIR/p1prev10.out" 2>&1; '
+            + 'echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV10_REV) + BOX_MODELS,
+                                  body, name="driver-prev10-lf.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-11 candidate confirmed the truncated dir (the defect)")
+        p1_out = (self.probe / "p1prev10.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+
+    def test_k10n1_round11_candidate_uses_config_cwd(self):
+        # K12-review contrast (b): the round-11 candidate resolves the
+        # relative base against the CONFIG WorkingDirectory and picks the
+        # configured decoy while the running cwd says otherwise.
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/configured-new",
+                                "Environment=HOME=/home/otheruser",
+                                "Environment=USERPROFILE="],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=\0USER=otheruser\0")
+        for rel, tag in (("home/runtime-old", "runtime-real"),
+                         ("home/configured-new", "configured-decoy")):
+            d = self.probe / rel / ".ak-sending"
+            d.mkdir(parents=True, exist_ok=True)
+            for name in ("registry.key", "registry.db"):
+                (d / name).write_text(f"{tag}-{name}", encoding="utf-8")
+        text = self.baseline_text(PREV10_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev10b.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev10b.sh" > "$PROBE_DIR/p1prev10b.out" 2>&1; '
+            + 'echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV10_REV) + BOX_MODELS,
+                                  body, name="driver-prev10-cwd.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev10b.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/configured-new/\.ak-sending$",
+                         "the round-11 candidate trusted the config cwd (the defect)")
+
+    def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
+        # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod
+        # failure — INSTALL_RC=0, the new binary enabled, no recovery —
+        # while 09fceb6 (pre-move, top-level set -e) caught it and left the
+        # box untouched on the old image.
+        for rev, expect_rc, expect_recovery in (
+                (PREV10_REV, "RUN_RC=0", False),
+                (PREV10_PRE_REV, "RUN_RC=1", False)):
+            with self.subTest(rev=rev):
+                self.setUp()
+                # In-place semantics (the model's REMOTE_DATA IS the runtime
+                # identity) so the K10-N2 fresh-dirty refusal stays out of
+                # the way; both baseline tips carry REMOTE_DATA_PREOWNED.
+                env_mode = self.P456_ENV_PREBUILT.replace(
+                    "CLOSE_7100=0 ", "CLOSE_7100=0 REMOTE_DATA_PREOWNED=1 ")
+                rc, out, p456_out = self.run_baseline_p456(
+                    rev, env_mode, f"p456chmod-{rev[:7]}",
+                    run_env={"FAIL_KEY_CHMOD": "1"},
+                    models="make_upgrade_model" + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn(expect_rc, out)
+                self.assertIn("chmod stub: forced key permission failure",
+                              p456_out)
+                if rev == PREV10_REV:
+                    self.assertNotIn("RECOVERY", p456_out,
+                                     "the round-11 candidate swallowed it (the defect)")
+                    self.assertEqual(
+                        (self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                        AK_CLI_STUB,
+                        "the round-11 candidate enabled the new image anyway")
+                else:
+                    # 09fceb6: top-level set -e caught it BEFORE any stop;
+                    # old image, old state.
+                    self.assertNotIn("systemctl stop", self.stubs_log())
+                    self.assertEqual(
+                        (self.probe / "opt-ak" / "ak-cli").read_text(encoding="utf-8"),
+                        AK_CLI_OLD)
+                self.doCleanups()
 
     # -- K2-N1: baselines leave the box stopped and broken at the first unit
     #    write. The old code has no (reaching) recovery; the NEW tests above

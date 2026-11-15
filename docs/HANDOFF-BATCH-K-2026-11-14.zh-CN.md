@@ -783,7 +783,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 27. 修复轮十独立复核证据（2026-11-15）
 
-被审差异固定为 `806ea6c..09fceb6`。发现与完整可复现输入见 [K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)，逐项状态只在审核状态表。本节、K11 报告及入口同步仅保留本地；复核未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、隔离模型、SQLite 事务和平台 CI 分别记录。
+被审差异固定为 `806ea6c..09fceb6`。发现与完整可复现输入见 [K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)，逐项状态只在审核状态表。本节、K11 报告及入口同步出具时仅保留本地，随后由执行方在 `2d77eed` 提交；复核未修改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、隔离模型、SQLite 事务和平台 CI 分别记录。
 
 | 本机验证 | 实际命令 / 范围 | 结果与边界 |
 |---|---|---|
@@ -832,7 +832,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 28. 修复轮十一（K11 复核后的新候选，执行方记录）
 
-[K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)（K10-N1/N2 双双判通过）后，执行方修复其唯一新发现；复核方本地同步（§27、STATUS、状态表、K10 历史归属）与本节代码改动一并提交。
+[K11 复核](REVIEW_2026-11-15-batchK11.zh-CN.md)（K10-N2 判通过；K10-N1 原输入翻转，但报告仍保留运行目录反例）后，执行方修复其唯一新发现；复核方本地同步（§27、STATUS、状态表、K10 历史归属）与本节代码改动一并提交。
 
 | K11 发现 | 修复内容 |
 |---|---|
@@ -845,3 +845,70 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `2d77eed` | K11-N1 停服后静默迁移；复核方文档同步与执行方本节记录入库 |
+
+## 29. 修复轮十一独立复核证据（2026-11-15）
+
+被审差异固定为 `09fceb6..1fad0a2`。发现与可复现输入见 [K12 复核](REVIEW_2026-11-15-batchK12.zh-CN.md)，逐项状态只在审核状态表。本节、K12 报告与入口同步仅保留本地；复核未改被审代码。“专项”为并行只读复核，“集成者”为主复核者；本机编译、隔离模型、SQLite 事务和平台 CI 分别记录。
+
+| 本机验证 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Shell 语法与自检 | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；两脚本各 `--self-test` | 均 exit 0；deploy 含生成 phase1/3/456/7 的语法与 pinned SHA；cross-NAT 为隔离自检，无服务器连接、SSH 或传输，不计作本轮 release 重建或公网实测 |
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 251/251，899.492 秒，exit 0，无 failure/error/skip；部署 94（当前 73、真实 git baseline 21），NAT lifecycle 11、NAT streak 51、netem 24、repository checker 64、SSH helper 7；包含 K11-N1、K10-N2/K8/K9/K3-N1/K2-N1 回归 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py`；集成者在 `git archive 1fad0a2` 完整导出树执行两者 | 均 exit 0；契约实际 5/5 PASS，未只凭 advisory 退出码。固定树 67 md/local links=283；门槛执行时工作树 82 md/local links=283（含本机忽略目录），两者分开记录 |
+| Rust 本机门槛 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows / rustc 1.99.1 均 exit 0；测试 1200 passed、0 failed、8 ignored，含 doctest，536.469 秒。clippy 28.312 秒、rustdoc 15.797 秒、实际 Windows build 33.844 秒，均无 warning/error 编译诊断；ignored 未计作执行 |
+| 实现变动范围 | `git diff --name-only 09fceb6..1fad0a2 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 无差异；本轮代码只改部署脚本及其 Python 测试，另有文档同步 |
+| 报告原文与文档收尾 | 从 K12 报告原样提取两段复现 Python 执行并断言输出；同步后 `python scripts/check_repository.py`、`git diff --check` | 两段均 exit 0，实际原 K11 五案及 chmod 四案输出与报告一致；同步后检查均 exit 0，工作树 83 md/local links=289。仅本地审核文档变化，无提交或被审代码改动 |
+
+| 行为 / 源码核对 | 实际输入和结果 | 证据层级 |
+|---|---|---|
+| 原 K11 报告原文 | 集成者机械提取 §5 PowerShell 内 Python，只将当前版本字符串改为 1fad0a2 | exit 0；LF/cwd 各阶段仍成功且复制错误目录；clean 的来源/目标均 active/1；当前 late 的来源/目标均 revoked/2；806ea6c late 来源 revoked/2、目标 active/1。runner 成功仅表示重放完成 |
+| 原 K10-N1 回归 | 专项逐名执行空 USERPROFILE、缺 WorkingDirectory 拒绝、EXTRA 内 LF 三项 | 3/3，32.803 秒，exit 0；与全集重叠，不重复计算新增覆盖。不能扩大为实际变量 LF 或运行 cwd 已验证 |
+| K10-N1 当前/上轮对照 | 专项从 K11 原文限定 LF/cwd × 1fad0a2/09fceb6，精确 NUL argv 与真实决策/安装 | 四案均 phase1=0、decision=0、INSTALL_RC=0；LF 复制 prefix 合成字节，cwd 复制 configured-decoy。当前日志均 post-stop，仍未读取运行 cwd；集成者原文重跑确认 |
+| cwd 与 CLI 语义控制 | `sudo -n readlink /proc/4242/cwd` 阳性控制；从当前 main.rs 精确提取默认链，以 `rustc --edition 2024` 编译运行 | cwd 返回 /home/runtime-old、exit 0；实际链未请求。Rust 保留值内/值尾 LF、空值返回相对 .ak-sending。Windows 未落盘含 LF 文件名，未冒充原生 Linux 路径实验 |
+| 数据库时序与目标冲突专项 | 提交内 K11 当前/基线两项，K10-N2 六项当前控制及目标冲突基线 | 9/9，113.647 秒，exit 0；copy corruption 和 differing 均验证 INSTALL_RC=5、RECOVERY OK、active/旧 image；fresh-dirty 验证空恢复；正常控制与原位升级通过 |
+| 真实 schema 晚提交 | 专项真实 phase1→decision→compose→install，store.rs 的五条 DDL/schema v3；stop 入口断言旧服务 active 后提交；当前与 806ea6c clean/late 对照 | 当前 stop→来源 cp→cmp，late 来源/目标均 revoked/2；旧候选 late 目标 active/1；两版 clean 均 active/1。集成者另以报告原文独立重跑，未启动真实 registry 或协议 revoke |
+| 提交内 fixture 精度 | 同名 K11 当前用例额外留档，读取安装捕获状态；与上述独立 active fixture 对照 | 提交内 oldregistry 只有 unit 文件，捕获为 exists/disabled/inactive，hook 未断言 active；独立重放显式补齐 enabled/active/PID，专项 hook active 断言实际成功，故时序通过不依赖该缺失前置。此项只校准测试声明，不另列阻断或新增覆盖计数 |
+| K12-N1 新回归 | 集成者只让 key 的 chmod 600 返回 1；当前/09fceb6 各含正常控制；专项在独立 TEMP 目录重跑 | 两版正常均安装 0、新 image；上轮失败安装 1、未 stop、active/旧 image；当前失败安装 0、已 stop、active/新 image、无恢复。实际 chmod 失败标记存在；Bash 顶层/函数最小语义控制也执行，不声称验证了 Linux 实际文件权限或泄露 |
+| 文档提交与历史归属 | `git show/diff 2d77eed`、`git show 1fad0a2` | K11 报告、§27、STATUS、状态表、K10 归属确实纳入 2d77eed；1fad0a2 仅两行哈希回填。双通过摘要与 K11 正文/状态表不符，本轮按原报告及实际行为纠正 |
+
+| GitHub / Git | 固定对象 | API / 引用结果 |
+|---|---|---|
+| tip CI | `1fad0a2d6814e6f19fa931960731cf2afe7dd68e`；[43693242265](https://github.com/wmqfl861/AK-sending/actions/runs/43693242265) | 当前 git 凭据直接读取 run/jobs API；首次查询已 completed/success，无需继续等待；head_branch=dev/batch-k-20261114，run_attempt=1；13 jobs 中 12 常规 success、1 手动 release-deep-tests skipped；完成更新时间 2026-11-15T08:23:04Z |
+| CI 实际门槛 | 同上 jobs/steps metadata 与固定 tip workflow | 全部 job 完整 head SHA 匹配；常规 steps 全 success，无 failure/cancelled/未完成。Linux/Windows Rust、特性测试、fmt/clippy/rustdoc，Flutter analyze/test、纯 Dart，Android 双 ABI FFI/符号验证/debug APK，Linux/macOS portability，audit/deny、仓库检查、legacy signal、NAT netns 模拟均 success；不等于生产部署或物理双机 |
+| 远端引用 | `git fetch --prune origin`；`git ls-remote --heads origin` | main=d6c71360784e1570720e56028a39f2a80777bb21、dev/batch-k-20261114=1fad0a2d6814e6f19fa931960731cf2afe7dd68e；没有调用合并、推送或分支删除 |
+| 本地引用与改动 | `git branch -avv`；`git worktree list --porcelain`；`git status --short --branch` | main 留在 d6c7136，批次分支在固定 tip，只有主工作树。本轮只新增 K12 报告并同步交接、状态表、STATUS 与 K11 历史归属；没有提交或被审代码改动 |
+
+| 未执行 / 限制 | 本轮事实 |
+|---|---|
+| Linux 原生 systemd/权限部署、远端 SSH、物理双机 C4、生产抓包 | 仅真实生成脚本的本机隔离模型；SQLite 文件/事务与模型服务状态不等于真实 Linux 停服或协议验证 |
+| 本机 Flutter/Dart、Android/Linux/macOS 重建 | 相关实现无差异；平台证据采用完整 SHA 匹配的最终 CI，不以旧产物冒充当前构建 |
+| 手动 release deep tests | push workflow job skipped；本机未运行 ignored release suite，不计作执行或通过 |
+| shellcheck / Flutter / Dart 本机命令 | PATH 未发现，未执行对应本机门槛；语法检查、自检和模型不能代替 shellcheck |
+| 数据库证据范围 | 本轮验证原 K11 的正常事务在 stop 入口前已提交的交错，未验证任意崩溃、中断事务或 SQLite journal 状态的恢复，不作该类完成声明 |
+
+| 仓外材料（本机 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-review-k12-1fad0a2` | 集成者 query_ci.py、run/jobs JSON、固定导出树与检查日志、K11 原文当前版重放、chmod 当前/上轮对照、K12 报告原文重放、submitted-late-fixture 留档与收尾检查；凭据仅在查询进程内存 |
+| `ak-k12-gates-536l6pox` | 全量门槛日志、summary.json、metadata.json、cargo-test-counts.json、python-test-counts.json |
+| `ak-k12-runtime-identity-review.py/.log`；`ak-k12-runtime-identity-xhb2t3zy` | 专项原报告 LF/cwd × 当前/上轮完整 fixture、脚本、输出、unit、summary；cwd 阳性控制、Rust 精确默认链、原 K10 三项回归日志 |
+| `ak-k12-toctou-regressions.log`；`ak-k12-registry-revoke.py` | 数据库/目标恢复专项；独立真实 schema 完整链 runner |
+| `ak-k12-registry-revoke-1fad0a2-7e1rbjd4`；`ak-k12-registry-revoke-806ea6c-f73v1o5a` | 专项 clean/late 当前与基线，含数据库、生成脚本、unit、stub 调用顺序和 summary.json |
+| `ak-k12-chmod-independent.py/.log`；`ak-k12-chmod-independent-61mr_9de` | 权限失败的专项独立重跑、正常/失败控制四案全部产物，与集成者结果一致 |
+
+## 30. 修复轮十二（K12 复核后的新候选，执行方记录）
+
+[K12 复核](REVIEW_2026-11-15-batchK12.zh-CN.md)（K11-N1 TOCTOU 判通过；K10-N1 维持阻断并给出两个精确反例；K12-N1 为 `2d77eed` 引入的回归）后，执行方完成三项修复；复核方本地同步（§29、STATUS、状态表、K11 历史归属）与本节代码改动一并提交。执行方对上轮「K10-N1/N2 双双通过」的摘要措辞过强，按报告更正：K11 复核实际通过的是 K10-N2 与 K10-N1 的原输入，K10-N1 阻断保留。
+
+| K12 发现 | 修复内容 |
+|---|---|
+| K10-N1(a)（P1） | 环境值 LF 字节端到端：提取改 `grep -za -m1`（按 NUL 记录限一，内嵌 LF 存活命令替换），删除再次截断的 `head -n 1`；phase1 报告与 real_run 消费为行制，值含管线无法忠实传输的字节（换行/空格/制表）即显式拒绝「cannot carry faithfully」，grep 自身输出字节数与捕获长度比对检出尾字节丢失——绝不截断后确认另一目录。复核夹具（真实 `USERPROFILE=/home/otheruser\nsuffix` 记录+EnvironmentFile）从确认前缀目录翻转为拒绝；`1fad0a2` 基线同夹具确认截断目录；EXTRA 伪造回归保持 |
+| K10-N1(b)（P1） | 相对基目录以**运行实例** cwd 解析：`sudo -n readlink /proc/<PID>/cwd` 取代 `systemctl cat` 配置的 WorkingDirectory；不可读/非绝对即拒绝。复核夹具（配置 `/home/configured-new` 诱饵 vs 运行 `/proc/4242/cwd=/home/runtime-old`）从选配置诱饵翻转为选运行目录（readlink 实际被查询）；不可读拒绝；`1fad0a2` 基线选诱饵 |
+| K12-N1（P2，回归） | 已存 key 的 `chmod 600` 失败显式 `|| return 1` 进入统一恢复（key 缺失的全新安装分支保持跳过）。复核夹具（仅 key chmod 失败）从 `1fad0a2` 的 exit 0+新镜像+无恢复翻转为 exit 5+RECOVERY OK+旧镜像双服务 active；`09fceb6` 的顶层 set -e 行为作对照保留；成功与无 key 控制齐备。另按复核夹具精度注记：K11 TOCTOU 回归补 enabled/active/pid 前置，停服钩子断言提交时服务仍 active |
+
+### 修复轮十二门禁与提交
+
+本地：`bash -n`+自检全过；Python 258/258（部署套件 101，含 7 项轮十三回归与跨十版基线对照）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十二首个提交，推送后回填哈希） | K10-N1(a)(b) 与 K12-N1 修复；复核方文档同步与执行方本节记录入库 |

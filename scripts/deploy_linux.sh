@@ -674,13 +674,19 @@ self_test() {
     || fail "the occupant's runtime identity dir must be derived and reported (K9-N1)"
   grep -q 'to derive the default identity dir' "$WORK/p1.sh" \
     || fail "missing runtime environment evidence must refuse (K9-N1)"
-  # K 复核 K10-N1: environ is parsed STRICTLY on NUL records; a set-but-empty
-  # USERPROFILE does NOT fall back to HOME (Some("")); a relative base binds
-  # to the unit's absolute WorkingDirectory or refuses.
-  grep -q "grep -za '^USERPROFILE='" "$WORK/p1.sh" \
-    || fail "environ variables must be read as NUL records, never fabricated from values (K10-N1)"
-  grep -q 'WorkingDirectory' "$WORK/p1.sh" \
-    || fail "a relative identity base must resolve against the unit working directory (K10-N1)"
+  # K 复核 K10-N1: environ is parsed STRICTLY on NUL records with the FULL
+  # value kept; a set-but-empty USERPROFILE does NOT fall back to HOME
+  # (Some("")); values carrying bytes the line-based pipeline cannot
+  # transport are refused; a relative base binds to the RUNNING process's
+  # /proc/<PID>/cwd (never the configured WorkingDirectory=) or refuses.
+  grep -q "grep -za -m1 '^USERPROFILE='" "$WORK/p1.sh" \
+    || fail "environ variables must be read as FULL NUL records, never truncated at an embedded LF (K10-N1)"
+  grep -q 'cannot carry faithfully' "$WORK/p1.sh" \
+    || fail "values with untransportable bytes must refuse rather than confirm a truncated path (K10-N1)"
+  grep -q 'readlink /proc/\$reg_pid/cwd' "$WORK/p1.sh" \
+    || fail "a relative identity base must resolve against the RUNNING process cwd (K10-N1)"
+  grep -q 'chmod 600 .*registry\.key || return 1' "$WORK/p456.sh" \
+    || fail "a key-chmod failure on an existing key must enter the unified recovery (K12-N1)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -1228,8 +1234,30 @@ REG_EFF_H
           echo "ERROR: no runtime environment evidence (unreadable/empty /proc/\$reg_pid/environ) to derive the default identity dir of \$reg_unit; refusing before any switchover (K9-N1)" >&2
           exit 3
         fi
-        ev_up_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za '^USERPROFILE=' | head -n 1)
-        ev_home_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za '^HOME=' | head -n 1)
+        # K 复核 K10-N1 (round 13): extract the FIRST matching NUL record
+        # VERBATIM — 'grep -z -m1' limits to the first matching RECORD (a
+        # following 'head -n 1' re-truncated values at the first embedded
+        # LF and confirmed a DIFFERENT directory). Command substitution
+        # keeps every byte of the record except its NUL terminator; values
+        # carrying bytes this line-based pipeline cannot transport are
+        # REFUSED, never truncated-then-confirmed.
+        ev_up_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za -m1 '^USERPROFILE=' || true)
+        ev_home_rec=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -za -m1 '^HOME=' || true)
+        for re_var in USERPROFILE HOME; do
+          eval "re_val=\\\$\$( [ "\$re_var" = USERPROFILE ] && printf ev_up_rec || printf ev_home_rec)"
+          case "\$re_val" in
+            *\$'\n'*|*' '*|*'	'*)
+              echo "ERROR: the runtime \$re_var of \$reg_unit contains a byte (newline/space/tab) this deploy's line-based evidence cannot carry faithfully; refusing rather than confirm a truncated path (K10-N1)" >&2
+              exit 3 ;;
+          esac
+          re_grep_bytes=\$(sudo -n cat /proc/\$reg_pid/environ 2>/dev/null | grep -zao -m1 "^\${re_var}=.*" | wc -c || true)
+          re_bash_bytes=\$(printf '%s' "\$re_val" | wc -c)
+          if [ "\$re_grep_bytes" -gt 0 ] \\
+             && [ "\$((re_grep_bytes - 1))" != "\$re_bash_bytes" ]; then
+            echo "ERROR: the runtime \$re_var of \$reg_unit lost trailing bytes (newline) on its way into this script; refusing rather than confirm a truncated path (K10-N1)" >&2
+            exit 3
+          fi
+        done
         # The CLI's exact default chain (main.rs id_dir(), verified against
         # the source): var_os("USERPROFILE").or_else(var_os("HOME")) —
         # Some("") does NOT fall back to HOME; an empty value yields the
@@ -1278,21 +1306,23 @@ REG_EFF_H
           /*)
             reg_rt_id="\$ev_base/.ak-sending" ;;
           *)
-            # K 复核 K10-N1(a): an empty or RELATIVE base resolves against
-            # the process working directory — the unit's WorkingDirectory=
-            # ('-' ignore-missing prefix stripped). Without an absolute
-            # WorkingDirectory the cwd is undeterminable -> REFUSE rather
-            # than guess another directory.
-            reg_wd=\$(printf '%s\\n' "\$reg_cat2" | sed -n 's/^WorkingDirectory=-\\{0,1\\}\\(.*\\)\$/\\1/p' | tail -1)
-            case "\$reg_wd" in
+            # K 复核 K10-N1(b) (round 13): an empty or RELATIVE base resolves
+            # against the RUNNING PROCESS's actual working directory —
+            # /proc/<PID>/cwd via sudo readlink — NOT the unit's configured
+            # WorkingDirectory= (a started-then-edited unit legitimately
+            # differs from its running cwd; the configured value is not
+            # evidence). Unreadable/relative cwd -> REFUSE.
+            reg_cwd=\$(sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null) \\
+              || { echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit; refusing before any switchover (K10-N1)" >&2; exit 3; }
+            case "\$reg_cwd" in
               /*)
                 if [ -n "\$ev_base" ]; then
-                  reg_rt_id="\$reg_wd/\$ev_base/.ak-sending"
+                  reg_rt_id="\$reg_cwd/\$ev_base/.ak-sending"
                 else
-                  reg_rt_id="\$reg_wd/.ak-sending"
+                  reg_rt_id="\$reg_cwd/.ak-sending"
                 fi ;;
               *)
-                echo "ERROR: the identity-dir default of \$reg_unit resolves RELATIVELY (base '\$ev_base' per the CLI's USERPROFILE/HOME chain) and the working directory cannot be established from the unit (no absolute WorkingDirectory=); refusing before any switchover (K10-N1)" >&2
+                echo "ERROR: the RUNNING working directory of \$reg_unit (/proc/\$reg_pid/cwd) is not absolute ('\$reg_cwd'); refusing before any switchover (K10-N1)" >&2
                 exit 3 ;;
             esac ;;
         esac
@@ -1835,7 +1865,14 @@ do_switchover() {
   fi
   sudo -n chown -R $SERVICE_USER:$SERVICE_USER $REMOTE_DATA || return 1
   sudo -n chmod 700 $REMOTE_DATA || return 1
-  sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null && sudo -n chmod 600 $REMOTE_DATA/registry.key
+  # K 复核 K12-N1: a chmod failure on an EXISTING key must enter the unified
+  # recovery — inside 'if ! do_switchover' errexit is suspended, so the old
+  # 'A && B' form silently swallowed it (INSTALL_RC=0 with the key's
+  # permissions unset). The key-ABSENT branch stays skipped (legit fresh
+  # install).
+  if sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null; then
+    sudo -n chmod 600 $REMOTE_DATA/registry.key || return 1
+  fi
   # 3) binary swap (K 复核 K-R1: staging source != destination, verified
   #    above BEFORE anything was stopped). K 复核 K2-N1(c): the move-aside
   #    of the previous binary must not be '|| true'd away — if the rename

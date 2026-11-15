@@ -1245,4 +1245,4 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 | 提交 | 内容 |
 |---|---|
-| （修复轮十七首个提交，推送后回填哈希） | 二次 grep triage、token 遍历改写与校验、ffi_pairing 事件排水轮询；复核方文档同步与执行方本节记录入库 |
+| `063b80a` | 二次 grep triage、token 遍历改写与校验、ffi_pairing 事件排水轮询；复核方文档同步与执行方本节记录入库 |

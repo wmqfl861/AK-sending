@@ -687,6 +687,15 @@ self_test() {
     || fail "a relative identity base must resolve against the RUNNING process cwd (K10-N1)"
   grep -q 'chmod 600 .*registry\.key || return 1' "$WORK/p456.sh" \
     || fail "a key-chmod failure on an existing key must enter the unified recovery (K12-N1)"
+  # K 复核 K10-N1 (round 14): the cwd value gets the same byte-fidelity
+  # discipline (emitting-tool byte count + untransportable-byte refusal).
+  grep -q 'the RUNNING working directory of \$reg_unit lost trailing bytes' "$WORK/p1.sh" \
+    || fail "a cwd that loses trailing bytes must refuse, not confirm a truncated dir (K10-N1)"
+  # K 复核 K13-N1: decision-derived paths baked into generated scripts must
+  # be shell-safe or refused before the switchover (the guard lives in
+  # real_run's decision block, so grep THIS script).
+  grep -q 'shell-significant bytes this deploy cannot bake faithfully' "$0" \
+    || fail "paths with shell-significant bytes must refuse before any switchover (K13-N1)"
   grep -q 'was identified but its unit file cannot be located' "$WORK/p1.sh" \
     || fail "an identified occupant without locatable config must refuse (K2-R3)"
   # K 复核 K2-N1: the unit writes, daemon-reload and enable --now must sit
@@ -1312,8 +1321,27 @@ REG_EFF_H
             # WorkingDirectory= (a started-then-edited unit legitimately
             # differs from its running cwd; the configured value is not
             # evidence). Unreadable/relative cwd -> REFUSE.
+            # K 复核 K10-N1 (round 14): the cwd value gets the SAME
+            # carry-faithfully discipline as the environ values — command
+            # substitution cannot distinguish readlink's line terminator
+            # from a cwd that genuinely ends in LF, so compare the EMITTING
+            # tool's byte count with the captured length (trailing-LF loss
+            # -> refuse), and refuse values containing bytes the line-based
+            # pipeline cannot transport. Never truncate-then-confirm.
             reg_cwd=\$(sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null) \\
               || { echo "ERROR: cannot read the RUNNING working directory (/proc/\$reg_pid/cwd) needed to resolve the relative identity base '\$ev_base' of \$reg_unit; refusing before any switchover (K10-N1)" >&2; exit 3; }
+            case "\$reg_cwd" in
+              *\$'\n'*|*' '*|*'	'*)
+                echo "ERROR: the RUNNING working directory of \$reg_unit contains a byte (newline/space/tab) this deploy's line-based evidence cannot carry faithfully; refusing rather than confirm a truncated path (K10-N1)" >&2
+                exit 3 ;;
+            esac
+            cwd_tool_bytes=\$(sudo -n readlink /proc/\$reg_pid/cwd 2>/dev/null | wc -c || true)
+            cwd_bash_bytes=\$(printf '%s' "\$reg_cwd" | wc -c)
+            if [ "\$cwd_tool_bytes" -gt 0 ] \\
+               && [ "\$((cwd_tool_bytes - 1))" != "\$cwd_bash_bytes" ]; then
+              echo "ERROR: the RUNNING working directory of \$reg_unit lost trailing bytes (newline) on its way into this script; refusing rather than confirm a truncated path (K10-N1)" >&2
+              exit 3
+            fi
             case "\$reg_cwd" in
               /*)
                 if [ -n "\$ev_base" ]; then
@@ -2234,6 +2262,20 @@ real_run() {
     [ -n "$REG_RW" ] || REG_RW=$REMOTE_DATA
   fi
   REGISTRY_EXEC=${REGISTRY_EXEC//\'/}   # unit files must not carry quotes
+  # K 复核 K13-N1: every decision-derived value that gets BAKED into the
+  # generated phase456 script becomes Bash SOURCE there ('DATA_SOURCE=<v>' is
+  # re-parsed by the generated shell). A literal quote/dollar/backtick in a
+  # path survived preflight verbatim, then the executing script re-interpreted
+  # it and copied from a DIFFERENT directory (install exit 0). Refuse, before
+  # any switchover, any identity/database path outside the safe whitelist
+  # [A-Za-z0-9/._-] — never silently strip or re-interpret the bytes.
+  for bake_val in "$DATA_SOURCE_DIR" "$REG_RW"; do
+    case "$bake_val" in
+      '') : ;;
+      *[!A-Za-z0-9/._-]*)
+        fail "the identity/database path '$bake_val' contains shell-significant bytes this deploy cannot bake faithfully into the generated install script; resolve the source path and re-run (K13-N1)" ;;
+    esac
+  done
   LEGACY_UNIT=${legacy_unit:-}
   OLD_REGISTRY_UNIT=${old_registry_unit:-}
   [ "$LEGACY_UNIT" = "ak-stun-server" ] && LEGACY_UNIT=""

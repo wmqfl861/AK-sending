@@ -726,6 +726,15 @@ self_test() {
     || fail "the db rewrite must verify the RESULT, not the statement (K15-N1)"
   grep -q 'cannot bake faithfully into the generated unit' "$0" \
     || fail "non-whitelisted db arguments must refuse before the rewrite (K15-N1)"
+  # K 复核 K10-N1 (round 18): the VALUE-EXTRACTION grep also gets an rc
+  # triage — a presence rc=0 followed by an extraction error must refuse.
+  grep -q 'cannot determine the value of' "$WORK/p1.sh" \
+    || fail "a value-extraction grep error must refuse, never fall through as absent (K10-N1)"
+  # K 复核 K15-N1 (round 18): the db rewrite walks space-delimited
+  # ARGUMENT tokens — never a raw substring split that corrupts a
+  # legitimate identity dir containing the token.
+  grep -q 'for re_tok in \$REGISTRY_EXEC' "$0" \
+    || fail "the db rewrite must walk space-delimited argument tokens (K15-N1)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1324,17 +1333,46 @@ REG_EFF_H
               exit 3 ;;
           esac
         done
-        ev_up_rec=\$(grep -za -m1 '^USERPROFILE=' "\$reg_env_raw" || true)
-        ev_home_rec=\$(grep -za -m1 '^HOME=' "\$reg_env_raw" || true)
+        # K 复核 K10-N1 (round 18): the VALUE-EXTRACTION grep gets the SAME
+        # errexit-safe rc triage as the presence check above — the old
+        # '|| true' + empty-continue let a presence rc=0 followed by an
+        # extraction rc=2 (no stdout) fall through as variable-absent and
+        # migrate the HOME decoy. rc=0 proceeds; rc=1 contradicts the
+        # triaged presence result (the snapshot cannot have changed — it is
+        # a file) and refuses; rc>=2 refuses as a tool error.
+        ev_up_rec=""
+        ev_up_xrc=0
+        ev_up_rec=\$(grep -za -m1 '^USERPROFILE=' "\$reg_env_raw" 2>/dev/null) || ev_up_xrc=\$?
+        ev_home_rec=""
+        ev_home_xrc=0
+        ev_home_rec=\$(grep -za -m1 '^HOME=' "\$reg_env_raw" 2>/dev/null) || ev_home_xrc=\$?
+        for re_stat in "\$ev_up_xrc:USERPROFILE:\$ev_up_rc" "\$ev_home_xrc:HOME:\$ev_home_rc"; do
+          re_x=\${re_stat%%:*}
+          re_rest=\${re_stat#*:}
+          re_name=\${re_rest%%:*}
+          re_pres=\${re_rest##*:}
+          case "\$re_x:\$re_pres" in
+            0:*) : ;;
+            1:0)
+              rm -f "\$reg_env_raw"
+              echo "ERROR: the \$re_name extraction found no record while its presence check matched (the snapshot file cannot change mid-read); refusing rather than treat the mismatch as variable-absent (K10-N1)" >&2
+              exit 3 ;;
+            1:1) : ;;
+            *)
+              rm -f "\$reg_env_raw"
+              echo "ERROR: cannot determine the value of \$re_name in the runtime environ of \$reg_unit (grep rc=\$re_x); refusing rather than treat an error as variable-absent (K10-N1)" >&2
+              exit 3 ;;
+          esac
+        done
         for re_var in USERPROFILE HOME; do
           if [ "\$re_var" = USERPROFILE ]; then
             re_val="\$ev_up_rec"
           else
             re_val="\$ev_home_rec"
           fi
-          # An ABSENT record (rc=1, triaged above) is a legitimate chain
-          # input; only PRESENT records are verified (a PRESENT-but-empty
-          # record is the non-empty string 'VAR=' and still verifies below).
+          # An ABSENT record (presence rc=1, triaged above) is a legitimate
+          # chain input; only PRESENT records are verified (a PRESENT-but-
+          # empty record is the non-empty string 'VAR=' and verifies below).
           [ -n "\$re_val" ] || continue
           case "\$re_val" in
             *\$'\n'*|*' '*|*'	'*)
@@ -2526,24 +2564,52 @@ real_run() {
         if [ -z "${runtime_cwd:-}" ]; then
           fail "the effective ExecStart carries a RELATIVE --db-path '$rel_db' but the running cwd was not captured; the database object cannot be bound to the running instance; resolve it to an absolute path and re-run (K15-N1)"
         fi
-        # K 复核 K15-N1 (round 17): the rewrite uses PLAIN STRING OPS (no
-        # ${var//pattern/} — brackets in the filename are pattern syntax and
-        # made the substitution silently no-op while the log claimed a
-        # rewrite). Split the line at the argument boundary and rebuild.
+        # K 复核 K15-N1 (round 17/18): the rewrite uses PLAIN STRING OPS on
+        # space-delimited ARGUMENT BOUNDARIES — no ${var//pattern/} (brackets
+        # are pattern syntax) and no raw substring split (a legitimate
+        # identity dir like '/x/--db-path-archive/.ak-sending' CONTAINS the
+        # token and got corrupted by the first-occurrence split while the
+        # real --db-path argument stayed relative). Walk the space-separated
+        # tokens; replace ONLY a standalone '--db-path <value>' or
+        # '--db-path=<value>' token; leave every other token untouched.
         abs_db="${runtime_cwd%/}/${rel_db#./}"
-        re_prefix=${REGISTRY_EXEC%%--db-path*}
-        re_suffix=${REGISTRY_EXEC#*--db-path}
-        re_sep=${re_suffix%%[! =]*}          # the separator (' ' or '=') that followed --db-path
-        re_suffix=${re_suffix#"$re_sep"}
-        re_suffix=${re_suffix#"$rel_db"}      # strip ONLY the literal argument
-        REGISTRY_EXEC="${re_prefix}--db-path${re_sep}${abs_db}${re_suffix}"
-        # Verify the RESULT, not the statement: the argument actually
-        # replaced, no relative form left anywhere in the composed line.
-        case "$REGISTRY_EXEC" in
-          *"--db-path${re_sep}${abs_db}"*) : ;;
-          *)
-            fail "the --db-path rewrite did not take (composed line still carries the relative argument); refusing rather than generate a cwd-dependent unit (K15-N1)" ;;
-        esac
+        re_new=""
+        re_replaced=0
+        re_seen_sep=""
+        for re_tok in $REGISTRY_EXEC; do
+          if [ "$re_seen_sep" = 1 ]; then
+            re_new="${re_new:+$re_new }$abs_db"
+            re_seen_sep=0
+            re_replaced=1
+            continue
+          fi
+          case "$re_tok" in
+            --db-path)
+              re_new="${re_new:+$re_new }$re_tok"
+              re_seen_sep=1 ;;
+            --db-path=*)
+              re_new="${re_new:+$re_new }--db-path=$abs_db"
+              re_replaced=1 ;;
+            *) re_new="${re_new:+$re_new }$re_tok" ;;
+          esac
+        done
+        REGISTRY_EXEC="$re_new"
+        # Verify the RESULT, not the statement: the RESOLVED ABSOLUTE db
+        # argument is present as a STANDALONE token AND no equals-form with
+        # the relative value remains (checking a substring we just
+        # concatenated proves nothing — the round-17 check passed on a
+        # corrupted identity dir). A standalone '--db-path' token is the
+        # correct final form when followed by the resolved absolute token
+        # (re_ok above proves that token exists).
+        re_ok=0
+        re_rel_left=0
+        for re_tok in $REGISTRY_EXEC; do
+          [ "$re_tok" = "$abs_db" ] && re_ok=1
+          [ "$re_tok" = "--db-path=$rel_db" ] && re_rel_left=1
+        done
+        if [ "$re_replaced" != 1 ] || [ "$re_ok" != 1 ] || [ "$re_rel_left" = 1 ]; then
+          fail "the --db-path rewrite did not take (the resolved absolute argument is absent or a relative --db-path remains); refusing rather than generate a cwd-dependent unit (K15-N1)"
+        fi
         note "relative --db-path '$rel_db' rewritten to the RUNNING-resolved $abs_db (K15-N1)"
         # ReadWritePaths must cover the RESOLVED db object's directory when
         # it lies outside the identity dir (re-derived from the absolute

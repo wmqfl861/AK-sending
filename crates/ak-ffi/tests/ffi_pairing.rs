@@ -1042,7 +1042,27 @@ fn sched_snapshot_and_set_policy_fields() {
     // Let the fixture's single transfer finish, then drain the scheduler
     // events: the full task lifecycle must be observable.
     snapshot_until(engine, |json| count_state(json, "Completed") == 1, 120);
-    let lines = drain_sched_events(engine);
+    // CI flake fix (run 43752760678, Linux, 2026-11-15): the snapshot can
+    // observe the Completed STATE a moment BEFORE the terminal task event
+    // lands in the scheduler's event queue — a single immediate drain then
+    // sees queued/admitted/started/policy_changed but no completed event.
+    // Same slow-runner ordering class as the itest harness fixes: poll the
+    // EVENT channel (bounded) instead of trusting one drain.
+    let mut lines = Vec::new();
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            lines.extend(drain_sched_events(engine));
+            if lines
+                .iter()
+                .any(|line| line.contains("\"outcome\":\"completed\""))
+                || Instant::now() > deadline
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
     assert!(
         lines.iter().any(|line| line.contains("task_queued")),
         "no task_queued event in {lines:?}"

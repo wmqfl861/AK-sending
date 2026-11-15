@@ -1177,3 +1177,72 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `f2574cb` | PIPESTATUS 读取者守卫、grep rc triage、纯字符串 db 改写+白名单；复核方文档同步与执行方本节记录入库 |
+
+## 39. 修复轮十六独立复核证据（2026-11-16）
+
+固定范围为 `0602f92..7a93314`，实现提交 `f2574cb`，完整 tip 为 `7a93314db81cabb0c089451d92eae1eb1d4f8d23`。机制、修复要求与可重放代码见 [K17 复核](REVIEW_2026-11-16-batchK17.zh-CN.md)，逐项裁决只在审核状态表。本节与 K17、STATUS、状态表、K16 历史归属补注仅本地同步，没有修改被审实现。“专项”为并行只读复核，“主复核”为集成者独立重放。报告按指定日期；GitHub API 的 UTC 时间按实际响应保留。
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 289/289，0 failure/error/skip；unittest 1608.069 秒、runner 1608.640 秒。部署132（当前100、历史对照32），NAT lifecycle11、streak51、netem24、repository64、SSH7。全集一次执行，无重试；被审实现固定7a93314，本轮评审文档收尾另验。 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 初始固定 tip 均 exit 0：87 md/315 local links、契约 5/5；分别 5.266、0.187 秒。文档同步后的结果另列。 |
+| Shell | `bash -n scripts/deploy_linux.sh`、`bash -n scripts/cross_nat_test.sh`；各自 `--self-test` | 均 exit 0；语法检查 0.094/0.078 秒，自检 9.359/4.704 秒；离线生成与模型，没有 SSH 或生产连接。 |
+| Rust 常规门槛 | `cargo fmt --all -- --check`；`cargo test --locked --workspace`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`RUSTDOCFLAGS=-D warnings` 下 `cargo doc --locked --workspace --no-deps`；`cargo build --locked --workspace` | Windows 均 exit 0。workspace 含 doctest：1200 passed、0 failed、8 ignored，579.953 秒；fmt 4.234 秒、clippy 26.359 秒、rustdoc 22.375 秒、Windows build 31.172 秒。ignored 不在此行计执行。 |
+| Rust 特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 均 exit 0：sqlite 54 passed（12.204 秒），persistence 219 passed（54.328 秒），无失败。 |
+| Flutter / Dart 本机 | `cargo build --locked -p ak-ffi --release`；明确路径运行 `flutter analyze --no-pub`、`flutter test --no-pub`、嵌套包 `dart test` | release FFI build exit 0（64.922 秒）；Flutter 3.47.9 / Dart 3.13.7；analyze 无问题（65.578 秒），app 220/220（35.032 秒），Dart 170/170（18.484 秒），无 skip。SDK 不在 PATH，但实际安装在文档给出的 flutter-sdk/bin，故本轮确实执行，不再按未发现处理。 |
+| Release 深测 | `cargo test --locked --release -p ak-engine -- --ignored --nocapture`；`cargo test --locked --release -p ak-itests -- --ignored --nocapture` | ak-engine exit 0：5 GiB+13 bytes 与尾文件真实环回，1 passed，测试270.28秒、命令303.578秒。ak-itests exit 101，199.313秒：框架4 passed/1 failed，其中netem在Windows打印SKIP（不算实际执行）；实际成功为256 MiB×8 chunk sweep、512 MiB×2 throughput、25种子传输。property_random.rs:234 的10种子中断恢复项在seed=1收到Err(IdleTimeout(30s))失败；原始日志保留，无重跑。Cargo因此未执行后续20,000/65,537文件及其后的测试二进制。启动大文件前空闲12,575,678,464 bytes，最低观察余量1,764,401,152 bytes，未触发停止；测试正常清理。 |
+| 工具与实现范围 | Python 3.12.10、GNU Bash 5.3.15、cargo/rustc 1.99.1；`git diff --exit-code 0602f92..7a93314 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | 固定工具版本；实现范围检查 exit 0、无差异。代码变化仅部署 Shell 与 Python 模型，另有文档同步。 |
+| 文档收尾 | 仓库检查、契约、`git diff --check`；报告代码与已执行 runner 比较/compile；被审实现与引用核验 | 最终同步检查均 exit 0：88 md/320 local links、契约5/5、diff无空白错误；报告两份Python代码与实际执行runner逐字一致且compile通过。reader/DB专项只读同行复核无事实异议，已采纳执行次数措辞精化。实现diff为空，仅K17、交接、状态表、STATUS、K16历史补注五份文档本地变更，未提交。 |
+
+| 行为与对照 | 实际输入 / 执行结果 | 证据层级与计数 |
+|---|---|---|
+| Reader 四条捕获路径 | environ、环境推导身份 cwd、显式相对 id cwd、相对 DB cwd；健康、非零 reader、空输出、writer 失败、尾 LF、只有工具 LF | 专项 33 次执行/32 个唯一 label：主矩阵 29 案 471.079 秒，定点 cwd tee 补充 1 案 10.531 秒，newline-only 补充 3 案 29.437 秒。当前 4 健康完整链零、19 拒绝 phase1=3、5 writer 拒绝 phase1=73；旧版 5 个非零 reader 对照完整链零。主矩阵 cwd-env writer 首次命中先行 environ tee，定点补充再命中 cwd tee，故有一次重复，最终 runner 定义32个唯一案例；本轮按上述主矩阵与补充执行。 |
+| Reader 主复核重放 | 当前/0602f92 的 environ 部分输出后 rc74、DB cwd 完整输出后 rc74 | 4 案通过预期断言，81.046 秒；当前 phase1=3、不 stop/写 key；baseline 全链零，部分 environ 真实复制 fallback-decoy。生成代码四处下一语句均为 PIPESTATUS 捕获。 |
+| Grep 原反例及新余项 | 健康、真缺失、存在但空、首次错误、0602f92 首次错误；当前存在性 rc0 后第二次提取 rc2/no stdout、rc1、完整输出后 rc2 | 主复核 8 案全部匹配断言。首次错误当前 phase1=3、旧版错源；第二次 rc2/no stdout 全链零且实际复制 HOME 诱饵。完整输出后 rc2 只证明错误状态未核验，仍选真源；第二次 rc1 是矛盾状态控制，不称工具错误。 |
+| Grep active 补充 | 显式初始化 oldregistry enabled/active/PID/running；健康、首次拒绝、旧版首错、当前二次提取错 | 主复核补充 4 案全部匹配断言，原8案材料保留。当前二次提取故障仍全链零、复制 fallback-decoy；健康真源与首次拒绝保持。reader 专项独立复核 stub 只在第二次调用注入且第一次实际 rc0，未改快照。 |
+| DB 原方括号及控制 | 当前 bracket 拒绝、0602f92 silent no-op；普通/等号/点前缀/绝对/绝对方括号、DB 值内含选项子串 | 专项首批3案 76.187 秒，控制8案 243.359 秒；原相对 bracket 当前 decision=1、无 stop/install，旧版全链零且真实参数仍相对。其余控制保持对应对象。绝对 bracket 不走新增相对路径白名单，按实际行为记录。 |
+| DB 新边界回归 | id-dir 内先出现合法 --db-path 子串；当前/基线、空格/等号；补充默认 cwd 下 DB 在原身份 RWP 内，及显式旧服务 active 状态 | 专项 DB 合计15个完整链案例：另含 contained pair 61.860 秒、active-contained pair 64.422 秒。当前身份参数损坏、真实 DB 仍相对、离线链零；0602f92 身份保留且 DB 绝对化。active pair 两版均捕获 oldregistry:exists:enabled:active。 |
+| DB 主复核重放 | 原边界当前/基线、原方括号当前/基线、普通/等号/绝对；随后执行报告精简 runner 的 active-contained 当前/基线 | 首次7案 196.438 秒，精简 runner 2案 64.375 秒，全部满足断言；实际生成 unit 与 SQLite 对象映射相符。初始 /state 诱饵在 RWP 外，补充 DB 诱饵在内；损坏身份路径本身在 RWP 外，不扩大为原生服务成功启动。 |
+| 历史归属 | `git show/diff f2574cb`；`git show 7a93314` | K16 报告与同步、执行方 §38 已由 f2574cb 入库；7a93314 仅交接一行哈希回填。本轮补 K16 出具时点历史归属，不改其历史裁决。 |
+
+| GitHub / Git | 固定对象 / 命令 | API / 引用结果 |
+|---|---|---|
+| tip CI | `7a93314db81cabb0c089451d92eae1eb1d4f8d23`；[43752760678](https://github.com/wmqfl861/AK-sending/actions/runs/43752760678) | 当前 git 凭据直接查询 run/jobs API；首次 2026-11-15T19:33:53.367524Z 为 in_progress，2026-11-15T19:43:42.786536Z 确认 completed/failure，19:52:09.361807Z 再查一致。head_branch=dev/batch-k-20261114，attempt=1，updated_at=2026-11-15T19:41:41Z。13 jobs：11 success、1 failure、1手动 skipped；121步骤：116 success、1 failure、4 skipped。所有 job head_sha 均匹配。 |
+| Linux 失败证据 | `Rust 1.99.1 (ubuntu-latest)`，job 132930161061；同凭据 annotations API | `Tests (workspace)` 失败，2026-11-15T19:30:39Z 至19:33:29Z；annotations 明确 `Process completed with exit code 101.`。该 job 后续 sqlite、server-persistence、Docs 与缓存 post 跳过。未获得具体失败测试，不猜测根因、不归为偶发或已修复。 |
+| 日志权限 | `GET /repos/wmqfl861/AK-sending/actions/jobs/132930161061/logs` | API 返回302跳转后，日志存储返回 HTTP 401：`Server failed to authenticate the request. Please refer to the information in the www-authenticate header.`。保留错误记录，没有换身份、没有重试该被拒日志下载或绕过。run/jobs 与独立 annotations 接口同一凭据成功，凭据只驻查询进程内存，不输出/落盘。 |
+| CI 边界 | 固定 SHA workflow 与完整 jobs/steps JSON | Windows Rust、Flutter/Dart、Android 双ABI FFI/符号/debug APK、Linux/macOS portability、audit/deny、repository、legacy signal、NAT netns成功。Linux workspace失败及其后步骤跳过不能被本机Windows成功替代；portability check不当作应用构建。 |
+| 远端引用 | `git fetch origin --prune`；`git ls-remote --heads origin`，行为验证后再次读取 | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=7a93314db81cabb0c089451d92eae1eb1d4f8d23，复读一致；未调用 merge、push 或分支删除。 |
+| 本地引用 | `git worktree list --porcelain`、status/diff | 只有主工作树；批次分支固定 tip，main 保持 d6c7136；仅本轮五份评审相关文档同步，未创建提交。 |
+
+| 未执行 / 边界 | 本轮事实 |
+|---|---|
+| 生产、Linux 原生 systemd/权限、物理双机 C4、抓包 | 均未执行。Shell 生成与执行、临时 cp/cmp/SQLite 为真实本机操作；proc/systemctl/权限及故障为 Windows Bash 离线模型。未启动原生 registry CLI，不将离线 install=0 写成真实部署成功。 |
+| 平台重建与工具 | 本机 Windows workspace 与 host release FFI、Flutter/Dart 实际执行；本机 Android/Linux/macOS 未重建，使用固定 tip CI 的相应真实结果。shellcheck 未发现，未执行。 |
+| 手动 CI release | CI release-deep job 按 push 事件 skipped，不计执行；本机 release 结果单列，不冒充 CI 同一平台验证。 |
+| 绝对 DB 与写权限 | 绝对 DB 外部目录未增加 RWP 的旧行为保留为已知边界，没有将未经本轮原生权限验证的行为扩成新增缺陷。 |
+
+| 仓外材料（系统 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k17-review-0u_sv46_/ci` | 各次 run/jobs JSON、annotations、日志接口拒绝记录；查询脚本在父目录。 |
+| `ak-k17-review-0u_sv46_/gates` | 实际命令、exit、耗时、工具快照、所有门槛日志和 release 盘量记录。 |
+| `ak-k17-review-0u_sv46_/grep`、`grep-active` | 主复核原8案和active补4案；生成脚本、stubs、输出、合成文件及结果；`review_grep.py`在父目录。 |
+| `ak-k17-review-0u_sv46_/reader`、`reader-main` | 专项主矩阵、补充、说明、runner；主复核4案独立重放材料。 |
+| `ak-k17-review-0u_sv46_/db`、`db-main`、`db-active-main` | 专项15案、完整/精简runner与聚合结果；主复核7案及精简runner的active pair。 |
+
+## 40. 修复轮十七（K17 复核后的新候选，执行方记录）
+
+[K17 复核](REVIEW_2026-11-16-batchK17.zh-CN.md)（PIPESTATUS 守卫判通过；剩二次提取 grep 与子串切分两项 P1）后，执行方完成修复并处理该轮发现的 tip CI 红项；复核方本地同步（§39、STATUS、状态表、K16 历史归属）与本节代码改动一并提交。
+
+| K17 发现 | 修复内容 |
+|---|---|
+| 二次值提取 grep 吞错误（P1） | 值提取 grep 改 errexit 安全捕获并按**存在性 rc 联动 triage**：rc=0 进行；rc=1 且存在 rc=0（快照文件不可能中途变化）拒绝「不一致」；rc=1 且存在 rc=1 为合法缺失；rc≥2 拒绝「cannot determine the value」。复核夹具（存在 rc=0、提取 rc=2 无输出）从「HOME 诱饵上线」翻转为拒绝（stub 计数证明第 2 次调用真实报错）；健康控制保持；`7a93314` 基线同注入 exit 0 |
+| 子串切分改坏含 token 的 id-dir（P1，回归） | 改写改为**按空格分词遍历**：独立 `--db-path` token 替换其**后继 token**、`--db-path=<v>` 整体替换，其余 token（含路径中恰含 `--db-path-archive` 的 id-dir）原样透传；结果校验同样按 token 解析（绝对值须为独立 token、无 `=<rel>` 等值形残留）。复核夹具（id-dir 含 token+真相对 db）从「id-dir 被改坏+真参数仍相对+校验放行」翻转为仅真参数绝对化、id-dir 字节不变且生成 unit 双双正确；普通/方括号/绝对/全链控制保持；`7a93314` 基线产出改坏行——原缺陷 |
+| tip CI 红项（run 43752760678，Linux `Tests (workspace)` exit 101） | 失败用例 `sched_snapshot_and_set_policy_fields`：快照已见 Completed 状态但事件队列尚无 completed 终态事件（状态翻转与事件入队的既有慢机时序类，与部署修复无关；Rust 树本轮未改）。处置：同一提交重跑失败 job → **success**（flake 证据）；测试加固——排水改为有界轮询事件通道（30s，25ms 间隔）直到 completed 事件出现，不再信任单次即时排水；本地 24/24 |
+
+### 修复轮十七门禁与提交
+
+本地：两脚本 `bash -n`+自检全过；Python 295/295（部署套件 138，含 6 项轮十八回归与跨十五版基线）；`ak-ffi::ffi_pairing` 24/24；fmt/clippy（ak-ffi）exit 0；`check_repository.py` exit 0；契约 5/5；其余 Rust 树与已验证链一致。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮十七首个提交，推送后回填哈希） | 二次 grep triage、token 遍历改写与校验、ffi_pairing 事件排水轮询；复核方文档同步与执行方本节记录入库 |

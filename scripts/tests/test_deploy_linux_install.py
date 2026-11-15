@@ -83,7 +83,9 @@ PREV10_PRE_REV = "09fceb6"  # round-10 tip (pre-move key chmod: set -e caught it
 PREV11_REV = "0b41201"
 PREV12_REV = "943a346"
 PREV13_REV = "f425256"
-PREV14_REV = "0602f92"  # round-15 tip (K16 findings: partial-snapshot
+PREV14_REV = "0602f92"
+PREV15_REV = "7a93314"  # round-16 tip (K17 findings: extraction-error
+                         # passthrough, substring-split id-dir corruption)  # round-15 tip (K16 findings: partial-snapshot
                          # acceptance, extraction-error-as-absent, bracket
                          # db rewrite no-op)  # round-14 tip (K15 findings: environ fail-open
                          # verification reads, relative --db-path unbound)  # round-13 tip (K14 findings: fail-open second cwd
@@ -516,15 +518,31 @@ exec "@REAL_CHMOD@" "$@"
 """
 
 GREP_STUB = r"""#!/usr/bin/env bash
-# K10-N1 (round 17) model: GREP_EXTRACT_VAR makes the extraction grep for
-# that variable ('grep -za -m1 ^VAR= file') exit 2 with no stdout — a TOOL
-# ERROR that must never be read as variable-absent. Everything else passes
-# through to the real grep.
+# K10-N1 (round 17/18) models:
+#  - GREP_EXTRACT_VAR: EVERY '-za -m1 ^VAR=' grep for that variable exits 2
+#    (the round-17 persistent-error shape).
+#  - GREP_EXTRACT_FAIL_AT=2: only the Nth '-za -m1 ^VAR=' call for that
+#    variable fails (rc=2, no stdout) — the round-18 shape where the FIRST
+#    (presence) grep succeeds and the SECOND (value extraction) errors.
+# Everything else passes through to the real grep.
 if [ "${1:-}" = -za ] && [ "${2:-}" = -m1 ] && [ -n "${GREP_EXTRACT_VAR:-}" ] \
    && [ "$3" = "^${GREP_EXTRACT_VAR}=" ]; then
-  printf 'REVIEW_GREP_EXTRACT_ERROR=2\n' >> "$PROBE_DIR/stubs.log"
-  echo "grep stub: forced extraction error for $GREP_EXTRACT_VAR" >&2
-  exit 2
+  n=0
+  cnt="$PROBE_DIR/grep-${GREP_EXTRACT_VAR}-count"
+  [ ! -f "$cnt" ] || read -r n < "$cnt"
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$cnt"
+  hit=0
+  if [ -n "${GREP_EXTRACT_FAIL_AT:-}" ] && [ "$n" -eq "$GREP_EXTRACT_FAIL_AT" ]; then
+    hit=1
+  elif [ -z "${GREP_EXTRACT_FAIL_AT:-}" ]; then
+    hit=1
+  fi
+  if [ "$hit" = 1 ]; then
+    printf 'REVIEW_GREP_%s_ERROR=2\n' "$n" >> "$PROBE_DIR/stubs.log"
+    echo "grep stub: forced extraction error for $GREP_EXTRACT_VAR (call $n)" >&2
+    exit 2
+  fi
 fi
 exec "@REAL_GREP@" "$@"
 """
@@ -1272,6 +1290,44 @@ class ProbeHarness(unittest.TestCase):
             environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
         (self.probe / identity.lstrip("/") / "registry.key").write_text(
             "same-synthetic-identity", encoding="utf-8")
+
+    def _db_arg_of(self, exec_line: str) -> str:
+        toks = exec_line.split()
+        for i, tok in enumerate(toks):
+            if tok == "--db-path":
+                return toks[i + 1]
+            if tok.startswith("--db-path="):
+                return tok[len("--db-path="):]
+        return ""
+
+    def _make_k18_db_fixture(self, identity: str, dbpath: str):
+        args = "--port 17200 --id-dir " + identity + " --db-path " + dbpath
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        live = self.probe / identity.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("synthetic-runtime-key", encoding="utf-8")
+        (live / "registry.db").write_text("synthetic-identity-default-db",
+                                         encoding="utf-8")
+        import sqlite3
+        live_db = dbpath if dbpath.startswith("/") else "/home/runtime-old/" + dbpath
+        alt_db = None if dbpath.startswith("/") else "/" + dbpath
+        for obj, marker in ((live_db, "runtime-real"), (alt_db, "new-cwd-decoy")):
+            if obj is None:
+                continue
+            path = self.probe / obj.lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.unlink()
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE review_marker(value TEXT)")
+            con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
+            con.commit()
+            con.close()
 
     def _make_k14_relative_fixture(self, identity: str):
         """Unit + argv both carry '--id-dir <identity>'; the running cwd is
@@ -3320,6 +3376,114 @@ echo "C4=[$c4]"
         self.assertIn("--db-path /home/runtime-old/state/registry.db", exec_line)
         self.assertNotIn("--db-path state/registry.db", exec_line + " ")
 
+    # -- K10-N1 (round 18): presence OK + extraction error must refuse -------
+    def test_k10n1_extraction_error_after_presence_ok_refuses(self):
+        # Reviewer fixture: the FIRST (presence) grep for USERPROFILE passes
+        # (rc=0, variable present), the SECOND (value extraction) grep
+        # exits 2 with no stdout. Rounds <= 17's '|| true' + empty-continue
+        # read that as variable-absent -> HOME fallback -> decoy migrated.
+        # The extraction rc triage refuses instead.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EXTRACT_VAR=USERPROFILE GREP_EXTRACT_FAIL_AT=2 '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "an extraction error after a successful presence check "
+                      "must refuse, never fall through as absent")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("cannot determine the value of USERPROFILE", p1_out)
+        self.assertIn("grep rc=2", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
+        log = self.stubs_log()
+        self.assertIn("REVIEW_GREP_2_ERROR=2", log,
+                      "the SECOND grep call really failed")
+        # The first call really succeeded (the marker file only exists once
+        # the stub ran it; only one ERROR marker is present).
+        self.assertNotIn("REVIEW_GREP_1_ERROR=2", log)
+
+    def test_k10n1_healthy_extraction_control(self):
+        # The healthy control on the same fixture: the true runtime-real
+        # source is selected end-to-end.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-real/\.ak-sending$")
+
+    # -- K15-N1 (round 18): the token-in-id-dir split regression --------------
+    def test_k15n1_token_inside_id_dir_not_corrupted(self):
+        # Reviewer fixture: the identity dir itself contains the substring
+        # '--db-path-archive'; the REAL --db-path argument is relative.
+        # The round-17 first-occurrence substring split corrupted the
+        # identity and left the real db relative; the token walk must
+        # absolutize ONLY the real argument and leave the id-dir untouched.
+        identity = "/home/otheruser/--db-path-archive/.ak-sending"
+        self._make_k18_db_fixture(identity, "state/registry.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k18tok.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertIn("--id-dir " + identity, exec_line,
+                      "the identity dir must remain byte-identical")
+        self.assertEqual(self._db_arg_of(exec_line),
+                         "/home/runtime-old/state/registry.db",
+                         "the REAL --db-path argument must be the resolved "
+                         "absolute object")
+        # The real generated unit with the CHOSEN values baked.
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
+            + 'REG_RW="' + identity + ' /home/runtime-old/state" '
+            + 'LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=' + identity + ' CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456k18tok.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456k18tok.sh" > "$PROBE_DIR/p456k18tok.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.generate_and_run_p456(body)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        unit_exec = [l for l in unit.splitlines() if l.startswith("ExecStart=")][0]
+        self.assertIn("--id-dir " + identity, unit)
+        self.assertEqual(self._db_arg_of(unit_exec),
+                         "/home/runtime-old/state/registry.db")
+
+    def test_k15n1_ordinary_and_bracket_controls_unchanged(self):
+        # Ordinary relative db still rewrites; bracket still refuses;
+        # absolute unchanged (round-17 behavior preserved).
+        self._make_k18_db_fixture("/home/otheruser/.ak-sending", "state/registry.db")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k18ord.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertEqual(self._db_arg_of(exec_line),
+                         "/home/runtime-old/state/registry.db")
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -4266,7 +4430,7 @@ class BaselineContrastTests(ProbeHarness):
         p1_out = (self.probe / "p1prev14g.out").read_text(encoding="utf-8")
         self.assertRegex(p1_out,
                          r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
-        self.assertIn("REVIEW_GREP_EXTRACT_ERROR=2", self.stubs_log())
+        self.assertIn("REVIEW_GREP_1_ERROR=2", self.stubs_log())
 
     def test_k15n1_round15_tip_bracket_db_rewrite_noop(self):
         # K16-review contrast: 0602f92 on the bracket db fixture — the
@@ -4298,6 +4462,64 @@ class BaselineContrastTests(ProbeHarness):
                          after,
                          "the round-15 tip's pattern substitution silently no-opped "
                          "on the bracket filename (the defect)")
+
+    def test_k10n1_round16_tip_extraction_error_after_presence_ok(self):
+        # K17-review contrast: 7a93314 on the two-grep fixture — the
+        # presence triage passes (rc=0) but the value-extraction '|| true'
+        # swallows the second grep's rc=2, the empty record continues as
+        # variable-absent and the chain migrates the HOME decoy.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        text = self.baseline_text(PREV15_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev15.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EXTRACT_VAR=USERPROFILE GREP_EXTRACT_FAIL_AT=2 '
+            + 'bash "$PROBE_DIR/p1prev15.sh" '
+            + '> "$PROBE_DIR/p1prev15.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV15_REV) + BOX_MODELS,
+                                  body, name="driver-prev15-g2.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-16 tip fell through the extraction error (the defect)")
+        p1_out = (self.probe / "p1prev15.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/otheruser/\.ak-sending$")
+        self.assertIn("REVIEW_GREP_2_ERROR=2", self.stubs_log())
+        self.assertNotIn("REVIEW_GREP_1_ERROR=2", self.stubs_log())
+
+    def test_k15n1_round16_tip_substring_split_corrupts_id_dir(self):
+        # K17-review contrast: 7a93314 on the token-in-id-dir fixture —
+        # the first-occurrence substring split corrupts the identity
+        # argument and leaves the REAL --db-path relative while the log
+        # claims a rewrite. Executed with the baseline's own decisions
+        # block driving the same rewrite code path.
+        identity = "/home/otheruser/--db-path-archive/.ak-sending"
+        self._make_k18_db_fixture(identity, "state/registry.db")
+        # Run the baseline's own phase1 + decision to get its CHOSEN values
+        # verbatim (the defect lives in ITS decisions-block rewrite).
+        text = self.baseline_text(PREV15_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev15b.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev15b.sh" '
+            + '> "$PROBE_DIR/p1prev15b.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV15_REV) + BOX_MODELS,
+                                  body, name="driver-prev15b-p1.sh")
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1prev15b.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev15b-decision.sh", text=text,
+            origin=f"the {PREV15_REV} baseline")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        # The identity argument is corrupted and the real db stays relative
+        # (parsed as a standalone argument, not a substring).
+        self.assertNotIn("--id-dir " + identity + " ", exec_line,
+                         "the round-16 tip corrupted the id-dir (the defect)")
+        self.assertEqual(self._db_arg_of(chosen_exec), "state/registry.db",
+                         "the real --db-path argument stayed relative (the defect)")
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

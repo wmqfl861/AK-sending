@@ -752,6 +752,24 @@ self_test() {
     || fail "a dangling --db-path option must refuse pre-stop (K19-N2)"
   grep -q 'cannot be used multiple times' "$0" \
     || fail "duplicate --db-path bindings must refuse pre-stop (K19-N2)"
+  # K 复核 K20-N1 (round 21): every input-derived token walk (phase1 db
+  # parser/validator, /home candidate enumeration, decisions extraction/
+  # rewrite/verification) runs with GLOBBING DISABLED — word splitting
+  # only, so a bracket filename never expands against the cwd.
+  grep -q 'for bd_tok in \$bd_line' "$WORK/p1.sh" \
+    || fail "the phase1 db parser must walk tokens noglob (K20-N1)"
+  grep -q 'db_binding_invalid' "$WORK/p1.sh" \
+    || fail "phase1 must validate the CLI option grammar before comparing (K20-N2)"
+  grep -q 'set -f' "$0" \
+    || fail "token walks over operator-controlled lines must run noglob (K20-N1)"
+  # K 复核 K20-N2 (round 21): the CLI-invalid --db-path VALUE SHAPES refuse
+  # pre-stop, citing the CLI's own errors.
+  grep -q "an explicit EMPTY --db-path value" "$0" \
+    || fail "an empty '--db-path=' must refuse pre-stop (K20-N2)"
+  grep -q "a value is required for '--db-path <DB_PATH>' but none was supplied" "$0" \
+    || fail "the empty-value refusal must cite the CLI's own error (K20-N2)"
+  grep -q 'OPTION-SHAPED token as the space-form --db-path value' "$0" \
+    || fail "an option-shaped space-form --db-path value must refuse pre-stop (K20-N2)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1084,22 +1102,91 @@ effective_execstart() {
 # decisions-block rewrite/verification (K 复核 K19-N1); the old greedy sed
 # treated a value-internal '--db-path' as an option start and bound
 # '--port' instead.
+# K 复核 K20-N1 (round 21): the tokenization must do WORD SPLITTING ONLY —
+# an unquoted 'for x in \$line' also runs pathname expansion, so a literal
+# 'db[1].sqlite' filename GLOBBED to 'db1.sqlite' when the executing cwd
+# contained a matching file, silently retargeting the database object. The
+# walk therefore runs with globbing disabled ('set -f') and the tokens are
+# re-joined with a literal space so no later split can re-glob; the
+# K19-N2 dangling/duplicate checks are shared with the decisions walk.
+# K 复核 K20-N2 (round 21): mirror the REAL CLI's value grammar — an
+# explicit EMPTY equals suffix ('--db-path=') is rejected by the CLI with
+# "a value is required for '--db-path <DB_PATH>' but none was supplied",
+# and the SPACE form cannot bind an option-shaped next token ('--…'): the
+# CLI consumes it as the missing-value error, never as a filename. A
+# literal option-LIKE filename stays expressible via the equals form
+# (K19-N1), so this MIRRORS the CLI rather than restricting it. Output:
+# BD_VALUE (empty = option absent), BD_PRESENT=1 when a binding exists,
+# BD_COUNT bindings, BD_DANGLING=1 on a valueless trailing option,
+# BD_EMPTY=1 on an explicit empty equals value, BD_OPTIONVAL=1 when the
+# space form's next token is option-shaped. Callers refuse on any != 0.
 bound_db_arg() {
-  local bd_tok bd_val bd_pending
+  local bd_tok bd_val bd_pending bd_line
   bd_val=""
   bd_pending=0
-  for bd_tok in \$1; do
+  bd_present=0
+  bd_count=0
+  bd_dangling=0
+  bd_empty=0
+  bd_optionval=0
+  set -f
+  bd_line=\$1
+  for bd_tok in \$bd_line; do
     if [ "\$bd_pending" = 1 ]; then
-      [ -z "\$bd_val" ] && bd_val="\$bd_tok"
+      bd_present=1
+      bd_count=\$((bd_count + 1))
+      case "\$bd_tok" in
+        --*) bd_optionval=1 ;;
+        *) [ -z "\$bd_val" ] && bd_val="\$bd_tok" ;;
+      esac
       bd_pending=0
       continue
     fi
     case "\$bd_tok" in
-      --db-path) bd_pending=1 ;;
-      --db-path=*) [ -z "\$bd_val" ] && bd_val=\${bd_tok#--db-path=} ;;
+      --db-path)
+        bd_pending=1
+        bd_count=\$((bd_count + 1)) ;;
+      --db-path=)
+        bd_present=1
+        bd_count=\$((bd_count + 1))
+        bd_empty=1 ;;
+      --db-path=*)
+        bd_present=1
+        [ -z "\$bd_val" ] && bd_val=\${bd_tok#--db-path=} ;;
     esac
   done
+  [ "\$bd_pending" = 1 ] && bd_dangling=1
+  set +f
   printf '%s\\n' "\$bd_val"
+}
+# db_binding_invalid <line>: 0 when the --db-path OPTION SHAPE is one the
+# REAL CLI would reject at startup (K 复核 K20-N2): a dangling standalone
+# option, duplicate bindings, an explicit EMPTY equals suffix, or a
+# space-form value that is option-shaped ('--…'). Tokenization runs with
+# globbing disabled (K 复核 K20-N1) so a bracket filename never expands.
+db_binding_invalid() {
+  local tok pending count
+  pending=0
+  count=0
+  dbbi_bad=""
+  set -f
+  for tok in \$1; do
+    if [ "\$pending" = 1 ]; then
+      case "\$tok" in --*) dbbi_bad="the space-form --db-path value is option-shaped ('\$tok'); the CLI would report a missing value, never consume an option as the filename (K20-N2)" ;;
+    esac
+      pending=0
+      continue
+    fi
+    case "\$tok" in
+      --db-path) pending=1; count=\$((count + 1)) ;;
+      --db-path=) count=\$((count + 1)); dbbi_bad="an explicit EMPTY --db-path value (the CLI rejects it: \"a value is required for '--db-path <DB_PATH>' but none was supplied\")" ;;
+      --db-path=*) count=\$((count + 1)) ;;
+    esac
+  done
+  set +f
+  [ "\$count" -gt 1 ] && dbbi_bad="duplicate bindings: the line carries \$count '--db-path' bindings and the CLI rejects duplicates: \"cannot be used multiple times\""
+  [ "\$pending" = 1 ] && dbbi_bad="a dangling '--db-path' option without a value (the service CLI would reject it: \"a value is required for '--db-path <DB_PATH>'\")"
+  [ -n "\$dbbi_bad" ]
 }
 # reg_args_agree <exec-line> <cmdline-line>: 0 when the EFFECTIVE values of
 # the configured ExecStart and the running cmdline AGREE (defaults derived;
@@ -1109,9 +1196,14 @@ bound_db_arg() {
 # registry.key plus the default db location) and the subcommand's
 # --db-path select DATA/IDENTITY LOCATIONS (K 复核 K2-R3 round 8:
 # --db-path used to be missing, so a configured new.db was chosen over the
-# running old.db); --port and --bind select the LISTEN surface
-# (occupancy-relevant).
+# running old.db); --port and --bind select the LISTEN
+# surface (occupancy-relevant).
 reg_args_agree() {
+  # K 复核 K20-N2: a CLI-invalid --db-path SHAPE never reaches the
+  # comparison (an explicit empty value used to fall through as the
+  # default db and pass). rc 3 = invalid option grammar.
+  if db_binding_invalid "\$1"; then return 3; fi
+  if db_binding_invalid "\$2"; then return 3; fi
   # K 复核 K2-R3 (round 9): compare EFFECTIVE values, DEFAULTS INCLUDED —
   # round 8 compared an explicit value only when the RUNNING side spelled
   # the flag out, so a running instance relying on the default db location
@@ -1274,7 +1366,15 @@ if [ -n "\$reg_line" ]; then
         reg_hits=0
         while IFS= read -r re_e; do
           [ -n "\$re_e" ] || continue
-          if reg_args_agree "\$re_e" "\$reg_cmdline"; then
+          reg_one_rc=0
+          reg_args_agree "\$re_e" "\$reg_cmdline" || reg_one_rc=\$?
+          # K 复核 K20-N2: rc 3 = the option SHAPE itself is CLI-invalid —
+          # refuse with the grammar diagnosis, not the ambiguity fallback.
+          if [ "\$reg_one_rc" = 3 ]; then
+            echo "ERROR: the effective ExecStart of \$reg_unit carries \$dbbi_bad (configured '\$re_e' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2)" >&2
+            exit 3
+          fi
+          if [ "\$reg_one_rc" = 0 ]; then
             reg_pick="\$re_e"
             reg_hits=\$((reg_hits + 1))
           fi
@@ -1295,6 +1395,16 @@ REG_EFF_H
       # dependent default); rc 1 = material disagreement. Both refuse.
       rag_rc=0
       reg_args_agree "\$reg_pick" "\$reg_cmdline" || rag_rc=\$?
+      if [ "\$rag_rc" = 3 ]; then
+        # K 复核 K20-N2 (round 21): the option SHAPE is CLI-invalid — an
+        # explicit empty '--db-path=' or a space-form value that is
+        # option-shaped used to fall through as the effective DEFAULT db and
+        # the comparison PASSED, letting the deploy stop a service the CLI
+        # itself would refuse to start with that line. Refuse BEFORE any
+        # stop with the CLI's own error cited.
+        echo "ERROR: the effective ExecStart of \$reg_unit carries \$dbbi_bad (configured '\$reg_pick' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2)" >&2
+        exit 3
+      fi
       if [ "\$rag_rc" = 2 ]; then
         echo "ERROR: the effective configuration of \$reg_unit cannot be established against the running cmdline (an effective value relies on an environment-dependent default); refusing before any switchover (K2-R3)" >&2
         exit 3
@@ -1677,6 +1787,11 @@ sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 home_list=\$(sudo -n ls -1 /home 2>/dev/null) \\
   || { echo "ERROR: cannot enumerate /home (sudo -n ls failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
 home_ak_dirs=\$(printf '%s\\n' "\$home_list" | sed 's|^|/home/|; s|\$|/.ak-sending|')
+# K 复核 K20-N1 (round 21): candidate enumeration is WORD SPLITTING ONLY —
+# an unquoted 'for d in ...' also runs pathname expansion, and a home
+# directory name carrying glob-significant bytes would be re-expanded
+# against this script's cwd and probe a DIFFERENT candidate directory.
+set -f
 for d in $REMOTE_DATA /root/.ak-sending \$home_ak_dirs; do
   dstate=\$(priv_exists "\$d") \\
     || { echo "ERROR: cannot determine whether \$d exists; refusing before any switchover (K2-R3)" >&2; exit 3; }
@@ -1690,6 +1805,7 @@ for d in $REMOTE_DATA /root/.ak-sending \$home_ak_dirs; do
     fi
   fi
 done
+set +f
 # K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
 # prove NOW — before anything is stopped — that the install path is usable
 # through exactly that path (read-only mounts or restricted sudoers must
@@ -2616,13 +2732,37 @@ real_run() {
     # "a value is required for '--db-path <DB_PATH>'") and duplicate
     # bindings (-> "cannot be used multiple times"; both verified against
     # the current CLI) BEFORE any service is stopped.
+    # K 复核 K20-N1 (round 21): the walk does WORD SPLITTING ONLY — an
+    # unquoted 'for re_tok in $REGISTRY_EXEC' also runs pathname expansion,
+    # so the literal bracket filename 'db[1].sqlite' GLOBBED to
+    # 'db1.sqlite' when this deploy's cwd contained a matching file (the
+    # reviewer reproduced it with a plain decoy file named db1.sqlite in
+    # the cwd): the whitelist then vetted the GLOBBED value, the rewrite
+    # baked the globbed path into the unit, and the deploy silently
+    # retargeted the database object. Globbing is disabled around every
+    # walk of $REGISTRY_EXEC below (extraction, rewrite, verification).
+    # K 复核 K20-N2 (round 21): mirror the REAL CLI's value grammar — an
+    # explicit EMPTY equals suffix ('--db-path=') is CLI-rejected with
+    # "a value is required for '--db-path <DB_PATH>' but none was
+    # supplied" (the old walk let it fall through as "no --db-path" and
+    # compared it as the effective DEFAULT db), and the SPACE form never
+    # binds an option-shaped next token ('--…'): the CLI reports the
+    # missing-value error instead of consuming an option as the filename.
+    # A literal option-LIKE filename stays expressible via the EQUALS form
+    # (K19-N1: '--db-path=--db-path' keeps working).
     rel_db=""
     re_dangling=0
     re_count=0
     re_pending=0
+    re_empty=0
+    re_optionval=0
+    set -f
     for re_tok in $REGISTRY_EXEC; do
       if [ "$re_pending" = 1 ]; then
-        [ -z "$rel_db" ] && rel_db="$re_tok"
+        case "$re_tok" in
+          --*) re_optionval=1 ;;
+          *) [ -z "$rel_db" ] && rel_db="$re_tok" ;;
+        esac
         re_pending=0
         continue
       fi
@@ -2630,17 +2770,27 @@ real_run() {
         --db-path)
           re_pending=1
           re_count=$((re_count + 1)) ;;
+        --db-path=)
+          re_count=$((re_count + 1))
+          re_empty=1 ;;
         --db-path=*)
           re_count=$((re_count + 1))
           [ -z "$rel_db" ] && rel_db=${re_tok#--db-path=} ;;
       esac
     done
     [ "$re_pending" = 1 ] && re_dangling=1
+    set +f
     if [ "$re_dangling" = 1 ]; then
       fail "the effective ExecStart carries a dangling '--db-path' option without a value (the service CLI would reject it: \"a value is required for '--db-path <DB_PATH>'\"); refusing before any switchover (K19-N2)"
     fi
     if [ "$re_count" -gt 1 ]; then
       fail "the effective ExecStart carries $re_count '--db-path' bindings (the service CLI rejects duplicates: \"cannot be used multiple times\"); refusing before any switchover (K19-N2)"
+    fi
+    if [ "$re_empty" = 1 ]; then
+      fail "the effective ExecStart carries an explicit EMPTY --db-path value '--db-path=' (the service CLI rejects it: \"a value is required for '--db-path <DB_PATH>' but none was supplied\"); refusing before any switchover (K20-N2)"
+    fi
+    if [ "$re_optionval" = 1 ]; then
+      fail "the effective ExecStart binds an OPTION-SHAPED token as the space-form --db-path value (the service CLI reports the missing-value error and never consumes an option as the filename; a literal option-LIKE filename stays expressible via the equals form, K19-N1); refusing before any switchover (K20-N2)"
     fi
     case "$rel_db" in
       /*|'') : ;;
@@ -2670,6 +2820,9 @@ real_run() {
         re_new=""
         re_replaced=0
         re_seen_sep=""
+        # K 复核 K20-N1: noglob here too — the value being re-emitted can be
+        # a bracket filename that must reach the unit BYTE-FOR-BYTE.
+        set -f
         for re_tok in $REGISTRY_EXEC; do
           if [ "$re_seen_sep" = 1 ]; then
             re_new="${re_new:+$re_new }$abs_db"
@@ -2687,6 +2840,7 @@ real_run() {
             *) re_new="${re_new:+$re_new }$re_tok" ;;
           esac
         done
+        set +f
         REGISTRY_EXEC="$re_new"
         # Verify the RESULT by the OPTION-BOUND VALUE, not the statement or
         # any substring (the round-17 check passed on a corrupted identity
@@ -2699,6 +2853,9 @@ real_run() {
         re_parsed=""
         re_pending=0
         re_seen=0
+        # K 复核 K20-N1: noglob verification walk — parse the option-bound
+        # value from the UNEXPANDED tokens.
+        set -f
         for re_tok in $REGISTRY_EXEC; do
           if [ "$re_pending" = 1 ]; then
             re_parsed="$re_tok"
@@ -2711,6 +2868,7 @@ real_run() {
             --db-path=*) re_parsed=${re_tok#--db-path=}; re_seen=1 ;;
           esac
         done
+        set +f
         if [ "$re_replaced" != 1 ] || [ "$re_seen" != 1 ] || [ "$re_parsed" != "$abs_db" ]; then
           fail "the --db-path rewrite did not take (parsed db argument '$re_parsed' != resolved '$abs_db'); refusing rather than generate a cwd-dependent unit (K15-N1)"
         fi

@@ -87,7 +87,10 @@ PREV14_REV = "0602f92"
 PREV15_REV = "7a93314"
 PREV16_REV = "4db2b4f"
 PREV17_REV = "1d76871"  # round-18 tip (K19 findings: greedy db-value
-                         # pre-parse, dangling/duplicate db bindings)  # round-17 tip (K18 findings: byte-evidence
+                         # pre-parse, dangling/duplicate db bindings)
+PREV18_REV = "110bb34"  # round-20 tip (K20 findings: globbing in the token
+                         # walks retargets a bracket db filename; empty and
+                         # option-shaped --db-path values accepted)  # round-17 tip (K18 findings: byte-evidence
                          # producer error ignored, equals-form verification bug)  # round-16 tip (K17 findings: extraction-error
                          # passthrough, substring-split id-dir corruption)  # round-15 tip (K16 findings: partial-snapshot
                          # acceptance, extraction-error-as-absent, bracket
@@ -1394,6 +1397,117 @@ class ProbeHarness(unittest.TestCase):
             con.commit()
             con.close()
 
+    def _make_k20_glob_fixture(self, sep: str, value: str = "db[1].sqlite"):
+        """K20-N1 reviewer fixture: unit AND running argv carry
+        '--port 17200 --id-dir <id> --db-path<sep><value>'; service cwd
+        /home/runtime-old. The REAL object is /home/runtime-old/<value>
+        ('runtime-real'); the glob-decoy sits at /home/runtime-old/db1.sqlite
+        ('glob-decoy') — the file an unquoted walk's pathname expansion
+        retargets the bracket filename to."""
+        identity = "/home/otheruser/.ak-sending"
+        args = "--port 17200 --id-dir " + identity + " --db-path" + sep + value
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        live = self.probe / identity.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("synthetic-runtime-key", encoding="utf-8")
+        (live / "registry.db").write_text("synthetic-identity-default-db",
+                                         encoding="utf-8")
+        import sqlite3
+        objects = [("/home/runtime-old/" + value, "runtime-real")]
+        if value != "db1.sqlite":
+            objects.append(("/home/runtime-old/db1.sqlite", "glob-decoy"))
+        for obj, marker in objects:
+            path = self.probe / obj.lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.unlink()
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE review_marker(value TEXT)")
+            con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
+            con.commit()
+            con.close()
+
+    def _drop_glob_match(self, sep: str):
+        """The reviewer's cwd decoy: a plain file in the DECISION's cwd that
+        pathname expansion of the bracket filename matches ('db1.sqlite' for
+        the space form, '--db-path=db1.sqlite' for the equals form)."""
+        name = "--db-path=db1.sqlite" if sep == "=" else "db1.sqlite"
+        (self.probe / name).write_text("synthetic-shell-glob-match",
+                                       encoding="utf-8")
+
+    def _run_p1_isolated(self, script_name: str, out_name: str):
+        """Generate phase1 and run it from an ISOLATED cwd — the reviewer
+        kept phase1's cwd free of glob-target files so only the decision
+        walk's expansion was in play (K20-N1)."""
+        return self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/' + script_name + '" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'mkdir -p "$PROBE_DIR/preflight-cwd"' + chr(10)
+            + '(cd "$PROBE_DIR/preflight-cwd" '
+            + '&& PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/' + script_name + '") '
+            + '> "$PROBE_DIR/' + out_name + '" 2>&1; echo "RUN_RC=$?"' + chr(10))
+
+    def _make_oldregistry_running(self):
+        """The reviewer's old-service state: oldregistry.service
+        enabled/active under pid 4242 running the old image."""
+        state = self.probe / "systemctl-state"
+        state.mkdir(parents=True, exist_ok=True)
+        for suffix, text in (("enabled", "1\n"), ("active", "active\n"),
+                             ("pid", "4242\n")):
+            (state / ("oldregistry.service." + suffix)).write_text(
+                text, encoding="utf-8")
+        (state / "4242.exe").write_text("/opt/ak-sending/ak-cli\n",
+                                        encoding="utf-8")
+        (state / "oldregistry.service.running").write_text(
+            "/opt/ak-sending/ak-cli\n", encoding="utf-8")
+        (state / "oldregistry.service.running.bin").write_text(
+            AK_CLI_OLD, encoding="utf-8")
+
+    def _chosen_of(self, out: str):
+        """Parse a decision driver's CHOSEN_* echoes into
+        (exec, rw, old_registry)."""
+        def field(tag):
+            line = [l for l in out.splitlines() if l.startswith(tag)][0]
+            return line[len(tag):]
+        return (field("CHOSEN_EXEC="), field("CHOSEN_RW="),
+                field("CHOSEN_OLD_REGISTRY="))
+
+    def _install_with_chosen(self, chosen_exec: str, chosen_rw: str,
+                             old_registry: str, out_prefix: str,
+                             text: str | None = None,
+                             rev: str | None = None):
+        """Run the REAL write_phase456 (current tree, or a baseline's own)
+        with the decision's CHOSEN values baked — the reviewer's full-chain
+        install step."""
+        defs = (self.phase_defs(text, rev) if text is not None
+                else self.definitions())
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" '
+            + 'STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
+            + 'REG_RW="' + chosen_rw + '" '
+            + 'LEGACY_UNIT= OLD_REGISTRY_UNIT=' + old_registry + ' '
+            + 'DATA_SOURCE_DIR=/home/otheruser/.ak-sending '
+            + 'CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/' + out_prefix + '.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/' + out_prefix + '.sh" '
+            + '> "$PROBE_DIR/' + out_prefix + '.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10))
+        return self.run_driver(defs + BOX_MODELS, body,
+                               name="driver-install-" + out_prefix + ".sh")
+
     def _k20_decision_of(self, configured: str, running: str, name: str,
                          baseline_rev: str = ""):
         identity = "/home/otheruser/.ak-sending"
@@ -1403,16 +1517,33 @@ class ProbeHarness(unittest.TestCase):
             unit_service_lines=["User=otheruser",
                                 "WorkingDirectory=/home/runtime-old"],
             environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        if baseline_rev:
+            # K 复核 K2-R5: a baseline contrast runs the BASELINE's OWN
+            # phase1 as well — the old-code proof must demonstrate the old
+            # CHAIN accepting the shape. (Round 21: the current phase1
+            # refuses CLI-invalid --db-path grammar pre-stop, so feeding a
+            # current-tree phase1 report into the baseline decision would
+            # only prove the decision's ERROR relay, not the defect.)
+            # baseline_text/phase_defs are provided by BaselineContrastTests.
+            text = self.baseline_text(baseline_rev)
+            rc, out = self.run_driver(
+                self.phase_defs(text, baseline_rev) + BOX_MODELS,
+                'write_phase1 "$PROBE_DIR/p1prev.sh" '
+                '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                + 'bash "$PROBE_DIR/p1prev.sh" '
+                + '> "$PROBE_DIR/p1prev.out" 2>&1; echo "RUN_RC=$?"'
+                + chr(10))
+            self.assertEqual(rc, 0, out)
+            p1_out = (self.probe / "p1prev.out").read_text(encoding="utf-8")
+            return self.run_decision_and_config(
+                p1_out, name, text=text, origin=f"the {baseline_rev} baseline")
         rc, out = self.generate_and_run_p456(
             'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
             + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
             + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
         self.assertEqual(rc, 0, out)
         p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
-        if baseline_rev:
-            text = self.baseline_text(baseline_rev)
-            return self.run_decision_and_config(
-                p1_out, name, text=text, origin=f"the {baseline_rev} baseline")
         return self.run_decision_and_config(p1_out, name)
 
     def _make_k18_db_fixture(self, identity: str, dbpath: str):
@@ -3857,6 +3988,217 @@ echo "C4=[$c4]"
                 self.assertNotIn("CHOSEN_", out)
                 self.assertNotIn("systemctl stop", self.stubs_log())
 
+    # -- K20-N1 (round 21): the token walks must not run pathname expansion --
+    def test_k20n1_glob_target_in_decision_cwd_refuses_pre_stop(self):
+        # The reviewer's P1 fixture: unit AND running argv carry the literal
+        # bracket filename 'db[1].sqlite'; a plain matching file
+        # ('db1.sqlite' / '--db-path=db1.sqlite') sits in the DECISION's cwd
+        # while phase1 runs from an isolated cwd. Round 20's unquoted walk
+        # expanded the bracket filename against that file and retargeted the
+        # database object; the frozen-token walk must refuse with the
+        # whitelist message naming the UNEXPANDED bytes, either way round.
+        for i, (sep, label) in enumerate(((" ", "space"), ("=", "equals"))):
+            with self.subTest(spelling=label):
+                self.setUp()
+                self._make_k20_glob_fixture(sep)
+                self._drop_glob_match(sep)
+                rc, out = self._run_p1_isolated("p1k20g%d.sh" % i,
+                                                "p1k20g%d.out" % i)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out)
+                p1_out = (self.probe / ("p1k20g%d.out" % i)).read_text(
+                    encoding="utf-8")
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-decision-k20g%d.sh" % i)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("contains bytes this deploy cannot bake "
+                              "faithfully into the generated unit", out)
+                self.assertIn("db[1].sqlite", out,
+                              "the refusal must name the UNEXPANDED bracket "
+                              "filename — the walk must not glob")
+                self.assertNotIn("CHOSEN_", out)
+                self.assertNotIn("systemctl stop", self.stubs_log())
+                self.assertFalse(
+                    (self.probe
+                     / "etc/systemd/system/ak-registry-server.service").exists(),
+                    "no unit may be generated from a globbed db path")
+                self.doCleanups()
+
+    def test_k20n1_bracket_db_arg_refuses_without_glob_target(self):
+        # Control: with NO matching file in the cwd the bracket filename has
+        # no glob expansion — the refusal must be IDENTICAL (the outcome may
+        # not depend on the executing directory's contents).
+        self._make_k20_glob_fixture(" ")
+        rc, out = self._run_p1_isolated("p1k20gm.sh", "p1k20gm.out")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k20gm.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k20gm.sh")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("contains bytes this deploy cannot bake faithfully "
+                      "into the generated unit", out)
+        self.assertIn("db[1].sqlite", out)
+        self.assertNotIn("CHOSEN_", out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+
+    def test_k20n1_ordinary_db_arg_walks_identically_reads_runtime_real(self):
+        # Ordinary-token control: a plain 'db1.sqlite' value walks through
+        # the noglob tokenizer IDENTICALLY (word splitting is unchanged).
+        # The full chain resolves it against the RUNNING cwd, stops the old
+        # service, installs, and the object the new unit points at is the
+        # REAL runtime database.
+        self._make_k20_glob_fixture(" ", value="db1.sqlite")
+        self._make_oldregistry_running()
+        rc, out = self._run_p1_isolated("p1k20ord.sh", "p1k20ord.out")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k20ord.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k20ord.sh")
+        self.assertEqual(rc, 0, out)
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+        self.assertEqual(self._db_arg_of(chosen_exec),
+                         "/home/runtime-old/db1.sqlite")
+        rc, out = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, "p456k20ord")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        self.assertIn("systemctl stop", self.stubs_log(),
+                      "the ordinary control still migrates the old service")
+        p456_out = (self.probe / "p456k20ord.out").read_text(encoding="utf-8")
+        self.assertIn("oldregistry:exists:enabled:active", p456_out)
+        unit = (self.probe
+                / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        unit_exec = [l for l in unit.splitlines()
+                     if l.startswith("ExecStart=")][0]
+        self.assertEqual(self._db_arg_of(unit_exec),
+                         "/home/runtime-old/db1.sqlite")
+        import sqlite3
+        con = sqlite3.connect(self.probe / "home/runtime-old/db1.sqlite")
+        marker = con.execute("SELECT value FROM review_marker").fetchone()[0]
+        con.close()
+        self.assertEqual(marker, "runtime-real",
+                         "the resolved object is the REAL runtime database")
+
+    # -- K20-N2 (round 21): CLI-invalid db VALUE SHAPES refuse pre-stop -------
+    def test_k20n2_empty_equals_db_value_refuses_pre_stop(self):
+        # The reviewer's fixture: the RUNNING argv is the legal default-db
+        # form; the configured unit adds an explicit EMPTY '--db-path='.
+        # The real CLI (reviewer-verified at 110bb34) refuses it with
+        # "a value is required for '--db-path <DB_PATH>' but none was
+        # supplied". Round 20 treated the empty value as "option absent",
+        # compared it as the effective DEFAULT db, PASSED, and stopped the
+        # service; the generated unit kept the shape the CLI rejects. Both
+        # phase1 and the decision must refuse BEFORE any stop.
+        running = "--port 17200 --id-dir /home/otheruser/.ak-sending"
+        configured = running + " --db-path="
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + configured,
+            cmdline_extra=running,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        rc, out = self._run_p1_isolated("p1k20e.sh", "p1k20e.out")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "phase1 itself must refuse the CLI-invalid shape "
+                      "(the empty value is not the option-absent default)")
+        p1_out = (self.probe / "p1k20e.out").read_text(encoding="utf-8")
+        self.assertIn("an explicit EMPTY --db-path value", p1_out)
+        self.assertIn("a value is required for '--db-path <DB_PATH>' "
+                      "but none was supplied", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k20e.sh")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("an explicit EMPTY --db-path value", out)
+        self.assertNotIn("CHOSEN_", out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+        self.assertFalse(
+            (self.probe
+             / "etc/systemd/system/ak-registry-server.service").exists(),
+            "no unit carrying a CLI-rejected argument may be generated")
+
+    def test_k20n2_space_form_option_value_refuses_pre_stop(self):
+        # The reviewer's supplementary shape: the RUNNING argv legally binds
+        # the literal '--port' filename via the EQUALS form (K19-N1 control
+        # on the running side); the configured unit re-spells it as the
+        # SPACE form '--db-path --port 17200'. Round 20 consumed the OPTION
+        # token '--port' as the db filename and left '17200' an unexpected
+        # positional; the real CLI reports the DB missing-value error and
+        # never starts. The configured shape must refuse pre-stop.
+        identity = "/home/otheruser/.ak-sending"
+        running = "--id-dir " + identity + " --db-path=--port --port 17200"
+        configured = "--id-dir " + identity + " --db-path --port 17200"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + configured,
+            cmdline_extra=running,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        rc, out = self._run_p1_isolated("p1k20o.sh", "p1k20o.out")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "phase1 itself must refuse the option-shaped binding")
+        p1_out = (self.probe / "p1k20o.out").read_text(encoding="utf-8")
+        self.assertIn("space-form --db-path value is option-shaped", p1_out)
+        self.assertIn("never consume an option as the filename", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k20o.sh")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("space-form --db-path value is option-shaped", out)
+        self.assertNotIn("CHOSEN_", out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+        self.assertFalse(
+            (self.probe
+             / "etc/systemd/system/ak-registry-server.service").exists())
+
+    def test_k20_decisions_walk_refuses_cli_invalid_shapes(self):
+        # Direct proof that the DECISIONS walk's own guards fire (phase1's
+        # grammar gate is bypassed by feeding the report straight in): each
+        # CLI-invalid shape refuses with the CLI contract cited, and the
+        # noglob property holds at the decisions level too.
+        base_log = (
+            "sudo: passwordless-ok\n"
+            "unit ak-registry-server: present\n"
+            "  ExecStart=/opt/old/ak-cli registry-server {args}\n"
+            "unit ak-stun-server: absent\n"
+            "port 17200/tcp: free\n"
+            "port 17101/udp: free\n"
+            "  runtime-id-dir: /home/otheruser/.ak-sending\n"
+            "  runtime-cwd: /home/runtime-old\n"
+        )
+        identity = "/home/otheruser/.ak-sending"
+        shapes = [
+            ("empty-equals",
+             "--id-dir " + identity + " --port 17200 --db-path=",
+             ["an explicit EMPTY --db-path value",
+              "a value is required for '--db-path <DB_PATH>' but none was supplied"]),
+            ("option-value",
+             "--id-dir " + identity + " --db-path --port 17200",
+             ["OPTION-SHAPED token as the space-form --db-path value",
+              "missing-value error"]),
+            ("bracket-glob-match",
+             "--id-dir " + identity + " --port 17200 --db-path db[1].sqlite",
+             ["contains bytes this deploy cannot bake faithfully into "
+              "the generated unit", "db[1].sqlite"]),
+        ]
+        for label, args, needles in shapes:
+            with self.subTest(shape=label):
+                self.setUp()
+                if label == "bracket-glob-match":
+                    self._drop_glob_match(" ")
+                rc, out = self.run_decision_and_config(
+                    base_log.format(args=args),
+                    "driver-decision-k20syn.sh")
+                self.assertNotEqual(rc, 0, out)
+                for needle in needles:
+                    self.assertIn(needle, out)
+                self.assertNotIn("CHOSEN_", out)
+                self.assertNotIn("systemctl stop", self.stubs_log())
+                self.doCleanups()
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -5027,6 +5369,177 @@ class BaselineContrastTests(ProbeHarness):
                     "defect): " + out)
                 self.assertNotIn("dangling", out)
                 self.assertNotIn("cannot be used multiple times", out)
+                self.doCleanups()
+
+    def _run_baseline_p1_isolated(self, rev: str, text: str, script: str,
+                                  out: str):
+        """A baseline's OWN write_phase1, run from an isolated cwd (K20-N1
+        reviewer protocol: only the decision's cwd carries the match)."""
+        body = (
+            'write_phase1 "$PROBE_DIR/' + script + '" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'mkdir -p "$PROBE_DIR/preflight-cwd"' + chr(10)
+            + '(cd "$PROBE_DIR/preflight-cwd" '
+            + '&& PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/' + script + '") '
+            + '> "$PROBE_DIR/' + out + '" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        return self.run_driver(self.phase_defs(text, rev) + BOX_MODELS, body,
+                               name=f"driver-{rev}-{script}.sh")
+
+    def test_k20n1_round20_tip_expands_glob_and_reads_decoy(self):
+        # K20-review contrast: 110bb34 on the reviewer's glob fixture WITH
+        # the matching file in the decision cwd — the unquoted walk runs
+        # pathname expansion, the whitelist vets the GLOBBED 'db1.sqlite',
+        # the full chain stops the old service, and the generated unit
+        # points at the GLOB-DECOY database (the defect). Both spellings.
+        for sep, label in ((" ", "space"), ("=", "equals")):
+            with self.subTest(spelling=label):
+                self.setUp()
+                self._make_k20_glob_fixture(sep)
+                self._drop_glob_match(sep)
+                self._make_oldregistry_running()
+                text = self.baseline_text(PREV18_REV)
+                rc, out = self._run_baseline_p1_isolated(
+                    PREV18_REV, text, "p1prev18g.sh", "p1prev18g.out")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out,
+                              "the round-20 tip's phase1 passed the bracket "
+                              "value (the expansion lived in the decision)")
+                p1_out = (self.probe / "p1prev18g.out").read_text(
+                    encoding="utf-8")
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-prev18g-decision.sh", text=text,
+                    origin=f"the {PREV18_REV} baseline")
+                self.assertEqual(
+                    rc, 0,
+                    "the round-20 tip accepted the globbed value (the "
+                    "defect): " + out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertEqual(
+                    self._db_arg_of(chosen_exec),
+                    "/home/runtime-old/db1.sqlite",
+                    "the round-20 tip expanded 'db[1].sqlite' to the decoy "
+                    "name (the defect)")
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry, "p456prev18g",
+                    text=text, rev=PREV18_REV)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log(),
+                              "the round-20 tip stopped the old service on "
+                              "the globbed binding (the defect's harm)")
+                p456_out = (self.probe / "p456prev18g.out").read_text(
+                    encoding="utf-8")
+                self.assertIn("oldregistry:exists:enabled:active", p456_out)
+                unit = (self.probe
+                        / "etc/systemd/system/ak-registry-server.service") \
+                    .read_text(encoding="utf-8")
+                unit_exec = [l for l in unit.splitlines()
+                             if l.startswith("ExecStart=")][0]
+                self.assertEqual(self._db_arg_of(unit_exec),
+                                 "/home/runtime-old/db1.sqlite")
+                import sqlite3
+                con = sqlite3.connect(
+                    self.probe / "home/runtime-old/db1.sqlite")
+                marker = con.execute(
+                    "SELECT value FROM review_marker").fetchone()[0]
+                con.close()
+                self.assertEqual(
+                    marker, "glob-decoy",
+                    "the round-20 tip's generated unit reads the GLOB "
+                    "DECOY, not the real 'db[1].sqlite' object (the defect)")
+                self.doCleanups()
+
+    def test_k20n2_round20_tip_accepts_empty_and_option_value_bindings(self):
+        # K20-review contrast: 110bb34 accepted BOTH CLI-invalid shapes the
+        # reviewer demonstrated — the explicit EMPTY '--db-path=' (the real
+        # CLI: rc 2 "a value is required for '--db-path <DB_PATH>' but none
+        # was supplied"; the generated unit kept the shape after the stop)
+        # and the SPACE form binding the next OPTION ('--db-path --port
+        # 17200' -> '--port' consumed as the filename, '17200' left an
+        # unexpected positional the CLI reports as "unexpected argument
+        # '17200' found").
+        identity = "/home/otheruser/.ak-sending"
+        cases = [
+            ("empty",
+             "--port 17200 --id-dir " + identity + " --db-path=",
+             "--port 17200 --id-dir " + identity,
+             "--db-path="),
+            ("option-value",
+             "--id-dir " + identity + " --db-path --port 17200",
+             "--id-dir " + identity + " --db-path=--port --port 17200",
+             "--db-path /home/runtime-old/--port 17200"),
+        ]
+        for label, configured, running, unit_shape in cases:
+            with self.subTest(shape=label):
+                self.setUp()
+                if label == "option-value":
+                    # the equals-literal '--port' object the RUNNING side
+                    # legally binds (also the object the defect retargets)
+                    import sqlite3
+                    obj = self.probe / "home/runtime-old/--port"
+                    obj.parent.mkdir(parents=True, exist_ok=True)
+                    if obj.exists():
+                        obj.unlink()
+                    con = sqlite3.connect(obj)
+                    con.execute("CREATE TABLE review_marker(value TEXT)")
+                    con.execute("INSERT INTO review_marker VALUES (?)",
+                                ("runtime-real",))
+                    con.commit()
+                    con.close()
+                self.make_private_discovery_model(
+                    main_exec="/opt/ak-sending/ak-cli registry-server "
+                    + configured,
+                    cmdline_extra=running,
+                    unit_service_lines=["User=otheruser",
+                                        "WorkingDirectory=/home/runtime-old"],
+                    environ=b"HOME=/home/otheruser\0"
+                            b"USERPROFILE=/home/otheruser\0")
+                live = self.probe / identity.lstrip("/")
+                live.mkdir(parents=True, exist_ok=True)
+                (live / "registry.key").write_text("synthetic-runtime-key",
+                                                   encoding="utf-8")
+                (live / "registry.db").write_text("synthetic-identity-default-db",
+                                                  encoding="utf-8")
+                self._make_oldregistry_running()
+                text = self.baseline_text(PREV18_REV)
+                rc, out = self._run_baseline_p1_isolated(
+                    PREV18_REV, text, "p1prev18n2.sh", "p1prev18n2.out")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out,
+                              "the round-20 tip's phase1 accepted the "
+                              "CLI-invalid shape (the empty value fell "
+                              "through as the default db; the option token "
+                              "was consumed as the filename)")
+                p1_out = (self.probe / "p1prev18n2.out").read_text(
+                    encoding="utf-8")
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-prev18n2-decision.sh", text=text,
+                    origin=f"the {PREV18_REV} baseline")
+                self.assertEqual(
+                    rc, 0,
+                    f"the round-20 tip accepted the {label} shape (the "
+                    f"defect): " + out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertIn(unit_shape.split(" ")[0], chosen_exec)
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry, "p456prev18n2",
+                    text=text, rev=PREV18_REV)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log(),
+                              "the round-20 tip stopped the old service "
+                              "before generating the CLI-rejected unit "
+                              "(the defect's harm)")
+                unit = (self.probe
+                        / "etc/systemd/system/ak-registry-server.service") \
+                    .read_text(encoding="utf-8")
+                unit_exec = [l for l in unit.splitlines()
+                             if l.startswith("ExecStart=")][0]
+                self.assertIn(unit_shape, unit_exec,
+                              "the generated unit carries the CLI-rejected "
+                              "binding (the reviewer's real-CLI probe at "
+                              "110bb34 returned rc 2 on exactly this shape)")
                 self.doCleanups()
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):

@@ -1387,3 +1387,73 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `a050315` | 统一 token 绑定语义与悬空/重复拒绝；复核方文档同步与执行方本节记录入库 |
+
+
+## 45. 修复轮十九独立复核证据（2026-11-16）
+
+固定范围 `1d76871..110bb34`，实现与文档提交 `a050315`，完整 tip 为 `110bb3485cdee3d8bef1f64ae74bbbc2c95d42a0`。机制、归属和已执行的重放代码见 [K20 复核](REVIEW_2026-11-16-batchK20.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K19 历史归属补注仅本地同步；所有路径、key/db 与 SQLite 均为合成夹具，未修改被审实现。
+
+| 行为与对照 | 实际执行 / 对象 | 结果及层级 |
+|---|---|---|
+| K19 指定回归与历史对照 | 独立专项执行 `test_k19*`，当前回归与 `1d76871` / `4db2b4f` 对照 | 6 tests，131.805秒，OK，无 skip。字面名 unit 绑定真实库，尾悬空和重复项停服前拒绝；旧基线预期缺陷/拒绝继续复现。 |
+| 混合 DB 拼写补测 | 空格+等号、等号+空格 | 2方向均重复诊断、无 CHOSEN、无 stop；纠正新回归注释与实际列表不相符的非阻断描述。 |
+| 文件名展开专项 | `review_glob.py`，当前/基线、空格/等号、有/无匹配、普通控制 | 6案，runner exit0，131.235秒，全部断言吻合；当前两拼写匹配均全链0、stop旧active、生成cwd/db1.sqlite且读取glob-decoy；两个直接基线和当前无匹配停服前拒绝；普通控制读取runtime-real。 |
+| phase1 cwd 分离专项 | `review_glob_isolated.py space-match-tip space-match-baseline` | 2案，runner exit0，45.328秒；phase1在无匹配的空cwd，本机decision cwd有匹配：当前仍错库，直接基线仍拒绝。 |
+| 文件名展开主复核重放 | K20 §4.1逐字代码，phase1 cwd分离 | 6案，runner exit0，124.891秒，全部断言吻合；含两拼写当前错库、两基线拒绝、无匹配拒绝和普通正确控制。生成unit解析后实际打开所指SQLite，不靠路径日志判断。 |
+| 缺值形态专项 | `review_empty_db.py`，empty-tip、empty-baseline、option-value-tip | 3案phase1/decision/install均0、stop旧active；空等号当前与基线均保留空值，下一选项当前改成绝对路径并残留位置参数。专项CLI最初用现存11/14 release，不能称tip重建；主复核精确tip验证另列。 |
+| 空等号主复核重放 | K20 §4.2逐字代码，当前与 `1d76871` | 2案，runner exit0、ALL_EXPECTATIONS_MATCHED；全链0、stop旧active、生成空等号；改用本轮debug CLI，两案均rc2并首先报告DB value required。缺口在直接基线已存在。 |
+| 真实 tip CLI 解析 | 实际 `target/debug/ak-cli.exe --version` 为 git110bb34；`cli-tip-parse.json` | 7探针全部符合断言：字面--db-path与方括号均通过Clap后在预置15字节无效key处rc1（必须32），未到server spawn；空等号、下一选项、尾悬空均rc2/value required；重复rc2/cannot be used multiple times；下一选项生成argv rc2/unexpected argument 17200。非法形态除尾悬空自身必拒外，均以末位永久无效port保证不启动。 |
+| 引入归属 | 固定源码与git blame | 新原值遍历来自a050315；直接基线在glob展开前白名单拒绝。空等号直接基线已放行；next-option补充只执行当前完整链，不推断引入版本。 |
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python全集 | `python -m unittest discover -s scripts/tests -v` | 310/310，0failure/error/skip；unittest1915.767秒，runner1916.219秒，exit0。部署153，NAT lifecycle11、streak51、netem24、repository64、SSH7。一次执行无重试；实现保持固定tip，后段仅本轮审核文档同步。 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定tip初始均exit0，分别1.797秒、0.172秒，契约5/5；文档收尾结果另列。 |
+| Shell | deploy / cross_nat两脚本`bash -n`及`--self-test` | 均exit0；deploy syntax0.047秒/self8.625秒，cross_nat syntax0.062秒/self4.266秒。自检没有SSH或传输；cross_nat调用现存release CLI，不称其为本轮tip release重建。 |
+| Rust常规 | `cargo test --locked --workspace`；fmt；clippy；rustdoc；Windows build，CARGO_NET_OFFLINE=true | 均exit0：workspace含doctest1200passed/0failed/8ignored，706.671秒；`cargo fmt --all -- --check`4.016秒；`cargo clippy --locked --workspace --all-targets -- -D warnings`46.063秒；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps`30.031秒；`cargo build --locked --workspace`46.063秒。一次执行、无重试；清理后缓存实际重建。 |
+| Rust特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 均exit0：sqlite54passed，14.015秒；persistence含doctest219passed，68.047秒，无失败。 |
+| Flutter/Dart | host release FFI构建、Flutter analyze/test、Dart包test | `cargo build --locked -p ak-ffi --release`exit0缓存2.016秒；Flutter analyze --no-pub无问题18.078秒；app test --no-pub 220/220，58.25秒；Dart包test170/170，22.25秒，均exit0。 |
+| Release集成深测 | `cargo test --locked --release -p ak-itests -- --ignored --nocapture` | exit101，656.828秒。bench_chunk_sweep最后4096KiB/multistream在common/mod.rs:362触发loopback transfer did not finish within 600s；此前7组256MiB完成，框架0passed/1failed，测试653.89秒。Cargo随后停止，netem/throughput/property_random/20,000/65,537文件未执行。最低空闲31,789,961,216bytes，无资源中止或重试。与K19同一卡点但根因未定，不称已证明flake或本轮部署脚本引入。 |
+| Release大文件 | `cargo test --locked --release -p ak-engine -- --ignored --nocapture` | exit0，272.969秒；five_gib_sparse_file_transfers_with_u64_offsets 1passed，测试270.86秒。预检空闲32,511,004,672bytes，最低21,754,830,848bytes，无资源中止、无重试；这是5GiB单项通过，不覆盖前一套件未执行项。 |
+| 实现与工具范围 | `git diff --exit-code 1d76871..110bb34 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | exit0，无Rust、依赖或workflow差异；Rust/cargo1.99.1、Flutter3.47.9/Dart3.13.7；本轮shellcheck未发现，未执行。 |
+
+| GitHub / Git / 文档 | 固定对象或命令 | 结果 |
+|---|---|---|
+| tip CI | `110bb3485cdee3d8bef1f64ae74bbbc2c95d42a0`；[43800673709](https://github.com/wmqfl861/AK-sending/actions/runs/43800673709) | 当前git凭据直接查询head_sha runs、精确run及jobs API。首次2026-11-16T03:55:16Z为in_progress；04:04:28Z确认completed/success，attempt1，updated_at04:03:19Z，branch=dev/batch-k-20261114。13jobs=12success/1manual skipped，121steps全部success，所有job head_sha精确一致。 |
+| CI边界 | 固定tip run/jobs JSON | Linux/Windows Rust、Flutter/Dart、Android双ABI FFI/符号/debug APK、Linux/macOS portability、audit/deny、repository、legacy、NAT netns均success。release-deep依push事件skipped；portability是check，不当应用构建；netns不是物理双机。 |
+| 初始与收尾引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；worktree/status | 两次一致：main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=110bb3485cdee3d8bef1f64ae74bbbc2c95d42a0。仅这两个远端head，一个主worktree，初始工作区干净；收尾精确五份审核文档变化，本地分支与HEAD均未移动。 |
+| K19文档与清理声明核对 | `git diff 1d76871..110bb34`、`git show 110bb34` | a050315纳入K19报告、§43/44、STATUS和状态表；110bb34只回填交接一行哈希。受控区间无删除文件；仓外清理数量/被删内容无法由git独立追溯，§44的清理量保留为执行方陈述，本轮未删除任何历史材料。 |
+| 权限与外部操作 | 只读GitHub API和Git引用查询 | 无权限拒绝，没有日志下载、换身份、生产访问或SSH；没有merge/push/分支删除或强推。 |
+| 文档收尾 | 仓库/契约检查、diff检查、嵌入runner逐字核对、最终引用 | 同步初检exit0，91md/339 local links、2.062秒；收尾检查exit0，同计数、2.094秒，契约5/5、0.141秒；git diff --check exit0。报告两份Python代码与主复核已执行文件逐字一致且compile通过，K状态行五列/提交占位检查通过。专项交叉核对机制、归属与三文档口径一致；实现diff为空。 |
+
+| 未执行 / 证据边界 | 本轮事实 |
+|---|---|
+| 原生Linux部署、权限、物理双机C4、抓包 | 未执行。Bash/生成脚本/文件操作/SQLite为真实本机操作，proc/systemctl/权限为离线模型；CLI只做参数解析与预设失败，不启动服务。 |
+| 其他平台本机重建 | Android/Linux/macOS本机未重建，相应固定tip CI结果单列；Windows实际构建单列。 |
+
+| 仓外材料（系统TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k20-review-qmoeeo1w/ci`及父目录initial JSON | GitHub各次run/jobs响应与精确SHA核验；凭据仅驻进程内存，不输出或落盘。 |
+| `ak-k20-review-qmoeeo1w/gates` | 主复核Python/Shell/仓库/契约命令、日志与exit/耗时。 |
+| `ak-k20-review-qmoeeo1w/glob-main`、`malformed-main` | 主复核已执行runner、生成脚本/unit、模型状态与SQLite、results.json；报告代码逐字取自这两份runner。 |
+| `ak-k20-review-qmoeeo1w/cli-tip-parse.json` | 真实tip CLI版本与各解析诊断，合成无效key留在同目录子文件夹。 |
+| `ak-k20-parser-liqdl5b0` | glob专项完整矩阵、phase1 cwd分离对照、实际CLI接受字面方括号后预设失败证据。 |
+| `ak-k20-regression-review-025989e533a249498cabf343610462b1` | 指定回归、混合方向补测、空值/下一选项完整链、release解析证据；主复核另做tip CLI复验。 |
+| `ak-k20-platform-baev55c9` | 平台门槛命令/完整日志/summary与磁盘监控。 |
+
+## 46. 修复轮二十（K20 复核后的新候选，执行方记录）
+
+[K20 复核](REVIEW_2026-11-16-batchK20.zh-CN.md)（K19-N1/N2 判修复；新发现 K20-N1 glob 展开回归、K20-N2 空后缀/选项形值）后，执行方完成修复；复核方本地同步（§45、STATUS、状态表）与本节代码改动一并提交。
+
+| K20 发现 | 修复内容 |
+|---|---|
+| K20-N1（P1，回归） | 全部输入派生的未引用遍历改在 `set -f`/`set +f` 下执行（仅分词、永不路径展开）：phase1 `bound_db_arg`/`db_binding_invalid`/home 枚举与决策提取/改写/校验六处遍历全覆盖，全文件 `for…in` 审计确认其余均为引用变量或生成器烘焙常量。复核夹具（决策 cwd 放 `db1.sqlite` glob 目标、字面 `db[1].sqlite`、真库带 `[1]`、诱饵不带）从「展开后读诱饵+停服」翻转为拒绝未展开字面值且结果与 cwd 内容无关（有/无匹配文件两态同拒）；普通 token 全链保持；`110bb34` 基线两种拼写均展开读诱饵 |
+| K20-N2（P2） | 新 `db_binding_invalid` 共享助手前置入 `reg_args_agree`（两侧，rc=3 先于任何比较）：空等号后缀引用真实 CLI 报错原文拒绝；空格形后继 token 选项形（`--*`）拒绝（注释说明字面选项名文件仍可经等号形表达——镜像而非收紧 CLI 语法）；悬空/重复拒绝同步升至 phase1。复核两夹具从「过比对/停服/生成 CLI 必拒参数」翻转为 phase1 exit 3 预停服拒绝；`--db-path=--db-path` K19-N1 控制保持；`110bb34` 基线接受两形态 |
+
+### 修复轮二十门禁与提交
+
+本地：`bash -n`+自检全过（s6 新增 noglob/db_binding_invalid/set -f/两种新拒绝标记）；Python 318/318（部署套件新增 glob 目标/空值/选项形/合成遍历回归与 `110bb34` 双基线对照；首轮两处 K19-N2 对照因 phase1 升级需用基线自身 phase1 而修正后全量重跑通过）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust；复核注记的 release 深测 4096KiB/multistream 超时不在本轮范围且未触碰）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮二十首个提交，推送后回填哈希） | 六处遍历 noglob 化与 db_binding_invalid 前置门；复核方文档同步与执行方本节记录入库 |

@@ -4,6 +4,8 @@
 
 逐项裁决只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。实际命令、运行编号、计数、仓外材料与未执行范围统一记在 [K 交接 §49](HANDOFF-BATCH-K-2026-11-14.zh-CN.md#49-修复轮二十一独立复核证据2026-11-16)。本轮通过当前 Git 凭据查询 GitHub API，已等到固定 tip CI completed/success；现有 CI 通过不覆盖下述独立反例。依据 REJECTED，仅同步本地审核文档，保留 main 和批次分支，不提交、合并、推送或删除分支。以下源码行号均指固定 tip。
 
+> 归属补注（K23，2026-11-16）：本文及交接§49、STATUS、审核状态表已随 `8419310` 纳入仓库，`f578f39` 仅回填执行方§50的实现哈希；上文“仅同步本地”描述K22当时动作。后续复核见 [K23](REVIEW_2026-11-16-batchK23.zh-CN.md)。
+
 ## 1. K21 修复的机械核对
 
 `bound_id_dir()`、`id_binding_invalid()` 已应用于 phase1 的两侧身份比较与运行身份推导；driver 的 ReadWritePaths 提取、相对身份提取和改写也使用完整 token 边界。等号形式取自身后缀，空格形式取后继 token，遍历禁止 glob 展开。K21 §5.1 原夹具在当前两种拼写下均逐字绑定 `/home/otheruser/--id-dir`，迁移真实 key/db，保留正确的生成 argv 与 ReadWritePaths；`110bb34` 自身完整链仍绑定诱饵目录并生成损坏 argv。普通目录、相对 `state/--id-dir` 及合法 `--id-dir=--id-dir` 控制保持。

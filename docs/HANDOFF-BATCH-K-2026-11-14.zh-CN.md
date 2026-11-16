@@ -1523,7 +1523,7 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 
 ## 49. 修复轮二十一独立复核证据（2026-11-16）
 
-固定范围 `714099a..a369e1c`，实现与文档提交 `6964239`，完整 tip 为 `a369e1c250cd64c80922683ef82dd3e983416c7a`。机制、归属和主复核逐字重放代码见 [K22 复核](REVIEW_2026-11-16-batchK22.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K21 历史归属补注仅本地同步；没有修改被审实现。
+固定范围 `714099a..a369e1c`，实现与文档提交 `6964239`，完整 tip 为 `a369e1c250cd64c80922683ef82dd3e983416c7a`。机制、归属和主复核逐字重放代码见 [K22 复核](REVIEW_2026-11-16-batchK22.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K21 历史归属补注仅本地同步；没有修改被审实现。以上描述 K22 当时动作；随后该组文档已随 `8419310` 入库，执行方记录见§50，后续复核见§51。
 
 | 行为证据 | 实际执行 | 结果与边界 |
 |---|---|---|
@@ -1586,3 +1586,69 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `8419310` | has_opt_token/末次身份核验、find -print0 枚举、锚定 ENOENT 分类；复核方文档同步与执行方本节记录入库 |
+
+## 51. 修复轮二十二独立复核证据（2026-11-16）
+
+固定范围 `a369e1c..f578f39`，实现与文档提交 `8419310`，完整 tip 为 `f578f39f4fa90b8feace73b7648301611156ef2c`。机制、归属和逐字复现见 [K23 复核](REVIEW_2026-11-16-batchK23.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K22 历史归属补注仅本地同步；未修改被审实现。
+
+| 独立复核证据 | 实际命令 / 固定对象 | 结果与边界 |
+|---|---|---|
+| K22-N1 完整链 | 专项 `review_compose.py --output <TEMP>/compose-evidence`；当前、a369e1c、110bb34 | 8 案 ALL_EXPECTATIONS_MATCHED、exit0：当前两种 DB 拼写补身份，ordinary 与 genuine 控制保持；双基线各两拼写仍生成缺身份 unit。均执行各版本自身 phase1/decision/install，捕获旧 active、stop 和实际迁移字节。 |
+| K22-N1 实际 CLI 读取对象 | `review_cli.py <compose-evidence> <compose-cli-evidence>` | 8 探针 ALL_EXPECTATIONS_MATCHED、exit0；当前读迁移或显式身份，基线缺绑定读新 HOME。使用已有 Windows debug git a369e1c，CLI 源码到 tip diff=0；合成非32字节 seed 处预设 rc1，无 bind/spawn，不称 tip 新构建。 |
+| K22-N2、K23-N1/N2 主复核 | 报告 §8.1 逐字 `review_enumeration_combined.py <TEMP>/enumeration-combined` | 16 案 ALL_EXPECTATIONS_MATCHED、exit0，221.547 秒。真实 GNU find/ls，仅移除隔离根前缀；当前普通/两普通/空格漏计并 enable，嵌套诱饵 key/db 实际被复制；基线普通正确迁移、多候选/空格拒绝。当前 LF 单独/配对和 CR 整名拒绝，producer 失败拒绝；基线 LF 拆分。起点真实目录符号链接当前成功零记录并 enable，基线正确迁移。来源全部不变，无 live occupant/stop。另对 LF/CR 三份 phase1 原始日志按完整名字节断言通过。 |
+| 枚举专项交叉核对 | `review_enumeration.py <TEMP>/evidence-v2`；`review_home_symlink.py <TEMP>/symlink-evidence` | 14 案/190.125 秒与符号链接 2 案/39.156 秒均 exit0、ALL_EXPECTATIONS_MATCHED；结果与主复核一致。初版夹具误用只写文件的 tee stub 后中止，`evidence/` 与 `run.log` 不作证据；最终脚本显式 /usr/bin/tee，保留真实 stdout。 |
+| K22-N3 原反例与基线 helper | `review_diag.py <TEMP>/evidence` | exit0，36.828 秒；当前原权限污染和普通权限拒绝均 phase1=3，零 stop/enable/copy；可读双候选拒绝，普通真 ENOENT 继续。a369e1c/110bb34 各自 helper 仍误分类原权限污染。phase1 控制使用仓库 basename 模型隔离诊断，真实 find 边界另列。 |
+| K23-N3 字面路径 | 报告 §8.3 逐字 `review_diag_literal.py <TEMP>/literal-evidence` | exit0，67.297 秒；当前 bracket 空 home 的真实同路径 ENOENT 导致 phase1=3，普通控制和双基线继续。3 个 helper 诊断错路径探针中，bracket/star 错误返回 no/0，普通不同路径拒绝；此部分仅合同注入，不称真实 ls 错路径或权限绕过。 |
+| K23-N4 监听参数 | 报告 §8.2 逐字 `review_listen_substring.py --output <TEMP>/listen-evidence` | 8 案 ALL_EXPECTATIONS_MATCHED、exit0：当前/a369e1c/110bb34 × port/bind 六案自身完整链均误接受、stop 旧 active 并写入真实不同监听参数；普通身份路径两个控制 phase1=3/零stop。git blame=7e8bfb2，是既有缺口。 |
+| K23-N4 真实 CLI 语法 | `review_cli.py <listen-evidence> <listen-cli-evidence>` | 6 个生成 argv 探针 ALL_EXPECTATIONS_MATCHED、exit0；均在非32字节合成 seed 处预设 rc1，无实际 bind。binary 版本与边界同 K22-N1 专项，不称原生监听变更。 |
+| 归属检查 | `git diff a369e1c..f578f39`、`git blame` | N1/N2 的 producer 切换、N3 的未引用 case 路径、N5 的无条件 NTFS 映射来自 8419310；N4 贪婪监听解析来自 7e8bfb2，双基线自身完整链复现。f578f39 只回填交接一行哈希。 |
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 337/337，0failure/error/skip，exit0；unittest2303.970秒，runner2304.438秒。单次全集运行，无测试重试；实现始终固定tip，运行后段仅本轮审核文档同步。各模块：test_deploy_linux_install=180、test_nat_matrix_lifecycle=11、test_nat_streak=51、test_netem_benchmark=24、test_repository_checks=64、test_ssh_helper_exec=7。 |
+| 仓库与契约初检 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定 tip 均 exit0，2.188 秒/0.125 秒；93md/351 local links/50状态行，契约5/5。文档收尾另列。 |
+| Shell | `bash -n scripts/deploy_linux.sh`；`bash scripts/deploy_linux.sh --self-test` | 均 exit0，0.062 秒/8.532 秒；未访问 SSH 或生产。 |
+| Rust 常规 | `cargo test --locked --workspace`；fmt；clippy；rustdoc，CARGO_NET_OFFLINE=true | 全部 exit0，单次实际执行无测试重试：workspace含doctest1200passed/0failed/8ignored，566.938 秒；`cargo fmt --all -- --check`4.109 秒；`cargo clippy --locked --workspace --all-targets -- -D warnings`24.797 秒；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps`23.187 秒。 |
+| Rust 特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 均 exit0，sqlite54passed/10.688 秒，persistence含doctest219passed/49.359 秒； |
+| Windows 构建 | `cargo build --locked --workspace` | exit0，28.641 秒，CARGO_NET_OFFLINE=true。 |
+| 本机启动器边界 | TEMP gate runner 的 vcvars 初始化 | 最初 Python subprocess 列表对 cmd 引号处理错误，cargo 未实际启动；修正为在内存中读取 vcvars 环境后再执行上述门槛。原始 launcher-error 日志保留，不把启动失败算 Rust 测试失败，也不隐藏原始记录。 |
+| 实现与工具范围 | `git diff --exit-code a369e1c..f578f39 -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows packages flutter_app` | exit0，Rust、依赖、workflow 与客户端树未改。Python3.12.10、Rust/cargo1.99.1、Git Bash5.3.15。shellcheck、Dart、Flutter 未在本会话 PATH 找到，本机未执行；CI 对应层级另列，不由缺 PATH 推定磁盘完全无 SDK。 |
+
+| GitHub / Git / 文档 | 固定对象或命令 | 结果 |
+|---|---|---|
+| tip CI | `f578f39f4fa90b8feace73b7648301611156ef2c`；[43872399392](https://github.com/wmqfl861/AK-sending/actions/runs/43872399392) | 当前 git 凭据只读查询 SHA runs/jobs API，attempt1、branch=dev/batch-k-20261114。首次 2026-11-16T13:10:39Z 尚未全结束；13:24:05Z 确认 completed/failure，updated_at13:23:08Z。13 jobs=10success/1failure/1cancelled/1skipped；没有触发重跑。 |
+| CI 失败证据 / K23-N5 | Repository checks job 133316669099 的 GitHub API 日志 | Linux `python -m unittest discover -s scripts/tests -v`：Ran337/73.728秒，errors2/skipped58，exit1。新 LF 测试两子案在4823读取 other\\uf00auser/registry.key，FileNotFoundError；1609无条件NTFS映射是根因。baseline对照因浅历史跳过，不计验证完成。 |
+| CI 其余边界 | 同固定 SHA 的 jobs/steps JSON | Rust Linux/Windows、audit/deny、legacy、Flutter、Android FFI+debug APK、x86 macOS/Linux portability、NAT netns 均 success；aarch64 macOS portability cancelled，manual release-deep skipped，均不计通过。portability 是 check、netns 是模拟，不是物理双机或原生部署。 |
+| 初始引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；worktree/status | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=f578f39f4fa90b8feace73b7648301611156ef2c。仅两个远端 head，一个主 worktree，初始工作区干净。 |
+| K22 同步归属 | 8419310 与 f578f39 的逐文件差异 | 8419310 纳入 K22 报告、§49、STATUS、状态表及执行方§50；f578f39只回填实现哈希。为 K22 报告补注“仅本地”为当时动作，原结论不改。 |
+| 权限与外部操作 | 只读 GitHub API、git fetch/引用查询 | 没有真实权限拒绝，没有生产、SSH、merge/push/分支删除或强推。凭据仅驻内存，未输出或落盘；合成权限失败不算外部权限拒绝。依据 REJECTED 保留分支与本地审核结果。 |
+| 文档收尾与最终引用 | 仓库/契约、嵌入源码、diff、最终 refs | 收尾仓库检查exit0：94md/356 local links；契约5/5；git diff --check和实现diff均exit0。报告3份Python与实际执行runner逐字相同且compile通过；27个K相关状态行五列/真实提交号检查通过，专项交叉核对一致。最终fetch/prune和远端heads与初始一致，本地main/HEAD未移动，一个worktree，仅5份审核文档变化。完整命令结果在close-checks.json。 |
+
+| 未执行 / 证据边界 | 本轮事实 |
+|---|---|
+| Release 深测 | 未重跑历史 chunk sweep/multistream 超时或 5GiB 单项，沿用 §45/47/49 的限制；不称已解决。 |
+| 原生 Linux 部署、物理双机 C4、抓包 | 未执行。真实 GNU 工具/符号链接/文件操作/CLI预设失败与合成 systemctl/proc/权限分别记录；未产生真实生产身份或实际监听。 |
+| 其他平台本机构建 | Android/Linux/macOS 本机未重建，固定 tip CI 的成功、取消分别列出。 |
+
+| 仓外材料（系统 TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k23-main-4c2ua7wx` | GitHub 固定 SHA 历次 JSON、失败 job 原始日志、内存凭据查询脚本；主复核合并枚举 runner/实际输出；本机门槛日志和命令结果；文档收尾记录。 |
+| `ak-k23-identity-lz41mluu` | K22-N1完整链、双基线、真实CLI安全探针；K23监听差异完整链及CLI语法探针；逐字runner和结果JSON。 |
+| `ak-k23-enumeration-review-2ada5b5b` | 真实find/ls各控制、嵌套诱饵、LF/CR、起点符号链接的专项产物；最终只引用evidence-v2与symlink-evidence。 |
+| `ak-k23-diagnostic-929bbac3b6` | 原权限污染反例、普通控制、旧helper、真实ENOENT、字面诊断合同和空home phase1的runner与JSON。 |
+
+## 52. 修复轮二十三的执行方记录（K23 复核后，进行中）
+
+[K23 复核](REVIEW_2026-11-16-batchK23.zh-CN.md)判 REJECTED（K22 原反例三项均判修复；新增五项，其中 K23-N5 即固定 tip `f578f39` 的 Linux repository job CI 红因）。执行方按所有者指示先将当前全部代码与文档完整推送入库（本提交），随后继续修复轮二十三：
+
+| K23 发现 | 定性与修复方向 |
+|---|---|
+| K23-N1（P1） | find 记录协议不一致：真实 find 输出全路径 `/home/otheruser`，消费端再次前缀 `/home/`——普通来源从发现中消失；嵌套 `/home/home/otheruser` 夹具下实际拷贝诱饵。修复：消费端按 find 全路径原样使用（不再拼前缀），stub 同步改全路径记录。 |
+| K23-N2（P2） | `/home` 为目录符号链接时 find 默认不跟随、零记录——旧来源被当不存在、按全新安装继续。修复：`find -L`（或显式跟随）+ 起点不可判定拒绝。 |
+| K23-N3（P2） | 诊断路径匹配仍是 case 模式（`$1` 未引用）——合法 `spare[1]` 空目录触发新增误拒。修复：字面字符串比较（`=` 而非 case 模式）。 |
+| K23-N4（P2，既有） | `--port/--bind` 比较仍按子串——身份路径以 `--port`/`--bind` 结尾时掩盖真实监听差异。修复：has_opt_token 同款 token 绑定比较。 |
+| K23-N5（P2，CI 红因） | `_ntfs_backing()` 在 Linux 无条件把 LF→U+F00A——固定 tip 的 Linux repository job 两子测 FileNotFoundError（run 43872399392）。修复：仅 Windows/MSYS 平台转换，Linux 按原字节。 |
+
+### 当前推送内容
+
+本提交包含 K23 复核报告、复核方 STATUS/状态表/交接 §51 同步与执行方本节记录；代码与 `f578f39` 一致（K23 修复在后续提交）。tip CI 红因（K23-N5）已定位并以真实 Linux job 日志取证（`home/other\uf00auser/...` FileNotFoundError），将随修复轮二十三转绿。

@@ -1,7 +1,7 @@
 # 交接文档：批次 K（2026-11-14）
 
-> 分支：`dev/batch-k-20261114`。本次被审范围 `1fad0a2..0b41201`；§0–§30 保留前序记录与执行方声明，§31 为修复轮十二独立复核证据。K12 报告及同步已由执行方在 `a5a5ad6` 提交，`0b41201` 仅回填哈希；本次 K13 审查同步保留本地。
-> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次证据表；当前发现见 [K13 复核](REVIEW_2026-11-15-batchK13.zh-CN.md)，历史见 [K12](REVIEW_2026-11-15-batchK12.zh-CN.md)、[K11](REVIEW_2026-11-15-batchK11.zh-CN.md)、[K10](REVIEW_2026-11-15-batchK10.zh-CN.md) 及此前各轮报告。
+> 分支：`dev/batch-k-20261114`（第 24 轮验收通过；合入记录见 K24 §8）。§0–§52 保留历次执行方记录与独立复核证据；§53 为第 24 轮复核方修复与验收证据（本批最终轮）。
+> 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次证据表；最终结论见 [K24 复核](REVIEW_2026-11-16-batchK24.zh-CN.md)，历史见 [K23](REVIEW_2026-11-16-batchK23.zh-CN.md) 及此前各轮报告。
 
 ## 0. 范围与来源
 
@@ -1652,3 +1652,38 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 ### 当前推送内容
 
 本提交包含 K23 复核报告、复核方 STATUS/状态表/交接 §51 同步与执行方本节记录；代码与 `f578f39` 一致（K23 修复在后续提交）。tip CI 红因（K23-N5）已定位并以真实 Linux job 日志取证（`home/other\uf00auser/...` FileNotFoundError），将随修复轮二十三转绿。
+
+> 补注（第 24 轮，2026-11-16）：本节列出的修复方向，按所有者指示改由复核方在 `b8142cb` 实现（N2 用的是 `find -H` 加目录闸，没有用 `-L`），记录见 §53。
+
+## 53. 第 24 轮：复核方修复与验收证据（2026-11-16）
+
+被审 tip `9ddd9f3b836f50c4cffc0cccaa61365e61e927f3`，其部署脚本与测试和 `f578f39` 逐字相同。实现提交 `b8142cb`，报告见 [K24 复核](REVIEW_2026-11-16-batchK24.zh-CN.md)。复核在 Linux 容器内进行：没有生产访问，没有 SSH，没有真实密钥。真实 GNU 工具与文件操作的结果，和合成的 systemctl、/proc、权限模型的结果分开记录。
+
+| 复现与修复证据 | 实际命令 / 固定对象 | 结果与边界 |
+|---|---|---|
+| K23 原复现（被审 tip） | 在 `9ddd9f3` 的 worktree 内逐字运行 K23 §8 的三段脚本 | 三段都输出 ALL_EXPECTATIONS_MATCHED、exit 0，耗时分别为 12 s / 8 s / 2 s。五项缺陷在 Linux 上按报告出现 |
+| 被审 tip 的 CI | [43880847323](https://github.com/wmqfl861/AK-sending/actions/runs/43880847323)（`9ddd9f3`） | completed/failure：Repository checks 失败（LF 测试两个子用例 FileNotFoundError，即 K23-N5）；其余 11 项常规任务成功；手动 release 深测跳过 |
+| K23 夹具在修复后重跑 | 上述三段脚本改为读取工作树。只改夹具胶水：find 桩识别 `-H`；去掉针对旧版本的缺陷断言，保留结果 JSON | 枚举 16 个用例：当前树的普通来源、链接起点、嵌套诱饵都迁移普通来源的字节；两个普通来源被拒绝；LF/CR 整名拒绝和生产者失败拒绝保持不变。监听 8 个用例：WT 的两组遮蔽在停服前拒绝，零 stop；基线 a369e1c/110bb34 仍然 stop。诊断：三个错路径探针都返回不可判定，方括号空 home 继续 |
+| 部署回归模块 | `python -m unittest scripts.tests.test_deploy_linux_install` | 205/205 OK（原有 180 项 + 新增 25 项，其中 4 项是 `f578f39` 自身链对照）；0 skip |
+
+| 本机门槛（`b8142cb` 工作树） | 实际命令 | 结果与边界 |
+|---|---|---|
+| Python 全集 | `python -m unittest discover -s scripts/tests -v` | 362/362 OK，0 skip，143 s。各模块：deploy 205、nat_matrix_lifecycle 11、nat_streak 51、netem_benchmark 24、repository_checks 64、ssh_helper_exec 7 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 均 exit 0；契约 5/5 |
+| Shell | `bash -n scripts/deploy_linux.sh`；`bash scripts/deploy_linux.sh --self-test`；`bash scripts/cross_nat_test.sh --self-test` | 均 exit 0。部署自检 s1 共 6 个子用例，新增两项身份选项校验；跨 NAT 自检 9/9 |
+| Rust 常规（stable 1.97.0，非仓库钉的 1.99.1） | `cargo fmt --all -- --check`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`cargo test --locked --workspace --no-fail-fast`；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps` | 均 exit 0。workspace 测试含 doctest：1201 passed / 0 failed / 8 ignored（68 个结果行，单次执行，没有重试）；整个 Rust 门槛脚本耗时 611 s |
+| Rust 特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 均 exit 0。sqlite：52 passed；persistence（含 doctest）：219 passed |
+| `registry-id` 实机行为 | 用真实 debug 构建：先在空目录启动 `registry-server` 读取它打印的 pin，再用 `registry-id` 读同一目录；另对不存在的目录运行一次 | 输出逐字一致（单行 64 hex）；不存在的目录 exit 1 且没有被创建。对应的集成测试 `registry_id_matches_the_served_pin_and_never_creates_an_identity` 通过 |
+| CR-P3-21 压力复测 | 对 `holepunch_probe_early_exit` 三个测试：先顺序跑 200 轮，再 8 路并发跑 200 轮（每轮 `--test-threads=3`） | 运行中；结论在下一次提交写入本表 |
+
+| GitHub | 固定对象 | 结果 |
+|---|---|---|
+| 修复提交的 CI | [43890293579](https://github.com/wmqfl861/AK-sending/actions/runs/43890293579)（`b8142cb`） | 运行中；结论在下一次提交写入本表 |
+| NAT 十轮（手动触发，覆盖 `1d995b0` 的探测改动） | [43888103076](https://github.com/wmqfl861/AK-sending/actions/runs/43888103076)（workflow_dispatch，`9ddd9f3`；本轮修复没有改 ak-net） | 运行中；结论在下一次提交写入本表 |
+
+| 未执行 / 证据边界 | 本轮事实 |
+|---|---|
+| 原生 Linux 部署、systemd/journald 实机 | 未执行。身份守卫只在离线模型和真实 CLI 二进制上验证过 |
+| GUI 走查（K1） | Linux 环境没有 Flutter 和模拟器，没有重跑；以执行方记录和 CI Flutter 门槛为准 |
+| Release 深测 | 没有重跑历史 chunk sweep / multistream 超时；不称已解决 |
+| 物理双机 C4、抓包 | 未执行，属于所有者 |

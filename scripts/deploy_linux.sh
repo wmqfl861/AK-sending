@@ -467,6 +467,65 @@ compose_registry_exec() { # existing-exec-or-empty
     printf '%s\n' "$REMOTE_BIN$old_args --id-dir $REMOTE_DATA"
   fi
 }
+# bound_id_dir <line>: the value ACTUALLY BOUND to the --id-dir option by
+# full-token rules — the driver-side twin of phase1's helper (K 复核 K21-N1,
+# round 22): equals form takes the token's OWN suffix, space form takes
+# exactly the NEXT token; a literal option-shaped path component inside a
+# value never re-parses. The greedy 'sed s/.*--id-dir[= ]…/' used here bound
+# '--port' as the identity when a legal path ENDED in the literal '--id-dir'.
+# Noglob walk (K 复核 K20-N1): word splitting only, never pathname expansion.
+bound_id_dir() {
+  local bi_tok bi_val bi_pending bi_line
+  bi_val=""
+  bi_pending=0
+  set -f
+  bi_line="$1"
+  for bi_tok in $bi_line; do
+    if [ "$bi_pending" = 1 ]; then
+      case "$bi_tok" in
+        --*) : ;;
+        *) [ -z "$bi_val" ] && bi_val="$bi_tok" ;;
+      esac
+      bi_pending=0
+      continue
+    fi
+    case "$bi_tok" in
+      --id-dir) bi_pending=1 ;;
+      --id-dir=*) [ -z "$bi_val" ] && bi_val=${bi_tok#--id-dir=} ;;
+    esac
+  done
+  set +f
+  printf '%s\n' "$bi_val"
+}
+# id_binding_invalid <line>: the driver-side --id-dir grammar gate, the same
+# discipline as phase1's db/id helpers (K 复核 K21-N1, round 22). Error
+# strings verified against the real CLI (git 714099a): "a value is required
+# for '--id-dir <ID_DIR>' but none was supplied" and "the argument
+# '--id-dir <ID_DIR>' cannot be used multiple times".
+id_binding_invalid() {
+  local itok ipending icount ibi_bad
+  ipending=0
+  icount=0
+  ibi_bad=""
+  set -f
+  for itok in $1; do
+    if [ "$ipending" = 1 ]; then
+      case "$itok" in --*) ibi_bad="the space-form --id-dir value is option-shaped ('$itok'); the CLI reports the missing-value error and never consumes an option as the identity dir (K21-N1)" ;;
+      esac
+      ipending=0
+      continue
+    fi
+    case "$itok" in
+      --id-dir) ipending=1; icount=$((icount + 1)) ;;
+      --id-dir=) icount=$((icount + 1)); ibi_bad="an explicit EMPTY --id-dir value (the CLI rejects it: \"a value is required for '--id-dir <ID_DIR>' but none was supplied\")" ;;
+      --id-dir=*) icount=$((icount + 1)) ;;
+    esac
+  done
+  set +f
+  [ "$icount" -gt 1 ] && ibi_bad="duplicate bindings: the line carries $icount '--id-dir' bindings and the CLI rejects duplicates: \"the argument '--id-dir <ID_DIR>' cannot be used multiple times\""
+  [ "$ipending" = 1 ] && ibi_bad="a dangling '--id-dir' option without a value (the service CLI would reject it: \"a value is required for '--id-dir <ID_DIR>'\")"
+  [ -n "$ibi_bad" ]
+}
 
 # ---------------------------------------------------------------------------
 # systemd unit templates (docs/OPERATIONS.zh-CN.md §0/§3). Ports filled at
@@ -635,7 +694,7 @@ self_test() {
     || fail "an unreadable occupant cgroup must refuse the preflight (K2-R3)"
   grep -q 'cannot enumerate /home' "$WORK/p1.sh" \
     || fail "a failed home enumeration must refuse the preflight (K2-R3)"
-  grep -q 'cannot probe \$d/registry.key' "$WORK/p1.sh" \
+  grep -q 'cannot probe \$1/registry.key' "$WORK/p1.sh" \
     || fail "an undeterminable key/db existence probe must refuse the preflight (K2-R3)"
   grep -q "sed 's/^/  cmdline: /'; printf" "$WORK/p1.sh" \
     || fail "the cmdline line must be terminated so machine fields stay parseable (K2-R3)"
@@ -770,6 +829,25 @@ self_test() {
     || fail "the empty-value refusal must cite the CLI's own error (K20-N2)"
   grep -q 'OPTION-SHAPED token as the space-form --db-path value' "$0" \
     || fail "an option-shaped space-form --db-path value must refuse pre-stop (K20-N2)"
+  # K 复核 K21-N1 (round 22): the identity option uses the SAME token-bound
+  # semantics and CLI grammar gates as --db-path, in phase1 AND the
+  # decisions block; the id rewrite verifies the OPTION-BOUND value (a
+  # legal path ending in the literal '--id-dir' never re-parses).
+  grep -q 'bound_id_dir' "$WORK/p1.sh" \
+    || fail "phase1 identity extraction must be token-bound (K21-N1)"
+  grep -q 'id_binding_invalid' "$WORK/p1.sh" \
+    || fail "phase1 must validate the --id-dir option grammar (K21-N1)"
+  grep -q "an explicit EMPTY --id-dir value" "$0" \
+    || fail "an empty '--id-dir=' must refuse pre-stop (K21-N1)"
+  grep -q "a value is required for '--id-dir <ID_DIR>' but none was supplied" "$0" \
+    || fail "the id-dir grammar refusals must cite the CLI's own error (K21-N1)"
+  grep -q 'the --id-dir rewrite did not take' "$0" \
+    || fail "the id rewrite must verify the OPTION-BOUND value (K21-N1)"
+  # K 复核 K21-N2 (round 22): /home candidates iterate LINES, never words —
+  # a legal spaced home directory stays ONE candidate (word splitting also
+  # silently bypassed the multi-candidate refusal).
+  grep -q 'while IFS= read -r home_dir' "$WORK/p1.sh" \
+    || fail "home enumeration must iterate ls lines, not words (K21-N2)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1186,7 +1264,70 @@ db_binding_invalid() {
   set +f
   [ "\$count" -gt 1 ] && dbbi_bad="duplicate bindings: the line carries \$count '--db-path' bindings and the CLI rejects duplicates: \"cannot be used multiple times\""
   [ "\$pending" = 1 ] && dbbi_bad="a dangling '--db-path' option without a value (the service CLI would reject it: \"a value is required for '--db-path <DB_PATH>'\")"
+  obi_bad="\$dbbi_bad"
   [ -n "\$dbbi_bad" ]
+}
+# bound_id_dir <line>: the value ACTUALLY BOUND to the --id-dir option by
+# full-token rules — the SAME token-bound semantics bound_db_arg applies to
+# --db-path (K 复核 K21-N1, round 22): the equals form takes the token's OWN
+# suffix, the space form takes exactly the NEXT token, and a literal
+# option-shaped path component INSIDE a value never re-parses as an option.
+# The old greedy 'sed s/.*--id-dir[= ]…/' treated the trailing '--id-dir' of
+# a legal path like '/home/otheruser/--id-dir' as another option start and
+# bound the FOLLOWING '--port' as the identity dir. Noglob (K20-N1).
+bound_id_dir() {
+  local bi_tok bi_val bi_pending bi_line
+  bi_val=""
+  bi_pending=0
+  set -f
+  bi_line=\$1
+  for bi_tok in \$bi_line; do
+    if [ "\$bi_pending" = 1 ]; then
+      case "\$bi_tok" in
+        --*) : ;;
+        *) [ -z "\$bi_val" ] && bi_val="\$bi_tok" ;;
+      esac
+      bi_pending=0
+      continue
+    fi
+    case "\$bi_tok" in
+      --id-dir) bi_pending=1 ;;
+      --id-dir=*) [ -z "\$bi_val" ] && bi_val=\${bi_tok#--id-dir=} ;;
+    esac
+  done
+  set +f
+  printf '%s\\n' "\$bi_val"
+}
+# id_binding_invalid <line>: the --id-dir OPTION SHAPE gate — the same
+# discipline as db_binding_invalid, mirrored for the identity option
+# (K 复核 K21-N1, round 22). Error strings verified against the real CLI
+# (git 714099a): "a value is required for '--id-dir <ID_DIR>' but none was
+# supplied" (empty equals / option-shaped space value / dangling) and "the
+# argument '--id-dir <ID_DIR>' cannot be used multiple times" (duplicates).
+id_binding_invalid() {
+  local itok ipending icount
+  ipending=0
+  icount=0
+  idbi_bad=""
+  set -f
+  for itok in \$1; do
+    if [ "\$ipending" = 1 ]; then
+      case "\$itok" in --*) idbi_bad="the space-form --id-dir value is option-shaped ('\$itok'); the CLI would report a missing value, never consume an option as the identity dir (K21-N1)" ;;
+    esac
+      ipending=0
+      continue
+    fi
+    case "\$itok" in
+      --id-dir) ipending=1; icount=\$((icount + 1)) ;;
+      --id-dir=) icount=\$((icount + 1)); idbi_bad="an explicit EMPTY --id-dir value (the CLI rejects it: \"a value is required for '--id-dir <ID_DIR>' but none was supplied\")" ;;
+      --id-dir=*) icount=\$((icount + 1)) ;;
+    esac
+  done
+  set +f
+  [ "\$icount" -gt 1 ] && idbi_bad="duplicate bindings: the line carries \$icount '--id-dir' bindings and the CLI rejects duplicates: \"the argument '--id-dir <ID_DIR>' cannot be used multiple times\""
+  [ "\$ipending" = 1 ] && idbi_bad="a dangling '--id-dir' option without a value (the service CLI would reject it: \"a value is required for '--id-dir <ID_DIR>'\")"
+  obi_bad="\$idbi_bad"
+  [ -n "\$idbi_bad" ]
 }
 # reg_args_agree <exec-line> <cmdline-line>: 0 when the EFFECTIVE values of
 # the configured ExecStart and the running cmdline AGREE (defaults derived;
@@ -1204,6 +1345,10 @@ reg_args_agree() {
   # default db and pass). rc 3 = invalid option grammar.
   if db_binding_invalid "\$1"; then return 3; fi
   if db_binding_invalid "\$2"; then return 3; fi
+  # K 复核 K21-N1 (round 22): the SAME grammar gate for the identity
+  # option — a CLI-invalid --id-dir shape never reaches the comparison.
+  if id_binding_invalid "\$1"; then return 3; fi
+  if id_binding_invalid "\$2"; then return 3; fi
   # K 复核 K2-R3 (round 9): compare EFFECTIVE values, DEFAULTS INCLUDED —
   # round 8 compared an explicit value only when the RUNNING side spelled
   # the flag out, so a running instance relying on the default db location
@@ -1220,8 +1365,11 @@ reg_args_agree() {
   # actual source cannot be established (one side relies on an
   # environment-dependent default the other side does not share).
   local a_id b_id a_db b_db a_port b_port a_bind b_bind
-  a_id=\$(printf '%s\\n' "\$1" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
-  b_id=\$(printf '%s\\n' "\$2" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+  # K 复核 K21-N1 (round 22): token-bound identity extraction — the greedy
+  # sed bound '--port' as the id value when a legal path ENDED in the literal
+  # '--id-dir'; both sides misparsed identically and the comparison passed.
+  a_id=\$(bound_id_dir "\$1")
+  b_id=\$(bound_id_dir "\$2")
   if [ "\$a_id" != "\$b_id" ]; then
     if [ -z "\$a_id" ] || [ -z "\$b_id" ]; then
       printf '%s\\n' "[preflight] the effective --id-dir of one side relies on the service environment and cannot be established from its arguments (configured '\$1' vs running '\$2')" >&2
@@ -1371,7 +1519,7 @@ if [ -n "\$reg_line" ]; then
           # K 复核 K20-N2: rc 3 = the option SHAPE itself is CLI-invalid —
           # refuse with the grammar diagnosis, not the ambiguity fallback.
           if [ "\$reg_one_rc" = 3 ]; then
-            echo "ERROR: the effective ExecStart of \$reg_unit carries \$dbbi_bad (configured '\$re_e' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2)" >&2
+            echo "ERROR: the effective ExecStart of \$reg_unit carries \$obi_bad (configured '\$re_e' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2/K21-N1)" >&2
             exit 3
           fi
           if [ "\$reg_one_rc" = 0 ]; then
@@ -1402,7 +1550,7 @@ REG_EFF_H
         # the comparison PASSED, letting the deploy stop a service the CLI
         # itself would refuse to start with that line. Refuse BEFORE any
         # stop with the CLI's own error cited.
-        echo "ERROR: the effective ExecStart of \$reg_unit carries \$dbbi_bad (configured '\$reg_pick' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2)" >&2
+        echo "ERROR: the effective ExecStart of \$reg_unit carries \$obi_bad (configured '\$reg_pick' vs running '\$reg_cmdline'); the CLI itself would refuse this line; refusing before any switchover (K20-N2/K21-N1)" >&2
         exit 3
       fi
       if [ "\$rag_rc" = 2 ]; then
@@ -1424,7 +1572,11 @@ REG_EFF_H
       # from the RUNTIME /proc/<PID>/environ and cross-checked against the
       # unit's merged Environment=/UnsetEnvironment= directives. Missing or
       # contradictory evidence refuses BEFORE any switchover.
-      reg_rt_id=\$(printf '%s\\n' "\$reg_pick" | sed -n 's/.*--id-dir[= ]\\([^ ]*\\).*/\\1/p')
+      # K 复核 K21-N1 (round 22): token-bound extraction — the greedy sed
+      # bound '--port' when the legal id path ENDED in the literal '--id-dir',
+      # resolving the runtime identity to the WRONG absolute directory and
+      # pointing the migration source at a decoy.
+      reg_rt_id=\$(bound_id_dir "\$reg_pick")
       if [ -z "\$reg_rt_id" ]; then
         # K 复核 K10-N1: parse /proc/<PID>/environ STRICTLY on NUL records —
         # a blanket NUL->LF conversion fabricated variables out of values
@@ -1786,26 +1938,34 @@ sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 # "no identity".
 home_list=\$(sudo -n ls -1 /home 2>/dev/null) \\
   || { echo "ERROR: cannot enumerate /home (sudo -n ls failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
-home_ak_dirs=\$(printf '%s\\n' "\$home_list" | sed 's|^|/home/|; s|\$|/.ak-sending|')
-# K 复核 K20-N1 (round 21): candidate enumeration is WORD SPLITTING ONLY —
-# an unquoted 'for d in ...' also runs pathname expansion, and a home
-# directory name carrying glob-significant bytes would be re-expanded
-# against this script's cwd and probe a DIFFERENT candidate directory.
-set -f
-for d in $REMOTE_DATA /root/.ak-sending \$home_ak_dirs; do
-  dstate=\$(priv_exists "\$d") \\
-    || { echo "ERROR: cannot determine whether \$d exists; refusing before any switchover (K2-R3)" >&2; exit 3; }
+# K 复核 K21-N2 (round 22): candidates iterate LINES, never words — the
+# round-21 'for d in ... \$home_ak_dirs' loop still ran word splitting, so a
+# legal home named 'other user' split into '/home/other' plus a stray
+# 'user/.ak-sending' fragment: the PREFIX decoy became a reported candidate
+# (and was migrated), while the real spaced directory was never probed as
+# one object — also SILENTLY BYPASSING the multi-candidate refusal, since
+# the candidate count no longer reflected actual directory objects.
+# 'set -f' does NOT disable word splitting, so the loop SHAPE must be
+# line-based: each ls -1 record stays ONE candidate, whole bytes and all.
+registry_data_probe() {
+  dstate=\$(priv_exists "\$1") \\
+    || { echo "ERROR: cannot determine whether \$1 exists; refusing before any switchover (K2-R3)" >&2; exit 3; }
   if [ "\$dstate" = yes ]; then
-    k=\$(priv_exists "\$d/registry.key") \\
-      || { echo "ERROR: cannot probe \$d/registry.key; refusing before any switchover (K2-R3)" >&2; exit 3; }
-    db=\$(priv_exists "\$d/registry.db") \\
-      || { echo "ERROR: cannot probe \$d/registry.db; refusing before any switchover (K2-R3)" >&2; exit 3; }
+    k=\$(priv_exists "\$1/registry.key") \\
+      || { echo "ERROR: cannot probe \$1/registry.key; refusing before any switchover (K2-R3)" >&2; exit 3; }
+    db=\$(priv_exists "\$1/registry.db") \\
+      || { echo "ERROR: cannot probe \$1/registry.db; refusing before any switchover (K2-R3)" >&2; exit 3; }
     if [ "\$k" = yes ] || [ "\$db" = yes ]; then
-      echo "registry-data: \$d (key:\$k db:\$db)"
+      echo "registry-data: \$1 (key:\$k db:\$db)"
     fi
   fi
-done
-set +f
+}
+registry_data_probe "$REMOTE_DATA"
+registry_data_probe /root/.ak-sending
+while IFS= read -r home_dir || [ -n "\$home_dir" ]; do
+  [ -n "\$home_dir" ] || continue
+  registry_data_probe "/home/\$home_dir/.ak-sending"
+done < <(printf '%s\\n' "\$home_list")
 # K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
 # prove NOW — before anything is stopped — that the install path is usable
 # through exactly that path (read-only mounts or restricted sudoers must
@@ -2660,9 +2820,12 @@ real_run() {
   [ -n "$DATA_SOURCE_DIR" ] && warn "registry identity/db will be COPIED (never moved) from $DATA_SOURCE_DIR into $REMOTE_DATA"
   # If a preserved ExecStart points --id-dir elsewhere, keep ReadWritePaths
   # pointed at THAT dir instead of the standard data dir.
+  # K 复核 K21-N1 (round 22): token-bound extraction — the greedy sed bound
+  # '--port' as the identity dir when the legal path ENDED in the literal
+  # '--id-dir', pointing ReadWritePaths at the WRONG directory.
   REG_RW=$REMOTE_DATA
   if [ -n "$existing_exec" ] && printf '%s' "$existing_exec" | grep -q -- '--id-dir'; then
-    REG_RW=$(printf '%s' "$existing_exec" | sed -n 's/.*--id-dir[= ]\([^ ]*\).*/\1/p' | head -1)
+    REG_RW=$(bound_id_dir "$existing_exec")
     [ -n "$REG_RW" ] || REG_RW=$REMOTE_DATA
   fi
   REGISTRY_EXEC=${REGISTRY_EXEC//\'/}   # unit files must not carry quotes
@@ -2709,12 +2872,77 @@ real_run() {
       ?*) REG_RW=$runtime_id
            note "relative identity dir rewritten to the RUNNING-resolved absolute path: REG_RW=$REG_RW (K14-N1)" ;;
     esac
-    rel_id=$(printf '%s\n' "$REGISTRY_EXEC" | sed -n 's/.*--id-dir[= ]\([^ ]*\).*/\1/p' | head -1)
+    # K 复核 K21-N1 (round 22): the identity option gets the SAME
+    # token-bound discipline as --db-path — extraction, CLI grammar gate,
+    # bracket-safe token rewrite and option-bound verification. The greedy
+    # sed extraction bound '--port' when a legal path ENDED in the literal
+    # '--id-dir', and the ${REGISTRY_EXEC//…} pattern rewrite then replaced
+    # the IN-PATH '--id-dir --port' occurrence, inserting a stray absolute
+    # token and destroying the real port option.
+    if id_binding_invalid "$REGISTRY_EXEC"; then
+      fail "the effective ExecStart carries an invalid --id-dir binding; the service CLI itself would refuse this line; refusing before any switchover (K21-N1)"
+    fi
+    rel_id=$(bound_id_dir "$REGISTRY_EXEC")
     case "$rel_id" in
       /*|'') : ;;
       *)
-        REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir $rel_id/--id-dir $runtime_id}
-        REGISTRY_EXEC=${REGISTRY_EXEC//--id-dir=$rel_id/--id-dir=$runtime_id}
+        # Whitelist before the rewrite (K13-N1 discipline): the rewritten
+        # value is baked into the generated unit.
+        case "$rel_id" in
+          *[!A-Za-z0-9/._-]*)
+            fail "the --id-dir argument '$rel_id' contains bytes this deploy cannot bake faithfully into the generated unit; resolve it to a whitelisted absolute path and re-run (K21-N1)" ;;
+        esac
+        # K 复核 K15-N1 (round 17/18) discipline, applied to --id-dir: walk
+        # the space-separated ARGUMENT tokens (noglob); replace ONLY a
+        # standalone '--id-dir <value>' or '--id-dir=<value>' token; leave
+        # every other token — including a value-internal literal '--id-dir'
+        # path component — untouched.
+        rid_new=""
+        rid_replaced=0
+        rid_seen_sep=""
+        set -f
+        for re_tok in $REGISTRY_EXEC; do
+          if [ "$rid_seen_sep" = 1 ]; then
+            rid_new="${rid_new:+$rid_new }$runtime_id"
+            rid_seen_sep=0
+            rid_replaced=1
+            continue
+          fi
+          case "$re_tok" in
+            --id-dir)
+              rid_new="${rid_new:+$rid_new }$re_tok"
+              rid_seen_sep=1 ;;
+            --id-dir=*)
+              rid_new="${rid_new:+$rid_new }--id-dir=$runtime_id"
+              rid_replaced=1 ;;
+            *) rid_new="${rid_new:+$rid_new }$re_tok" ;;
+          esac
+        done
+        set +f
+        REGISTRY_EXEC="$rid_new"
+        # Verify the RESULT by the OPTION-BOUND VALUE (never a substring):
+        # parse the value actually bound to --id-dir in BOTH spellings and
+        # require it to equal the RUNNING-resolved identity.
+        rid_parsed=""
+        rid_pending=0
+        rid_seen=0
+        set -f
+        for re_tok in $REGISTRY_EXEC; do
+          if [ "$rid_pending" = 1 ]; then
+            rid_parsed="$re_tok"
+            rid_pending=0
+            rid_seen=1
+            continue
+          fi
+          case "$re_tok" in
+            --id-dir) rid_pending=1 ;;
+            --id-dir=*) rid_parsed=${re_tok#--id-dir=}; rid_seen=1 ;;
+          esac
+        done
+        set +f
+        if [ "$rid_replaced" != 1 ] || [ "$rid_seen" != 1 ] || [ "$rid_parsed" != "$runtime_id" ]; then
+          fail "the --id-dir rewrite did not take (parsed id argument '$rid_parsed' != resolved '$runtime_id'); refusing rather than generate a unit with the wrong identity dir (K21-N1)"
+        fi
         note "relative --id-dir '$rel_id' rewritten to the RUNNING-resolved $runtime_id (K14-N1)" ;;
     esac
     # K 复核 K15-N1: a relative --db-path resolves against the SAME running

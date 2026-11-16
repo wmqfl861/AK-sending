@@ -1457,3 +1457,66 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `f4b58a6` | 六处遍历 noglob 化与 db_binding_invalid 前置门；复核方文档同步与执行方本节记录入库 |
+
+## 47. 修复轮二十独立复核证据（2026-11-16）
+
+固定范围 `110bb34..714099a`，实现与文档提交 `f4b58a6`，完整 tip 为 `714099a974b33e7f4c0d91076c03af1aed15070a`。机制、归属和主复核逐字重放代码见 [K21 复核](REVIEW_2026-11-16-batchK21.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K20 历史归属补注仅本地同步；没有修改被审实现。
+
+| 行为证据 | 实际执行 | 结果与边界 |
+|---|---|---|
+| K20-N1 原始 glob 夹具 | 从 K20 §4.1 取 runner，当前 `714099a` 与 `110bb34` 自身完整链，phase1 cwd 隔离 | 8 案，exit0、ALL_EXPECTATIONS_MATCHED，204.046秒。当前空格/等号×有/无匹配均拒绝字面 db[1].sqlite，未stop/unit；基线两拼写全链0、stop旧active、按生成参数实际打开SQLite读到glob-decoy；当前普通两拼写读到runtime-real。 |
+| K20-N2 原始缺值夹具 | `k20-verified-results.json`，配置/运行 argv 独立，使用各版本自身 phase1 | 5 案全部断言吻合：当前空等号/下一长选项phase1=3、未stop；基线两案全链0并stop；literal `--db-path=--db-path` 全链0，按生成参数读取SQLite为runtime-real。最初探索的option夹具误把合成--port建成目录，已弃用该两条结果并用真实SQLite完整重跑；权威汇总只引用 `valid-fixtures` 修正后的结果。 |
+| 两侧 grammar helper | 实际当前生成脚本中的 `reg_args_agree`；`helper-matrix.log` | 13 案：空值、后继选项、悬空、重复等号、两方向混合拼写各置两侧均rc3，合法literal控制rc0。另已核对K19旧对照经baseline_rev提取基线自身phase1，而非复用当前预检结果。 |
+| K21-N1 主复核完整链 | 报告 §5.1 逐字 runner；`identity-main/results.json` | 4 案，exit0、ALL_EXPECTATIONS_MATCHED，118.954秒。当前空格/等号与直接基线均phase1/decision/install=0、捕获并stop旧enabled/active，实际目标key/db为substring-decoy；普通身份目录控制复制runtime-real并保留argv。专项另行独立执行同矩阵，结果一致。 |
+| K21-N1 真实 CLI | 本轮 `target/debug/ak-cli.exe --version` 为 git714099a；`identity-main/cli-parse.json` | 5 探针全部吻合：原始两拼写通过Clap后在15字节无效key加载处rc1，尚未spawn；当前两拼写与基线生成argv均rc2/unexpected argument '/home/runtime-old/--port'。生成参数附加永久无效port，保证不启动服务。 |
+| K21-N2 主复核目录枚举 | 报告 §5.2 逐字 runner，TEMP枚举模型调用真实GNU ls | 5 案，exit0、ALL_EXPECTATIONS_MATCHED，81.703秒。当前/基线均复制split-prefix诱饵key+db并enable；普通控制复制真实标记；含空格+普通双候选只报告一项并迁移；两个普通候选正确拒绝。全部无live occupant/stop，源文件保持原样。专项同矩阵92.781秒通过；探索runner曾因不存在的模型常量在执行案例前中止，改用_posix_tool后完整重跑。 |
+| 全文件遍历与归属 | `for…in` / `set -f`审计、固定源码、git blame | 六处目标遍历全部noglob。其余执行循环为引用值、字面量或生成器写入的服务/状态列表，后者包含发现的服务名。K21-N1身份比较来自7e8bfb2、运行提取e03a44f、改写d38cb01；K21-N2目录循环来自f7dece2。两个新反例均有110bb34自身完整链证明既有，不称本轮新增回归。 |
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python全集 | `python -m unittest discover -s scripts/tests -v` | 318/318，0failure/error/skip，exit0；unittest1918.227秒，runner1918.703秒。部署161、NAT lifecycle11、streak51、netem24、repository64、SSH7。单次完整运行无重试；实现始终固定tip，后段仅本轮审核文档同步。 |
+| 仓库与契约 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定tip初始均exit0，分别2.031秒、0.219秒；91md/340 local links/50状态行，契约5/5。文档收尾检查另列。 |
+| Shell | deploy/cross_nat 的 `bash -n` 与 `--self-test` | 全部exit0：deploy syntax0.062秒/self8.656秒，cross_nat syntax0.063秒/self4.406秒。自检无SSH/传输；cross_nat使用现有release git1e59342，不称本轮tip release重建。 |
+| Rust常规 | `cargo test --locked --workspace`；fmt；clippy；rustdoc；Windows build，CARGO_NET_OFFLINE=true | 全部exit0，单次无重试：含doctest1200passed/0failed/8ignored，548.390秒；`cargo fmt --all -- --check`3.922秒；`cargo clippy --locked --workspace --all-targets -- -D warnings`28.734秒；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps`23.329秒；`cargo build --locked --workspace`11.562秒。 |
+| Rust特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 全部exit0：sqlite54passed/8.344秒，persistence含doctest219passed/50.578秒。 |
+| Flutter/Dart与本机FFI | `cargo build --locked -p ak-ffi --release`；Flutter analyze/test；Dart包test | 全部exit0：FFI release缓存有效构建0.859秒；Flutter analyze --no-pub无问题13.812秒；app test --no-pub 220/220、32.110秒；Dart包test170/170、17.985秒。 |
+| 实现范围与工具 | `git diff --exit-code 110bb34..714099a -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | exit0。Rust/cargo1.99.1，Python3.12.10，Git Bash5.3.15，Flutter3.47.9/Dart3.13.7。shellcheck未找到，未执行。 |
+
+| GitHub / Git / 文档 | 固定对象或命令 | 结果 |
+|---|---|---|
+| tip CI | `714099a974b33e7f4c0d91076c03af1aed15070a`；[43822462144](https://github.com/wmqfl861/AK-sending/actions/runs/43822462144) | 当前git凭据查询head_sha runs、精确run与jobs API。首次2026-11-16T07:23:57Z为in_progress；07:28:06Z查询确认completed/success，attempt1，updated_at07:27:51Z，branch=dev/batch-k-20261114。13jobs=12success/1manual skipped，121steps全部success，每个job head_sha精确一致。 |
+| CI边界与读请求重试 | 固定tip run/jobs JSON | Linux/Windows Rust、Flutter/Dart、Android双ABI FFI/符号/debug APK、Linux/macOS portability、audit/deny、repository、legacy、NAT netns均success。manual release-deep依push事件skipped；portability是check，netns是模拟。中间一次精确run GET响应触发IncompleteRead(8957 bytes read,3020 more expected)，随后原接口/原凭据查询完整成功；不是权限拒绝。 |
+| 初始引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；worktree/status | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=714099a974b33e7f4c0d91076c03af1aed15070a。仅两个远端head，一个主worktree，初始工作区干净。 |
+| K20同步与hash回填 | `git diff 110bb34..714099a`；`git show f4b58a6`、`git show 714099a` | f4b58a6纳入K20报告、§45、STATUS、状态表及执行方§46；714099a只回填交接一行哈希。执行方首轮两处历史对照失败及修正后重跑的历史过程不能仅凭提交独立追溯，保留为§46执行方陈述；本轮核对最终代码并独立执行门禁。 |
+| 权限与外部操作 | 只读GitHub API和Git引用查询 | 无权限拒绝；没有生产访问、SSH、merge/push/分支删除或强推。依据REJECTED保留分支和本地审核结果。 |
+| 文档收尾与最终引用 | 仓库/契约、diff检查、嵌入runner核对、最终refs | 收尾检查exit0：92md/344 local links，2.062秒；契约5/5、0.125秒；git diff --check与实现diff均exit0。报告两份Python代码与主复核已执行runner逐字一致且compile通过，K状态行五列/真实提交号检查通过，专项交叉核对口径一致。07:54:25Z再次fetch/prune与远端heads查询和初始一致；本地HEAD/main未移动，一个主worktree，仅五份审核文档变化。 |
+
+| 未执行 / 证据边界 | 本轮事实 |
+|---|---|
+| Release深测 | 本轮未重跑K20的4096KiB/multistream chunk sweep超时及5GiB单项；沿用§45历史事实，不称超时已解决，不将本轮常规通过扩大为深测通过。Rust与依赖未改。 |
+| 原生Linux部署、物理双机C4、抓包 | 未执行。Bash、生成脚本、文件复制、SQLite查询与CLI预设失败真实运行；proc/systemctl/权限为合成模型，未验证原生服务启动。 |
+| 其他平台本机重建 | Android/Linux/macOS本机未重建；对应固定tip CI结果单列，Windows实际构建单列。 |
+
+| 仓外材料（系统TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k21-root-p61fi7uf` | GitHub两次完整run/jobs响应、查询脚本；主复核逐字runner、identity-main/home-main完整证据、日志、计时。凭据只驻进程内存，不输出或落盘。 |
+| `ak-k21-noglob-7wr6jfv6` | 原K20 glob完整矩阵、SQLite对象校验、目录枚举专项与控制、完整生成脚本/unit/日志/合成文件。 |
+| `ak-k21-db-review-00cb3ca9461c4c068ca6ed9fe4c44018` | K20权威汇总、修正后的valid-fixtures、两侧helper矩阵、当前CLI解析、身份子串专项。探索记录与最终权威结果分开。 |
+| `ak-k21-gates-044d13e2c1e64db68b4e080d43d3f731` | 本机所有门禁完整日志、命令/exit/耗时JSON与工具版本；Python单次完整运行记录。 |
+
+## 48. 修复轮二十一（K21 复核后的新候选，执行方记录）
+
+[K21 复核](REVIEW_2026-11-16-batchK21.zh-CN.md)（K20-N1/N2 判通过；新发现 K21-N1 --id-dir 贪婪正则误绑、K21-N2 /home 枚举空白分词，均 110bb34 亦复现）后，执行方完成修复；复核方本地同步（§47、STATUS、状态表）与本节代码改动一并提交。
+
+| K21 发现 | 修复内容 |
+|---|---|
+| K21-N1（P1） | `--id-dir` 全面 token 化：新 `bound_id_dir`/`id_binding_invalid`（等号取本 token 后缀、空格恰取后继、noglob、值内字面选项名不重解析），四处贪婪 sed 全部替换（reg_args_agree 身份比较、运行身份推导、REG_RW 提取、决策 rel_id）；CLI 语法门同款泛化（空后缀/选项形值/悬空/重复，错误串对照真实 714099a 二进制定稿）；决策 `--id-dir` 改写由模式替换改 token 遍历+白名单前置+选项绑定值校验。复核夹具（两种拼写）从「绑定 `--port` 为身份目录→停服→拷诱饵→生成 CLI rc2 参数」翻转为逐字绑定 `/home/otheruser/--id-dir`、真实数据迁移、生成 unit 参数为 CLI 接受的原始形态（诱饵字节不动）；语法四形态 phase1 拒绝；`110bb34` 基线误绑拷诱饵 |
+| K21-N2（P2） | /home 枚举改**按行读**：`while IFS= read -r` over `sudo ls -1`（set -f 不禁分词，循环形态本身更换），逐候选探测与多候选拒绝语义保持、候选为整行。复核夹具（含空格家目录）从「拆成 `/home/other` 片段→拷前缀诱饵→继续 enable」翻转为整行候选并在白名单处预停服拒绝（不可 bake 的空格路径）；空格+普通双候选多候选拒绝生效；普通单候选端到端保持；`110bb34` 基线分词拷诱饵 |
+
+### 修复轮二十一门禁与提交
+
+本地：`bash -n`+自检全过；Python 326/326（新增 8 项回归，id-dir 敏感的 K2-R3/K9/K10/K13/K14/K15/K19/K20 既有批次全部同轮复跑通过）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮二十一首个提交，推送后回填哈希） | --id-dir token 化+语法门泛化、home 枚举按行读；复核方文档同步与执行方本节记录入库 |

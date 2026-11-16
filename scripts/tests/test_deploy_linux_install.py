@@ -735,6 +735,14 @@ if [ -n "${LS_PERMDENY_PATH:-}" ] && [ "${!#}" = "$LS_PERMDENY_PATH" ]; then
 fi
 if [ "${1:-}" = "-1" ] && [ "$2" = "/home" ]; then
   # Model the home listing root would see (foreign users included).
+  # K 复核 K21-N2: LS_HOME_FILE provides the listing VERBATIM (one entry
+  # per line, exact bytes) so a legal home name with SPACES stays one ls
+  # record — the LS_HOME_ENTRIES word-split form cannot express that (and
+  # the round-22 fix makes phase1 iterate ls LINES, never words).
+  if [ -n "${LS_HOME_FILE:-}" ] && [ -f "$LS_HOME_FILE" ]; then
+    cat "$LS_HOME_FILE"
+    exit 0
+  fi
   for e in ${LS_HOME_ENTRIES:-otheruser}; do printf '%s\n' "$e"; done
   exit 0
 fi
@@ -1481,7 +1489,8 @@ class ProbeHarness(unittest.TestCase):
     def _install_with_chosen(self, chosen_exec: str, chosen_rw: str,
                              old_registry: str, out_prefix: str,
                              text: str | None = None,
-                             rev: str | None = None):
+                             rev: str | None = None,
+                             data_source: str = "/home/otheruser/.ak-sending"):
         """Run the REAL write_phase456 (current tree, or a baseline's own)
         with the decision's CHOSEN values baked — the reviewer's full-chain
         install step."""
@@ -1498,7 +1507,7 @@ class ProbeHarness(unittest.TestCase):
             + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
             + 'REG_RW="' + chosen_rw + '" '
             + 'LEGACY_UNIT= OLD_REGISTRY_UNIT=' + old_registry + ' '
-            + 'DATA_SOURCE_DIR=/home/otheruser/.ak-sending '
+            + 'DATA_SOURCE_DIR=' + data_source + ' '
             + 'CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
             + 'write_phase456 "$PROBE_DIR/' + out_prefix + '.sh" '
             '|| { echo GEN_FAILED; exit 90; }' + chr(10)
@@ -1507,6 +1516,65 @@ class ProbeHarness(unittest.TestCase):
             + 'echo "INSTALL_RC=$?"' + chr(10))
         return self.run_driver(defs + BOX_MODELS, body,
                                name="driver-install-" + out_prefix + ".sh")
+
+    def _make_k21_id_fixture(self, sep: str,
+                             idpath: str = "/home/otheruser/--id-dir"):
+        """K21-N1 reviewer fixture: unit AND running argv carry
+        '--id-dir<sep><idpath> --port 17200' where the id path ENDS in the
+        literal '--id-dir'; service cwd /home/runtime-old. The REAL
+        directory <idpath> holds runtime-real-key/db; the misbind decoy at
+        /home/runtime-old/--port holds substring-decoy-key/db (what the
+        greedy sed + cwd binding selected)."""
+        args = "--id-dir" + sep + idpath + " --port 17200"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        for path, key, db in ((idpath, "runtime-real-key", "runtime-real-db"),
+                              ("/home/runtime-old/--port",
+                               "substring-decoy-key", "substring-decoy-db")):
+            live = self.probe / path.lstrip("/")
+            live.mkdir(parents=True, exist_ok=True)
+            (live / "registry.key").write_text(key, encoding="utf-8")
+            (live / "registry.db").write_text(db, encoding="utf-8")
+        self._make_oldregistry_running()
+
+    def _make_k21_home_fixture(self, raw_homes: str, decoy: bool):
+        """K21-N2 reviewer fixture: a fresh host (no occupant, no units)
+        whose /home listing (LS_HOME_RAW, verbatim lines) may carry a
+        SPACED home name. The real candidate dir gets synthetic-existing-*
+        markers; when decoy=True the split-prefix directory /home/other
+        gets synthetic-split-decoy-* markers DIRECTLY inside it (what the
+        word-splitting loop probed)."""
+        for home in [h for h in raw_homes.split("\n") if h]:
+            live = self.probe / "home" / home / ".ak-sending"
+            live.mkdir(parents=True, exist_ok=True)
+            (live / "registry.key").write_text("synthetic-existing-key",
+                                               encoding="utf-8")
+            (live / "registry.db").write_text("synthetic-existing-db",
+                                              encoding="utf-8")
+        if decoy:
+            prefix = self.probe / "home" / "other"
+            prefix.mkdir(parents=True, exist_ok=True)
+            (prefix / "registry.key").write_text("synthetic-split-decoy-key",
+                                                 encoding="utf-8")
+            (prefix / "registry.db").write_text("synthetic-split-decoy-db",
+                                                encoding="utf-8")
+
+    def _run_p1_homes(self, script: str, out: str, raw_homes: str):
+        """phase1 on a fresh host (SS_EMPTY) with a verbatim /home listing
+        (LS_HOME_FILE: exact bytes, one entry per line — spaced names stay
+        one ls record)."""
+        listing = self.probe / "ls-home-listing.txt"
+        listing.write_text(raw_homes, encoding="utf-8", newline="\n")
+        return self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/' + script + '" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'SS_EMPTY=1 LS_HOME_FILE=' + listing.as_posix()
+            + ' bash "$PROBE_DIR/' + script + '" '
+            + '> "$PROBE_DIR/' + out + '" 2>&1; echo "RUN_RC=$?"' + chr(10))
 
     def _k20_decision_of(self, configured: str, running: str, name: str,
                          baseline_rev: str = ""):
@@ -4199,6 +4267,258 @@ echo "C4=[$c4]"
                 self.assertNotIn("systemctl stop", self.stubs_log())
                 self.doCleanups()
 
+    # -- K21-N1 (round 22): token-bound identity extraction -------------------
+    def test_k21n1_literal_option_shaped_id_dir_binds_verbatim(self):
+        # The reviewer's P1 fixture: the legal id path ENDS in the literal
+        # '--id-dir'. The greedy sed bound the FOLLOWING '--port' as the
+        # identity (resolving the decoy /home/runtime-old/--port against the
+        # running cwd) and the pattern rewrite then corrupted the args. The
+        # token-bound chain must bind the path VERBATIM, copy the REAL
+        # directory's key/db, and generate args the CLI accepts (the
+        # reviewer's real-CLI probe: original argv parses, fails only at
+        # identity loading; the corrupted argv gave rc 2 'unexpected
+        # argument /home/runtime-old/--port found').
+        for i, (sep, label) in enumerate(((" ", "space"), ("=", "equals"))):
+            with self.subTest(spelling=label):
+                self.setUp()
+                self._make_k21_id_fixture(sep)
+                script = "p1k21i%d.sh" % i
+                outname = "p1k21i%d.out" % i
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/' + script + '" '
+                    '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                    + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                    + 'bash "$PROBE_DIR/' + script + '" '
+                    + '> "$PROBE_DIR/' + outname + '" 2>&1; '
+                    + 'echo "RUN_RC=$?"' + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out)
+                p1_out = (self.probe / outname).read_text(encoding="utf-8")
+                self.assertIn("  runtime-id-dir: /home/otheruser/--id-dir",
+                              p1_out,
+                              "the runtime identity must bind the path "
+                              "VERBATIM, never the following '--port'")
+                self.assertNotIn("runtime-id-dir: /home/runtime-old/--port",
+                                 p1_out)
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-decision-k21i-decision%d.sh" % i)
+                self.assertEqual(rc, 0, out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertIn("--id-dir" + sep + "/home/otheruser/--id-dir",
+                              chosen_exec)
+                self.assertIn("--port 17200", chosen_exec)
+                self.assertNotIn("/home/runtime-old/--port", chosen_exec)
+                self.assertEqual(chosen_rw, "/home/otheruser/--id-dir")
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry,
+                    "p456k21i%d" % i,
+                    data_source="/home/otheruser/--id-dir")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log())
+                p456_out = (self.probe / ("p456k21i%d.out" % i)).read_text(
+                    encoding="utf-8")
+                self.assertIn("oldregistry:exists:enabled:active", p456_out)
+                dest = self.probe / "opt-ak" / "data"
+                self.assertEqual(
+                    (dest / "registry.key").read_text(encoding="utf-8"),
+                    "runtime-real-key",
+                    "the REAL directory's key must be migrated")
+                self.assertEqual(
+                    (dest / "registry.db").read_text(encoding="utf-8"),
+                    "runtime-real-db")
+                unit = (self.probe
+                        / "etc/systemd/system/ak-registry-server.service") \
+                    .read_text(encoding="utf-8")
+                self.assertIn(
+                    "--id-dir" + sep + "/home/otheruser/--id-dir --port 17200",
+                    [l for l in unit.splitlines()
+                     if l.startswith("ExecStart=")][0],
+                    "the generated argv must stay CLI-valid (literal path "
+                    "component preserved, real port option intact)")
+                self.assertIn("ReadWritePaths=/home/otheruser/--id-dir", unit)
+                decoy = self.probe / "home/runtime-old/--port"
+                self.assertEqual(
+                    (decoy / "registry.key").read_text(encoding="utf-8"),
+                    "substring-decoy-key",
+                    "the misbind decoy must never be touched")
+                self.doCleanups()
+
+    def test_k21n1_ordinary_id_dir_control_migrates_real(self):
+        # Ordinary-path control: no option-shaped bytes anywhere — the
+        # token-bound extraction behaves identically to the old sed and the
+        # full chain migrates the REAL identity.
+        self._make_k21_id_fixture(" ", idpath="/home/otheruser/identity")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1k21ord.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1k21ord.sh" '
+            + '> "$PROBE_DIR/p1k21ord.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k21ord.out").read_text(encoding="utf-8")
+        self.assertIn("  runtime-id-dir: /home/otheruser/identity", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k21ord.sh")
+        self.assertEqual(rc, 0, out)
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+        self.assertIn("--id-dir /home/otheruser/identity", chosen_exec)
+        rc, out = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, "p456k21ord",
+            data_source="/home/otheruser/identity")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "runtime-real-key")
+        self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
+                         "runtime-real-db")
+
+    def test_k21n1_id_dir_grammar_refuses_pre_stop(self):
+        # The CLI grammar gates mirrored for --id-dir (error strings
+        # verified against the real git-714099a CLI): explicit empty
+        # equals suffix, option-shaped space-form value, dangling trailing
+        # option ("a value is required for '--id-dir <ID_DIR>' but none was
+        # supplied") and duplicate bindings ("the argument '--id-dir
+        # <ID_DIR>' cannot be used multiple times"). All refuse in phase1,
+        # before any stop.
+        identity = "/home/otheruser/identity"
+        running = "--port 17200 --id-dir " + identity
+        shapes = [
+            ("empty", "--port 17200 --id-dir=",
+             ["an explicit EMPTY --id-dir value",
+              "a value is required for '--id-dir <ID_DIR>' but none was "
+              "supplied"]),
+            ("option-value", "--port 17200 --id-dir --port 17200",
+             ["space-form --id-dir value is option-shaped"]),
+            ("dangling", "--port 17200 --id-dir",
+             ["dangling '--id-dir' option without a value",
+              "a value is required for '--id-dir <ID_DIR>'"]),
+            ("duplicate", "--port 17200 --id-dir " + identity
+             + " --id-dir " + identity,
+             ["'--id-dir' bindings", "cannot be used multiple times"]),
+        ]
+        for label, configured, needles in shapes:
+            with self.subTest(shape=label):
+                self.setUp()
+                self.make_private_discovery_model(
+                    main_exec="/opt/ak-sending/ak-cli registry-server "
+                    + configured,
+                    cmdline_extra=running,
+                    unit_service_lines=["User=otheruser",
+                                        "WorkingDirectory=/home/runtime-old"],
+                    environ=b"HOME=/home/otheruser\0"
+                            b"USERPROFILE=/home/otheruser\0")
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/p1k21g.sh" '
+                    '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                    + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                    + 'bash "$PROBE_DIR/p1k21g.sh" '
+                    + '> "$PROBE_DIR/p1k21g.out" 2>&1; echo "RUN_RC=$?"'
+                    + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=3", out,
+                              "phase1 must refuse the CLI-invalid --id-dir "
+                              "shape pre-stop")
+                p1_out = (self.probe / "p1k21g.out").read_text(encoding="utf-8")
+                for needle in needles:
+                    self.assertIn(needle, p1_out)
+                self.assertNotIn("systemctl stop", self.stubs_log())
+                self.assertFalse(
+                    (self.probe
+                     / "etc/systemd/system/ak-registry-server.service").exists())
+                self.doCleanups()
+
+    # -- K21-N2 (round 22): /home candidates iterate LINES --------------------
+    def test_k21n2_spaced_home_is_one_whole_candidate(self):
+        # The reviewer's fixture: a legal home named 'other user' plus the
+        # split-prefix decoy directly under /home/other. The whole
+        # '/home/other user/.ak-sending' is ONE candidate; the '/home/other'
+        # fragment NEVER appears; the un-bakeable spaced name then refuses
+        # pre-stop at the K13-N1 whitelist instead of silently migrating
+        # the prefix decoy.
+        self._make_k21_home_fixture("other user", decoy=True)
+        rc, out = self._run_p1_homes("p1k21h.sh", "p1k21h.out", "other user")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k21h.out").read_text(encoding="utf-8")
+        self.assertIn(
+            "registry-data: /home/other user/.ak-sending (key:yes db:yes)",
+            p1_out, "the spaced directory is ONE whole candidate")
+        self.assertNotIn("registry-data: /home/other (", p1_out,
+                         "the split-prefix fragment must never be a "
+                         "candidate")
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k21h.sh")
+        self.assertNotEqual(
+            rc, 0,
+            "the spaced name cannot be baked; the deploy must refuse "
+            "pre-stop: " + out)
+        self.assertIn("contains shell-significant bytes this deploy cannot "
+                      "bake faithfully", out)
+        self.assertNotIn("CHOSEN_DATA_SOURCE=/home/other" + chr(10), out)
+        self.assertNotIn("systemctl enable", self.stubs_log())
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key")
+                         .exists(), "nothing may be copied from the decoy")
+        decoy = self.probe / "home" / "other" / "registry.key"
+        self.assertEqual(decoy.read_text(encoding="utf-8"),
+                         "synthetic-split-decoy-key",
+                         "the prefix decoy must stay untouched")
+        real = (self.probe / "home" / "other user" / ".ak-sending"
+                / "registry.key")
+        self.assertEqual(real.read_text(encoding="utf-8"),
+                         "synthetic-existing-key",
+                         "the real spaced candidate stays in place")
+
+    def test_k21n2_spaced_plus_ordinary_candidates_refuse(self):
+        # The bypass closure: a REAL spaced candidate plus an ordinary one
+        # must BOTH be reported, so the no-occupant multi-candidate
+        # refusal fires (the word-splitting loop dropped the spaced one and
+        # silently migrated the other).
+        self._make_k21_home_fixture("other user\notheruser", decoy=True)
+        rc, out = self._run_p1_homes("p1k21p.sh", "p1k21p.out",
+                                     "other user\notheruser")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k21p.out").read_text(encoding="utf-8")
+        self.assertIn("registry-data: /home/other user/.ak-sending "
+                      "(key:yes db:yes)", p1_out)
+        self.assertIn("registry-data: /home/otheruser/.ak-sending "
+                      "(key:yes db:yes)", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k21p.sh")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("multiple identity directories", out)
+        self.assertNotIn("systemctl enable", self.stubs_log())
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key")
+                         .exists())
+
+    def test_k21n2_ordinary_home_still_migrates(self):
+        # Ordinary control: a single plain-named home enumerates and
+        # migrates exactly as before.
+        self._make_k21_home_fixture("otheruser", decoy=False)
+        rc, out = self._run_p1_homes("p1k21o.sh", "p1k21o.out", "otheruser")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k21o.out").read_text(encoding="utf-8")
+        self.assertIn("registry-data: /home/otheruser/.ak-sending "
+                      "(key:yes db:yes)", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k21o.sh")
+        self.assertEqual(rc, 0, out)
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+        rc, out = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, "p456k21o")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        self.assertIn("systemctl enable --now", self.stubs_log())
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "synthetic-existing-key")
+        self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
+                         "synthetic-existing-db")
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -5541,6 +5861,136 @@ class BaselineContrastTests(ProbeHarness):
                               "binding (the reviewer's real-CLI probe at "
                               "110bb34 returned rc 2 on exactly this shape)")
                 self.doCleanups()
+
+    def test_k21n1_round20_tip_misbinds_id_dir_and_copies_decoy(self):
+        # K21-review contrast: 110bb34 on the literal '--id-dir' path — the
+        # greedy sed binds '--port' as the identity (resolved against the
+        # running cwd to the DECOY), the pattern rewrite corrupts the real
+        # port option, and the full chain stops the old service and copies
+        # the DECOY directory's key/db. The reviewer's real git-714099a CLI
+        # returns rc 2 "unexpected argument '/home/runtime-old/--port'
+        # found" on the generated argv. Both spellings.
+        for i, (sep, label) in enumerate(((" ", "space"), ("=", "equals"))):
+            with self.subTest(spelling=label):
+                self.setUp()
+                self._make_k21_id_fixture(sep)
+                text = self.baseline_text(PREV18_REV)
+                script = "p1prev21i%d.sh" % i
+                outname = "p1prev21i%d.out" % i
+                rc, out = self.run_driver(
+                    self.phase_defs(text, PREV18_REV) + BOX_MODELS,
+                    'write_phase1 "$PROBE_DIR/' + script + '" '
+                    '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                    + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                    + 'bash "$PROBE_DIR/' + script + '" '
+                    + '> "$PROBE_DIR/' + outname + '" 2>&1; '
+                    + 'echo "RUN_RC=$?"' + chr(10),
+                    name="driver-prev21i%d.sh" % i)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out,
+                              "the round-20 tip's phase1 passed the "
+                              "misbound identity (the defect)")
+                p1_out = (self.probe / outname).read_text(encoding="utf-8")
+                self.assertIn("  runtime-id-dir: /home/runtime-old/--port",
+                              p1_out,
+                              "the greedy extraction bound the FOLLOWING "
+                              "'--port' as the identity (the defect)")
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-prev21i-decision%d.sh" % i, text=text,
+                    origin=f"the {PREV18_REV} baseline")
+                self.assertEqual(
+                    rc, 0,
+                    "the round-20 tip accepted the misbound identity (the "
+                    "defect): " + out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertIn("/home/runtime-old/--port", chosen_exec,
+                              "the corrupted absolute token is baked into "
+                              "the generated argv (the defect)")
+                self.assertIn("CHOSEN_DATA_SOURCE=/home/runtime-old/--port",
+                              out)
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry,
+                    "p456prev21i%d" % i, text=text, rev=PREV18_REV,
+                    data_source="/home/runtime-old/--port")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log(),
+                              "the round-20 tip stopped the old service on "
+                              "the misbound identity (the defect's harm)")
+                dest = self.probe / "opt-ak" / "data"
+                self.assertEqual(
+                    (dest / "registry.key").read_text(encoding="utf-8"),
+                    "substring-decoy-key",
+                    "the DECOY's key was migrated (the defect)")
+                self.assertEqual(
+                    (dest / "registry.db").read_text(encoding="utf-8"),
+                    "substring-decoy-db")
+                if sep == " ":
+                    unit = (self.probe
+                            / "etc/systemd/system/ak-registry-server.service"
+                            ).read_text(encoding="utf-8")
+                    unit_exec = [l for l in unit.splitlines()
+                                 if l.startswith("ExecStart=")][0]
+                    self.assertIn(
+                        "--id-dir /home/otheruser/--id-dir "
+                        "/home/runtime-old/--port 17200", unit_exec,
+                        "the reviewer-verified corrupted argv shape: the "
+                        "stray absolute token + bare positional 17200 the "
+                        "real CLI rejects with rc 2")
+                self.doCleanups()
+
+    def test_k21n2_round20_tip_splits_spaced_home_and_copies_decoy(self):
+        # K21-review contrast: 110bb34's word-splitting /home enumeration —
+        # the spaced home splits into '/home/other' + a stray fragment, the
+        # PREFIX decoy becomes the only candidate, and the full chain
+        # migrates the decoy and enables the new units (the defect).
+        self._make_k21_home_fixture("other user", decoy=True)
+        listing = self.probe / "ls-home-listing.txt"
+        listing.write_text("other user", encoding="utf-8", newline="\n")
+        text = self.baseline_text(PREV18_REV)
+        rc, out = self.run_driver(
+            self.phase_defs(text, PREV18_REV) + BOX_MODELS,
+            'write_phase1 "$PROBE_DIR/p1prev21h.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'SS_EMPTY=1 LS_HOME_FILE=' + listing.as_posix()
+            + ' bash "$PROBE_DIR/p1prev21h.sh" '
+            + '> "$PROBE_DIR/p1prev21h.out" 2>&1; echo "RUN_RC=$?"'
+            + chr(10),
+            name="driver-prev21h.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev21h.out").read_text(encoding="utf-8")
+        self.assertEqual(
+            [x for x in p1_out.splitlines() if x.startswith("registry-data:")],
+            ["registry-data: /home/other (key:yes db:yes)"],
+            "the round-20 tip split the spaced path into the PREFIX decoy "
+            "(the defect)")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev21h-decision.sh", text=text,
+            origin=f"the {PREV18_REV} baseline")
+        self.assertEqual(rc, 0,
+                         "the round-20 tip accepted the split candidate "
+                         "(the defect): " + out)
+        self.assertIn("CHOSEN_DATA_SOURCE=/home/other", out)
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+        rc, out = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, "p456prev21h",
+            text=text, rev=PREV18_REV, data_source="/home/other")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        self.assertIn("systemctl enable --now", self.stubs_log())
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "synthetic-split-decoy-key",
+                         "the SPLIT DECOY's key was migrated (the defect)")
+        self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
+                         "synthetic-split-decoy-db")
+        real = (self.probe / "home" / "other user" / ".ak-sending"
+                / "registry.key")
+        self.assertEqual(real.read_text(encoding="utf-8"),
+                         "synthetic-existing-key",
+                         "the real spaced source stayed in place, never "
+                         "migrated (the defect's other half)")
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

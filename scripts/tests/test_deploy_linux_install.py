@@ -85,7 +85,9 @@ PREV12_REV = "943a346"
 PREV13_REV = "f425256"
 PREV14_REV = "0602f92"
 PREV15_REV = "7a93314"
-PREV16_REV = "4db2b4f"  # round-17 tip (K18 findings: byte-evidence
+PREV16_REV = "4db2b4f"
+PREV17_REV = "1d76871"  # round-18 tip (K19 findings: greedy db-value
+                         # pre-parse, dangling/duplicate db bindings)  # round-17 tip (K18 findings: byte-evidence
                          # producer error ignored, equals-form verification bug)  # round-16 tip (K17 findings: extraction-error
                          # passthrough, substring-split id-dir corruption)  # round-15 tip (K16 findings: partial-snapshot
                          # acceptance, extraction-error-as-absent, bracket
@@ -1357,6 +1359,61 @@ class ProbeHarness(unittest.TestCase):
             + 'GREP_EVIDENCE_VAR=USERPROFILE GREP_EVIDENCE_MODE=' + mode
             + ' bash "$PROBE_DIR/p1.sh" '
             + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+
+    def _make_k20_literal_fixture(self, configured_extra: str = ""):
+        """Configured unit AND running argv carry
+        '--id-dir /home/otheruser/.ak-sending --db-path=--db-path --port 17200'
+        (the db value is the literal filename '--db-path'; cwd /home/runtime-old).
+        The REAL object lives at /home/runtime-old/--db-path; decoys sit at
+        /home/runtime-old/--port (the misparsed binding) and /--db-path."""
+        identity = "/home/otheruser/.ak-sending"
+        base_args = ("--id-dir " + identity + " --db-path=--db-path --port 17200")
+        configured = base_args + configured_extra
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + configured,
+            cmdline_extra=base_args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        live = self.probe / identity.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("synthetic-runtime-key", encoding="utf-8")
+        (live / "registry.db").write_text("synthetic-identity-default-db",
+                                         encoding="utf-8")
+        import sqlite3
+        for obj, marker in (("/home/runtime-old/--db-path", "runtime-real"),
+                            ("/home/runtime-old/--port", "misparsed-token-decoy"),
+                            ("/--db-path", "new-cwd-decoy")):
+            path = self.probe / obj.lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.unlink()
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE review_marker(value TEXT)")
+            con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
+            con.commit()
+            con.close()
+
+    def _k20_decision_of(self, configured: str, running: str, name: str,
+                         baseline_rev: str = ""):
+        identity = "/home/otheruser/.ak-sending"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + configured,
+            cmdline_extra=running,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        if baseline_rev:
+            text = self.baseline_text(baseline_rev)
+            return self.run_decision_and_config(
+                p1_out, name, text=text, origin=f"the {baseline_rev} baseline")
+        return self.run_decision_and_config(p1_out, name)
 
     def _make_k18_db_fixture(self, identity: str, dbpath: str):
         args = "--port 17200 --id-dir " + identity + " --db-path " + dbpath
@@ -3707,6 +3764,99 @@ echo "C4=[$c4]"
         self.assertEqual(self._db_arg_of(exec_line[len("CHOSEN_EXEC="):]),
                          "/home/runtime-old/state/registry.db")
 
+    # -- K19-N1 (round 20): a literal '--db-path' filename is a VALUE -------
+    def test_k19n1_literal_db_filename_resolves_token_bound(self):
+        # The reviewer's exact fixture: the equals value is the literal
+        # filename '--db-path'. The old greedy sed treated the value as an
+        # option start and bound '--port'; the token-bound extraction keeps
+        # the literal, the whitelist passes ('-' only), and the chain reads
+        # the REAL object at /home/runtime-old/--db-path.
+        self._make_k20_literal_fixture()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k20lit.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        self.assertEqual(self._db_arg_of(chosen_exec),
+                         "/home/runtime-old/--db-path",
+                         "the literal filename must resolve against the running cwd")
+        self.assertNotIn("--db-path=/home/runtime-old/--port", chosen_exec,
+                         "'--port' must never be bound to --db-path")
+        self.assertIn("--id-dir /home/otheruser/.ak-sending", exec_line)
+        # Execute the real install with the CHOSEN values baked and prove
+        # the object the new unit points at is the REAL one.
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
+            + 'REG_RW="/home/otheruser/.ak-sending /home/runtime-old" '
+            + 'LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=/home/otheruser/.ak-sending CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456k20lit.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456k20lit.sh" > "$PROBE_DIR/p456k20lit.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.generate_and_run_p456(body)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        unit_exec = [l for l in unit.splitlines() if l.startswith("ExecStart=")][0]
+        self.assertEqual(self._db_arg_of(unit_exec),
+                         "/home/runtime-old/--db-path")
+        import sqlite3
+        obj = self.probe / "home/runtime-old/--db-path"
+        con = sqlite3.connect(obj)
+        marker = con.execute("SELECT value FROM review_marker").fetchone()[0]
+        con.close()
+        self.assertEqual(marker, "runtime-real",
+                         "the resolved object is the REAL runtime database")
+
+    # -- K19-N2 (round 20): dangling and duplicate db bindings refuse ---------
+    def test_k19n2_trailing_dangling_option_refuses_pre_stop(self):
+        # Configured unit edited to '--db-path=state/registry.db --db-path'
+        # (running argv stays the legal single binding). The dangling option
+        # has NO value — the real CLI errors "a value is required for
+        # '--db-path <DB_PATH>'". The decision must refuse before any stop.
+        running = "--port 17200 --id-dir /home/otheruser/.ak-sending --db-path=state/registry.db"
+        configured = running + " --db-path"
+        rc, out = self._k20_decision_of(configured, running,
+                                         "driver-decision-k20dang.sh")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("dangling '--db-path' option without a value", out)
+        self.assertIn("a value is required", out)
+        self.assertNotIn("CHOSEN_", out)
+        self.assertNotIn("systemctl stop", self.stubs_log())
+
+    def test_k19n2_duplicate_options_refuse_pre_stop(self):
+        # Three duplicate shapes: two standalone, standalone+equals, two
+        # equals. The real CLI errors "cannot be used multiple times".
+        running = "--port 17200 --id-dir /home/otheruser/.ak-sending --db-path=state/registry.db"
+        duplicates = [
+            ("--port 17200 --id-dir /home/otheruser/.ak-sending --db-path state/registry.db --db-path state/registry.db"),
+            (running + " --db-path=state/registry.db"),
+            ("--port 17200 --id-dir /home/otheruser/.ak-sending --db-path=state/registry.db --db-path=other.db"),
+        ]
+        for i, configured in enumerate(duplicates):
+            with self.subTest(shape=i):
+                rc, out = self._k20_decision_of(
+                    configured, running, f"driver-decision-k20dup{i}.sh")
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("cannot be used multiple times", out)
+                self.assertIn("'--db-path' bindings", out)
+                self.assertNotIn("CHOSEN_", out)
+                self.assertNotIn("systemctl stop", self.stubs_log())
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -4800,6 +4950,84 @@ class BaselineContrastTests(ProbeHarness):
             "(the defect): " + out)
         self.assertIn("the --db-path rewrite did not take", out)
         self.assertNotIn("CHOSEN_", out)
+
+    def test_k19n1_round18_tip_misbinds_literal_filename(self):
+        # K19-review contrast: 1d76871 on the literal-filename fixture —
+        # its greedy sed pre-parse binds '--port' as the db value, the
+        # verification compares against the SAME wrong absolute path and
+        # passes, and the full chain points the new unit at
+        # /home/runtime-old/--port (the misparsed-token decoy).
+        self._make_k20_literal_fixture()
+        text = self.baseline_text(PREV17_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev17.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev17.sh" '
+            + '> "$PROBE_DIR/p1prev17.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV17_REV) + BOX_MODELS,
+                                  body, name="driver-prev17-lit.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev17.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev17-lit-decision.sh", text=text,
+            origin=f"the {PREV17_REV} baseline")
+        self.assertEqual(
+            rc, 0, "the round-18 tip passed the misparse (the defect): " + out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertEqual(self._db_arg_of(exec_line[len("CHOSEN_EXEC="):]),
+                         "/home/runtime-old/--port",
+                         "the round-18 tip bound '--port' to --db-path (the defect)")
+
+    def test_k19n1_round17_tip_refused_literal_filename_pre_stop(self):
+        # Secondary contrast: 4db2b4f on the same fixture — its bare-token
+        # verification refused BEFORE any stop (the input was not silently
+        # misrouted there; the misrouting was opened by the round-19 change).
+        self._make_k20_literal_fixture()
+        text = self.baseline_text(PREV16_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev17b.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev17b.sh" '
+            + '> "$PROBE_DIR/p1prev17b.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV16_REV) + BOX_MODELS,
+                                  body, name="driver-prev17b-lit.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev17b.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev17b-decision.sh", text=text,
+            origin=f"the {PREV16_REV} baseline")
+        self.assertNotEqual(
+            rc, 0,
+            "4db2b4f refused the equals form pre-stop (the misparse path "
+            "was not open there): " + out)
+
+    def test_k19n2_round18_tip_accepts_dangling_and_duplicates(self):
+        # K19-review contrast: 1d76871 on the dangling and duplicate
+        # fixtures — its extraction/verification never checked the pending
+        # end-state or the binding count, so both shapes passed into a
+        # stop+install whose generated unit the real CLI rejects
+        # ("a value is required for '--db-path <DB_PATH>' /
+        # "cannot be used multiple times").
+        running = "--port 17200 --id-dir /home/otheruser/.ak-sending --db-path=state/registry.db"
+        for i, configured in enumerate(
+                (running + " --db-path",
+                 running + " --db-path=state/registry.db")):
+            with self.subTest(shape=i):
+                self.setUp()
+                rc, out = self._k20_decision_of(
+                    configured, running, f"driver-prev17-dup{i}.sh",
+                    baseline_rev=PREV17_REV)
+                self.assertEqual(
+                    rc, 0,
+                    "the round-18 tip accepted the invalid binding (the "
+                    "defect): " + out)
+                self.assertNotIn("dangling", out)
+                self.assertNotIn("cannot be used multiple times", out)
+                self.doCleanups()
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

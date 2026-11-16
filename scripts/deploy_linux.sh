@@ -743,6 +743,15 @@ self_test() {
     || fail "a failed byte-evidence producer must refuse, never pass on a partial count (K10-N1)"
   grep -q 're_parsed=\${re_tok#--db-path=}' "$0" \
     || fail "the db verification must parse the option-bound value in BOTH spellings (K15-N1)"
+  # K 复核 K19-N1/N2 (round 20): the db VALUE is extracted with the same
+  # token-bound rule everywhere (a literal '--db-path' filename stays a
+  # value), and dangling/duplicate bindings refuse pre-stop.
+  grep -q 'bound_db_arg' "$WORK/p1.sh" \
+    || fail "phase1 db comparisons must use the token-bound parser (K19-N1)"
+  grep -q "dangling '--db-path' option without a value" "$0" \
+    || fail "a dangling --db-path option must refuse pre-stop (K19-N2)"
+  grep -q 'cannot be used multiple times' "$0" \
+    || fail "duplicate --db-path bindings must refuse pre-stop (K19-N2)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1068,6 +1077,30 @@ effective_execstart() {
     || { echo "ERROR: cannot read the effective configuration of \$1 (systemctl cat failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
   printf '%s\\n' "\$ec_cat" | awk '/^ExecStart=/ { v = substr(\$0, 11); if (v == "") { n = 0; split("", L) } else { L[++n] = v } } END { for (i = 1; i <= n; i++) print L[i] }'
 }
+# bound_db_arg <line>: the value ACTUALLY BOUND to the --db-path option by
+# full-token rules — the equals form takes the token's OWN suffix (a literal
+# '--db-path' FILENAME as the value never re-parses as an option), the
+# space form takes exactly the NEXT token. Same semantics as the
+# decisions-block rewrite/verification (K 复核 K19-N1); the old greedy sed
+# treated a value-internal '--db-path' as an option start and bound
+# '--port' instead.
+bound_db_arg() {
+  local bd_tok bd_val bd_pending
+  bd_val=""
+  bd_pending=0
+  for bd_tok in \$1; do
+    if [ "\$bd_pending" = 1 ]; then
+      [ -z "\$bd_val" ] && bd_val="\$bd_tok"
+      bd_pending=0
+      continue
+    fi
+    case "\$bd_tok" in
+      --db-path) bd_pending=1 ;;
+      --db-path=*) [ -z "\$bd_val" ] && bd_val=\${bd_tok#--db-path=} ;;
+    esac
+  done
+  printf '%s\\n' "\$bd_val"
+}
 # reg_args_agree <exec-line> <cmdline-line>: 0 when the EFFECTIVE values of
 # the configured ExecStart and the running cmdline AGREE (defaults derived;
 # see the rc contract inside). The compared surface is 'ak-cli
@@ -1104,8 +1137,8 @@ reg_args_agree() {
     fi
     return 1
   fi
-  a_db=\$(printf '%s\\n' "\$1" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
-  b_db=\$(printf '%s\\n' "\$2" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
+  a_db=\$(bound_db_arg "\$1")
+  b_db=\$(bound_db_arg "\$2")
   if [ -z "\$a_db" ] && [ -n "\$a_id" ]; then a_db="\$a_id/registry.db"; fi
   if [ -z "\$b_db" ] && [ -n "\$b_id" ]; then b_db="\$b_id/registry.db"; fi
   if [ "\$a_db" != "\$b_db" ]; then
@@ -1572,7 +1605,7 @@ REG_EFF_H
       # captured yet (the identity itself was absolute), read the RUNNING
       # cwd now (same single-read discipline) and report it so the config
       # selection can absolutize the db object against it.
-      reg_db_arg=\$(printf '%s\\n' "\$reg_pick" | sed -n 's/.*--db-path[= ]\\([^ ]*\\).*/\\1/p')
+      reg_db_arg=\$(bound_db_arg "\$reg_pick")
       case "\$reg_db_arg" in
         /*|'') : ;;
         *)
@@ -2572,7 +2605,43 @@ real_run() {
     # cwd phase1 captured (baked as RUNTIME_CWD by write_phase1; absent when
     # the identity was absolute and no cwd was consulted -> refuse, the db
     # object cannot be bound).
-    rel_db=$(printf '%s\n' "$REGISTRY_EXEC" | sed -n 's/.*--db-path[= ]\([^ ]*\).*/\1/p' | head -1)
+    # K 复核 K19-N1 (round 20): the value is extracted with the SAME
+    # token-bound rule the verification below uses — the equals form takes
+    # the token's OWN suffix exactly (never scanning across tokens), the
+    # space form takes exactly the NEXT token. The old greedy sed treated a
+    # literal '--db-path' FILENAME as an option start and bound '--port'
+    # instead, generating a unit pointing at a different database object.
+    # K 复核 K19-N2: the token walk also refuses dangling (a standalone
+    # '--db-path' with no following token -> the real CLI errors
+    # "a value is required for '--db-path <DB_PATH>'") and duplicate
+    # bindings (-> "cannot be used multiple times"; both verified against
+    # the current CLI) BEFORE any service is stopped.
+    rel_db=""
+    re_dangling=0
+    re_count=0
+    re_pending=0
+    for re_tok in $REGISTRY_EXEC; do
+      if [ "$re_pending" = 1 ]; then
+        [ -z "$rel_db" ] && rel_db="$re_tok"
+        re_pending=0
+        continue
+      fi
+      case "$re_tok" in
+        --db-path)
+          re_pending=1
+          re_count=$((re_count + 1)) ;;
+        --db-path=*)
+          re_count=$((re_count + 1))
+          [ -z "$rel_db" ] && rel_db=${re_tok#--db-path=} ;;
+      esac
+    done
+    [ "$re_pending" = 1 ] && re_dangling=1
+    if [ "$re_dangling" = 1 ]; then
+      fail "the effective ExecStart carries a dangling '--db-path' option without a value (the service CLI would reject it: \"a value is required for '--db-path <DB_PATH>'\"); refusing before any switchover (K19-N2)"
+    fi
+    if [ "$re_count" -gt 1 ]; then
+      fail "the effective ExecStart carries $re_count '--db-path' bindings (the service CLI rejects duplicates: \"cannot be used multiple times\"); refusing before any switchover (K19-N2)"
+    fi
     case "$rel_db" in
       /*|'') : ;;
       *)

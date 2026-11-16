@@ -341,6 +341,24 @@ main() {
   [[ -n "$isolated_netns" && "$isolated_netns" != "$host_netns" ]] || fail 1 'refusing to run in the host network namespace'
   ns_isolated=1
   sudo -n ip -n "$namespace" link set lo up || fail 1 'namespace loopback setup failed'
+  # CR-P3-19 (review 2026-11-11 §4.5): the benchmark's QUIC sockets ask for
+  # 8 MiB SO_RCVBUF/SO_SNDBUF (crates/ak-net/src/lib.rs
+  # enlarge_udp_socket_buffers), and the kernel caps that request at
+  # net.core.rmem_max/wmem_max — 212992 on stock Ubuntu, the cap the netem
+  # tiers' RcvbufErrors (+247/+167/+219) and the 8 MiB tier's 2177 lost
+  # packets were measured under. Raise both ceilings to 16 MiB BEFORE any
+  # shaping runs. In-namespace only, best-effort: on per-netns-sysctl
+  # kernels a fresh netns starts from the kernel default (not the host's
+  # raised value), so the benchmark sockets NEED this write; on global-
+  # sysctl kernels the entry is init_net's and this write can fail — the
+  # workflow's host-level sysctl step covers that case (CI runner, not a
+  # production host), so a refusal is logged, never fatal. The write dies
+  # with this owned namespace at cleanup, leaving the host untouched.
+  if ns_exec sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216; then
+    log "namespace UDP buffer ceilings raised (CR-P3-19): rmem_max=$(ns_exec sysctl -n net.core.rmem_max 2>/dev/null || printf 'unreadable') wmem_max=$(ns_exec sysctl -n net.core.wmem_max 2>/dev/null || printf 'unreadable')"
+  else
+    log 'namespace sysctl raise unavailable (global-sysctl kernel?); CR-P3-19 ceiling is whatever the workflow set on the host'
+  fi
   # Creating an actual qdisc proves CAP_NET_ADMIN + sch_netem, even when
   # sch_netem is built into the kernel (lsmod/modprobe alone would not prove it).
   ns_exec tc qdisc add dev lo root netem delay 1ms || fail 1 'sch_netem/CAP_NET_ADMIN write probe failed'

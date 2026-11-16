@@ -16,6 +16,11 @@ on:
       # its tc invocation or assertions must re-run the evidence workflow
       # (the tc argument-order fix in 2312250 did not trigger one).
       - crates/ak-itests/tests/bench_netem.rs
+      # CR-P3-19 (review 2026-11-11 §4.5): the QUIC socket buffer sizing in
+      # ak-net's bind path is a direct input to the throughput measurement
+      # (RcvbufErrors / lost packets per tier) — a change there must re-run
+      # the A/B evidence too.
+      - crates/ak-net/src/lib.rs
   workflow_dispatch:
 
 permissions:
@@ -50,6 +55,17 @@ jobs:
         run: |
           bash -n scripts/run_netem_benchmark.sh
           python3 -I -B -m unittest discover -s scripts/tests -p test_netem_benchmark.py -v
+      # CR-P3-19 (review 2026-11-11 §4.5): the netem tiers measured host
+      # `udp RcvbufErrors` (+247/+167/+219) and 2177 lost packets on the
+      # 8 MiB-window tier; ak-net now asks for 8 MiB SO_RCVBUF/SO_SNDBUF,
+      # which the kernel caps at net.core.rmem_max/wmem_max (212992 on
+      # stock Ubuntu). Raise both to 16 MiB BEFORE the benchmark shapes
+      # anything, so the re-run A/B reflects the enlarged buffers. This is
+      # a CI runner, not a production host. The runner script repeats the
+      # write inside its owned namespace (best-effort) because a fresh
+      # netns starts from the kernel default on per-netns-sysctl kernels.
+      - name: Raise UDP socket buffer ceilings before the benchmark (CR-P3-19)
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
       - name: Build as runner user, then measure inside a privileged namespace
         # sudo lives ONLY inside this script; Cargo must remain the runner user.
         # Missing iproute2/sch_netem/privilege is NOT-MEASURED + a failed job,

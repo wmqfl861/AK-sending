@@ -121,6 +121,21 @@ mock_ip() {
   esac
 }
 ip() { [[ "$*" == -V ]] || return 90; printf 'ip synthetic\n'; }
+sysctl() {
+  # CR-P3-19 (review 2026-11-11 §4.5): the runner raises the UDP buffer
+  # ceilings inside the owned namespace only; the host-level raise is the
+  # workflow's step (a CI runner), never this script's.
+  [[ "${MOCK_IN_NS:-}" == isolated ]] || { printf 'HOST SYSCTL MUTATION REJECTED\n' >&2; return 90; }
+  printf 'namespace sysctl %s\n' "$*" >> "$MOCK_ROOT/commands"
+  if [[ "$1" == -w ]]; then
+    [[ "$*" == '-w net.core.rmem_max=16777216 net.core.wmem_max=16777216' ]] || return 90
+    return 0
+  fi
+  case "$*" in
+    '-n net.core.rmem_max'|'-n net.core.wmem_max') printf '16777216\n' ;;
+    *) return 90 ;;
+  esac
+}
 tc() {
   if [[ "$*" == -V ]]; then printf 'tc synthetic\n'; return; fi
   [[ "${MOCK_IN_NS:-}" == isolated ]] || { printf 'HOST TC MUTATION REJECTED\n' >&2; return 90; }
@@ -384,6 +399,32 @@ python3() {
         self.assertIn("sudo kill -KILL 987654", commands)
         self.assertNotIn("sudo cargo", commands)
         self.assertNotIn("HOST TC", result.stderr)
+
+    def test_udp_buffer_ceilings_raised_in_namespace_before_shaping(self):
+        # CR-P3-19 (review 2026-11-11 §4.5): the runner must raise the
+        # in-namespace rmem/wmem ceilings BEFORE the first netem qdisc --
+        # ak-net's 8 MiB SO_RCVBUF/SO_SNDBUF ask (enlarge_udp_socket_buffers)
+        # is capped by them -- and must never touch the host sysctl itself
+        # (the host raise is the workflow's step; a CI runner, not this
+        # script's concern). A fresh netns starts from the kernel default
+        # on per-netns-sysctl kernels, so the write has to happen inside
+        # the owned namespace after it is created.
+        result, _, commands = self.run_main()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = commands.splitlines()
+        raise_at = next((i for i, line in enumerate(lines) if line ==
+                         "namespace sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216"), None)
+        shape_at = next((i for i, line in enumerate(lines) if line ==
+                         "namespace tc qdisc add dev lo root netem delay 1ms"), None)
+        self.assertIsNotNone(raise_at, "no in-namespace sysctl raise was issued")
+        self.assertIsNotNone(shape_at, "the shaping write probe never ran")
+        self.assertLess(raise_at, shape_at,
+                        "the CR-P3-19 sysctl raise must precede the first netem qdisc")
+        self.assertNotIn("\nsudo sysctl", "\n" + commands,
+                         "the script must not mutate the host sysctl; that is the workflow's step")
+        self.assertNotIn("HOST SYSCTL", result.stderr)
+        self.assertIn("namespace UDP buffer ceilings raised (CR-P3-19)", result.stdout)
+        self.assertIn("rmem_max=16777216 wmem_max=16777216", result.stdout)
 
     def test_non_linux_is_not_measured_and_does_not_build(self):
         result, summary, commands = self.run_main(MOCK_OS="MINGW64_NT")

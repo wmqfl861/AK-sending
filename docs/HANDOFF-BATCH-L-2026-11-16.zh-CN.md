@@ -187,7 +187,8 @@ bash scripts/cross_nat_test.sh --self-test
 
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
-| main 上批次 K 最终提交的 CI | 执行方在 L0 回填 | 执行方在 L0 回填 |
-| L1 | — | — |
-| L2 | — | — |
-| L3 | — | — |
+| dev 分支批次 K 最终提交的 CI | `9e8c36a` run [43898974384](https://github.com/wmqfl861/AK-sending/actions/runs/43898974384) | 第 1 次运行 aarch64-apple-darwin 因 macOS arm64 托管 runner 容量不足从未开始而被取消；第 2 次只重跑该任务并 success，整体 success。其余 11 项常规任务两次均 success，1 项手动深测 skipped |
+| main 上批次 K 最终提交的 CI | `9e8c36a` run [43902374141](https://github.com/wmqfl861/AK-sending/actions/runs/43902374141) | 第 1 次运行 aarch64-apple-darwin 因 macOS arm64 托管 runner 容量不足被取消（其余 11 项常规任务 success，1 项手动深测 skipped），整体 failure；第 2 次重跑仅 aarch64 任务 success，整体 success。与 dev 分支 run 43898974384 相同的容量问题 |
+| L1 身份守卫与部署回归 | 本地（本提交） | `bash scripts/deploy_linux.sh --self-test` PASS；部署套件 205/205 OK；全量 Python 363/363 OK；`check_repository.py` exit 0；`check_contracts.py` 5/5。无 K24 §5 阻断口径内的新发现问题 |
+| L2 K4/CR-P2-08 ak-engine 拆分 | 本地（本提交） | `lib.rs` 10,082→4,866 行，`#[cfg(test)] mod tests`（5,215 行）移至 `tests.rs`（纯移动，零可见性/API 变更，`use super::*` 不变）；测试数不变（78/0/1 前后一致）；fmt/clippy（ak-engine -D warnings）/rustdoc（-D warnings）通过。admission 岛因耦合密度不满足"纯移动"标准而未选（报告见子代理） |
+| L3 K5/CR-P3-19 UDP 缓冲 | 本地（本提交） | `ak-net/src/lib.rs` `bind_inner` 前插 `enlarge_udp_socket_buffers`（8 MiB 目标，socket2 SockRef，尽力设+读回记录，失败不阻断 bind）；netem 工作流+脚本在整形前升 `rmem_max/wmem_max` 至 16 MiB（namespace 内+主机级）；`ak-net` 49/0 含新单测；netem 脚本+测试 25/25。**netem A/B 对照须 CI 提供**（本机 Windows 无特权 Linux）|

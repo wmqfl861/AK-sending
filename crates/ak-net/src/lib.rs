@@ -422,6 +422,10 @@ impl DirectEndpoint {
         identity: &ak_identity::tls::TlsBundle,
         dual_stack: bool,
     ) -> io::Result<Self> {
+        // CR-P3-19 (review 2026-11-11 §4.5): enlarge the UDP buffers while
+        // the socket is still ours — best-effort by design, never a reason
+        // to fail the bind (see `enlarge_udp_socket_buffers`).
+        Self::enlarge_udp_socket_buffers(&socket);
         socket.set_nonblocking(true)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no async runtime found"))?;
@@ -441,6 +445,61 @@ impl DirectEndpoint {
             dual_stack,
             migration_disabled: tls::MIGRATION_DISABLED,
         })
+    }
+
+    /// Best-effort `SO_RCVBUF`/`SO_SNDBUF` target for the QUIC UDP socket:
+    /// 8 MiB, the top of the 4–8 MiB range CR-P3-19 recommends (review
+    /// 2026-11-11 §4.5), matching the CR-P2-04 8 MiB flow-control windows so
+    /// the kernel buffer can hold a full window of in-flight datagrams.
+    const UDP_SOCKET_BUFFER_TARGET: usize = 8 * 1024 * 1024;
+
+    /// CR-P3-19 (review 2026-11-11 §4.5): best-effort enlarge of the UDP
+    /// socket's receive/send buffers on the socket that is about to carry
+    /// QUIC (single choke point: every constructor funnels through
+    /// [`Self::bind_inner`], including adopted hole-punch sockets).
+    ///
+    /// Evidence: the netem tiers measured host `udp RcvbufErrors` of
+    /// +247/+167/+219 (no shaping / 50 ms / 100 ms), and the 8 MiB-window
+    /// tier at 100 ms lost 2177 packets — 60.6 RTTs against the ~42-RTT
+    /// ramp-inclusive estimate — while the 1.25 MiB-window tier stayed at
+    /// 0 overflow / 0 loss (too little in-flight data to overflow). A
+    /// kernel receive buffer sized for quinn's defaults silently caps a
+    /// large congestion window.
+    ///
+    /// Best-effort by design ("尽力调大"): a refusal never fails the bind —
+    /// Linux caps the request at `net.core.rmem_max`/`wmem_max` (the netem
+    /// workflow raises both to 16 MiB before shaping; production hosts keep
+    /// whatever the administrator set), and sandboxed runtimes may refuse
+    /// outright. The actually-obtained sizes are read back and logged so a
+    /// capped buffer stays visible in diagnostics: Linux doubles the
+    /// requested value and reports the doubled size, Windows grants the
+    /// request as-is — only record, never assert a specific size.
+    ///
+    /// Returns the obtained `(recv, send)` sizes when the OS reports them
+    /// (`None` per side when the read-back is unsupported); for tests and
+    /// diagnostics only — [`Self::bind_inner`] ignores the value.
+    fn enlarge_udp_socket_buffers(socket: &std::net::UdpSocket) -> (Option<usize>, Option<usize>) {
+        let sock = socket2::SockRef::from(socket);
+        if let Err(error) = sock.set_recv_buffer_size(Self::UDP_SOCKET_BUFFER_TARGET) {
+            log::debug!(
+                "UDP SO_RCVBUF -> {} bytes refused ({error}); keeping the OS default",
+                Self::UDP_SOCKET_BUFFER_TARGET
+            );
+        }
+        if let Err(error) = sock.set_send_buffer_size(Self::UDP_SOCKET_BUFFER_TARGET) {
+            log::debug!(
+                "UDP SO_SNDBUF -> {} bytes refused ({error}); keeping the OS default",
+                Self::UDP_SOCKET_BUFFER_TARGET
+            );
+        }
+        let recv = sock.recv_buffer_size().ok();
+        let send = sock.send_buffer_size().ok();
+        log::info!(
+            "QUIC UDP socket buffers (CR-P3-19 best-effort, target {} bytes): \
+             SO_RCVBUF={recv:?} SO_SNDBUF={send:?}",
+            Self::UDP_SOCKET_BUFFER_TARGET
+        );
+        (recv, send)
     }
 
     /// The bound socket address (on a dual-stack endpoint this is
@@ -1894,6 +1953,24 @@ mod tests {
             endpoint.classify_peer(v4m(127, 0, 0, 1)),
             PathKind::LocalDirect
         );
+    }
+
+    /// CR-P3-19 (review 2026-11-11 §4.5): the best-effort buffer enlargement
+    /// must complete on a freshly bound socket without panicking, so a
+    /// sandboxed or capped host can never fail `bind_inner`. Granted sizes
+    /// are platform- and policy-dependent (Linux caps at
+    /// `net.core.rmem_max` and doubles the value; Windows grants the
+    /// request; the read-back itself can be unsupported), so this asserts
+    /// completion and positivity only — never a specific size.
+    #[test]
+    fn udp_socket_buffer_enlargement_is_best_effort() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+            .or_else(|_| std::net::UdpSocket::bind("[::1]:0"))
+            .expect("loopback UDP bind for the buffer test");
+        let (recv, send) = DirectEndpoint::enlarge_udp_socket_buffers(&socket);
+        for size in [recv, send].into_iter().flatten() {
+            assert!(size > 0, "a reported socket buffer size must be positive");
+        }
     }
 
     /// Best-effort connect for the dual-stack tests: some hosts (observed on

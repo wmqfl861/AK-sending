@@ -84,7 +84,9 @@ PREV11_REV = "0b41201"
 PREV12_REV = "943a346"
 PREV13_REV = "f425256"
 PREV14_REV = "0602f92"
-PREV15_REV = "7a93314"  # round-16 tip (K17 findings: extraction-error
+PREV15_REV = "7a93314"
+PREV16_REV = "4db2b4f"  # round-17 tip (K18 findings: byte-evidence
+                         # producer error ignored, equals-form verification bug)  # round-16 tip (K17 findings: extraction-error
                          # passthrough, substring-split id-dir corruption)  # round-15 tip (K16 findings: partial-snapshot
                          # acceptance, extraction-error-as-absent, bracket
                          # db rewrite no-op)  # round-14 tip (K15 findings: environ fail-open
@@ -543,6 +545,31 @@ if [ "${1:-}" = -za ] && [ "${2:-}" = -m1 ] && [ -n "${GREP_EXTRACT_VAR:-}" ] \
     echo "grep stub: forced extraction error for $GREP_EXTRACT_VAR (call $n)" >&2
     exit 2
   fi
+fi
+# K10-N1 (round 19) models for the BYTE-EVIDENCE grep ('-zao -m1 ^VAR=.*'):
+#  - GREP_EVIDENCE_MODE=partial: run the real grep, emit the full match
+#    minus its last two bytes (still ending in one LF), then exit 2 — the
+#    reviewer's exact partial-output-then-error shape whose truncated count
+#    '-1' matched the bash-captured length and passed the old check.
+#  - GREP_EVIDENCE_MODE=complete: emit the FULL real match, then exit 2.
+#  - GREP_EVIDENCE_MODE=none: no output, exit 2.
+if [ "${1:-}" = -zao ] && [ "${2:-}" = -m1 ] && [ -n "${GREP_EVIDENCE_VAR:-}" ] \
+   && [ "$3" = "^${GREP_EVIDENCE_VAR}=.*" ] && [ -n "${GREP_EVIDENCE_MODE:-}" ]; then
+  case "${GREP_EVIDENCE_MODE}" in
+    partial)
+      "@REAL_GREP@" "$@" > "$PROBE_DIR/evidence-record" 2>/dev/null
+      count=$(wc -c < "$PROBE_DIR/evidence-record")
+      head -c "$((count - 2))" "$PROBE_DIR/evidence-record"
+      printf 'REVIEW_BYTE_GREP_PARTIAL_ERROR=2\n' >> "$PROBE_DIR/stubs.log"
+      exit 2 ;;
+    complete)
+      "@REAL_GREP@" "$@" 2>/dev/null
+      printf 'REVIEW_BYTE_GREP_COMPLETE_ERROR=2\n' >> "$PROBE_DIR/stubs.log"
+      exit 2 ;;
+    none)
+      printf 'REVIEW_BYTE_GREP_EMPTY_ERROR=2\n' >> "$PROBE_DIR/stubs.log"
+      exit 2 ;;
+  esac
 fi
 exec "@REAL_GREP@" "$@"
 """
@@ -1299,6 +1326,37 @@ class ProbeHarness(unittest.TestCase):
             if tok.startswith("--db-path="):
                 return tok[len("--db-path="):]
         return ""
+
+    def _make_k19_env_fixture(self):
+        """The reviewer's fixture: USERPROFILE=/home/runtime-real followed by
+        TWO real LF bytes then the NUL terminator; HOME=/home/otheruser.
+        Bash substitution strips NUL + trailing LFs, leaving the prefix; the
+        prefix dir holds prefix-decoy data (the WRONG source — the true
+        runtime dir contains an LF and cannot be this dir)."""
+        self.make_private_discovery_model(
+            main_exec=self.K9_BASE,
+            cmdline_extra="--port 17200",
+            unit_service_lines=["User=otheruser",
+                                "EnvironmentFile=/etc/default/oldregistry"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/runtime-real\x0a\x0a\0"
+                    + b"USER=otheruser\0")
+        envf = self.probe / "etc/default/oldregistry"
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_bytes(b"HOME=/home/otheruser\n"
+                         b"USERPROFILE=\"/home/runtime-real\n\n\"\nUSER=otheruser\n")
+        for d, marker in (("home/runtime-real/.ak-sending", "prefix-decoy"),
+                          ("home/otheruser/.ak-sending", "fallback-decoy")):
+            dd = self.probe / d
+            dd.mkdir(parents=True, exist_ok=True)
+            for name in ("registry.key", "registry.db"):
+                (dd / name).write_text(f"{marker}-{name}", encoding="utf-8")
+
+    def _run_p1_with_evidence_mode(self, mode: str):
+        return self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EVIDENCE_VAR=USERPROFILE GREP_EVIDENCE_MODE=' + mode
+            + ' bash "$PROBE_DIR/p1.sh" '
+            + '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
 
     def _make_k18_db_fixture(self, identity: str, dbpath: str):
         args = "--port 17200 --id-dir " + identity + " --db-path " + dbpath
@@ -3484,6 +3542,171 @@ echo "C4=[$c4]"
         self.assertEqual(self._db_arg_of(exec_line),
                          "/home/runtime-old/state/registry.db")
 
+    # -- K10-N1 (round 19): the byte-evidence PRODUCER's rc is evidence -----
+    def test_k10n1_byte_evidence_partial_output_then_error_refuses(self):
+        # Reviewer fixture: the byte-evidence grep emits the full match
+        # minus its last two bytes (still one LF) and exits 2. wc's count
+        # '-1' matched the truncated bash length, so rounds <= 18 passed the
+        # check and the whole chain copied the prefix decoy. The producer-rc
+        # guard refuses before the count is consumed.
+        self._make_k19_env_fixture()
+        rc, out = self._run_p1_with_evidence_mode("partial")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a byte-evidence grep that errored after partial output "
+                      "must refuse, never pass on the partial count")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("byte-evidence producer for USERPROFILE of", p1_out)
+        self.assertIn("grep rc=2", p1_out)
+        self.assertIn("partial evidence is not evidence", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key").exists())
+        self.assertIn("REVIEW_BYTE_GREP_PARTIAL_ERROR=2", self.stubs_log())
+
+    def test_k10n1_byte_evidence_complete_output_then_error_refuses(self):
+        # rc!=0 with the FULL bytes on stdout must also refuse (a healthy
+        # count is not proof when the producer errored).
+        self._make_k19_env_fixture()
+        rc, out = self._run_p1_with_evidence_mode("complete")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("byte-evidence producer for USERPROFILE of", p1_out)
+        self.assertIn("REVIEW_BYTE_GREP_COMPLETE_ERROR=2", self.stubs_log())
+
+    def test_k10n1_byte_evidence_no_output_error_refuses(self):
+        self._make_k19_env_fixture()
+        rc, out = self._run_p1_with_evidence_mode("none")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("byte-evidence producer for USERPROFILE of", p1_out)
+        self.assertIn("REVIEW_BYTE_GREP_EMPTY_ERROR=2", self.stubs_log())
+
+    def test_k10n1_byte_evidence_healthy_tail_lf_control_refuses(self):
+        # Healthy producer, the same two-LF snapshot: the count mismatch is
+        # detected (the byte count exceeds the truncated bash length) and
+        # phase1 refuses — this input must NEVER succeed.
+        self._make_k19_env_fixture()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a genuinely LF-terminated runtime value must refuse")
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertIn("lost trailing bytes", p1_out)
+        self.assertNotIn("runtime-id-dir:", p1_out)
+
+    def test_k10n1_byte_evidence_healthy_ordinary_control(self):
+        # Ordinary healthy value: the chain succeeds on the true source.
+        self._make_k16_env_fixture(b"/home/runtime-real")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-real/\.ak-sending$")
+
+    # -- K15-N1 (round 19): the equals spelling must complete the chain ------
+    def test_k15n1_relative_equals_db_form_completes_chain(self):
+        # Reviewer fixture: '--db-path=state/registry.db' (equals form).
+        # The round-18 verification accepted only a bare token and falsely
+        # refused the correctly rewritten '--db-path=<abs>' form.
+        identity = "/home/otheruser/.ak-sending"
+        args = "--port 17200 --id-dir " + identity + " --db-path=state/registry.db"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        live = self.probe / identity.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("synthetic-runtime-key", encoding="utf-8")
+        (live / "registry.db").write_text("synthetic-identity-default-db",
+                                         encoding="utf-8")
+        import sqlite3
+        for obj, marker in (("/home/runtime-old/state/registry.db", "runtime-real"),
+                            ("/state/registry.db", "new-cwd-decoy")):
+            path = self.probe / obj.lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.unlink()
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE review_marker(value TEXT)")
+            con.execute("INSERT INTO review_marker VALUES (?)", (marker,))
+            con.commit()
+            con.close()
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k19eq.sh")
+        self.assertEqual(
+            rc, 0,
+            "the rewritten equals form must PASS the option-bound verification "
+            "(round-18 falsely refused it): " + out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        chosen_exec = exec_line[len("CHOSEN_EXEC="):]
+        self.assertEqual(self._db_arg_of(chosen_exec),
+                         "/home/runtime-old/state/registry.db")
+        self.assertIn("--id-dir " + identity, exec_line)
+        # The real generated unit with the CHOSEN values baked.
+        body = (
+            'mkdir -p "$PROBE_DIR/staging"' + chr(10)
+            + 'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'chmod +x "$PROBE_DIR/staging/ak-cli"' + chr(10)
+            + 'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            + 'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            + 'SHORT_SHA=deadbee ' + chr(10)
+            + 'REGISTRY_EXEC="' + chosen_exec + '" ' + chr(10)
+            + 'REG_RW="' + identity + ' /home/runtime-old/state" '
+            + 'LEGACY_UNIT= OLD_REGISTRY_UNIT= '
+            + 'DATA_SOURCE_DIR=' + identity + ' CLOSE_7100=0 REMOTE_DATA_PREOWNED=0 ' + chr(10)
+            + 'write_phase456 "$PROBE_DIR/p456k19eq.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p456k19eq.sh" > "$PROBE_DIR/p456k19eq.out" 2>&1; '
+            + 'echo "INSTALL_RC=$?"' + chr(10)
+        )
+        rc, out = self.generate_and_run_p456(body)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        unit = (self.probe / "etc/systemd/system/ak-registry-server.service") \
+            .read_text(encoding="utf-8")
+        unit_exec = [l for l in unit.splitlines() if l.startswith("ExecStart=")][0]
+        self.assertEqual(self._db_arg_of(unit_exec),
+                         "/home/runtime-old/state/registry.db",
+                         "the unit must carry the resolved absolute db object")
+        self.assertIn("--id-dir " + identity, unit)
+
+    def test_k15n1_absolute_equals_db_control(self):
+        # Absolute equals form: untouched (no relative rewrite involved).
+        identity = "/home/otheruser/.ak-sending"
+        args = ("--port 17200 --id-dir " + identity
+                + " --db-path=/home/runtime-old/state/registry.db")
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1.sh" > "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        p1_out = (self.probe / "p1.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out, "driver-decision-k19abs.sh")
+        self.assertEqual(rc, 0, out)
+        exec_line = [l for l in out.splitlines() if l.startswith("CHOSEN_EXEC=")][0]
+        self.assertEqual(self._db_arg_of(exec_line[len("CHOSEN_EXEC="):]),
+                         "/home/runtime-old/state/registry.db")
+
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
                 mainpid: str = "4242"):
@@ -4520,6 +4743,63 @@ class BaselineContrastTests(ProbeHarness):
                          "the round-16 tip corrupted the id-dir (the defect)")
         self.assertEqual(self._db_arg_of(chosen_exec), "state/registry.db",
                          "the real --db-path argument stayed relative (the defect)")
+
+    def test_k10n1_round17_tip_partial_evidence_error_passes(self):
+        # K18-review contrast: 4db2b4f on the partial-output-then-error
+        # fixture — its 'grep | wc' only surfaces wc's status, so the
+        # truncated count '-1' matched and the whole chain copied the
+        # prefix decoy with the reported dir /home/runtime-real/.ak-sending.
+        self._make_k19_env_fixture()
+        text = self.baseline_text(PREV16_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev16.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'GREP_EVIDENCE_VAR=USERPROFILE GREP_EVIDENCE_MODE=partial '
+            + 'bash "$PROBE_DIR/p1prev16.sh" '
+            + '> "$PROBE_DIR/p1prev16.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV16_REV) + BOX_MODELS,
+                                  body, name="driver-prev16-be.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out,
+                      "the round-17 tip passed on the partial count (the defect)")
+        p1_out = (self.probe / "p1prev16.out").read_text(encoding="utf-8")
+        self.assertRegex(p1_out,
+                         r"(?m)^  runtime-id-dir: /home/runtime-real/\.ak-sending$")
+        self.assertIn("REVIEW_BYTE_GREP_PARTIAL_ERROR=2", self.stubs_log())
+
+    def test_k15n1_round17_tip_falsely_refuses_equals_form(self):
+        # K18-review contrast: 4db2b4f on the relative-equals fixture — its
+        # rewrite produces '--db-path=<abs>' but the verification accepts
+        # only a bare token, so the decision refuses and nothing runs.
+        identity = "/home/otheruser/.ak-sending"
+        args = "--port 17200 --id-dir " + identity + " --db-path=state/registry.db"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "WorkingDirectory=/home/runtime-old"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        text = self.baseline_text(PREV16_REV)
+        body = (
+            'write_phase1 "$PROBE_DIR/p1prev16q.sh" || { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1prev16q.sh" '
+            + '> "$PROBE_DIR/p1prev16q.out" 2>&1; echo "RUN_RC=$?"' + chr(10)
+        )
+        rc, out = self.run_driver(self.phase_defs(text, PREV16_REV) + BOX_MODELS,
+                                  body, name="driver-prev16-q.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev16q.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev16-q-decision.sh", text=text,
+            origin=f"the {PREV16_REV} baseline")
+        self.assertNotEqual(
+            rc, 0,
+            "the round-17 tip falsely refused the rewritten equals form "
+            "(the defect): " + out)
+        self.assertIn("the --db-path rewrite did not take", out)
+        self.assertNotIn("CHOSEN_", out)
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

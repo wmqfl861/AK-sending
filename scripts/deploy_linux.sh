@@ -735,6 +735,14 @@ self_test() {
   # legitimate identity dir containing the token.
   grep -q 'for re_tok in \$REGISTRY_EXEC' "$0" \
     || fail "the db rewrite must walk space-delimited argument tokens (K15-N1)"
+  # K 复核 K10-N1 (round 19): the byte-evidence grep's PRODUCER rc must be
+  # captured (errexit-safe) and any nonzero refuses before the count is
+  # consumed; the db verification accepts BOTH spellings by the
+  # option-bound value.
+  grep -q 'byte-evidence producer' "$WORK/p1.sh" \
+    || fail "a failed byte-evidence producer must refuse, never pass on a partial count (K10-N1)"
+  grep -q 're_parsed=\${re_tok#--db-path=}' "$0" \
+    || fail "the db verification must parse the option-bound value in BOTH spellings (K15-N1)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1384,13 +1392,30 @@ REG_EFF_H
           # exists whose failure could open this check. The variable is
           # KNOWN PRESENT (its record was extracted above), so a missing/
           # empty count is unavailability of evidence: refuse, never skip.
-          re_grep_bytes=\$(grep -zao -m1 "^\${re_var}=.*" "\$reg_env_raw" | wc -c)
+          # K 复核 K10-N1 (round 19): the PRODUCER's rc is evidence too —
+          # under set -eu without pipefail, 'grep | wc' only surfaced wc's
+          # status, so a byte-evidence grep that emitted a PARTIAL match
+          # and THEN errored (rc=2) still produced a count whose '-1'
+          # matched the truncated bash length and the whole chain migrated
+          # the prefix decoy. Capture grep's rc through the pipe
+          # (PIPESTATUS[0]) and refuse on ANY nonzero BEFORE consuming the
+          # count; only a healthy producer's bytes are compared.
+          re_evidence_raw=\$(mktemp /tmp/ak-env-evidence.XXXXXX)
+          re_grep_rc=0
+          grep -zao -m1 "^\${re_var}=.*" "\$reg_env_raw" > "\$re_evidence_raw" 2>/dev/null || re_grep_rc=\$?
+          if [ "\$re_grep_rc" != 0 ]; then
+            rm -f "\$re_evidence_raw" "\$reg_env_raw"
+            echo "ERROR: the byte-evidence producer for \$re_var of \$reg_unit failed (grep rc=\$re_grep_rc) — partial evidence is not evidence; refusing rather than confirm a truncated path (K10-N1)" >&2
+            exit 3
+          fi
+          re_grep_bytes=\$(wc -c < "\$re_evidence_raw")
+          rm -f "\$re_evidence_raw"
           re_bash_bytes=\$(printf '%s' "\$re_val" | wc -c)
           if [ "\$re_grep_bytes" -eq 0 ] \\
              || [ "\$((re_grep_bytes - 1))" != "\$re_bash_bytes" ]; then
-              rm -f "\$reg_env_raw"
-              echo "ERROR: the runtime \$re_var of \$reg_unit lost trailing bytes (newline) or its byte evidence is unavailable; refusing rather than confirm a truncated path (K10-N1)" >&2
-              exit 3
+            rm -f "\$reg_env_raw"
+            echo "ERROR: the runtime \$re_var of \$reg_unit lost trailing bytes (newline) or its byte evidence is unavailable; refusing rather than confirm a truncated path (K10-N1)" >&2
+            exit 3
           fi
         done
         rm -f "\$reg_env_raw"
@@ -2594,21 +2619,31 @@ real_run() {
           esac
         done
         REGISTRY_EXEC="$re_new"
-        # Verify the RESULT, not the statement: the RESOLVED ABSOLUTE db
-        # argument is present as a STANDALONE token AND no equals-form with
-        # the relative value remains (checking a substring we just
-        # concatenated proves nothing — the round-17 check passed on a
-        # corrupted identity dir). A standalone '--db-path' token is the
-        # correct final form when followed by the resolved absolute token
-        # (re_ok above proves that token exists).
-        re_ok=0
-        re_rel_left=0
+        # Verify the RESULT by the OPTION-BOUND VALUE, not the statement or
+        # any substring (the round-17 check passed on a corrupted identity
+        # dir; the round-18 check accepted only a bare token and falsely
+        # refused the legal rewritten equals form). BOTH supported spellings
+        # are accepted: '--db-path <value>' (standalone token followed by
+        # the value) and '--db-path=<value>'. Walk the tokens, parse the
+        # value actually bound to the option, and require it to equal the
+        # resolved absolute path; any option-bound relative value refuses.
+        re_parsed=""
+        re_pending=0
+        re_seen=0
         for re_tok in $REGISTRY_EXEC; do
-          [ "$re_tok" = "$abs_db" ] && re_ok=1
-          [ "$re_tok" = "--db-path=$rel_db" ] && re_rel_left=1
+          if [ "$re_pending" = 1 ]; then
+            re_parsed="$re_tok"
+            re_pending=0
+            re_seen=1
+            continue
+          fi
+          case "$re_tok" in
+            --db-path) re_pending=1 ;;
+            --db-path=*) re_parsed=${re_tok#--db-path=}; re_seen=1 ;;
+          esac
         done
-        if [ "$re_replaced" != 1 ] || [ "$re_ok" != 1 ] || [ "$re_rel_left" = 1 ]; then
-          fail "the --db-path rewrite did not take (the resolved absolute argument is absent or a relative --db-path remains); refusing rather than generate a cwd-dependent unit (K15-N1)"
+        if [ "$re_replaced" != 1 ] || [ "$re_seen" != 1 ] || [ "$re_parsed" != "$abs_db" ]; then
+          fail "the --db-path rewrite did not take (parsed db argument '$re_parsed' != resolved '$abs_db'); refusing rather than generate a cwd-dependent unit (K15-N1)"
         fi
         note "relative --db-path '$rel_db' rewritten to the RUNNING-resolved $abs_db (K15-N1)"
         # ReadWritePaths must cover the RESOLVED db object's directory when

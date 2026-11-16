@@ -1,6 +1,6 @@
 # 交接文档：批次 K（2026-11-14）
 
-> 分支：`dev/batch-k-20261114`（第 24 轮验收通过；合入记录见 K24 §8）。§0–§52 保留历次执行方记录与独立复核证据；§53 为第 24 轮复核方修复与验收证据（本批最终轮）。
+> 分支：`dev/batch-k-20261114`（第 24 轮验收通过，已快进合入 main；合入记录见 K24 §8）。§0–§52 保留历次执行方记录与独立复核证据；§53 为第 24 轮复核方修复与验收证据（本批最终轮）。
 > 每项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。运行编号、计数与结果集中在本文对应轮次证据表；最终结论见 [K24 复核](REVIEW_2026-11-16-batchK24.zh-CN.md)，历史见 [K23](REVIEW_2026-11-16-batchK23.zh-CN.md) 及此前各轮报告。
 
 ## 0. 范围与来源
@@ -1674,12 +1674,13 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | Rust 常规（stable 1.97.0，非仓库钉的 1.99.1） | `cargo fmt --all -- --check`；`cargo clippy --locked --workspace --all-targets -- -D warnings`；`cargo test --locked --workspace --no-fail-fast`；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps` | 均 exit 0。workspace 测试含 doctest：1201 passed / 0 failed / 8 ignored（68 个结果行，单次执行，没有重试）；整个 Rust 门槛脚本耗时 611 s |
 | Rust 特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 均 exit 0。sqlite：52 passed；persistence（含 doctest）：219 passed |
 | `registry-id` 实机行为 | 用真实 debug 构建：先在空目录启动 `registry-server` 读取它打印的 pin，再用 `registry-id` 读同一目录；另对不存在的目录运行一次 | 输出逐字一致（单行 64 hex）；不存在的目录 exit 1 且没有被创建。对应的集成测试 `registry_id_matches_the_served_pin_and_never_creates_an_identity` 通过 |
-| CR-P3-21 压力复测 | 对 `holepunch_probe_early_exit` 三个测试：先顺序跑 200 轮，再 8 路并发跑 200 轮（每轮 `--test-threads=3`） | 运行中；结论在下一次提交写入本表 |
+| CR-P3-21 压力复测 | 对 `holepunch_probe_early_exit` 三个测试：先顺序跑 200 轮，再 8 路并发跑 200 轮（每轮 `--test-threads=3`） | 顺序 200 轮、并发 200 轮，失败轮次均为 0（共 1200 次用例执行），耗时 463 s；在 `b8142cb` 工作树的 ak-net 测试二进制上运行，没有重试 |
 
 | GitHub | 固定对象 | 结果 |
 |---|---|---|
-| 修复提交的 CI | [43890293579](https://github.com/wmqfl861/AK-sending/actions/runs/43890293579)（`b8142cb`） | 运行中；结论在下一次提交写入本表 |
-| NAT 十轮（手动触发，覆盖 `1d995b0` 的探测改动） | [43888103076](https://github.com/wmqfl861/AK-sending/actions/runs/43888103076)（workflow_dispatch，`9ddd9f3`；本轮修复没有改 ak-net） | 运行中；结论在下一次提交写入本表 |
+| 修复提交的 CI | [43890293579](https://github.com/wmqfl861/AK-sending/actions/runs/43890293579)（`b8142cb`） | cancelled：推送 `2dd63e4` 时被 ci.yml 的 `cancel-in-progress` 取消，不计通过也不计失败 |
+| 文档提交的 CI（含 `b8142cb` 全部代码） | [43890872640](https://github.com/wmqfl861/AK-sending/actions/runs/43890872640)（`2dd63e4`） | success：12 项常规任务成功（含 Rust 1.99.1 的 Linux/Windows 任务、Repository checks 362 项 OK 其中 62 项因浅克隆跳过、NAT 矩阵、Android、Flutter）；手动 release 深测按惯例跳过 |
+| NAT 十轮（手动触发，覆盖 `1d995b0` 的探测改动） | [43888103076](https://github.com/wmqfl861/AK-sending/actions/runs/43888103076)（workflow_dispatch，`9ddd9f3`；本轮修复没有改 ak-net） | success：verdict=PASS，completed_rounds=10/10，passed_cases=40/40，exit 0；14:39:54Z 至 15:39:32Z。网络命名空间模拟，不是真机 |
 
 | 未执行 / 证据边界 | 本轮事实 |
 |---|---|

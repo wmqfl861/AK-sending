@@ -752,6 +752,41 @@ fn invite_redeem_once_receives_one_job_then_exits_zero() {
     assert_books_cross_record(&a_dir, &a_fp, &b_dir, &b_fp);
 }
 
+/// `ak-cli registry-id` (the deploy script's identity-continuity check):
+/// across real processes it prints exactly the pin the RUNNING
+/// `registry-server` printed for the same identity directory, as one bare
+/// 64-hex line; for a missing identity it fails and creates nothing.
+#[test]
+fn registry_id_matches_the_served_pin_and_never_creates_an_identity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let absent = tmp.path().join("absent-id-dir");
+    let missing = run_cli(
+        &["--id-dir", &absent.to_string_lossy(), "registry-id"],
+        Duration::from_secs(30),
+    );
+    assert!(
+        !missing.success,
+        "a missing identity must fail: {}",
+        missing.stdout
+    );
+    assert!(missing.stdout.trim().is_empty(), "{}", missing.stdout);
+    assert!(!absent.exists(), "registry-id must not create the id dir");
+
+    let server_dir = tmp.path().join("server");
+    std::fs::create_dir_all(&server_dir).expect("create dir");
+    let registry = RegistryProc::spawn("regid", &server_dir, &tmp.path().join("registry.db"));
+    let read = run_cli(
+        &["registry-id", "--id-dir", &server_dir.to_string_lossy()],
+        Duration::from_secs(30),
+    );
+    assert!(
+        read.success,
+        "registry-id on the served identity: {}",
+        read.stderr
+    );
+    assert_eq!(read.stdout, format!("{}\n", registry.fp_hex));
+}
+
 /// Cross-process state: `--server/--registry-fp` persist the pin once,
 /// later invocations reuse it; `invite list` shows real states and the
 /// masked hint; `invite revoke` flips the state and forgets the local

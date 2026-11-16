@@ -120,6 +120,8 @@ WantedBy=multi-user.target
 
 - **它是什么**：`registry.key`＝注册中心的 Ed25519 设备身份对（`registry-server` 首启自动生成于 `<id-dir>/registry.key`），派生 TLS 自签证书；其公钥 hex 即 **RegistryId＝客户端钉扎值**（`--registry-fp` / 客户端 `registry.pin` / GUI 构建注入 `AK_REGISTRY_ID`，见 [SECURITY](SECURITY.zh-CN.md) 第 4 节）。它**不是** TLS 会话密钥而是长期身份：换文件＝换身份。
 - **在哪**：服务器上实际位置未核实；按默认布局＝运行用户 `$HOME/.ak-sending/registry.key`（同目录 `registry.db`）。
+- **只读查询 pin**（2026-11-16 起）：`ak-cli --id-dir <目录> registry-id` 打印该目录现有 `registry.key` 对应的 RegistryId（一行 64 位小写 hex，与 `registry-server` 启动时打印的值同源同格式）；只读——不创建目录或密钥、不开端口、不碰数据库，密钥缺失或损坏时报错退出。用于部署前后核对“将要服务/正在服务的身份”。
+- **部署脚本的身份连续性守卫**（`scripts/deploy_linux.sh`，K 复核第 24 轮）：默认要求部署后服务的 RegistryId 等于本文 §3 记载的生产 pin；`--expect-pin <hex>` 指定其他期望值，`--new-identity` 表示有意使用全新身份（之后须按下条更新全部客户端钉扎）。脚本在**停任何服务之前**用新二进制的 `registry-id` 推导将被服务的身份，不一致或会新建身份即拒绝（零停机）；最终迁移后在受保护切换窗口内复核，不一致走统一恢复；第 7 阶段再核对运行中服务实际打印的 pin。§3 记载的 pin 尚未在服务器上核实：若与现网不符，脚本会在停服前拒绝并给出它将服务的 pin，由所有者确认后用 `--expect-pin` 重跑。
 - **备份**：与 `registry.db` 一起离线备份（加密介质/密码管理器附件，chmod 600），每轮部署（§3 步骤 1）与每次轮换前各一份。**私钥内容绝不进文档、工单、git**；RegistryId（公钥 hex）可公开。
 - **丢失后果**：无法重建身份，只能生成新 key＝全体已钉扎客户端失联重配（等同轮换）。
 - **泄露后果与处置**：攻击者可冒充注册中心接管配对协调面（数据面仍有端到端设备指纹校验兜底，但协调面信任被接管）——立即轮换（下条）并公告。
@@ -153,6 +155,7 @@ WantedBy=multi-user.target
 ### 启动与端口
 
 - `ak-cli signal-server [--tcp-port 7100] [--stun-port 7101]`（遗留）：单进程、双套接字——TCP 信令与 UDP STUN 响应器；Ctrl-C 优雅关停。E1/E6 的退役对象：独立 STUN 部署验证（§0 步骤 3）后可停。
+- `ak-cli [--id-dir <目录>] registry-id`（2026-11-16）：只读打印现有 `registry.key` 的 RegistryId（见 §5），供部署脚本身份连续性守卫与人工核对使用；不监听、不创建任何文件。
 - `ak-cli stun-server [--port 7101] [--bind 0.0.0.0]`（CR-P2-13）：独立 UDP STUN 响应器，与 signal-server 内置的同一份实现（`ak_signal::stun::serve_stun`）；单套接字、无密钥无数据库；启动日志带版本行（§1 同款），Ctrl-C 优雅关停。
 - 防火墙需放行 TCP 信令端口与 UDP STUN 端口各一个。`probe --server IP:7100` 隐含向 server 端口 +1 发 STUN 查询，规划端口时保持 TCP N / UDP N+1 的相邻约定即可。
 

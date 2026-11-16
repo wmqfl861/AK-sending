@@ -165,6 +165,12 @@ enum Command {
         #[arg(long)]
         db_path: Option<PathBuf>,
     },
+    /// Print the registry id (the 64-hex pin clients set with
+    /// --registry-fp) of an EXISTING `<id-dir>/registry.key` — exactly the
+    /// id `registry-server` serves for that directory. Read-only: never
+    /// creates the directory or a key, opens no socket and no database;
+    /// a missing or invalid key is an error.
+    RegistryId,
     /// Receive transfers into a directory. By default keeps serving one job
     /// after another until Ctrl-C; --once handles exactly one job.
     Receive {
@@ -707,15 +713,21 @@ fn completions_command(shell: ShellKind) -> Result<()> {
 }
 
 fn id_dir(cli: &Cli) -> PathBuf {
-    let base = cli.id_dir.clone().unwrap_or_else(|| {
+    let base = id_dir_path(cli);
+    std::fs::create_dir_all(&base).ok();
+    base
+}
+
+/// The identity directory `id_dir` resolves to, WITHOUT creating it (the
+/// read-only `registry-id` must not leave a directory behind).
+fn id_dir_path(cli: &Cli) -> PathBuf {
+    cli.id_dir.clone().unwrap_or_else(|| {
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         home.join(".ak-sending")
-    });
-    std::fs::create_dir_all(&base).ok();
-    base
+    })
 }
 
 fn parse_fingerprint(text: &str) -> Result<Fingerprint> {
@@ -3800,6 +3812,32 @@ fn registry_server_config(
     (config, note)
 }
 
+/// The registry id clients pin with `--registry-fp`: the lowercase hex of
+/// the registry identity's Ed25519 public key. ONE formatter for both
+/// `registry-server` (what is served) and `registry-id` (what would be
+/// served), so the two can never drift apart.
+fn registry_pin(registry: &DeviceKeyPair) -> String {
+    hex_of(&registry.public_key())
+}
+
+/// The pin of an EXISTING `<id-dir>/registry.key`, never creating one (see
+/// [`DeviceKeyPair::load_existing`]).
+fn registry_id_of(id: &Path) -> Result<String> {
+    let key_path = id.join("registry.key");
+    let registry = DeviceKeyPair::load_existing(&key_path)
+        .with_context(|| format!("no usable registry identity at {}", key_path.display()))?;
+    Ok(registry_pin(&registry))
+}
+
+/// `ak-cli registry-id`: print the pin of the existing registry identity as
+/// ONE line holding exactly 64 lowercase hex characters (machine-readable:
+/// the deploy script compares it before switching services over).
+fn registry_id_command(id: &Path) -> Result<()> {
+    let pin = registry_id_of(id)?;
+    println!("{pin}");
+    Ok(())
+}
+
 /// `ak-cli registry-server`: load/create `<id-dir>/registry.key`, print
 /// the registry pin, serve until Ctrl-C. TLS-only: no plaintext invite
 /// service exists to fall back to.
@@ -3829,11 +3867,7 @@ async fn registry_server_command(
     if let Some(note) = note {
         println!("{note}");
     }
-    let registry_id: String = registry
-        .public_key()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let registry_id = registry_pin(&registry);
     println!(
         "v2 pairing registry on tls {} (db {}); no file routes exist",
         config.listen,
@@ -3891,7 +3925,13 @@ async fn stun_server_command(port: Option<u16>, bind: Option<BindArg>) -> Result
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let id = id_dir(&cli);
+    // `registry-id` is read-only by contract: it resolves the identity
+    // directory WITHOUT the create_dir_all every other command performs.
+    let id = if matches!(cli.command, Command::RegistryId) {
+        id_dir_path(&cli)
+    } else {
+        id_dir(&cli)
+    };
     match cli.command {
         Command::Keygen => {
             let (key, _) = load_identity(&id)?;
@@ -3911,6 +3951,7 @@ async fn main() -> Result<()> {
             bind,
             db_path,
         } => registry_server_command(&id, port, bind, db_path).await,
+        Command::RegistryId => registry_id_command(&id),
         Command::Receive {
             out,
             port,
@@ -4616,6 +4657,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// `registry-id` (deploy identity-continuity check): parses with the
+    /// global --id-dir in either position, reports exactly the pin
+    /// `registry-server` serves for the same identity (one formatter), and
+    /// never creates the directory or a key.
+    #[test]
+    fn registry_id_reads_the_served_pin_and_never_creates() {
+        for argv in [
+            ["ak-cli", "--id-dir", "/x", "registry-id"],
+            ["ak-cli", "registry-id", "--id-dir", "/x"],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("argv must parse");
+            assert!(matches!(cli.command, Command::RegistryId));
+            assert_eq!(id_dir_path(&cli), PathBuf::from("/x"));
+        }
+        let tmp = TempDir::new("registry-id");
+        let absent = tmp.path().join("absent");
+        let err = registry_id_of(&absent).expect_err("a missing identity is an error");
+        assert!(
+            format!("{err:#}").contains("no usable registry identity"),
+            "{err:#}"
+        );
+        assert!(!absent.exists(), "registry-id must not create the id dir");
+
+        let (served, created) =
+            DeviceKeyPair::load_or_create(&tmp.path().join("registry.key")).expect("create");
+        assert!(created);
+        let pin = registry_id_of(tmp.path()).expect("existing identity");
+        assert_eq!(pin, registry_pin(&served));
+        assert_eq!(pin.len(), 64);
+        assert!(pin.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("registry.key")]);
+
+        std::fs::write(tmp.path().join("registry.key"), b"short").expect("write");
+        assert!(
+            registry_id_of(tmp.path()).is_err(),
+            "an invalid seed is an error"
+        );
     }
 
     fn random_fp() -> Fingerprint {

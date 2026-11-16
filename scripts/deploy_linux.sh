@@ -30,6 +30,7 @@
 #     [--ssh-port 22] [--ssh-pass <password> | --ssh-key <keyfile>] \
 #     [--commit HEAD] [--binary <prebuilt-linux-ak-cli>] \
 #     [--registry-port 7200] [--stun-port 7101] \
+#     [--expect-pin <64-hex> | --new-identity] \
 #     [--keep-legacy-signal] [--close-7100] [--keep-build-dir]
 #
 # Options:
@@ -47,6 +48,21 @@
 #                         instead of building on the server
 #   --registry-port <n>   registry TLS port (default 7200, frozen v2 port)
 #   --stun-port <n>       standalone STUN UDP port (default 7101)
+#   --expect-pin <hex>    the registry id (64 hex, public) the deployed
+#                         registry MUST serve; default: the documented
+#                         production pin (DOCUMENTED_PIN below). IDENTITY
+#                         CONTINUITY GUARD (K 复核 K23 convergence): the
+#                         identity the new unit will load is derived with the
+#                         staged binary's read-only 'ak-cli registry-id'
+#                         BEFORE any service is stopped (mismatch / missing
+#                         identity refuses with zero downtime), re-checked
+#                         after the final migration inside the protected
+#                         switchover (mismatch -> unified recovery), and the
+#                         RUNNING registry's served id is checked in phase 7
+#   --new-identity        deliberate FRESH identity: no existing registry.key
+#                         may be served; the registry creates a new one at
+#                         first start (every pinned client must then be
+#                         re-pinned, OPERATIONS §5). Excludes --expect-pin
 #   --keep-legacy-signal do NOT stop a legacy signal-server that currently
 #                         owns UDP <stun-port>; the deploy will abort on the
 #                         port conflict instead (§0: two processes cannot
@@ -78,7 +94,12 @@
 #   4. install: backup ak-cli + registry.key + registry.db to
 #      /opt/ak-sending/backup-<ts>/, install binary to /opt/ak-sending/ak-cli,
 #      system user `akreg`, data dir /opt/ak-sending/data (existing identity
-#      and database are preserved, never deleted)
+#      and database are preserved, never deleted). IDENTITY CONTINUITY
+#      (K 复核 K23 convergence guard): BEFORE any service is stopped, the
+#      staged binary's read-only `ak-cli registry-id` derives the registry
+#      id the new unit will serve; it must equal --expect-pin (default: the
+#      documented production pin) or, with --new-identity, no existing key
+#      may be served — anything else refuses with zero downtime
 #   5. systemd: ak-registry-server.service + ak-stun-server.service
 #      (templates from docs/OPERATIONS.zh-CN.md §0/§3); a legacy
 #      signal-server holding UDP <stun-port> is stopped+disabled with a
@@ -87,7 +108,9 @@
 #      protected unit: before anything is stopped the previous binary, unit
 #      files and each unit's enabled/active state are saved, and ANY failure
 #      restores the runnable old configuration and REPORTS the recovery
-#      outcome (K 复核 K2-N1; stop failures are never swallowed, K 复核 K2-R2)
+#      outcome (K 复核 K2-N1; stop failures are never swallowed, K 复核 K2-R2).
+#      Inside that window the registry id is re-derived from the FINAL
+#      migrated key file; a mismatch enters the same recovery (K23 guard)
 #   6. firewall: ufw allow <registry-port>/tcp + <stun-port>/udp when ufw is
 #      active; otherwise prints the cloud security-group checklist
 #   7. verify: units active, journal version lines, listening sockets,
@@ -95,7 +118,9 @@
 #      MainPID resolved, its actual executable read via /proc/<PID>/exe
 #      (sudo readlink) and compared to the deployed binary — ExecStart is
 #      only configuration and is checked separately (K 复核 K-R2/K2-R2);
-#      registry id exported to /opt/ak-sending/registry-id
+#      the RUNNING registry's served id must equal the expectation (exit 6
+#      otherwise, nothing exported); registry id exported to
+#      /opt/ak-sending/registry-id
 #
 # Exit code 0 = success (or self-test PASS).
 
@@ -118,13 +143,17 @@ CLOSE_7100=0
 KEEP_BUILD_DIR=0
 CHECK_ONLY=0
 SELF_TEST=0
+EXPECT_PIN=""
+NEW_IDENTITY=0
 
 REMOTE_BASE=/opt/ak-sending            # binary + data + backups live here
 REMOTE_DATA="$REMOTE_BASE/data"        # --id-dir: registry.key + registry.db
 REMOTE_BIN="$REMOTE_BASE/ak-cli"
 SERVICE_USER=akreg
 # Registry pin recorded in the repo for the production box (docs §3; public
-# hex, not a secret). Used only to REPORT whether a migrated identity matches.
+# hex, not a secret). The DEFAULT identity-continuity expectation (see
+# --expect-pin / --new-identity): a deploy whose served identity would differ
+# refuses before any service is stopped.
 DOCUMENTED_PIN=8f012017f57cfef1a3e74e90fa1e13a5f6ffbed3a9ddeecb98f819e002f94f36
 
 usage() { sed -n '/^# Usage:/,/^#   -h | --help /p' "$0"; }
@@ -148,6 +177,9 @@ while [ $# -gt 0 ]; do
                  REGISTRY_PORT=$2; shift 2 ;;
     --stun-port) [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
                  STUN_PORT=$2; shift 2 ;;
+    --expect-pin) [ $# -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }
+                 EXPECT_PIN=$2; shift 2 ;;
+    --new-identity) NEW_IDENTITY=1; shift ;;
     --keep-legacy-signal) KEEP_LEGACY_SIGNAL=1; shift ;;
     --close-7100) CLOSE_7100=1; shift ;;
     --keep-build-dir)     KEEP_BUILD_DIR=1; shift ;;
@@ -167,6 +199,22 @@ num_in_range() { # value name lo hi
 num_in_range "$SSH_PORT"       --ssh-port       1 65535
 num_in_range "$REGISTRY_PORT"  --registry-port  1 65535
 num_in_range "$STUN_PORT"      --stun-port      1 65535
+# Identity-continuity expectation (K 复核 K23 convergence guard): exactly one
+# of an expected pin (default: the documented production pin) or a
+# deliberate fresh identity. A pin is 64 hex characters (case-insensitive on
+# input, compared lowercase — 'ak-cli registry-id' prints lowercase).
+if [ -n "$EXPECT_PIN" ] && [ "$NEW_IDENTITY" -eq 1 ]; then
+  echo "--expect-pin and --new-identity are mutually exclusive" >&2; exit 2
+fi
+if [ -n "$EXPECT_PIN" ]; then
+  EXPECT_PIN=$(printf '%s' "$EXPECT_PIN" | tr 'A-F' 'a-f')
+  case "$EXPECT_PIN" in
+    *[!0-9a-f]*) echo "--expect-pin must be 64 hex characters" >&2; exit 2 ;;
+  esac
+  [ "${#EXPECT_PIN}" -eq 64 ] || { echo "--expect-pin must be 64 hex characters" >&2; exit 2; }
+elif [ "$NEW_IDENTITY" -eq 0 ]; then
+  EXPECT_PIN=$DOCUMENTED_PIN
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -614,7 +662,13 @@ self_test() {
   [ "$sub" -eq 2 ] || fail "missing required options should exit 2, got $sub"
   sub=0; bash "$0" --help >/dev/null 2>&1 || sub=$?
   [ "$sub" -eq 0 ] || fail "--help should exit 0, got $sub"
-  echo "[self-test]   4 validation sub-cases behaved"
+  # K 复核 K23 convergence guard: the identity expectation is validated up
+  # front (64 hex; --expect-pin and --new-identity are exclusive).
+  sub=0; bash "$0" --self-test --expect-pin abc >/dev/null 2>&1 || sub=$?
+  [ "$sub" -eq 2 ] || fail "a malformed --expect-pin should exit 2, got $sub"
+  sub=0; bash "$0" --self-test --new-identity --expect-pin "$DOCUMENTED_PIN" >/dev/null 2>&1 || sub=$?
+  [ "$sub" -eq 2 ] || fail "--expect-pin with --new-identity should exit 2, got $sub"
+  echo "[self-test]   6 validation sub-cases behaved"
 
   echo "[self-test] s2/8 unit templates"
   local reg_unit stun_unit
@@ -868,10 +922,19 @@ self_test() {
   # K 复核 K21-N2/K22-N2 (rounds 22/23): /home candidates iterate WHOLE
   # NUL-delimited records (find -print0), never words or LF-split lines; a
   # name the line-based report cannot carry refuses as ONE candidate.
-  grep -q 'while IFS= read -r -d .. home_dir' "$WORK/p1.sh" \
+  grep -q 'while IFS= read -r -d .. home_rec' "$WORK/p1.sh" \
     || fail "home enumeration must iterate NUL-delimited records (K22-N2)"
-  grep -q 'find /home -mindepth 1 -maxdepth 1 -print0' "$WORK/p1.sh" \
-    || fail "the enumeration producer must be find -print0 (K22-N2)"
+  grep -q 'find -H /home -mindepth 1 -maxdepth 1 -print0' "$WORK/p1.sh" \
+    || fail "the enumeration producer must be find -H -print0 (K22-N2/K23-N2)"
+  # K 复核 K23-N1/N2 (round 24): the consumer follows the producer's REAL
+  # full-path record protocol (strip '/home/' once, refuse other shapes) and
+  # a /home that is not a directory refuses before the producer runs.
+  grep -q 'home_dir=\${home_rec#"/home/"}' "$WORK/p1.sh" \
+    || fail "the consumer must strip the producer's '/home/' start-point prefix exactly once (K23-N1)"
+  grep -q 'the producer protocol is' "$WORK/p1.sh" \
+    || fail "a record outside the '/home/<name>' protocol must refuse (K23-N1)"
+  grep -q 'sudo -n test -d /home' "$WORK/p1.sh" \
+    || fail "a /home that is not a directory must refuse before enumeration (K23-N2)"
   grep -q 'cannot carry faithfully' "$WORK/p1.sh" \
     || fail "an LF-carrying home name must refuse as one whole candidate (K22-N2)"
   # K 复核 K22-N1 (round 23): option PRESENCE is token-form — a VALUE merely
@@ -884,8 +947,38 @@ self_test() {
   # K 复核 K22-N3 (round 23): 'absent' requires the tool's exact quoted-path
   # ENOENT diagnostic for the EXACT probed path; anything else is
   # undeterminable.
+  # K 复核 K23 convergence guard: identity continuity is checked with the
+  # staged binary's read-only 'registry-id' BEFORE any stop (exit 5),
+  # re-checked on the final file inside do_switchover (return 1 into the
+  # recovery), and phase 7 refuses a served id that differs.
+  grep -q 'registry-id 2>/dev/null) || return 2' "$WORK/p456.sh" \
+    || fail "the identity pin must come from the staged binary's read-only registry-id (K23 guard)"
+  grep -q 'continuity verified before any stop' "$WORK/p456.sh" \
+    || fail "identity continuity must be verified before any service is stopped (K23 guard)"
+  grep -q "not the expected registry id \$IDENTITY_EXPECT; recovering" "$WORK/p456.sh" \
+    || fail "a post-migration identity mismatch must return into the unified recovery (K23 guard)"
+  grep -q 'the RUNNING registry serves' "$WORK/p7.sh" \
+    || fail "phase 7 must refuse a served registry id that differs from the expectation (K23 guard)"
   grep -q "ls: cannot access '" "$WORK/p1.sh" \
     || fail "the ENOENT classification must anchor to the exact quoted-path diagnostic (K22-N3)"
+  # K 复核 K23-N3 (round 24): that diagnostic is compared LITERALLY — no
+  # case pattern may carry the probed path (bracket/star bytes are glob
+  # syntax there).
+  grep -q 'if \[ "\$pe_out" = "\$pe_enoent" \]' "$WORK/p1.sh" \
+    || fail "the ENOENT diagnostic must be compared as a literal string (K23-N3)"
+  if grep -q "cannot access '\"\\\$1\"'" "$WORK/p1.sh"; then
+    fail "the probed path must never sit unquoted inside a case pattern (K23-N3)"
+  fi
+  # K 复核 K23-N4 (round 24): the listen surface (--port/--bind) is
+  # compared by token-bound values with the CLI grammar gate — never a
+  # greedy substring sed.
+  grep -q 'bound_listen_arg "\$1" --port' "$WORK/p1.sh" \
+    || fail "the --port comparison must be token-bound (K23-N4)"
+  grep -q 'bound_listen_arg "\$1" --bind' "$WORK/p1.sh" \
+    || fail "the --bind comparison must be token-bound (K23-N4)"
+  if grep -q "sed -n 's/.\*--port\[= \]" "$WORK/p1.sh"; then
+    fail "the greedy --port substring extraction must be gone (K23-N4)"
+  fi
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1170,7 +1263,7 @@ sudo -n test -x $REMOTE_BIN 2>/dev/null && echo "existing-version: \$($REMOTE_BI
 # diagnostic means absent — permission/I-O and every other diagnostic are
 # UNDETERMINABLE (the caller refuses the preflight).
 priv_exists() {
-  local pe_out pe_rc
+  local pe_out pe_rc pe_enoent
   pe_rc=0
   pe_out=\$(sudo -n env LC_ALL=C ls -d "\$1" 2>&1) || pe_rc=\$?
   if [ "\$pe_rc" = 0 ]; then echo yes; return 0; fi
@@ -1182,11 +1275,17 @@ priv_exists() {
   # into 'absent' (the candidate was dropped and another source migrated).
   # ANY other shape — a path portion that differs, an escaped/quoting-
   # mangled name, or a different errno text — is UNDETERMINABLE and the
-  # caller refuses. The probed path is matched LITERALLY (no globbing).
-  case "\$pe_out" in
-    "ls: cannot access '"\$1"': No such file or directory") echo no; return 0 ;;
-    *) printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2; return 2 ;;
-  esac
+  # caller refuses.
+  # K 复核 K23-N3 (round 24): the comparison is a LITERAL string equality
+  # ('[ = ]' never pattern-matches). The round-23 case pattern left the
+  # probed path UNQUOTED between two quoted segments, so bracket/star bytes
+  # of a legal name acted as glob syntax: the real same-path ENOENT of
+  # '/home/spare[1]/.ak-sending' did not match (a new false refusal) and a
+  # DIFFERENT path's ENOENT could match a starred request.
+  pe_enoent="ls: cannot access '\$1': No such file or directory"
+  if [ "\$pe_out" = "\$pe_enoent" ]; then echo no; return 0; fi
+  printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2
+  return 2
 }
 # find_unit_file <unit.service>: echo the first existing unit-file path across
 # the standard systemd directories. rc 0 = found (path on stdout), rc 1 =
@@ -1376,6 +1475,60 @@ id_binding_invalid() {
   obi_bad="\$idbi_bad"
   [ -n "\$idbi_bad" ]
 }
+# bound_listen_arg <line> <option>: the value BOUND to a registry LISTEN
+# option (--port / --bind) by the SAME full-token rules as bound_db_arg and
+# bound_id_dir (K 复核 K23-N4, round 24): the equals form takes the token's
+# OWN suffix, the space form takes exactly the NEXT token, and an option-
+# shaped component INSIDE another value never re-parses as an option. The
+# old greedy 'sed s/.*--port[= ]…/' bound the token AFTER a legal path
+# component ending in the literal '--port' ('--id-dir /home/u/--port
+# --db-path …' read '--db-path' as the port on BOTH sides) and so masked a
+# REAL listen difference. Noglob walk (K20-N1). Sets bl_val (empty = the
+# option is absent) and bl_bad (non-empty = an option SHAPE the real CLI
+# rejects at startup: a dangling option, an option-shaped space-form value,
+# an explicit empty equals value, or duplicate bindings — clap reports "a
+# value is required for '--port <PORT>' but none was supplied" / "cannot be
+# used multiple times"). Always returns 0; callers invoke it DIRECTLY (never
+# in a subshell) so both globals reach them.
+bound_listen_arg() {
+  local bl_tok bl_pending bl_count bl_line bl_opt
+  bl_opt=\$2
+  bl_val=""
+  bl_bad=""
+  bl_pending=0
+  bl_count=0
+  set -f
+  bl_line=\$1
+  for bl_tok in \$bl_line; do
+    if [ "\$bl_pending" = 1 ]; then
+      bl_pending=0
+      case "\$bl_tok" in
+        --*) bl_bad="an option-shaped space-form \$bl_opt value ('\$bl_tok'; the CLI reports the missing-value error)" ;;
+        *) bl_val=\$bl_tok ;;
+      esac
+      continue
+    fi
+    case "\$bl_tok" in
+      "\$bl_opt")
+        bl_pending=1
+        bl_count=\$((bl_count + 1)) ;;
+      "\$bl_opt=")
+        bl_count=\$((bl_count + 1))
+        bl_bad="an explicit EMPTY \$bl_opt value (the CLI rejects it)" ;;
+      "\$bl_opt="*)
+        bl_count=\$((bl_count + 1))
+        bl_val=\${bl_tok#"\$bl_opt="} ;;
+    esac
+  done
+  set +f
+  if [ "\$bl_pending" = 1 ]; then
+    bl_bad="a dangling '\$bl_opt' option without a value (the CLI rejects it)"
+  fi
+  if [ "\$bl_count" -gt 1 ]; then
+    bl_bad="duplicate bindings: the line carries \$bl_count '\$bl_opt' bindings and the CLI rejects duplicates (\"cannot be used multiple times\")"
+  fi
+  return 0
+}
 # reg_args_agree <exec-line> <cmdline-line>: 0 when the EFFECTIVE values of
 # the configured ExecStart and the running cmdline AGREE (defaults derived;
 # see the rc contract inside). The compared surface is 'ak-cli
@@ -1411,7 +1564,7 @@ reg_args_agree() {
   # rc 0 = agree; rc 1 = materially differ; rc 2 = an effective value's
   # actual source cannot be established (one side relies on an
   # environment-dependent default the other side does not share).
-  local a_id b_id a_db b_db a_port b_port a_bind b_bind
+  local a_id b_id a_db b_db a_port b_port a_bind b_bind a_bad b_bad
   # K 复核 K21-N1 (round 22): token-bound identity extraction — the greedy
   # sed bound '--port' as the id value when a legal path ENDED in the literal
   # '--id-dir'; both sides misparsed identically and the comparison passed.
@@ -1435,13 +1588,28 @@ reg_args_agree() {
     fi
     return 1
   fi
-  a_port=\$(printf '%s\\n' "\$1" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
-  b_port=\$(printf '%s\\n' "\$2" | sed -n 's/.*--port[= ]\\([^ ]*\\).*/\\1/p')
+  # K 复核 K23-N4 (round 24): the LISTEN surface is compared by the SAME
+  # token-bound values (bound_listen_arg) with the CLI grammar gate; equal
+  # raw (port, bind) pairs give the same listen address because the CLI
+  # derives it deterministically from exactly these two values (a full
+  # ip:port --bind wins over --port), so string equality after the
+  # documented defaults never hides a difference — at worst an equivalent
+  # spelling ('07200') refuses conservatively.
+  bound_listen_arg "\$1" --port; a_port=\$bl_val; a_bad=\$bl_bad
+  bound_listen_arg "\$2" --port; b_port=\$bl_val; b_bad=\$bl_bad
+  if [ -n "\$a_bad" ] || [ -n "\$b_bad" ]; then
+    obi_bad=\${a_bad:-\$b_bad}
+    return 3
+  fi
   if [ -z "\$a_port" ]; then a_port=7200; fi
   if [ -z "\$b_port" ]; then b_port=7200; fi
   if [ "\$a_port" != "\$b_port" ]; then return 1; fi
-  a_bind=\$(printf '%s\\n' "\$1" | sed -n 's/.*--bind[= ]\\([^ ]*\\).*/\\1/p')
-  b_bind=\$(printf '%s\\n' "\$2" | sed -n 's/.*--bind[= ]\\([^ ]*\\).*/\\1/p')
+  bound_listen_arg "\$1" --bind; a_bind=\$bl_val; a_bad=\$bl_bad
+  bound_listen_arg "\$2" --bind; b_bind=\$bl_val; b_bad=\$bl_bad
+  if [ -n "\$a_bad" ] || [ -n "\$b_bad" ]; then
+    obi_bad=\${a_bad:-\$b_bad}
+    return 3
+  fi
   if [ -z "\$a_bind" ]; then a_bind=0.0.0.0; fi
   if [ -z "\$b_bind" ]; then b_bind=0.0.0.0; fi
   if [ "\$a_bind" != "\$b_bind" ]; then return 1; fi
@@ -1993,8 +2161,26 @@ sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 # consumes exactly those records. A name whose bytes cannot ride the
 # line-based report below is SEEN as one candidate and REFUSED here,
 # never silently dropped. The producer's own failure still refuses phase1.
+# K 复核 K23-N1 (round 24): the RECORD PROTOCOL is frozen as the REAL tool
+# emits it — GNU find prints every entry as the start point plus '/<name>'
+# ('/home/otheruser'), never a bare name. Round 23 re-prefixed that full
+# path ('/home//home/otheruser/.ak-sending' was probed): ordinary sources
+# vanished and a nested '/home/home/otheruser' decoy was migrated. The
+# consumer below strips EXACTLY the '/home/' start-point prefix once and
+# refuses any record of another shape.
+# K 复核 K23-N2 (round 24): '-H' follows a symlinked START POINT, exactly as
+# the pre-round-23 'ls -1 /home' listed a directory link's target (GNU
+# find's default -P lists ZERO records for a directory symlink start and
+# still exits 0, so an accessible legacy source read as an empty host).
+# Entries INSIDE /home are not followed (-H only applies to the command
+# line). '-H' on a DANGLING link also exits 0 with no records, so a /home
+# that is not (or does not resolve to) a directory refuses up front.
+if ! sudo -n test -d /home 2>/dev/null; then
+  echo "ERROR: /home is not a directory (or is a dangling symlink); cannot enumerate home candidates; refusing before any switchover (K23-N2)" >&2
+  exit 3
+fi
 home_nul=\$(mktemp /tmp/ak-home-nul.XXXXXX)
-if ! sudo -n find /home -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "\$home_nul"; then
+if ! sudo -n find -H /home -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "\$home_nul"; then
   rm -f "\$home_nul"
   echo "ERROR: cannot enumerate /home (sudo -n find failed); refusing before any switchover (K2-R3/K22-N2)" >&2
   exit 3
@@ -2031,16 +2217,40 @@ registry_data_probe /root/.ak-sending
 # cannot carry faithfully — is refused HERE, as one whole candidate,
 # instead of being split or silently dropped.
 cr_lf=\$'\\n\\r'
-while IFS= read -r -d '' home_dir || [ -n "\$home_dir" ]; do
-  [ -n "\$home_dir" ] || continue
+# K 复核 K23-N1 (round 24): TWO passes — every producer record is validated
+# (shape + carriable bytes) BEFORE any candidate is probed or reported, so a
+# refusal never follows a partial candidate report and the outcome does not
+# depend on the producer's (filesystem) order.
+home_names=()
+while IFS= read -r -d '' home_rec || [ -n "\$home_rec" ]; do
+  [ -n "\$home_rec" ] || continue
+  # K 复核 K23-N1: full-path records — strip the start-point prefix ONCE
+  # (a quoted, literal pattern) and refuse anything that is not exactly one
+  # direct child of /home.
+  case "\$home_rec" in
+    /home/?*) home_dir=\${home_rec#"/home/"} ;;
+    *)
+      rm -f "\$home_nul"
+      echo "ERROR: unexpected /home enumeration record '\$home_rec' (the producer protocol is '/home/<name>'); refusing before any switchover (K23-N1)" >&2
+      exit 3 ;;
+  esac
+  case "\$home_dir" in
+    */*)
+      rm -f "\$home_nul"
+      echo "ERROR: the /home enumeration record '\$home_rec' is not a direct child of /home; refusing before any switchover (K23-N1)" >&2
+      exit 3 ;;
+  esac
   if [[ "\$home_dir" == *[\$cr_lf]* ]]; then
     rm -f "\$home_nul"
     echo "ERROR: the /home candidate '\$home_dir' contains a byte (newline/carriage return) this deploy's line-based report cannot carry faithfully; refusing before any switchover (K22-N2)" >&2
     exit 3
   fi
-  registry_data_probe "/home/\$home_dir/.ak-sending"
+  home_names+=("\$home_dir")
 done < "\$home_nul"
 rm -f "\$home_nul"
+for home_dir in \${home_names[@]+"\${home_names[@]}"}; do
+  registry_data_probe "/home/\$home_dir/.ak-sending"
+done
 # K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
 # prove NOW — before anything is stopped — that the install path is usable
 # through exactly that path (read-only mounts or restricted sudoers must
@@ -2111,6 +2321,9 @@ PREBUILT_MODE=${PREBUILT_MODE:-0}
 REMOTE_DATA_PREOWNED=${REMOTE_DATA_PREOWNED:-0}
 STAGING_DIR=${STAGING_DIR:-}
 STAGED_BIN=${STAGED_BIN:-}
+IDENTITY_EXPECT=${IDENTITY_EXPECT:-}
+IDENTITY_NEW=${IDENTITY_NEW:-0}
+IDENTITY_DIR=${IDENTITY_DIR:-}
 SRC_BIN=\$BUILD_DIR/target/release/ak-cli
 [ "\$PREBUILT_MODE" = 1 ] && SRC_BIN=${STAGED_BIN:-}
 [ -n "\$SRC_BIN" ] && [ -x "\$SRC_BIN" ] || { echo "ERROR: source binary not found/executable at \${SRC_BIN:-<unset>}" >&2; exit 5; }
@@ -2184,6 +2397,77 @@ done
 # copy/cmp/conflict decisions moved into the stop window, where any failure
 # flows through recover_services exactly like the other post-stop failures.
 DATA_SOURCE=${DATA_SOURCE_DIR:-}
+
+# --- registry identity continuity (K 复核 K23 convergence guard) ------------
+# The identity the NEW unit serves is <IDENTITY_DIR>/registry.key after the
+# migration below. real_run always sets an expectation — --expect-pin
+# (default: the documented production pin) or --new-identity — and it is
+# checked HERE, before anything is stopped, with the staged binary's
+# read-only 'ak-cli registry-id' (the same loader and formatter the registry
+# serves with; it never creates a key), then re-checked on the FINAL file
+# inside the protected switchover. Every discovery path (occupant, environ,
+# cmdline, enumeration) thereby fails SAFE: whichever source it selected, a
+# differing or missing identity refuses instead of silently rotating the
+# registry id every client pins (OPERATIONS §5: rotation = re-pin and
+# re-release every client).
+IDENTITY_GUARD=0
+if [ -n "\$IDENTITY_EXPECT" ] || [ "\$IDENTITY_NEW" = 1 ]; then IDENTITY_GUARD=1; fi
+# identity_pin <dir>: rc 0 + the pin on stdout when <dir>/registry.key
+# exists and the source binary answers a well-formed 64-hex id; rc 1 = no
+# key file (the registry would CREATE a new identity there); rc 2 = cannot
+# determine (the callers refuse).
+identity_pin() {
+  local ip_pin
+  if ! sudo -n test -e "\$1/registry.key" 2>/dev/null; then
+    return 1
+  fi
+  ip_pin=\$(sudo -n "\$SRC_BIN" --id-dir "\$1" registry-id 2>/dev/null) || return 2
+  case "\$ip_pin" in
+    ''|*[!0-9a-f]*) return 2 ;;
+  esac
+  [ "\${#ip_pin}" = 64 ] || return 2
+  printf '%s\\n' "\$ip_pin"
+}
+if [ "\$IDENTITY_GUARD" = 1 ]; then
+  case "\$IDENTITY_DIR" in
+    /*) : ;;
+    *) echo "ERROR: the identity dir the new unit will load ('\${IDENTITY_DIR:-<unset>}') is not absolute; identity continuity cannot be verified; refusing BEFORE service switchover" >&2
+       exit 5 ;;
+  esac
+  # The file that will be SERVED: the migration source's key when the
+  # migration copies it INTO the identity dir (a differing destination key
+  # is refused post-stop, so the source key is what ends up served),
+  # otherwise the identity dir's own key.
+  ic_from="\$IDENTITY_DIR"
+  if [ -n "\$DATA_SOURCE" ] && [ "\$DATA_SOURCE" != "$REMOTE_DATA" ] \\
+     && [ "\$IDENTITY_DIR" = "$REMOTE_DATA" ] \\
+     && sudo -n test -e "\$DATA_SOURCE/registry.key" 2>/dev/null; then
+    ic_from="\$DATA_SOURCE"
+  fi
+  ic_rc=0
+  ic_pin=\$(identity_pin "\$ic_from") || ic_rc=\$?
+  if [ "\$ic_rc" = 2 ]; then
+    echo "ERROR: cannot derive the registry id of \$ic_from/registry.key with the staged binary ('ak-cli registry-id'); identity continuity cannot be verified; refusing BEFORE service switchover" >&2
+    exit 5
+  fi
+  if [ "\$IDENTITY_NEW" = 1 ]; then
+    if [ "\$ic_rc" = 0 ]; then
+      echo "ERROR: --new-identity was given but this deploy would SERVE the EXISTING registry identity \$ic_pin (from \$ic_from/registry.key); re-run with --expect-pin \$ic_pin to keep it; refusing BEFORE service switchover" >&2
+      exit 5
+    fi
+    echo "[install] identity: no existing registry identity will be served (--new-identity); the registry creates a NEW one at first start — re-pin every client (OPERATIONS §5)"
+  else
+    if [ "\$ic_rc" = 1 ]; then
+      echo "ERROR: no existing registry identity would be served (\$ic_from/registry.key is absent): the registry would CREATE a new identity and every client pinned to \$IDENTITY_EXPECT would break; refusing BEFORE service switchover (pass --new-identity only for a deliberate fresh identity)" >&2
+      exit 5
+    fi
+    if [ "\$ic_pin" != "\$IDENTITY_EXPECT" ]; then
+      echo "ERROR: the identity this deploy would serve (\$ic_pin, from \$ic_from/registry.key) differs from the expected registry id \$IDENTITY_EXPECT; refusing BEFORE service switchover (if that identity is intended, re-run with --expect-pin \$ic_pin)" >&2
+      exit 5
+    fi
+    echo "[install] identity: continuity verified before any stop — \$ic_from/registry.key serves the expected registry id \$IDENTITY_EXPECT"
+  fi
+fi
 
 # --- service switchover under UNIFIED failure recovery (K 复核 K2-N1) --------
 # Everything above only read state or created new files. From the first
@@ -2536,6 +2820,25 @@ do_switchover() {
   if sudo -n test -f $REMOTE_DATA/registry.key 2>/dev/null; then
     sudo -n chmod 600 $REMOTE_DATA/registry.key || return 1
   fi
+  # 2b) identity continuity, FINAL (K 复核 K23 convergence guard): re-derive
+  #     the registry id from the very file the new unit will load, now that
+  #     the migration is complete; any mismatch returns into the unified
+  #     recovery (services restored) BEFORE the binary swap and unit writes.
+  if [ "\$IDENTITY_GUARD" = 1 ]; then
+    ic_rc=0
+    ic_pin=\$(identity_pin "\$IDENTITY_DIR") || ic_rc=\$?
+    if [ "\$IDENTITY_NEW" = 1 ]; then
+      if [ "\$ic_rc" != 1 ]; then
+        echo "ERROR: --new-identity was given but \$IDENTITY_DIR/registry.key exists or cannot be checked after the migration (rc \$ic_rc); recovering" >&2
+        return 1
+      fi
+    elif [ "\$ic_rc" != 0 ] || [ "\$ic_pin" != "\$IDENTITY_EXPECT" ]; then
+      echo "ERROR: after the migration \$IDENTITY_DIR/registry.key serves '\${ic_pin:-<none>}' (rc \$ic_rc), not the expected registry id \$IDENTITY_EXPECT; recovering" >&2
+      return 1
+    else
+      echo "[install] identity: continuity re-verified post-migration — \$IDENTITY_DIR/registry.key serves \$IDENTITY_EXPECT"
+    fi
+  fi
   # 3) binary swap (K 复核 K-R1: staging source != destination, verified
   #    above BEFORE anything was stopped). K 复核 K2-N1(c): the move-aside
   #    of the previous binary must not be '|| true'd away — if the rename
@@ -2634,6 +2937,7 @@ EOF
 write_phase7() { # out-file
   cat > "$1" <<EOF
 set -eu
+IDENTITY_EXPECT=${IDENTITY_EXPECT:-}
 sleep 2
 for u in ak-registry-server ak-stun-server; do
   st=\$(systemctl is-active \$u.service 2>/dev/null || true)
@@ -2688,6 +2992,14 @@ for u in ak-registry-server ak-stun-server; do
 done
 # Export the registry pin (public hex; §5) for scripts/cross_nat_test.sh.
 PIN=\$(journalctl -u ak-registry-server.service --since '-5 min' --no-pager 2>/dev/null | sed -n 's/.*registry id (pin with --registry-fp): \\([0-9a-f]\\{64\\}\\).*/\\1/p' | tail -1)
+# K 复核 K23 convergence guard: the RUNNING registry's served id must be the
+# expected one (the file-level check before the switchover is authoritative;
+# this catches a unit override or an identity file changed since). A
+# mismatch fails BEFORE the wrong id is exported for the client scripts.
+if [ -n "\$PIN" ] && [ -n "\$IDENTITY_EXPECT" ] && [ "\$PIN" != "\$IDENTITY_EXPECT" ]; then
+  echo "ERROR: the RUNNING registry serves \$PIN, not the expected registry id \$IDENTITY_EXPECT (the pre-switchover file check passed: a unit override or a changed identity file?); roll back from $REMOTE_BASE/backup-<ts> (OPERATIONS §4/§5)" >&2
+  exit 6
+fi
 if [ -n "\$PIN" ]; then
   printf '%s\n' "\$PIN" | sudo -n tee $REMOTE_BASE/registry-id >/dev/null
   sudo -n chmod 644 $REMOTE_BASE/registry-id
@@ -2815,6 +3127,11 @@ real_run() {
       fail "UDP $STUN_PORT is held by legacy unit '$legacy_unit'; re-run without --keep-legacy-signal to perform the §0 handover, or stop it manually"
     fi
     warn "legacy unit '$legacy_unit' will be STOPPED and DISABLED (stun-server takes UDP $STUN_PORT)"
+  fi
+  if [ "${NEW_IDENTITY:-0}" -eq 1 ]; then
+    note "identity guard: --new-identity (no existing registry identity may be served)"
+  else
+    note "identity guard: the deployed registry must serve ${EXPECT_PIN:-<unset>} (derived with the staged binary's 'registry-id' before any stop)"
   fi
   if [ "$CHECK_ONLY" -eq 1 ]; then
     note "--check-only: no changes made; full report above"
@@ -3205,16 +3522,30 @@ real_run() {
   if ! has_opt_token "${existing_exec:-}" --id-dir && [ "$rid_final" != "$REMOTE_DATA" ]; then
     fail "the preserved ExecStart lacks --id-dir but the composed identity is '$rid_final' instead of the migrated $REMOTE_DATA; refusing before any switchover (K22-N1)"
   fi
+  # K 复核 K23 convergence guard: the identity dir the new unit will load is
+  # baked into the install script for the continuity checks (K13-N1 bake
+  # whitelist; an absolute path is required by the guard itself).
+  IDENTITY_DIR=$rid_final
+  case "$IDENTITY_DIR" in
+    /*) : ;;
+    *) fail "the composed identity dir '$IDENTITY_DIR' is not absolute; identity continuity cannot be verified; refusing before any switchover" ;;
+  esac
+  case "$IDENTITY_DIR" in
+    *[!A-Za-z0-9/._-]*)
+      fail "the identity dir '$IDENTITY_DIR' contains shell-significant bytes this deploy cannot bake faithfully into the generated install script (K13-N1)" ;;
+  esac
 
   # ---- phase 4/5/6: install + systemd + firewall ----------------------------
   phase "4-6/7 install, systemd, firewall"
-  REMOTE_DATA_PREOWNED=$REMOTE_DATA_PREOWNED write_phase456 "$WORK/phase456.sh"
+  REMOTE_DATA_PREOWNED=$REMOTE_DATA_PREOWNED IDENTITY_EXPECT=$EXPECT_PIN \
+    IDENTITY_NEW=$NEW_IDENTITY IDENTITY_DIR=$IDENTITY_DIR \
+    write_phase456 "$WORK/phase456.sh"
   remote_script "$WORK/phase456.sh" | tee "$WORK/phase456.log" \
     || fail "install phase failed (see $WORK/phase456.log)"
 
   # ---- phase 7: verify -------------------------------------------------------
   phase "7/7 verify"
-  write_phase7 "$WORK/phase7.sh"
+  IDENTITY_EXPECT=$EXPECT_PIN write_phase7 "$WORK/phase7.sh"
   remote_script "$WORK/phase7.sh" | tee "$WORK/phase7.log" \
     || fail "verification failed (see $WORK/phase7.log)"
   grep -q 'registry-server version:' "$WORK/phase7.log" \
@@ -3230,11 +3561,15 @@ real_run() {
 
   local pin
   pin=$(sed -n 's/^registry id (pin with --registry-fp): \([0-9a-f]\{64\}\)$/\1/p' "$WORK/phase7.log" | tail -1)
-  if [ -n "$pin" ] && [ "$pin" = "$DOCUMENTED_PIN" ]; then
-    note "registry identity matches the pin documented in docs/OPERATIONS.zh-CN.md §3 ($DOCUMENTED_PIN)"
+  # K 复核 K23 convergence guard: phase 7 already refused a served id that
+  # differs from the expectation; report which case this run was.
+  if [ "$NEW_IDENTITY" -eq 1 ]; then
+    note "registry id (NEW identity, --new-identity): ${pin:-see $REMOTE_BASE/registry-id}"
+    warn "every client must be re-pinned to this id (--registry-fp / AK_REGISTRY_ID, OPERATIONS §5)"
   elif [ -n "$pin" ]; then
-    note "registry id (new pin): $pin"
-    warn "this identity differs from the documented production pin ($DOCUMENTED_PIN) — if clients pin the old value they must be re-pinned (--registry-fp / AK_REGISTRY_ID, §5)"
+    note "registry identity continuity verified: the running registry serves the expected id $EXPECT_PIN"
+  else
+    note "registry identity continuity verified on the identity file before the switchover ($EXPECT_PIN); the served id could not be read from the journal"
   fi
 
   if [ "$KEEP_BUILD_DIR" -ne 1 ] && [ "$PREBUILT_MODE" -eq 0 ]; then

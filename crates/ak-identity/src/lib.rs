@@ -175,6 +175,22 @@ impl DeviceKeyPair {
         }
     }
 
+    /// Load an EXISTING seed file without ever creating one: the same
+    /// read-and-validate rules as [`DeviceKeyPair::load_or_create`], but a
+    /// missing file is an [`io::ErrorKind::NotFound`] error instead of a
+    /// freshly generated identity. Read-only callers (the deploy script's
+    /// identity-continuity check via `ak-cli registry-id`) use this so that
+    /// asking "which identity would be served" can never mint a new one.
+    pub fn load_existing(path: &Path) -> io::Result<Self> {
+        match read_existing_seed(path)? {
+            Some(seed) => Ok(Self::from_seed(seed)),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}: no seed file", path.display()),
+            )),
+        }
+    }
+
     /// Load the seed file, or create and persist a new key. The bool says
     /// whether a new key was created.
     ///
@@ -184,35 +200,11 @@ impl DeviceKeyPair {
     /// `created == false`. This path never overwrites an existing seed file
     /// (use [`DeviceKeyPair::save`] to replace one deliberately).
     pub fn load_or_create(path: &Path) -> io::Result<(Self, bool)> {
-        /// Read and validate an existing seed file; `None` means "not there".
-        fn read_existing(path: &Path) -> io::Result<Option<[u8; SEED_LEN]>> {
-            match fs::read(path) {
-                Ok(seed) => {
-                    if seed.len() != SEED_LEN {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "{}: seed file must hold exactly {} bytes, found {}",
-                                path.display(),
-                                SEED_LEN,
-                                seed.len()
-                            ),
-                        ));
-                    }
-                    let mut bytes = [0u8; SEED_LEN];
-                    bytes.copy_from_slice(&seed);
-                    Ok(Some(bytes))
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-
         // Each round either loads the existing seed or tries to exclusively
         // publish a fresh one. Losing a race just means re-reading, so a
         // small bound covers any realistic number of contenders.
         for _ in 0..8 {
-            if let Some(seed) = read_existing(path)? {
+            if let Some(seed) = read_existing_seed(path)? {
                 return Ok((Self::from_seed(seed), false));
             }
             let key = Self::generate();
@@ -222,7 +214,7 @@ impl DeviceKeyPair {
                 Err(err) => {
                     // The winner may have published between our read and the
                     // failed write; give the disk one last chance.
-                    if let Some(seed) = read_existing(path)? {
+                    if let Some(seed) = read_existing_seed(path)? {
                         return Ok((Self::from_seed(seed), false));
                     }
                     return Err(err);
@@ -323,6 +315,32 @@ impl DeviceKeyPair {
         verifying
             .verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
             .is_ok()
+    }
+}
+
+/// Read and validate an existing seed file; `None` means "not there". Shared
+/// by [`DeviceKeyPair::load_or_create`] and [`DeviceKeyPair::load_existing`]
+/// so both apply exactly the same validation.
+fn read_existing_seed(path: &Path) -> io::Result<Option<[u8; SEED_LEN]>> {
+    match fs::read(path) {
+        Ok(seed) => {
+            if seed.len() != SEED_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: seed file must hold exactly {} bytes, found {}",
+                        path.display(),
+                        SEED_LEN,
+                        seed.len()
+                    ),
+                ));
+            }
+            let mut bytes = [0u8; SEED_LEN];
+            bytes.copy_from_slice(&seed);
+            Ok(Some(bytes))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -1812,6 +1830,36 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["blocker".to_owned()]);
+    }
+
+    #[test]
+    fn load_existing_reads_the_same_identity_and_never_creates() {
+        let dir = TempDir::new("load-existing");
+        let path = dir.path().join("registry.key");
+
+        // Missing file: NotFound, and NOTHING is created (the deploy's
+        // identity-continuity check must never mint an identity).
+        let err = DeviceKeyPair::load_existing(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // Existing file: exactly the identity load_or_create serves.
+        let (served, created) = DeviceKeyPair::load_or_create(&path).unwrap();
+        assert!(created);
+        let loaded = DeviceKeyPair::load_existing(&path).unwrap();
+        assert_eq!(loaded.public_key(), served.public_key());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Same validation as load_or_create: a wrong-length seed is
+        // InvalidData for both, and the file is left untouched.
+        fs::write(&path, b"short").unwrap();
+        let err = DeviceKeyPair::load_existing(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            DeviceKeyPair::load_or_create(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"short");
     }
 
     #[test]

@@ -33,6 +33,14 @@ for the --binary flow:
     so real_run's anchored parser keeps working; the REAL decision block
     refuses unknown REGISTRY occupants like unknown STUN occupants.
 
+K 复核 K23 (round 24, reviewer-side repair): the /home enumeration stub runs
+the REAL find over each fixture's real directories and only strips the
+sandbox prefix, so the consumer is tested against the real tool's full-path
+record protocol (the round-23 stub fed bare names and hid K23-N1); the
+staged ak-cli stub answers the read-only 'registry-id' with a model pin
+(sha256 of the key bytes) so the identity-continuity guard (pre-stop,
+post-migration, phase 7) is exercised end to end.
+
 PERMISSION MODELS ARE OFFLINE: the ss stub shows other users' pid= info only
 when invoked through the sudo stub, and the test/cat/cp/sed/ls stubs map
 /etc, /home, /root and /proc arguments into the probe directory. These model
@@ -91,6 +99,9 @@ PREV17_REV = "1d76871"  # round-18 tip (K19 findings: greedy db-value
 PREV18_REV = "110bb34"  # round-20 tip (K20 findings: globbing in the token
                          # walks retargets a bracket db filename; empty and
                          # option-shaped --db-path values accepted)
+PREV20_REV = "f578f39"  # round-23 tip (K23 findings: find full-path
+                         # records re-prefixed, symlinked /home start point
+                         # empty, case-pattern ENOENT path, greedy listen sed)
 PREV19_REV = "a369e1c"  # round-22 tip (K22 findings: substring option
                          # presence drops --id-dir; LF homes split;
                          # path-text pollution flips the ENOENT classifier)  # round-17 tip (K18 findings: byte-evidence
@@ -436,10 +447,15 @@ esac
 JOURNALCTL_STUB = r"""#!/usr/bin/env bash
 set -u
 printf 'journalctl %s\n' "$*" >> "$PROBE_DIR/stubs.log"
+# JOURNAL_PIN: the registry id the RUNNING registry printed (K23 guard
+# phase-7 model); the default is a fixed synthetic pin.
 cat <<'JEOF'
 registry-server version: ak-cli 0.1.0 (git deadbee stub)
 v2 registry server listening on tls 0.0.0.0:17200
-registry id (pin with --registry-fp): aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111
+JEOF
+printf 'registry id (pin with --registry-fp): %s\n' \
+  "${JOURNAL_PIN:-aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111}"
+cat <<'JEOF'
 stun-server version: ak-cli 0.1.0 (git deadbee stub)
 stun responder listening on 0.0.0.0:17101 udp
 JEOF
@@ -471,7 +487,7 @@ set -u
 args=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) args+=("$PROBE_DIR$a") ;;
+    /etc/*|/home|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) args+=("$PROBE_DIR$a") ;;
     *) args+=("$a") ;;
   esac
 done
@@ -783,17 +799,39 @@ if [ -n "${LS_FAIL_MATCH:-}" ]; then
     *" ${LS_FAIL_MATCH} "*) echo "sudo: find: blocked by stub (forced)" >&2; exit 1 ;;
   esac
 fi
-# K 复核 K22-N2: the /home enumeration producer. FIND_HOME_FILE provides the
-# NUL-delimited listing VERBATIM (exact bytes — LF/tab/space names stay one
-# record); FIND_HOME_ENTRIES is the simple no-whitespace form.
+# K 复核 K22-N2 / K23-N1 (round 24): the /home enumeration producer is the
+# REAL find, run against the sandbox home ($PROBE_DIR/home — real
+# directories, symlinks and names created by each fixture) with the
+# caller's options UNCHANGED (-H, -print0, ...). Only the sandbox prefix is
+# removed from each NUL record, so the caller receives the real tool's
+# full-path record protocol ('/home/<name>') — the round-23 stub emitted
+# bare names and hid exactly the producer/consumer mismatch. The raw and
+# the logical records are kept (find-home-real.bin / find-home-logical.bin)
+# for consistency assertions. FIND_HOME_FILE overrides the producer with
+# VERBATIM bytes ONLY for consumer-shape tests that no real filesystem can
+# produce.
 case " $* " in
   *" /home "*)
     if [ -n "${FIND_HOME_FILE:-}" ] && [ -f "$FIND_HOME_FILE" ]; then
       cat "$FIND_HOME_FILE"
       exit 0
     fi
-    for e in ${FIND_HOME_ENTRIES:-otheruser}; do printf '%s\0' "$e"; done
-    exit 0 ;;
+    fargs=()
+    for a in "$@"; do
+      if [ "$a" = /home ]; then fargs+=("$PROBE_DIR/home"); else fargs+=("$a"); fi
+    done
+    real_out="$PROBE_DIR/find-home-real.bin"
+    (exec -a find "@REAL_FIND@" "${fargs[@]}") > "$real_out"
+    find_rc=$?
+    : > "$PROBE_DIR/find-home-logical.bin"
+    while IFS= read -r -d '' rec || [ -n "$rec" ]; do
+      case "$rec" in
+        "$PROBE_DIR"/*) rec=${rec#"$PROBE_DIR"} ;;
+      esac
+      printf '%s\0' "$rec"
+      printf '%s\0' "$rec" >> "$PROBE_DIR/find-home-logical.bin"
+    done < "$real_out"
+    exit "$find_rc" ;;
 esac
 mapped=()
 declare -A find_orig_of=()
@@ -846,7 +884,43 @@ def _posix_tool(tool: str) -> str:
     return path
 
 
-AK_CLI_STUB = '#!/usr/bin/env bash\necho "ak-cli 0.1.0 (git deadbee stub)"\n'
+# The staged/installed binary. K 复核 K23 convergence guard: its read-only
+# 'registry-id' answers a deterministic MODEL pin — sha256 of the key file's
+# bytes (the real pin is the Ed25519 public key; the deploy only COMPARES
+# pins, so any collision-free function of the key bytes models it) — and
+# fails without a key file, never creating one. Paths under /etc, /home and
+# /root map into the probe like every other stub. Everything else prints
+# the version line.
+AK_CLI_STUB = r'''#!/usr/bin/env bash
+case " $* " in
+  *" registry-id "*)
+    printf 'ak-cli %s\n' "$*" >> "$PROBE_DIR/stubs.log"
+    rid=""
+    prev=""
+    for a in "$@"; do
+      [ "$prev" = --id-dir ] && rid=$a
+      case "$a" in --id-dir=*) rid=${a#--id-dir=} ;; esac
+      prev=$a
+    done
+    case "$rid" in /etc/*|/home/*|/root/*) rid="$PROBE_DIR$rid" ;; esac
+    if [ -n "${REGISTRY_ID_FAIL:-}" ]; then
+      echo "error: registry-id failed (forced by stub)" >&2; exit 1
+    fi
+    [ -f "$rid/registry.key" ] || { echo "error: no usable registry identity at $rid/registry.key" >&2; exit 1; }
+    sha256sum "$rid/registry.key" | cut -c1-64
+    exit 0 ;;
+esac
+echo "ak-cli 0.1.0 (git deadbee stub)"
+'''
+
+
+DOCUMENTED_PIN_T = ("8f012017f57cfef1a3e74e90fa1e13a5f6ffbed3a9ddeecb98f819e002f94f36")
+
+
+def model_pin(key_bytes: bytes) -> str:
+    """The pin AK_CLI_STUB's 'registry-id' reports for a key file."""
+    import hashlib
+    return hashlib.sha256(key_bytes).hexdigest()
 # The pre-upgrade binary: a DIFFERENT version string so restore checks can
 # tell old bytes from new bytes on disk (and the stateful stub copies those
 # bytes into <unit>.running.bin at every start/restart).
@@ -994,6 +1068,9 @@ class ProbeHarness(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.probe = Path(tmp.name).resolve()
         (self.probe / "bin").mkdir()
+        # The probe models the server's root filesystem: /home always exists
+        # (the real find producer enumerates it; K23-N1/N2).
+        (self.probe / "home").mkdir()
         for name, body in STUBS.items():
             stub = self.probe / "bin" / name
             stub.write_text(body, encoding="utf-8", newline="\n")
@@ -1603,10 +1680,20 @@ class ProbeHarness(unittest.TestCase):
 
     @staticmethod
     def _ntfs_backing(name: str) -> str:
-        """MSYS maps LF/tab to private-use code points in NTFS backing
-        names; native Python must use the backing name to inspect what the
-        POSIX name created (identity on non-Windows hosts)."""
-        return name.translate({10: 0xF00A, 9: 0xF009})
+        """The name NATIVE Python must use to open what Bash created.
+
+        K 复核 K23-N5 (round 24): ONLY native Windows Python sees MSYS's
+        NTFS backing names — MSYS stores the bytes NTFS forbids (control
+        characters 0x01-0x1f and '"*:<>?|') as private-use U+F000+byte. On
+        every POSIX host (the Linux CI runner included) Python reads the
+        exact bytes Bash created, so the name is returned unchanged; the
+        round-23 helper translated unconditionally and the Linux repository
+        job failed with FileNotFoundError."""
+        if os.name != "nt":
+            return name
+        table = {code: 0xF000 + code for code in range(1, 32)}
+        table.update({ord(ch): 0xF000 + ord(ch) for ch in '"*:<>?|'})
+        return name.translate(table)
 
     def _make_k21_home_fixture(self, homes, decoy: bool):
         """K21-N2/K22-N2 reviewer fixture: a fresh host (no occupant, no
@@ -1649,19 +1736,30 @@ class ProbeHarness(unittest.TestCase):
                                                 encoding="utf-8")
 
     def _run_p1_homes(self, script: str, out: str, records):
-        """phase1 on a fresh host (SS_EMPTY) with a verbatim NUL-delimited
-        /home listing (FIND_HOME_FILE: exact bytes, one record per NUL —
-        spaced/LF names stay one find record). `records` is an iterable of
-        entry names; each may carry spaces or LF bytes."""
-        listing = self.probe / "find-home-nul.bin"
-        raw = b"".join(r.encode("utf-8") + b"\0" for r in records)
-        listing.write_bytes(raw)
-        return self.generate_and_run_p456(
+        """phase1 on a fresh host (SS_EMPTY) whose /home enumeration comes
+        from the REAL find over the fixture's real directories (K 复核
+        K23-N1: the round-23 helper fed a basename listing the real tool
+        never produces). `records` names the direct children of /home the
+        fixture created; when the producer ran, its logical output must be
+        EXACTLY those children in the real full-path protocol
+        ('/home/<name>', one NUL-terminated record each, any order) — an
+        independent consistency check between the fixture, the real tool
+        and the protocol the consumer implements."""
+        result = self.generate_and_run_p456(
             'write_phase1 "$PROBE_DIR/' + script + '" '
             '|| { echo GEN_FAILED; exit 90; }' + chr(10)
-            + 'SS_EMPTY=1 FIND_HOME_FILE=' + listing.as_posix()
-            + ' bash "$PROBE_DIR/' + script + '" '
+            + 'SS_EMPTY=1 bash "$PROBE_DIR/' + script + '" '
             + '> "$PROBE_DIR/' + out + '" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        logical = self.probe / "find-home-logical.bin"
+        if (self.probe / "find-home-real.bin").exists():
+            got = logical.read_bytes().split(b"\0")
+            self.assertEqual(got[-1], b"", "every record is NUL-terminated")
+            self.assertEqual(
+                sorted(got[:-1]),
+                sorted(("/home/" + r).encode("utf-8") for r in records),
+                "the real producer's records must be exactly the fixture's "
+                "/home children in full-path form")
+        return result
 
     def _make_k22_id_fixture(self, db_arg: str, sep: str = " "):
         """K22-N1 reviewer fixture: unit AND running argv genuinely LACK
@@ -1880,6 +1978,111 @@ class ProbeHarness(unittest.TestCase):
             return con.execute("SELECT state, revision FROM invite_codes").fetchall()
         finally:
             con.close()
+
+    # -- K23 (round 24) shared fixtures -------------------------------------
+    def _k23_source(self, rel: str, marker: str):
+        """A REAL identity directory at logical path `rel` holding
+        <marker>-key / <marker>-db bytes (synthetic markers, never keys)."""
+        live = self.probe / rel.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text(marker + "-key", encoding="utf-8")
+        (live / "registry.db").write_text(marker + "-db", encoding="utf-8")
+        return live
+
+    def _k23_dest(self, name: str):
+        f = self.probe / "opt-ak" / "data" / name
+        return f.read_text(encoding="utf-8") if f.exists() else None
+
+    def _k23_chain(self, name: str, records, text: str | None = None,
+                   rev: str | None = None):
+        """The reviewer's full fresh-host chain: phase1 (REAL find producer
+        over the fixture) -> the REAL decision blocks -> the REAL install of
+        the chosen configuration. `text`/`rev` select a baseline's OWN
+        generators and decisions. Returns the phase1 output/rc, decision
+        rc/output, chosen data source and install rc (None when an earlier
+        stage refused)."""
+        saved = self.text
+        if text is not None:
+            self.text = text
+        try:
+            rc, out = self._run_p1_homes(f"p1{name}.sh", f"p1{name}.out",
+                                         records)
+        finally:
+            self.text = saved
+        self.assertEqual(rc, 0, out)
+        res = {"phase1_out": (self.probe / f"p1{name}.out").read_text(
+                   encoding="utf-8"),
+               "phase1_rc": int(re.search(r"RUN_RC=(\d+)", out).group(1)),
+               "decision_rc": None, "decision_out": "", "data_source": None,
+               "install_rc": None}
+        if res["phase1_rc"] != 0:
+            return res
+        drc, dout = self.run_decision_and_config(
+            res["phase1_out"], f"driver-decision-{name}.sh", text=text,
+            origin=rev or "the current script")
+        res["decision_rc"], res["decision_out"] = drc, dout
+        if drc != 0:
+            return res
+        line = [l for l in dout.splitlines()
+                if l.startswith("CHOSEN_DATA_SOURCE=")][0]
+        res["data_source"] = line[len("CHOSEN_DATA_SOURCE="):]
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(dout)
+        irc, iout = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, f"p456{name}", text=text,
+            rev=rev, data_source=res["data_source"])
+        self.assertEqual(irc, 0, iout)
+        res["install_rc"] = int(re.search(r"INSTALL_RC=(\d+)", iout).group(1))
+        return res
+
+    def _k23_symlink_home(self):
+        """Replace the probe's /home with a REAL directory symlink to
+        actual-homes (skips where the platform refuses symlinks)."""
+        home = self.probe / "home"
+        target = self.probe / "actual-homes"
+        home.rename(target)
+        try:
+            home.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            target.rename(home)
+            self.skipTest(f"directory symlinks unavailable here: {exc}")
+        self.assertTrue(home.is_symlink())
+        return target
+
+    def _k23_reg_args(self, text: str, cases):
+        """Run the GENERATED phase1's reg_args_agree (plus the token helpers
+        it calls) on (configured, running) pairs; returns {label: (rc,
+        obi_bad)} — the helper contract the listen comparison rests on."""
+        names = ["bound_db_arg", "db_binding_invalid", "bound_id_dir",
+                 "id_binding_invalid", "bound_listen_arg", "reg_args_agree"]
+        lines = ['write_phase1 "$PROBE_DIR/p1ra.sh" || exit 90',
+                 ': > "$PROBE_DIR/ra-defs.sh"']
+        for fn in names:
+            lines.append("sed -n '/^" + fn + "() {/,/^}/p' "
+                         '"$PROBE_DIR/p1ra.sh" >> "$PROBE_DIR/ra-defs.sh"')
+        lines.append('. "$PROBE_DIR/ra-defs.sh"')
+        for label, configured, running in cases:
+            lines.append("obi_bad=''; rc=0; reg_args_agree '" + configured
+                         + "' '" + running + "' 2>/dev/null || rc=$?")
+            lines.append("printf 'RA %s rc=%s bad=%s\\n' '" + label
+                         + "' \"$rc\" \"$obi_bad\"")
+        saved = self.text
+        self.text = text
+        try:
+            rc, out = self.run_driver(
+                self.section(text, "write_phase1() {",
+                             "# Phase 3: build on the server",
+                             skip_if_missing=True),
+                chr(10).join(lines) + chr(10), name="driver-ra.sh")
+        finally:
+            self.text = saved
+        self.assertEqual(rc, 0, out)
+        res = {}
+        for label, _c, _r in cases:
+            m = re.search(r"^RA " + re.escape(label) + r" rc=(\d+) bad=(.*)$",
+                          out, re.M)
+            self.assertIsNotNone(m, out)
+            res[label] = (int(m.group(1)), m.group(2))
+        return res
 
     def assert_recovery_restored_old_state(self, out: str):
         """Shared K2-N1 assertions: old binary + old unit BYTES back on disk,
@@ -4577,7 +4780,8 @@ echo "C4=[$c4]"
         # pre-stop at the K13-N1 whitelist instead of silently migrating
         # the prefix decoy.
         self._make_k21_home_fixture(["other user"], decoy=True)
-        rc, out = self._run_p1_homes("p1k21h.sh", "p1k21h.out", ["other user"])
+        rc, out = self._run_p1_homes("p1k21h.sh", "p1k21h.out",
+                                     ["other user", "other"])
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1k21h.out").read_text(encoding="utf-8")
@@ -4616,7 +4820,7 @@ echo "C4=[$c4]"
         # silently migrated the other).
         self._make_k21_home_fixture(["other user", "otheruser"], decoy=True)
         rc, out = self._run_p1_homes("p1k21p.sh", "p1k21p.out",
-                                     ["other user", "otheruser"])
+                                     ["other user", "otheruser", "other"])
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1k21p.out").read_text(encoding="utf-8")
@@ -4864,7 +5068,11 @@ echo "C4=[$c4]"
         self.assertIn(
             "cannot determine existence of "
             "/home/No such file or directory/.ak-sending", p1_out)
-        self.assertNotIn("registry-data:", p1_out)
+        # K23-N1: the REAL producer's order is the filesystem's, so the
+        # ordinary candidate may be REPORTED before the polluted one refuses;
+        # the polluted candidate itself is never reported, and phase1's
+        # non-zero exit (asserted above) fails the whole preflight.
+        self.assertNotIn("registry-data: /home/No such file", p1_out)
         self.assertNotIn("systemctl enable", self.stubs_log())
         self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key")
                          .exists(), "nothing may be copied")
@@ -4893,7 +5101,9 @@ echo "C4=[$c4]"
     def test_k22n3_genuine_enoent_still_classifies_absent(self):
         # Control: a candidate that genuinely does not exist still reads
         # ABSENT (the anchored diagnostic form matches) and the fresh
-        # install proceeds.
+        # install proceeds. K23-N1: the home itself is a REAL directory the
+        # real producer enumerates; only its .ak-sending is absent.
+        (self.probe / "home" / "ghosthome").mkdir()
         rc, out = self._run_p1_homes("p1k22eno.sh", "p1k22eno.out",
                                      ["ghosthome"])
         self.assertEqual(rc, 0, out)
@@ -4908,10 +5118,12 @@ echo "C4=[$c4]"
 
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
-                mainpid: str = "4242"):
+                mainpid: str = "4242", identity_expect: str = ""):
         """exe_map_expr: a quoted bash expression for the /proc/<pid>/exe
-        readlink result, e.g. '"$REMOTE_BIN"' or '"$REMOTE_BIN (deleted)"'."""
+        readlink result, e.g. '"$REMOTE_BIN"' or '"$REMOTE_BIN (deleted)"'.
+        identity_expect: the K23-guard expectation baked into phase 7."""
         body = (
+            f'IDENTITY_EXPECT={identity_expect} '
             f'SHORT_SHA={short_sha} write_phase7 "$PROBE_DIR/p7.sh" '
             '|| { echo GEN_FAILED; exit 90; }\n'
             'mkdir -p "$REMOTE_BASE"\n'
@@ -5021,8 +5233,11 @@ echo "C4=[$c4]"
         self.assertIn("sudo -n cat /proc/4242/cgroup", log)
         # K 复核 K22-N2 (round 23): the /home enumeration producer is
         # find -print0 (NUL-delimited records), no longer 'ls -1'.
+        # K 复核 K23-N2 (round 24): with '-H' (a symlinked /home start point
+        # is followed), behind a privileged directory gate.
+        self.assertIn("sudo -n test -d /home", log)
         self.assertIn(
-            "sudo -n find /home -mindepth 1 -maxdepth 1 -print0", log)
+            "sudo -n find -H /home -mindepth 1 -maxdepth 1 -print0", log)
         self.assertIn("sudo -n env LC_ALL=C ls -d /home/otheruser/.ak-sending/registry.key", log)
         n_ss = len([l for l in log.splitlines() if l.startswith("ss ")])
         n_sudo_ss = len([l for l in log.splitlines() if l.startswith("sudo -n ss ")])
@@ -5138,6 +5353,502 @@ echo "C4=[$c4]"
         self.assertEqual(rc, 0, out)
         self.assertIn("registry-port occupant unit: oldregistry", out)
         self.assertIn("old registry unit 'oldregistry.service' will be stopped", out)
+    # == K23 (round 24): real producer protocol, symlinked start point, ====
+    # == literal diagnostics, token-bound listen surface, identity guard ===
+    def test_k23n1_real_find_records_feed_the_consumer_ordinary_migrates(self):
+        # The reviewer's ordinary control under the REAL producer: the real
+        # find emits '/home/otheruser'; the consumer must probe exactly
+        # '/home/otheruser/.ak-sending' (never the re-prefixed
+        # '/home//home/otheruser/...') and migrate that source.
+        self._k23_source("/home/otheruser/.ak-sending", "synthetic-ordinary")
+        res = self._k23_chain("k23o", ["otheruser"])
+        self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+        self.assertIn("registry-data: /home/otheruser/.ak-sending "
+                      "(key:yes db:yes)", res["phase1_out"])
+        log = self.stubs_log()
+        self.assertIn("ls -d /home/otheruser/.ak-sending", log)
+        self.assertNotIn("/home//home", log)
+        self.assertEqual(res["decision_rc"], 0, res["decision_out"])
+        self.assertEqual(res["data_source"], "/home/otheruser/.ak-sending")
+        self.assertEqual(res["install_rc"], 0)
+        self.assertEqual(self._k23_dest("registry.key"), "synthetic-ordinary-key")
+        self.assertEqual(self._k23_dest("registry.db"), "synthetic-ordinary-db")
+
+    def test_k23n1_nested_decoy_is_never_a_candidate(self):
+        # The reviewer's nested fixture: /home/home/otheruser/.ak-sending is
+        # exactly what the round-23 re-prefixing probed. With the producer
+        # protocol honored, only the ordinary source is a candidate and its
+        # bytes (never the decoy's) are migrated; the decoy stays untouched.
+        self._k23_source("/home/otheruser/.ak-sending", "synthetic-ordinary")
+        decoy = self._k23_source("/home/home/otheruser/.ak-sending",
+                                 "synthetic-nested-decoy")
+        res = self._k23_chain("k23n", ["otheruser", "home"])
+        reports = [l for l in res["phase1_out"].splitlines()
+                   if l.startswith("registry-data:")]
+        self.assertEqual(reports, ["registry-data: /home/otheruser/.ak-sending "
+                                   "(key:yes db:yes)"], res["phase1_out"])
+        self.assertEqual(res["data_source"], "/home/otheruser/.ak-sending")
+        self.assertEqual(res["install_rc"], 0)
+        self.assertEqual(self._k23_dest("registry.key"), "synthetic-ordinary-key")
+        self.assertEqual((decoy / "registry.key").read_text(encoding="utf-8"),
+                         "synthetic-nested-decoy-key")
+
+    def test_k23n1_two_ordinary_sources_refuse_as_ambiguous(self):
+        # Both real sources are SEEN (the round-23 chain lost both and
+        # continued as a fresh install), so the no-occupant multi-candidate
+        # refusal fires before anything is stopped or copied.
+        self._k23_source("/home/otherone/.ak-sending", "synthetic-one")
+        self._k23_source("/home/otheruser/.ak-sending", "synthetic-ordinary")
+        res = self._k23_chain("k23t", ["otherone", "otheruser"])
+        self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+        self.assertIn("registry-data: /home/otherone/.ak-sending",
+                      res["phase1_out"])
+        self.assertIn("registry-data: /home/otheruser/.ak-sending",
+                      res["phase1_out"])
+        self.assertNotEqual(res["decision_rc"], 0, res["decision_out"])
+        self.assertIn("multiple identity directories", res["decision_out"])
+        self.assertIsNone(self._k23_dest("registry.key"))
+        self.assertNotIn("systemctl enable", self.stubs_log())
+
+    def test_k23n1_consumer_refuses_records_outside_the_protocol(self):
+        # Consumer-shape contract (producer bytes injected verbatim; no real
+        # filesystem produces these): a bare name, a nested record and a
+        # foreign prefix each refuse phase1 before any candidate is probed.
+        for label, raw, needle in (
+                ("bare", b"otheruser\0", "the producer protocol is"),
+                ("nested", b"/home/a/b\0", "is not a direct child of /home"),
+                ("foreign", b"/elsewhere/x\0", "the producer protocol is")):
+            with self.subTest(case=label):
+                self.setUp()
+                self._k23_source("/home/otheruser/.ak-sending",
+                                 "synthetic-ordinary")
+                listing = self.probe / "find-override.bin"
+                listing.write_bytes(raw)
+                self.driver_env["FIND_HOME_FILE"] = listing.as_posix()
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/p1sh.sh" || exit 90' + chr(10)
+                    + 'SS_EMPTY=1 bash "$PROBE_DIR/p1sh.sh" > '
+                    '"$PROBE_DIR/p1sh.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=3", out)
+                p1_out = (self.probe / "p1sh.out").read_text(encoding="utf-8")
+                self.assertIn(needle, p1_out)
+                self.assertNotIn("registry-data: /home/", p1_out,
+                                 "validation precedes every candidate probe")
+                self.doCleanups()
+
+    def test_k23n2_symlinked_home_start_point_is_followed(self):
+        # The reviewer's fixture: /home -> actual-homes (a REAL directory
+        # link) holding an ordinary source. find -H follows the start point
+        # like the pre-round-23 'ls -1 /home' did; the source is migrated
+        # instead of the host reading as empty.
+        target = self._k23_symlink_home()
+        live = target / "otheruser" / ".ak-sending"
+        live.mkdir(parents=True)
+        (live / "registry.key").write_text("synthetic-ordinary-key",
+                                           encoding="utf-8")
+        (live / "registry.db").write_text("synthetic-ordinary-db",
+                                          encoding="utf-8")
+        res = self._k23_chain("k23s", ["otheruser"])
+        self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+        self.assertIn("registry-data: /home/otheruser/.ak-sending "
+                      "(key:yes db:yes)", res["phase1_out"])
+        self.assertEqual(res["install_rc"], 0)
+        self.assertEqual(self._k23_dest("registry.key"), "synthetic-ordinary-key")
+        self.assertTrue((self.probe / "home").is_symlink())
+        self.assertEqual((live / "registry.key").read_text(encoding="utf-8"),
+                         "synthetic-ordinary-key", "the source stays in place")
+
+    def test_k23n2_home_that_is_not_a_directory_refuses(self):
+        # '-H' on a dangling link exits 0 with no records, so a /home that is
+        # not (or does not resolve to) a directory refuses up front — the
+        # host must never read as "no legacy identity" by accident.
+        for label in ("dangling", "regular-file"):
+            with self.subTest(case=label):
+                self.setUp()
+                home = self.probe / "home"
+                home.rmdir()
+                if label == "dangling":
+                    try:
+                        home.symlink_to(self.probe / "nowhere",
+                                        target_is_directory=True)
+                    except OSError as exc:
+                        self.skipTest(f"symlinks unavailable here: {exc}")
+                else:
+                    home.write_text("not a directory", encoding="utf-8")
+                rc, out = self._run_p1_homes("p1k23d.sh", "p1k23d.out", [])
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=3", out)
+                p1_out = (self.probe / "p1k23d.out").read_text(encoding="utf-8")
+                self.assertIn("/home is not a directory", p1_out)
+                self.assertNotIn("find -H /home", self.stubs_log(),
+                                 "the gate precedes the producer")
+                self.doCleanups()
+
+    def test_k23n3_bracket_named_empty_home_proceeds_as_fresh_install(self):
+        # The reviewer's fixture: an EMPTY home named 'spare[1]' (no
+        # identity, no database). The real same-path ENOENT now matches the
+        # LITERAL expected diagnostic, so phase1 continues and the decision
+        # proceeds as a fresh install (round 23 refused: a new false
+        # refusal), exactly like the ordinary 'spare1' control.
+        for home in ("spare[1]", "spare1"):
+            with self.subTest(home=home):
+                self.setUp()
+                (self.probe / "home" / home).mkdir()
+                res = self._k23_chain("k23b", [home])
+                self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+                self.assertNotIn("cannot determine existence", res["phase1_out"])
+                self.assertIn("ls -d /home/" + home + "/.ak-sending",
+                              self.stubs_log())
+                self.assertEqual(res["decision_rc"], 0, res["decision_out"])
+                self.assertEqual(res["data_source"], "")
+                self.doCleanups()
+
+    def test_k23n3_priv_exists_compares_the_diagnostic_literally(self):
+        # Helper contract (diagnostic injection; no real-ls or permission
+        # claim): only the EXACT quoted same-path ENOENT reads absent.
+        # Bracket/star requests no longer glob-match a different path.
+        body = (
+            'write_phase1 "$PROBE_DIR/p1pe.sh" || exit 90' + chr(10)
+            + "sed -n '/^priv_exists() {/,/^}/p' \"$PROBE_DIR/p1pe.sh\" "
+            '> "$PROBE_DIR/pe.sh"' + chr(10)
+            + '. "$PROBE_DIR/pe.sh"' + chr(10)
+            + 'sudo() { printf "%s\\n" "$DIAG" >&2; return 2; }' + chr(10))
+        cases = (
+            ("/home/missing[1]/.ak-sending",
+             "ls: cannot access '/home/missing1/.ak-sending': "
+             "No such file or directory", "", "2"),
+            ("/home/missing*/.ak-sending",
+             "ls: cannot access '/home/missing2/.ak-sending': "
+             "No such file or directory", "", "2"),
+            ("/home/missing[1]/.ak-sending",
+             "ls: cannot access '/home/missing[1]/.ak-sending': "
+             "No such file or directory", "no", "0"),
+            ("/home/otheruser/.ak-sending",
+             "ls: cannot access '/home/otheruser/.ak-sending': "
+             "Permission denied", "", "2"),
+        )
+        for i, (path, diag, _v, _r) in enumerate(cases):
+            body += ("DIAG=\"" + diag.replace('"', '\\"') + "\"; rc=0; "
+                     "v=$(priv_exists '" + path + "' 2>/dev/null) || rc=$?; "
+                     "printf 'PE" + str(i) + " v=%s rc=%s\\n' \"$v\" \"$rc\""
+                     + chr(10))
+        rc, out = self.run_driver(self.definitions(), body, name="driver-pe.sh")
+        self.assertEqual(rc, 0, out)
+        for i, (_p, _d, value, prc) in enumerate(cases):
+            self.assertIn(f"PE{i} v={value} rc={prc}", out)
+
+    K23_LISTEN_SUFFIX = (" --id-dir /home/otheruser/--{opt}"
+                         " --db-path /home/otheruser/--id-dir.sqlite")
+
+    def test_k23n4_listen_surface_is_token_bound(self):
+        # The reviewer's masking pairs (a legal id path ENDING in the
+        # literal '--port'/'--bind') must now DISAGREE (rc 1); identical
+        # option-like lines and equivalent spellings still agree; invalid
+        # option grammar is rc 3 with the CLI's own diagnosis.
+        sp = self.K23_LISTEN_SUFFIX.format(opt="port")
+        sb = self.K23_LISTEN_SUFFIX.format(opt="bind")
+        cases = [
+            ("port-masked", "x registry-server --port 18200" + sp,
+             "x registry-server --port 17200" + sp),
+            ("bind-masked", "x registry-server --port 17200 --bind 127.0.0.1" + sb,
+             "x registry-server --port 17200 --bind 0.0.0.0" + sb),
+            ("identical", "x registry-server --port 17200" + sp,
+             "x registry-server --port 17200" + sp),
+            ("equals-vs-space", "x registry-server --port=17200 --bind=0.0.0.0" + sp,
+             "x registry-server --port 17200 --bind 0.0.0.0" + sp),
+            ("defaults", "x registry-server --id-dir /d",
+             "x registry-server --port 7200 --bind 0.0.0.0 --id-dir /d"),
+            ("duplicate-port", "x registry-server --port 17200 --port 17200 --id-dir /d",
+             "x registry-server --port 17200 --id-dir /d"),
+            ("dangling-bind", "x registry-server --id-dir /d --bind",
+             "x registry-server --id-dir /d"),
+            ("option-valued", "x registry-server --port --bind 1.2.3.4 --id-dir /d",
+             "x registry-server --id-dir /d"),
+            ("empty-bind", "x registry-server --bind= --id-dir /d",
+             "x registry-server --id-dir /d"),
+        ]
+        got = self._k23_reg_args(self.text, cases)
+        self.assertEqual(got["port-masked"][0], 1, got)
+        self.assertEqual(got["bind-masked"][0], 1, got)
+        self.assertEqual(got["identical"][0], 0, got)
+        self.assertEqual(got["equals-vs-space"][0], 0, got)
+        self.assertEqual(got["defaults"][0], 0, got)
+        for label, needle in (("duplicate-port", "cannot be used multiple times"),
+                              ("dangling-bind", "dangling '--bind'"),
+                              ("option-valued", "option-shaped space-form --port"),
+                              ("empty-bind", "explicit EMPTY --bind")):
+            self.assertEqual(got[label][0], 3, (label, got))
+            self.assertIn(needle, got[label][1], (label, got))
+
+    def test_k23n4_masked_listen_difference_refuses_before_any_stop(self):
+        # The reviewer's full phase1 fixture: an identified occupant whose
+        # configured and running listen values differ while the id path ends
+        # in '--port' / '--bind'. Round 23 accepted, stopped the old active
+        # service and baked the configured port; now phase1 refuses with the
+        # material disagreement and nothing is stopped.
+        for opt, configured, running in (
+                ("port", "--port 18200", "--port 17200"),
+                ("bind", "--port 17200 --bind 127.0.0.1",
+                 "--port 17200 --bind 0.0.0.0")):
+            with self.subTest(option=opt):
+                self.setUp()
+                suffix = self.K23_LISTEN_SUFFIX.format(opt=opt)
+                self.make_private_discovery_model(
+                    main_exec="/opt/ak-sending/ak-cli registry-server "
+                              + configured + suffix,
+                    cmdline_extra=running + suffix,
+                    unit_service_lines=["User=otheruser",
+                                        "Environment=HOME=/home/otheruser",
+                                        "UnsetEnvironment=USERPROFILE"],
+                    environ=b"HOME=/home/otheruser\0USER=otheruser\0")
+                self._k23_source("/home/otheruser/--" + opt, "runtime-real")
+                self._make_oldregistry_running()
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/p1l.sh" || exit 90' + chr(10)
+                    + 'bash "$PROBE_DIR/p1l.sh" > "$PROBE_DIR/p1l.out" 2>&1; '
+                    'echo "RUN_RC=$?"' + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=3", out)
+                p1_out = (self.probe / "p1l.out").read_text(encoding="utf-8")
+                self.assertIn("materially disagrees with the running cmdline",
+                              p1_out)
+                self.assertNotRegex(self.stubs_log(), r"(?m)^systemctl stop ")
+                self.doCleanups()
+
+    def test_k23n4_option_like_identity_path_with_equal_listen_still_proceeds(self):
+        # Positive control for the reviewer's two LEGAL identity paths: with
+        # configured == running, an id dir ending in '--port' / '--bind' is
+        # an ordinary value — phase1 accepts it and binds the runtime
+        # identity to exactly that directory.
+        for opt in ("port", "bind"):
+            with self.subTest(option=opt):
+                self.setUp()
+                suffix = self.K23_LISTEN_SUFFIX.format(opt=opt)
+                listen = "--port 17200 --bind 0.0.0.0"
+                self.make_private_discovery_model(
+                    main_exec="/opt/ak-sending/ak-cli registry-server "
+                              + listen + suffix,
+                    cmdline_extra=listen + suffix,
+                    unit_service_lines=["User=otheruser",
+                                        "Environment=HOME=/home/otheruser",
+                                        "UnsetEnvironment=USERPROFILE"],
+                    environ=b"HOME=/home/otheruser\0USER=otheruser\0")
+                self._k23_source("/home/otheruser/--" + opt, "runtime-real")
+                self._make_oldregistry_running()
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/p1lc.sh" || exit 90' + chr(10)
+                    + 'bash "$PROBE_DIR/p1lc.sh" > "$PROBE_DIR/p1lc.out" 2>&1; '
+                    'echo "RUN_RC=$?"' + chr(10))
+                self.assertEqual(rc, 0, out)
+                p1_out = (self.probe / "p1lc.out").read_text(encoding="utf-8")
+                self.assertIn("RUN_RC=0", out, p1_out)
+                self.assertIn("runtime-id-dir: /home/otheruser/--" + opt, p1_out)
+                self.assertNotIn("materially disagrees", p1_out)
+                self.doCleanups()
+
+    def test_k23n5_ntfs_backing_only_maps_on_native_windows(self):
+        # K23-N5: POSIX hosts (the Linux CI runner) read the bytes Bash
+        # created; only native Windows Python sees MSYS backing names.
+        name = "other\nuser\ttab*"
+        if os.name == "nt":
+            self.assertEqual(self._ntfs_backing(name),
+                             "otherusertab")
+        else:
+            self.assertEqual(self._ntfs_backing(name), name)
+
+    # -- K23 convergence guard: registry identity continuity -----------------
+    def _run_guard_install(self, name: str, *, expect: str = "", new: str = "0",
+                           identity_dir: str = "$REMOTE_DATA",
+                           data_source: str = "", preowned: str = "1",
+                           old_registry: str = "", models: str = "",
+                           run_env: dict | None = None):
+        body = (
+            models
+            + 'mkdir -p "$PROBE_DIR/staging"\n'
+            'cp "$AK_CLI_STUB" "$PROBE_DIR/staging/ak-cli"\n'
+            'chmod +x "$PROBE_DIR/staging/ak-cli"\n'
+            'TS=t12345 BUILD_DIR= PREBUILT_MODE=1 '
+            'STAGING_DIR="$PROBE_DIR/staging" STAGED_BIN="$PROBE_DIR/staging/ak-cli" '
+            'SHORT_SHA=deadbee '
+            'REGISTRY_EXEC="$REMOTE_BIN registry-server --port 17200 --id-dir $REMOTE_DATA" '
+            f'REG_RW="$REMOTE_DATA" LEGACY_UNIT= OLD_REGISTRY_UNIT={old_registry} '
+            f'DATA_SOURCE_DIR={data_source} CLOSE_7100=0 REMOTE_DATA_PREOWNED={preowned} '
+            f'IDENTITY_EXPECT={expect} IDENTITY_NEW={new} '
+            f'IDENTITY_DIR="{identity_dir}" '
+            f'write_phase456 "$PROBE_DIR/{name}.sh" || {{ echo GEN_FAILED; exit 90; }}\n'
+            f'bash "$PROBE_DIR/{name}.sh" > "$PROBE_DIR/{name}.out" 2>&1; '
+            'echo "INSTALL_RC=$?"\n')
+        rc, out = self.generate_and_run_p456(body, run_env=run_env)
+        self.assertEqual(rc, 0, out)
+        install_rc = int(re.search(r"INSTALL_RC=(\d+)", out).group(1))
+        return install_rc, (self.probe / f"{name}.out").read_text(encoding="utf-8")
+
+    def _assert_untouched_upgrade_model(self):
+        log = self.stubs_log()
+        self.assertNotRegex(log, r"(?m)^systemctl stop ",
+                            "the guard must refuse BEFORE any stop")
+        self.assertNotIn("systemctl enable --now", log)
+        self.assertEqual((self.probe / "opt-ak" / "ak-cli").read_text(
+            encoding="utf-8"), AK_CLI_OLD, "the old binary stays in place")
+        for unit in ("ak-registry-server.service", "ak-stun-server.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active")
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD)
+
+    def test_k23guard_mismatching_identity_refuses_before_any_stop(self):
+        # A deploy that would serve ANY identity other than the expected one
+        # (here: the box's own key against a different expectation) refuses
+        # with zero downtime: nothing stopped, old image still running.
+        rc, out = self._run_guard_install(
+            "p456g1", expect=model_pin(b"some-other-identity"),
+            models="make_upgrade_model\n")
+        self.assertEqual(rc, 5, out)
+        self.assertIn("differs from the expected registry id", out)
+        self.assertIn("re-run with --expect-pin " + model_pin(b"key-bytes\n"),
+                      out, "the refusal names the identity that WOULD be served")
+        self._assert_untouched_upgrade_model()
+
+    def test_k23guard_matching_identity_installs_and_reverifies(self):
+        rc, out = self._run_guard_install(
+            "p456g2", expect=model_pin(b"key-bytes\n"),
+            models="make_upgrade_model\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("continuity verified before any stop", out)
+        self.assertIn("continuity re-verified post-migration", out)
+        log = self.stubs_log()
+        pre = self.log_line(log, "registry-id")
+        stop = self.log_line(log, "systemctl stop ak-registry-server.service")
+        self.assertLess(pre, stop, "the first identity check precedes every stop")
+        self.assertEqual(len(re.findall(r"(?m)^ak-cli .*registry-id", log)), 2)
+        self.assertEqual((self.probe / "opt-ak" / "data" / "registry.key")
+                         .read_text(encoding="utf-8"), "key-bytes\n",
+                         "the identity file itself is never modified")
+        self.assertIn("systemctl enable --now", log)
+
+    def test_k23guard_missing_identity_refuses_unless_new_identity(self):
+        # A fresh box: the registry would CREATE a new identity. Expect mode
+        # refuses pre-stop; --new-identity is the explicit acknowledgement.
+        rc, out = self._run_guard_install("p456g3", expect=DOCUMENTED_PIN_T,
+                                          preowned="0")
+        self.assertEqual(rc, 5, out)
+        self.assertIn("no existing registry identity would be served", out)
+        self.assertNotIn("systemctl enable --now", self.stubs_log())
+        self.setUp()
+        rc, out = self._run_guard_install("p456g3n", new="1", preowned="0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no existing registry identity will be served "
+                      "(--new-identity)", out)
+        self.assertIn("systemctl enable --now", self.stubs_log())
+
+    def test_k23guard_new_identity_refuses_to_serve_an_existing_key(self):
+        rc, out = self._run_guard_install("p456g4", new="1",
+                                          models="make_upgrade_model\n")
+        self.assertEqual(rc, 5, out)
+        self.assertIn("--new-identity was given but this deploy would SERVE "
+                      "the EXISTING registry identity "
+                      + model_pin(b"key-bytes\n"), out)
+        self._assert_untouched_upgrade_model()
+
+    def test_k23guard_checks_the_migration_source_that_would_be_served(self):
+        # The served identity comes from the MIGRATION SOURCE when it is
+        # copied into the identity dir: a discovery that picked the right
+        # source passes; one that picked any other source (a decoy) refuses
+        # BEFORE any stop — whatever the discovery path, it fails safe.
+        for label, marker, expect_rc in (("right", "source", 0),
+                                         ("decoy", "decoy", 5)):
+            with self.subTest(source=label):
+                self.setUp()
+                self._k23_source("/home/otheruser/.ak-sending", marker)
+                rc, out = self._run_guard_install(
+                    "p456g5", expect=model_pin(b"source-key"),
+                    data_source="/home/otheruser/.ak-sending", preowned="0")
+                self.assertEqual(rc, expect_rc, out)
+                if expect_rc == 0:
+                    self.assertIn("/home/otheruser/.ak-sending/registry.key "
+                                  "serves the expected registry id", out)
+                    self.assertEqual(self._k23_dest("registry.key"), "source-key")
+                else:
+                    self.assertIn("from /home/otheruser/.ak-sending/registry.key) "
+                                  "differs from the expected registry id", out)
+                    self.assertIsNone(self._k23_dest("registry.key"))
+                    self.assertNotIn("systemctl enable", self.stubs_log())
+                self.doCleanups()
+
+    def test_k23guard_post_migration_mismatch_enters_recovery(self):
+        # The source identity changes AFTER the pre-stop check (while the
+        # old registry stops): the FINAL check on the migrated file returns
+        # into the unified recovery — previous binary, units and running
+        # images restored — before the binary swap or any unit write.
+        self._k23_source("/home/otheruser/.ak-sending", "source")
+        rc, out = self._run_guard_install(
+            "p456g6", expect=model_pin(b"source-key"),
+            data_source="/home/otheruser/.ak-sending", preowned="0",
+            old_registry="oldregistry",
+            models="make_upgrade_model\n"
+            'for f in registry.key registry.db; do rm -f "$REMOTE_DATA/$f"; done\n'
+            'write_old_unit oldregistry\n'
+            'echo 1 > "$ST/oldregistry.service.enabled"\n'
+            'echo active > "$ST/oldregistry.service.active"\n'
+            'echo 4244 > "$ST/oldregistry.service.pid"\n'
+            'printf "%s\\n" "$REMOTE_BIN" > "$ST/4244.exe"\n'
+            'printf "%s\\n" "$REMOTE_BIN" > "$ST/oldregistry.service.running"\n'
+            'cp "$REMOTE_BIN" "$ST/oldregistry.service.running.bin"\n',
+            run_env={"SYSTEMCTL_STOP_HOOK":
+                     "printf rotated-key > @PROBE_DIR@/home/otheruser/"
+                     ".ak-sending/registry.key",
+                     "SYSTEMCTL_STOP_HOOK_UNIT": "oldregistry.service"})
+        self.assertEqual(rc, 5, out)
+        self.assertIn("continuity verified before any stop", out)
+        self.assertIn("serves '" + model_pin(b"rotated-key") + "' (rc 0), not "
+                      "the expected registry id", out)
+        self.assertIn("RECOVERY OK", out)
+        log = self.stubs_log()
+        self.assertNotIn("install -m 0755", log,
+                         "no binary swap after the failed identity check")
+        self.assertNotIn("tee /etc/systemd/system/ak-registry-server.service", log)
+        for unit in ("ak-registry-server.service", "ak-stun-server.service",
+                     "oldregistry.service"):
+            self.assertEqual(self.unit_state(unit, "active"), "active", unit)
+            self.assertEqual(self.unit_running_bin(unit), AK_CLI_OLD, unit)
+
+    def test_k23guard_underivable_identity_refuses(self):
+        rc, out = self._run_guard_install(
+            "p456g7", expect=model_pin(b"key-bytes\n"),
+            models="make_upgrade_model\n", run_env={"REGISTRY_ID_FAIL": "1"})
+        self.assertEqual(rc, 5, out)
+        self.assertIn("cannot derive the registry id", out)
+        self._assert_untouched_upgrade_model()
+
+    def test_k23guard_relative_identity_dir_refuses(self):
+        rc, out = self._run_guard_install(
+            "p456g8", expect=model_pin(b"key-bytes\n"), identity_dir="data",
+            models="make_upgrade_model\n")
+        self.assertEqual(rc, 5, out)
+        self.assertIn("is not absolute; identity continuity cannot be verified",
+                      out)
+        self._assert_untouched_upgrade_model()
+
+    def test_k23guard_phase7_refuses_a_served_id_that_differs(self):
+        good = model_pin(b"key-bytes\n")
+        for label, served, expect_rc in (("match", good, "0"),
+                                         ("differs", model_pin(b"x"), "6")):
+            with self.subTest(case=label):
+                self.setUp()
+                self.driver_env["JOURNAL_PIN"] = served
+                rc, out = self._run_p7('"$REMOTE_BIN"', '"$REMOTE_BIN"',
+                                       identity_expect=good)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=" + expect_rc, out)
+                p7_out = (self.probe / "p7.out").read_text(encoding="utf-8")
+                exported = self.probe / "opt-ak" / "registry-id"
+                if expect_rc == "0":
+                    self.assertEqual(exported.read_text(encoding="utf-8").strip(),
+                                     good)
+                else:
+                    self.assertIn("the RUNNING registry serves " + served, p7_out)
+                    self.assertFalse(exported.exists(),
+                                     "a wrong served id is never exported")
+                self.doCleanups()
 
 
 class BaselineContrastTests(ProbeHarness):
@@ -6761,6 +7472,71 @@ class BaselineContrastTests(ProbeHarness):
         self.assertEqual(rc, 0, out)
         self.assertIn("registry-port occupant unit: none-detected", out,
                       "the round-3 chain lost the old registry unit (the parser gap)")
+
+    # -- K23 (round 24): the round-22 candidate's OWN chain reproduces -------
+    def test_k23_baseline_find_protocol_mismatch_loses_or_misroutes_sources(self):
+        # f578f39 executed with its OWN phase1/decisions/install against the
+        # REAL find producer: the ordinary source vanishes (none-found,
+        # fresh-install path) and, with the nested fixture, the DECOY bytes
+        # are what it migrates — the unmitigated K23-N1 failure.
+        base = self.baseline_text(PREV20_REV)
+        self._k23_source("/home/otheruser/.ak-sending", "synthetic-ordinary")
+        res = self._k23_chain("b23o", ["otheruser"], text=base, rev=PREV20_REV)
+        self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+        self.assertNotIn("registry-data:", res["phase1_out"])
+        self.assertEqual(res["data_source"], "")
+        self.assertIsNone(self._k23_dest("registry.key"))
+        self.setUp()
+        base = self.baseline_text(PREV20_REV)
+        self._k23_source("/home/otheruser/.ak-sending", "synthetic-ordinary")
+        self._k23_source("/home/home/otheruser/.ak-sending",
+                         "synthetic-nested-decoy")
+        res = self._k23_chain("b23n", ["otheruser", "home"], text=base,
+                              rev=PREV20_REV)
+        self.assertIn("registry-data: /home//home/otheruser/.ak-sending",
+                      res["phase1_out"])
+        self.assertEqual(res["install_rc"], 0)
+        self.assertEqual(self._k23_dest("registry.key"),
+                         "synthetic-nested-decoy-key")
+
+    def test_k23_baseline_symlinked_home_reads_as_empty(self):
+        base = self.baseline_text(PREV20_REV)
+        target = self._k23_symlink_home()
+        live = target / "otheruser" / ".ak-sending"
+        live.mkdir(parents=True)
+        (live / "registry.key").write_text("synthetic-ordinary-key",
+                                           encoding="utf-8")
+        # The real default -P producer emits NO record for the link start.
+        res = self._k23_chain("b23s", [], text=base, rev=PREV20_REV)
+        self.assertEqual(res["phase1_rc"], 0, res["phase1_out"])
+        self.assertNotIn("registry-data:", res["phase1_out"])
+        self.assertEqual(res["data_source"], "")
+        self.assertIsNone(self._k23_dest("registry.key"))
+
+    def test_k23_baseline_bracket_empty_home_falsely_refuses(self):
+        base = self.baseline_text(PREV20_REV)
+        (self.probe / "home" / "spare[1]").mkdir()
+        res = self._k23_chain("b23b", ["spare[1]"], text=base, rev=PREV20_REV)
+        # The real tool's SAME-path ENOENT does not match the case pattern
+        # (K23-N3). Under the real producer the round-23 tip also doubles the
+        # prefix (K23-N1); the false refusal is the same either way.
+        self.assertEqual(res["phase1_rc"], 3, res["phase1_out"])
+        self.assertRegex(res["phase1_out"],
+                         r"cannot determine existence of /home/(/home/)?"
+                         r"spare\[1\]/\.ak-sending \(ls: cannot access "
+                         r"'/home/(/home/)?spare\[1\]/\.ak-sending': "
+                         r"No such file or directory\)")
+
+    def test_k23_baseline_listen_substring_masks_a_real_difference(self):
+        base = self.baseline_text(PREV20_REV)
+        sp = (" --id-dir /home/otheruser/--port"
+              " --db-path /home/otheruser/--id-dir.sqlite")
+        got = self._k23_reg_args(base, [
+            ("port-masked", "x registry-server --port 18200" + sp,
+             "x registry-server --port 17200" + sp)])
+        self.assertEqual(got["port-masked"][0], 0,
+                         "the greedy sed reads '--db-path' as the port on both "
+                         "sides and accepts a real port difference")
 
 
 if __name__ == "__main__":

@@ -1520,3 +1520,69 @@ Android 辅助 runner 的采样调整已经在 `bd61553` 入库，原文“workt
 | 提交 | 内容 |
 |---|---|
 | `6964239` | --id-dir token 化+语法门泛化、home 枚举按行读；复核方文档同步与执行方本节记录入库 |
+
+## 49. 修复轮二十一独立复核证据（2026-11-16）
+
+固定范围 `714099a..a369e1c`，实现与文档提交 `6964239`，完整 tip 为 `a369e1c250cd64c80922683ef82dd3e983416c7a`。机制、归属和主复核逐字重放代码见 [K22 复核](REVIEW_2026-11-16-batchK22.zh-CN.md)，逐项裁决只在审核状态表。本轮报告、本文、STATUS、状态表及 K21 历史归属补注仅本地同步；没有修改被审实现。
+
+| 行为证据 | 实际执行 | 结果与边界 |
+|---|---|---|
+| K21-N1 原始完整链 | 从 K21 §5.1 抽取 `original-replay.py`，固定当前 a369e1c 并按修复更新期望；110bb34 自身完整链 | 5 案全部断言吻合：当前空格/等号与普通控制迁移 runtime-real-key/db，字面身份和 ReadWritePaths 正确；基线两拼写仍误绑 runtime-old/--port、复制 substring-decoy 并生成坏 argv。旧 active 状态捕获与 stop 均检查。 |
+| K21-N1 语法与相对字面控制 | `helper-matrix.sh`、`literal-controls.py`、`cli-probes.py` | helper 17 案：7 种非法形态各放两侧均 rc3，3 合法控制 rc0；相对 state/--id-dir 两拼写及 --id-dir=--id-dir 共 3 案全链正确。真实 git a369e1c CLI 共 17 探针覆盖 grammar、原合法形态、坏基线 argv 及新缺口：语法错误 rc2，合法形态在合成无效 key 加载处 rc1，未启动服务。 |
+| K21-N2 原始完整链 | 从 K21 §5.2 抽取 `review_home.py`，真实 GNU ls 列出合成目录 | 7 案 ALL_EXPECTATIONS_MATCHED，121.485 秒。当前空格有/无诱饵保持整条候选，预安装白名单拒绝；空格+普通及两普通拒绝多候选；普通单目录正确迁移；714099a/110bb34 自身链仍复制前缀诱饵并 enable。无 live occupant/stop。 |
+| K22-N1 主复核完整链 | 报告 §6.1 逐字 `review_compose.py`；`compose-main/results.json` | 7 案 ALL_EXPECTATIONS_MATCHED，exit0，210.984 秒。a369e1c/714099a/110bb34 × DB 两拼写均全链0、stop旧active、迁移真实key/db，却生成缺少真正id-dir的unit；普通DB控制正确补参数。专项独立执行相同矩阵，结果一致。 |
+| K22-N1 主复核真实 CLI | 报告 §6.2 `review_cli.py`；本轮 Windows debug git a369e1c | 8 探针 ALL_EXPECTATIONS_MATCHED，exit0，0.453 秒。六个缺省身份生成argv在新合成环境读取 new-service-home/.ak-sending/registry.key（26字节）；普通DB控制读取已迁移opt-ak/data/registry.key（16字节）；原命令旧环境读取old-runtime-home/.ak-sending/registry.key（19字节）。均在非32字节合成key处预设失败、rc1，无bind/spawn。 |
+| K22-N2 主复核 LF 边界 | 报告 §6.3 `review_home_lf.py`；真实 MSYS mkdir/GNU ls，`home-lf-main/results.json` | 7 案 ALL_EXPECTATIONS_MATCHED，exit0，96.172 秒。当前/714099a/110bb34的LF+普通均漏计LF来源、实际复制普通key/db并enable；LF单候选按none-found继续enable但无真实key生成；tab+普通、两普通拒绝；ls失败phase1=3。专项同矩阵93.937秒一致。NTFS backing名由MSYS映射U+F00A/U+F009，ls输出实际含LF/tab。 |
+| K22-N3 主复核诊断边界 | 报告 §6.4 `review_home_diag.py`；现有 LS_PERMDENY_PATH 离线故障注入 | 当前3案 ALL_EXPECTATIONS_MATCHED，exit0，32.656秒：错误文本目录名被拒绝探测时仍全链0、选普通源、复制并enable；相同拒绝置普通目录名时phase1=3；特殊名可读则多候选拒绝。专项3案32.828秒一致。无真实权限请求、无live occupant/stop。 |
+| K22-N3 基线层级 | 报告 §6.5 `review_home_diag_helper.py`；`home-diag-helper-main/helper-results.json` | a369e1c/714099a/110bb34各自生成的helper，3版本共6探针，exit0，4.594秒。原始Permission denied均rc2；错误文本名误转no/rc0，普通名返回错误rc2。只属函数级对照，未称旧版完整链。 |
+| 新缺口归属 | 固定源码与 git blame | K22-N1的存在性grep来自dbb46fc；K22-N2的ls producer来自e8b621a，当前read consumer为6964239；K22-N3诊断分类来自46473fc。前两项三版本自身完整链、后一项当前完整链+三版本helper，分别证明既有缺口。 |
+
+| 本机门槛 | 实际命令 / 范围 | 结果与边界 |
+|---|---|---|
+| Python全集 | `python -m unittest discover -s scripts/tests -v` | 326/326，0failure/error/skip，exit0；unittest2128.547秒，runner2128.984秒。部署169、NAT lifecycle11、streak51、netem24、repository64、SSH7。单次完整运行无重试；实现始终固定tip，后段仅本轮审核文档同步。 |
+| 仓库与契约初检 | `python scripts/check_repository.py`；`python scripts/check_contracts.py` | 固定tip均exit0，分别2.734秒、0.141秒；92md/345 local links/50状态行，契约5/5。文档收尾另列。 |
+| Shell | deploy/cross_nat 的 `bash -n` 与 `--self-test` | 全部exit0：deploy syntax0.063秒/self8.828秒，cross_nat syntax0.078秒/self4.688秒。自检无SSH/传输；cross_nat使用现有release git1e59342，不称tip release重建。 |
+| Rust常规 | `cargo test --locked --workspace`；fmt；clippy；rustdoc；Windows build，CARGO_NET_OFFLINE=true | 全部exit0，单次无重试：含doctest1200passed/0failed/8ignored，563.891秒；`cargo fmt --all -- --check`3.875秒；`cargo clippy --locked --workspace --all-targets -- -D warnings`28.828秒；`RUSTDOCFLAGS=-D warnings cargo doc --locked --workspace --no-deps`23.422秒；`cargo build --locked --workspace`37.250秒。 |
+| Rust特性 | `cargo test --locked -p ak-store --features sqlite`；`cargo test --locked -p ak-signal --features server-persistence` | 全部exit0：sqlite54passed/5.391秒，persistence含doctest219passed/48.328秒。 |
+| Flutter/Dart与本机FFI | `cargo build --locked -p ak-ffi --release`；Flutter analyze/test；Dart包test | 全部exit0：FFI release缓存有效构建0.875秒；Flutter analyze --no-pub无问题15.500秒；app test --no-pub 220/220、30.281秒；Dart包test170/170、8.500秒。 |
+| 实现范围与工具 | `git diff --exit-code 714099a..a369e1c -- crates Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows` | exit0。Rust/cargo1.99.1，Python3.12.10，Git Bash5.3.15，Flutter3.47.9/Dart3.13.7。shellcheck未找到，未执行。 |
+
+| GitHub / Git / 文档 | 固定对象或命令 | 结果 |
+|---|---|---|
+| tip CI | `a369e1c250cd64c80922683ef82dd3e983416c7a`；[43843267284](https://github.com/wmqfl861/AK-sending/actions/runs/43843267284) | 当前git凭据查询head_sha runs、精确run与jobs API。首次2026-11-16T09:54:21Z为in_progress；10:02:32Z查询确认completed/success，attempt1，updated_at10:02:12Z，branch=dev/batch-k-20261114。13jobs=12success/1manual skipped，121steps全部success；每个job head_sha精确一致。 |
+| CI证据边界 | 固定tip run/jobs JSON | Linux/Windows Rust、Flutter/Dart、Android双ABI FFI/符号/debug APK、Linux/macOS portability、audit/deny、repository、legacy、NAT netns均success。manual release-deep依push事件skipped；portability是check，netns是模拟，均不当物理双机或原生部署验证。 |
+| 初始引用 | `git fetch origin --prune`；`git ls-remote --heads origin`；worktree/status | main=d6c71360784e1570720e56028a39f2a80777bb21；dev/batch-k-20261114=a369e1c250cd64c80922683ef82dd3e983416c7a。仅两个远端head，一个主worktree，初始工作区干净。 |
+| K21同步与hash回填 | `git diff 714099a..a369e1c`；`git show 6964239`、`git show a369e1c` | 6964239纳入K21报告、§47、STATUS、状态表及执行方§48；a369e1c只回填§48一行实现哈希。执行方历史本机运行保留为§48陈述，本轮从固定实现独立验证。 |
+| 权限与外部操作 | 只读GitHub API和Git引用查询 | 无真实权限拒绝；没有生产访问、SSH、merge/push/分支删除或强推。K22-N3仅是已有离线权限模型的失败注入。依据REJECTED保留分支和本地审核结果。 |
+| 文档收尾与最终引用 | 仓库/契约、diff检查、嵌入runner核对、最终refs | 收尾仓库检查exit0：93md/350 local links；契约5/5；git diff --check及实现diff均exit0。报告五份Python代码与主复核已执行runner逐字一致且compile通过，K状态行五列/真实提交号检查通过，专项交叉核对口径一致并纠正旧状态行时态。10:32Z再次fetch/prune与远端heads查询和初始一致；本地HEAD/main未移动，一个主worktree，仅五份审核文档变化。最终日志与命令结果保存于仓外close-checks.json。 |
+
+| 未执行 / 证据边界 | 本轮事实 |
+|---|---|
+| Release深测 | 本轮未重跑历史4096KiB/multistream chunk sweep超时及5GiB单项，沿用§45/47历史事实；不称超时已解决，不将常规通过扩大为深测通过。Rust与依赖未改。 |
+| 原生Linux部署、物理双机C4、抓包 | 未执行。Bash、生成脚本、文件操作、GNU ls、SQLite及CLI预设失败真实运行；proc/systemctl/权限为合成模型。未验证原生服务启动或产生真实新身份。 |
+| 其他平台本机重建 | Android/Linux/macOS本机未重建，对应固定tip CI结果单列；Windows实际构建单列。 |
+
+| 仓外材料（系统TEMP，无凭据） | 内容 |
+|---|---|
+| `ak-k22-root-eglujwed` | GitHub精确SHA历次runs/run/jobs响应与查询脚本；报告逐字runner、主复核compose/CLI/LF/诊断/helper完整产物、结果JSON、日志与计时。凭据只驻进程内存，不输出或落盘。 |
+| `ak-k22-id-review-6dk4zfb5` | K21身份原夹具、grammar矩阵、相对literal控制、K22-N1当前/基线完整链、真实CLI安全探针及各自结果JSON。 |
+| `ak-k22-home-177688c025d1432ba9a20e04e8300d43` | K21空格原夹具、LF真实目录/ls字节与完整链、诊断失败模型完整链及三版本helper；runner和合成文件。 |
+| `ak-k22-gates-8d63a5b74c2649f4b497a91fefc68564` | 本机门槛完整日志、命令/exit/耗时JSON、工具版本、固定SHA与范围检查；Python单次完整运行记录。 |
+
+## 50. 修复轮二十二（K22 复核后的新候选，执行方记录）
+
+[K22 复核](REVIEW_2026-11-16-batchK22.zh-CN.md)（K21-N1/N2 判通过；新发现 K22-N1 子串存在性、K22-N2 LF 名枚举、K22-N3 错误文本污染）后，执行方完成修复；复核方本地同步（§49、STATUS、状态表）与本节代码改动一并提交。
+
+| K22 发现 | 修复内容 |
+|---|---|
+| K22-N1（P1） | 新 `has_opt_token`（noglob token 遍历：独立 `--opt` token 或 `--opt=` 前缀 token 才算存在，绝不做另一选项值的子串）；compose_registry_exec 与决策 ReadWritePaths 守卫两处子串检测替换（全文件审计仅此两处）；末次身份核验：改写后的组合 argv 必须绑定 id-dir（无绑定拒绝），保留行原本无选项时绑定值必须等于迁移身份目录。复核夹具（db 参数名含 `--id-dir` 文本、真缺省）从「生成 unit 缺身份参数→CLI 读新 HOME 身份」翻转为组合行与生成 unit 均携带 `--id-dir <REMOTE_DATA>`（绑定值断言）；普通 db 与真存在 id-dir（恰一绑定不重复追加）控制保持；a369e1c/110bb34 双基线生成缺失身份 unit |
+| K22-N2（P2） | 枚举改 `find /home -mindepth 1 -maxdepth 1 -print0` 落临时文件（失败显式拒绝）+ `read -r -d ''`（NUL 边界对任意文件名字节无歧义）；含换行/CR 的候选**整名拒绝**（行制报告不可忠实承载）——不拆分、不静默丢弃，多候选/白名单路径不可绕过；stub 换 FIND_STUB（真实 find + argv[0] 保真，映射路径诊断改写）。复核夹具（LF 家目录、单独/与普通配对）从「拆成幻影记录→普通目录成唯一候选→拷贝+enable」翻转为整名拒绝且两种来源都不动；生产者失败拒绝、轮 22 空格/普通控制经 find 生产者保持；a369e1c 基线拆分拷贝 |
+| K22-N3（P2） | `priv_exists` 仅在工具诊断**精确匹配** `ls: cannot access '<PATH>': No such file or directory` 且路径逐字相等（引号段字面匹配、无 glob）时判缺失；任何其他形态（路径段不同、Permission denied、名字恰含该短语）一律不可判定→调用方拒绝；stub 以 `exec -a` 保真 argv[0] 并改写映射参数的诊断路径。复核夹具（名为该短语的目录+Permission denied）从「误判不存在→漏候选→拷普通源+enable」翻转为拒绝；普通名权限拒绝与真 ENOENT（全新安装继续）控制保持；双基线 helper 对照复现误分类 |
+
+### 修复轮二十三门禁与提交
+
+本地：`bash -n`+自检全过；Python 337/337（新增 8 项回归与 a369e1c/110bb34 双基线对照；两处生产者形态断言随 find 切换更新后全量重跑通过）；`check_repository.py` exit 0；契约 5/5；Rust 树与已验证链一致（本轮未改 Rust）。
+
+| 提交 | 内容 |
+|---|---|
+| （修复轮二十二首个提交，推送后回填哈希） | has_opt_token/末次身份核验、find -print0 枚举、锚定 ENOENT 分类；复核方文档同步与执行方本节记录入库 |

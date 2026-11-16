@@ -461,7 +461,9 @@ compose_registry_exec() { # existing-exec-or-empty
   if [ "$old_exe" != "$REMOTE_BIN" ]; then
     warn "existing unit executable '$old_exe' is replaced by the newly installed $REMOTE_BIN (arguments preserved; K 复核 K-R2)"
   fi
-  if printf '%s' "$old_args" | grep -q -- '--id-dir'; then
+  # K 复核 K22-N1 (round 23): TOKEN-form presence — a --db-path VALUE named
+  # '…--id-dir.sqlite' is not an identity option; the append must fire.
+  if has_opt_token "$old_args" --id-dir; then
     printf '%s\n' "$REMOTE_BIN$old_args"
   else
     printf '%s\n' "$REMOTE_BIN$old_args --id-dir $REMOTE_DATA"
@@ -496,6 +498,26 @@ bound_id_dir() {
   done
   set +f
   printf '%s\n' "$bi_val"
+}
+# has_opt_token <line> <option>: 0 when the line carries the option as a
+# FULL TOKEN — a standalone '--opt' or a '--opt=…' prefix token — never a
+# substring inside another option's VALUE (K 复核 K22-N1, round 23): a
+# '--db-path /home/otheruser/--id-dir.sqlite' value made the old
+# 'grep -q -- --id-dir' judge the identity option PRESENT, so the composed
+# unit silently DROPPED --id-dir and the service read a NEW identity under
+# the CLI default (USERPROFILE|HOME + '.ak-sending' — main.rs:709) instead
+# of the migrated data dir. Noglob walk (K20-N1 discipline).
+has_opt_token() {
+  local hot_tok hot_opt
+  hot_opt="$2"
+  set -f
+  for hot_tok in $1; do
+    case "$hot_tok" in
+      "$hot_opt"|"$hot_opt="*) set +f; return 0 ;;
+    esac
+  done
+  set +f
+  return 1
 }
 # id_binding_invalid <line>: the driver-side --id-dir grammar gate, the same
 # discipline as phase1's db/id helpers (K 复核 K21-N1, round 22). Error
@@ -843,11 +865,27 @@ self_test() {
     || fail "the id-dir grammar refusals must cite the CLI's own error (K21-N1)"
   grep -q 'the --id-dir rewrite did not take' "$0" \
     || fail "the id rewrite must verify the OPTION-BOUND value (K21-N1)"
-  # K 复核 K21-N2 (round 22): /home candidates iterate LINES, never words —
-  # a legal spaced home directory stays ONE candidate (word splitting also
-  # silently bypassed the multi-candidate refusal).
-  grep -q 'while IFS= read -r home_dir' "$WORK/p1.sh" \
-    || fail "home enumeration must iterate ls lines, not words (K21-N2)"
+  # K 复核 K21-N2/K22-N2 (rounds 22/23): /home candidates iterate WHOLE
+  # NUL-delimited records (find -print0), never words or LF-split lines; a
+  # name the line-based report cannot carry refuses as ONE candidate.
+  grep -q 'while IFS= read -r -d .. home_dir' "$WORK/p1.sh" \
+    || fail "home enumeration must iterate NUL-delimited records (K22-N2)"
+  grep -q 'find /home -mindepth 1 -maxdepth 1 -print0' "$WORK/p1.sh" \
+    || fail "the enumeration producer must be find -print0 (K22-N2)"
+  grep -q 'cannot carry faithfully' "$WORK/p1.sh" \
+    || fail "an LF-carrying home name must refuse as one whole candidate (K22-N2)"
+  # K 复核 K22-N1 (round 23): option PRESENCE is token-form — a VALUE merely
+  # containing the option text never counts — and the final argv must bind
+  # the identity option.
+  grep -q 'has_opt_token' "$0" \
+    || fail "option presence must be detected on full tokens (K22-N1)"
+  grep -q 'carries no --id-dir binding' "$0" \
+    || fail "the composed ExecStart must be verified to bind the identity (K22-N1)"
+  # K 复核 K22-N3 (round 23): 'absent' requires the tool's exact quoted-path
+  # ENOENT diagnostic for the EXACT probed path; anything else is
+  # undeterminable.
+  grep -q "ls: cannot access '" "$WORK/p1.sh" \
+    || fail "the ENOENT classification must anchor to the exact quoted-path diagnostic (K22-N3)"
   # K 复核 K13-N1: decision-derived paths baked into generated scripts must
   # be shell-safe or refused before the switchover (the guard lives in
   # real_run's decision block, so grep THIS script).
@@ -1136,8 +1174,17 @@ priv_exists() {
   pe_rc=0
   pe_out=\$(sudo -n env LC_ALL=C ls -d "\$1" 2>&1) || pe_rc=\$?
   if [ "\$pe_rc" = 0 ]; then echo yes; return 0; fi
+  # K 复核 K22-N3 (round 23): 'absent' is decided ONLY by the tool's exact
+  # diagnostic FORM for the EXACT probed path — GNU ls emits
+  # "ls: cannot access '<PATH>': No such file or directory" with the path
+  # single-quoted. The old anywhere-substring match let a directory merely
+  # NAMED 'No such file or directory' turn a Permission-denied diagnostic
+  # into 'absent' (the candidate was dropped and another source migrated).
+  # ANY other shape — a path portion that differs, an escaped/quoting-
+  # mangled name, or a different errno text — is UNDETERMINABLE and the
+  # caller refuses. The probed path is matched LITERALLY (no globbing).
   case "\$pe_out" in
-    *"No such file or directory"*) echo no; return 0 ;;
+    "ls: cannot access '"\$1"': No such file or directory") echo no; return 0 ;;
     *) printf 'cannot determine existence of %s (%s)\\n' "\$1" "\$pe_out" >&2; return 2 ;;
   esac
 }
@@ -1936,8 +1983,22 @@ sig_line=\$(printf '%s\\n' "\$ss_tcp" | grep -E '[:.]7100\b' | head -1 || true)
 # determine answer for a candidate identity path fails the preflight BEFORE
 # a switchover — a blocked or permission-denied probe must never read as
 # "no identity".
-home_list=\$(sudo -n ls -1 /home 2>/dev/null) \\
-  || { echo "ERROR: cannot enumerate /home (sudo -n ls failed); refusing before any switchover (K2-R3)" >&2; exit 3; }
+# K 复核 K22-N2 (round 23): NUL-delimited enumeration — 'ls -1' cannot
+# distinguish a newline INSIDE a directory name from the record separator,
+# so a legal '/home/other<LF>user' split into phantom records ('/home/other',
+# '/home/user'), the real candidate was silently DROPPED, and the ordinary
+# directory became the 'only' candidate (defeating the multi-candidate
+# refusal). 'find -print0' emits one NUL-terminated record per actual
+# directory entry — unambiguous for ANY filename bytes — and 'read -r -d ""'
+# consumes exactly those records. A name whose bytes cannot ride the
+# line-based report below is SEEN as one candidate and REFUSED here,
+# never silently dropped. The producer's own failure still refuses phase1.
+home_nul=\$(mktemp /tmp/ak-home-nul.XXXXXX)
+if ! sudo -n find /home -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "\$home_nul"; then
+  rm -f "\$home_nul"
+  echo "ERROR: cannot enumerate /home (sudo -n find failed); refusing before any switchover (K2-R3/K22-N2)" >&2
+  exit 3
+fi
 # K 复核 K21-N2 (round 22): candidates iterate LINES, never words — the
 # round-21 'for d in ... \$home_ak_dirs' loop still ran word splitting, so a
 # legal home named 'other user' split into '/home/other' plus a stray
@@ -1962,10 +2023,24 @@ registry_data_probe() {
 }
 registry_data_probe "$REMOTE_DATA"
 registry_data_probe /root/.ak-sending
-while IFS= read -r home_dir || [ -n "\$home_dir" ]; do
+# K 复核 K21-N2 (round 22): candidates iterate WHOLE RECORDS, never words —
+# a legal home named 'other user' is ONE candidate (word splitting made the
+# prefix '/home/other' a phantom candidate and migrated its decoy).
+# K 复核 K22-N2 (round 23): the records are NUL-delimited (see above), and
+# a name carrying a newline/CR — bytes this deploy's LINE-based report
+# cannot carry faithfully — is refused HERE, as one whole candidate,
+# instead of being split or silently dropped.
+cr_lf=\$'\\n\\r'
+while IFS= read -r -d '' home_dir || [ -n "\$home_dir" ]; do
   [ -n "\$home_dir" ] || continue
+  if [[ "\$home_dir" == *[\$cr_lf]* ]]; then
+    rm -f "\$home_nul"
+    echo "ERROR: the /home candidate '\$home_dir' contains a byte (newline/carriage return) this deploy's line-based report cannot carry faithfully; refusing before any switchover (K22-N2)" >&2
+    exit 3
+  fi
   registry_data_probe "/home/\$home_dir/.ak-sending"
-done < <(printf '%s\\n' "\$home_list")
+done < "\$home_nul"
+rm -f "\$home_nul"
 # K 复核 K-R2: install steps run as this NON-ROOT SSH user through sudo -n;
 # prove NOW — before anything is stopped — that the install path is usable
 # through exactly that path (read-only mounts or restricted sudoers must
@@ -2823,8 +2898,11 @@ real_run() {
   # K 复核 K21-N1 (round 22): token-bound extraction — the greedy sed bound
   # '--port' as the identity dir when the legal path ENDED in the literal
   # '--id-dir', pointing ReadWritePaths at the WRONG directory.
+  # K 复核 K22-N1 (round 23): TOKEN-form presence — a --db-path VALUE merely
+  # containing the text '--id-dir' is not an identity option and must not
+  # divert ReadWritePaths either.
   REG_RW=$REMOTE_DATA
-  if [ -n "$existing_exec" ] && printf '%s' "$existing_exec" | grep -q -- '--id-dir'; then
+  if [ -n "$existing_exec" ] && has_opt_token "$existing_exec" --id-dir; then
     REG_RW=$(bound_id_dir "$existing_exec")
     [ -n "$REG_RW" ] || REG_RW=$REMOTE_DATA
   fi
@@ -3111,6 +3189,21 @@ real_run() {
              note "ReadWritePaths extended to cover the resolved db object: $REG_RW (K15-N1)" ;;
         esac ;;
     esac
+  fi
+  # K 复核 K22-N1 (round 23): verify the FINAL argv actually binds the
+  # identity option — compose appends '--id-dir $REMOTE_DATA' when the
+  # preserved line lacks it, but a --db-path VALUE merely CONTAINING the
+  # option text used to suppress the append (substring presence), and the
+  # generated unit ran under the CLI default identity (USERPROFILE|HOME +
+  # '.ak-sending', main.rs:709) — a DIFFERENT home than the migrated data.
+  # The bound value must exist, and when the preserved line carried no
+  # identity option it must BE the migrated data dir.
+  rid_final=$(bound_id_dir "$REGISTRY_EXEC")
+  if [ -z "$rid_final" ]; then
+    fail "the composed registry ExecStart carries no --id-dir binding (the service would fall back to the CLI default identity under a different home); refusing before any switchover (K22-N1)"
+  fi
+  if ! has_opt_token "${existing_exec:-}" --id-dir && [ "$rid_final" != "$REMOTE_DATA" ]; then
+    fail "the preserved ExecStart lacks --id-dir but the composed identity is '$rid_final' instead of the migrated $REMOTE_DATA; refusing before any switchover (K22-N1)"
   fi
 
   # ---- phase 4/5/6: install + systemd + firewall ----------------------------

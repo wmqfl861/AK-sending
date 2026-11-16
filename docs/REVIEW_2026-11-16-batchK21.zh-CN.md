@@ -4,6 +4,8 @@
 
 逐项裁决只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。实际命令、运行编号、计数、仓外材料及未执行范围统一记在 [K 交接 §47](HANDOFF-BATCH-K-2026-11-14.zh-CN.md#47-修复轮二十独立复核证据2026-11-16)。固定 tip CI 已通过 GitHub API 等到 completed/success；CI 与现有回归不能覆盖下述独立反例。本轮只同步本地审核文档，不修改被审实现，不创建提交、合并、推送或删除分支。以下行号均指固定 tip。
 
+> 归属补注（K22，2026-11-16）：本文及交接 §47、STATUS、审核状态表已随 `6964239` 纳入仓库，`a369e1c` 仅回填执行方 §48 的实现哈希；上文“本轮只同步本地”描述 K21 当时动作。后续复核见 [K22](REVIEW_2026-11-16-batchK22.zh-CN.md)。
+
 ## 1. K20 修复的实际效果
 
 `scripts/deploy_linux.sh` 的 phase1 `bound_db_arg`、`db_binding_invalid`、`/home` 枚举及 decision 的 DB 提取、改写、校验遍历均已限定在 `set -f` / `set +f` 内。用 K20 报告中的原始完整链夹具、分离的 phase1 cwd、真实方括号 SQLite 和普通名称诱饵重放，当前空格/等号拼写在本机 cwd 有/无匹配文件时都拒绝 **未展开的** `db[1].sqlite`，没有停服或生成 unit；普通文件名完整链正确。`110bb34` 自身 phase1→decision→install 则仍停服，并按生成 unit 中的参数读取到诱饵 SQLite。K20-N1 的精确修复有效。

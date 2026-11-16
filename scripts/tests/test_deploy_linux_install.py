@@ -90,7 +90,10 @@ PREV17_REV = "1d76871"  # round-18 tip (K19 findings: greedy db-value
                          # pre-parse, dangling/duplicate db bindings)
 PREV18_REV = "110bb34"  # round-20 tip (K20 findings: globbing in the token
                          # walks retargets a bracket db filename; empty and
-                         # option-shaped --db-path values accepted)  # round-17 tip (K18 findings: byte-evidence
+                         # option-shaped --db-path values accepted)
+PREV19_REV = "a369e1c"  # round-22 tip (K22 findings: substring option
+                         # presence drops --id-dir; LF homes split;
+                         # path-text pollution flips the ENOENT classifier)  # round-17 tip (K18 findings: byte-evidence
                          # producer error ignored, equals-form verification bug)  # round-16 tip (K17 findings: extraction-error
                          # passthrough, substring-split id-dir corruption)  # round-15 tip (K16 findings: partial-snapshot
                          # acceptance, extraction-error-as-absent, bracket
@@ -747,13 +750,68 @@ if [ "${1:-}" = "-1" ] && [ "$2" = "/home" ]; then
   exit 0
 fi
 mapped=()
+declare -A ls_orig_of=()
 for a in "$@"; do
   case "$a" in
-    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a") ;;
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a"); ls_orig_of["$PROBE_DIR$a"]="$a" ;;
     *) mapped+=("$a") ;;
   esac
 done
-exec "@REAL_LS@" "${mapped[@]}"
+# K 复核 K22-N3: the real tool reports the MAPPED path; rewrite each MAPPED
+# argument (in its quoted diagnostic form) back to the ORIGINAL request
+# path so the caller's exact-form ENOENT classification anchors to the path
+# it actually probed (a diagnostic whose path portion differs from the probe
+# is undeterminable by design). argv[0]='ls' keeps the deployment-shaped
+# 'ls: cannot access ...' prefix (an absolute-path invocation would print
+# '/usr/bin/ls:' instead).
+out=$(exec -a ls "@REAL_LS@" "${mapped[@]}" 2>&1)
+ls_rc=$?
+for mo in "${!ls_orig_of[@]}"; do
+  q_mo="'$mo'"
+  q_orig="'${ls_orig_of[$mo]}'"
+  out="${out//"$q_mo"/"$q_orig"}"
+done
+printf '%s\n' "$out"
+exit "$ls_rc"
+"""
+
+FIND_STUB = r"""#!/usr/bin/env bash
+set -u
+printf 'find %s\n' "$*" >> "$PROBE_DIR/stubs.log"
+if [ -n "${LS_FAIL_MATCH:-}" ]; then
+  case " $* " in
+    *" ${LS_FAIL_MATCH} "*) echo "sudo: find: blocked by stub (forced)" >&2; exit 1 ;;
+  esac
+fi
+# K 复核 K22-N2: the /home enumeration producer. FIND_HOME_FILE provides the
+# NUL-delimited listing VERBATIM (exact bytes — LF/tab/space names stay one
+# record); FIND_HOME_ENTRIES is the simple no-whitespace form.
+case " $* " in
+  *" /home "*)
+    if [ -n "${FIND_HOME_FILE:-}" ] && [ -f "$FIND_HOME_FILE" ]; then
+      cat "$FIND_HOME_FILE"
+      exit 0
+    fi
+    for e in ${FIND_HOME_ENTRIES:-otheruser}; do printf '%s\0' "$e"; done
+    exit 0 ;;
+esac
+mapped=()
+declare -A find_orig_of=()
+for a in "$@"; do
+  case "$a" in
+    /etc/*|/home/*|/root/*|/proc/*|/usr/lib/systemd/*|/lib/systemd/*|/run/systemd/*) mapped+=("$PROBE_DIR$a"); find_orig_of["$PROBE_DIR$a"]="$a" ;;
+    *) mapped+=("$a") ;;
+  esac
+done
+out=$(exec -a find "@REAL_FIND@" "${mapped[@]}" 2>&1)
+find_rc=$?
+for mo in "${!find_orig_of[@]}"; do
+  q_mo="'$mo'"
+  q_orig="'${find_orig_of[$mo]}'"
+  out="${out//"$q_mo"/"$q_orig"}"
+done
+printf '%s\n' "$out"
+exit "$find_rc"
 """
 
 STUBS = {
@@ -762,6 +820,7 @@ STUBS = {
     "uname": UNAME_STUB, "journalctl": JOURNALCTL_STUB, "ss": SS_STUB,
     "sleep": SLEEP_STUB, "test": TEST_STUB, "cp": CP_STUB, "cat": CAT_STUB,
     "sed": SED_STUB, "readlink": READLINK_STUB, "ls": LS_STUB, "mv": MV_STUB,
+    "find": FIND_STUB,
     "cmp": CMP_STUB,
     "chmod": CHMOD_STUB,
     "grep": GREP_STUB,
@@ -939,7 +998,8 @@ class ProbeHarness(unittest.TestCase):
             stub = self.probe / "bin" / name
             stub.write_text(body, encoding="utf-8", newline="\n")
             stub.chmod(0o755)
-        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp", "chmod", "grep"):
+        for tool in ("cp", "cat", "sed", "ls", "mv", "cmp", "chmod", "grep",
+                     "find"):
             real = _posix_tool(tool)
             self.assertTrue(real, f"real {tool} is required for the stubs")
             stub = self.probe / "bin" / tool
@@ -1541,14 +1601,39 @@ class ProbeHarness(unittest.TestCase):
             (live / "registry.db").write_text(db, encoding="utf-8")
         self._make_oldregistry_running()
 
-    def _make_k21_home_fixture(self, raw_homes: str, decoy: bool):
-        """K21-N2 reviewer fixture: a fresh host (no occupant, no units)
-        whose /home listing (LS_HOME_RAW, verbatim lines) may carry a
-        SPACED home name. The real candidate dir gets synthetic-existing-*
-        markers; when decoy=True the split-prefix directory /home/other
-        gets synthetic-split-decoy-* markers DIRECTLY inside it (what the
-        word-splitting loop probed)."""
-        for home in [h for h in raw_homes.split("\n") if h]:
+    @staticmethod
+    def _ntfs_backing(name: str) -> str:
+        """MSYS maps LF/tab to private-use code points in NTFS backing
+        names; native Python must use the backing name to inspect what the
+        POSIX name created (identity on non-Windows hosts)."""
+        return name.translate({10: 0xF00A, 9: 0xF009})
+
+    def _make_k21_home_fixture(self, homes, decoy: bool):
+        """K21-N2/K22-N2 reviewer fixture: a fresh host (no occupant, no
+        units) whose /home may carry SPACED or LF-carrying home names.
+        `homes` is an iterable of entry names. Each real candidate dir gets
+        synthetic-existing-* markers; when decoy=True the split-prefix
+        directory /home/other gets synthetic-split-decoy-* markers DIRECTLY
+        inside it (what the word-splitting loop probed)."""
+        for home in homes:
+            rel = "home/" + home + "/.ak-sending"
+            if "\n" in home or "\t" in home:
+                # Windows: create through MSYS bash so the POSIX spelling
+                # resolves for the stubs' real tools (the reviewer's
+                # protocol); native access uses the backing name.
+                script = (
+                    'mkdir -p "$P/' + rel + '"\n'
+                    'printf %s synthetic-existing-key '
+                    '> "$P/' + rel + '/registry.key"\n'
+                    'printf %s synthetic-existing-db '
+                    '> "$P/' + rel + '/registry.db"\n')
+                result = subprocess.run(
+                    [BASH, "--noprofile", "--norc", "-c", script],
+                    env=dict(os.environ, P=self.probe.as_posix()),
+                    capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0,
+                                 result.stderr.decode("utf-8", "replace"))
+                continue
             live = self.probe / "home" / home / ".ak-sending"
             live.mkdir(parents=True, exist_ok=True)
             (live / "registry.key").write_text("synthetic-existing-key",
@@ -1563,18 +1648,71 @@ class ProbeHarness(unittest.TestCase):
             (prefix / "registry.db").write_text("synthetic-split-decoy-db",
                                                 encoding="utf-8")
 
-    def _run_p1_homes(self, script: str, out: str, raw_homes: str):
-        """phase1 on a fresh host (SS_EMPTY) with a verbatim /home listing
-        (LS_HOME_FILE: exact bytes, one entry per line — spaced names stay
-        one ls record)."""
-        listing = self.probe / "ls-home-listing.txt"
-        listing.write_text(raw_homes, encoding="utf-8", newline="\n")
+    def _run_p1_homes(self, script: str, out: str, records):
+        """phase1 on a fresh host (SS_EMPTY) with a verbatim NUL-delimited
+        /home listing (FIND_HOME_FILE: exact bytes, one record per NUL —
+        spaced/LF names stay one find record). `records` is an iterable of
+        entry names; each may carry spaces or LF bytes."""
+        listing = self.probe / "find-home-nul.bin"
+        raw = b"".join(r.encode("utf-8") + b"\0" for r in records)
+        listing.write_bytes(raw)
         return self.generate_and_run_p456(
             'write_phase1 "$PROBE_DIR/' + script + '" '
             '|| { echo GEN_FAILED; exit 90; }' + chr(10)
-            + 'SS_EMPTY=1 LS_HOME_FILE=' + listing.as_posix()
+            + 'SS_EMPTY=1 FIND_HOME_FILE=' + listing.as_posix()
             + ' bash "$PROBE_DIR/' + script + '" '
             + '> "$PROBE_DIR/' + out + '" 2>&1; echo "RUN_RC=$?"' + chr(10))
+
+    def _make_k22_id_fixture(self, db_arg: str, sep: str = " "):
+        """K22-N1 reviewer fixture: unit AND running argv genuinely LACK
+        --id-dir while the --db-path VALUE contains the option text
+        ('/home/otheruser/--id-dir.sqlite'). The old service env pins
+        HOME=/home/otheruser (User=otheruser + Environment= + UnsetEnvironment=)
+        so phase1 derives the runtime identity from the environment; the
+        real identity dir holds runtime-real-* markers; the db file is a
+        real SQLite with marker row 'runtime-real'."""
+        args = "--port 17200 --db-path" + sep + db_arg
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser",
+                                "Environment=HOME=/home/otheruser",
+                                "UnsetEnvironment=USERPROFILE"],
+            environ=b"HOME=/home/otheruser\0USER=otheruser\0")
+        identity = "/home/otheruser/.ak-sending"
+        live = self.probe / identity.lstrip("/")
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("runtime-real-key", encoding="utf-8")
+        (live / "registry.db").write_text("runtime-real-db", encoding="utf-8")
+        import sqlite3
+        dbfile = self.probe / db_arg.lstrip("/")
+        dbfile.parent.mkdir(parents=True, exist_ok=True)
+        if dbfile.exists():
+            dbfile.unlink()
+        con = sqlite3.connect(dbfile)
+        con.execute("CREATE TABLE review_marker(value TEXT)")
+        con.execute("INSERT INTO review_marker VALUES ('runtime-real')",)
+        con.commit()
+        con.close()
+        self._make_oldregistry_running()
+
+    @staticmethod
+    def _has_id_dir_token(exec_line: str) -> bool:
+        tokens = exec_line.split()
+        return any(t == "--id-dir" or t.startswith("--id-dir=")
+                   for t in tokens)
+
+    @staticmethod
+    def _bound_id_of(exec_line: str) -> str:
+        """The value bound to --id-dir by full-token rules (test-side twin
+        of the script's bound_id_dir)."""
+        tokens = exec_line.split()
+        for i, t in enumerate(tokens):
+            if t == "--id-dir":
+                return tokens[i + 1] if i + 1 < len(tokens) else ""
+            if t.startswith("--id-dir="):
+                return t[len("--id-dir="):]
+        return ""
 
     def _k20_decision_of(self, configured: str, running: str, name: str,
                          baseline_rev: str = ""):
@@ -4438,8 +4576,8 @@ echo "C4=[$c4]"
         # fragment NEVER appears; the un-bakeable spaced name then refuses
         # pre-stop at the K13-N1 whitelist instead of silently migrating
         # the prefix decoy.
-        self._make_k21_home_fixture("other user", decoy=True)
-        rc, out = self._run_p1_homes("p1k21h.sh", "p1k21h.out", "other user")
+        self._make_k21_home_fixture(["other user"], decoy=True)
+        rc, out = self._run_p1_homes("p1k21h.sh", "p1k21h.out", ["other user"])
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1k21h.out").read_text(encoding="utf-8")
@@ -4476,9 +4614,9 @@ echo "C4=[$c4]"
         # must BOTH be reported, so the no-occupant multi-candidate
         # refusal fires (the word-splitting loop dropped the spaced one and
         # silently migrated the other).
-        self._make_k21_home_fixture("other user\notheruser", decoy=True)
+        self._make_k21_home_fixture(["other user", "otheruser"], decoy=True)
         rc, out = self._run_p1_homes("p1k21p.sh", "p1k21p.out",
-                                     "other user\notheruser")
+                                     ["other user", "otheruser"])
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1k21p.out").read_text(encoding="utf-8")
@@ -4497,8 +4635,8 @@ echo "C4=[$c4]"
     def test_k21n2_ordinary_home_still_migrates(self):
         # Ordinary control: a single plain-named home enumerates and
         # migrates exactly as before.
-        self._make_k21_home_fixture("otheruser", decoy=False)
-        rc, out = self._run_p1_homes("p1k21o.sh", "p1k21o.out", "otheruser")
+        self._make_k21_home_fixture(["otheruser"], decoy=False)
+        rc, out = self._run_p1_homes("p1k21o.sh", "p1k21o.out", ["otheruser"])
         self.assertEqual(rc, 0, out)
         self.assertIn("RUN_RC=0", out)
         p1_out = (self.probe / "p1k21o.out").read_text(encoding="utf-8")
@@ -4518,6 +4656,255 @@ echo "C4=[$c4]"
                          "synthetic-existing-key")
         self.assertEqual((dest / "registry.db").read_text(encoding="utf-8"),
                          "synthetic-existing-db")
+
+    # -- K22-N1 (round 23): option PRESENCE is token-form ---------------------
+    def test_k22n1_db_value_containing_id_dir_text_appends_identity(self):
+        # The reviewer's fixture: --id-dir genuinely ABSENT, the db argument
+        # named '/home/otheruser/--id-dir.sqlite'. The substring presence
+        # check suppressed the '--id-dir $REMOTE_DATA' append, and the
+        # generated unit ran under the CLI default identity (a DIFFERENT
+        # home than the migrated data). Token-form presence must append the
+        # identity binding — both spellings — while the db argument is
+        # preserved verbatim and the old data is migrated.
+        for i, sep in enumerate((" ", "=")):
+            with self.subTest(shape="space" if i == 0 else "equals"):
+                self.setUp()
+                arg = "/home/otheruser/--id-dir.sqlite"
+                self._make_k22_id_fixture(arg, sep=sep)
+                script = "p1k22i%d.sh" % i
+                outname = "p1k22i%d.out" % i
+                rc, out = self.generate_and_run_p456(
+                    'write_phase1 "$PROBE_DIR/' + script + '" '
+                    '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                    + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                    + 'bash "$PROBE_DIR/' + script + '" '
+                    + '> "$PROBE_DIR/' + outname + '" 2>&1; '
+                    + 'echo "RUN_RC=$?"' + chr(10))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out)
+                p1_out = (self.probe / outname).read_text(encoding="utf-8")
+                self.assertIn("  runtime-id-dir: /home/otheruser/.ak-sending",
+                              p1_out)
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-decision-k22i%d.sh" % i)
+                self.assertEqual(rc, 0, out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertTrue(
+                    self._has_id_dir_token(chosen_exec),
+                    "the composed ExecStart must CARRY the identity option "
+                    "(the db value merely containing the text is not an "
+                    "option): " + chosen_exec)
+                id_val = self._bound_id_of(chosen_exec)
+                probe_m = re.search(r"^PROBE=(\S+)$", out, re.MULTILINE)
+                self.assertTrue(probe_m, out)
+                self.assertEqual(
+                    id_val, probe_m.group(1) + "/opt-ak/data",
+                    "a genuinely absent --id-dir must bind the MIGRATED "
+                    "data dir")
+                self.assertIn(arg, chosen_exec,
+                              "the db argument is preserved verbatim")
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry,
+                    "p456k22i%d" % i,
+                    data_source="/home/otheruser/.ak-sending")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log())
+                p456_out = (self.probe / ("p456k22i%d.out" % i)).read_text(
+                    encoding="utf-8")
+                self.assertIn("oldregistry:exists:enabled:active", p456_out)
+                dest = self.probe / "opt-ak" / "data"
+                self.assertEqual(
+                    (dest / "registry.key").read_text(encoding="utf-8"),
+                    "runtime-real-key",
+                    "the old identity data is still migrated correctly")
+                self.assertEqual(
+                    (dest / "registry.db").read_text(encoding="utf-8"),
+                    "runtime-real-db")
+                unit = (self.probe
+                        / "etc/systemd/system/ak-registry-server.service") \
+                    .read_text(encoding="utf-8")
+                unit_exec = [l for l in unit.splitlines()
+                             if l.startswith("ExecStart=")][0]
+                self.assertTrue(
+                    self._has_id_dir_token(unit_exec),
+                    "the generated unit must carry the identity argument "
+                    "(the reviewer's real-CLI probe showed the missing form "
+                    "reads a NEW identity under the new service home)")
+                self.doCleanups()
+
+    def test_k22n1_ordinary_db_filename_control_appends_identity(self):
+        # Ordinary control: with a plain db filename the append fired even
+        # before the fix — it must keep firing (token-form presence behaves
+        # identically on clean input).
+        self._make_k22_id_fixture("/home/otheruser/ordinary.sqlite")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1k22ord.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+            + 'bash "$PROBE_DIR/p1k22ord.sh" '
+            + '> "$PROBE_DIR/p1k22ord.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k22ord.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k22ord.sh")
+        self.assertEqual(rc, 0, out)
+        chosen_exec = self._chosen_of(out)[0]
+        self.assertTrue(self._has_id_dir_token(chosen_exec))
+
+    def test_k22n1_existing_id_dir_not_duplicated(self):
+        # A genuine --id-dir on the preserved line is still detected as
+        # PRESENT — exactly one binding survives (no duplicate append).
+        args = "--port 17200 --id-dir /home/otheruser/.ak-sending"
+        self.make_private_discovery_model(
+            main_exec="/opt/ak-sending/ak-cli registry-server " + args,
+            cmdline_extra=args,
+            unit_service_lines=["User=otheruser"],
+            environ=b"HOME=/home/otheruser\0USERPROFILE=/home/otheruser\0")
+        live = self.probe / "home/otheruser/.ak-sending"
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "registry.key").write_text("runtime-real-key", encoding="utf-8")
+        (live / "registry.db").write_text("runtime-real-db", encoding="utf-8")
+        rc, out = self.generate_and_run_p456(
+            'write_phase1 "$PROBE_DIR/p1k22dup.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'bash "$PROBE_DIR/p1k22dup.sh" '
+            + '> "$PROBE_DIR/p1k22dup.out" 2>&1; echo "RUN_RC=$?"' + chr(10))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k22dup.out").read_text(encoding="utf-8")
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k22dup.sh")
+        self.assertEqual(rc, 0, out)
+        chosen_exec = self._chosen_of(out)[0]
+        n_bindings = sum(1 for t in chosen_exec.split()
+                         if t == "--id-dir" or t.startswith("--id-dir="))
+        self.assertEqual(n_bindings, 1,
+                         "a genuine --id-dir must be detected PRESENT and "
+                         "never duplicated: " + chosen_exec)
+        self.assertIn("--id-dir /home/otheruser/.ak-sending", chosen_exec)
+
+    # -- K22-N2 (round 23): NUL-delimited /home enumeration -------------------
+    def test_k22n2_lf_home_candidate_refuses_whole_never_dropped(self):
+        # The reviewer's fixture: a legal home name containing a REAL LF.
+        # 'ls -1' cannot separate it from the record separator; find -print0
+        # keeps it ONE record, and the deploy REFUSES on the un-carriable
+        # byte instead of silently dropping the candidate (which let the
+        # ordinary directory become the 'only' source and defeated the
+        # multi-candidate refusal). Both the LF-only and LF+ordinary
+        # pairings refuse; nothing is copied or enabled.
+        for label, records in (("lf-only", ["other\nuser"]),
+                               ("lf-paired", ["other\nuser", "otheruser"])):
+            with self.subTest(case=label):
+                self.setUp()
+                self._make_k21_home_fixture(records, decoy=False)
+                rc, out = self._run_p1_homes("p1k22lf.sh", "p1k22lf.out",
+                                             records)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=3", out,
+                              "an LF-carrying home name must refuse as ONE "
+                              "whole candidate, never be split or dropped")
+                p1_out = (self.probe / "p1k22lf.out").read_text(
+                    encoding="utf-8")
+                self.assertIn("contains a byte (newline/carriage return)",
+                              p1_out)
+                self.assertIn("'other\nuser'", p1_out,
+                              "the refusal names the WHOLE candidate")
+                self.assertNotIn("registry-data: /home/otheruser", p1_out)
+                self.assertNotIn("systemctl enable", self.stubs_log())
+                self.assertFalse(
+                    (self.probe / "opt-ak" / "data" / "registry.key").exists(),
+                    "no source may be migrated while a candidate cannot be "
+                    "carried faithfully")
+                real = (self.probe / "home"
+                        / self._ntfs_backing("other\nuser") / ".ak-sending"
+                        / "registry.key")
+                self.assertEqual(real.read_text(encoding="utf-8"),
+                                 "synthetic-existing-key")
+                self.doCleanups()
+
+    def test_k22n2_find_producer_failure_refuses(self):
+        # The producer's own failure still refuses phase1 (K2-R3 semantics
+        # preserved across the ls -> find switch).
+        self._make_k21_home_fixture(["otheruser"], decoy=False)
+        self.driver_env["LS_FAIL_MATCH"] = "/home"
+        try:
+            rc, out = self._run_p1_homes("p1k22fail.sh", "p1k22fail.out",
+                                         ["otheruser"])
+        finally:
+            self.driver_env.pop("LS_FAIL_MATCH", None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1k22fail.out").read_text(encoding="utf-8")
+        self.assertIn("ERROR: cannot enumerate /home", p1_out)
+        self.assertNotIn("systemctl enable", self.stubs_log())
+
+    # -- K22-N3 (round 23): anchored ENOENT classification --------------------
+    def test_k22n3_error_text_dirname_with_permission_denied_refuses(self):
+        # The reviewer's fixture: a directory NAMED 'No such file or
+        # directory' plus a Permission-denied diagnostic for its candidate.
+        # The old anywhere-substring classifier read the diagnostic as
+        # 'absent', dropped the candidate and migrated the ordinary one.
+        # The anchored classifier refuses (undeterminable) instead.
+        homes = ["No such file or directory", "otheruser"]
+        self._make_k21_home_fixture(homes, decoy=False)
+        self.driver_env["LS_PERMDENY_PATH"] = \
+            "/home/No such file or directory/.ak-sending"
+        try:
+            rc, out = self._run_p1_homes("p1k22diag.sh", "p1k22diag.out",
+                                         homes)
+        finally:
+            self.driver_env.pop("LS_PERMDENY_PATH", None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out,
+                      "a path-text-polluted Permission-denied diagnostic is "
+                      "UNDETERMINABLE, never 'absent'")
+        p1_out = (self.probe / "p1k22diag.out").read_text(encoding="utf-8")
+        self.assertIn(
+            "cannot determine existence of "
+            "/home/No such file or directory/.ak-sending", p1_out)
+        self.assertNotIn("registry-data:", p1_out)
+        self.assertNotIn("systemctl enable", self.stubs_log())
+        self.assertFalse((self.probe / "opt-ak" / "data" / "registry.key")
+                         .exists(), "nothing may be copied")
+        ordinary = (self.probe / "home" / "otheruser" / ".ak-sending"
+                    / "registry.key")
+        self.assertEqual(ordinary.read_text(encoding="utf-8"),
+                         "synthetic-existing-key",
+                         "the ordinary source stays in place")
+
+    def test_k22n3_ordinary_name_permission_denied_still_refuses(self):
+        # Control (reviewer-verified): the same permission error on an
+        # ORDINARY name refused before and must keep refusing.
+        self._make_k21_home_fixture(["otheruser"], decoy=False)
+        self.driver_env["LS_PERMDENY_PATH"] = "/home/otheruser/.ak-sending"
+        try:
+            rc, out = self._run_p1_homes("p1k22perm.sh", "p1k22perm.out",
+                                         ["otheruser"])
+        finally:
+            self.driver_env.pop("LS_PERMDENY_PATH", None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=3", out)
+        p1_out = (self.probe / "p1k22perm.out").read_text(encoding="utf-8")
+        self.assertIn("cannot determine existence of "
+                      "/home/otheruser/.ak-sending", p1_out)
+
+    def test_k22n3_genuine_enoent_still_classifies_absent(self):
+        # Control: a candidate that genuinely does not exist still reads
+        # ABSENT (the anchored diagnostic form matches) and the fresh
+        # install proceeds.
+        rc, out = self._run_p1_homes("p1k22eno.sh", "p1k22eno.out",
+                                     ["ghosthome"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1k22eno.out").read_text(encoding="utf-8")
+        self.assertNotIn("cannot determine existence", p1_out)
+        self.assertNotIn("registry-data:", p1_out)
+        rc, out = self.run_decision_and_config(p1_out,
+                                               "driver-decision-k22eno.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("CHOSEN_DATA_SOURCE=", out)
 
     # -- K2-R2: phase 7 verifies the RUNNING process --------------------------
     def _run_p7(self, live_path: str, exe_map_expr: str, short_sha: str = "deadbee",
@@ -4632,7 +5019,10 @@ echo "C4=[$c4]"
         self.assertIn("sudo -n ss -ltnp", log)
         self.assertIn("sudo -n ss -lunp", log)
         self.assertIn("sudo -n cat /proc/4242/cgroup", log)
-        self.assertIn("sudo -n ls -1 /home", log)
+        # K 复核 K22-N2 (round 23): the /home enumeration producer is
+        # find -print0 (NUL-delimited records), no longer 'ls -1'.
+        self.assertIn(
+            "sudo -n find /home -mindepth 1 -maxdepth 1 -print0", log)
         self.assertIn("sudo -n env LC_ALL=C ls -d /home/otheruser/.ak-sending/registry.key", log)
         n_ss = len([l for l in log.splitlines() if l.startswith("ss ")])
         n_sudo_ss = len([l for l in log.splitlines() if l.startswith("sudo -n ss ")])
@@ -4673,7 +5063,10 @@ echo "C4=[$c4]"
         self.make_private_discovery_model()
         body = (
             'write_phase1 "$PROBE_DIR/p1.sh" || { echo GEN_FAILED; exit 90; }\n'
-            'LS_FAIL_MATCH="-1 /home" bash "$PROBE_DIR/p1.sh" '
+            # K 复核 K22-N2 (round 23): the producer is now find -print0;
+            # '/home' still matches its first argument (the enumeration
+            # fails before any candidate probe runs).
+            'LS_FAIL_MATCH="/home" bash "$PROBE_DIR/p1.sh" '
             '> "$PROBE_DIR/p1.out" 2>&1; echo "RUN_RC=$?"\n'
         )
         rc, out = self.generate_and_run_p456(body)
@@ -5944,7 +6337,7 @@ class BaselineContrastTests(ProbeHarness):
         # the spaced home splits into '/home/other' + a stray fragment, the
         # PREFIX decoy becomes the only candidate, and the full chain
         # migrates the decoy and enables the new units (the defect).
-        self._make_k21_home_fixture("other user", decoy=True)
+        self._make_k21_home_fixture(["other user"], decoy=True)
         listing = self.probe / "ls-home-listing.txt"
         listing.write_text("other user", encoding="utf-8", newline="\n")
         text = self.baseline_text(PREV18_REV)
@@ -5991,6 +6384,174 @@ class BaselineContrastTests(ProbeHarness):
                          "synthetic-existing-key",
                          "the real spaced source stayed in place, never "
                          "migrated (the defect's other half)")
+
+    def test_k22n1_round21_tip_generates_missing_identity_unit(self):
+        # K22-review contrast: a369e1c (and 110bb34) on the reviewer's
+        # fixture — the substring presence check reads the '--id-dir.sqlite'
+        # DB VALUE as an identity option, the composed unit DROPS --id-dir
+        # (the service would read the CLI default identity under a
+        # DIFFERENT home — the reviewer's real-CLI probe), while the old
+        # data is still migrated and the old service stopped.
+        for rev, i, sep in ((PREV19_REV, 0, " "), (PREV19_REV, 1, "="),
+                            (PREV18_REV, 2, " ")):
+            with self.subTest(rev=rev, shape="space" if sep == " " else "equals"):
+                self.setUp()
+                self._make_k22_id_fixture("/home/otheruser/--id-dir.sqlite",
+                                          sep=sep)
+                text = self.baseline_text(rev)
+                script = "p1prev22i%d.sh" % i
+                outname = "p1prev22i%d.out" % i
+                rc, out = self.run_driver(
+                    self.phase_defs(text, rev) + BOX_MODELS,
+                    'write_phase1 "$PROBE_DIR/' + script + '" '
+                    '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+                    + 'PROC_CWD_MAP="/proc/4242/cwd=/home/runtime-old" '
+                    + 'bash "$PROBE_DIR/' + script + '" '
+                    + '> "$PROBE_DIR/' + outname + '" 2>&1; '
+                    + 'echo "RUN_RC=$?"' + chr(10),
+                    name="driver-prev22i%d.sh" % i)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("RUN_RC=0", out)
+                p1_out = (self.probe / outname).read_text(encoding="utf-8")
+                self.assertIn("  runtime-id-dir: /home/otheruser/.ak-sending",
+                              p1_out)
+                rc, out = self.run_decision_and_config(
+                    p1_out, "driver-prev22i-decision%d.sh" % i, text=text,
+                    origin=f"the {rev} baseline")
+                self.assertEqual(
+                    rc, 0,
+                    f"the {rev} tip accepted the line (the defect): " + out)
+                chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+                self.assertFalse(
+                    self._has_id_dir_token(chosen_exec),
+                    "the substring presence check suppressed the --id-dir "
+                    "append (the defect): " + chosen_exec)
+                rc, out = self._install_with_chosen(
+                    chosen_exec, chosen_rw, old_registry,
+                    "p456prev22i%d" % i, text=text, rev=rev,
+                    data_source="/home/otheruser/.ak-sending")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("INSTALL_RC=0", out)
+                self.assertIn("systemctl stop", self.stubs_log(),
+                              "the old active service was still stopped (the "
+                              "defect's harm)")
+                dest = self.probe / "opt-ak" / "data"
+                self.assertEqual(
+                    (dest / "registry.key").read_text(encoding="utf-8"),
+                    "runtime-real-key",
+                    "the data migration itself was correct — only the "
+                    "generated argv lost the identity binding")
+                unit = (self.probe
+                        / "etc/systemd/system/ak-registry-server.service") \
+                    .read_text(encoding="utf-8")
+                unit_exec = [l for l in unit.splitlines()
+                             if l.startswith("ExecStart=")][0]
+                self.assertFalse(
+                    self._has_id_dir_token(unit_exec),
+                    "the generated unit carries NO identity argument — the "
+                    "CLI default identity (a different home) would be read "
+                    "(the reviewer's real-CLI probe at the fixed tips)")
+                self.doCleanups()
+
+    def test_k22n2_round21_tip_splits_lf_home_and_copies(self):
+        # K22-review contrast: a369e1c's ls -1 line enumeration cannot
+        # separate the LF INSIDE '/home/other<LF>user' from the record
+        # separator — the phantom records do not exist, the ordinary
+        # directory becomes the 'only' candidate and is migrated+enabled
+        # while the real LF-named source stays in place.
+        self._make_k21_home_fixture(["other\nuser", "otheruser"], decoy=False)
+        listing = self.probe / "ls-home-listing.txt"
+        listing.write_bytes(b"other\nuser\notheruser\n")
+        text = self.baseline_text(PREV19_REV)
+        rc, out = self.run_driver(
+            self.phase_defs(text, PREV19_REV) + BOX_MODELS,
+            'write_phase1 "$PROBE_DIR/p1prev22lf.sh" '
+            '|| { echo GEN_FAILED; exit 90; }' + chr(10)
+            + 'SS_EMPTY=1 LS_HOME_FILE=' + listing.as_posix()
+            + ' bash "$PROBE_DIR/p1prev22lf.sh" '
+            + '> "$PROBE_DIR/p1prev22lf.out" 2>&1; echo "RUN_RC=$?"'
+            + chr(10),
+            name="driver-prev22lf.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RUN_RC=0", out)
+        p1_out = (self.probe / "p1prev22lf.out").read_text(encoding="utf-8")
+        self.assertEqual(
+            [x for x in p1_out.splitlines() if x.startswith("registry-data:")],
+            ["registry-data: /home/otheruser/.ak-sending (key:yes db:yes)"],
+            "the LF-carrying home was SPLIT into phantom records and never "
+            "probed as one candidate (the defect)")
+        rc, out = self.run_decision_and_config(
+            p1_out, "driver-prev22lf-decision.sh", text=text,
+            origin=f"the {PREV19_REV} baseline")
+        self.assertEqual(rc, 0,
+                         "the split made the ordinary dir the 'only' "
+                         "candidate (the defect): " + out)
+        chosen_exec, chosen_rw, old_registry = self._chosen_of(out)
+        rc, out = self._install_with_chosen(
+            chosen_exec, chosen_rw, old_registry, "p456prev22lf",
+            text=text, rev=PREV19_REV,
+            data_source="/home/otheruser/.ak-sending")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("INSTALL_RC=0", out)
+        self.assertIn("systemctl enable --now", self.stubs_log())
+        dest = self.probe / "opt-ak" / "data"
+        self.assertEqual((dest / "registry.key").read_text(encoding="utf-8"),
+                         "synthetic-existing-key",
+                         "the ORDINARY directory was migrated (the defect)")
+        real = (self.probe / "home"
+                / self._ntfs_backing("other\nuser") / ".ak-sending"
+                / "registry.key")
+        self.assertEqual(real.read_text(encoding="utf-8"),
+                         "synthetic-existing-key",
+                         "the real LF-named source stayed in place, never "
+                         "migrated (the defect's other half)")
+
+    def test_k22n3_baseline_helpers_misclassify_error_text_dirname(self):
+        # K22-review helper-level contrast (reviewer §6.5): the priv_exists
+        # extracted from the BASELINES' own generated phase1 flips a
+        # Permission-denied diagnostic for a directory NAMED 'No such file
+        # or directory' into 'absent' (VALUE=no RC=0); the current helper
+        # classifies BOTH that and the ordinary name as undeterminable
+        # (VALUE empty RC=2) so the preflight refuses.
+        error_home = "No such file or directory"
+        body = (
+            'write_phase1 "$PROBE_DIR/p1.sh"\n'
+            "sed -n '/^priv_exists() {/,/^}/p' "
+            '"$PROBE_DIR/p1.sh" > "$PROBE_DIR/priv-exists.sh"\n'
+            '. "$PROBE_DIR/priv-exists.sh"\n'
+            "for path in '/home/" + error_home + "/.ak-sending' "
+            "'/home/ordinary/.ak-sending'; do\n"
+            '  export LS_PERMDENY_PATH="$path"\n'
+            "  set +e\n"
+            '  val=$(priv_exists "$path" 2> "$PROBE_DIR/helper-err")\n'
+            "  rc=$?\n"
+            '  printf \'PATH=%s VALUE=%s RC=%s\\n\' "$path" "$val" "$rc"\n'
+            "done\n")
+        # Current tree: BOTH shapes are undeterminable (refuse).
+        rc, out = self.run_driver(self.definitions() + BOX_MODELS, body,
+                                  name="driver-prev22h-current.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PATH=/home/" + error_home + "/.ak-sending VALUE= RC=2",
+                      out,
+                      "the anchored classifier treats the polluted "
+                      "diagnostic as UNDETERMINABLE, never absent")
+        self.assertIn("PATH=/home/ordinary/.ak-sending VALUE= RC=2", out)
+        for rev in (PREV19_REV, PREV18_REV):
+            with self.subTest(rev=rev):
+                self.setUp()
+                text = self.baseline_text(rev)
+                rc, out = self.run_driver(
+                    self.phase_defs(text, rev) + BOX_MODELS, body,
+                    name=f"driver-prev22h-{rev}.sh")
+                self.assertEqual(rc, 0, out)
+                self.assertIn(
+                    "PATH=/home/" + error_home + "/.ak-sending VALUE=no RC=0",
+                    out,
+                    f"the {rev} helper misclassified the path-text-polluted "
+                    "Permission-denied diagnostic as absent (the defect)")
+                self.assertIn("PATH=/home/ordinary/.ak-sending VALUE= RC=2",
+                              out)
+                self.doCleanups()
 
     def test_k12n1_round11_candidate_swallows_key_chmod_failure(self):
         # K12-review contrast: 1fad0a2 (post-move) swallows the key-chmod

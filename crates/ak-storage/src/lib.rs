@@ -35,7 +35,34 @@
 //! reserved namespace: a manifest rel_path that names it is rejected at
 //! prepare, so received content can never land inside (and be deleted by)
 //! the engine's terminal staging cleanup.
-#![forbid(unsafe_code)]
+//!
+//! # Lazy part-file handles (M-N1, batch N 2026-11-17)
+//!
+//! A prepared sink holds NO open file descriptor: `prepare` opens the part
+//! file only to verify the resume prefix (and truncate it to the verified
+//! length), records the file's platform identity, and closes it. The
+//! descriptor is (re)opened at the first `write_chunk` and at `finish`,
+//! re-verified against the recorded identity, and closed again as soon as
+//! the content is durable. The engine prepares one sink per manifest entry
+//! before answering the ResumeRequest, so the old always-open handle made
+//! a 2,000-file receive fail under a 1,024-fd `ulimit -n` (M-N1, P1); now
+//! the number of simultaneously open part files is bounded by the number
+//! of actively transferring streams (1 single-stream, <= 4 multistream).
+//!
+//! Reopening is not a bare reopen-by-path: `ensure_not_symlink` re-runs
+//! immediately before the open, and the reopened file must still be THE
+//! SAME FILE prepare verified — compared by device number + inode on Unix
+//! and volume serial number + file index on Windows (`fstat` /
+//! `GetFileInformationByHandle`). A replaced part file fails closed
+//! instead of being written through.
+//!
+//! Unsafe policy (like ak-net's CR-P1-06): `deny` instead of `forbid` —
+//! the Windows identity query above needs `GetFileInformationByHandle`,
+//! and its hand-declared FFI is the ONE audited `unsafe` block in this
+//! crate (see `win_file_id`), individually `#[allow]`-ed with a SAFETY
+//! argument. Everything else stays unsafe-free; a stray `unsafe` anywhere
+//! else still fails the build.
+#![deny(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -185,6 +212,151 @@ fn conflict_err(path: &Path) -> io::Error {
     io::Error::new(
         ErrorKind::AlreadyExists,
         format!("conflict: {} already exists", path.display()),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Part-file identity (M-N1 lazy reopen check)
+// ---------------------------------------------------------------------------
+
+/// Platform identity of ONE open part-file descriptor: `(device, inode)`
+/// on Unix, `(volume serial number, file index)` on Windows. Equality is
+/// what the lazy reopen check (M-N1, batch N) relies on: a sink that
+/// closed its descriptor at prepare must refuse to write through a part
+/// path that now resolves to a different file. Both members come from the
+/// OPEN HANDLE (`fstat` / `GetFileInformationByHandle`), never from the
+/// path, so the comparison itself cannot be redirected.
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+
+/// Windows member of [`FileIdentity`]: `(volume serial number, file
+/// index)`. The volume serial is `Option` because `GetFileInformationByHandle`
+/// can report it as unknown on some filesystems; the file index then
+/// carries the comparison (same volume, same index).
+#[cfg(windows)]
+type FileIdentity = (Option<u32>, u64);
+
+/// Query the platform file identity of an open descriptor.
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    // Handle-bound fstat: no path is involved, so a path swap cannot
+    // influence which file is measured.
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Windows identity query via `GetFileInformationByHandle`. std exposes
+/// exactly this (`MetadataExt::volume_serial_number` / `file_index`) only
+/// behind the still-unstable `windows_by_handle` feature (tracking issue
+/// #63010, still unstable on the pinned 1.99.1), so the single kernel32
+/// call is declared here by hand. This is the crate's ONE audited
+/// `unsafe` block (M-N1), mirroring ak-net's CR-P1-06 discipline.
+#[cfg(windows)]
+mod win_file_id {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// `BY_HANDLE_FILE_INFORMATION`, laid out as ten `DWORD`s so every
+    /// member (including the three `FILETIME`s, each two `DWORD`s) keeps
+    /// the C struct's 4-byte alignment on both 32- and 64-bit Windows.
+    /// Only the two members the identity check needs are named.
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        _attributes: u32,
+        _creation_time: [u32; 2],
+        _last_access_time: [u32; 2],
+        _last_write_time: [u32; 2],
+        volume_serial: u32,
+        _size_high: u32,
+        _size_low: u32,
+        _number_of_links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        /// <https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle>
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    /// `(volume serial number, file index)` of the file `file` holds open.
+    /// This function is the crate's single audited `unsafe` site.
+    #[allow(unsafe_code)]
+    pub(super) fn identity(file: &File) -> io::Result<(Option<u32>, u64)> {
+        let mut information = ByHandleFileInformation {
+            _attributes: 0,
+            _creation_time: [0; 2],
+            _last_access_time: [0; 2],
+            _last_write_time: [0; 2],
+            volume_serial: 0,
+            _size_high: 0,
+            _size_low: 0,
+            _number_of_links: 0,
+            index_high: 0,
+            index_low: 0,
+        };
+        // SAFETY: `file.as_raw_handle()` is a live owned handle of `file`
+        // (borrowed outlives the call), and `information` is a valid,
+        // fully-initialized (zeroed above) `repr(C)` mirror of
+        // `BY_HANDLE_FILE_INFORMATION` of the correct 40-byte size and
+        // 4-byte alignment, so the call writes only within bounds. The
+        // return value is checked; on failure the untouched struct is
+        // never read for results.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let index = (u64::from(information.index_high) << 32) | u64::from(information.index_low);
+        Ok((Some(information.volume_serial), index))
+    }
+}
+
+/// Query the platform file identity of an open descriptor (Windows side).
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    win_file_id::identity(file)
+}
+
+/// No known identity primitive on this platform; part commits already
+/// refuse here (`commit_no_replace`), so the sink refuses earlier. Keeps
+/// the not(unix)-and-not(windows) build honest instead of silently
+/// comparing nothing.
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &File) -> io::Result<FileIdentity> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "part-file identity check is not implemented for this platform",
+    ))
+}
+
+/// Identity type for the fallback platform above (never constructed).
+#[cfg(not(any(unix, windows)))]
+type FileIdentity = ();
+
+/// The error returned when a part path no longer resolves to the file the
+/// sink's prepare verified: the reopen check must fail closed because
+/// writing through the new file would store received bytes into a file
+/// nobody verified (M-N1).
+fn part_replaced_err() -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidData,
+        "PART_REPLACED: the part path now resolves to a different file than the one prepare verified",
+    )
+}
+
+fn part_length_changed_err(actual: u64, expected: u64) -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "PART_LENGTH_CHANGED: part file holds {actual} bytes but the verified prefix is {expected} bytes"
+        ),
     )
 }
 
@@ -571,8 +743,16 @@ impl LocalSaveTarget {
             .truncate(false)
             .open(&part_path)?;
         let verified_prefix = verify_part_prefix(&mut file, &part_path, entry, chunk_size)?;
+        // M-N1: record the verified file's identity from the open handle,
+        // then CLOSE the descriptor. The sink reopens (and re-verifies
+        // identity) at the first chunk write and at finish, so a prepared
+        // sink costs no descriptor and a many-file receive holds at most
+        // one open part file per actively transferring stream.
+        let identity = file_identity(&file)?;
+        drop(file);
         let state = PartState {
-            file,
+            file: None,
+            identity,
             final_path,
             part_path,
             conflict,
@@ -824,7 +1004,15 @@ enum SinkKind {
 }
 
 struct PartState {
-    file: File,
+    /// Lazily (re)opened part-file descriptor (M-N1): `None` after
+    /// prepare and after finish, `Some` only while chunks are being
+    /// written. Keeps the number of simultaneously open part files
+    /// bounded by the active stream count instead of the manifest size.
+    file: Option<File>,
+    /// Identity of the part file observed at prepare (device + inode on
+    /// Unix, volume serial + file index on Windows). Every reopen must
+    /// observe the same identity or the sink fails closed.
+    identity: FileIdentity,
     final_path: PathBuf,
     part_path: PathBuf,
     conflict: ConflictPolicy,
@@ -841,6 +1029,63 @@ struct PartState {
     /// verified content is reused instead of surfacing as a conflict. The
     /// unstaged path keeps its exact historical behavior.
     staged: bool,
+}
+
+impl PartState {
+    /// Total bytes covered by the verified chunk prefix: 0 for zero
+    /// verified chunks, else the end of the last verified chunk's range.
+    /// This is the exact on-disk length `verify_part_prefix` truncated
+    /// the part file to at prepare, so it is also the length every
+    /// reopen must observe.
+    fn verified_prefix_bytes(&self) -> u64 {
+        if self.verified_prefix == 0 {
+            return 0;
+        }
+        ChunkPlan::new(self.size, self.chunk_size)
+            .range(self.verified_prefix - 1)
+            .map_or(0, |range| range.end)
+    }
+
+    /// Return the part-file descriptor, opening it if the sink currently
+    /// holds none (M-N1 lazy reopen). The reopen re-runs the pre-open
+    /// symlink check and then verifies BOTH that the opened file is the
+    /// same file prepare saw (platform identity, compared through the
+    /// open handle — never by path string) AND that its length still
+    /// equals the verified prefix. Anything else fails closed: received
+    /// bytes must never land in a file that was not verified here.
+    ///
+    /// Residual window (same as the prepare-time open, P1-2): std has no
+    /// openat2/no-follow open on Windows, so a swap between the symlink
+    /// check and the open is still possible — but the identity comparison
+    /// immediately after the open detects the swapped file, which the
+    /// always-open handle of the old design could never do.
+    fn open_part(&mut self) -> io::Result<&mut File> {
+        if self.file.is_none() {
+            // Re-validated immediately before the open (P1-2 posture).
+            ensure_not_symlink(&self.part_path)?;
+            // No `create`: prepare created the part file; a vanished part
+            // is an honest NotFound — the caller surfaces the error and a
+            // retry re-prepares from the (now shorter) on-disk prefix.
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.part_path)?;
+            let identity = file_identity(&file)?;
+            if identity != self.identity {
+                return Err(part_replaced_err());
+            }
+            let expected = self.verified_prefix_bytes();
+            let actual = file.metadata()?.len();
+            if actual != expected {
+                return Err(part_length_changed_err(actual, expected));
+            }
+            self.file = Some(file);
+        }
+        Ok(self
+            .file
+            .as_mut()
+            .expect("open_part just ensured the handle is Some"))
+    }
 }
 
 impl FileSink for LocalFileSink {
@@ -883,8 +1128,11 @@ impl FileSink for LocalFileSink {
             ));
         }
         if chunk_index == st.verified_prefix {
-            st.file.seek(SeekFrom::Start(range.start))?;
-            st.file.write_all(data)?;
+            // First write of this session reopens the part file (identity
+            // re-verified, M-N1); subsequent writes reuse the descriptor.
+            let file = st.open_part()?;
+            file.seek(SeekFrom::Start(range.start))?;
+            file.write_all(data)?;
             st.verified_prefix += 1;
             Ok(())
         } else if chunk_index < st.verified_prefix {
@@ -923,24 +1171,37 @@ impl FileSink for LocalFileSink {
         // no code path can store a larger one, but the allocation below is
         // guarded again anyway.
         ensure_chunk_size_within_cap(st.chunk_size)?;
-        st.file.rewind()?;
-        if st.size == 0 {
-            // Empty file: no heap buffer at all. The digest gate still
-            // catches stray bytes a previous session may have left in the
-            // part file (verify_part_prefix normally truncated them).
-            if st.file.metadata()?.len() != 0 || st.whole_digest != b3(b"") {
-                return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+        // M-N1: a finish without writes this session (fully resumed part)
+        // reopens the part file here, re-verifying identity and length.
+        {
+            let size = st.size;
+            let whole_digest = st.whole_digest;
+            let buf_len = streaming_buffer_len(st.chunk_size, size);
+            let file = st.open_part()?;
+            file.rewind()?;
+            if size == 0 {
+                // Empty file: no heap buffer at all. The digest gate still
+                // catches stray bytes a previous session may have left in the
+                // part file (verify_part_prefix normally truncated them).
+                if file.metadata()?.len() != 0 || whole_digest != b3(b"") {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+                }
+            } else {
+                // Bounded buffer: min(chunk_size, file size) — a file shorter
+                // than one chunk never allocates the full chunk size.
+                let mut buf = vec![0u8; buf_len];
+                if hash_reader(file, &mut buf)? != whole_digest {
+                    // Keep the part file: its verified prefix is still
+                    // reusable.
+                    return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
+                }
             }
-        } else {
-            // Bounded buffer: min(chunk_size, file size) — a file shorter
-            // than one chunk never allocates the full chunk size.
-            let mut buf = vec![0u8; streaming_buffer_len(st.chunk_size, st.size)];
-            if hash_reader(&mut st.file, &mut buf)? != st.whole_digest {
-                // Keep the part file: its verified prefix is still reusable.
-                return Err(io::Error::new(ErrorKind::InvalidData, "HASH_MISMATCH"));
-            }
+            file.sync_all()?;
         }
-        st.file.sync_all()?;
+        // M-N1: the content is durable; release the descriptor BEFORE the
+        // path-based commit steps below so the verify phase of a
+        // many-file job never holds more than one part descriptor.
+        st.file = None;
         // Every remaining part-path action below (mtime stamp, reuse
         // unlink, the hard-link claim) is a PATH operation: re-validate the
         // part path first. set_file_mtime follows symlinks and hard_link
@@ -1350,8 +1611,13 @@ impl LocalSaveTarget {
             .truncate(false)
             .open(&part_path)?;
         let verified_prefix = verify_part_prefix(&mut file, &part_path, entry, chunk_size)?;
+        // M-N1: same lazy-handle contract as the unstaged variant — record
+        // the identity observed on the open handle, then close it.
+        let identity = file_identity(&file)?;
+        drop(file);
         let state = PartState {
-            file,
+            file: None,
+            identity,
             final_path,
             part_path,
             conflict,
@@ -1471,6 +1737,52 @@ pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
         fs::remove_dir(&dir)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RLIMIT_NOFILE startup mitigation (M-N1)
+// ---------------------------------------------------------------------------
+
+/// Best-effort mitigation for M-N1 (batch N): raise this process's
+/// `RLIMIT_NOFILE` soft limit to its hard limit and return the new soft
+/// limit, or `None` when there was nothing to raise (already at the hard
+/// limit, no hard limit, a non-Unix platform, or a failed `setrlimit`).
+///
+/// This does NOT replace the real fix — since the lazy-handle rework a
+/// prepared sink holds no descriptor and a receive keeps at most one open
+/// part file per actively transferring stream — it merely widens the fd
+/// headroom of processes embedding this crate (the CLI binary and the FFI
+/// library call this once at startup). Never lowers any limit.
+///
+/// Unix implementation note: `rustix::process` is used because it wraps
+/// `getrlimit`/`setrlimit` in a safe API, which keeps this crate's
+/// `#![deny(unsafe_code)]` intact.
+#[cfg(unix)]
+pub fn raise_nofile_soft_limit_to_hard() -> Option<u64> {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let current = getrlimit(Resource::Nofile);
+    // `maximum == None` means "no hard limit": the soft limit cannot
+    // meaningfully bind, leave it alone. `current == None` (soft side
+    // unlimited) likewise needs nothing.
+    let hard = current.maximum?;
+    if current.current.is_none_or(|soft| soft >= hard) {
+        return None;
+    }
+    let raised = Rlimit {
+        current: Some(hard),
+        maximum: Some(hard),
+    };
+    match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => Some(hard),
+        Err(_) => None,
+    }
+}
+
+/// Windows has no `RLIMIT_NOFILE`-style per-process open-file budget, so
+/// the mitigation is a defined no-op (keeps call sites unconditional).
+#[cfg(not(unix))]
+pub fn raise_nofile_soft_limit_to_hard() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -3189,5 +3501,271 @@ mod tests {
         wf(&real_tree.join("d/x.akpart"), b"y");
         discard_staging(dst.path(), TASK_B).unwrap();
         assert!(!real_tree.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy part-file handles (M-N1, batch N 2026-11-17)
+    // -----------------------------------------------------------------------
+
+    /// Open descriptors of this process via /proc, or `None` on Unix
+    /// systems without it (macOS): the fd assertions below then reduce to
+    /// the white-box `file.is_none()` checks instead of passing vacuously.
+    /// Only ever used for BEFORE/AFTER deltas.
+    #[cfg(unix)]
+    fn open_fd_count() -> Option<u64> {
+        fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|entries| entries.count() as u64)
+    }
+
+    /// The receive engine prepares one sink per manifest entry before it
+    /// answers the ResumeRequest. M-N1: none of those prepared sinks may
+    /// hold an open descriptor — otherwise a 2,000-file job exhausts a
+    /// 1,024-fd `ulimit -n` exactly as the pre-fix receiver did.
+    #[test]
+    fn prepare_leaves_every_part_file_closed() {
+        let content = b"0123456789abcdef"; // 16 bytes, chunk 8 -> 2 chunks
+        let (_src, _source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+
+        // Unstaged variant: the very first prepare of a fresh entry.
+        let mut unstaged = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        match &unstaged.kind {
+            SinkKind::File(st) => {
+                assert!(
+                    st.file.is_none(),
+                    "unstaged prepare must close the part file"
+                );
+                // The part file itself exists on disk (resume artifact),
+                // just not as an open descriptor.
+                assert!(st.part_path.exists());
+            }
+            _ => panic!("expected a file sink"),
+        }
+        unstaged.finish().err().unwrap(); // incomplete: drop via error path
+
+        // Staged variant at scale: 128 prepared sinks, still zero open
+        // descriptors (white-box), and on Unix the process descriptor
+        // count does not move at all (black-box).
+        let mut entries = Vec::new();
+        for index in 0..128u32 {
+            let mut e = entry.clone();
+            e.rel_path = PathBuf::from(format!("f{index:03}.bin"));
+            entries.push(e);
+        }
+        #[cfg(unix)]
+        let before = open_fd_count();
+        let sinks: Vec<LocalFileSink> = entries
+            .iter()
+            .map(|e| {
+                target
+                    .prepare_file_staged(TASK_A, e, ConflictPolicy::Fail, cs(8))
+                    .unwrap()
+            })
+            .collect();
+        for sink in &sinks {
+            match &sink.kind {
+                SinkKind::File(st) => assert!(
+                    st.file.is_none(),
+                    "staged prepare must close the part file (M-N1)"
+                ),
+                _ => panic!("expected a file sink"),
+            }
+        }
+        #[cfg(unix)]
+        if let Some(before) = before {
+            assert_eq!(
+                open_fd_count(),
+                Some(before),
+                "128 prepared sinks must not hold any open descriptor (M-N1)"
+            );
+        }
+        drop(sinks);
+    }
+
+    /// Writing and finishing one file at a time — exactly the single
+    /// stream's access pattern — keeps the descriptor count flat: the
+    /// first write reopens the part, finish closes it again.
+    #[test]
+    fn sequential_write_finish_cycles_do_not_leak_descriptors() {
+        let content = b"0123456789abcdef"; // 2 chunks
+        let (_src, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+
+        let mut entries = Vec::new();
+        for index in 0..32u32 {
+            let mut e = entry.clone();
+            e.rel_path = PathBuf::from(format!("f{index:03}.bin"));
+            entries.push(e);
+        }
+        let mut sinks: Vec<LocalFileSink> = entries
+            .iter()
+            .map(|e| {
+                target
+                    .prepare_file_staged(TASK_A, e, ConflictPolicy::Fail, cs(8))
+                    .unwrap()
+            })
+            .collect();
+        #[cfg(unix)]
+        let before = open_fd_count();
+        for (sink, entry) in sinks.iter_mut().zip(&entries) {
+            write_all_chunks(sink, &source, entry);
+            sink.finish().unwrap();
+            match &sink.kind {
+                SinkKind::File(st) => {
+                    assert!(st.finished);
+                    assert!(
+                        st.file.is_none(),
+                        "finish must close the part descriptor again (M-N1)"
+                    );
+                }
+                _ => panic!("expected a file sink"),
+            }
+        }
+        #[cfg(unix)]
+        if let Some(before) = before {
+            assert_eq!(
+                open_fd_count(),
+                Some(before),
+                "32 write+finish cycles must not leak descriptors"
+            );
+        }
+        for entry in &entries {
+            assert_eq!(fs::read(dst.path().join(&entry.rel_path)).unwrap(), content);
+        }
+    }
+
+    /// A part path that no longer resolves to the file prepare verified
+    /// (different inode / file index — here: deleted and recreated) must
+    /// fail closed on BOTH lazy reopen sites: the first write and the
+    /// write-less finish of a fully resumed part.
+    #[test]
+    fn replaced_part_file_fails_closed_on_write_and_finish() {
+        let content = b"0123456789abcdef"; // 2 chunks
+        let (_src, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let part_path = dst.path().join("payload.bin.akpart");
+
+        // --- Write path: fresh prepare, then swap the part behind it. ---
+        let mut sink = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        fs::remove_file(&part_path).unwrap();
+        wf(&part_path, b"attacker-controlled"); // new inode / file index
+        let mut chunk0 = vec![0u8; 8];
+        assert_eq!(source.read_chunk(0, 0, &mut chunk0).unwrap(), 8);
+        let err = sink.write_chunk(0, &chunk0).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("PART_REPLACED"),
+            "reopen must reject a different file, got: {err}"
+        );
+        assert_eq!(sink.verified_prefix_chunks(), 0, "nothing was stored");
+        // The replacement file was not written through.
+        assert_eq!(fs::read(&part_path).unwrap(), b"attacker-controlled");
+
+        // --- Finish path: fully resumed part, swapped before finish. ---
+        let mut full = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        write_all_chunks(&mut full, &source, &entry);
+        drop(full); // interrupted after the last chunk, before commit
+
+        let mut resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(resumed.verified_prefix_chunks(), 2);
+        fs::remove_file(&part_path).unwrap();
+        wf(&part_path, b"attacker-controlled");
+        let err = resumed.finish().err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("PART_REPLACED"),
+            "write-less finish must reject a different file, got: {err}"
+        );
+        // No final name may appear from a part nobody verified.
+        assert!(!dst.path().join("payload.bin").exists());
+    }
+
+    /// Same inode / file index but a different length than the verified
+    /// prefix (someone appended or truncated by path between prepare and
+    /// the lazy reopen): fail closed instead of writing at an offset into
+    /// unknown company.
+    #[test]
+    fn part_length_changed_behind_our_back_fails_closed() {
+        let content = b"0123456789abcdef"; // 2 chunks
+        let (_src, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+        let part_path = dst.path().join("payload.bin.akpart");
+
+        let mut first = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        first.write_chunk(0, b"01234567").unwrap();
+        drop(first);
+
+        let mut resumed = target
+            .prepare_file_with_chunk_size(&entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(resumed.verified_prefix_chunks(), 1);
+        // Same file, three extra bytes: identity passes, length must not.
+        let mut part = fs::OpenOptions::new()
+            .append(true)
+            .open(&part_path)
+            .unwrap();
+        part.write_all(b"xyz").unwrap();
+        drop(part);
+
+        let mut chunk1 = vec![0u8; 8];
+        assert_eq!(source.read_chunk(0, 1, &mut chunk1).unwrap(), 8);
+        let err = resumed.write_chunk(1, &chunk1).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("PART_LENGTH_CHANGED"),
+            "reopen must reject a changed length, got: {err}"
+        );
+        assert_eq!(resumed.verified_prefix_chunks(), 1);
+    }
+
+    /// The healthy resume case the lazy reopen exists for: a previous
+    /// session verified the WHOLE part but died before finish; the new
+    /// session's prepare reports the full prefix and `finish` reopens
+    /// the untouched part (identity + length match) and commits it
+    /// without a single write this session.
+    #[test]
+    fn fully_resumed_part_finishes_by_reopening_without_writes() {
+        let content = b"0123456789abcdef"; // 2 chunks
+        let (_src, _source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+
+        let mut first = target
+            .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        // Drive the writes through the lazy reopen at least once, too.
+        first.write_chunk(0, b"01234567").unwrap();
+        first.write_chunk(1, b"89abcdef").unwrap();
+        drop(first); // crash before finish: full verified part survives
+
+        let mut resumed = target
+            .prepare_file_staged(TASK_A, &entry, ConflictPolicy::Fail, cs(8))
+            .unwrap();
+        assert_eq!(resumed.verified_prefix_chunks(), 2);
+        // No write_chunk call this session — finish must do the reopen.
+        resumed.finish().unwrap();
+        assert_eq!(fs::read(dst.path().join("payload.bin")).unwrap(), content);
+        match &resumed.kind {
+            SinkKind::File(st) => {
+                assert!(st.finished);
+                assert!(st.file.is_none(), "commit closes the descriptor");
+            }
+            _ => panic!("expected a file sink"),
+        }
     }
 }

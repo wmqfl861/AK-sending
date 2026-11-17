@@ -3924,6 +3924,13 @@ async fn stun_server_command(port: Option<u16>, bind: Option<BindArg>) -> Result
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // M-N1 mitigation (batch N): widen this process's fd headroom before
+    // any receive path can prepare part files. Pure mitigation — the real
+    // fix keeps at most one open part file per active stream — so a None
+    // return (nothing to raise / non-Unix / failed raise) is fine.
+    if let Some(limit) = ak_storage::raise_nofile_soft_limit_to_hard() {
+        log::info!("RLIMIT_NOFILE soft limit raised to {limit}");
+    }
     let cli = Cli::parse();
     // `registry-id` is read-only by contract: it resolves the identity
     // directory WITHOUT the create_dir_all every other command performs.

@@ -212,6 +212,13 @@ fn fail_buffer(need: usize, capacity: usize, what: &str) -> i32 {
 #[no_mangle]
 pub extern "C" fn ak_engine_new() -> *mut AkEngine {
     core::clear_last_error();
+    // M-N1 mitigation (batch N): widen the embedding process's fd
+    // headroom (RLIMIT_NOFILE soft -> hard) before any receive job can
+    // prepare part files. Pure mitigation — the storage layer itself now
+    // keeps at most one open part file per active stream — so a None
+    // return (nothing to raise / non-Unix / failed raise) is fine and
+    // never blocks engine creation.
+    let _ = ak_storage::raise_nofile_soft_limit_to_hard();
     let build = || {
         AkEngine::new().map_err(|error| {
             FfiError::internal(format!("cannot build the embedded tokio runtime: {error}"))

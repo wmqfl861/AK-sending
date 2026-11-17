@@ -15,5 +15,12 @@ filetime = "0.2"
 fs2 = "0.4"
 thiserror = { workspace = true }
 
+# M-N1 mitigation (batch N, 2026-11-17), Unix-only: safe (no `unsafe`)
+# getrlimit/setrlimit wrappers behind `raise_nofile_soft_limit_to_hard`,
+# which the CLI and FFI call at startup. Already present in Cargo.lock
+# transitively; default features off, `process` only.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 tempfile = "3"

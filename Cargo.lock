@@ -177,6 +177,7 @@ dependencies = [
  "blake3",
  "filetime",
  "fs2",
+ "rustix",
  "tempfile",
  "thiserror",
 ]

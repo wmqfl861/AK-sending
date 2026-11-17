@@ -178,3 +178,10 @@ Select-String -Path n1-run-*.log -Pattern 'no complete frame within' | Select-Ob
 
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
+| main 上批次 M 最终提交的 CI | `46ec56d` run [44037260448](https://github.com/wmqfl861/AK-sending/actions/runs/44037260448) | completed success（12 项常规任务 success，1 项手动深测 skipped） |
+| main 上批次 M 最终提交的 netem | `46ec56d` run [44037260481](https://github.com/wmqfl861/AK-sending/actions/runs/44037260481) | completed success |
+| N1 M2 确认（30 次循环） | 本地 Windows | **30/30 通过，0 失败**；无 "no complete frame within" 报错（Select-String 扫描零命中） |
+| N1 workspace | 本地 Windows | **1214 passed, 0 failed, 8 ignored** |
+| N2 ak-engine release 深测 | 本地 Windows | five_gib_sparse_file **通过**（253.24s） |
+| N2 ak-itests release 深测 | 本地 Windows | property_random 10 seeds **通过**（M7 确认）；25 seeds **通过**；20,000 文件 **通过**；**65,537 文件失败**：`send=Err(IdleTimeout(30s)) recv=Err(PeerClosed)`（142.55s，巨型 manifest 处理期间 sender 空闲超时——与 M-N1 的 EMFILE 是不同根因；N4 的句柄修复由 20K 通过+句柄清零证明） |
+| N4 M-N1 修复 | 本地 Windows | prepare 后进程句柄 **+0**（旧代码 +2000）；ak-storage 56 测试（+5 新）；t13 two_thousand 通过；CI 新增 ulimit -n 1024 回归步骤 |

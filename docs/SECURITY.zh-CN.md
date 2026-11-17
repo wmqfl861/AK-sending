@@ -96,7 +96,7 @@
 - 缓冲区容量协议：出参字符串写入调用方提供并声明容量的缓冲区，写入不越过声明容量，容量不足按协议显式报告（截断可见、可按需重试）而非越界；除显式释放 API 外不把 Rust 侧分配交给调用方 free，规避跨分配器释放。
 - 控制字符拒绝：跨边界显示字符串延续仓库两层注入防护（`ak-signal::codec`＋`ak-wire`，2026-11-03）——C0 控制字符（含 NUL）、DEL、C1 控制字符不得经设备名、路径、错误消息进入 UI 渲染；NUL 截断与终端转义序列无法借 FFI 边界绕过既有拒绝规则。
 - 句柄生命周期：句柄由 `ak_engine_new` 创建、内嵌 tokio 运行时随句柄存活，由显式 free API 释放；free 后使用与重复 free（double-free/use-after-free）属调用方契约违例，按 C ABI 语义为未定义行为（UB），不以"必然返回错误"作承诺——恰一次 free、free 后不再触碰句柄是调用方义务，各导出函数的 Rustdoc `# Safety` 节（`crates/ak-ffi/src/shim.rs`）逐条登记；边界处若有防御性检测，仅为尽力而为的诊断辅助，不构成可依赖的保证。
-- unsafe 收敛：`unsafe` 仅存在于 `ak-ffi` 的 shim 且逐块带 SAFETY 注释（仓库唯一例外，其余 crate 全部 `#![forbid(unsafe_code)]`），业务逻辑全部位于安全函数中，内存安全审计面集中在一层。
+- unsafe 收敛：允许 `unsafe` 的只有 `ak-ffi` 的 shim（逐块带 SAFETY 注释，仓库唯一的大面积例外）；另有两处在 crate 级 `#![deny(unsafe_code)]` 之下逐块审计放行的单点例外——`ak-net` 的 Unix sendmsg cmsg 站点（CR-P1-06）与 `ak-storage` 的 Windows `GetFileInformationByHandle` part 文件身份查询（M-N1，批次 N）——其余 crate 全部 `#![forbid(unsafe_code)]`；业务逻辑全部位于安全函数中，内存安全审计面集中在少数登记过的站点。
 
 ### 已知限制（截至 2026-11-03，实现验收后固化）
 

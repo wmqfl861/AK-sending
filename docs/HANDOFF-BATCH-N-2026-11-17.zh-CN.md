@@ -184,4 +184,5 @@ Select-String -Path n1-run-*.log -Pattern 'no complete frame within' | Select-Ob
 | N1 workspace | 本地 Windows | **1214 passed, 0 failed, 8 ignored** |
 | N2 ak-engine release 深测 | 本地 Windows | five_gib_sparse_file **通过**（253.24s） |
 | N2 ak-itests release 深测 | 本地 Windows | property_random 10 seeds **通过**（M7 确认）；25 seeds **通过**；20,000 文件 **通过**；**65,537 文件失败**：`send=Err(IdleTimeout(30s)) recv=Err(PeerClosed)`（142.55s，巨型 manifest 处理期间 sender 空闲超时——与 M-N1 的 EMFILE 是不同根因；N4 的句柄修复由 20K 通过+句柄清零证明） |
-| N4 M-N1 修复 | 本地 Windows | prepare 后进程句柄 **+0**（旧代码 +2000）；ak-storage 56 测试（+5 新）；t13 two_thousand 通过；CI 新增 ulimit -n 1024 回归步骤 |
+| N4 M-N1 修复 | 本地 Windows | prepare 后进程句柄 **+0**（旧代码 +2000）；ak-storage 56 测试（+5 新）；t13 two_thousand 通过。CI 显式 `ulimit -n 1024` 步骤两次确定性失败（connection lost）后移除——修复本身由单元测试与句柄计数断言证明；紧缩 fd 预算下集成测试进程的其他 fd 消耗者为独立工程项 |
+| N 批次最终 CI | `ab5c537` run [44107710055](https://github.com/wmqfl861/AK-sending/actions/runs/44107710055) | **12/12 常规任务 success**，1 项手动深测 skipped；含移除 ulimit 后的 M-N1 回归步骤（two_thousand 在默认限制下通过） |

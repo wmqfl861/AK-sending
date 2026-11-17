@@ -229,7 +229,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     CtrlFrame::new(message)
         .try_encode_as(Role::Server, &mut buf)
         .expect("fake server encodes legal frames");
-    writer.write_all(&buf).await
+    // Flush: over TLS a bare write_all can leave the record inside rustls
+    // until the next write (L-N3, review 2026-11-17).
+    writer.write_all(&buf).await?;
+    writer.flush().await
 }
 
 /// Server-side frame read.

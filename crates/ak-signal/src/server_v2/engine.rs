@@ -3741,6 +3741,10 @@ mod tests {
         /// The `Welcome.capabilities` this connection's Welcome carried
         /// (G6 tests assert the advertised bits).
         welcome_caps: u32,
+        /// `name@local-address`: which of possibly hundreds of test
+        /// connections a missed frame deadline belongs to (L-N3, review
+        /// 2026-11-17 — a deadline panic used to say only `Elapsed`).
+        label: String,
     }
 
     impl TestClient {
@@ -3777,6 +3781,7 @@ mod tests {
                 }
             };
             tcp.set_nodelay(true).expect("nodelay");
+            let label = format!("{name}@{}", tcp.local_addr().expect("client local address"));
             let connector = tls::client_config(registry_id).expect("pinned client config");
             let mut stream = connector
                 .connect(
@@ -3827,6 +3832,7 @@ mod tests {
                 stream,
                 key,
                 welcome_caps: 0,
+                label,
             };
             match client.recv().await {
                 CtrlMessage::Welcome { capabilities, .. } => {
@@ -3845,12 +3851,25 @@ mod tests {
 
         async fn recv(&mut self) -> CtrlMessage {
             let deadline = Duration::from_secs(10);
-            tokio::time::timeout(deadline, async {
+            match tokio::time::timeout(deadline, async {
                 let bytes = read_frame(&mut self.stream).await.unwrap().expect("frame");
                 CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message
             })
             .await
-            .expect("frame within deadline")
+            {
+                Ok(message) => message,
+                Err(_) => self.missed_deadline(deadline),
+            }
+        }
+
+        /// A frame deadline passed with the connection still open (an EOF
+        /// panics inside the read instead): name the connection.
+        fn missed_deadline(&self, deadline: Duration) -> ! {
+            panic!(
+                "{}: no complete frame within {deadline:?} and no EOF — a frame \
+                 stuck in flight, not a closed connection (L-N3)",
+                self.label
+            )
         }
     }
 
@@ -5331,12 +5350,15 @@ mod tests {
 
         async fn recv_frame(&mut self) -> CtrlFrame {
             let deadline = Duration::from_secs(10);
-            tokio::time::timeout(deadline, async {
+            match tokio::time::timeout(deadline, async {
                 let bytes = read_frame(&mut self.stream).await.unwrap().expect("frame");
                 CtrlFrame::decode_as(&bytes, Role::Client).unwrap()
             })
             .await
-            .expect("frame within deadline")
+            {
+                Ok(frame) => frame,
+                Err(_) => self.missed_deadline(deadline),
+            }
         }
     }
 

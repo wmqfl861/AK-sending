@@ -5,7 +5,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
@@ -28,6 +28,18 @@ pub(crate) enum Outbound {
     Frame(CtrlMessage),
     /// Best-effort TLS `close_notify`, then the writer exits.
     Shutdown,
+}
+
+/// Write one already-encoded frame and FLUSH it: when this returns, the
+/// frame has been handed to the transport (L-N3, review 2026-11-17 — the
+/// same contract as `server_v2::framing::write_frame`). Over TLS a bare
+/// `write_all` is not enough: tokio-rustls takes the plaintext into the
+/// session and reports success even while the socket is momentarily not
+/// writable, and the encrypted record then waits inside rustls for the
+/// next write on the stream, which an idle control connection never makes.
+async fn send_encoded<W: AsyncWrite + Unpin>(write: &mut W, encoded: &[u8]) -> io::Result<()> {
+    write.write_all(encoded).await?;
+    write.flush().await
 }
 
 /// Read exactly one v2 frame from any async reader. `Ok(None)` = clean EOF.
@@ -175,7 +187,7 @@ pub(crate) async fn open_connection(inner: &Arc<Inner>) -> Result<(), ClientV2Er
     CtrlFrame::new(hello)
         .try_encode_as(Role::Client, &mut buf)
         .map_err(ClientV2Error::Encode)?;
-    tokio::time::timeout(connect_timeout, stream.write_all(&buf))
+    tokio::time::timeout(connect_timeout, send_encoded(&mut stream, &buf))
         .await
         .map_err(|_| ClientV2Error::HandshakeTimeout(connect_timeout))?
         .map_err(ClientV2Error::Io)?;
@@ -276,7 +288,7 @@ async fn writer_loop(
                     log::warn!("client_v2: refusing to encode outbound frame: {e}");
                     continue;
                 }
-                if let Err(e) = write.write_all(&buf).await {
+                if let Err(e) = send_encoded(&mut write, &buf).await {
                     log::debug!("client_v2: write failed, dropping connection: {e}");
                     inner.on_disconnect(epoch);
                     return;
@@ -363,5 +375,53 @@ impl ClientV2 {
             .expect("client_v2 plane taps poisoned")
             .push(tx);
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// L-N3 (review 2026-11-17): the Hello and every writer-task frame go
+    /// through [`send_encoded`], which must not return while the frame is
+    /// still parked inside the TLS session (client transport momentarily
+    /// unwritable), and must deliver it once writable without any later
+    /// write on the stream.
+    #[tokio::test]
+    async fn send_encoded_returns_only_after_the_frame_left_tls() {
+        let crate::test_support::GatedTlsPair {
+            mut client,
+            client_gate: gate,
+            mut server,
+            ..
+        } = crate::test_support::gated_tls_pair().await;
+        let mut encoded = Vec::new();
+        CtrlFrame::new(CtrlMessage::Ping { nonce: [5; 16] })
+            .try_encode_as(Role::Client, &mut encoded)
+            .unwrap();
+        let expected = encoded.clone();
+
+        gate.close();
+        let writer =
+            tokio::spawn(async move { send_encoded(&mut client, &encoded).await.map(|()| client) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "send_encoded reported success for a frame still buffered inside TLS"
+        );
+
+        gate.open();
+        let _client = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the write completes once the transport is writable")
+            .unwrap()
+            .expect("the write succeeds");
+        let received = tokio::time::timeout(Duration::from_secs(5), read_v2_frame(&mut server))
+            .await
+            .expect("the frame reaches the server without a later write")
+            .unwrap()
+            .expect("a frame, not EOF");
+        assert_eq!(received, expected, "byte-identical frame on the wire");
     }
 }

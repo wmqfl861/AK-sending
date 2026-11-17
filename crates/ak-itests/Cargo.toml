@@ -18,6 +18,9 @@ ak-wire = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# L-N4 (review 2026-11-17): the netem bench enables `ak_net=info` so the
+# obtained UDP socket buffer sizes (CR-P3-19) reach the evidence log.
+env_logger = { workspace = true }
 tokio = { workspace = true }
 # Invite-pairing itests (wave 21/22): the shared pairing orchestration
 # layer (PairingOrchestrator + RegistryClient) driven cross-boundary from

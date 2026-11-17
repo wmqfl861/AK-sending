@@ -565,6 +565,9 @@ async fn hello_replay_is_rejected_across_and_within_connections() {
     .try_encode_as(Role::Client, &mut frame)
     .unwrap();
     first.write_all(&frame).await.unwrap();
+    // Flushed: a bare write_all can leave the TLS record inside rustls
+    // (L-N3, review 2026-11-17).
+    first.flush().await.unwrap();
     let reply = read_frame(&mut first).await.unwrap().unwrap();
     assert!(matches!(
         CtrlFrame::decode_as(&reply, Role::Client).unwrap().message,
@@ -578,6 +581,7 @@ async fn hello_replay_is_rejected_across_and_within_connections() {
         .unwrap();
     let _ = read_frame(&mut second).await.unwrap().unwrap();
     second.write_all(&frame).await.unwrap();
+    second.flush().await.unwrap();
     assert!(second_closed(&mut second).await, "replayed Hello rejected");
     drop(first);
 
@@ -718,6 +722,7 @@ async fn v1_frames_are_refused_on_the_v2_port() {
     let _ = read_frame(&mut stream).await.unwrap().unwrap();
     // A v1-coded header (version byte 1) inside the TLS stream.
     stream.write_all(&[1u8, 0x01, 0x00, 0x00]).await.unwrap();
+    stream.flush().await.unwrap();
     assert!(second_closed(&mut stream).await, "no downgrade to v1");
     server.stop().await;
 }

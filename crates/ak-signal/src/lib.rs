@@ -42,3 +42,8 @@ pub mod server_v2;
 pub mod stun;
 
 mod util;
+
+/// Test-only I/O helpers (gated TLS pair for the frame-writer flush
+/// contract, L-N3).
+#[cfg(test)]
+mod test_support;

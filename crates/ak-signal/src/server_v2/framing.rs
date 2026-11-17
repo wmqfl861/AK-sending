@@ -47,6 +47,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Opti
 /// section) as sent by `sender`. Encoding is fallible per contract
 /// (`try_encode_as`): an over-budget frame is an I/O error, never a
 /// truncated frame, and an illegally-directed message is refused.
+///
+/// Returns once the frame has been handed to the transport, i.e. after a
+/// FLUSH (L-N3, review 2026-11-17). Over TLS, `write_all` alone is not
+/// enough: tokio-rustls's `poll_write` takes the plaintext into the TLS
+/// session and reports success even while the socket is momentarily not
+/// writable, and the encrypted record then waits inside rustls for the
+/// next write on the stream — on an idle control connection (a `Welcome`,
+/// the tail of a catch-up burst) that next write may never come.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &CtrlFrame,
@@ -56,7 +64,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     frame
         .try_encode_as(sender, &mut buf)
         .map_err(|e| invalid_data(encode_context(&e)))?;
-    writer.write_all(&buf).await
+    writer.write_all(&buf).await?;
+    writer.flush().await
 }
 
 /// Encode and write one plain message (no wave-28 extension) as sent by
@@ -81,10 +90,66 @@ fn encode_context(error: &EncodeError) -> &'static str {
 mod tests {
     use super::*;
     use crate::protocol_v2::DecodeError;
+    use std::time::Duration;
     use tokio::io::duplex;
 
     fn ping(nonce: u8) -> CtrlMessage {
         CtrlMessage::Ping { nonce: [nonce; 16] }
+    }
+
+    /// L-N3 (review 2026-11-17): a frame write is COMPLETE only once the
+    /// frame left every buffering layer between the caller and the
+    /// transport. tokio-rustls's `poll_write` takes the plaintext into the
+    /// TLS session and reports success even while the transport is not
+    /// writable; without a flush the TLS record then sits inside rustls
+    /// until the NEXT write on that stream — and on an idle control
+    /// connection (a Welcome nobody follows up) there is no next write.
+    #[tokio::test]
+    async fn a_written_frame_reaches_the_peer_through_tls_without_a_later_write() {
+        let crate::test_support::GatedTlsPair {
+            mut client,
+            mut server,
+            server_gate: gate,
+            ..
+        } = crate::test_support::gated_tls_pair().await;
+
+        // The server's transport stops taking bytes (a full send buffer).
+        gate.close();
+        let welcome = CtrlMessage::Welcome {
+            session_ttl_secs: 60,
+            capabilities: 1,
+        };
+        let sent = welcome.clone();
+        let writer = tokio::spawn(async move {
+            write_message(&mut server, &sent, Role::Server)
+                .await
+                .map(|()| server)
+        });
+        // While the transport refuses bytes the write is still in progress:
+        // reporting success now would mean the frame is parked inside TLS.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "write_frame reported success for a frame still buffered inside TLS"
+        );
+
+        // Writable again: the SAME write completes and the peer receives the
+        // frame — no later write on the stream is needed to push it out.
+        gate.open();
+        let _server = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the write completes once the transport is writable")
+            .unwrap()
+            .expect("the write succeeds");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("the frame reaches the peer without a later write")
+            .unwrap()
+            .expect("a frame, not EOF");
+        assert_eq!(
+            CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message,
+            welcome
+        );
     }
 
     #[tokio::test]

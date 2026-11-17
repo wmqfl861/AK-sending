@@ -518,6 +518,17 @@ fn print_quinn_stats(tier: &str, stats: &PassStats) {
 #[ignore = "Linux tc-netem throughput bench (CR-P2-04); needs root/CAP_NET_ADMIN and skips elsewhere; release only: cargo test --release -p ak-itests --test bench_netem -- --ignored --nocapture"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn netem_delay_50_100ms_256mib_loopback_throughput() {
+    // L-N4 (review 2026-11-17): put ak-net's OWN record of the UDP socket
+    // buffers each endpoint actually obtained (CR-P3-19: a best-effort
+    // 8 MiB ask, capped by net.core.rmem_max/wmem_max; Linux reports the
+    // doubled value) into the evidence log. Only `ak_net=info` is enabled
+    // and that record is ak-net's single info-level line, so the measured
+    // output is otherwise unchanged.
+    let _ = env_logger::Builder::new()
+        .parse_filters("ak_net=info")
+        .format_timestamp(None)
+        .is_test(true)
+        .try_init();
     if std::env::consts::OS != "linux" {
         skip_bench(&format!(
             "host is {} - tc netem is Linux-only; simulated-RTT bench not applicable",

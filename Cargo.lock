@@ -111,6 +111,7 @@ dependencies = [
  "ak-storage",
  "ak-store",
  "ak-wire",
+ "env_logger",
  "tempfile",
  "tokio",
 ]

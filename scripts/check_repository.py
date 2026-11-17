@@ -45,8 +45,15 @@ BANNED_CRATE_NAMES = {"coturn", "libquic-tunnel"}
 # "本提交" placeholder.
 REVIEW_DOC = "docs/REVIEW_2026-11-11.zh-CN.md"
 STATUS_TABLE_HEADING = "## 7."
-STATUS_ROW_PREFIXES = ("| CR-", "| R36", "| E", "| wave-36")
+# M1 (REVIEW_2026-11-17-batchL.zh-CN.md, L-N1): EVERY data row of the
+# section-7 table is checked — the old ID-prefix filter (CR-/R36/E/wave-36)
+# let the batch L rows (L1-L3, "本提交" in the commit column) through
+# unchecked, and a row split off the table by a blank line rendered as plain
+# text without any error. A table starts at a header row immediately
+# followed by its delimiter row; a "|" line anywhere else in the section is
+# an orphan row.
 STATUS_TABLE_COLUMNS = 5
+TABLE_DELIMITER_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 COMMIT_PLACEHOLDER = "本提交"
 
 # CR-P3-20 (REVIEW_2026-11-14-batchJ.zh-CN.md §4, 2026-11-14): each fact is
@@ -208,13 +215,16 @@ def banned_crates(lockfile: Path) -> list[str]:
 def status_table_issues(text: str) -> tuple[int, list[str]]:
     """CR-P3-10: validate the review doc's section-7 status table.
 
-    Every table row whose ID cell starts with CR-/R36/E (i.e. the execution
-    rows; header/separator rows are excluded by the prefix match) must have
-    exactly 5 columns and must not use the "本提交" placeholder in place of a
-    commit hash. Column counting is escape-aware: ``\\|`` inside a cell is
-    literal text (e.g. CR-P3-02's ``<>\"\\|?*``), never a separator. Empty
+    Every DATA row of the table (header and delimiter rows excluded by
+    position, not by an ID prefix — M1, L-N1) must have exactly 5 columns
+    and must not use the "本提交" placeholder in place of a commit hash.
+    Column counting is escape-aware: ``\\|`` inside a cell is literal text
+    (e.g. CR-P3-02's ``<>\"\\|?*``), never a separator. Empty
     leading/trailing fragments come from the delimiting pipes; interior empty
     fragments are real empty cells (e.g. CR-P2-08's blank 提交/证据摘要).
+    A "|" line that does not belong to a table (header + delimiter, then
+    contiguous rows) is reported as an orphan: Markdown renders it as plain
+    text, so a status written there is invisible in the table (L-N1).
     Returns (rows_checked, errors) and fails closed when the section is gone.
     """
     lines = text.splitlines()
@@ -230,9 +240,26 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
         return 0, [f"{REVIEW_DOC}: status table section not found"]
     rows = 0
     errors: list[str] = []
-    for i in range(start + 1, end):
+    in_table = False
+    i = start + 1
+    while i < end:
         row = lines[i].lstrip()
-        if not row.startswith(STATUS_ROW_PREFIXES):
+        if not row.startswith("|"):
+            in_table = False
+            i += 1
+            continue
+        if not in_table:
+            following = lines[i + 1].strip() if i + 1 < end else ""
+            if TABLE_DELIMITER_RE.match(following):
+                # Header + delimiter: a table starts; neither is a data row.
+                in_table = True
+                i += 2
+                continue
+            errors.append(
+                f"{REVIEW_DOC}:{i + 1}: table row outside the status table "
+                "(split off by a blank line or text, so it renders as plain text)"
+            )
+            i += 1
             continue
         rows += 1
         cells = re.split(r"(?<!\\)\|", row)
@@ -261,6 +288,7 @@ def status_table_issues(text: str) -> tuple[int, list[str]]:
                 f'{REVIEW_DOC}:{i + 1}: status table row uses "{COMMIT_PLACEHOLDER}" '
                 "placeholder instead of a commit hash"
             )
+        i += 1
     return rows, errors
 
 

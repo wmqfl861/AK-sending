@@ -166,6 +166,59 @@ class ReviewStatusTableTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("not found", errors[0])
 
+    def test_every_data_row_is_checked_whatever_its_id(self):
+        # M1 (L-N1, review 2026-11-17): the ID-prefix filter let batch-L
+        # rows with "本提交" through unchecked. Batch-, review- and
+        # merge-style IDs are data rows like any other.
+        for row in [
+            "| L1 | 批次 L | 已完成 | 本提交 | 本地全门槛通过 |",
+            "| K24-G | 复核 / K24 | 已完成 | 本提交 | 守卫 |",
+            "| main 合并 | 复核 | 已合并 | 本提交 | 快进 |",
+        ]:
+            with self.subTest(row=row):
+                rows_checked, errors = checks.status_table_issues(self._doc(row))
+                self.assertEqual(rows_checked, 1)
+                self.assertTrue(any("本提交" in e for e in errors), errors)
+        for row in [
+            "| L-N3 | 复核 / L | 未开始（批次 M） | | 见 L 复核 |",
+            "| U1 | U1 / J1 | 已解决 | bd61553+0e1f793 | 证据 |",
+            "| main 合并 | 复核 / K24 | 已合并 | b8142cb+2dd63e4 | 快进 |",
+        ]:
+            with self.subTest(row=row):
+                self.assertEqual(checks.status_table_issues(self._doc(row)), (1, []))
+        # Six columns on a non-CR row are caught too.
+        rows_checked, errors = checks.status_table_issues(
+            self._doc("| K-CI | 复核 | 全绿 | b8142cb | 证据 | 多余列 |")
+        )
+        self.assertEqual(rows_checked, 1)
+        self.assertTrue(any("6 columns" in e for e in errors), errors)
+
+    def test_rows_split_off_the_table_are_orphans(self):
+        # M1 (L-N1): a blank line before new rows ends the table; Markdown
+        # renders the rows as plain text, so the statuses never appear in
+        # the table. Each orphan line is reported with its line number.
+        doc = self._doc("| CR-P1-01 | A | 已完成 | 3b3eb64 | CI 全绿 |").replace(
+            "\n\n## 8.",
+            "\n\n| L2 | 批次 L | 已完成 | 2bc6a87 | 纯移动 |\n"
+            "| L3 | 批次 L | 已完成 | 2bc6a87 | 缓冲 |\n\n## 8.",
+        )
+        rows_checked, errors = checks.status_table_issues(doc)
+        self.assertEqual(rows_checked, 1, "orphans are not counted as table rows")
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(all("outside the status table" in e for e in errors), errors)
+        lines = doc.splitlines()
+        for error in errors:
+            line_no = int(error.split(":")[1])
+            self.assertTrue(lines[line_no - 1].startswith("| L"), (error, lines[line_no - 1]))
+        # Rejoined to the table (no blank line), the same rows pass.
+        rows_checked, errors = checks.status_table_issues(
+            self._doc(
+                "| CR-P1-01 | A | 已完成 | 3b3eb64 | CI 全绿 |",
+                "| L2 | 批次 L | 已完成 | 2bc6a87 | 纯移动 |",
+            )
+        )
+        self.assertEqual((rows_checked, errors), (2, []))
+
 
 class HandoffConsistencyTests(unittest.TestCase):
     """CR-P3-20: STATUS "最新验证" run ids vs the newest HANDOFF-BATCH doc.

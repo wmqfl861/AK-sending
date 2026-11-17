@@ -354,10 +354,29 @@ main() {
   # workflow's host-level sysctl step covers that case (CI runner, not a
   # production host), so a refusal is logged, never fatal. The write dies
   # with this owned namespace at cleanup, leaving the host untouched.
-  if ns_exec sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216; then
-    log "namespace UDP buffer ceilings raised (CR-P3-19): rmem_max=$(ns_exec sysctl -n net.core.rmem_max 2>/dev/null || printf 'unreadable') wmem_max=$(ns_exec sysctl -n net.core.wmem_max 2>/dev/null || printf 'unreadable')"
+  # L-N4 (review 2026-11-17): the write's exit status is NOT the evidence —
+  # procps sysctl was observed to exit 0 while printing "Operation not
+  # permitted" for these global (init_net) entries on the Ubuntu runner, and
+  # the old message then claimed "raised". The READ-BACK decides; the log
+  # states whether the namespace write itself was accepted or refused.
+  local ns_raise_rc=0 ns_raise_err ns_write ns_rmem ns_wmem
+  ns_raise_err=$(ns_exec sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 2>&1 >/dev/null) || ns_raise_rc=$?
+  ns_raise_err=${ns_raise_err//$'\n'/ | }
+  ns_rmem=$(ns_exec sysctl -n net.core.rmem_max 2>/dev/null) || ns_rmem=unreadable
+  ns_wmem=$(ns_exec sysctl -n net.core.wmem_max 2>/dev/null) || ns_wmem=unreadable
+  if [[ "$ns_raise_rc" == 0 && -z "$ns_raise_err" ]]; then
+    ns_write=accepted
   else
-    log 'namespace sysctl raise unavailable (global-sysctl kernel?); CR-P3-19 ceiling is whatever the workflow set on the host'
+    ns_write="refused or unconfirmed (rc=$ns_raise_rc${ns_raise_err:+; stderr: $ns_raise_err})"
+  fi
+  if [[ "$ns_rmem" == 16777216 && "$ns_wmem" == 16777216 ]]; then
+    if [[ "$ns_write" == accepted ]]; then
+      log "UDP buffer ceilings effective in the namespace (CR-P3-19): rmem_max=$ns_rmem wmem_max=$ns_wmem; namespace write accepted"
+    else
+      log "UDP buffer ceilings effective in the namespace (CR-P3-19): rmem_max=$ns_rmem wmem_max=$ns_wmem; namespace write $ns_write, so the value is the host's (global-sysctl kernel; raised by the workflow step)"
+    fi
+  else
+    log "WARNING: UDP buffer ceilings NOT raised in the namespace (CR-P3-19): rmem_max=$ns_rmem wmem_max=$ns_wmem; namespace write $ns_write; this run measures capped socket buffers"
   fi
   # Creating an actual qdisc proves CAP_NET_ADMIN + sch_netem, even when
   # sch_netem is built into the kernel (lsmod/modprobe alone would not prove it).

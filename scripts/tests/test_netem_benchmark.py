@@ -129,10 +129,17 @@ sysctl() {
   printf 'namespace sysctl %s\n' "$*" >> "$MOCK_ROOT/commands"
   if [[ "$1" == -w ]]; then
     [[ "$*" == '-w net.core.rmem_max=16777216 net.core.wmem_max=16777216' ]] || return 90
+    # L-N4: model procps on a global (init_net) entry -- EPERM printed,
+    # exit status still 0 unless the test asks for a failing status.
+    if [[ "${MOCK_NS_SYSCTL_REFUSE:-0}" == 1 ]]; then
+      printf 'sysctl: setting key "net.core.rmem_max": Operation not permitted\n' >&2
+      printf 'sysctl: setting key "net.core.wmem_max": Operation not permitted\n' >&2
+      return "${MOCK_NS_SYSCTL_RC:-0}"
+    fi
     return 0
   fi
   case "$*" in
-    '-n net.core.rmem_max'|'-n net.core.wmem_max') printf '16777216\n' ;;
+    '-n net.core.rmem_max'|'-n net.core.wmem_max') printf '%s\n' "${MOCK_NS_CEILING:-16777216}" ;;
     *) return 90 ;;
   esac
 }
@@ -423,8 +430,39 @@ python3() {
         self.assertNotIn("\nsudo sysctl", "\n" + commands,
                          "the script must not mutate the host sysctl; that is the workflow's step")
         self.assertNotIn("HOST SYSCTL", result.stderr)
-        self.assertIn("namespace UDP buffer ceilings raised (CR-P3-19)", result.stdout)
-        self.assertIn("rmem_max=16777216 wmem_max=16777216", result.stdout)
+        self.assertIn("UDP buffer ceilings effective in the namespace (CR-P3-19): "
+                      "rmem_max=16777216 wmem_max=16777216; namespace write accepted",
+                      result.stdout)
+
+    def test_udp_buffer_ceiling_report_follows_the_read_back_not_the_exit_status(self):
+        # L-N4 (review 2026-11-17): on the Ubuntu runner procps printed
+        # EPERM for the global entries yet exited 0, and the old message
+        # claimed "raised". The report now follows the READ-BACK and says
+        # the namespace write was refused -- with rc 0 and with rc 1.
+        def fresh_run(**env):
+            # The runner refuses an existing output directory; each run here
+            # is a separate invocation with its own evidence directory.
+            shutil.rmtree(self.work / "evidence", ignore_errors=True)
+            (self.work / "commands").unlink(missing_ok=True)
+            return self.run_main(**env)
+
+        for rc in ("0", "1"):
+            with self.subTest(sysctl_rc=rc):
+                result, _, _ = fresh_run(MOCK_NS_SYSCTL_REFUSE="1", MOCK_NS_SYSCTL_RC=rc)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("UDP buffer ceilings effective in the namespace (CR-P3-19): "
+                              "rmem_max=16777216 wmem_max=16777216; namespace write refused or "
+                              f"unconfirmed (rc={rc}; stderr: sysctl: setting key", result.stdout)
+                self.assertIn("so the value is the host's (global-sysctl kernel; raised by the "
+                              "workflow step)", result.stdout)
+                self.assertNotIn("namespace write accepted", result.stdout)
+        # A ceiling the read-back shows NOT raised is reported as such (the
+        # run measures capped buffers); never presented as raised.
+        result, _, _ = fresh_run(MOCK_NS_CEILING="212992")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("WARNING: UDP buffer ceilings NOT raised in the namespace (CR-P3-19): "
+                      "rmem_max=212992 wmem_max=212992", result.stdout)
+        self.assertNotIn("ceilings effective", result.stdout)
 
     def test_non_linux_is_not_measured_and_does_not_build(self):
         result, summary, commands = self.run_main(MOCK_OS="MINGW64_NT")

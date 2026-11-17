@@ -185,11 +185,28 @@ bash scripts/cross_nat_test.sh --self-test
 
 ## 8. 证据表（执行方填写）
 
+> 复核方更正（2026-11-17，L-N2）：L1、L2、L3 三行的提交列原写“本地（本提交）”，现填实现提交号；L2 行引用的子代理报告没有入库；L3 的 netem 前后对照已由上方 L3 CI 行给出。复核方自己的证据见 §9。
+
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
 | dev 分支批次 K 最终提交的 CI | `9e8c36a` run [43898974384](https://github.com/wmqfl861/AK-sending/actions/runs/43898974384) | 第 1 次运行 aarch64-apple-darwin 因 macOS arm64 托管 runner 容量不足从未开始而被取消；第 2 次只重跑该任务并 success，整体 success。其余 11 项常规任务两次均 success，1 项手动深测 skipped |
 | main 上批次 K 最终提交的 CI | `9e8c36a` run [43902374141](https://github.com/wmqfl861/AK-sending/actions/runs/43902374141) | 第 1 次运行 aarch64-apple-darwin 因 macOS arm64 托管 runner 容量不足被取消（其余 11 项常规任务 success，1 项手动深测 skipped），整体 failure；第 2 次重跑仅 aarch64 任务 success，整体 success。与 dev 分支 run 43898974384 相同的容量问题 |
-| L1 身份守卫与部署回归 | 本地（本提交） | `bash scripts/deploy_linux.sh --self-test` PASS；部署套件 205/205 OK；全量 Python 363/363 OK；`check_repository.py` exit 0；`check_contracts.py` 5/5。无 K24 §5 阻断口径内的新发现问题 |
-| L2 K4/CR-P2-08 ak-engine 拆分 | 本地（本提交） | `lib.rs` 10,082→4,866 行，`#[cfg(test)] mod tests`（5,215 行）移至 `tests.rs`（纯移动，零可见性/API 变更，`use super::*` 不变）；测试数不变（78/0/1 前后一致）；fmt/clippy（ak-engine -D warnings）/rustdoc（-D warnings）通过。admission 岛因耦合密度不满足"纯移动"标准而未选（报告见子代理） |
+| L1 身份守卫与部署回归 | `2bc6a87`（执行方本机） | `bash scripts/deploy_linux.sh --self-test` PASS；部署套件 205/205 OK；全量 Python 363/363 OK；`check_repository.py` exit 0；`check_contracts.py` 5/5。无 K24 §5 阻断口径内的新发现问题 |
+| L2 K4/CR-P2-08 ak-engine 拆分 | `2bc6a87`（执行方本机） | `lib.rs` 10,082→4,866 行，`#[cfg(test)] mod tests`（5,215 行）移至 `tests.rs`（纯移动，零可见性/API 变更，`use super::*` 不变）；测试数不变（78/0/1 前后一致）；fmt/clippy（ak-engine -D warnings）/rustdoc（-D warnings）通过。admission 岛因耦合密度不满足"纯移动"标准而未选（执行方说明；所引子代理报告未入库） |
 | L3 CI | `2bc6a87` run [43917001671](https://github.com/wmqfl861/AK-sending/actions/runs/43917001671)（netem）+ [43917001890](https://github.com/wmqfl861/AK-sending/actions/runs/43917001890)（CI） | netem：成功；**三档 `RcvbufErrors +0`**（复核基线 +247/+167/+219）；8 MiB 档 23.4 MiB/s、54.8 RTTs（含爬坡估计 ~42 RTTs，接近）。CI：第 1 次 Windows Rust 一超时 flake（ak-signal fair_share 帧截止超时，本批未改该 crate）+ aarch64 容量取消，第 2 次重跑 12/12 全绿 |
-| L3 K5/CR-P3-19 UDP 缓冲 | 本地（本提交） | `ak-net/src/lib.rs` `bind_inner` 前插 `enlarge_udp_socket_buffers`（8 MiB 目标，socket2 SockRef，尽力设+读回记录，失败不阻断 bind）；netem 工作流+脚本在整形前升 `rmem_max/wmem_max` 至 16 MiB（namespace 内+主机级）；`ak-net` 49/0 含新单测；netem 脚本+测试 25/25。**netem A/B 对照须 CI 提供**（本机 Windows 无特权 Linux）|
+| L3 K5/CR-P3-19 UDP 缓冲 | `2bc6a87`（执行方本机） | `ak-net/src/lib.rs` `bind_inner` 前插 `enlarge_udp_socket_buffers`（8 MiB 目标，socket2 SockRef，尽力设+读回记录，失败不阻断 bind）；netem 工作流+脚本在整形前升 `rmem_max/wmem_max` 至 16 MiB（namespace 内+主机级）；`ak-net` 49/0 含新单测；netem 脚本+测试 25/25。netem 前后对照见上方 L3 CI 行（本机 Windows 无特权 Linux）|
+
+## 9. 复核方证据（2026-11-17）
+
+复核方是 Claude，在云端 Linux 工作区（2 vCPU）操作，没有接触生产服务器。结论见 [L 复核](REVIEW_2026-11-17-batchL.zh-CN.md)，逐项状态只见 [审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 远端分支 | GitHub API，2026-11-17 | 只有 `main` 与 `dev/batch-l-20261117` |
+| 实现提交的 CI | `2bc6a87` run [43917001890](https://github.com/wmqfl861/AK-sending/actions/runs/43917001890) | 第 1 次运行：10 项 success；Windows Rust 任务 failure（`fair_share_serving_cap_admits_a_newcomer_past_the_soft_cap` 在 engine.rs:3853 报 `frame within deadline: Elapsed(())`，即 L-N3）；aarch64-apple-darwin 因 runner 容量不足 cancelled；手动深测 skipped。第 2 次运行重跑了全部任务：12 项 success，1 项 skipped |
+| 实现提交的 netem | `2bc6a87` run [43917001671](https://github.com/wmqfl861/AK-sending/actions/runs/43917001671) | success。日志 17:19:12.389Z–17:19:12.412Z：命名空间内的 `sysctl -w` 先打印两行 “Operation not permitted”，runner 随后仍打印 “namespace UDP buffer ceilings raised (CR-P3-19): rmem_max=16777216 wmem_max=16777216”；工作流的主机层 `sudo sysctl -w` 步骤输出两项均为 16777216。日志里没有 ak-net 的缓冲读回行（基准未初始化日志）。以上即 L-N4 |
+| 被审 tip 的 CI | `6e4147c` run [43922568447](https://github.com/wmqfl861/AK-sending/actions/runs/43922568447) | 第 1 次运行：12 项 success，1 项 skipped（手动深测） |
+| Windows 失败的时间线 | run 43917001890 第 1 次运行，Windows Rust 任务日志 | ak-signal 单测二进制 17:31:45.97 开始；其余 112 个测试在 17:31:57.04 前全部结束；失败在 17:32:01.29 报出（该二进制 `finished in 15.31s`）。超时的那次等待约从 17:31:51.29 开始，其中最后约 4.2 s 没有任何其他测试在运行 |
+| L2 纯移动证明 | `6e4147c` 对 `9e8c36a` | 旧 lib.rs 第 1–4865 行与新 lib.rs 第 1–4865 行字节相同；旧模块体去掉 4 格缩进、经 rustfmt（edition 2021）格式化后，与新 tests.rs 字节相同 |
+| 复核方本机门槛 | `6e4147c`；rustc 1.97.0（`rust-toolchain.toml` 钉的 1.99.1 无法下载，代理拒绝访问 static.rust-lang.org） | fmt 通过；clippy `-D warnings` 通过；rustdoc `-D warnings` 通过；workspace 测试 68 组结果，1202 passed / 0 failed / 8 ignored；ak-store `sqlite` 52 passed；ak-signal `server-persistence` 113 + 26 + 53 + 26 + 1 passed；Python 363 项 OK；`check_repository.py` passed（检查状态表 50 行）；`check_contracts.py` 5/5 PASS；部署自检 PASS；跨 NAT 自检 PASS；总耗时 816 s |
+| L-N3 机制实验 | 本机，实验代码在实验时未提交 | 新回归测试（用生产 TLS 配置建立的 TLS 测试对，写入时让服务端传输层暂时不可写）在旧 `write_frame` 上失败，报 “write_frame reported success for a frame still buffered inside TLS”。一次性探针（不入库）：写入返回 `Ok(Ok(()))`；传输层恢复可写后连接保持空闲，对端 3 s 内收不到这一帧，连接也没有断开。在 `write_all` 之后加上 flush，回归测试通过。tokio-rustls 0.26.6 `src/common/mod.rs` 第 278–312 行：明文已收下、底层写入 Pending 时，`poll_write` 返回 `Ready(Ok(n))`。修复与测试随批次 M 提交 |

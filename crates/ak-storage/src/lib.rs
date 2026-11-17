@@ -41,28 +41,31 @@
 //! A prepared sink holds NO open file descriptor: `prepare` opens the part
 //! file only to verify the resume prefix (and truncate it to the verified
 //! length), records the file's platform identity, and closes it. The
-//! descriptor is (re)opened at the first `write_chunk` and at `finish`,
-//! re-verified against the recorded identity, and closed again as soon as
-//! the content is durable. The engine prepares one sink per manifest entry
-//! before answering the ResumeRequest, so the old always-open handle made
-//! a 2,000-file receive fail under a 1,024-fd `ulimit -n` (M-N1, P1); now
-//! the number of simultaneously open part files is bounded by the number
-//! of actively transferring streams (1 single-stream, <= 4 multistream).
+//! descriptor is (re)opened at the first `write_chunk` of a session,
+//! re-verified against the recorded identity, and released again right
+//! after the file's last chunk; `finish` reopens it for the whole-digest
+//! pass and releases it before the commit. The engine prepares one sink
+//! per manifest entry before answering the ResumeRequest and finishes
+//! every file only after the whole chunk phase, so a descriptor held
+//! from prepare — or from the first write until finish — pinned one per
+//! file and a 2,000-file receive failed under a 1,024-fd `ulimit -n`
+//! (M-N1, P1; the release after the last chunk is the review 2026-11-18
+//! completion of the batch N rework). Now only files whose chunks are
+//! still arriving hold a descriptor: one per active data stream
+//! (1 single-stream, <= 4 multistream).
 //!
 //! Reopening is not a bare reopen-by-path: `ensure_not_symlink` re-runs
 //! immediately before the open, and the reopened file must still be THE
 //! SAME FILE prepare verified — compared by device number + inode on Unix
 //! and volume serial number + file index on Windows (`fstat` /
-//! `GetFileInformationByHandle`). A replaced part file fails closed
-//! instead of being written through.
-//!
-//! Unsafe policy (like ak-net's CR-P1-06): `deny` instead of `forbid` —
-//! the Windows identity query above needs `GetFileInformationByHandle`,
-//! and its hand-declared FFI is the ONE audited `unsafe` block in this
-//! crate (see `win_file_id`), individually `#[allow]`-ed with a SAFETY
-//! argument. Everything else stays unsafe-free; a stray `unsafe` anywhere
-//! else still fails the build.
-#![deny(unsafe_code)]
+//! `GetFileInformationByHandle`, the latter through winapi-util's safe
+//! wrapper) — and still have exactly the verified length. A replaced or
+//! resized part file fails closed instead of being written through. The
+//! identity check is defense in depth: a Unix filesystem may hand a
+//! deleted part's inode number to a new file, so a replacement with the
+//! same length can pass both checks; the whole-digest check in `finish`
+//! remains the gate that keeps unverified content from any final name.
+#![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -230,11 +233,9 @@ fn conflict_err(path: &Path) -> io::Error {
 type FileIdentity = (u64, u64);
 
 /// Windows member of [`FileIdentity`]: `(volume serial number, file
-/// index)`. The volume serial is `Option` because `GetFileInformationByHandle`
-/// can report it as unknown on some filesystems; the file index then
-/// carries the comparison (same volume, same index).
+/// index)`.
 #[cfg(windows)]
-type FileIdentity = (Option<u32>, u64);
+type FileIdentity = (u64, u64);
 
 /// Query the platform file identity of an open descriptor.
 #[cfg(unix)]
@@ -246,82 +247,16 @@ fn file_identity(file: &File) -> io::Result<FileIdentity> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// Windows identity query via `GetFileInformationByHandle`. std exposes
-/// exactly this (`MetadataExt::volume_serial_number` / `file_index`) only
-/// behind the still-unstable `windows_by_handle` feature (tracking issue
-/// #63010, still unstable on the pinned 1.99.1), so the single kernel32
-/// call is declared here by hand. This is the crate's ONE audited
-/// `unsafe` block (M-N1), mirroring ak-net's CR-P1-06 discipline.
-#[cfg(windows)]
-mod win_file_id {
-    use std::ffi::c_void;
-    use std::fs::File;
-    use std::io;
-    use std::os::windows::io::AsRawHandle as _;
-
-    /// `BY_HANDLE_FILE_INFORMATION`, laid out as ten `DWORD`s so every
-    /// member (including the three `FILETIME`s, each two `DWORD`s) keeps
-    /// the C struct's 4-byte alignment on both 32- and 64-bit Windows.
-    /// Only the two members the identity check needs are named.
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        _attributes: u32,
-        _creation_time: [u32; 2],
-        _last_access_time: [u32; 2],
-        _last_write_time: [u32; 2],
-        volume_serial: u32,
-        _size_high: u32,
-        _size_low: u32,
-        _number_of_links: u32,
-        index_high: u32,
-        index_low: u32,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        /// <https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle>
-        fn GetFileInformationByHandle(
-            file: *mut c_void,
-            information: *mut ByHandleFileInformation,
-        ) -> i32;
-    }
-
-    /// `(volume serial number, file index)` of the file `file` holds open.
-    /// This function is the crate's single audited `unsafe` site.
-    #[allow(unsafe_code)]
-    pub(super) fn identity(file: &File) -> io::Result<(Option<u32>, u64)> {
-        let mut information = ByHandleFileInformation {
-            _attributes: 0,
-            _creation_time: [0; 2],
-            _last_access_time: [0; 2],
-            _last_write_time: [0; 2],
-            volume_serial: 0,
-            _size_high: 0,
-            _size_low: 0,
-            _number_of_links: 0,
-            index_high: 0,
-            index_low: 0,
-        };
-        // SAFETY: `file.as_raw_handle()` is a live owned handle of `file`
-        // (borrowed outlives the call), and `information` is a valid,
-        // fully-initialized (zeroed above) `repr(C)` mirror of
-        // `BY_HANDLE_FILE_INFORMATION` of the correct 40-byte size and
-        // 4-byte alignment, so the call writes only within bounds. The
-        // return value is checked; on failure the untouched struct is
-        // never read for results.
-        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let index = (u64::from(information.index_high) << 32) | u64::from(information.index_low);
-        Ok((Some(information.volume_serial), index))
-    }
-}
-
-/// Query the platform file identity of an open descriptor (Windows side).
+/// Windows identity query: `GetFileInformationByHandle` on the open
+/// handle. std exposes these fields (`MetadataExt::volume_serial_number`
+/// / `file_index`) only behind the unstable `windows_by_handle` feature,
+/// so the call goes through winapi-util's safe wrapper, which keeps this
+/// crate free of `unsafe` (review 2026-11-18 replaced a hand-declared
+/// kernel32 binding).
 #[cfg(windows)]
 fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    win_file_id::identity(file)
+    let information = winapi_util::file::information(file)?;
+    Ok((information.volume_serial_number(), information.file_index()))
 }
 
 /// No known identity primitive on this platform; part commits already
@@ -1005,9 +940,16 @@ enum SinkKind {
 
 struct PartState {
     /// Lazily (re)opened part-file descriptor (M-N1): `None` after
-    /// prepare and after finish, `Some` only while chunks are being
-    /// written. Keeps the number of simultaneously open part files
-    /// bounded by the active stream count instead of the manifest size.
+    /// prepare, `Some` from the first write of a session until the file's
+    /// last chunk is stored, `None` again from then on (finish reopens it
+    /// for the whole-digest pass and closes it before the commit).
+    ///
+    /// The release after the last chunk is what bounds the descriptor
+    /// count: the engine calls `finish()` for every file only after the
+    /// whole chunk phase, so a handle kept until finish pinned one
+    /// descriptor per received file (review 2026-11-18). With the early
+    /// release, only files whose chunks are still arriving hold one —
+    /// one per active data stream.
     file: Option<File>,
     /// Identity of the part file observed at prepare (device + inode on
     /// Unix, volume serial + file index on Windows). Every reopen must
@@ -1134,6 +1076,14 @@ impl FileSink for LocalFileSink {
             file.seek(SeekFrom::Start(range.start))?;
             file.write_all(data)?;
             st.verified_prefix += 1;
+            if st.verified_prefix == st.chunk_digests.len() as u64 {
+                // Last chunk stored: release the descriptor now rather
+                // than at finish(), which the engine only reaches after
+                // the whole chunk phase (see `PartState::file`). The data
+                // sits in the page cache; finish() reopens with the
+                // identity and length checks and makes it durable.
+                st.file = None;
+            }
             Ok(())
         } else if chunk_index < st.verified_prefix {
             // Already stored and verified in this or a previous session.
@@ -1171,7 +1121,8 @@ impl FileSink for LocalFileSink {
         // no code path can store a larger one, but the allocation below is
         // guarded again anyway.
         ensure_chunk_size_within_cap(st.chunk_size)?;
-        // M-N1: a finish without writes this session (fully resumed part)
+        // M-N1: the descriptor was released after the last chunk (or never
+        // opened this session, for a fully resumed part), so finish
         // reopens the part file here, re-verifying identity and length.
         {
             let size = st.size;
@@ -1747,16 +1698,18 @@ pub fn discard_staging(root: &Path, task_id: [u8; 16]) -> io::Result<()> {
 /// `RLIMIT_NOFILE` soft limit to its hard limit and return the new soft
 /// limit, or `None` when there was nothing to raise (already at the hard
 /// limit, no hard limit, a non-Unix platform, or a failed `setrlimit`).
+/// With no hard limit (macOS reports an unlimited hard limit) nothing is
+/// raised, so macOS keeps its low default soft limit.
 ///
-/// This does NOT replace the real fix — since the lazy-handle rework a
-/// prepared sink holds no descriptor and a receive keeps at most one open
-/// part file per actively transferring stream — it merely widens the fd
-/// headroom of processes embedding this crate (the CLI binary and the FFI
-/// library call this once at startup). Never lowers any limit.
+/// This does NOT replace the real fix — a prepared sink holds no
+/// descriptor and a receive keeps at most one open part file per actively
+/// transferring stream — it merely widens the fd headroom of processes
+/// embedding this crate (the CLI binary and the FFI library call this
+/// once at startup). Never lowers any limit.
 ///
 /// Unix implementation note: `rustix::process` is used because it wraps
 /// `getrlimit`/`setrlimit` in a safe API, which keeps this crate's
-/// `#![deny(unsafe_code)]` intact.
+/// `#![forbid(unsafe_code)]` intact.
 #[cfg(unix)]
 pub fn raise_nofile_soft_limit_to_hard() -> Option<u64> {
     use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
@@ -3577,13 +3530,14 @@ mod tests {
         }
         #[cfg(unix)]
         if let Some(before) = before {
-            // The /proc/self/fd read_dir itself opens (and may cache) one
-            // directory descriptor between calls; a ±1 tolerance absorbs
-            // that measurement artifact without weakening the zero-leak
-            // claim (128 sinks opening files would move the count by 128).
+            // The count is process-wide, so it also sees descriptors that
+            // concurrently running tests of this binary open and close
+            // (CI observed 8 -> 7). The exact claim is the white-box check
+            // above; this black-box check only needs a margin far below
+            // the 128 descriptors a regression would pin.
             let after = open_fd_count().unwrap_or(before);
             assert!(
-                after <= before + 1,
+                after < before + 64,
                 "128 prepared sinks must not hold any open descriptor (M-N1): {before} -> {after}"
             );
         }
@@ -3632,15 +3586,93 @@ mod tests {
         }
         #[cfg(unix)]
         if let Some(before) = before {
-            // Same ±1 tolerance for the readdir measurement artifact.
+            // Process-wide count: same concurrent-test margin as above.
             let after = open_fd_count().unwrap_or(before);
             assert!(
-                after <= before + 1,
+                after < before + 16,
                 "32 write+finish cycles must not leak descriptors: {before} -> {after}"
             );
         }
         for entry in &entries {
             assert_eq!(fs::read(dst.path().join(&entry.rel_path)).unwrap(), content);
+        }
+    }
+
+    /// The receive engine's real order (review 2026-11-18): every chunk of
+    /// every file arrives first, and `finish()` runs for all files only in
+    /// the verify phase after the chunk phase. A sink whose last chunk is
+    /// stored must therefore hold no descriptor; a handle kept until
+    /// finish pinned one descriptor per received file at the end of the
+    /// chunk phase (CI's `ulimit -n 1024` step failed on exactly that).
+    /// A sink still in the middle of its file keeps its handle: that is
+    /// the intended bound, one per active data stream.
+    #[test]
+    fn complete_sinks_hold_no_descriptor_before_finish() {
+        let content = b"0123456789abcdef@"; // 3 chunks of 8: 8 + 8 + 1
+        let (_src, source, entry) = transfer_entry(content, 8);
+        let dst = TempDir::new().unwrap();
+        let target = LocalSaveTarget::open(dst.path()).unwrap();
+
+        let entries: Vec<FileEntry> = (0..129u32)
+            .map(|index| {
+                let mut e = entry.clone();
+                e.rel_path = PathBuf::from(format!("f{index:03}.bin"));
+                e
+            })
+            .collect();
+        let mut sinks: Vec<LocalFileSink> = entries
+            .iter()
+            .map(|e| {
+                target
+                    .prepare_file_staged(TASK_A, e, ConflictPolicy::Fail, cs(8))
+                    .unwrap()
+            })
+            .collect();
+        let mut chunk0 = [0u8; 8];
+        assert_eq!(source.read_chunk(0, 0, &mut chunk0).unwrap(), 8);
+        let held = |sink: &LocalFileSink| match &sink.kind {
+            SinkKind::File(st) => st.file.is_some(),
+            _ => panic!("expected a file sink"),
+        };
+
+        // A file in progress holds exactly its own descriptor.
+        let (last, complete) = sinks.split_last_mut().unwrap();
+        last.write_chunk(0, &chunk0).unwrap();
+        assert!(held(last), "a sink mid-file keeps its descriptor");
+
+        #[cfg(unix)]
+        let before = open_fd_count();
+        // Chunk phase for the other 128 files: every chunk, no finish.
+        for sink in complete.iter_mut() {
+            write_all_chunks(sink, &source, &entry);
+            assert_eq!(sink.verified_prefix_chunks(), 3);
+            assert!(
+                !held(sink),
+                "a complete sink must release its descriptor before finish (M-N1)"
+            );
+        }
+        #[cfg(unix)]
+        if let Some(before) = before {
+            // Process-wide count: same concurrent-test margin as above.
+            let after = open_fd_count().unwrap_or(before);
+            assert!(
+                after < before + 64,
+                "128 complete sinks must not pin descriptors until finish (M-N1): {before} -> {after}"
+            );
+        }
+
+        // The in-progress file completes and lets go as well.
+        write_all_chunks(last, &source, &entry);
+        assert!(!held(last));
+
+        // Verify phase: finish reopens each part (identity and length
+        // re-checked), hashes it and commits it.
+        for sink in &mut sinks {
+            sink.finish().unwrap();
+            assert!(!held(sink));
+        }
+        for e in &entries {
+            assert_eq!(fs::read(dst.path().join(&e.rel_path)).unwrap(), content);
         }
     }
 

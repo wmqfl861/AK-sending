@@ -22,5 +22,12 @@ thiserror = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process"] }
 
+# M-N1 part-file identity on Windows (review 2026-11-18): the safe
+# `GetFileInformationByHandle` wrapper (volume serial + file index), so
+# this crate stays `forbid(unsafe_code)`. Already present in Cargo.lock
+# transitively (same-file, walkdir).
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
+
 [dev-dependencies]
 tempfile = "3"

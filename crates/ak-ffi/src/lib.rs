@@ -18,11 +18,10 @@
 //! Every other crate in this repository compiles `#![deny(unsafe_code)]`
 //! or stricter; this crate is the single deliberate unsafe-permitting
 //! exception, because a C ABI is exactly the place where raw pointers are
-//! the interface. Two further crates carry ONE audited `#[allow]`-ed
-//! `unsafe` block each under a crate-level `deny` (the ak-net CR-P1-06
-//! Unix sendmsg cmsg site, and ak-storage's M-N1 Windows
-//! `GetFileInformationByHandle` part-file identity query); everywhere
-//! else a stray `unsafe` still fails the build. The exception here is
+//! the interface. One further crate carries ONE audited `#[allow]`-ed
+//! `unsafe` block under a crate-level `deny` (the ak-net CR-P1-06 Unix
+//! sendmsg cmsg site); everywhere else a stray `unsafe` still fails the
+//! build. The exception here is
 //! contained: `shim` holds the `unsafe` blocks of the v1 + wave-22
 //! exports (pointer dereference, `CStr` reads, buffer writes — each with a
 //! `SAFETY:` comment covering non-nullness, lifetime, and UTF-8

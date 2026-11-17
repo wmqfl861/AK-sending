@@ -192,6 +192,16 @@ const POLICY_GATE_CLOSE_CODE: u32 = 0xA0_01;
 /// legacy [`send`] establishes itself at connect time. No protocol frame
 /// precedes it (not even the admission TaskOpen).
 const PEER_MISMATCH_CLOSE_CODE: u32 = 0xA0_02;
+/// QUIC application-error code for a failed multistream receive (M6, batch
+/// M 2026-11-17): `0xA0` protocol family, `0x03` multistream abort. The
+/// multistream receiver's control reader (deliberately never cancelled:
+/// quinn reads are not cancel-safe) and its per-stream tasks hold stream
+/// handles, and a quinn connection stays open while any handle lives — with
+/// keep-alive PINGs it never idles out. Without an explicit close the
+/// sender therefore never learned that the receive had failed and could
+/// block forever in a flow-controlled write. The single-stream path needs
+/// no code: its handles all drop with the failing call.
+const MULTISTREAM_ABORT_CLOSE_CODE: u32 = 0xA0_03;
 
 /// Optional end-of-transfer transport-stats sink (2026-11-13 review §5.2
 /// follow-up): invoked exactly once per successful transfer with an
@@ -3933,21 +3943,29 @@ async fn receive_frozen_body(
         // Chunk phase: the frozen single-stream loop, or per-file streams
         // when both sides announced CAP_MULTISTREAM.
         let tail = if multistream {
-            TailHold::Events(
-                multistream_receive(
-                    &channel,
-                    rx,
-                    job_id,
-                    chunk_size,
-                    &job.manifest,
-                    &mut sinks,
-                    &mut record,
-                    store,
-                    spec.idle_timeout,
-                    progress,
-                )
-                .await?,
+            match multistream_receive(
+                &channel,
+                rx,
+                job_id,
+                chunk_size,
+                &job.manifest,
+                &mut sinks,
+                &mut record,
+                store,
+                spec.idle_timeout,
+                progress,
             )
+            .await
+            {
+                Ok(events) => TailHold::Events(events),
+                Err(error) => {
+                    // Close explicitly: the receiver's lingering stream
+                    // tasks would otherwise keep the connection open and
+                    // the sender waiting (see MULTISTREAM_ABORT_CLOSE_CODE).
+                    channel.close(MULTISTREAM_ABORT_CLOSE_CODE, b"multistream receive failed");
+                    return Err(error);
+                }
+            }
         } else {
             TailHold::Stream(
                 receive_single_stream(
@@ -4461,6 +4479,14 @@ enum StreamEvent {
         file_index: u32,
         sink: ak_storage::LocalFileSink,
     },
+    /// An accepted per-file stream delivered its first frame (read by the
+    /// stream's own opener task, never inline in the driver loop — see
+    /// [`multistream_receive`]); the driver validates it and starts the
+    /// stream's receive task.
+    Opened {
+        stream: DirectStream,
+        first: Frame,
+    },
     /// A stream task or the control stream failed.
     Failed(EngineError),
     /// Finalize observed on the control stream.
@@ -4686,25 +4712,9 @@ async fn multistream_receive(
                             }
                         }
                     }
-                    StreamEvent::Failed(error) => return Err(error),
-                    StreamEvent::Finalize => finalized = true,
-                    StreamEvent::Cancelled => return Err(EngineError::Cancelled),
-                }
-            }
-            accepted = tokio::time::timeout(budget, channel.accept_bi()), if !finalized => {
-                match accepted {
-                    Err(_elapsed) => return Err(EngineError::IdleTimeout(idle)),
-                    Ok(Err(e)) => return Err(EngineError::Stream(e)),
-                    Ok(Ok(mut stream)) => {
-                        last_activity = Instant::now();
-                        let _ = activity_tx.try_send(());
+                    StreamEvent::Opened { stream, first } => {
                         // The first frame on a new stream names its file and
                         // must belong to this job.
-                        let first = match tokio::time::timeout(idle, stream.recv_frame(&limits)).await {
-                            Ok(Ok(frame)) => frame,
-                            Ok(Err(e)) => return Err(EngineError::Stream(e)),
-                            Err(_) => return Err(EngineError::IdleTimeout(idle)),
-                        };
                         let Message::Chunk {
                             job_id: chunk_job,
                             file_index,
@@ -4727,7 +4737,6 @@ async fn multistream_receive(
                                 bytes: entry.size,
                             });
                         }
-                        open_streams += 1;
                         receive_stream_task(
                             stream,
                             sink,
@@ -4737,6 +4746,49 @@ async fn multistream_receive(
                             idle,
                             events_tx.clone(),
                         );
+                    }
+                    StreamEvent::Failed(error) => return Err(error),
+                    StreamEvent::Finalize => finalized = true,
+                    StreamEvent::Cancelled => return Err(EngineError::Cancelled),
+                }
+            }
+            accepted = tokio::time::timeout(budget, channel.accept_bi()), if !finalized => {
+                match accepted {
+                    Err(_elapsed) => return Err(EngineError::IdleTimeout(idle)),
+                    Ok(Err(e)) => return Err(EngineError::Stream(e)),
+                    Ok(Ok(stream)) => {
+                        last_activity = Instant::now();
+                        let _ = activity_tx.try_send(());
+                        // M6 (batch M, 2026-11-17): the first frame on a new
+                        // stream is read by the stream's own opener task,
+                        // never inline here. While the driver awaited one
+                        // stream's first frame it could neither accept nor
+                        // let anything read the sender's other concurrently
+                        // opened streams, whose buffered data still counts
+                        // against QUIC's connection-level receive window
+                        // (credit returns only as the application reads).
+                        // Once streams x (chunk + header) exceeded that
+                        // window (2 streams at 4 MiB chunks, 4 at 2 MiB,
+                        // against 8 MiB) the first frame could never
+                        // complete: a deadlock, which the release
+                        // chunk-size sweep hit at 4096 KiB / multistream on
+                        // Linux and Windows alike.
+                        open_streams += 1;
+                        let events = events_tx.clone();
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let event = match tokio::time::timeout(
+                                idle,
+                                stream.recv_frame(&limits),
+                            )
+                            .await
+                            {
+                                Ok(Ok(first)) => StreamEvent::Opened { stream, first },
+                                Ok(Err(e)) => StreamEvent::Failed(EngineError::Stream(e)),
+                                Err(_) => StreamEvent::Failed(EngineError::IdleTimeout(idle)),
+                            };
+                            let _ = events.send(event).await;
+                        });
                     }
                 }
             }

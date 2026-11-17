@@ -3008,6 +3008,184 @@ async fn multistream_file_stream_rejects_foreign_file_index() {
     );
 }
 
+/// M6 (batch M, 2026-11-17): concurrent file streams whose chunk frames
+/// together exceed QUIC's connection-level receive window (8 MiB):
+/// 3 files x 8 MiB in 4 MiB chunks. The old receiver read each new
+/// stream's first frame inline in its driver loop; the sender's other
+/// streams' unread data pinned the connection window, so that frame could
+/// never complete. The receiver gave up after its idle budget and the
+/// sender hung — the release chunk-size sweep's 4096 KiB / multistream
+/// round, on Linux and Windows alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multistream_chunks_beyond_the_connection_window_share_complete() {
+    const FILE_BYTES: usize = 8 * 1024 * 1024;
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let files: Vec<Vec<u8>> = (0..3u32)
+        .map(|file| {
+            (0..FILE_BYTES as u32)
+                .map(|i| i.wrapping_mul(31).wrapping_add(file * 7) as u8)
+                .collect()
+        })
+        .collect();
+    for (index, bytes) in files.iter().enumerate() {
+        write(&src.path().join(format!("big-{index}.bin")), bytes);
+    }
+    let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 4096); // 4 MiB chunks
+    send_spec.multistream = true;
+    send_spec.in_flight_window = 8; // the engine default: up to 4 streams
+    send_spec.idle_timeout = Duration::from_secs(10);
+    recv.idle_timeout = Duration::from_secs(10);
+
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(async move { receive_with_addr(recv, &noop, addr_tx).await });
+    send_spec.peer = addr_rx.await.unwrap();
+    let (sent, received) = tokio::time::timeout(Duration::from_secs(60), async {
+        let sent = send(send_spec, &noop).await;
+        (sent, receiver.await.unwrap())
+    })
+    .await
+    .expect("the transfer must finish, not deadlock on connection flow control");
+    let sent = sent.expect("multistream send completes");
+    let received = received.expect("multistream receive completes");
+    assert_eq!(sent.bytes, (3 * FILE_BYTES) as u64);
+    assert_eq!(received.bytes, sent.bytes);
+    for (index, bytes) in files.iter().enumerate() {
+        assert_eq!(
+            &fs::read(dst.path().join(format!("big-{index}.bin"))).unwrap(),
+            bytes,
+            "big-{index}.bin must arrive byte-identical"
+        );
+    }
+}
+
+/// M6 (batch M, 2026-11-17): when a multistream receive fails, the
+/// receiver closes the connection itself (`MULTISTREAM_ABORT_CLOSE_CODE`).
+/// Its control reader (never cancelled, quinn reads are not cancel-safe)
+/// and per-stream tasks hold stream handles that kept the QUIC connection
+/// open — keep-alive PINGs included — so the sender never learned of the
+/// failure and could block forever in a flow-controlled write. Same
+/// failure as the foreign-file-index test; here the sender watches its
+/// connection instead of dropping it.
+#[tokio::test]
+async fn multistream_receive_failure_closes_the_connection() {
+    let dst = tempfile::tempdir().unwrap();
+    let receiver_key = DeviceKeyPair::generate();
+    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+    let mut recv = ReceiveSpec::new(dst.path().to_path_buf(), receiver_bundle.clone());
+    recv.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    recv.idle_timeout = Duration::from_secs(5);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    let addr = addr_rx.await.unwrap();
+
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let entry = chunked_wire_entry("owned.bin", &payload, 1024);
+    let receiver_fp = receiver_key.fingerprint();
+    let fake = tokio::spawn(async move {
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_bundle)
+            .await
+            .unwrap();
+        let channel = endpoint.connect(addr, &receiver_fp).await.unwrap();
+        let mut control = channel.open_bi().await.unwrap();
+        let limits = engine_limits();
+        control
+            .send_frame(&hello_frame(
+                "closer",
+                &sender_bundle,
+                CAP_RESUME | CAP_MULTISTREAM,
+            ))
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap();
+        let job_id = [0xB7; 16];
+        control
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Offer {
+                    job_id,
+                    root_name: "closer".to_owned(),
+                    file_count: 1,
+                    total_bytes: entry.size,
+                    chunk_size: 1024,
+                },
+            })
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap(); // Accept
+        control
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::ManifestPage {
+                    job_id,
+                    page_index: 0,
+                    last_page: true,
+                    entries: vec![entry],
+                },
+            })
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap(); // ResumeRequest
+
+        // One stream announcing file 0, then a chunk claiming file 1.
+        let mut stream = channel.open_bi().await.unwrap();
+        let (c0, rest) = payload.split_at(1024);
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Chunk {
+                    job_id,
+                    file_index: 0,
+                    chunk_index: 0,
+                    data: c0.to_vec(),
+                },
+            })
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // ack for chunk 0
+        let _ = stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Chunk {
+                    job_id,
+                    file_index: 1, // foreign file on this stream
+                    chunk_index: 1,
+                    data: rest[..1024].to_vec(),
+                },
+            })
+            .await;
+        // The receiver fails on that chunk; its connection must then close
+        // from ITS side while this sender keeps every handle alive.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while channel.healthy() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let closed = !channel.healthy();
+        drop((stream, control));
+        closed
+    });
+
+    let err = receiver
+        .await
+        .unwrap()
+        .expect_err("a foreign file index on a file stream must fail the receive");
+    assert!(
+        matches!(
+            &err,
+            EngineError::PeerError {
+                code: ErrorCode::ProtocolUnsupported,
+                ..
+            }
+        ),
+        "got: {err:?}"
+    );
+    assert!(
+        fake.await.unwrap(),
+        "the failed multistream receive must close the connection, not leave the sender waiting"
+    );
+}
+
 // ------------------------------------------------------------------
 // Wave 21: on-channel admission handshake + per-task staging
 // ------------------------------------------------------------------

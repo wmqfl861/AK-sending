@@ -3186,6 +3186,115 @@ async fn multistream_receive_failure_closes_the_connection() {
     );
 }
 
+/// M6 (batch M, 2026-11-17): a multistream receive that is CANCELLED mid
+/// transfer (its task aborted, the "process restart" shape of the property
+/// suite) must not leave its helper tasks holding stream handles: the
+/// [`ReceiveTaskGuard`] aborts them, the last handles drop and the QUIC
+/// connection closes, so the sender fails at once instead of waiting out
+/// its idle budget (`IdleTimeout(30s)`) — or, blocked in a flow-controlled
+/// write, forever.
+#[tokio::test]
+async fn cancelled_multistream_receive_closes_the_connection() {
+    let dst = tempfile::tempdir().unwrap();
+    let receiver_key = DeviceKeyPair::generate();
+    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    let sender_bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+    let mut recv = ReceiveSpec::new(dst.path().to_path_buf(), receiver_bundle.clone());
+    recv.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    recv.idle_timeout = Duration::from_secs(5);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    let (acked_tx, acked_rx) = tokio::sync::oneshot::channel::<()>();
+    let addr = addr_rx.await.unwrap();
+
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let entry = chunked_wire_entry("owned.bin", &payload, 1024);
+    let receiver_fp = receiver_key.fingerprint();
+    let fake = tokio::spawn(async move {
+        let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &sender_bundle)
+            .await
+            .unwrap();
+        let channel = endpoint.connect(addr, &receiver_fp).await.unwrap();
+        let mut control = channel.open_bi().await.unwrap();
+        let limits = engine_limits();
+        control
+            .send_frame(&hello_frame(
+                "cancelled",
+                &sender_bundle,
+                CAP_RESUME | CAP_MULTISTREAM,
+            ))
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap();
+        let job_id = [0xB7; 16];
+        control
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Offer {
+                    job_id,
+                    root_name: "cancelled".to_owned(),
+                    file_count: 1,
+                    total_bytes: entry.size,
+                    chunk_size: 1024,
+                },
+            })
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap(); // Accept
+        control
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::ManifestPage {
+                    job_id,
+                    page_index: 0,
+                    last_page: true,
+                    entries: vec![entry],
+                },
+            })
+            .await
+            .unwrap();
+        let _ = control.recv_frame(&limits).await.unwrap(); // ResumeRequest
+
+        // One file stream: chunk 0 and its ack put the receive mid transfer.
+        let mut stream = channel.open_bi().await.unwrap();
+        let c0 = &payload[..1024];
+        stream
+            .send_frame(&Frame {
+                version: ak_wire::VERSION,
+                message: Message::Chunk {
+                    job_id,
+                    file_index: 0,
+                    chunk_index: 0,
+                    data: c0.to_vec(),
+                },
+            })
+            .await
+            .unwrap();
+        let _ = stream.recv_frame(&limits).await.unwrap(); // ack for chunk 0
+                                                           // Mid transfer: let the test cancel the receive now.
+        acked_tx.send(()).unwrap();
+        // The receive is cancelled; its connection must then close from ITS
+        // side while this sender keeps every handle alive.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while channel.healthy() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let closed = !channel.healthy();
+        drop((stream, control));
+        closed
+    });
+
+    acked_rx
+        .await
+        .expect("the fake sender reached the data phase");
+    receiver.abort();
+    let _ = receiver.await;
+    assert!(
+        fake.await.unwrap(),
+        "a cancelled multistream receive must close the connection, not leave the sender waiting"
+    );
+}
+
 // ------------------------------------------------------------------
 // Wave 21: on-channel admission handshake + per-task staging
 // ------------------------------------------------------------------

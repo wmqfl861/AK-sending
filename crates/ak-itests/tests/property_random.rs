@@ -292,13 +292,28 @@ async fn run_resume_seed(seed: u64) -> Duration {
     let wall = started.elapsed();
 
     // ---- 续传不变量 --------------------------------------------------------
+    // Wave 17 (`record_id_for`) split the wire job id — the content id that
+    // `Report.job_id` carries — from the checkpoint RECORD id that keys the
+    // `.akjob` file (content id + peer + direction + root). Comparing a
+    // report's job id with the record id could never hold after that split;
+    // the first Linux release run of this suite reached the comparison
+    // (M5, batch M, 2026-11-17). Resumption is: both ends report the same
+    // content id, leg 2 derives exactly the surviving leg-1 record's id
+    // (the same transfer instance, so that is the record it resumed), and
+    // both ends skip verified chunks (asserted below).
     assert_eq!(
-        send_report.job_id, job_id,
-        "{ctx}job id must survive the interruption (resume, not a new job)"
+        recv_report.job_id, send_report.job_id,
+        "{ctx}both ends must report the same (content) job id"
     );
     assert_eq!(
-        recv_report.job_id, job_id,
-        "{ctx}receiver job id must match the pre-abort checkpoint record"
+        ak_engine::record_id_for(
+            &send_report.job_id,
+            &receiver_key.fingerprint(),
+            ak_store::Direction::Send,
+            src.path(),
+        ),
+        job_id,
+        "{ctx}leg 2 must be the transfer instance of the surviving leg-1 record (resume, not a new job)"
     );
     assert!(
         send_report.resumed_chunks >= 1,

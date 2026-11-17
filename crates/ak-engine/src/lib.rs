@@ -4494,6 +4494,44 @@ enum StreamEvent {
     Cancelled,
 }
 
+/// Abort handles of a multistream receive's helper tasks (control reader,
+/// control monitor, per-stream openers and receive tasks). Dropping the
+/// guard aborts every task that is still running, so a multistream receive
+/// that fails or is cancelled (its future dropped, e.g. the receiving task
+/// aborted) cannot leave stream handles behind (M6, batch M 2026-11-17).
+/// Those handles kept the QUIC connection — and its keep-alives — alive, so
+/// the sender waited out its whole idle budget (`IdleTimeout(30s)`, the
+/// property suite's historical Windows failure, reproduced on Linux) or,
+/// blocked in a flow-controlled write, forever. A completed receive
+/// disarms the guard: its tasks then run exactly as before (the control
+/// reader keeps draining through the FinalAck hold).
+#[derive(Default)]
+struct ReceiveTaskGuard(Vec<tokio::task::AbortHandle>);
+
+impl ReceiveTaskGuard {
+    fn track(&mut self, task: &tokio::task::JoinHandle<()>) {
+        self.0.push(task.abort_handle());
+    }
+
+    /// Forget finished tasks so a long job holds one handle per live task.
+    fn prune(&mut self) {
+        self.0.retain(|task| !task.is_finished());
+    }
+
+    /// The receive completed: leave the remaining tasks running.
+    fn disarm(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for ReceiveTaskGuard {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// Receive a multistream job: accept per-file streams until Finalize, drive
 /// each stream in its own task (write/verify/ack), keep the checkpoint
 /// current at the same cadence as the single-stream path. Returns the event
@@ -4532,7 +4570,8 @@ async fn multistream_receive(
     let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (frames_tx, mut frames_rx) =
         tokio::sync::mpsc::channel::<Result<Frame, ak_net::StreamError>>(8);
-    tokio::spawn(async move {
+    let mut tasks = ReceiveTaskGuard::default();
+    let reader = tokio::spawn(async move {
         let mut rx = control_rx;
         loop {
             match rx.recv_frame(&limits).await {
@@ -4548,13 +4587,14 @@ async fn multistream_receive(
             }
         }
     });
+    tasks.track(&reader);
 
     // Control monitor: forwards Finalize/Cancel/Error into the driver's
     // event channel, then keeps draining silently so the connection is
     // held until the sender half-closes after reading the FinalAck. All
     // frames must name this job (cross-frame validation).
     let control_tx = events_tx.clone();
-    tokio::spawn(async move {
+    let monitor = tokio::spawn(async move {
         let mut finalized = false;
         let mut activity_open = true;
         let mut deadline = tokio::time::Instant::now() + idle;
@@ -4645,6 +4685,7 @@ async fn multistream_receive(
             }
         }
     });
+    tasks.track(&monitor);
 
     let mut finalized = false;
     let mut open_streams = 0usize;
@@ -4702,6 +4743,7 @@ async fn multistream_receive(
                     }
                     StreamEvent::FileDone { file_index, sink } => {
                         open_streams = open_streams.saturating_sub(1);
+                        tasks.prune();
                         if let Some(slot) = sinks.get_mut(file_index as usize) {
                             *slot = Some(sink);
                         }
@@ -4737,7 +4779,7 @@ async fn multistream_receive(
                                 bytes: entry.size,
                             });
                         }
-                        receive_stream_task(
+                        tasks.track(&receive_stream_task(
                             stream,
                             sink,
                             file_index,
@@ -4745,7 +4787,7 @@ async fn multistream_receive(
                             job_id,
                             idle,
                             events_tx.clone(),
-                        );
+                        ));
                     }
                     StreamEvent::Failed(error) => return Err(error),
                     StreamEvent::Finalize => finalized = true,
@@ -4775,7 +4817,7 @@ async fn multistream_receive(
                         // Linux and Windows alike.
                         open_streams += 1;
                         let events = events_tx.clone();
-                        tokio::spawn(async move {
+                        let opener = tokio::spawn(async move {
                             let mut stream = stream;
                             let event = match tokio::time::timeout(
                                 idle,
@@ -4789,16 +4831,19 @@ async fn multistream_receive(
                             };
                             let _ = events.send(event).await;
                         });
+                        tasks.track(&opener);
                     }
                 }
             }
         }
     }
+    tasks.disarm();
     Ok(events_rx)
 }
 
 /// Drive one accepted per-file stream: write/verify/ack every chunk until
-/// the sender half-closes, then hand the sink back to the driver.
+/// the sender half-closes, then hand the sink back to the driver. Returns
+/// the task's handle so the driver's [`ReceiveTaskGuard`] can abort it.
 fn receive_stream_task(
     mut stream: DirectStream,
     mut sink: ak_storage::LocalFileSink,
@@ -4807,7 +4852,7 @@ fn receive_stream_task(
     job_id: JobId,
     idle: Duration,
     events: tokio::sync::mpsc::Sender<StreamEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let limits = engine_limits();
         let mut current = Some(first);
@@ -4902,7 +4947,7 @@ fn receive_stream_task(
                 Err(error) => StreamEvent::Failed(error),
             })
             .await;
-    });
+    })
 }
 
 /// Run one receive to completion (see [`receive_with_addr`]).

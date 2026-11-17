@@ -1789,6 +1789,223 @@ fn one_hundred_thousand_resume_entries_arrive_sharded() {
 }
 
 // ------------------------------------------------------------------
+// Receiver liveness during prepare and verify (review 2026-11-18)
+// ------------------------------------------------------------------
+
+/// The cadence is a quarter of the receiver's idle budget, capped at five
+/// seconds: the default 30 s budget signals every 5 s, a 1 s budget
+/// every 250 ms.
+#[test]
+fn liveness_interval_is_a_quarter_of_idle_capped_at_five_seconds() {
+    assert_eq!(
+        liveness_interval(DEFAULT_IDLE_TIMEOUT),
+        LIVENESS_MAX_INTERVAL
+    );
+    assert_eq!(LIVENESS_MAX_INTERVAL, Duration::from_secs(5));
+    assert_eq!(
+        liveness_interval(Duration::from_secs(8)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        liveness_interval(Duration::from_secs(1)),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        liveness_interval(Duration::from_secs(3600)),
+        LIVENESS_MAX_INTERVAL
+    );
+}
+
+fn resume_entry(index: u32) -> ResumeEntry {
+    ResumeEntry {
+        file_index: index,
+        verified_prefix_chunks: u64::from(index % 4),
+    }
+}
+
+/// A shard leaves when it fills a frame or when the interval has passed
+/// since the last frame (then possibly empty), never otherwise; whatever
+/// is left stays for the final frame.
+#[test]
+fn resume_shards_leave_when_full_or_when_due() {
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let mut shards = ResumeShards::new(3, Duration::from_secs(5), t0);
+    assert_eq!(shards.take_due(at(1)), None, "nothing pending, not due");
+    shards.push(resume_entry(0));
+    shards.push(resume_entry(1));
+    assert_eq!(shards.take_due(at(2)), None, "partial and not due");
+    shards.push(resume_entry(2));
+    assert_eq!(
+        shards.take_due(at(2)),
+        Some(vec![resume_entry(0), resume_entry(1), resume_entry(2)]),
+        "a full frame leaves at once"
+    );
+    assert_eq!(shards.take_due(at(6)), None, "the clock restarted at 2 s");
+    assert_eq!(
+        shards.take_due(at(7)),
+        Some(Vec::new()),
+        "due with nothing pending (a run of directories): an empty keep-alive shard"
+    );
+    shards.push(resume_entry(3));
+    assert_eq!(shards.take_due(at(12)), Some(vec![resume_entry(3)]));
+    shards.push(resume_entry(4));
+    assert_eq!(shards.take_due(at(13)), None);
+    assert_eq!(shards.into_rest(), vec![resume_entry(4)]);
+
+    // A zero cap is clamped to one entry per frame, like the final shards.
+    let mut tiny = ResumeShards::new(0, Duration::from_secs(5), t0);
+    tiny.push(resume_entry(9));
+    assert_eq!(tiny.take_due(t0), Some(vec![resume_entry(9)]));
+}
+
+/// The sender's collector folds progressive shards (full ones, a partial
+/// one sent on the timer, an empty keep-alive one) plus the final frame
+/// into exactly the answer the receiver prepared, through a real
+/// encode/decode round trip.
+#[test]
+fn progressive_resume_shards_fold_into_the_full_answer() {
+    let limits = engine_limits();
+    let job_id = [5; 16];
+    let manifest = Manifest {
+        chunk_size: NonZeroU32::new(1024).unwrap(),
+        entries: (0..10)
+            .map(|i| {
+                FileEntry::new(&format!("f{i}.bin"), 4 * 1024, 0, [1; 32], vec![[1; 32]; 4])
+                    .unwrap()
+            })
+            .collect(),
+    };
+    let answer: Vec<ResumeEntry> = (0..10).map(resume_entry).collect();
+
+    let t0 = Instant::now();
+    let mut shards = ResumeShards::new(4, Duration::from_secs(1), t0);
+    let mut messages = Vec::new();
+    let mut emit = |shards: &mut ResumeShards, now: Instant| {
+        if let Some(files) = shards.take_due(now) {
+            messages.push(Message::ResumeRequest {
+                job_id,
+                files,
+                more: true,
+            });
+        }
+    };
+    for entry in &answer[..4] {
+        shards.push(*entry);
+        emit(&mut shards, t0); // the fourth fills the frame
+    }
+    emit(&mut shards, t0 + Duration::from_secs(2)); // empty keep-alive
+    shards.push(answer[4]);
+    emit(&mut shards, t0 + Duration::from_millis(2500));
+    shards.push(answer[5]);
+    emit(&mut shards, t0 + Duration::from_secs(3)); // partial, on the timer
+    for entry in &answer[6..] {
+        shards.push(*entry);
+        emit(&mut shards, t0 + Duration::from_secs(3)); // the last fills the frame
+    }
+    messages.extend(resume_request_frames(
+        job_id,
+        &shards.into_rest(),
+        usize::from(limits.max_resume_entries),
+    ));
+    let sizes: Vec<(usize, bool)> = messages
+        .iter()
+        .map(|message| match message {
+            Message::ResumeRequest { files, more, .. } => (files.len(), *more),
+            other => panic!("unexpected message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![(4, true), (0, true), (2, true), (4, true), (0, false)]
+    );
+
+    let mut collector = ResumeCollector::new(job_id, &manifest, &limits);
+    let mut done = false;
+    for message in messages {
+        assert!(!done, "no frame may follow the final one");
+        let mut buf = Vec::new();
+        Frame {
+            version: ak_wire::VERSION,
+            message,
+        }
+        .encode(&mut buf);
+        let Message::ResumeRequest {
+            job_id: frame_job,
+            files,
+            more,
+        } = Frame::decode(&buf, &limits).unwrap().message
+        else {
+            panic!("not a ResumeRequest");
+        };
+        done = collector.push(frame_job, files, more).unwrap();
+    }
+    assert!(done, "the exchange ends with the more = false frame");
+    assert_eq!(collector.entries, answer);
+}
+
+/// Liveness while verifying (review 2026-11-18). In a multi-thread
+/// runtime — the production shape — the sender's FinalAck wait is a real
+/// timer: a verify phase longer than the sender's idle budget used to
+/// end in a sender-side `IdleTimeout` while the receiver committed every
+/// file. (The single-thread test runtime hid this: the receiver's
+/// blocking verify pass also stopped the sender's timer.) The receiver's
+/// progress callback stretches the verify phase here to several idle
+/// budgets; the no-op `Control::Resume` signals keep the sender waiting
+/// and both sides complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_verify_phase_keeps_the_sender_waiting() {
+    const FILES: usize = 12;
+    let idle = Duration::from_secs(1);
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    for i in 0..FILES {
+        write(&src.path().join(format!("f{i:02}.bin")), &[i as u8; 3000]);
+    }
+    let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1);
+    send_spec.idle_timeout = idle;
+    recv.idle_timeout = idle;
+
+    let window: Arc<std::sync::Mutex<(Option<Instant>, Option<Instant>)>> =
+        Arc::new(std::sync::Mutex::new((None, None)));
+    let progress = {
+        let window = Arc::clone(&window);
+        Arc::new(move |event: Progress| match event {
+            Progress::Verifying => window.lock().unwrap().0 = Some(Instant::now()),
+            // Each file's verification takes 3/10 of the idle budget.
+            Progress::FileVerified { .. } => std::thread::sleep(idle * 3 / 10),
+            Progress::FinalAck { .. } => window.lock().unwrap().1 = Some(Instant::now()),
+            _ => {}
+        })
+    };
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = {
+        let progress = Arc::clone(&progress);
+        tokio::spawn(async move { receive_with_addr(recv, &*progress, addr_tx).await })
+    };
+    send_spec.peer = addr_rx.await.unwrap();
+    let sender = tokio::spawn(async move { send(send_spec, &noop).await });
+    let recv_outcome = receiver.await.unwrap();
+    let send_outcome = sender.await.unwrap();
+    let report = send_outcome.expect("the sender must outlast a long verify phase");
+    recv_outcome.expect("the receiver completes");
+    assert_eq!(report.files, FILES as u64);
+
+    let (start, end) = *window.lock().unwrap();
+    let span = end.expect("FinalAck sent") - start.expect("verify phase began");
+    assert!(
+        span >= idle * 3,
+        "the verify phase must outlast the sender's idle budget several times over: {span:?}"
+    );
+    for i in 0..FILES {
+        assert_eq!(
+            fs::read(dst.path().join(format!("f{i:02}.bin"))).unwrap(),
+            vec![i as u8; 3000]
+        );
+    }
+}
+
+// ------------------------------------------------------------------
 // Round 17: record id vs content id (review item 4)
 // ------------------------------------------------------------------
 

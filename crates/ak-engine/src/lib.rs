@@ -49,7 +49,14 @@
 //! - multi-root send jobs: [`SendSpec::extra_roots`] merges several
 //!   files/directories into one manifest, each entry prefixed with its
 //!   root's name; the receiver side is unchanged (the tree simply grows a
-//!   top-level directory per root).
+//!   top-level directory per root);
+//! - receiver liveness (review 2026-11-18): the receiver sends its sharded
+//!   ResumeRequest answer while it prepares the sinks (a `more = true`
+//!   shard, possibly empty, at least every `liveness_interval`), and
+//!   during the verify phase it sends a no-op `Control::Resume` to a peer
+//!   that negotiated `CAP_PAUSE_RESUME` at the same cadence, so the
+//!   sender's per-frame idle budget never has to cover a whole prepare or
+//!   verify pass of a large job.
 //!
 //! Concurrent receive (round 6, no wire-format change):
 //! [`serve_concurrently`] binds once and serves several senders — one
@@ -176,6 +183,26 @@ fn engine_limits() -> Limits {
 }
 /// Default idle timeout applied to every frame receive wait.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest the receiver stays silent toward the sender while it works
+/// through a phase that sends no frames of its own (review 2026-11-18):
+/// preparing every sink before the ResumeRequest answer, and verifying
+/// and committing every file between Finalize and FinalAck. The sender
+/// waits for each frame under its idle budget (default 30 s), while both
+/// phases grow with the file count, so a large job on a slow disk
+/// outlasted the budget and the sender gave up on a healthy receiver.
+const LIVENESS_MAX_INTERVAL: Duration = Duration::from_secs(5);
+/// Checkpoint cadence of the verify phase. The record is rewritten whole
+/// on every save, so saving after every file cost O(files²) bytes.
+/// Commit safety does not depend on it: a retry finds a committed file
+/// through the storage layer's whole-digest check of the final name.
+const VERIFY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Liveness cadence of one receive: a quarter of the receiver's own idle
+/// budget (the sender normally runs the same default), never more than
+/// [`LIVENESS_MAX_INTERVAL`].
+fn liveness_interval(idle: Duration) -> Duration {
+    (idle / 4).min(LIVENESS_MAX_INTERVAL)
+}
 /// Hard cap on concurrent per-file streams in multistream mode.
 const MAX_PARALLEL_STREAMS: usize = 4;
 /// QUIC application-error code for a policy-gate refusal: `0xA0` marks the
@@ -1585,6 +1612,55 @@ fn resume_request_frames(
         });
     }
     frames
+}
+
+/// Receiver-side builder of the sharded resume answer while the sinks are
+/// being prepared (review 2026-11-18). Instead of answering only after
+/// the whole prepare pass, a `more = true` shard leaves as soon as it
+/// reaches the per-frame cap, or when the liveness interval has passed
+/// since the last frame — then possibly empty, which the sender's
+/// [`ResumeCollector`] accepts as "keep waiting". Whatever is left goes
+/// out through [`resume_request_frames`] as the final `more = false`
+/// frame once the pass is over.
+struct ResumeShards {
+    pending: Vec<ResumeEntry>,
+    max_per_frame: usize,
+    every: Duration,
+    last_frame: Instant,
+}
+
+impl ResumeShards {
+    fn new(max_per_frame: usize, every: Duration, now: Instant) -> Self {
+        ResumeShards {
+            pending: Vec::new(),
+            max_per_frame: max_per_frame.max(1),
+            every,
+            last_frame: now,
+        }
+    }
+
+    fn push(&mut self, entry: ResumeEntry) {
+        self.pending.push(entry);
+    }
+
+    /// The `more = true` shard to send at `now`, if one is due: the
+    /// pending entries once they fill a frame, or whatever is pending
+    /// (possibly nothing) once the liveness interval has passed.
+    fn take_due(&mut self, now: Instant) -> Option<Vec<ResumeEntry>> {
+        let full = self.pending.len() >= self.max_per_frame;
+        let quiet_too_long = now.saturating_duration_since(self.last_frame) >= self.every;
+        if full || quiet_too_long {
+            self.last_frame = now;
+            Some(std::mem::take(&mut self.pending))
+        } else {
+            None
+        }
+    }
+
+    /// The entries for the final frame(s).
+    fn into_rest(self) -> Vec<ResumeEntry> {
+        self.pending
+    }
 }
 
 /// Sender-side accumulator for the sharded ResumeRequest exchange: folds in
@@ -3580,6 +3656,23 @@ async fn receive_admission_stage(
     }
 }
 
+/// Discard every prepared sink that holds no verified chunk: after a
+/// failed receive those part files are pure litter, while parts holding
+/// verified chunks survive for resume. Sinks already handed to
+/// multistream tasks are no longer in `sinks` and are left alone.
+fn discard_empty_sinks(sinks: &mut [Option<ak_storage::LocalFileSink>]) {
+    for slot in sinks.iter_mut() {
+        let empty = slot
+            .as_ref()
+            .is_some_and(|sink| sink.verified_prefix_chunks() == 0);
+        if empty {
+            if let Some(sink) = slot.take() {
+                sink.discard();
+            }
+        }
+    }
+}
+
 /// The frozen receive body (wave 27 split out of `receive_job` verbatim;
 /// wave 28 adds the optional `consent` hook):
 /// everything from Offer/Accept through manifest pages, resume answer,
@@ -3874,9 +3967,19 @@ async fn receive_frozen_body(
     // previous record's verified prefix; "still matches" is proven by
     // re-hashing the committed file, so a deleted or modified target falls
     // back to a normal retransfer.
+    //
+    // The answer is sent while the sinks are prepared (review 2026-11-18):
+    // a `more = true` shard leaves whenever it fills a frame or the
+    // liveness interval has passed, so the sender's per-frame idle budget
+    // never has to cover the whole prepare pass (see LIVENESS_MAX_INTERVAL).
     let mut sinks: Vec<Option<ak_storage::LocalFileSink>> =
         Vec::with_capacity(job.manifest.entries.len());
-    let mut resume: Vec<ResumeEntry> = Vec::new();
+    let mut shards = ResumeShards::new(
+        usize::from(limits.max_resume_entries),
+        liveness_interval(spec.idle_timeout),
+        Instant::now(),
+    );
+    let mut resumed_chunks: u64 = 0;
     let mut committed_skip = vec![false; job.manifest.entries.len()];
     for (index, entry) in job.manifest.entries.iter().enumerate() {
         let was_fully_verified = previous
@@ -3887,35 +3990,55 @@ async fn receive_frozen_body(
             });
         if was_fully_verified && committed_file_matches(target.root(), entry) {
             committed_skip[index] = true;
-            resume.push(ResumeEntry {
+            let chunks = entry.chunk_digests.len() as u64;
+            resumed_chunks += chunks;
+            shards.push(ResumeEntry {
                 file_index: index as u32,
-                verified_prefix_chunks: entry.chunk_digests.len() as u64,
+                verified_prefix_chunks: chunks,
             });
             if let Some(slot) = record.files.get_mut(index) {
-                slot.verified_prefix_chunks = entry.chunk_digests.len() as u64;
+                slot.verified_prefix_chunks = chunks;
             }
             // No sink: no part file, no chunk phase, no finish for this file.
             sinks.push(None);
-            continue;
+        } else {
+            let sink = match staged_task {
+                // Scheduled task: the part file lives in this task's own
+                // staging tree (`<root>/.ak-staging/<task_hex>/...`), so a
+                // second task aiming at the same destination can never
+                // compete for one `.akpart` (wave 20 staging contract).
+                Some(task) => target.prepare_file_staged(task, entry, spec.conflict, chunk_size)?,
+                None => target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?,
+            };
+            let prefix = sink.verified_prefix_chunks();
+            if !entry.is_dir {
+                resumed_chunks += prefix;
+                shards.push(ResumeEntry {
+                    file_index: index as u32,
+                    verified_prefix_chunks: prefix,
+                });
+            }
+            sinks.push(Some(sink));
         }
-        let sink = match staged_task {
-            // Scheduled task: the part file lives in this task's own
-            // staging tree (`<root>/.ak-staging/<task_hex>/...`), so a
-            // second task aiming at the same destination can never
-            // compete for one `.akpart` (wave 20 staging contract).
-            Some(task) => target.prepare_file_staged(task, entry, spec.conflict, chunk_size)?,
-            None => target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?,
-        };
-        let prefix = sink.verified_prefix_chunks();
-        if !entry.is_dir {
-            resume.push(ResumeEntry {
-                file_index: index as u32,
-                verified_prefix_chunks: prefix,
-            });
+        if let Some(files) = shards.take_due(Instant::now()) {
+            let shard = Frame {
+                version: ak_wire::VERSION,
+                message: Message::ResumeRequest {
+                    job_id,
+                    files,
+                    more: true,
+                },
+            };
+            if let Err(error) = tx.send_frame(&shard).await {
+                // Same litter rule as the outcome wrapper below.
+                discard_empty_sinks(&mut sinks);
+                return Err(EngineError::from(error));
+            }
+            // Let the transport (and a peer sharing this runtime) run.
+            tokio::task::yield_now().await;
         }
-        sinks.push(Some(sink));
     }
-    let resumed_chunks: u64 = resume.iter().map(|r| r.verified_prefix_chunks).sum();
+    let resume_rest = shards.into_rest();
     if resumed_chunks > 0 {
         progress(Progress::Resuming {
             chunks: resumed_chunks,
@@ -3926,11 +4049,11 @@ async fn receive_frozen_body(
     // discards empty part files so a failed receive leaves no litter.
     // Parts holding verified chunks always survive for resume.
     let outcome = async {
-        // ResumeRequest, sharded: each frame carries at most
-        // `max_resume_entries` entries; the last (the only one for an empty
-        // answer) carries more = false.
+        // The rest of the resume answer: at most `max_resume_entries`
+        // entries per frame, the last one (the only one when the prepare
+        // pass was short) with more = false.
         for message in
-            resume_request_frames(job_id, &resume, usize::from(limits.max_resume_entries))
+            resume_request_frames(job_id, &resume_rest, usize::from(limits.max_resume_entries))
         {
             tx.send_frame(&Frame {
                 version: ak_wire::VERSION,
@@ -3990,7 +4113,33 @@ async fn receive_frozen_body(
         // lets a retry of the same record skip the file (see the prepare
         // loop) instead of colliding with its own committed output.
         progress(Progress::Verifying);
+        // One save up front captures the whole chunk phase (the chunk-phase
+        // cadence may trail the last acks); during the pass the record is
+        // saved on a timer, not per file (VERIFY_CHECKPOINT_INTERVAL).
+        record.updated_unix_ms = now_ms();
+        store.save(&record).map_err(EngineError::Checkpoint)?;
+        let mut last_save = Instant::now();
+        // Liveness while verifying (review 2026-11-18): the sender waits
+        // for the FinalAck under its idle budget and tolerates Control
+        // frames at that gate, so a peer that negotiated Pause/Resume gets
+        // a no-op Control::Resume whenever the liveness interval passes.
+        let signal_liveness = (peer_caps & CAP_PAUSE_RESUME) != 0;
+        let liveness = liveness_interval(spec.idle_timeout);
+        let mut last_signal = Instant::now();
         for (index, sink_slot) in sinks.iter_mut().enumerate() {
+            if signal_liveness && last_signal.elapsed() >= liveness {
+                tx.send_frame(&Frame {
+                    version: ak_wire::VERSION,
+                    message: Message::Control {
+                        job_id,
+                        control: Control::Resume,
+                    },
+                })
+                .await?;
+                // Let the transport (and a peer sharing this runtime) run.
+                tokio::task::yield_now().await;
+                last_signal = Instant::now();
+            }
             if let Some(mut sink) = sink_slot.take() {
                 if job.manifest.entries[index].is_dir {
                     sink.finish().map_err(EngineError::Io)?;
@@ -3999,8 +4148,11 @@ async fn receive_frozen_body(
                 sink.finish().map_err(EngineError::Io)?;
                 record.files[index].verified_prefix_chunks =
                     job.manifest.entries[index].chunk_digests.len() as u64;
-                record.updated_unix_ms = now_ms();
-                store.save(&record).map_err(EngineError::Checkpoint)?;
+                if last_save.elapsed() >= VERIFY_CHECKPOINT_INTERVAL {
+                    record.updated_unix_ms = now_ms();
+                    store.save(&record).map_err(EngineError::Checkpoint)?;
+                    last_save = Instant::now();
+                }
                 progress(Progress::FileVerified {
                     file_index: index as u32,
                 });
@@ -4099,16 +4251,7 @@ async fn receive_frozen_body(
         Err(error) => {
             // Sinks consumed by multistream tasks are already gone; every
             // sink still held here with no verified chunk is pure litter.
-            for slot in sinks.iter_mut() {
-                let empty = slot
-                    .as_ref()
-                    .is_some_and(|sink| sink.verified_prefix_chunks() == 0);
-                if empty {
-                    if let Some(sink) = slot.take() {
-                        sink.discard();
-                    }
-                }
-            }
+            discard_empty_sinks(&mut sinks);
             // Cancellation is the other terminal state whose whole
             // staging tree is discarded (wave 20 contract: parts holding
             // verified chunks otherwise survive for resume). Any other

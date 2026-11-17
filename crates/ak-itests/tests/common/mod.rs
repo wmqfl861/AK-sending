@@ -197,6 +197,36 @@ pub struct RawOutcome {
     pub recv: Result<Report, ak_engine::EngineError>,
     pub events: Vec<Progress>,
     pub recv_local_addr: SocketAddr,
+    /// Phase boundaries since the run started (review 2026-11-18): the
+    /// receiver's manifest arrival, the first chunk sent (the sender has
+    /// the whole resume answer), the last chunk received, the start of
+    /// the verify phase, the FinalAck and Done events. Lets a scale run
+    /// show which phase took the time when it fails on another machine.
+    pub timeline: Vec<(Duration, &'static str)>,
+}
+
+/// Phase marks collected while a run is in flight (see
+/// [`RawOutcome::timeline`]): one-shot boundaries, plus the time of the
+/// latest `ChunkReceived`.
+#[derive(Default)]
+struct PhaseMarks {
+    marks: Vec<(Duration, &'static str)>,
+    last_chunk: Option<Duration>,
+}
+
+/// The phase-boundary label of `event`, if it is one (see
+/// [`RawOutcome::timeline`]). `ChunkReceived` is tracked separately as
+/// "last chunk received".
+fn phase_mark(event: &Progress) -> Option<&'static str> {
+    match event {
+        Progress::ManifestReceived => Some("manifest received"),
+        Progress::Resuming { .. } => Some("resuming"),
+        Progress::ChunkSent { .. } => Some("first chunk sent"),
+        Progress::Verifying => Some("verify phase started"),
+        Progress::FinalAck { .. } => Some("final ack"),
+        Progress::Done => Some("done"),
+        _ => None,
+    }
 }
 
 /// Address-family and stream-shape knobs for [`try_run_transfer_opts`].
@@ -337,9 +367,26 @@ pub async fn try_run_transfer_parties(
     }
 
     let events: Arc<Mutex<Vec<Progress>>> = Arc::new(Mutex::new(Vec::new()));
+    let started = Instant::now();
+    let marks: Arc<Mutex<PhaseMarks>> = Arc::new(Mutex::new(PhaseMarks::default()));
     let callback = {
         let events = Arc::clone(&events);
+        let marks = Arc::clone(&marks);
         Arc::new(move |progress: Progress| {
+            if let Ok(mut marks) = marks.lock() {
+                let at = started.elapsed();
+                if matches!(progress, Progress::ChunkReceived { .. }) {
+                    marks.last_chunk = Some(at);
+                } else if let Some(label) = phase_mark(&progress) {
+                    // "first chunk sent" keeps its first occurrence only;
+                    // FinalAck and Done fire once on each side.
+                    let first_chunk_seen = label == "first chunk sent"
+                        && marks.marks.iter().any(|(_, seen)| *seen == label);
+                    if !first_chunk_seen {
+                        marks.marks.push((at, label));
+                    }
+                }
+            }
             if let Ok(mut log) = events.lock() {
                 log.push(progress);
             }
@@ -368,11 +415,23 @@ pub async fn try_run_transfer_parties(
         .lock()
         .map(|mut log| std::mem::take(&mut *log))
         .unwrap_or_default();
+    let timeline = marks
+        .lock()
+        .map(|mut marks| {
+            let mut timeline = std::mem::take(&mut marks.marks);
+            if let Some(at) = marks.last_chunk {
+                timeline.push((at, "last chunk received"));
+            }
+            timeline.sort_by_key(|(at, _)| *at);
+            timeline
+        })
+        .unwrap_or_default();
     RawOutcome {
         send,
         recv,
         events,
         recv_local_addr,
+        timeline,
     }
 }
 

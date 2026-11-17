@@ -18,6 +18,11 @@
 //!   落盘 —— 21,200 条目（20,000 文件 + 800 组目录 + 400 空目录链）、
 //!   5,063,071 字节、83 个清单页，wall 263.7s（send 263.6s / recv
 //!   263.6s）；第二轮首次转完整路径时旧值 wall 328s。
+//!
+//! 运行时形态（2026-11-18 复核）：本文件全部测试跑在多线程 tokio 运行时上，
+//! 与产品（FFI 内嵌多线程运行时）一致。单线程测试运行时里，接收端阻塞式的
+//! 准备与校验过程会连带停住发送端的空闲计时，曾掩盖“大任务里发送端在接收端
+//! 准备或校验期间空闲超时”的缺陷（N-N1）。
 #![forbid(unsafe_code)]
 
 mod common;
@@ -180,6 +185,14 @@ async fn run_scale_run(base: &Path, non_dir_entries: u64, budget_secs: u64, labe
         try_run_transfer_full(base, dst.path(), 1, ConflictPolicy::Fail, budget_secs).await;
     let elapsed = started.elapsed();
     let pages = count_events(&outcome.events, is_page);
+    // Phase timeline first, whatever the outcome: on a failure it shows
+    // which phase outlasted which budget.
+    let phases: Vec<String> = outcome
+        .timeline
+        .iter()
+        .map(|(at, phase)| format!("{phase} @ {at:.1?}"))
+        .collect();
+    eprintln!("{label}: phases: {}", phases.join(", "));
 
     match (&outcome.send, &outcome.recv) {
         (Ok(send), Ok(recv)) => {
@@ -238,7 +251,7 @@ async fn run_scale_run(base: &Path, non_dir_entries: u64, budget_secs: u64, labe
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_thousand_small_files_transfer_byte_identical_with_paging() {
     let base = tempfile::tempdir().unwrap();
     // 2,000 files + 80 group dirs + 200 empty dirs = 2,280 manifest entries
@@ -251,7 +264,7 @@ async fn two_thousand_small_files_transfer_byte_identical_with_paging() {
 /// (verified by a one-off release probe: 4,096 completes, 4,097 does not).
 /// This test pins the 4,097 side and stays green both while the defect exists
 /// and after it is fixed (then it asserts full completion).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn four_thousand_ninety_seven_files_hit_the_resume_request_budget_defect() {
     let base = tempfile::tempdir().unwrap();
     build_flat(base.path(), 4_097);
@@ -263,7 +276,7 @@ async fn four_thousand_ninety_seven_files_hit_the_resume_request_budget_defect()
 /// Release only (debug hashing and the per-file checkpoint cadence make this
 /// unnecessarily slow); run explicitly:
 /// `cargo test --release -p ak-itests -- --ignored --nocapture`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "20,000-file scale run; release only"]
 async fn twenty_thousand_files_release_scale_run() {
     let base = tempfile::tempdir().unwrap();
@@ -275,7 +288,7 @@ async fn twenty_thousand_files_release_scale_run() {
 /// since the 2026-11-03 paged exchange the surplus entries must arrive in a
 /// second frame and the transfer must complete. 1-byte flat files keep the
 /// run about per-entry overhead, not payload volume.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "65,537-file boundary run; release only"]
 async fn sixty_five_thousand_five_hundred_thirty_seven_files_release_boundary_run() {
     let base = tempfile::tempdir().unwrap();

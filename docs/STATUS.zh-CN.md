@@ -1,10 +1,10 @@
 # 项目状态
 
-> 更新：2026-11-18，批次 N 复核（复核方补完 M-N1、修复 N-N1）合入。
+> 更新：2026-11-18，批次 O（Windows 确认与 release 深测）。
 
 ## 当前状态
 
-批次 N 由本地 agent 执行，经 [N 复核](REVIEW_2026-11-18-batchN.zh-CN.md) 判定按交付形态不通过：
+批次 O 全部完成并推送。O1 Windows 常规确认通过（workspace 1219/0/8、slow_verify 10/10、ak-storage 57/0）；O2 release 深测全部通过，65,537 文件项首次在 Windows 上通过（2366.2s）。下一步：CI 绿后交复核。生产部署（E6）由所有者执行。
 
 - N0、N1 通过：M2（TLS 帧写入后 flush）在 Windows 上反复运行确认；
 - N2 部分通过：M7 在 Windows 上确认，M6 没有逐项记录，65,537 文件项失败；

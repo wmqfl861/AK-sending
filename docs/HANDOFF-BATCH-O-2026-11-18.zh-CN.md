@@ -124,3 +124,16 @@ $results | Format-Table
 
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
+| main 上批次 N 最终提交的 CI | `e8c7d84` run [44146280956](https://github.com/wmqfl861/AK-sending/actions/runs/44146280956) | completed success（12 项常规任务 success，1 项手动深测 skipped） |
+| O1 workspace | 本地 Windows | **1219 passed, 0 failed, 8 ignored** |
+| O1 slow_verify 10 次 | 本地 Windows | **10/10 通过，0 失败** |
+| O1 ak-storage | 本地 Windows | **57 passed, 0 failed**；`replaced_part_file_fails_closed_on_write_and_finish` 通过 |
+| O2 ak-engine 5 GiB | 本地 Windows | **通过**（226.68s）；磁盘 6.8GB 时两次失败（connection lost），清理至 23GB 后通过 |
+| O2 chunk_sweep_256mib | 本地 Windows | **通过**（36.88s） |
+| O2 netem 50/100ms | 本地 Windows | SKIP（tc netem 仅 Linux；同机 Windows 不适用） |
+| O2 multistream_512mib | 本地 Windows | **通过**（20.03s）——M6 Windows 确认 |
+| O2 property_random 10 seeds | 本地 Windows | **通过**（含 seed 1 中断续传）——M7 Windows 确认 |
+| O2 property_random 25 seeds | 本地 Windows | **通过** |
+| O2 20,000 文件 | 本地 Windows | **通过**（369.1s）；`T13-20000: phases: manifest received @ 9.0s, first chunk sent @ 26.5s, last chunk received @ 303.7s, verify phase started @ 306.7s, final ack @ 369.1s, final ack @ 369.1s, done @ 369.1s, done @ 369.2s` |
+| O2 65,537 文件 | 本地 Windows | **通过**（2366.2s ≈ 39.4 min）；`T13-65537: phases: manifest received @ 26.1s, first chunk sent @ 67.7s, last chunk received @ 2143.1s, verify phase started @ 2151.8s, final ack @ 2366.1s, final ack @ 2366.1s, done @ 2366.2s, done @ 2366.3s`——**首次在 Windows 上通过** |
+| O2 全量门槛 | 本地 Windows | fmt/clippy/rustdoc/sqlite/server-persistence/Python/repo/contracts/部署自检/跨NAT自检 全部通过 |

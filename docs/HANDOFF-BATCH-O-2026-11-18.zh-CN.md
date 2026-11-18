@@ -137,3 +137,4 @@ $results | Format-Table
 | O2 20,000 文件 | 本地 Windows | **通过**（369.1s）；`T13-20000: phases: manifest received @ 9.0s, first chunk sent @ 26.5s, last chunk received @ 303.7s, verify phase started @ 306.7s, final ack @ 369.1s, final ack @ 369.1s, done @ 369.1s, done @ 369.2s` |
 | O2 65,537 文件 | 本地 Windows | **通过**（2366.2s ≈ 39.4 min）；`T13-65537: phases: manifest received @ 26.1s, first chunk sent @ 67.7s, last chunk received @ 2143.1s, verify phase started @ 2151.8s, final ack @ 2366.1s, final ack @ 2366.1s, done @ 2366.2s, done @ 2366.3s`——**首次在 Windows 上通过** |
 | O2 全量门槛 | 本地 Windows | fmt/clippy/rustdoc/sqlite/server-persistence/Python/repo/contracts/部署自检/跨NAT自检 全部通过 |
+| O 批次最终 CI | `4f0331c` run [44242047799](https://github.com/wmqfl861/AK-sending/actions/runs/44242047799) | **12/12 常规任务 success**，1 项手动深测 skipped |

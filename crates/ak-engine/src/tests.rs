@@ -2198,7 +2198,7 @@ async fn offloaded_pass_keeps_signalling_until_it_finishes() {
 /// it is kept to four chunks: with a 1 GiB remainder the 300 ms budget
 /// also timed a receiver-side checkpoint save, whose fsync takes hundreds
 /// of milliseconds under that write load (intermittent on Linux), and on
-/// Windows the first resumed write itself (see the setup below).
+/// Windows the first resumed write itself (see the prefix setup below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "4 GiB transfer; run in release only"]
 async fn large_file_passes_keep_the_sender_waiting() {
@@ -2212,26 +2212,31 @@ async fn large_file_passes_keep_the_sender_waiting() {
     let file = fs::File::create(src.path().join("big.bin")).unwrap();
     file.set_len(size).unwrap();
     drop(file);
-    // The verified prefix as an earlier session leaves it: written and
-    // flushed. The content is zeros, so a zero-filled part file of whole
-    // chunks is exactly a verified prefix. `set_len` alone is not that
-    // state on NTFS: the extension stays beyond the file's valid data
-    // length, and the first write past it zero-fills the whole gap inside
-    // that write — the receiver's first resumed chunk, which stalled the
-    // receive task past the budget on every Windows run. Writing the
-    // prefix's last byte makes the file system fill the range here, before
-    // the timed transfer; on Linux the file stays sparse.
-    let materialize = Instant::now();
+    // The verified prefix as an earlier session leaves it: every byte
+    // written, then flushed. The content is zeros, so a zero-filled part
+    // file of whole chunks is exactly a verified prefix. Nothing short of
+    // writing it is that state on NTFS: a prefix made by `set_len`, or by
+    // writing only its last byte, stays beyond the file's valid data
+    // length, and the receiver's first resumed write then waits while the
+    // file system zero-fills the whole prefix (23-27 s for ~4 GiB on
+    // windows-latest; batch P handoff, section 9). Writing it costs time
+    // here, before the timed transfer, and real disk space everywhere.
+    let written = Instant::now();
     {
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::Write;
         let mut part = fs::File::create(dst.path().join("big.bin.akpart")).unwrap();
-        part.seek(SeekFrom::Start(prefix - 1)).unwrap();
-        part.write_all(&[0]).unwrap();
+        let block = vec![0u8; 8 * 1024 * 1024];
+        let mut left = prefix;
+        while left > 0 {
+            let n = left.min(block.len() as u64) as usize;
+            part.write_all(&block[..n]).unwrap();
+            left -= n as u64;
+        }
         part.sync_all().unwrap();
     }
     eprintln!(
-        "large-file passes: prefix of {prefix} bytes materialized in {:.2?}",
-        materialize.elapsed()
+        "large-file passes: prefix of {prefix} bytes written and flushed in {:.2?}",
+        written.elapsed()
     );
 
     let idle = Duration::from_millis(300);
@@ -2319,86 +2324,6 @@ async fn large_file_passes_keep_the_sender_waiting() {
         size
     );
     assert!(!dst.path().join("big.bin.akpart").exists());
-}
-
-/// TEMPORARY probe (batch P review, removed again in the next commit):
-/// how long the receiver's first resumed write into a ~4 GiB part file
-/// takes on the CI runners, for different ways of creating the prefix.
-/// It mimics the receiver: a full read pass (prepare's re-hash), a
-/// read+write reopen (`open_part`), then writes at the prefix end.
-#[test]
-#[ignore = "temporary file-system probe; release only"]
-fn zz_probe_first_resumed_write() {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    const MIB: u64 = 1024 * 1024;
-    let prefix = 4 * 1024 * MIB - 4 * MIB;
-    let chunk = vec![0u8; MIB as usize];
-    for case in ["set_len", "last_byte", "last_byte_then_10s", "written"] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("probe.akpart");
-        let t = Instant::now();
-        {
-            let mut f = fs::File::create(&path).unwrap();
-            match case {
-                "set_len" => f.set_len(prefix).unwrap(),
-                "written" => {
-                    let block = vec![0u8; 8 * MIB as usize];
-                    let mut left = prefix;
-                    while left > 0 {
-                        let n = left.min(block.len() as u64) as usize;
-                        f.write_all(&block[..n]).unwrap();
-                        left -= n as u64;
-                    }
-                    f.sync_all().unwrap();
-                }
-                _ => {
-                    f.seek(SeekFrom::Start(prefix - 1)).unwrap();
-                    f.write_all(&[0]).unwrap();
-                    f.sync_all().unwrap();
-                }
-            }
-        }
-        let setup = t.elapsed();
-        let t = Instant::now();
-        {
-            let mut f = fs::File::open(&path).unwrap();
-            let mut buf = vec![0u8; MIB as usize];
-            let mut total = 0u64;
-            loop {
-                let n = f.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n as u64;
-            }
-            assert_eq!(total, prefix);
-        }
-        let read = t.elapsed();
-        if case == "last_byte_then_10s" {
-            std::thread::sleep(Duration::from_secs(10));
-        }
-        let t = Instant::now();
-        let mut f = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let open = t.elapsed();
-        let t = Instant::now();
-        f.seek(SeekFrom::Start(prefix)).unwrap();
-        f.write_all(&chunk).unwrap();
-        let first = t.elapsed();
-        let t = Instant::now();
-        f.write_all(&chunk).unwrap();
-        let second = t.elapsed();
-        let t = Instant::now();
-        f.sync_all().unwrap();
-        let sync = t.elapsed();
-        eprintln!(
-            "PROBE {case}: setup {setup:.2?}, read pass {read:.2?}, reopen {open:.2?}, \
-             first write {first:.2?}, second write {second:.2?}, sync {sync:.2?}"
-        );
-    }
 }
 
 // ------------------------------------------------------------------

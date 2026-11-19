@@ -386,9 +386,10 @@ jobs:
   # Windows half of the manual deep test (2026-11-19 review of batch P):
   # the ak-engine release-only tests (5 GiB transfer, large-file liveness)
   # write multi-GiB files whose cost depends on the file system, and NTFS
-  # differs from the ext4 runner above (a set_len extension is zero-filled
-  # by the first write past it, where ext4 keeps a hole; batch P's
-  # Windows-only failure of the large-file test came from that). Same
+  # differs from the ext4 runner above (a range never written, made by
+  # set_len or by writing only past it, is zero-filled on NTFS when a later
+  # write lands past it, where ext4 keeps a hole; batch P's Windows-only
+  # failure of the large-file test came from that). Same
   # trigger as above: workflow_dispatch only. The ak-itests scale runs
   # stay Linux-only here; the local Windows host covers them.
   release-deep-tests-windows:

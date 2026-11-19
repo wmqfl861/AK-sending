@@ -79,8 +79,10 @@
 //! a ChunkAck means the chunk's digest was verified and its bytes were
 //! written to the receiver's part file — into the OS page cache, **not**
 //! durably on disk. The engine's durability boundaries are exactly two:
-//! (a) checkpoint batches — every `CHECKPOINT_EVERY_ACKS` acknowledged
-//! chunks the verified prefix is persisted to the checkpoint store; and
+//! (a) checkpoint batches — on every `CHECKPOINT_EVERY_ACKS`-th
+//! acknowledged chunk, at most once per `CHUNK_CHECKPOINT_INTERVAL`
+//! (review 2026-11-19), the verified prefix is persisted to the
+//! checkpoint store, and once more right before the verify phase; and
 //! (b) file commit — `finish()` re-verifies the whole digest, calls
 //! `sync_all` and atomically renames the part file, and only then is the
 //! per-file commit marker persisted (strictly before the final
@@ -162,8 +164,63 @@ use ak_wire::{
 /// Manifest pages are assembled under this byte budget so every page fits a
 /// frame comfortably below `ak_wire::MAX_FRAME_BYTES`.
 const PAGE_BUDGET_BYTES: usize = 4 << 20;
-/// Checkpoint write cadence, in acknowledged chunks.
+/// Progress cadence, in acknowledged chunks: every this many acks the
+/// sender and the receiver report `BytesAcked`, and the receiver considers
+/// a checkpoint save (see [`ChunkCheckpointCadence`]).
 const CHECKPOINT_EVERY_ACKS: u64 = 16;
+/// Least time between two chunk-phase checkpoint saves, on both sides
+/// (review 2026-11-19). A save rewrites the whole record, whose size grows
+/// with the file count, so the sender's save after every file and the
+/// receiver's save on every 16th ack cost O(files²) bytes over a
+/// many-file job — most of its chunk phase. Neither side's resume trusts
+/// these saves: the receiver re-hashes its part files, and the sender
+/// resumes from the receiver's ResumeRequest.
+const CHUNK_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The receiver's chunk-phase cadence: progress on every
+/// [`CHECKPOINT_EVERY_ACKS`]-th ack as before, a checkpoint save on such
+/// an ack only once [`CHUNK_CHECKPOINT_INTERVAL`] has passed since the
+/// last save. The acks that never reach a save are covered by the verify
+/// phase, which saves once before it starts.
+struct ChunkCheckpointCadence {
+    acks: u64,
+    last_save: Instant,
+}
+
+/// What one acknowledged chunk asks of the receive loop.
+#[derive(Debug, PartialEq, Eq)]
+struct CadenceTick {
+    progress: bool,
+    save: bool,
+}
+
+impl ChunkCheckpointCadence {
+    fn new(now: Instant) -> Self {
+        ChunkCheckpointCadence {
+            acks: 0,
+            last_save: now,
+        }
+    }
+
+    fn on_ack(&mut self, now: Instant) -> CadenceTick {
+        self.acks += 1;
+        if self.acks < CHECKPOINT_EVERY_ACKS {
+            return CadenceTick {
+                progress: false,
+                save: false,
+            };
+        }
+        self.acks = 0;
+        let save = now.saturating_duration_since(self.last_save) >= CHUNK_CHECKPOINT_INTERVAL;
+        if save {
+            self.last_save = now;
+        }
+        CadenceTick {
+            progress: true,
+            save,
+        }
+    }
+}
 /// Wire protocol version this engine speaks.
 const PROTO_VERSION: u16 = 1;
 
@@ -2303,6 +2360,9 @@ async fn multistream_send_files(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<SendEvent>(64);
     let mut set: tokio::task::JoinSet<Result<u32, EngineError>> = tokio::task::JoinSet::new();
     let mut events_alive = true;
+    // Per-file progress goes into the record at once, onto disk at most
+    // once per CHUNK_CHECKPOINT_INTERVAL (O-N2, review 2026-11-19).
+    let mut last_save = Instant::now();
     loop {
         while set.len() < concurrency {
             let Some(file_index) = work.pop_front() else {
@@ -2358,8 +2418,11 @@ async fn multistream_send_files(
                         ) {
                             checkpoint.verified_prefix_chunks = entry.chunk_digests.len() as u64;
                         }
-                        record.updated_unix_ms = now_ms();
-                        store.save(record).map_err(EngineError::Checkpoint)?;
+                        if last_save.elapsed() >= CHUNK_CHECKPOINT_INTERVAL {
+                            record.updated_unix_ms = now_ms();
+                            store.save(record).map_err(EngineError::Checkpoint)?;
+                            last_save = Instant::now();
+                        }
                     }
                     Some(Ok(Err(error))) => return Err(error),
                     Some(Err(join)) => {
@@ -2917,6 +2980,9 @@ async fn send_channel_body(
     } else {
         let window_size = spec.in_flight_window.max(1);
         let mut acks = AckWindow::new();
+        // See the multistream path: progress into the record per file, onto
+        // disk at most once per CHUNK_CHECKPOINT_INTERVAL (O-N2).
+        let mut last_save = Instant::now();
         for (file_index, entry) in manifest.entries.iter().enumerate() {
             if entry.is_dir {
                 continue;
@@ -2979,11 +3045,17 @@ async fn send_channel_body(
                     .await?;
                 }
             }
-            // Keep checkpointed progress roughly current per file.
+            // Keep checkpointed progress roughly current per file. The
+            // record is rewritten whole on every save and grows with the
+            // file count, so saving after every file cost O(files²) bytes
+            // — most of a many-file job's chunk phase (O-N2).
             record.files[file_index].verified_prefix_chunks =
                 manifest.entries[file_index].chunk_digests.len() as u64;
-            record.updated_unix_ms = now_ms();
-            store.save(&record).map_err(EngineError::Checkpoint)?;
+            if last_save.elapsed() >= CHUNK_CHECKPOINT_INTERVAL {
+                record.updated_unix_ms = now_ms();
+                store.save(&record).map_err(EngineError::Checkpoint)?;
+                last_save = Instant::now();
+            }
         }
         drain_acks(
             &mut rx,
@@ -4657,7 +4729,7 @@ async fn receive_single_stream(
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<DirectRecvStream, EngineError> {
     let limits = engine_limits();
-    let mut acks_since_checkpoint: u64 = 0;
+    let mut cadence = ChunkCheckpointCadence::new(Instant::now());
     let mut current_file: u32 = u32::MAX;
     'transfer: loop {
         let frame = match recv_within(&mut rx, &limits, idle).await {
@@ -4713,11 +4785,12 @@ async fn receive_single_stream(
                     file_index,
                     chunk_index,
                 });
-                acks_since_checkpoint += 1;
-                if acks_since_checkpoint >= CHECKPOINT_EVERY_ACKS {
-                    acks_since_checkpoint = 0;
+                let tick = cadence.on_ack(Instant::now());
+                if tick.save {
                     record.updated_unix_ms = now_ms();
                     store.save(record).map_err(EngineError::Checkpoint)?;
+                }
+                if tick.progress {
                     if let Some(entry) = manifest.entries.get(file_index as usize) {
                         let cumulative = sink
                             .verified_prefix_chunks()
@@ -4978,7 +5051,7 @@ async fn multistream_receive(
 
     let mut finalized = false;
     let mut open_streams = 0usize;
-    let mut acks_since_checkpoint: u64 = 0;
+    let mut cadence = ChunkCheckpointCadence::new(Instant::now());
     let mut last_activity = Instant::now();
     loop {
         if finalized && open_streams == 0 {
@@ -5013,12 +5086,13 @@ async fn multistream_receive(
                         slot.verified_prefix_chunks =
                             slot.verified_prefix_chunks.max(chunk_index + 1);
                         progress(Progress::ChunkReceived { file_index, chunk_index });
-                        acks_since_checkpoint += 1;
-                        if acks_since_checkpoint >= CHECKPOINT_EVERY_ACKS {
-                            acks_since_checkpoint = 0;
+                        let tick = cadence.on_ack(Instant::now());
+                        let prefix = slot.verified_prefix_chunks;
+                        if tick.save {
                             record.updated_unix_ms = now_ms();
-                            let prefix = slot.verified_prefix_chunks;
                             store.save(record).map_err(EngineError::Checkpoint)?;
+                        }
+                        if tick.progress {
                             if let Some(entry) = manifest.entries.get(file_index as usize) {
                                 let cumulative = prefix
                                     .saturating_mul(u64::from(chunk_size.get()))

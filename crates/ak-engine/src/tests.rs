@@ -2005,6 +2005,69 @@ async fn slow_verify_phase_keeps_the_sender_waiting() {
     }
 }
 
+/// Chunk-phase checkpoint cadence (review 2026-11-19): progress on every
+/// 16th ack as before, a save on such an ack only once a second has
+/// passed since the last one — so a many-file burst no longer rewrites
+/// the whole record every 16 files, while slow, large chunks still save
+/// on every 16th ack.
+#[test]
+fn chunk_checkpoint_saves_at_most_once_per_interval() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let quiet = CadenceTick {
+        progress: false,
+        save: false,
+    };
+    let mut cadence = ChunkCheckpointCadence::new(t0);
+    for _ in 0..15 {
+        assert_eq!(cadence.on_ack(at(10)), quiet);
+    }
+    assert_eq!(
+        cadence.on_ack(at(10)),
+        CadenceTick {
+            progress: true,
+            save: false
+        },
+        "the 16th ack reports progress; the last save is too recent"
+    );
+    for _ in 0..15 {
+        assert_eq!(cadence.on_ack(at(1000)), quiet);
+    }
+    assert_eq!(
+        cadence.on_ack(at(1000)),
+        CadenceTick {
+            progress: true,
+            save: true
+        },
+        "a second after the last save, the 16th ack saves"
+    );
+    for _ in 0..15 {
+        cadence.on_ack(at(1500));
+    }
+    assert!(
+        !cadence.on_ack(at(1500)).save,
+        "half a second later: no save"
+    );
+
+    // A many-file burst: 65,536 acks within 0.65 s report progress 4,096
+    // times and do not save at all.
+    let mut cadence = ChunkCheckpointCadence::new(t0);
+    let (mut ticks, mut saves) = (0, 0);
+    for ack in 0..65_536u64 {
+        let tick = cadence.on_ack(at(ack / 100));
+        ticks += u64::from(tick.progress);
+        saves += u64::from(tick.save);
+    }
+    assert_eq!((ticks, saves), (4096, 0));
+    // Spread over ten seconds instead: about one save a second.
+    let mut cadence = ChunkCheckpointCadence::new(t0);
+    let mut saves = 0;
+    for ack in 0..65_536u64 {
+        saves += u64::from(cadence.on_ack(at(ack * 10_000 / 65_536)).save);
+    }
+    assert!((9..=10).contains(&saves), "{saves} saves over ten seconds");
+}
+
 /// One loopback QUIC stream: the opener's send half and the acceptor's
 /// receive half, plus the endpoints and channels that must outlive them.
 async fn loopback_stream() -> (

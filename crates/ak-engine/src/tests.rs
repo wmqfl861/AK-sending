@@ -2185,27 +2185,54 @@ async fn offloaded_pass_keeps_signalling_until_it_finishes() {
 }
 
 /// Large-file liveness end to end (review 2026-11-19), release only like
-/// the 5 GiB test. A 4 GiB file arrives with 3 GiB of it already in a
-/// verified part file, both sides on a 300 ms idle budget, multi-thread
-/// runtime (the production shape). The receiver's prepare re-hashes the
-/// 3 GiB prefix before it can answer the ResumeRequest, and its verify
-/// phase hashes and flushes the whole 4 GiB file before the FinalAck —
-/// each a single pass far longer than the sender's budget. Before the
-/// offload the sender gave up at the ResumeRequest gate.
+/// the 5 GiB test. A 4 GiB file arrives with all but its last four chunks
+/// already in a verified part file, both sides on a 300 ms idle budget,
+/// multi-thread runtime (the production shape). The receiver's prepare
+/// re-hashes the prefix before it can answer the ResumeRequest, and its
+/// verify phase hashes and flushes the whole 4 GiB file before the
+/// FinalAck — each a single pass far longer than the sender's budget.
+/// Before the offload the sender gave up at the ResumeRequest gate.
+///
+/// Only those two passes may outlast the budget here (batch P review).
+/// The chunk phase has no liveness signal of its own (each ack is one), so
+/// it is kept to four chunks: with a 1 GiB remainder the 300 ms budget
+/// also timed a receiver-side checkpoint save, whose fsync takes hundreds
+/// of milliseconds under that write load (intermittent on Linux), and on
+/// Windows the first resumed write itself (see the setup below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "4 GiB transfer; run in release only"]
 async fn large_file_passes_keep_the_sender_waiting() {
     const GIB: u64 = 1024 * 1024 * 1024;
+    const CHUNK: u64 = 1024 * 1024;
+    const REMAINING_CHUNKS: u64 = 4;
+    let size = 4 * GIB;
+    let prefix = size - REMAINING_CHUNKS * CHUNK;
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let file = fs::File::create(src.path().join("big.bin")).unwrap();
-    file.set_len(4 * GIB).unwrap();
+    file.set_len(size).unwrap();
     drop(file);
-    // A verified prefix of three quarters: the content is zeros, so a
-    // zero-filled part file of whole chunks is exactly a verified prefix.
-    let part = fs::File::create(dst.path().join("big.bin.akpart")).unwrap();
-    part.set_len(3 * GIB).unwrap();
-    drop(part);
+    // The verified prefix as an earlier session leaves it: written and
+    // flushed. The content is zeros, so a zero-filled part file of whole
+    // chunks is exactly a verified prefix. `set_len` alone is not that
+    // state on NTFS: the extension stays beyond the file's valid data
+    // length, and the first write past it zero-fills the whole gap inside
+    // that write — the receiver's first resumed chunk, which stalled the
+    // receive task past the budget on every Windows run. Writing the
+    // prefix's last byte makes the file system fill the range here, before
+    // the timed transfer; on Linux the file stays sparse.
+    let materialize = Instant::now();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut part = fs::File::create(dst.path().join("big.bin.akpart")).unwrap();
+        part.seek(SeekFrom::Start(prefix - 1)).unwrap();
+        part.write_all(&[0]).unwrap();
+        part.sync_all().unwrap();
+    }
+    eprintln!(
+        "large-file passes: prefix of {prefix} bytes materialized in {:.2?}",
+        materialize.elapsed()
+    );
 
     let idle = Duration::from_millis(300);
     let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1024);
@@ -2232,7 +2259,7 @@ async fn large_file_passes_keep_the_sender_waiting() {
             }
             Progress::ChunkReceived { .. } => {
                 let n = chunks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n == 1 || n == 1024 {
+                if n == 1 || n == REMAINING_CHUNKS {
                     note(format!("recv chunk #{n} stored"));
                 }
             }
@@ -2249,7 +2276,7 @@ async fn large_file_passes_keep_the_sender_waiting() {
         move |event: Progress| match event {
             Progress::ChunkSent { .. } => {
                 let n = chunks_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n == 1 || n == 1024 {
+                if n == 1 || n == REMAINING_CHUNKS {
                     note(format!("send chunk #{n} sent"));
                 }
             }
@@ -2281,15 +2308,15 @@ async fn large_file_passes_keep_the_sender_waiting() {
         .expect("the receiver ends within 120 s")
         .unwrap()
         .expect("the receiver completes");
-    assert_eq!(report.bytes, 4 * GIB);
+    assert_eq!(report.bytes, size);
     assert_eq!(
         *resumed.lock().unwrap(),
-        Some(3 * 1024),
-        "the 3 GiB prefix (1 MiB chunks) must be resumed, not re-sent"
+        Some(prefix / CHUNK),
+        "the verified prefix (1 MiB chunks) must be resumed, not re-sent"
     );
     assert_eq!(
         fs::metadata(dst.path().join("big.bin")).unwrap().len(),
-        4 * GIB
+        size
     );
     assert!(!dst.path().join("big.bin.akpart").exists());
 }

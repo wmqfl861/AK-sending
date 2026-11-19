@@ -8,6 +8,10 @@
 
 下一步：CI 绿后交复核。生产部署（E6）、物理双机（C4）、签名（E5）等所有者事项继续按 [状态表](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)、[OPERATIONS](OPERATIONS.zh-CN.md) 与 [支持矩阵](SUPPORT_MATRIX.zh-CN.md) 执行。
 
+## 最新验证
+
+命令、运行编号、计数与证据层级统一见 [P 交接 §8](HANDOFF-BATCH-P-2026-11-19.zh-CN.md#8-证据表执行方填写)。
+
 ## 交接入口
 
 - [P 交接（当前）](HANDOFF-BATCH-P-2026-11-19.zh-CN.md) · [O 复核](REVIEW_2026-11-19-batchO.zh-CN.md) · [O 交接](HANDOFF-BATCH-O-2026-11-18.zh-CN.md)

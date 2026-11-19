@@ -383,6 +383,28 @@ jobs:
       - name: ak-itests ignored tests (20k files + benches)
         run: cargo test --locked --release -p ak-itests -- --ignored --nocapture
 
+  # Windows half of the manual deep test (2026-11-19 review of batch P):
+  # the ak-engine release-only tests (5 GiB transfer, large-file liveness)
+  # write multi-GiB files whose cost depends on the file system, and NTFS
+  # behaves differently from the ext4 runner above (batch P saw a
+  # Windows-only failure the Linux job did not). Same trigger as above:
+  # workflow_dispatch only. The ak-itests scale runs stay Linux-only here;
+  # the local Windows host covers them.
+  release-deep-tests-windows:
+    name: Release deep tests (Windows, ak-engine ignored suite)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Free space on the temp volume
+        shell: pwsh
+        run: Get-PSDrive -Name $env:TEMP.Substring(0, 1) | Format-Table Name, Used, Free
+      - name: ak-engine ignored tests (5 GiB transfer, large-file liveness)
+        run: cargo test --locked --release -p ak-engine -- --ignored --nocapture --test-threads=1
+
   # Cross-target portability matrix: cargo check of the pure-Rust core
   # against non-host triples, mirroring scripts/check_targets.sh (本地脚本
   # 的 CI 镜像；本地 2026-11-04 实跑结果见 docs/TECH_SELECTION.zh-CN.md

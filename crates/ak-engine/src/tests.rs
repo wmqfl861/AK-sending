@@ -2211,14 +2211,53 @@ async fn large_file_passes_keep_the_sender_waiting() {
     let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1024);
     send_spec.idle_timeout = idle;
     recv.idle_timeout = idle;
+    // Phase timeline of both sides, printed whatever the outcome, so a
+    // failure shows which phase outlasted the budget (2026-11-19 review of
+    // batch P: the Windows failure came with nothing but the error).
+    let started = Instant::now();
+    let timeline: Arc<std::sync::Mutex<Vec<(Duration, String)>>> = Arc::default();
+    let note = {
+        let timeline = Arc::clone(&timeline);
+        move |what: String| timeline.lock().unwrap().push((started.elapsed(), what))
+    };
     let resumed: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
     let progress = {
         let resumed = Arc::clone(&resumed);
-        Arc::new(move |event: Progress| {
-            if let Progress::Resuming { chunks } = event {
+        let note = note.clone();
+        let chunks_received = std::sync::atomic::AtomicU64::new(0);
+        Arc::new(move |event: Progress| match event {
+            Progress::Resuming { chunks } => {
                 *resumed.lock().unwrap() = Some(chunks);
+                note(format!("recv resuming {chunks}"));
             }
+            Progress::ChunkReceived { .. } => {
+                let n = chunks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n == 1024 {
+                    note(format!("recv chunk #{n} stored"));
+                }
+            }
+            Progress::ManifestReceived
+            | Progress::Verifying
+            | Progress::FinalAck { .. }
+            | Progress::Done => note(format!("recv {event:?}")),
+            _ => {}
         })
+    };
+    let send_progress = {
+        let note = note.clone();
+        let chunks_sent = std::sync::atomic::AtomicU64::new(0);
+        move |event: Progress| match event {
+            Progress::ChunkSent { .. } => {
+                let n = chunks_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n == 1024 {
+                    note(format!("send chunk #{n} sent"));
+                }
+            }
+            Progress::Resuming { .. } | Progress::FinalAck { .. } | Progress::Done => {
+                note(format!("send {event:?}"));
+            }
+            _ => {}
+        }
     };
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     let receiver = {
@@ -2226,10 +2265,22 @@ async fn large_file_passes_keep_the_sender_waiting() {
         tokio::spawn(async move { receive_with_addr(recv, &*progress, addr_tx).await })
     };
     send_spec.peer = addr_rx.await.unwrap();
-    let report = send(send_spec, &noop)
-        .await
-        .expect("the sender must outlast both whole-file passes");
-    receiver.await.unwrap().expect("the receiver completes");
+    let sent = send(send_spec, &send_progress).await;
+    note(format!("send returned ok={}", sent.is_ok()));
+    let received = tokio::time::timeout(Duration::from_secs(120), receiver).await;
+    let phases: Vec<String> = timeline
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(at, what)| format!("{what} @ {at:.2?}"))
+        .collect();
+    eprintln!("large-file passes: phases: {}", phases.join(", "));
+    eprintln!("large-file passes: send = {sent:?}; recv = {received:?}");
+    let report = sent.expect("the sender must outlast both whole-file passes");
+    received
+        .expect("the receiver ends within 120 s")
+        .unwrap()
+        .expect("the receiver completes");
     assert_eq!(report.bytes, 4 * GIB);
     assert_eq!(
         *resumed.lock().unwrap(),

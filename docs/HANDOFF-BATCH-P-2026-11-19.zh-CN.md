@@ -10,7 +10,9 @@
 - O-N1（P1）：单个大文件的整文件处理改到阻塞线程池上执行，期间照常发活动信号；
 - O-N2（P2）：块阶段两端的检查点至多每秒写盘一次。
 
-批次 P 在本地 Windows 上确认这两处改动：
+第一次合入 main 后，复核方又修了一处既有缺陷（O-N4，P2）：注册服务器改为先监听、再打印就绪行，绑定端口或打开数据库失败时直接报错退出；起注册服务器的集成测试改为从就绪行读端口。它由 main 的一次 Windows CI 失败引出；修复后 Windows CI 通过，本批不另设确认项。
+
+批次 P 在本地 Windows 上确认 O-N1、O-N2 两处改动：
 
 - P0：收尾清理；
 - P1：大文件 release 测试；
@@ -24,7 +26,8 @@
 |---|---|---|
 | O-N1 | 不小于 64 MiB 的文件，其整文件处理（准备阶段的续传前缀与已提交文件重新哈希、校验阶段的整文件摘要与落盘）放到 tokio 阻塞线程池执行，接收任务照常按间隔发活动信号；ak-storage 的替换检测测试在 Windows 上收紧为必须报 `PART_REPLACED` | `crates/ak-engine/src/lib.rs`（`offload_with_liveness`、`OFFLOAD_WHOLE_FILE_BYTES`、`receive_frozen_body`）、`crates/ak-engine/src/tests.rs`、`crates/ak-storage/src/lib.rs` |
 | O-N2 | 块阶段两端的检查点都至多每秒写盘一次（发送端原来每个文件写一次，是主要开销；接收端原来每 16 个块写一次）；进度节奏不变 | `crates/ak-engine/src/lib.rs`（`ChunkCheckpointCadence`、`CHUNK_CHECKPOINT_INTERVAL`） |
-| 文档 | PROTOCOL 的接收端活动信号与持久边界、engine 模块文档、BACKLOG | `docs/PROTOCOL.zh-CN.md`、`docs/BACKLOG.zh-CN.md` |
+| O-N4 | `registry-server` 先绑定端口、再打开数据库，都成功后才打印就绪行（打印实际绑定的地址，`--port 0` 可用），任一步失败或服务循环自行结束时命令带错误退出；五个起注册服务器的集成测试文件改用 `--port 0` 并从就绪行读端口，等待超时的报错带上子进程的 stderr | `crates/ak-cli/src/main.rs`（`registry_server_command`）、`crates/ak-signal/src/server_v2/engine.rs`（`bind_v2`）、`crates/ak-itests/tests/` 下 t03_ipv6_loopback、send_admission_cli、invite_pairing_security、attack_recovery、invite_pairing_cli_e2e 五个文件 |
+| 文档 | PROTOCOL 的接收端活动信号与持久边界、engine 模块文档、BACKLOG、README 的 registry-server 说明 | `docs/PROTOCOL.zh-CN.md`、`docs/BACKLOG.zh-CN.md`、`README.md` |
 
 ## 2. 接手前必读
 
@@ -47,6 +50,12 @@
 ### 2.4 纯移动的证明方法（P4 会用到）
 
 见 [N 交接 §2.3](HANDOFF-BATCH-N-2026-11-17.zh-CN.md#23-纯移动的证明方法m4n3-会用到)。
+
+### 2.5 注册服务器的就绪行（O-N4）
+
+- `registry-server` 的两行就绪输出（`v2 pairing registry on tls <地址> …` 与 `registry id …`）现在表示它已经在监听；端口被占或数据库打不开时，它不打印这两行，直接报错退出。
+- 新写的测试或脚本起注册服务器时，用 `--port 0`，从 `v2 pairing registry on tls` 那一行读出实际端口；不要先探一个空闲端口再交给子进程绑定，两步之间端口可能被别的连接占用。
+- 等子进程输出超时的报错，要带上该进程的 stderr。
 
 ## 3. 全项目未完成事项
 

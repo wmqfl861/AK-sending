@@ -36,7 +36,6 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -978,18 +977,27 @@ fn read_all(mut pipe: impl Read) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
+/// The port a `registry-server --port 0` bound, from its `v2 pairing
+/// registry on tls <addr> (db …)` line. The server prints that line only
+/// once it listens (2026-11-19 review), so no port is picked here and
+/// bound later by another process, and no client starts too early.
+fn announced_registry_port(line: &str) -> u16 {
+    line.split("v2 pairing registry on tls ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse::<std::net::SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
 }
 
 /// A resident CLI child (killed on drop).
 struct Proc {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
+    /// Read so a chatty child can never block on a full pipe, and shown
+    /// when a wait times out (2026-11-19 review).
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 impl Proc {
@@ -1002,10 +1010,12 @@ impl Proc {
             .spawn()
             .unwrap_or_else(|err| panic!("spawn ({:?} {:?}): {err}", cli, args));
         let stdout = pipe_lines(child.stdout.take().expect("stdout piped"));
-        // Drain stderr too (into the void) so a chatty child can never
-        // block on a full pipe.
-        let _ = pipe_lines(child.stderr.take().expect("stderr piped"));
-        Proc { child, stdout }
+        let stderr = pipe_lines(child.stderr.take().expect("stderr piped"));
+        Proc {
+            child,
+            stdout,
+            stderr,
+        }
     }
 
     fn wait_stdout(&self, needle: &str, timeout: Duration) -> String {
@@ -1016,14 +1026,19 @@ impl Proc {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            for line in lines {
+            for line in &lines {
                 if line.contains(needle) {
-                    return line;
+                    return line.clone();
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "no stdout line containing {needle:?} within {timeout:?}"
+                "no stdout line containing {needle:?} within {timeout:?}; stdout so far:\n{}\nstderr so far:\n{}",
+                lines.join("\n"),
+                self.stderr
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .join("\n")
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1065,16 +1080,17 @@ struct RegistryProc {
 
 impl RegistryProc {
     fn spawn(server_dir: &Path, db: &Path) -> RegistryProc {
-        let port = free_port();
         let proc = Proc::spawn(&[
             "registry-server",
             "--port",
-            &port.to_string(),
+            "0",
             "--db-path",
             &db.to_string_lossy(),
             "--id-dir",
             &server_dir.to_string_lossy(),
         ]);
+        let listening = proc.wait_stdout("v2 pairing registry on tls ", Duration::from_secs(30));
+        let port = announced_registry_port(&listening);
         let line = proc.wait_stdout(
             "registry id (pin with --registry-fp): ",
             Duration::from_secs(30),

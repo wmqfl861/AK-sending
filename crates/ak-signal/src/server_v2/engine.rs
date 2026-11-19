@@ -3,8 +3,10 @@
 //! state machine over the authoritative [`RegistryStore`]
 //! (`docs/contracts/pairing-flow.md` §6).
 //!
-//! Entry points: [`run_v2`] (bind + serve) and [`serve_v2`] (pre-bound
-//! listener, used by embedders and the integration tests). Both require
+//! Entry points: [`run_v2`] (bind + serve), [`bind_v2`] (only the binding
+//! and store opening, for callers that announce readiness in between) and
+//! [`serve_v2`] (pre-bound listener, used by embedders and the integration
+//! tests). All of them require
 //! the `server-persistence` feature — without the authoritative store the
 //! server refuses invite operations entirely rather than issuing codes it
 //! cannot make unique (`storage-schema.md` §1).
@@ -156,13 +158,7 @@ pub async fn run_v2(
     registry: &DeviceKeyPair,
     shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let listener = TcpListener::bind(config.listen).await?;
-    let store = if config.db_path.as_os_str() == ":memory:" {
-        RegistryStore::open_in_memory()
-    } else {
-        RegistryStore::open(&config.db_path)
-    }
-    .map_err(|e| io::Error::other(format!("registry store: {e}")))?;
+    let (listener, store) = bind_v2(&config).await?;
     serve_v2_with_revision(
         listener,
         registry,
@@ -172,6 +168,30 @@ pub async fn run_v2(
         shutdown,
     )
     .await
+}
+
+/// The part of [`run_v2`] that can fail before serving: bind
+/// `config.listen` and open the authoritative store at `config.db_path`
+/// (`:memory:` opens an in-memory store).
+///
+/// An embedder that announces readiness calls this first, reports the
+/// listener's `local_addr` (the bound port, so port 0 works) and only
+/// then serves with [`serve_v2_with_revision`]: whatever it announced is
+/// already accepting connections, and a port in use or an unusable
+/// database fails before anything was announced (2026-11-19 review — the
+/// CLI used to print its pin before binding and then idle without
+/// listening when the bind failed).
+pub async fn bind_v2(config: &Config) -> io::Result<(TcpListener, RegistryStore)> {
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("listen on {}: {e}", config.listen)))?;
+    let store = if config.db_path.as_os_str() == ":memory:" {
+        RegistryStore::open_in_memory()
+    } else {
+        RegistryStore::open(&config.db_path)
+    }
+    .map_err(|e| io::Error::other(format!("registry store {}: {e}", config.db_path.display())))?;
+    Ok((listener, store))
 }
 
 /// Serve v2 on an already-bound listener (embedders/tests bind ephemeral

@@ -3131,6 +3131,32 @@ fn registry_server_defaults_to_the_frozen_v2_port() {
     );
 }
 
+/// 2026-11-19 review: `registry-server` binds and opens its store BEFORE
+/// it prints the pin, so a port that is already taken ends the command at
+/// once with the address in the error. It used to print the pin and then
+/// idle without listening until Ctrl-C.
+#[tokio::test]
+async fn registry_server_fails_fast_when_its_port_is_taken() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = holder.local_addr().expect("held port").port();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        registry_server_command(
+            tmp.path(),
+            Some(port),
+            Some(BindArg::Ip("127.0.0.1".parse().unwrap())),
+            Some(tmp.path().join("registry.db")),
+        ),
+    )
+    .await
+    .expect("a taken port must end the command, not leave it idling");
+    let error = outcome.expect_err("a taken port must fail the command");
+    let text = format!("{error:#}");
+    assert!(text.contains(&format!("127.0.0.1:{port}")), "{text}");
+    drop(holder);
+}
+
 #[test]
 fn expect_accepts_the_explicit_book_word() {
     let dir = tempfile::tempdir().unwrap();

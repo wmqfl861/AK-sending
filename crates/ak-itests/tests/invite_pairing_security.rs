@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -259,12 +259,18 @@ fn read_all(mut pipe: impl Read) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
+/// The port a `registry-server --port 0` bound, from its `v2 pairing
+/// registry on tls <addr> (db …)` line. The server prints that line only
+/// once it listens (2026-11-19 review), so no port is picked here and
+/// bound later by another process, and no client starts too early.
+fn announced_registry_port(line: &str) -> u16 {
+    line.split("v2 pairing registry on tls ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
 }
 
 /// A resident CLI child (killed on drop).
@@ -414,16 +420,17 @@ struct RegistryProc {
 
 impl RegistryProc {
     fn spawn(server_dir: &Path, db: &Path) -> RegistryProc {
-        let port = free_port();
         let mut proc = Proc::spawn(&[
             "registry-server",
             "--port",
-            &port.to_string(),
+            "0",
             "--db-path",
             &db.to_string_lossy(),
             "--id-dir",
             &server_dir.to_string_lossy(),
         ]);
+        let listening = proc.wait_stdout("v2 pairing registry on tls ", Duration::from_secs(30));
+        let port = announced_registry_port(&listening);
         let line = proc.wait_stdout(
             "registry id (pin with --registry-fp): ",
             Duration::from_secs(30),
@@ -953,16 +960,17 @@ fn malformed_invite_codes_fail_closed_at_the_cli() {
     std::fs::create_dir_all(&server_dir).expect("server dir");
     std::fs::create_dir_all(&b_dir).expect("b dir");
     std::fs::create_dir_all(&out_dir).expect("out dir");
-    let port = free_port();
     let mut server = Proc::spawn(&[
         "registry-server",
         "--port",
-        &port.to_string(),
+        "0",
         "--db-path",
         &tmp.path().join("reg.db").to_string_lossy(),
         "--id-dir",
         &server_dir.to_string_lossy(),
     ]);
+    let listening = server.wait_stdout("v2 pairing registry on tls ", Duration::from_secs(30));
+    let port = announced_registry_port(&listening);
     let pin_line = server.wait_stdout(
         "registry id (pin with --registry-fp): ",
         Duration::from_secs(30),

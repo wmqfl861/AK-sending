@@ -79,7 +79,7 @@ cargo run -p ak-cli -- send PATH [PATH...] --to IP:7100 --fp <完整指纹|唯�
 cargo run -p ak-cli -- jobs [list] | jobs status <id> | jobs clean --all|--completed  # 检查点记录查看/清理（.akpart 分片永不删除，保持可续传）
 cargo run -p ak-cli -- discover [--seconds N] [--json]  # mDNS 发现（带配对状态与设备名）
 cargo run -p ak-cli -- signal-server [--tcp-port 7100] [--stun-port 7101] [--bind IP|IP:PORT] [--stun-bind IP|IP:PORT]  # 协调服务器（信令+STUN，无文件路由）
-cargo run -p ak-cli -- registry-server [--port 7200] [--bind IP|IP:PORT] [--db-path PATH]  # v2 权威邀请码注册服务（TLS 1.3＋SQLite；启动打印 registry id 供对端 --registry-fp 钉扎；无文件路由）
+cargo run -p ak-cli -- registry-server [--port 7200] [--bind IP|IP:PORT] [--db-path PATH]  # v2 权威邀请码注册服务（TLS 1.3＋SQLite；监听与数据库就绪后才打印实际地址与 registry id 供对端 --registry-fp 钉扎，端口被占或数据库打不开时报错退出；无文件路由）
 cargo run -p ak-cli -- --id-dir DIR registry-id  # 只读打印 DIR/registry.key 的 registry id（与 registry-server 打印值同源；不创建任何文件、不监听）
 cargo run -p ak-cli -- invite create [--ttl-secs 600 | --long-lived] --server IP:7200 --registry-fp <64hex>  # 生成并登记配对邀请码（输出 AKI1-...；bearer 凭证，像密码一样保管；--server/--registry-fp 首次成对提供后持久化到 registry.pin）
 cargo run -p ak-cli -- invite list | invite revoke <code-id-32hex>  # 列出/撤销本机邀请码（list 只显示状态/到期/掩码，不输出明文码）

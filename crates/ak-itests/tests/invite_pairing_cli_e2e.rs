@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -87,14 +87,18 @@ fn cli_exe() -> PathBuf {
 // ---- process plumbing -------------------------------------------------------
 
 /// Lines a piped stream has produced so far (fed by a reader thread so
-/// the child can never block on a full pipe).
+/// the child can never block on a full pipe). A stdout log also holds its
+/// process's stderr so a timed-out wait reports both (2026-11-19 review).
 #[derive(Clone, Default)]
-struct LineLog(Arc<Mutex<Vec<String>>>);
+struct LineLog {
+    lines: Arc<Mutex<Vec<String>>>,
+    stderr: Option<Arc<Mutex<Vec<String>>>>,
+}
 
 impl LineLog {
     fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
         let log = LineLog::default();
-        let sink = Arc::clone(&log.0);
+        let sink = Arc::clone(&log.lines);
         std::thread::spawn(move || {
             for line in BufReader::new(stream).lines() {
                 match line {
@@ -110,11 +114,31 @@ impl LineLog {
         log
     }
 
+    /// Report `stderr` (the same process's other stream) on a timeout.
+    fn with_stderr(mut self, stderr: &LineLog) -> Self {
+        self.stderr = Some(Arc::clone(&stderr.lines));
+        self
+    }
+
     fn snapshot(&self) -> Vec<String> {
-        self.0
+        self.lines
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// This stream so far, plus the process's stderr when attached.
+    fn report(&self) -> String {
+        let mut text = self.snapshot().join("\n");
+        if let Some(stderr) = &self.stderr {
+            let stderr = stderr
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .join("\n");
+            text.push_str("\nstderr so far:\n");
+            text.push_str(&stderr);
+        }
+        text
     }
 
     /// First line containing `needle`, polling until it appears.
@@ -129,7 +153,7 @@ impl LineLog {
             assert!(
                 Instant::now() < deadline,
                 "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
-                self.snapshot().join("\n")
+                self.report()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -156,8 +180,9 @@ impl Proc {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|err| panic!("spawn {tag} ({:?} {:?}): {err}", cli, args));
-        let stdout = LineLog::spawn_reader(child.stdout.take().expect("stdout piped"));
         let stderr = LineLog::spawn_reader(child.stderr.take().expect("stderr piped"));
+        let stdout =
+            LineLog::spawn_reader(child.stdout.take().expect("stdout piped")).with_stderr(&stderr);
         Proc {
             child,
             stdout,
@@ -226,12 +251,18 @@ fn read_all(mut pipe: impl Read) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind a probe socket")
-        .local_addr()
-        .expect("probe local addr")
-        .port()
+/// The port a `registry-server --port 0` bound, from its `v2 pairing
+/// registry on tls <addr> (db …)` line. The server prints that line only
+/// once it listens (2026-11-19 review), so no port is picked here and
+/// bound later by another process, and no client starts too early.
+fn announced_registry_port(line: &str) -> u16 {
+    line.split("v2 pairing registry on tls ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
 }
 
 // ---- fixtures ---------------------------------------------------------------
@@ -263,20 +294,22 @@ struct RegistryProc {
 
 impl RegistryProc {
     fn spawn(tag: &str, server_dir: &Path, db: &Path) -> RegistryProc {
-        let port = free_port();
-        let port_text = port.to_string();
         let db_text = db.to_string_lossy().into_owned();
         let id_text = server_dir.to_string_lossy().into_owned();
         let args = [
             "registry-server",
             "--port",
-            &port_text,
+            "0",
             "--db-path",
             &db_text,
             "--id-dir",
             &id_text,
         ];
         let proc = Proc::spawn(tag, &args);
+        let listening = proc
+            .stdout
+            .wait_for("v2 pairing registry on tls ", Duration::from_secs(30));
+        let port = announced_registry_port(&listening);
         let line = proc.stdout.wait_for(
             "registry id (pin with --registry-fp): ",
             Duration::from_secs(30),

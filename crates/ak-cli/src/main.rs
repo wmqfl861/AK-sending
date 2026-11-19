@@ -3838,8 +3838,10 @@ fn registry_id_command(id: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `ak-cli registry-server`: load/create `<id-dir>/registry.key`, print
-/// the registry pin, serve until Ctrl-C. TLS-only: no plaintext invite
+/// `ak-cli registry-server`: load/create `<id-dir>/registry.key`, bind the
+/// listener and open the store, then print the bound address and the
+/// registry pin, and serve until Ctrl-C (a failed bind, store or serve
+/// loop ends the command with its error). TLS-only: no plaintext invite
 /// service exists to fall back to.
 async fn registry_server_command(
     id: &Path,
@@ -3867,21 +3869,53 @@ async fn registry_server_command(
     if let Some(note) = note {
         println!("{note}");
     }
+    // Ready before announced (2026-11-19 review): bind and open the store
+    // FIRST. Deploy checks, scripts and the itests start clients as soon
+    // as the pin line appears, so it must mean "accepting connections";
+    // a port in use or an unusable database fails the command here
+    // instead of leaving a process that printed its pin but never
+    // listens. The address printed is the bound one (`--port 0` works).
+    let (listener, store) = ak_signal::server_v2::engine::bind_v2(&config)
+        .await
+        .context("registry-server cannot start")?;
+    let listen = listener
+        .local_addr()
+        .context("registry-server listener address")?;
     let registry_id = registry_pin(&registry);
     println!(
-        "v2 pairing registry on tls {} (db {}); no file routes exist",
-        config.listen,
+        "v2 pairing registry on tls {listen} (db {}); no file routes exist",
         config.db_path.display()
     );
     println!("registry id (pin with --registry-fp): {registry_id}");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let server = tokio::spawn(async move {
-        ak_signal::server_v2::engine::run_v2(config, &registry, shutdown_rx).await
+    let mut server = tokio::spawn(async move {
+        ak_signal::server_v2::engine::serve_v2_with_revision(
+            listener,
+            &registry,
+            store,
+            config.limits,
+            config.revision.as_deref(),
+            shutdown_rx,
+        )
+        .await
     });
-    tokio::signal::ctrl_c().await.ok();
-    let _ = shutdown_tx.send(true);
-    server.await??;
-    Ok(())
+    // A serve loop that ends on its own ends the command with its error
+    // rather than idling until Ctrl-C.
+    let ended_early = tokio::select! {
+        _ = tokio::signal::ctrl_c() => None,
+        ended = &mut server => Some(ended),
+    };
+    match ended_early {
+        None => {
+            let _ = shutdown_tx.send(true);
+            server.await??;
+            Ok(())
+        }
+        Some(ended) => {
+            ended??;
+            bail!("the registry server stopped without a shutdown request")
+        }
+    }
 }
 
 /// `ak-cli stun-server` (CR-P2-13): a standalone UDP STUN binding responder

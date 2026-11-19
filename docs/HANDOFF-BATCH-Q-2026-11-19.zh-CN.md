@@ -126,3 +126,7 @@ bash scripts/cross_nat_test.sh --self-test
 
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
+| main 上批次 P 最终提交的 CI | `2acc3ea` run [44502857824](https://github.com/wmqfl861/AK-sending/actions/runs/44502857824) | completed success（12 项常规任务 success，2 项手动深测 skipped） |
+| Q1 全量 release 深测 | 本地 Windows（磁盘 59GB） | **2/2 通过**（263.58s）；`large_file_passes_keep_the_sender_waiting` 通过（P-N1 在 Windows 确认）；`written and flushed in 7.50s`（约 4 GiB 前缀实际写下）；`phases: recv ManifestReceived @ 4.14s, recv resuming 4092 @ 8.62s, send Resuming { chunks: 4092 } @ 8.62s, send chunk #1 sent @ 8.63s, send chunk #4 sent @ 8.64s, recv chunk #1 stored @ 8.67s, recv chunk #4 stored @ 8.72s, recv Verifying @ 8.72s, recv FinalAck { verified: true } @ 13.37s, send FinalAck { verified: true } @ 13.37s, recv Done @ 13.37s, send Done @ 13.37s, send returned ok=true @ 13.37s` |
+| Q1 大文件 3 次循环 | 本地 Windows | **3/3 通过**（每次 exit 0）；前缀写盘耗时分别为 9.01s、6.34s、6.73s；phases 行与全量运行一致（P-N1 Windows 确认稳定） |
+| Q 全量门槛 | 本地 Windows | fmt/clippy/rustdoc/workspace(1222/0/9)/sqlite/server-persistence/Python/repo/contracts/部署自检/跨NAT自检 全部通过 |

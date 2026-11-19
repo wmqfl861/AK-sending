@@ -147,3 +147,4 @@ $results | Format-Table
 | P2 20,000 文件 | 本地 Windows | **通过**；`T13-20000: phases: manifest received @ 9.3s, first chunk sent @ 28.9s, last chunk received @ 43.9s, verify phase started @ 46.8s, final ack @ 148.8s, final ack @ 148.8s, done @ 148.9s, done @ 148.9s`；块阶段（28.9→43.9 = **15.0s**，O2 基线 277.2s → **~18x 快**） |
 | P2 65,537 文件 | 本地 Windows | **通过**；`T13-65537: phases: manifest received @ 28.7s, first chunk sent @ 72.0s, last chunk received @ 117.2s, verify phase started @ 126.1s, final ack @ 467.8s, final ack @ 467.8s, done @ 467.8s, done @ 467.9s`；块阶段（72.0→117.2 = **45.2s**，O2 基线 2075.4s → **~46x 快**） |
 | P 全量门槛 | 本地 Windows | fmt/clippy/rustdoc/workspace(1222/0/9)/sqlite/server-persistence/Python(366/366，首次 errors=2 不复现)/repo/contracts/部署自检/跨NAT自检 全部通过 |
+| P 批次最终 CI | `57c0a15` run [44476483911](https://github.com/wmqfl861/AK-sending/actions/runs/44476483911) | **12/12 常规任务 success**，1 项手动深测 skipped |

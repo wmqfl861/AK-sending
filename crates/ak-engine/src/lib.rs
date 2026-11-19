@@ -56,7 +56,10 @@
 //!   during the verify phase it sends a no-op `Control::Resume` to a peer
 //!   that negotiated `CAP_PAUSE_RESUME` at the same cadence, so the
 //!   sender's per-frame idle budget never has to cover a whole prepare or
-//!   verify pass of a large job.
+//!   verify pass of a large job. A single large file's own pass (the
+//!   prepare-time re-hash, finish()'s whole-digest pass and flush) runs on
+//!   the blocking pool while the same signal keeps going on the timer
+//!   (review 2026-11-19).
 //!
 //! Concurrent receive (round 6, no wire-format change):
 //! [`serve_concurrently`] binds once and serves several senders — one
@@ -197,11 +200,68 @@ const LIVENESS_MAX_INTERVAL: Duration = Duration::from_secs(5);
 /// through the storage layer's whole-digest check of the final name.
 const VERIFY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Size from which a file's whole-content pass on the receiver — the
+/// prepare-time re-hash of a resumed part or of an already committed
+/// final, and finish()'s whole-digest pass plus `sync_all` — runs on the
+/// blocking pool while the receive task keeps signalling liveness (review
+/// 2026-11-19). Between files the cadence check covers smaller files: at
+/// even 100 MB/s such a pass takes well under the liveness interval.
+const OFFLOAD_WHOLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Liveness cadence of one receive: a quarter of the receiver's own idle
 /// budget (the sender normally runs the same default), never more than
 /// [`LIVENESS_MAX_INTERVAL`].
 fn liveness_interval(idle: Duration) -> Duration {
     (idle / 4).min(LIVENESS_MAX_INTERVAL)
+}
+
+/// Run one long, blocking whole-file pass on the blocking pool and send
+/// `keepalive` every `every` until it finishes (review 2026-11-19).
+///
+/// One file's pass — hashing a multi-gigabyte file, flushing it — cannot
+/// be split at file boundaries, so the between-file cadence of the
+/// prepare and verify loops alone left the sender's idle budget to cover
+/// the whole pass: on an ordinary disk a single file of a few gigabytes
+/// made the sender give up while the receiver committed the file. The
+/// receive task is also no longer blocked, so the transport keeps
+/// running (a long blocking pass on a single-thread runtime used to
+/// starve QUIC's own timers). `last_signal` is the time of the last frame
+/// this receive sent; it moves with every keepalive. With `keepalive =
+/// None` (a peer that cannot take one) the pass is still offloaded but
+/// nothing is sent.
+///
+/// A failed keepalive stops the signalling but not the pass, which cannot
+/// be interrupted anyway: the pass's result comes back as usual, and the
+/// caller's next regular frame reports the broken connection and runs the
+/// usual cleanup (so a sink prepared meanwhile is not leaked as litter).
+async fn offload_with_liveness<T: Send + 'static>(
+    tx: &mut DirectSendStream,
+    mut keepalive: Option<&Frame>,
+    every: Duration,
+    last_signal: &mut Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, EngineError> {
+    let mut work = tokio::task::spawn_blocking(work);
+    loop {
+        let due = tokio::time::Instant::from_std(*last_signal + every);
+        tokio::select! {
+            joined = &mut work => {
+                return joined.map_err(|join| {
+                    EngineError::Io(std::io::Error::other(format!(
+                        "whole-file pass did not complete: {join}"
+                    )))
+                });
+            }
+            () = tokio::time::sleep_until(due) => {
+                if let Some(frame) = keepalive {
+                    if tx.send_frame(frame).await.is_err() {
+                        keepalive = None;
+                    }
+                }
+                *last_signal = Instant::now();
+            }
+        }
+    }
 }
 /// Hard cap on concurrent per-file streams in multistream mode.
 const MAX_PARALLEL_STREAMS: usize = 4;
@@ -3974,21 +4034,60 @@ async fn receive_frozen_body(
     // never has to cover the whole prepare pass (see LIVENESS_MAX_INTERVAL).
     let mut sinks: Vec<Option<ak_storage::LocalFileSink>> =
         Vec::with_capacity(job.manifest.entries.len());
+    let liveness = liveness_interval(spec.idle_timeout);
     let mut shards = ResumeShards::new(
         usize::from(limits.max_resume_entries),
-        liveness_interval(spec.idle_timeout),
+        liveness,
         Instant::now(),
     );
+    // While one large file's prepare pass runs on the blocking pool (see
+    // OFFLOAD_WHOLE_FILE_BYTES), the liveness signal is an empty shard.
+    let prepare_keepalive = Frame {
+        version: ak_wire::VERSION,
+        message: Message::ResumeRequest {
+            job_id,
+            files: Vec::new(),
+            more: true,
+        },
+    };
     let mut resumed_chunks: u64 = 0;
     let mut committed_skip = vec![false; job.manifest.entries.len()];
     for (index, entry) in job.manifest.entries.iter().enumerate() {
+        // A large file's pass here can re-hash gigabytes (a committed
+        // final, or a resumed part's verified prefix): off this task.
+        let offload = !entry.is_dir && entry.size >= OFFLOAD_WHOLE_FILE_BYTES;
         let was_fully_verified = previous
             .as_ref()
             .and_then(|record| record.files.get(index))
             .is_some_and(|file| {
                 !entry.is_dir && file.verified_prefix_chunks >= entry.chunk_digests.len() as u64
             });
-        if was_fully_verified && committed_file_matches(target.root(), entry) {
+        let committed = if !was_fully_verified {
+            false
+        } else if offload {
+            let root = target.root().to_path_buf();
+            let owned = entry.clone();
+            let checked = offload_with_liveness(
+                &mut tx,
+                Some(&prepare_keepalive),
+                liveness,
+                &mut shards.last_frame,
+                move || committed_file_matches(&root, &owned),
+            )
+            .await;
+            match checked {
+                Ok(matches) => matches,
+                Err(error) => {
+                    // The pass itself failed (panicked); same litter rule
+                    // as the outcome wrapper below.
+                    discard_empty_sinks(&mut sinks);
+                    return Err(error);
+                }
+            }
+        } else {
+            committed_file_matches(target.root(), entry)
+        };
+        if committed {
             committed_skip[index] = true;
             let chunks = entry.chunk_digests.len() as u64;
             resumed_chunks += chunks;
@@ -4002,14 +4101,45 @@ async fn receive_frozen_body(
             // No sink: no part file, no chunk phase, no finish for this file.
             sinks.push(None);
         } else {
-            let sink = match staged_task {
-                // Scheduled task: the part file lives in this task's own
-                // staging tree (`<root>/.ak-staging/<task_hex>/...`), so a
-                // second task aiming at the same destination can never
-                // compete for one `.akpart` (wave 20 staging contract).
-                Some(task) => target.prepare_file_staged(task, entry, spec.conflict, chunk_size)?,
-                None => target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size)?,
+            // Scheduled task: the part file lives in this task's own
+            // staging tree (`<root>/.ak-staging/<task_hex>/...`), so a
+            // second task aiming at the same destination can never
+            // compete for one `.akpart` (wave 20 staging contract).
+            let prepared = if offload {
+                let owned_target = target.clone();
+                let owned = entry.clone();
+                let conflict = spec.conflict;
+                let done = offload_with_liveness(
+                    &mut tx,
+                    Some(&prepare_keepalive),
+                    liveness,
+                    &mut shards.last_frame,
+                    move || match staged_task {
+                        Some(task) => {
+                            owned_target.prepare_file_staged(task, &owned, conflict, chunk_size)
+                        }
+                        None => {
+                            owned_target.prepare_file_with_chunk_size(&owned, conflict, chunk_size)
+                        }
+                    },
+                )
+                .await;
+                match done {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        discard_empty_sinks(&mut sinks);
+                        return Err(error);
+                    }
+                }
+            } else {
+                match staged_task {
+                    Some(task) => {
+                        target.prepare_file_staged(task, entry, spec.conflict, chunk_size)
+                    }
+                    None => target.prepare_file_with_chunk_size(entry, spec.conflict, chunk_size),
+                }
             };
+            let sink = prepared?;
             let prefix = sink.verified_prefix_chunks();
             if !entry.is_dir {
                 resumed_chunks += prefix;
@@ -4123,29 +4253,45 @@ async fn receive_frozen_body(
         // for the FinalAck under its idle budget and tolerates Control
         // frames at that gate, so a peer that negotiated Pause/Resume gets
         // a no-op Control::Resume whenever the liveness interval passes.
-        let signal_liveness = (peer_caps & CAP_PAUSE_RESUME) != 0;
-        let liveness = liveness_interval(spec.idle_timeout);
+        // A large file's own pass runs on the blocking pool with the same
+        // signal sent on the timer (review 2026-11-19, see
+        // OFFLOAD_WHOLE_FILE_BYTES).
+        let verify_keepalive = ((peer_caps & CAP_PAUSE_RESUME) != 0).then_some(Frame {
+            version: ak_wire::VERSION,
+            message: Message::Control {
+                job_id,
+                control: Control::Resume,
+            },
+        });
         let mut last_signal = Instant::now();
         for (index, sink_slot) in sinks.iter_mut().enumerate() {
-            if signal_liveness && last_signal.elapsed() >= liveness {
-                tx.send_frame(&Frame {
-                    version: ak_wire::VERSION,
-                    message: Message::Control {
-                        job_id,
-                        control: Control::Resume,
-                    },
-                })
-                .await?;
-                // Let the transport (and a peer sharing this runtime) run.
-                tokio::task::yield_now().await;
-                last_signal = Instant::now();
+            if let Some(keepalive) = &verify_keepalive {
+                if last_signal.elapsed() >= liveness {
+                    tx.send_frame(keepalive).await?;
+                    // Let the transport (and a peer sharing this runtime) run.
+                    tokio::task::yield_now().await;
+                    last_signal = Instant::now();
+                }
             }
             if let Some(mut sink) = sink_slot.take() {
-                if job.manifest.entries[index].is_dir {
+                let entry = &job.manifest.entries[index];
+                if entry.is_dir {
                     sink.finish().map_err(EngineError::Io)?;
                     continue;
                 }
-                sink.finish().map_err(EngineError::Io)?;
+                if entry.size >= OFFLOAD_WHOLE_FILE_BYTES {
+                    offload_with_liveness(
+                        &mut tx,
+                        verify_keepalive.as_ref(),
+                        liveness,
+                        &mut last_signal,
+                        move || sink.finish(),
+                    )
+                    .await?
+                    .map_err(EngineError::Io)?;
+                } else {
+                    sink.finish().map_err(EngineError::Io)?;
+                }
                 record.files[index].verified_prefix_chunks =
                     job.manifest.entries[index].chunk_digests.len() as u64;
                 if last_save.elapsed() >= VERIFY_CHECKPOINT_INTERVAL {

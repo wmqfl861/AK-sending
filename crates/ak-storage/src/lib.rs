@@ -574,6 +574,11 @@ impl SourceHandle for LocalSource {
 // ---------------------------------------------------------------------------
 
 /// Receive side: one destination directory tree.
+///
+/// `Clone` copies the already validated, canonical root (no re-open): the
+/// engine hands a copy to the blocking pool for a large file's prepare
+/// (review 2026-11-19).
+#[derive(Clone)]
 pub struct LocalSaveTarget {
     root: PathBuf,
 }
@@ -3707,6 +3712,14 @@ mod tests {
                 || err.to_string().contains("PART_LENGTH_CHANGED"),
             "reopen must reject a different file, got: {err}"
         );
+        // On Windows the NTFS file index carries a reuse sequence number,
+        // so a recreated file never keeps the old identity: the identity
+        // check itself must fire (review 2026-11-19; Windows CI checks it).
+        #[cfg(windows)]
+        assert!(
+            err.to_string().contains("PART_REPLACED"),
+            "Windows identity must catch the replacement, got: {err}"
+        );
         assert_eq!(sink.verified_prefix_chunks(), 0, "nothing was stored");
         // The replacement file was not written through.
         assert_eq!(fs::read(&part_path).unwrap(), b"attacker-controlled");
@@ -3731,6 +3744,11 @@ mod tests {
             err.to_string().contains("PART_REPLACED")
                 || err.to_string().contains("PART_LENGTH_CHANGED"),
             "write-less finish must reject a different file, got: {err}"
+        );
+        #[cfg(windows)]
+        assert!(
+            err.to_string().contains("PART_REPLACED"),
+            "Windows identity must catch the replacement, got: {err}"
         );
         // No final name may appear from a part nobody verified.
         assert!(!dst.path().join("payload.bin").exists());

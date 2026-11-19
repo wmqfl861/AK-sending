@@ -2005,6 +2005,181 @@ async fn slow_verify_phase_keeps_the_sender_waiting() {
     }
 }
 
+/// One loopback QUIC stream: the opener's send half and the acceptor's
+/// receive half, plus the endpoints and channels that must outlive them.
+async fn loopback_stream() -> (
+    DirectSendStream,
+    DirectRecvStream,
+    (DirectEndpoint, DirectEndpoint, DirectChannel, DirectChannel),
+) {
+    let server_key = DeviceKeyPair::generate();
+    let client_key = DeviceKeyPair::generate();
+    let server_bundle = ak_identity::tls::make_self_signed(&server_key);
+    let client_bundle = ak_identity::tls::make_self_signed(&client_key);
+    let server = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &server_bundle)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let accepting = tokio::spawn(async move {
+        let channel = server.accept(&|_| true).await.unwrap();
+        let stream = channel.accept_bi().await.unwrap();
+        (server, channel, stream)
+    });
+    let client = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &client_bundle)
+        .await
+        .unwrap();
+    let client_channel = client
+        .connect(addr, &server_key.fingerprint())
+        .await
+        .unwrap();
+    let (mut tx, _client_rx) = client_channel.open_bi().await.unwrap().split();
+    // A stream exists for the acceptor only once the opener has sent on it.
+    tx.send_frame(&Frame {
+        version: ak_wire::VERSION,
+        message: Message::Control {
+            job_id: [0; 16],
+            control: Control::Resume,
+        },
+    })
+    .await
+    .unwrap();
+    let (server, server_channel, accepted) = accepting.await.unwrap();
+    let (_server_tx, mut rx) = accepted.split();
+    let _ = rx.recv_frame(&engine_limits()).await.unwrap(); // the opener frame
+    (tx, rx, (server, client, server_channel, client_channel))
+}
+
+/// The offload helper (review 2026-11-19): while a blocking pass runs on
+/// the blocking pool, the keepalive leaves on every interval and moves
+/// `last_signal`; without a keepalive nothing is sent but the pass still
+/// completes. Timing-based on purpose: the pass takes 650 ms, the
+/// interval is 100 ms, and only a lower bound of four signals is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offloaded_pass_keeps_signalling_until_it_finishes() {
+    let (mut tx, mut rx, _keep) = loopback_stream().await;
+    let limits = engine_limits();
+    let keepalive = Frame {
+        version: ak_wire::VERSION,
+        message: Message::Control {
+            job_id: [7; 16],
+            control: Control::Resume,
+        },
+    };
+    let mut last_signal = Instant::now();
+    let before = last_signal;
+    let value = offload_with_liveness(
+        &mut tx,
+        Some(&keepalive),
+        Duration::from_millis(100),
+        &mut last_signal,
+        || {
+            std::thread::sleep(Duration::from_millis(650));
+            42
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, 42);
+    assert!(last_signal > before, "each keepalive moves last_signal");
+    let mut beats = 0;
+    while let Ok(frame) =
+        tokio::time::timeout(Duration::from_millis(300), rx.recv_frame(&limits)).await
+    {
+        let frame = frame.unwrap();
+        assert!(
+            matches!(
+                frame.message,
+                Message::Control {
+                    job_id,
+                    control: Control::Resume
+                } if job_id == [7; 16]
+            ),
+            "only the keepalive may arrive: {:?}",
+            frame.message
+        );
+        beats += 1;
+    }
+    assert!(
+        beats >= 4,
+        "a 650 ms pass at a 100 ms cadence: {beats} signals"
+    );
+
+    // No keepalive (a peer without CAP_PAUSE_RESUME): silent, still done.
+    let mut quiet = Instant::now();
+    let value = offload_with_liveness(&mut tx, None, Duration::from_millis(50), &mut quiet, || {
+        std::thread::sleep(Duration::from_millis(200));
+        7
+    })
+    .await
+    .unwrap();
+    assert_eq!(value, 7);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv_frame(&limits))
+            .await
+            .is_err(),
+        "nothing may be sent without a keepalive"
+    );
+}
+
+/// Large-file liveness end to end (review 2026-11-19), release only like
+/// the 5 GiB test. A 4 GiB file arrives with 3 GiB of it already in a
+/// verified part file, both sides on a 300 ms idle budget, multi-thread
+/// runtime (the production shape). The receiver's prepare re-hashes the
+/// 3 GiB prefix before it can answer the ResumeRequest, and its verify
+/// phase hashes and flushes the whole 4 GiB file before the FinalAck —
+/// each a single pass far longer than the sender's budget. Before the
+/// offload the sender gave up at the ResumeRequest gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "4 GiB transfer; run in release only"]
+async fn large_file_passes_keep_the_sender_waiting() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let file = fs::File::create(src.path().join("big.bin")).unwrap();
+    file.set_len(4 * GIB).unwrap();
+    drop(file);
+    // A verified prefix of three quarters: the content is zeros, so a
+    // zero-filled part file of whole chunks is exactly a verified prefix.
+    let part = fs::File::create(dst.path().join("big.bin.akpart")).unwrap();
+    part.set_len(3 * GIB).unwrap();
+    drop(part);
+
+    let idle = Duration::from_millis(300);
+    let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1024);
+    send_spec.idle_timeout = idle;
+    recv.idle_timeout = idle;
+    let resumed: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+    let progress = {
+        let resumed = Arc::clone(&resumed);
+        Arc::new(move |event: Progress| {
+            if let Progress::Resuming { chunks } = event {
+                *resumed.lock().unwrap() = Some(chunks);
+            }
+        })
+    };
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = {
+        let progress = Arc::clone(&progress);
+        tokio::spawn(async move { receive_with_addr(recv, &*progress, addr_tx).await })
+    };
+    send_spec.peer = addr_rx.await.unwrap();
+    let report = send(send_spec, &noop)
+        .await
+        .expect("the sender must outlast both whole-file passes");
+    receiver.await.unwrap().expect("the receiver completes");
+    assert_eq!(report.bytes, 4 * GIB);
+    assert_eq!(
+        *resumed.lock().unwrap(),
+        Some(3 * 1024),
+        "the 3 GiB prefix (1 MiB chunks) must be resumed, not re-sent"
+    );
+    assert_eq!(
+        fs::metadata(dst.path().join("big.bin")).unwrap().len(),
+        4 * GIB
+    );
+    assert!(!dst.path().join("big.bin.akpart").exists());
+}
+
 // ------------------------------------------------------------------
 // Round 17: record id vs content id (review item 4)
 // ------------------------------------------------------------------

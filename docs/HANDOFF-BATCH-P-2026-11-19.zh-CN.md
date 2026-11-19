@@ -139,3 +139,11 @@ $results | Format-Table
 
 | 证据 | 提交 / 运行 | 结果与边界 |
 |---|---|---|
+| main 上批次 O 最终提交的 CI | `7bb66a2` run [44452952190](https://github.com/wmqfl861/AK-sending/actions/runs/44452952190) | completed success（12 项常规任务 success，1 项手动深测 skipped） |
+| P3 offloaded_pass 10 次 | 本地 Windows | **10/10 通过，0 失败** |
+| P3 chunk_checkpoint 10 次 | 本地 Windows | **10/10 通过，0 失败** |
+| P1 five_gib_sparse | 本地 Windows | **通过**（运行时磁盘 19GB）；上一批两次磁盘不足导致的失败见 O 交接 §8 |
+| P1 large_file_passes | 本地 Windows | **失败**（确定性）：`the sender must outlast both whole-file passes: IdleTimeout(300ms)`（tests.rs:2231）；300ms 极紧预算下活动信号在 Windows 上不够快——复核方 O-N1 实现的 Windows 特有发现，需复核方处理 |
+| P2 20,000 文件 | 本地 Windows | **通过**；`T13-20000: phases: manifest received @ 9.3s, first chunk sent @ 28.9s, last chunk received @ 43.9s, verify phase started @ 46.8s, final ack @ 148.8s, final ack @ 148.8s, done @ 148.9s, done @ 148.9s`；块阶段（28.9→43.9 = **15.0s**，O2 基线 277.2s → **~18x 快**） |
+| P2 65,537 文件 | 本地 Windows | **通过**；`T13-65537: phases: manifest received @ 28.7s, first chunk sent @ 72.0s, last chunk received @ 117.2s, verify phase started @ 126.1s, final ack @ 467.8s, final ack @ 467.8s, done @ 467.8s, done @ 467.9s`；块阶段（72.0→117.2 = **45.2s**，O2 基线 2075.4s → **~46x 快**） |
+| P 全量门槛 | 本地 Windows | fmt/clippy/rustdoc/workspace(1222/0/9)/sqlite/server-persistence/Python(366/366，首次 errors=2 不复现)/repo/contracts/部署自检/跨NAT自检 全部通过 |

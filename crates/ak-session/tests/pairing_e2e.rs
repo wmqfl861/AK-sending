@@ -153,12 +153,16 @@ async fn device(registry: &TestRegistry, name: &str) -> Device {
     .await
 }
 
-/// Tunables that keep the flows quick while staying inside the frozen
-/// server windows.
+/// Tunables for the positive flows, inside the frozen server windows. The
+/// windows are deadlines, not delays: a healthy flow finishes as soon as it
+/// can. They used to be 8 s / 20 s, and on a loaded Windows CI runner four
+/// flows of one run took longer than 8 s and failed at the redeem deadline
+/// (batch S review, S-N6), so they now leave room for a slow machine. The
+/// negative tests set their own short windows (`deadline_config`).
 fn fast_config() -> OrchestratorConfig {
     OrchestratorConfig {
-        redeem_window_ms: 8_000,
-        ready_wait_ms: 20_000,
+        redeem_window_ms: 30_000,
+        ready_wait_ms: 45_000,
         claim_conflict_retries: 8,
     }
 }

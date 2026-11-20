@@ -1263,11 +1263,24 @@ impl FileSink for LocalFileSink {
 /// Atomically make `part` visible as `target` WITHOUT ever replacing an
 /// existing file at `target` (review 2026-11-04, atomic no-replace commit).
 ///
-/// Both platforms commit through `hard_link(part, target)` + unlink of the
-/// part name: `link(2)` / `CreateHardLinkW` fail with `AlreadyExists` when
-/// the target name exists, and on success the inode is immediately visible
-/// under the final name — link + unlink is the standard atomic no-replace
+/// Linux and Android commit with `renameat2(RENAME_NOREPLACE)` (batch S
+/// review, S-N3): one atomic call that fails with `AlreadyExists` when the
+/// target name exists. It is the only such primitive an Android app has —
+/// Android's SELinux policy never lets an untrusted app create a hard link
+/// (`neverallow all_untrusted_apps file_type:file link`), and the shell
+/// domain may not either (on `/data/local/tmp` it may not) — so the
+/// link-based commit below failed every Android receive at its last step.
+/// A kernel or filesystem without the flag falls back to that link-based
 /// commit.
+///
+/// Elsewhere (and as that fallback) the commit is `hard_link(part, target)`
+/// followed by an unlink of the part name: `link(2)` / `CreateHardLinkW`
+/// fail with `AlreadyExists` when the target name exists, and on success the
+/// inode is immediately visible under the final name — link then unlink is
+/// the standard atomic no-replace commit. Where a Unix link is refused outright
+/// (permission, or a filesystem that cannot link), the last resort is a
+/// rename guarded by one more existence check, which leaves the same
+/// theoretical check-to-commit race as the Windows fallback below.
 ///
 /// Why not `rename`: POSIX `rename(2)` silently replaces an existing
 /// target, and as of the current toolchain std's Windows `rename` does too
@@ -1286,9 +1299,16 @@ impl FileSink for LocalFileSink {
 /// pre-existing was overwritten; `AlreadyExists` means `target` was left
 /// untouched and `part` still holds the data.
 fn commit_no_replace(part: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        link_then_unlink(part, target)
+        match rename_noreplace(part, target) {
+            Err(e) if noreplace_unsupported(&e) => commit_by_link(part, target, link_then_unlink),
+            other => other,
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    {
+        commit_by_link(part, target, link_then_unlink)
     }
     #[cfg(windows)]
     {
@@ -1313,8 +1333,54 @@ fn commit_no_replace(part: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// `renameat2(part, target, RENAME_NOREPLACE)`: atomic, and `AlreadyExists`
+/// (EEXIST) when `target` exists, leaving both names untouched.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(part: &Path, target: &Path) -> io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, part, CWD, target, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+/// The kernel or the filesystem does not know `RENAME_NOREPLACE` (EINVAL,
+/// ENOSYS, EOPNOTSUPP): try the link-based commit instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn noreplace_unsupported(e: &io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported)
+}
+
+/// Unix link-based commit: `link` (the claim) + unlink, or — when the link
+/// itself is refused (EACCES/EPERM: a security policy or a filesystem that
+/// cannot link; EOPNOTSUPP) — a rename guarded by one more existence check.
+/// A refusal that is really about the directory fails the rename the same
+/// way and is returned. `link` is a parameter so the fallback is testable.
+#[cfg(unix)]
+fn commit_by_link(
+    part: &Path,
+    target: &Path,
+    link: fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match link(part, target) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::Unsupported
+            ) =>
+        {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "commit target already exists",
+                ));
+            }
+            fs::rename(part, target)
+        }
+        other => other,
+    }
+}
+
 /// Link `part` to `target` (atomic no-replace claim), then drop the part
-/// name. Shared by every supported platform.
+/// name. The commit on Windows and on Unix systems other than Linux and
+/// Android, and the fallback where `RENAME_NOREPLACE` is missing.
 fn link_then_unlink(part: &Path, target: &Path) -> io::Result<()> {
     match fs::hard_link(part, target) {
         Ok(()) => {
@@ -2461,15 +2527,70 @@ mod tests {
         assert!(!part.exists());
 
         // Existing target: AlreadyExists, target untouched, part kept with
-        // its data. Both platform branches go through hard_link (Windows
-        // only falls back to rename on link-less filesystems, which never
-        // happens on NTFS temp dirs), so this contract is exercised on
-        // whichever platform the suite runs.
+        // its data. Linux runs renameat2(RENAME_NOREPLACE) here, Windows the
+        // hard link (it only falls back to rename on link-less filesystems,
+        // which never happens on NTFS temp dirs), so the contract is
+        // exercised on whichever platform the suite runs.
         wf(&part, b"newer-content");
         let err = commit_no_replace(&part, &target).err().unwrap();
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&target).unwrap(), b"new-content");
         assert_eq!(fs::read(&part).unwrap(), b"newer-content");
+    }
+
+    /// S-N3 (batch S review): where the hard link is refused — Android
+    /// denies `link` to every untrusted app and to the shell — the Unix
+    /// link-based commit still lands the file, and still never replaces an
+    /// existing one.
+    #[cfg(unix)]
+    #[test]
+    fn refused_hard_link_falls_back_to_a_checked_rename() {
+        fn refused(_: &Path, _: &Path) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(13)) // EACCES, as SELinux answers
+        }
+        let tmp = TempDir::new().unwrap();
+        let part = tmp.path().join("g.bin.akpart");
+        let target = tmp.path().join("g.bin");
+        wf(&part, b"content");
+        commit_by_link(&part, &target, refused).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"content");
+        assert!(!part.exists());
+
+        wf(&part, b"other");
+        let err = commit_by_link(&part, &target, refused).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"content", "target untouched");
+        assert_eq!(fs::read(&part).unwrap(), b"other", "part keeps its data");
+
+        // Any other link failure is returned as it is.
+        fn missing(_: &Path, _: &Path) -> io::Result<()> {
+            Err(io::Error::from(ErrorKind::NotFound))
+        }
+        let err = commit_by_link(&part, &tmp.path().join("h.bin"), missing)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(part.exists());
+    }
+
+    /// The Linux/Android primitive itself: RENAME_NOREPLACE lands the file
+    /// under a free name and refuses a taken one with both names intact.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rename_noreplace_never_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let part = tmp.path().join("r.bin.akpart");
+        let target = tmp.path().join("r.bin");
+        wf(&part, b"one");
+        rename_noreplace(&part, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        assert!(!part.exists());
+
+        wf(&part, b"two");
+        let err = rename_noreplace(&part, &target).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        assert_eq!(fs::read(&part).unwrap(), b"two");
     }
 
     #[cfg(windows)]

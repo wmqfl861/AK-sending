@@ -2005,6 +2005,126 @@ async fn slow_verify_phase_keeps_the_sender_waiting() {
     }
 }
 
+/// A verify-phase failure while other files are being verified (batch Q
+/// review, Q-N2). The receiver verifies and commits up to
+/// VERIFY_PARALLEL_FILES files at a time; when one fails, every pass
+/// already running must return before the receive does, so nothing is
+/// still writing in the destination afterwards. Each file ends up either
+/// committed with the right bytes or still a part file, and a second run
+/// of the same job skips the committed files, fetches the damaged one
+/// again and commits the rest without leaving extra copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_failure_waits_for_running_passes_and_a_retry_completes() {
+    const FILES: usize = 3 * VERIFY_PARALLEL_FILES;
+    const BAD: usize = 2;
+    const LEN: usize = 3000;
+    let body = |i: usize| -> Vec<u8> { (0..LEN).map(|b| (b * 7 + i * 131 + 0x51) as u8).collect() };
+    let name = |i: usize| format!("q{i:02}.bin");
+    let part = |dir: &Path, i: usize| dir.join(format!("{}{}", name(i), ak_storage::PART_SUFFIX));
+    let listing = |dir: &Path| -> Vec<(String, u64)> {
+        let mut entries: Vec<(String, u64)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (name, entry.metadata().unwrap().len())
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    for i in 0..FILES {
+        write(&src.path().join(name(i)), &body(i));
+    }
+
+    // First run: once every chunk is in, damage one part file in place
+    // (same file, so its whole-file digest fails rather than its identity).
+    let bad_part = part(dst.path(), BAD);
+    let progress = {
+        let bad_part = bad_part.clone();
+        Arc::new(move |event: Progress| {
+            if let Progress::Verifying = event {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut file = fs::OpenOptions::new().write(true).open(&bad_part).unwrap();
+                file.seek(SeekFrom::Start(100)).unwrap();
+                file.write_all(&[!body(BAD)[100]]).unwrap();
+                file.sync_all().unwrap();
+            }
+        })
+    };
+    let (send_spec, recv, _) = specs(src.path(), dst.path(), 1);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = {
+        let progress = Arc::clone(&progress);
+        tokio::spawn(async move { receive_with_addr(recv, &*progress, addr_tx).await })
+    };
+    let mut first = send_spec.clone();
+    first.peer = addr_rx.await.unwrap();
+    let sender = tokio::spawn(async move { send(first, &noop).await });
+    let error = receiver
+        .await
+        .unwrap()
+        .expect_err("the damaged file must fail its whole-file digest");
+    let at_return = listing(dst.path());
+    assert!(error.to_string().contains("HASH_MISMATCH"), "{error}");
+    assert!(
+        sender.await.unwrap().is_err(),
+        "the sender must not report success"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        listing(dst.path()),
+        at_return,
+        "no verify pass may still be writing once the receive has returned"
+    );
+    assert!(
+        bad_part.exists(),
+        "the failed file keeps its part for resume"
+    );
+    for i in 0..FILES {
+        let committed = dst.path().join(name(i));
+        assert!(
+            committed.exists() != part(dst.path(), i).exists(),
+            "file {i}: exactly one of the final file and its part"
+        );
+        if committed.exists() {
+            assert_eq!(fs::read(&committed).unwrap(), body(i), "file {i}");
+        }
+    }
+
+    // Second run of the same job.
+    let (mut send_spec, recv, _) = specs(src.path(), dst.path(), 1);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    send_spec.peer = addr_rx.await.unwrap();
+    send(send_spec, &noop)
+        .await
+        .expect("the second run completes");
+    receiver
+        .await
+        .unwrap()
+        .expect("the second receive completes");
+    for i in 0..FILES {
+        assert_eq!(
+            fs::read(dst.path().join(name(i))).unwrap(),
+            body(i),
+            "file {i}"
+        );
+    }
+    assert_eq!(
+        count_entries(dst.path()),
+        (FILES as u64, (FILES * LEN) as u64),
+        "no part files or extra copies remain"
+    );
+    assert_eq!(
+        listing(dst.path()).len(),
+        FILES,
+        "nothing else in the destination"
+    );
+}
+
 /// Chunk-phase checkpoint cadence (review 2026-11-19): progress on every
 /// 16th ack as before, a save on such an ack only once a second has
 /// passed since the last one — so a many-file burst no longer rewrites

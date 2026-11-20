@@ -21,7 +21,8 @@
 //!    single-frame 65,535-entry cap on one job.
 //! 5. Per file, chunked send with windowed acks; the receiver verifies every
 //!    chunk digest on arrival and checkpoints the verified prefix.
-//! 6. Per file: receiver finish (whole digest, fsync, atomic rename).
+//! 6. Per file: receiver finish (whole digest, fsync, atomic rename), for
+//!    up to `VERIFY_PARALLEL_FILES` files at a time (batch Q review).
 //! 7. Finalize -> FinalAck only after every file verified and committed; the
 //!    checkpoint is marked completed strictly before FinalAck is sent.
 //! 8. Cancel/Error at any point aborts; part files and checkpoints survive
@@ -59,7 +60,10 @@
 //!   verify pass of a large job. A single large file's own pass (the
 //!   prepare-time re-hash, finish()'s whole-digest pass and flush) runs on
 //!   the blocking pool while the same signal keeps going on the timer
-//!   (review 2026-11-19).
+//!   (review 2026-11-19). In the verify phase every file's pass runs
+//!   there, up to `VERIFY_PARALLEL_FILES` at a time (batch Q review,
+//!   2026-11-20); after a failure no further pass starts and the running
+//!   ones are waited for before the receive returns.
 //!
 //! Concurrent receive (round 6, no wire-format change):
 //! [`serve_concurrently`] binds once and serves several senders — one
@@ -262,8 +266,21 @@ const VERIFY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 /// final, and finish()'s whole-digest pass plus `sync_all` — runs on the
 /// blocking pool while the receive task keeps signalling liveness (review
 /// 2026-11-19). Between files the cadence check covers smaller files: at
-/// even 100 MB/s such a pass takes well under the liveness interval.
+/// even 100 MB/s such a pass takes well under the liveness interval. The
+/// verify phase runs every file's finish() on the blocking pool
+/// ([`VERIFY_PARALLEL_FILES`]); there this size only keeps two such files
+/// from running at once.
 const OFFLOAD_WHOLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Files the verify phase verifies and commits at once (batch Q review,
+/// 2026-11-20). One file's finish() — open, whole-file hash, flush, link —
+/// mostly waits on the file system, and one after another they took most
+/// of a 65,537-file job on Windows (P handoff §9); running several at a
+/// time overlaps those waits. Each file's own order is unchanged: its data
+/// is flushed before its final name appears. Files of at least
+/// [`OFFLOAD_WHOLE_FILE_BYTES`] never run beside each other, so at most one
+/// multi-gigabyte pass competes for the disk.
+const VERIFY_PARALLEL_FILES: usize = 8;
 
 /// Liveness cadence of one receive: a quarter of the receiver's own idle
 /// budget (the sender normally runs the same default), never more than
@@ -291,6 +308,10 @@ fn liveness_interval(idle: Duration) -> Duration {
 /// be interrupted anyway: the pass's result comes back as usual, and the
 /// caller's next regular frame reports the broken connection and runs the
 /// usual cleanup (so a sink prepared meanwhile is not leaked as litter).
+///
+/// The prepare loop uses it; the verify phase runs its passes, several at
+/// a time, through its own loop with the same signalling
+/// ([`VERIFY_PARALLEL_FILES`]).
 async fn offload_with_liveness<T: Send + 'static>(
     tx: &mut DirectSendStream,
     mut keepalive: Option<&Frame>,
@@ -4309,11 +4330,10 @@ async fn receive_frozen_body(
             )
         };
 
-        // Verify and commit every file; only then report completion. Each
-        // successful finish persists the per-file commit marker (verified
-        // prefix == total chunks) immediately, so a crash after this point
-        // lets a retry of the same record skip the file (see the prepare
-        // loop) instead of colliding with its own committed output.
+        // Verify and commit every file; only then report completion. A
+        // retry of the same record skips a file this pass committed (the
+        // prepare loop checks the final name's whole digest), so a crash
+        // after any commit does not collide with its own output.
         progress(Progress::Verifying);
         // One save up front captures the whole chunk phase (the chunk-phase
         // cadence may trail the last acks); during the pass the record is
@@ -4325,9 +4345,6 @@ async fn receive_frozen_body(
         // for the FinalAck under its idle budget and tolerates Control
         // frames at that gate, so a peer that negotiated Pause/Resume gets
         // a no-op Control::Resume whenever the liveness interval passes.
-        // A large file's own pass runs on the blocking pool with the same
-        // signal sent on the timer (review 2026-11-19, see
-        // OFFLOAD_WHOLE_FILE_BYTES).
         let verify_keepalive = ((peer_caps & CAP_PAUSE_RESUME) != 0).then_some(Frame {
             version: ak_wire::VERSION,
             message: Message::Control {
@@ -4335,66 +4352,114 @@ async fn receive_frozen_body(
                 control: Control::Resume,
             },
         });
+        let report_committed = |index: usize| {
+            progress(Progress::FileVerified {
+                file_index: index as u32,
+            });
+            progress(Progress::FileCommitted {
+                file_index: index as u32,
+                path: job.manifest.entries[index]
+                    .rel_path
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            });
+        };
+        // Up to VERIFY_PARALLEL_FILES files' finish() passes run at a time
+        // on the blocking pool (batch Q review); this task keeps the
+        // liveness signal going (a large file's pass included, see
+        // OFFLOAD_WHOLE_FILE_BYTES) and records each file as its pass
+        // returns, so progress events come in completion order. After a
+        // failure no further pass starts and the running ones are waited
+        // for: none is still writing in the destination once this returns.
+        let mut passes: tokio::task::JoinSet<(usize, std::io::Result<()>)> =
+            tokio::task::JoinSet::new();
+        let mut large_in_flight = false;
+        let mut next = 0;
+        let mut failure: Option<EngineError> = None;
         let mut last_signal = Instant::now();
-        for (index, sink_slot) in sinks.iter_mut().enumerate() {
-            if let Some(keepalive) = &verify_keepalive {
-                if last_signal.elapsed() >= liveness {
-                    tx.send_frame(keepalive).await?;
-                    // Let the transport (and a peer sharing this runtime) run.
-                    tokio::task::yield_now().await;
-                    last_signal = Instant::now();
+        loop {
+            // Due between any two steps, a slow progress callback included.
+            if failure.is_none() && last_signal.elapsed() >= liveness {
+                if let Some(keepalive) = &verify_keepalive {
+                    match tx.send_frame(keepalive).await {
+                        Ok(()) => {
+                            // Let the transport (and a peer sharing this
+                            // runtime) run.
+                            tokio::task::yield_now().await;
+                            last_signal = Instant::now();
+                        }
+                        Err(error) => failure = Some(EngineError::from(error)),
+                    }
                 }
             }
-            if let Some(mut sink) = sink_slot.take() {
-                let entry = &job.manifest.entries[index];
-                if entry.is_dir {
-                    sink.finish().map_err(EngineError::Io)?;
-                    continue;
+            while failure.is_none() && next < sinks.len() && passes.len() < VERIFY_PARALLEL_FILES {
+                let entry = &job.manifest.entries[next];
+                let large = !entry.is_dir && entry.size >= OFFLOAD_WHOLE_FILE_BYTES;
+                if large && large_in_flight {
+                    break;
                 }
-                if entry.size >= OFFLOAD_WHOLE_FILE_BYTES {
-                    offload_with_liveness(
-                        &mut tx,
-                        verify_keepalive.as_ref(),
-                        liveness,
-                        &mut last_signal,
-                        move || sink.finish(),
-                    )
-                    .await?
-                    .map_err(EngineError::Io)?;
-                } else {
-                    sink.finish().map_err(EngineError::Io)?;
+                let index = next;
+                next += 1;
+                if let Some(mut sink) = sinks[index].take() {
+                    if entry.is_dir {
+                        if let Err(error) = sink.finish() {
+                            failure = Some(EngineError::Io(error));
+                        }
+                    } else {
+                        large_in_flight |= large;
+                        passes.spawn_blocking(move || (index, sink.finish()));
+                    }
+                } else if committed_skip[index] {
+                    // Committed by the previous run of this record and
+                    // skipped; still report it as verified/committed for
+                    // honest progress.
+                    report_committed(index);
                 }
-                record.files[index].verified_prefix_chunks =
-                    job.manifest.entries[index].chunk_digests.len() as u64;
-                if last_save.elapsed() >= VERIFY_CHECKPOINT_INTERVAL {
-                    record.updated_unix_ms = now_ms();
-                    store.save(&record).map_err(EngineError::Checkpoint)?;
-                    last_save = Instant::now();
-                }
-                progress(Progress::FileVerified {
-                    file_index: index as u32,
-                });
-                progress(Progress::FileCommitted {
-                    file_index: index as u32,
-                    path: job.manifest.entries[index]
-                        .rel_path
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                });
-            } else if committed_skip[index] {
-                // Committed by the previous run of this record and skipped;
-                // still report it as verified/committed for honest progress.
-                progress(Progress::FileVerified {
-                    file_index: index as u32,
-                });
-                progress(Progress::FileCommitted {
-                    file_index: index as u32,
-                    path: job.manifest.entries[index]
-                        .rel_path
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                });
             }
+            if passes.is_empty() {
+                // Every file was started and has returned, or a failure
+                // stopped the loop and the running passes have returned.
+                break;
+            }
+            let due = tokio::time::Instant::from_std(last_signal + liveness);
+            let signal = failure.is_none() && verify_keepalive.is_some();
+            let joined = tokio::select! {
+                biased;
+                joined = passes.join_next() => joined,
+                () = tokio::time::sleep_until(due), if signal => continue,
+            };
+            match joined {
+                Some(Ok((index, Ok(())))) => {
+                    let entry = &job.manifest.entries[index];
+                    if entry.size >= OFFLOAD_WHOLE_FILE_BYTES {
+                        large_in_flight = false;
+                    }
+                    record.files[index].verified_prefix_chunks = entry.chunk_digests.len() as u64;
+                    if failure.is_none() && last_save.elapsed() >= VERIFY_CHECKPOINT_INTERVAL {
+                        record.updated_unix_ms = now_ms();
+                        match store.save(&record) {
+                            Ok(()) => last_save = Instant::now(),
+                            Err(error) => failure = Some(EngineError::Checkpoint(error)),
+                        }
+                    }
+                    report_committed(index);
+                }
+                Some(Ok((index, Err(error)))) => {
+                    if job.manifest.entries[index].size >= OFFLOAD_WHOLE_FILE_BYTES {
+                        large_in_flight = false;
+                    }
+                    failure.get_or_insert(EngineError::Io(error));
+                }
+                Some(Err(join)) => {
+                    failure.get_or_insert(EngineError::Io(std::io::Error::other(format!(
+                        "verify pass did not complete: {join}"
+                    ))));
+                }
+                None => {}
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         // Completion marker strictly after verification and commit (PROTOCOL).
         record.state = "completed".into();

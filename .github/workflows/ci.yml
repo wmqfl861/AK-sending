@@ -390,10 +390,14 @@ jobs:
   # set_len or by writing only past it, is zero-filled on NTFS when a later
   # write lands past it, where ext4 keeps a hole; batch P's Windows-only
   # failure of the large-file test came from that). Same
-  # trigger as above: workflow_dispatch only. The ak-itests scale runs
-  # stay Linux-only here; the local Windows host covers them.
+  # trigger as above: workflow_dispatch only. The two many-files scale runs
+  # of t13 run here too (2026-11-20 review of batch Q): their verify phase
+  # is per-file open, hash, flush and link, and on NTFS that cost per file
+  # is many times the ext4 runner's, so changes to it are measured here
+  # before the local Windows host confirms them. The rest of the ak-itests
+  # ignored suite (benches) stays Linux-only.
   release-deep-tests-windows:
-    name: Release deep tests (Windows, ak-engine ignored suite)
+    name: Release deep tests (Windows, ak-engine ignored suite, t13 scale)
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 90
@@ -410,6 +414,8 @@ jobs:
           try { Get-MpComputerStatus | Format-List AntivirusEnabled, RealTimeProtectionEnabled } catch { "Defender status unavailable: $_" }
       - name: ak-engine ignored tests (5 GiB transfer, large-file liveness)
         run: cargo test --locked --release -p ak-engine -- --ignored --nocapture --test-threads=1
+      - name: t13 scale tests (20,000 and 65,537 files)
+        run: cargo test --locked --release -p ak-itests --test t13_many_files -- --ignored --nocapture --test-threads=1
 
   # Cross-target portability matrix: cargo check of the pure-Rust core
   # against non-host triples, mirroring scripts/check_targets.sh (本地脚本

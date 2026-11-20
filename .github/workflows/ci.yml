@@ -416,6 +416,11 @@ jobs:
         run: cargo test --locked --release -p ak-engine -- --ignored --nocapture --test-threads=1
       - name: t13 scale tests (20,000 and 65,537 files)
         run: cargo test --locked --release -p ak-itests --test t13_many_files -- --ignored --nocapture --test-threads=1
+      # Per-file costs of the verify phase's raw operations on NTFS (flush,
+      # write-through, link, rename; one thread and eight), for the next
+      # change to that phase.
+      - name: Per-file commit cost benchmark
+        run: cargo test --locked --release -p ak-itests --test bench_commit_cost -- --ignored --nocapture --test-threads=1
 
   # Cross-target portability matrix: cargo check of the pure-Rust core
   # against non-host triples, mirroring scripts/check_targets.sh (本地脚本

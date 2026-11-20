@@ -314,6 +314,20 @@ impl LineLog {
 
     /// First line containing `needle`, polling until it appears.
     fn wait_for(&self, needle: &str, timeout: std::time::Duration) -> String {
+        self.wait_for_reporting(needle, timeout, &[])
+    }
+
+    /// [`Self::wait_for`], with `others`' output (stderr included) in the
+    /// timeout report too: a wait on one process often runs out because
+    /// of another (2026-11-20 review of batch Q: a Windows CI run timed
+    /// out waiting for the receiver's offer line, and the report held only
+    /// the receiver's side).
+    fn wait_for_reporting(
+        &self,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
         let deadline = Instant::now() + timeout;
         loop {
             for line in self.snapshot() {
@@ -321,11 +335,16 @@ impl LineLog {
                     return line;
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
-                self.report()
-            );
+            if Instant::now() >= deadline {
+                let mut report = format!(
+                    "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
+                    self.report()
+                );
+                for (name, other) in others {
+                    report.push_str(&format!("\n--- {name}, output so far:\n{}", other.report()));
+                }
+                panic!("{report}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -554,9 +573,13 @@ fn run_task_code_chain(
     // asks the consent question; wait out the requested delay (a real
     // user reading the banner for ~90 s in the E2/G4 scenario), then
     // keep feeding a fresh `y` until the transfer visibly moves on.
-    recv.stdout.wait_for(
+    recv.stdout.wait_for_reporting(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
+        &[
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
     if !consent_delay.is_zero() {
         std::thread::sleep(consent_delay);
@@ -946,9 +969,13 @@ fn stun_reflexive_rides_the_cli_receiver_socket() {
     ]
     .to_vec();
     let mut sender = Proc::spawn("t03-stun-send", &send_args);
-    recv.stdout.wait_for(
+    recv.stdout.wait_for_reporting(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
+        &[
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
     recv.consent_yes(
         &["[recv]", "task complete", "declined"],
@@ -1240,9 +1267,13 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
     ]
     .to_vec();
     let mut sender = Proc::spawn("t03-punch-send", &send_args);
-    recv.stdout.wait_for(
+    recv.stdout.wait_for_reporting(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
+        &[
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
     recv.consent_yes(
         &["[recv]", "task complete", "declined"],
@@ -1498,9 +1529,13 @@ fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
     );
 
     // Drive the transfer to completion (offer + consent + done).
-    recv.stdout.wait_for(
+    recv.stdout.wait_for_reporting(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
+        &[
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
     recv.consent_yes(
         &["[recv]", "task complete", "declined"],
@@ -1638,9 +1673,13 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
 
     // The transfer still completes (the junk candidate costs the sender
     // nothing — it dials the RECEIVER's list, not its own).
-    recv.stdout.wait_for(
+    recv.stdout.wait_for_reporting(
         "the peer wants to send",
         std::time::Duration::from_secs(120),
+        &[
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
     recv.consent_yes(
         &["[recv]", "task complete", "declined"],

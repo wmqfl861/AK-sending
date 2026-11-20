@@ -2302,12 +2302,20 @@ mod cancel_tests {
         let payload = vec![0x3Cu8; 16 << 20];
         std::fs::write(src.path().join("big.bin"), &payload).expect("write 16 MiB source");
 
+        // The receiver's checkpoint store lives outside the measured tree:
+        // a save after the cancel (a temp file, then a rename over the
+        // record) is bookkeeping, not delivered bytes. With it inside `dst`
+        // a Windows CI run saw the tree shrink by one temp file between the
+        // two samples below while the payload stayed the same (2026-11-20
+        // review of batch R).
+        let recv_checkpoints = tempfile::tempdir().expect("receiver checkpoint tempdir");
+
         let sender_key = DeviceKeyPair::generate();
         let receiver_key = DeviceKeyPair::generate();
         let mut recv_spec =
             ak_engine::ReceiveSpec::new(dst.path().to_path_buf(), make_self_signed(&receiver_key));
         recv_spec.bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-        recv_spec.checkpoint_dir = dst.path().join("checkpoints");
+        recv_spec.checkpoint_dir = recv_checkpoints.path().to_path_buf();
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let noop = |_progress: ak_engine::Progress| {};

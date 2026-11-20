@@ -33,7 +33,8 @@
 | S-N4 | 接收在绑定之前失败时显示引擎的真实错误（`receiver failed to start`） | `crates/ak-cli` |
 | 互通脚本 | `scripts/mixed_version_check.sh`：两个构建在四个方向、两种模式下互传并逐字节比较 | `scripts/` |
 | 规模测试 | t13 新增 65,537 个文件、两端空闲时限 4 秒的一项（ignored，release） | `crates/ak-itests` |
-| 文档 | S 复核、S 交接 §9、状态表（S-N1–S-N5 与表尾说明）、STATUS、BACKLOG（P3-02 两项关闭）、PROTOCOL、OPERATIONS 的版本行、支持矩阵 Android 一行 | `docs/` |
+| S-N6 | ak-session 配对端到端测试的正向流程窗口放宽（Windows CI 负载高时曾超时） | `crates/ak-session/tests` |
+| 文档 | S 复核、S 交接 §9、状态表（S-N1–S-N6 与表尾说明）、STATUS、BACKLOG（P3-02 两项关闭）、PROTOCOL、OPERATIONS 的版本行、支持矩阵 Android 一行 | `docs/` |
 
 ## 2. 接手前必读
 

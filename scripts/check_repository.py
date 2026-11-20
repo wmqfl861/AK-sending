@@ -160,6 +160,43 @@ QUOTED_SPAN_PATTERNS = tuple(
     for pattern in (r"“[^”]*”", r"「[^」]*」", r"『[^』]*』", r'"[^"]*"')
 )
 
+# Q-N1 (REVIEW_2026-11-20-batchQ.zh-CN.md §2): batches O, P and Q broke the
+# same record rules although every handoff restated them, so the parts a
+# script can tell apart are gates now.
+#   c. STATUS is the project's entry page: it links every handoff and review
+#      document in docs/ and the project entry documents below (batches P
+#      and Q each rewrote it down to the latest few handoffs).
+#   d. Section-7 rows of batch L onward (IDs such as L1, L-N1, M-CI) carry
+#      no run ids, pass ratios, test counts, multipliers or measured
+#      durations in their 状态 and 证据摘要 cells, and STATUS carries none
+#      outside its 最新验证 index; those numbers belong in the batch
+#      handoff's evidence table. A duration counts as measured only when it
+#      has decimals or is a range ("7.50s", "7-9s"): a whole number of
+#      seconds is as often a time budget ("300 ms 时限") as a measurement.
+STATUS_ENTRY_DOCS = (
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "docs/ROADMAP.zh-CN.md",
+    "docs/BACKLOG.zh-CN.md",
+    "docs/OPERATIONS.zh-CN.md",
+    "docs/SUPPORT_MATRIX.zh-CN.md",
+)
+HISTORY_DOC_RE = re.compile(r"^(?:HANDOFF|REVIEW_).*\.md$")
+BATCH_ROW_ID_RE = re.compile(r"^[L-Z](?:\d+|-N\d+|-CI)$")
+COUNT_PATTERNS = (
+    ("run id", RUN_ID_RE),
+    ("pass ratio", re.compile(r"(?<![\w.])\d+\s*/\s*\d+(?![\w.])")),
+    ("test count", re.compile(r"\d+\s*(?:passed|failed|ignored)\b")),
+    ("multiplier", re.compile(r"\d+(?:\.\d+)?\s*(?:x|×|倍)(?![A-Za-z0-9_])")),
+    (
+        "measured duration",
+        re.compile(
+            r"\d+\.\d+\s*(?:ms|s|min|秒|分钟)(?![A-Za-z])"
+            r"|\d+\s*[-–~～]\s*\d+\s*(?:ms|s|min|秒|分钟)(?![A-Za-z])"
+        ),
+    ),
+)
+
 EXPECTED_ARCHITECTURE = {
     "schema_version": 1,
     "project": "AK-sending",
@@ -618,6 +655,110 @@ def handoff_contradiction_issues(handoff_text: str, handoff_name: str) -> list[s
     ]
 
 
+def _count_hits(text: str) -> list[tuple[str, str]]:
+    """(label, matched text) for every record-rule number pattern in `text`."""
+    return [
+        (label, match.group(0))
+        for label, pattern in COUNT_PATTERNS
+        for match in pattern.finditer(text)
+    ]
+
+
+def status_entry_link_issues(root: Path, status_text: str) -> tuple[int, list[str]]:
+    """Q-N1 check c: STATUS links every handoff/review doc and entry doc.
+
+    Required: every docs/HANDOFF*.md and docs/REVIEW_*.md file (docs/archive
+    holds frozen history and is not required) plus those STATUS_ENTRY_DOCS
+    that exist. A local link counts when it resolves, against STATUS's own
+    directory with the fragment stripped, to that file. Returns (documents
+    required, errors).
+    """
+    base = (root / STATUS_DOC).parent
+    linked: set[Path] = set()
+    for match in MARKDOWN_LINK_RE.finditer(status_text):
+        link = match.group(1)
+        if "://" in link or link.startswith(("mailto:", "#")):
+            continue
+        linked.add((base / _link_destination(link)).resolve())
+    docs = root / "docs"
+    required = (
+        sorted(path for path in docs.glob("*.md") if HISTORY_DOC_RE.match(path.name))
+        if docs.is_dir()
+        else []
+    )
+    required += [root / name for name in STATUS_ENTRY_DOCS if (root / name).is_file()]
+    errors = [
+        f"{STATUS_DOC}: no link to {path.relative_to(root).as_posix()} — "
+        "交接入口 keeps every handoff and review document and the project "
+        "entry documents (rewrite STATUS whole, keep its history links)"
+        for path in required
+        if path.resolve() not in linked
+    ]
+    return len(required), errors
+
+
+def status_table_number_issues(text: str) -> list[str]:
+    """Q-N1 check d: batch rows (L onward) carry no counts, run ids or timings.
+
+    Only rows whose 编号 is a batch-style ID (BATCH_ROW_ID_RE) are checked;
+    the older CR-/E-/K- rows predate CR-P3-20 and keep their history. The
+    状态 and 证据摘要 cells are scanned. Shape errors (column counts, orphan
+    rows, a missing section) are status_table_issues' job; rows of the
+    wrong shape are skipped here.
+    """
+    lines = text.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(STATUS_TABLE_HEADING)),
+        None,
+    )
+    if start is None:
+        return []
+    errors: list[str] = []
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("## "):
+            break
+        row = lines[i].lstrip()
+        if not row.startswith("|"):
+            continue
+        cells = re.split(r"(?<!\\)\|", row)[1:-1]
+        if len(cells) != STATUS_TABLE_COLUMNS:
+            continue
+        row_id = cells[0].strip()
+        if not BATCH_ROW_ID_RE.match(row_id):
+            continue
+        for column, name in ((2, "状态"), (4, "证据摘要")):
+            for label, hit in _count_hits(cells[column]):
+                errors.append(
+                    f"{REVIEW_DOC}:{i + 1}: row {row_id} {name} carries a {label} "
+                    f"({hit!r}) — run ids, counts and measured durations go in "
+                    "the batch handoff's evidence table only"
+                )
+    return errors
+
+
+def status_number_issues(status_text: str) -> list[str]:
+    """Q-N1 check d, STATUS half: no counts outside the 最新验证 index.
+
+    Link destinations are dropped before matching (file names carry dates).
+    """
+    errors: list[str] = []
+    in_index = False
+    for lineno, line in enumerate(status_text.splitlines(), 1):
+        if line.startswith("## "):
+            in_index = line.startswith(LATEST_VERIFICATION_HEADING)
+            continue
+        if in_index:
+            continue
+        visible = re.sub(r"\]\([^)]*\)", "]", line)
+        for label, hit in _count_hits(visible):
+            errors.append(
+                f"{STATUS_DOC}:{lineno}: carries a {label} ({hit!r}) outside "
+                f"'{LATEST_VERIFICATION_HEADING[3:]}' — STATUS holds stage "
+                "conclusions, next steps and links"
+            )
+    return errors
+
+
 def check(root: Path) -> dict:
     errors: list[str] = []
     required = [
@@ -692,11 +833,13 @@ def check(root: Path) -> dict:
     rust_tests = sum(p.read_text(encoding="utf-8").count("#[test]") for p in source_files)
     # CR-P3-10: gate the review status table's shape after every write-back.
     try:
-        status_rows, status_errors = status_table_issues(
-            (root / REVIEW_DOC).read_text(encoding="utf-8")
-        )
+        review_text = (root / REVIEW_DOC).read_text(encoding="utf-8")
     except OSError as exc:
         status_rows, status_errors = 0, [f"cannot read {REVIEW_DOC}: {exc}"]
+    else:
+        status_rows, status_errors = status_table_issues(review_text)
+        # Q-N1 check d: no counts or timings in batch rows.
+        status_errors += status_table_number_issues(review_text)
     errors.extend(status_errors)
     # CR-P3-20: STATUS "最新验证" run ids must be traceable in the handoff
     # STATUS actually links to, and that handoff must not mix 已核 claims
@@ -710,11 +853,17 @@ def check(root: Path) -> dict:
     # cannot be located or read.
     latest_runs_checked = 0
     latest_handoff_name: str | None = None
+    status_entry_docs_checked = 0
     try:
         status_text = (root / STATUS_DOC).read_text(encoding="utf-8")
     except OSError as exc:
         errors.append(f"cannot read CR-P3-20 documents: {exc}")
     else:
+        # Q-N1 checks c and d: every entry link kept, no counts outside
+        # 最新验证.
+        status_entry_docs_checked, entry_errors = status_entry_link_issues(root, status_text)
+        errors.extend(entry_errors)
+        errors.extend(status_number_issues(status_text))
         handoff_path, handoff_errors = status_handoff_issues(root, status_text)
         errors.extend(handoff_errors)
         if handoff_path is not None:
@@ -755,6 +904,7 @@ def check(root: Path) -> dict:
         "local_links_checked": checked_links,
         "rust_test_cases_present_not_executed": rust_tests,
         "review_status_table_rows_checked": status_rows,
+        "status_entry_docs_checked": status_entry_docs_checked,
         "status_latest_verification_runs_checked": latest_runs_checked,
         "latest_handoff_checked": latest_handoff_name,
         "banned_dependency_scan": "clean" if not violations else violations,

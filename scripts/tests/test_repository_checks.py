@@ -1141,5 +1141,165 @@ class StatusHandoffLinkTests(unittest.TestCase):
             self.assertEqual(path.name, name)
 
 
+class RecordRuleTests(unittest.TestCase):
+    """Q-N1 (REVIEW_2026-11-20-batchQ.zh-CN.md §2): STATUS keeps every entry
+    link (check c); batch rows of the status table and STATUS outside its
+    最新验证 index carry no run ids, counts or measured durations (check d).
+    Real check functions on real (temporary) files or text; nothing mocked.
+    """
+
+    DOCS = (
+        "docs/HANDOFF-BATCH-P-2026-11-19.zh-CN.md",
+        "docs/HANDOFF-BATCH-Q-2026-11-19.zh-CN.md",
+        "docs/HANDOFF.zh-CN.md",
+        "docs/REVIEW_2026-11-11.zh-CN.md",
+        "docs/REVIEW_2026-11-19-batchP.zh-CN.md",
+        "docs/ROADMAP.zh-CN.md",
+        "docs/BACKLOG.zh-CN.md",
+        "AGENTS.md",
+        "CHANGELOG.md",
+    )
+    ENTRY_LINKS = (
+        "- [Q 交接](HANDOFF-BATCH-Q-2026-11-19.zh-CN.md) · "
+        "[P 复核](REVIEW_2026-11-19-batchP.zh-CN.md) · "
+        "[P 交接 §8](HANDOFF-BATCH-P-2026-11-19.zh-CN.md#8-证据表)\n"
+        "- [状态表](REVIEW_2026-11-11.zh-CN.md#7-状态表) · [规则](../AGENTS.md)\n"
+        "- [HANDOFF](HANDOFF.zh-CN.md) · [ROADMAP](ROADMAP.zh-CN.md) · "
+        "[BACKLOG](BACKLOG.zh-CN.md) · [CHANGELOG](../CHANGELOG.md)"
+    )
+
+    @staticmethod
+    def _status(current: str, links: str, latest: str = "- 见 Q 交接 §8。") -> str:
+        return (
+            "# 项目状态\n\n> 更新：2026-11-20，批次 Q 复核。\n\n## 当前状态\n\n"
+            + current + "\n\n## 最新验证\n\n" + latest + "\n\n## 交接入口\n\n" + links + "\n"
+        )
+
+    def _repo(self, root: Path) -> None:
+        for name in self.DOCS:
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("# x\n", encoding="utf-8")
+        # Frozen history under docs/archive is not required.
+        (root / "docs/archive").mkdir()
+        (root / "docs/archive/HANDOFF-BATCH-A-2026-11-01.zh-CN.md").write_text(
+            "# a\n", encoding="utf-8"
+        )
+
+    def test_status_linking_every_entry_document_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._repo(root)
+            required, errors = checks.status_entry_link_issues(
+                root, self._status("- 阶段结论。", self.ENTRY_LINKS)
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(required, len(self.DOCS))
+
+    def test_status_dropping_history_links_fails_naming_each(self):
+        # Batches P and Q rewrote STATUS down to the latest few handoffs.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._repo(root)
+            links = (
+                "- [Q 交接](HANDOFF-BATCH-Q-2026-11-19.zh-CN.md) · "
+                "[状态表](REVIEW_2026-11-11.zh-CN.md) · [规则](../AGENTS.md)"
+            )
+            _, errors = checks.status_entry_link_issues(root, self._status("- 结论。", links))
+            missing = sorted(error.split("no link to ")[1].split(" ")[0] for error in errors)
+            self.assertEqual(
+                missing,
+                sorted([
+                    "CHANGELOG.md",
+                    "docs/BACKLOG.zh-CN.md",
+                    "docs/HANDOFF-BATCH-P-2026-11-19.zh-CN.md",
+                    "docs/HANDOFF.zh-CN.md",
+                    "docs/REVIEW_2026-11-19-batchP.zh-CN.md",
+                    "docs/ROADMAP.zh-CN.md",
+                ]),
+            )
+
+    def test_external_link_with_the_same_name_does_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._repo(root)
+            links = self.ENTRY_LINKS.replace(
+                "(BACKLOG.zh-CN.md)", "(https://example.org/docs/BACKLOG.zh-CN.md)"
+            )
+            _, errors = checks.status_entry_link_issues(root, self._status("- 结论。", links))
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("docs/BACKLOG.zh-CN.md", errors[0])
+
+    @staticmethod
+    def _table(*rows: str) -> str:
+        return (
+            "## 7. 状态表\n\n| 编号 | 批次 | 状态 | 提交 | 证据摘要 |\n|---|---|---|---|---|\n"
+            + "\n".join(rows) + "\n\n## 8. 其他\n"
+        )
+
+    def test_batch_rows_with_counts_or_timings_fail(self):
+        # Batch Q's Q1 row as pushed (7b399bf): two pass ratios and a range.
+        q1 = (
+            "| Q1 | 批次 Q | P-N1 改正后的大文件测试在 Windows 全部通过 | 7b399bf | "
+            "全量 2/2 通过；3 次单独循环 3/3 通过；前缀落盘（7-9s）；300ms 时限下等待 |"
+        )
+        errors = checks.status_table_number_issues(self._table(q1))
+        self.assertEqual(
+            [error.split("carries a ")[1].split(" (")[0] for error in errors],
+            ["pass ratio", "pass ratio", "measured duration"],
+        )
+        self.assertTrue(all(error.startswith(f"{checks.REVIEW_DOC}:5:") for error in errors), errors)
+        for cell, label in [
+            ("run 44550426438 全绿", "run id"),
+            ("workspace 1222 passed", "test count"),
+            ("块阶段快了约 18x", "multiplier"),
+            ("块阶段缩短到 1/46", "pass ratio"),
+            ("整项 263.58s", "measured duration"),
+            ("校验快了 3 倍", "multiplier"),
+        ]:
+            with self.subTest(cell=cell):
+                errors = checks.status_table_number_issues(
+                    self._table(f"| P-N3 | 复核 / P | 已更正 | adb9391 | {cell} |")
+                )
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"carries a {label}", errors[0])
+                self.assertIn("证据摘要", errors[0])
+        # The 状态 cell is checked too.
+        errors = checks.status_table_number_issues(
+            self._table("| R1 | 批次 R | 通过（5/5） | 0d4d88f | 见 R 交接 §8 |")
+        )
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("row R1 状态", errors[0])
+
+    def test_parameters_and_older_rows_pass(self):
+        rows = [
+            # Time budgets and sizes are parameters, not measurements.
+            "| P-N1 | 复核 / P | 已改正：300 ms 时限也卡住了块阶段 | fcc6c3e | 时限仍为 300 ms；64 MiB 起卸载 |",
+            "| M7 | 复核 / M | 已修复 | 02fdd6f | IdleTimeout(30s) 已在 Linux 复现（seed 7） |",
+            "| N-N1 | 复核 / N | 已修复 | 5896ce8 | 20,000 文件超时，65,537 文件通过；Windows 复测通过（O2） |",
+            "| O-N4 | 复核 / O | 已修复 | 2e57683 | 0xA003 关闭码；x86_64 与 IPv4/IPv6；见 O 交接 §8/§9 |",
+            # Rows before batch L predate CR-P3-20 and keep their history.
+            "| CR-P1-02 | C / F | 已完成 | 3b3eb64 | run 43011364868：5/5，150ms |",
+            "| K-CI | 复核 / K24 | 全绿 | b8142cb | 12/12 |",
+            "| main 合并 | 复核 / P | 已合并 | f6b54b0 | 1/1 |",
+        ]
+        self.assertEqual(checks.status_table_number_issues(self._table(*rows)), [])
+
+    def test_status_counts_only_inside_latest_verification(self):
+        current = (
+            "批次 Q 的 Q1 在本地 Windows 上确认：全量 release 深测 2/2 通过、"
+            "3 次单独循环 3/3 通过，300 ms 时限不变。"
+        )
+        errors = checks.status_number_issues(self._status(current, self.ENTRY_LINKS))
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(all(error.startswith(f"{checks.STATUS_DOC}:7:") for error in errors), errors)
+        # The same numbers in the 最新验证 index, and dates inside link
+        # destinations, are fine.
+        latest = "- run [44552857837](HANDOFF-BATCH-Q-2026-11-19.zh-CN.md#9)：2/2 通过。"
+        self.assertEqual(
+            checks.status_number_issues(self._status("- 阶段结论。", self.ENTRY_LINKS, latest)),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

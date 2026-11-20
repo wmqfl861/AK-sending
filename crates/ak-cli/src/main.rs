@@ -2559,12 +2559,12 @@ async fn receive_command(
         let spec = config.iteration_spec();
         let printer = progress_printer("recv");
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-        let receiver =
+        let mut receiver =
             tokio::spawn(
                 async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
             );
         if first {
-            let addr = addr_rx.await.context("receiver failed to bind")?;
+            let addr = bound_address(addr_rx, &mut receiver).await?;
             println!("receiving into {}", out.display());
             println!("address: {addr}");
             // Wave 25: 0.0.0.0:PORT is useless to a sender on a multi-NIC
@@ -2613,6 +2613,25 @@ async fn receive_command(
             Ok(Err(error)) => return Err(error.into()),
             Err(join) => bail!("receiver task failed: {join}"),
         }
+    }
+}
+
+/// Wait for a spawned engine receive to announce its bound address. A
+/// receive that fails before it binds (missing output directory, port in
+/// use, ...) only drops the address channel, so its own error is taken from
+/// the task: the bare "channel closed" used to hide the cause (batch S
+/// review; S1 met it with a missing `--out` directory).
+pub(crate) async fn bound_address(
+    addr_rx: tokio::sync::oneshot::Receiver<SocketAddr>,
+    receiver: &mut tokio::task::JoinHandle<Result<Report, EngineError>>,
+) -> Result<SocketAddr> {
+    match addr_rx.await {
+        Ok(addr) => Ok(addr),
+        Err(_) => match receiver.await {
+            Ok(Err(error)) => Err(anyhow::Error::new(error).context("receiver failed to start")),
+            Ok(Ok(_)) => bail!("receiver finished before it announced an address"),
+            Err(join) => bail!("receiver task failed: {join}"),
+        },
     }
 }
 
@@ -3666,7 +3685,7 @@ async fn receive_one_after_pairing(
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
     let mut receiver =
         tokio::spawn(async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await });
-    let addr = addr_rx.await.context("receiver failed to bind")?;
+    let addr = bound_address(addr_rx, &mut receiver).await?;
     println!(
         "receiving one transfer into {} (listening on {addr})",
         out.display()

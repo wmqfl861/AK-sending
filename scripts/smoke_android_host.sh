@@ -369,7 +369,8 @@ if [ "$REVERSE" -eq 1 ]; then
   adb_cmd -s "$SERIAL" shell rm -rf "$REV_IDDIR" "$REV_OUT" >/dev/null 2>&1 || true
   # A previous run's android receiver can OUTLIVE its adb client (killing
   # adb.exe on the host does not stop the device-side process), and it
-  # would keep UDP $PORT bound -> "receiver failed to bind". Kill any
+  # would keep UDP $PORT bound -> "receiver failed to start" (address in
+  # use). Kill any
   # stale receiver carrying this smoke's fixed id-dir before rebinding.
   if adb_cmd -s "$SERIAL" shell pkill -f "ak-cli --id-dir $REV_IDDIR" >/dev/null 2>&1; then
     sleep 1

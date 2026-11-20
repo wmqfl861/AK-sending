@@ -1892,12 +1892,12 @@ pub(crate) async fn daemon_core(
         // identity arrives only with the Offer, after `Connected`.
         let printer = daemon_progress_printer(out.json_lines, start_slot.clone(), None);
         let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
-        let receiver =
+        let mut receiver =
             tokio::spawn(
                 async move { ak_engine::receive_with_addr(spec, &*printer, addr_tx).await },
             );
         if first {
-            let addr = addr_rx.await.context("receiver failed to bind")?;
+            let addr = crate::bound_address(addr_rx, &mut receiver).await?;
             out.event(&DaemonEvent::Listening {
                 addr: &addr.to_string(),
                 port: addr.port(),

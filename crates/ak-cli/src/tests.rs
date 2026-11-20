@@ -3168,3 +3168,28 @@ fn expect_accepts_the_explicit_book_word() {
     let upper = ExpectPolicy::parse("BOOK", &book_path).expect("BOOK parses");
     assert!(matches!(upper, ExpectPolicy::Book(_)));
 }
+
+/// Batch S review: a receive that fails before it binds — here because the
+/// output directory does not exist — reports the engine's own error, not
+/// the closed address channel ("receiver failed to bind: channel closed"
+/// hid the cause in S1).
+#[tokio::test]
+async fn a_receive_failing_before_it_binds_reports_its_own_error() {
+    let tmp = TempDir::new("bind-error");
+    let missing = tmp.path().join("no-such-dir");
+    let bundle = ak_identity::tls::make_self_signed(&DeviceKeyPair::generate());
+    let mut spec = ReceiveSpec::new(missing, bundle);
+    spec.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let mut receiver = tokio::spawn(async move {
+        let quiet = |_: Progress| {};
+        ak_engine::receive_with_addr(spec, &quiet, addr_tx).await
+    });
+    let error = bound_address(addr_rx, &mut receiver)
+        .await
+        .expect_err("no output directory, so no bound address");
+    let text = format!("{error:#}");
+    assert!(text.contains("receiver failed to start"), "{text}");
+    assert!(text.contains("not found"), "{text}");
+    assert!(!text.contains("channel closed"), "{text}");
+}

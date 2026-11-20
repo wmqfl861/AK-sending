@@ -141,3 +141,22 @@ bash scripts/cross_nat_test.sh --self-test
 | S 全量门槛 | 本地 Windows（rustc 1.99.1） | fmt/clippy/rustdoc/workspace（69 组，1223/0/10）/sqlite（54/0）/server-persistence（221/0）/Python（372 OK）/repo/contracts（5/5 PASS）/部署自检（PASS）/跨NAT自检（PASS）全部通过；`check_repository.py` 在回填本表提交号后通过（回填前只报状态表提交列占位） |
 | S1 复测尝试与复核方的并行改动 | 复核方在本批执行期间直接向 `dev/batch-s-20261120` 推送了 S-N1 至 S-N4（源文件复核期间的活动信号与 StorageFull、混合版本回环检查、S1 缺陷的修复、接收端绑定前错误透出） | 执行方按 S1 的修复（f5ae8f6）尝试在模拟器上复测：交叉编译 `x86_64-linux-android` 失败，`ak-storage` 报 4 个 E0277（`&Path: Arg`、`io::Error: From<Errno>` 不满足）——rustix 声明缺 `std` feature；本机临时加 `std` 后 `cargo check --target x86_64-linux-android` 通过（改动已还原，未提交）。复核方随后推了 `21ba370`（同款修复），其前一次运行 44739416350 按并发规则被取消。按 f5ae8f6 提交信息，Android 路径的复测属批次 T；本表 S1 各行都是 db51363 代码上的记录 |
 | S 批次最终 CI | `1b57ec2` run [44737651024](https://github.com/wmqfl861/AK-sending/actions/runs/44737651024) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
+
+## 9. 复核方证据（2026-11-20）
+
+复核方在云端 Linux 工作区（2 vCPU，rustc 1.97.0，钉的 1.99.1 下载不到）执行；Windows 上的结果只来自 CI，Android 上的结果来自 §8。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 分支活动 | GitHub activity API | 11:26:33Z 删除 `dev/batch-r-20261120`（`db51363`）；12:39:46Z 一次推送创建 `dev/batch-s-20261120` @ `1b57ec2`（含 `87d6b00`、`1b57ec2`）；12:52Z 复核方推送到 `e0bbd88`（`3677fa1`、`1c50dd8`、`f5ae8f6`、`1580675`、`e0bbd88`），12:56Z 推送 `21ba370`；13:10Z 执行方在其上推送 `0aba436`（补记 CI）与 `8238659`（复测尝试）；之后复核方推送最终文档提交。全部是快进的普通推送，没有强推。执行方第一次回复“完成并已推送”是 11:20Z（本地 19:20），早于这两次远端操作（S-N5） |
+| 执行方推送的 CI | `1b57ec2` run [44737651024](https://github.com/wmqfl861/AK-sending/actions/runs/44737651024) | success：12 项常规任务 success，2 项手动深测 skipped（§8 最后一行据此补记） |
+| 复核方推送的 CI（失败） | `e0bbd88` run [44739416350](https://github.com/wmqfl861/AK-sending/actions/runs/44739416350) | failure：Portability check (x86_64-unknown-linux-gnu)、NAT matrix、Flutter gate、Android FFI + debug APK 四项在编译 ak-storage 时失败（``the trait bound `&std::path::Path: Arg` is not satisfied``、``the trait bound `std::io::Error: From<Errno>` is not satisfied``）。原因：`f5ae8f6` 只打开了 rustix 的 `fs` 特性，`std` 特性靠 tempfile（开发依赖）带进来，测试构建因此通过，不带开发依赖的构建都失败；复核方本地第一次门槛的 test 与 doc 两步也因此失败。其余任务在 `21ba370` 推送时被取消（§8 的复测一行只写了“被取消”，不完整） |
+| 复核方推送的 CI | `21ba370` run [44739971499](https://github.com/wmqfl861/AK-sending/actions/runs/44739971499) | success：12 项常规任务 success，2 项手动深测 skipped。Windows 与 Ubuntu 两个 Rust 任务的工作区测试都是 69 组 1231 passed / 0 failed / 11 ignored；Android FFI 任务把 ak-storage 编译到了 Android 目标（新提交路径能编译） |
+| 执行方之后推送的 CI | `8238659` run [44741936351](https://github.com/wmqfl861/AK-sending/actions/runs/44741936351) | success：12 项常规任务 success，2 项手动深测 skipped（代码与 `21ba370` 相同） |
+| 最终文档提交的 CI | — | 本文随该提交入库，运行编号由执行方在 T0 回填 |
+| 本地全部门槛 | `21ba370` 加本次文档 | 全部通过（672s）：fmt、clippy、workspace 69 组 1231 passed / 0 failed / 11 ignored、rustdoc、ak-store sqlite 52 passed、ak-signal server-persistence 221 passed、Python 372 OK、check_repository、check_contracts、部署自检、跨 NAT 自检 |
+| S-N1/S-N2 的新测试 | ak-engine 单元测试 | 6 项通过（单流与多流的慢源文件复核、信号只发给协商了的接收端、接收端对信号的取舍、单流与多流的块阶段写满）。去掉发送端信号与两处写满上报后 5 项失败：两项慢复核报 `IdleTimeout(800ms)`，信号计数为 0，单流写满时发送端报 `Stream(Connection("connection lost"))`，多流报 `Stream(Connection("sending stopped by peer: error 0"))`；去掉接收端对信号的接受后 2 项失败（`unexpected frame: Control { … control: Resume }`） |
+| S-N2 真实写满 | Linux 云端工作区，48 MiB tmpfs，两个各 32 MiB 的任务同时写入，debug 构建，同机回环 | 旧构建 `db51363`：两个发送端都报 `stream failed: connection lost`，两个接收端 `No space left on device (os error 28)`。新构建、加“安静即结束”之前：两个发送端都报 `对端返回错误 STORAGE_FULL（receiver ran out of disk space during the transfer）`，用时 10.3s（命令行发送端退出时没有发关闭帧，接收端等满上限）。之后的构建共 7 次，每次两个发送端都报 STORAGE_FULL，用时 0.99、5.94、5.78、5.96、5.89、5.91、5.90s（最后两次是 `21ba370` 的构建）。这是同机测试，不是真机验证 |
+| 新旧版本互通 | `scripts/mixed_version_check.sh`，`db51363` 与 `21ba370` 的 debug 构建 | `RESULT: PASS (8/8 runs)`：new→new、new→old、old→new、old→old，单流与多流各一次，接收树逐字节一致（job 760f8009）。此前用加 S-N3 之前的构建跑过一次，同样 8/8 |
+| S-N3 的依据与测试 | Android SELinux 策略、ak-storage 单元测试 | [app_neverallows.te（android-16.0.0_r4）](https://android.googlesource.com/platform/system/sepolicy/+/refs/tags/android-16.0.0_r4/private/app_neverallows.te)：`neverallow all_untrusted_apps file_type:file link;`，覆盖 untrusted_app 与 untrusted_app_25/27/29/30 等全部普通应用域。ak-storage 58 项通过，其中新增 `rename_noreplace_never_replaces` 与 `refused_hard_link_falls_back_to_a_checked_rename`。本工作区装不了 Android 目标（rustup 下载被拒），Android 上的行为由 T1、T2 在模拟器上确认 |
+| S-N4 | ak-cli 单元测试 | `a_receive_failing_before_it_binds_reports_its_own_error` 通过。改之前，复核方的写满脚本第一次运行时就遇到同一报错（`receiver failed to bind / Caused by: channel closed`，原因是接收目录不存在） |

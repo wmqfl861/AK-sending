@@ -19,10 +19,12 @@ thiserror = { workspace = true }
 # getrlimit/setrlimit wrappers behind `raise_nofile_soft_limit_to_hard`,
 # which the CLI and FFI call at startup. Already present in Cargo.lock
 # transitively; default features off. `fs` (batch S review, S-N3) adds the
-# safe `renameat2(RENAME_NOREPLACE)` wrapper the Linux/Android commit uses
-# (tempfile already enables the same feature).
+# safe `renameat2(RENAME_NOREPLACE)` wrapper the Linux/Android commit uses,
+# and `std` its `&Path` arguments and `io::Error` conversion. tempfile
+# already enables both, but only test builds see tempfile, so they are
+# named here; no new crate either way.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process", "fs"] }
+rustix = { version = "1", default-features = false, features = ["process", "fs", "std"] }
 
 # M-N1 part-file identity on Windows (review 2026-11-18): the safe
 # `GetFileInformationByHandle` wrapper (volume serial + file index), so

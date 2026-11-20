@@ -63,7 +63,22 @@
 //!   (review 2026-11-19). In the verify phase every file's pass runs
 //!   there, up to `VERIFY_PARALLEL_FILES` at a time (batch Q review,
 //!   2026-11-20); after a failure no further pass starts and the running
-//!   ones are waited for before the receive returns.
+//!   ones are waited for before the receive returns;
+//! - sender liveness (batch S review, 2026-11-20): the sender's final
+//!   source check — one stat per source file, right before Finalize — runs
+//!   on the blocking pool, and when both Hellos carry
+//!   [`ak_wire::CAP_SENDER_KEEPALIVE`] the sender sends a no-op
+//!   `Control::Resume` at the same cadence meanwhile, which the receiver
+//!   accepts and ignores until Finalize. Either end without the bit keeps
+//!   the frozen behavior (no signal, and the frame stays unexpected);
+//! - storage full mid-transfer (batch S review): when a chunk write fails
+//!   because the destination is out of space or quota, the receiver first
+//!   sends `Error{StorageFull}` where the sender reads its acks (the ack
+//!   stream, or in multistream mode the failing file's stream) and holds
+//!   the connection briefly so the sender can read it; the sender reports
+//!   [`EngineError::PeerError`] with that code instead of a lost
+//!   connection. Wire format unchanged; every engine version already maps
+//!   the frame.
 //!
 //! Concurrent receive (round 6, no wire-format change):
 //! [`serve_concurrently`] binds once and serves several senders — one
@@ -161,8 +176,9 @@ use ak_net::{DirectChannel, DirectEndpoint, DirectRecvStream, DirectSendStream, 
 use ak_storage::{LocalSaveTarget, LocalSource};
 use ak_store::{CheckpointStore, Direction, FileCheckpoint, FileCheckpointStore, TaskRecord};
 use ak_wire::{
-    scheduler_frames_allowed, AdmissionReason, Control, Frame, JobId, Limits, Message, ResumeEntry,
-    WireEntry, CAP_MULTISTREAM, CAP_PAUSE_RESUME, CAP_RESUME, CAP_SCHEDULER, DIRECTION_SEND,
+    scheduler_frames_allowed, sender_keepalive_allowed, AdmissionReason, Control, Frame, JobId,
+    Limits, Message, ResumeEntry, WireEntry, CAP_MULTISTREAM, CAP_PAUSE_RESUME, CAP_RESUME,
+    CAP_SCHEDULER, CAP_SENDER_KEEPALIVE, DIRECTION_SEND,
 };
 
 /// Manifest pages are assembled under this byte budget so every page fits a
@@ -282,15 +298,17 @@ const OFFLOAD_WHOLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// multi-gigabyte pass competes for the disk.
 const VERIFY_PARALLEL_FILES: usize = 8;
 
-/// Liveness cadence of one receive: a quarter of the receiver's own idle
-/// budget (the sender normally runs the same default), never more than
-/// [`LIVENESS_MAX_INTERVAL`].
+/// Liveness cadence of one transfer end: a quarter of this end's own idle
+/// budget (the peer normally runs the same default), never more than
+/// [`LIVENESS_MAX_INTERVAL`]. The receiver signals at this cadence while
+/// it prepares and verifies, the sender while it re-checks its sources.
 fn liveness_interval(idle: Duration) -> Duration {
     (idle / 4).min(LIVENESS_MAX_INTERVAL)
 }
 
-/// Run one long, blocking whole-file pass on the blocking pool and send
-/// `keepalive` every `every` until it finishes (review 2026-11-19).
+/// Run one long, blocking pass (a whole-file pass, or the sender's source
+/// check) on the blocking pool and send `keepalive` every `every` until it
+/// finishes (review 2026-11-19).
 ///
 /// One file's pass — hashing a multi-gigabyte file, flushing it — cannot
 /// be split at file boundaries, so the between-file cadence of the
@@ -309,8 +327,10 @@ fn liveness_interval(idle: Duration) -> Duration {
 /// caller's next regular frame reports the broken connection and runs the
 /// usual cleanup (so a sink prepared meanwhile is not leaked as litter).
 ///
-/// The prepare loop uses it; the verify phase runs its passes, several at
-/// a time, through its own loop with the same signalling
+/// The receiver's prepare loop uses it, and so does the sender's final
+/// source check (batch S review: one stat per source file, so it grows
+/// with the file count); the verify phase runs its passes, several at a
+/// time, through its own loop with the same signalling
 /// ([`VERIFY_PARALLEL_FILES`]).
 async fn offload_with_liveness<T: Send + 'static>(
     tx: &mut DirectSendStream,
@@ -326,7 +346,7 @@ async fn offload_with_liveness<T: Send + 'static>(
             joined = &mut work => {
                 return joined.map_err(|join| {
                     EngineError::Io(std::io::Error::other(format!(
-                        "whole-file pass did not complete: {join}"
+                        "blocking pass did not complete: {join}"
                     )))
                 });
             }
@@ -1251,8 +1271,14 @@ fn hello_frame(name: &str, identity: &TlsBundle, capabilities: u16) -> Frame {
 }
 
 /// Capabilities this receiver advertises: it can always resume, honor
-/// Pause/Resume, and accept per-file parallel streams.
-const RECV_CAPABILITIES: u16 = CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM;
+/// Pause/Resume, accept per-file parallel streams, and take the sender's
+/// liveness signal before Finalize.
+const RECV_CAPABILITIES: u16 =
+    CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM | CAP_SENDER_KEEPALIVE;
+
+/// Capabilities every engine sender advertises; multistream and scheduled
+/// admission are added per job.
+const SEND_CAPABILITIES: u16 = CAP_RESUME | CAP_PAUSE_RESUME | CAP_SENDER_KEEPALIVE;
 
 async fn expect_hello(
     rx: &mut DirectRecvStream,
@@ -2141,8 +2167,14 @@ impl SourceSet {
         source.read_chunk(local_index, chunk_index, buf)
     }
 
-    /// Re-check every root against its manifest.
+    /// Re-check every root against its manifest. One stat per file, so it
+    /// grows with the file count; the sender runs it on the blocking pool
+    /// with the liveness signal going (see [`CAP_SENDER_KEEPALIVE`]).
     fn verify_stable(&self) -> Result<(), EngineError> {
+        #[cfg(test)]
+        if let Some(delay) = seams::source_check_delay(&self.names) {
+            std::thread::sleep(delay);
+        }
         for source in &self.sources {
             source
                 .verify_stable()
@@ -2841,7 +2873,7 @@ async fn send_channel_body(
     let stream = channel.open_bi().await?;
     let (mut tx, mut rx) = stream.split();
 
-    let mut capabilities = CAP_RESUME | CAP_PAUSE_RESUME;
+    let mut capabilities = SEND_CAPABILITIES;
     if spec.multistream {
         capabilities |= CAP_MULTISTREAM;
     }
@@ -2872,6 +2904,7 @@ async fn send_channel_body(
         admission_handshake_sender(&mut tx, &mut rx, &limits, spec.idle_timeout, ctx).await?;
     }
     let multistream = spec.multistream && (peer_caps & CAP_MULTISTREAM) != 0;
+    let sender_keepalive = sender_keepalive_allowed(capabilities, peer_caps);
 
     // Offer -> Accept/Reject (receiver consent is mandatory).
     tx.send_frame(&Frame {
@@ -3091,8 +3124,30 @@ async fn send_channel_body(
         .await?;
     }
 
-    // Final integrity gate on the sources, then Finalize.
-    sources.verify_stable()?;
+    // Final integrity gate on the sources, then Finalize. The check stats
+    // every source file, so on a job with hundreds of thousands of files
+    // it alone can outlast the receiver's per-frame idle budget while the
+    // receiver waits for Finalize (BACKLOG P3-02, batch S review). It runs
+    // on the blocking pool; a receiver that negotiated
+    // CAP_SENDER_KEEPALIVE gets a no-op Control::Resume every liveness
+    // interval meanwhile, any other receiver sees the frozen silence.
+    let keepalive = sender_keepalive.then_some(Frame {
+        version: ak_wire::VERSION,
+        message: Message::Control {
+            job_id,
+            control: Control::Resume,
+        },
+    });
+    let mut last_signal = Instant::now();
+    let checked = Arc::clone(&sources);
+    offload_with_liveness(
+        &mut tx,
+        keepalive.as_ref(),
+        liveness_interval(spec.idle_timeout),
+        &mut last_signal,
+        move || checked.verify_stable(),
+    )
+    .await??;
     tx.send_frame(&Frame {
         version: ak_wire::VERSION,
         message: Message::Finalize { job_id },
@@ -3854,6 +3909,9 @@ async fn receive_frozen_body(
 ) -> Result<Report, EngineError> {
     let limits = engine_limits();
     let multistream = (peer_caps & CAP_MULTISTREAM) != 0;
+    // Every receiver Hello carries the bit (RECV_CAPABILITIES), so the
+    // sender's announcement decides.
+    let sender_keepalive = sender_keepalive_allowed(RECV_CAPABILITIES, peer_caps);
 
     // Offer -> consent -> Accept. Channel-level consent already happened via
     // the authorize callback; the offer is accepted per current product copy.
@@ -3892,6 +3950,8 @@ async fn receive_frozen_body(
             }
             Err(other) => return Err(other),
         };
+    #[cfg(test)]
+    seams::arm_receive(&root_name, job_id);
     // P1-1 defense in depth (review round 17): validate the offered chunk
     // size against the engine's own limits BEFORE consenting. The wire
     // decoder's budget covers frame bytes (and may itself refuse the
@@ -4299,6 +4359,7 @@ async fn receive_frozen_body(
                 &mut record,
                 store,
                 spec.idle_timeout,
+                sender_keepalive,
                 progress,
             )
             .await
@@ -4324,6 +4385,7 @@ async fn receive_frozen_body(
                     &mut record,
                     store,
                     spec.idle_timeout,
+                    sender_keepalive,
                     progress,
                 )
                 .await?,
@@ -4777,6 +4839,139 @@ enum TailHold {
     Events(tokio::sync::mpsc::Receiver<StreamEvent>),
 }
 
+/// Text of the mid-transfer storage-full Error frame (fixed: it reaches the
+/// peer, so it carries no local path or size).
+const STORAGE_FULL_MESSAGE: &str = "receiver ran out of disk space during the transfer";
+
+/// Upper bound on how long a receive whose disk filled up mid-transfer
+/// holds the connection after telling the sender (batch S review; also
+/// capped by the idle budget). Meanwhile it keeps reading and dropping
+/// the sender's in-flight frames, so a sender blocked by flow control gets
+/// to its next ack read and finds the Error frame. The hold ends earlier
+/// when the sender closes, or goes quiet for one liveness interval: a
+/// sender stops sending once it has read the frame, and a sender process
+/// that exits right away may never send a close.
+const STORAGE_FULL_DRAIN_WAIT: Duration = Duration::from_secs(10);
+
+/// How long one storage-full drain read may wait: one liveness interval.
+/// A sender that has read the Error frame stops sending, and a sender
+/// process that exits right away may never send a close, so silence for
+/// this long ends the hold too (see [`STORAGE_FULL_DRAIN_WAIT`]).
+fn storage_full_quiet(idle: Duration) -> Duration {
+    liveness_interval(idle)
+}
+
+/// Whether a receive failure is the destination running out of space (or
+/// out of quota): the case the receiver reports to the sender as
+/// `Error{StorageFull}` during the chunk phase.
+fn is_storage_full(error: &EngineError) -> bool {
+    match error {
+        EngineError::Io(error) | EngineError::Checkpoint(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        ),
+        _ => false,
+    }
+}
+
+fn storage_full_frame() -> Frame {
+    Frame {
+        version: ak_wire::VERSION,
+        message: Message::Error {
+            code: ErrorCode::StorageFull,
+            message: STORAGE_FULL_MESSAGE.into(),
+        },
+    }
+}
+
+/// Store one received chunk in its part file. Under the unit tests a seam
+/// can make it fail the way a full disk does (see `seams`).
+fn write_chunk_into(
+    sink: &mut ak_storage::LocalFileSink,
+    job_id: &JobId,
+    chunk_index: u64,
+    data: &[u8],
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    seams::chunk_write(job_id)?;
+    #[cfg(not(test))]
+    let _ = job_id;
+    sink.write_chunk(chunk_index, data)
+}
+
+/// Single-stream chunk phase failing on a local error (batch S review,
+/// BACKLOG P3-02): when the disk filled up, tell the sender with an
+/// `Error{StorageFull}` frame on the ack stream — the sender reads that
+/// stream for its acks, and every engine version maps the frame to
+/// `PeerError` — then hold the connection, reading and dropping the
+/// sender's in-flight frames, until the sender closes, goes quiet
+/// ([`storage_full_quiet`]) or the bound passes ([`STORAGE_FULL_DRAIN_WAIT`]).
+/// Any other error is returned at once, as before. Returns `error`
+/// unchanged either way.
+async fn tell_storage_full_single(
+    error: EngineError,
+    tx: &mut DirectSendStream,
+    rx: &mut DirectRecvStream,
+    idle: Duration,
+) -> EngineError {
+    if is_storage_full(&error) && tx.send_frame(&storage_full_frame()).await.is_ok() {
+        let _ = tx.finish();
+        let limits = engine_limits();
+        let quiet = storage_full_quiet(idle);
+        // Quinn reads are not cancel-safe; the stream is never read again,
+        // so a frame cut off by the quiet timer is moot.
+        let _ = tokio::time::timeout(STORAGE_FULL_DRAIN_WAIT.min(idle), async {
+            while let Ok(Ok(_)) = tokio::time::timeout(quiet, rx.recv_frame(&limits)).await {}
+        })
+        .await;
+    }
+    error
+}
+
+/// Multistream counterpart of [`tell_storage_full_single`], run by the
+/// failing file's stream task: the frame goes on that file's own stream,
+/// where the sender's task for the file reads its acks. The failure goes
+/// to the driver at once ([`StreamEvent::DiskFull`]), so nothing the
+/// sender's reaction sets off can be taken for the cause; the driver then
+/// waits for this task's drain to end before it returns and the
+/// connection closes. Draining keeps the sender's writes on this stream
+/// from sticking on flow control before it reads the frame.
+async fn tell_storage_full_on_stream(
+    stream: &mut DirectStream,
+    error: EngineError,
+    idle: Duration,
+    events: &tokio::sync::mpsc::Sender<StreamEvent>,
+) {
+    let told = stream.send_frame(&storage_full_frame()).await.is_ok();
+    let _ = stream.finish_send();
+    let (drained_tx, drained) = tokio::sync::oneshot::channel();
+    let _ = events.send(StreamEvent::DiskFull { error, drained }).await;
+    if told {
+        let limits = engine_limits();
+        let quiet = storage_full_quiet(idle);
+        // Same cancel-safety note as in tell_storage_full_single.
+        let _ = tokio::time::timeout(STORAGE_FULL_DRAIN_WAIT.min(idle), async {
+            while let Ok(Ok(_)) = tokio::time::timeout(quiet, stream.recv_frame(&limits)).await {}
+        })
+        .await;
+    }
+    drop(drained_tx);
+}
+
+/// A full disk already reported in the driver's event channel (see the
+/// accept branch of [`multistream_receive`]); other pending events are
+/// dropped, the receive is ending anyway.
+fn pending_storage_full(
+    events: &mut tokio::sync::mpsc::Receiver<StreamEvent>,
+) -> Option<EngineError> {
+    while let Ok(event) = events.try_recv() {
+        if let StreamEvent::DiskFull { error, .. } = event {
+            return Some(error);
+        }
+    }
+    None
+}
+
 /// Frozen v1 chunk loop: one stream, chunks one way, windowed acks the
 /// other way. Returns the receive half so the caller can hold the
 /// connection for the FinalAck.
@@ -4791,6 +4986,7 @@ async fn receive_single_stream(
     record: &mut TaskRecord,
     store: &FileCheckpointStore,
     idle: Duration,
+    sender_keepalive: bool,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<DirectRecvStream, EngineError> {
     let limits = engine_limits();
@@ -4818,8 +5014,15 @@ async fn receive_single_stream(
                     .get_mut(file_index as usize)
                     .and_then(Option::as_mut)
                     .ok_or(EngineError::PeerClosed)?;
-                sink.write_chunk(chunk_index, &data)
-                    .map_err(EngineError::Io)?;
+                if let Err(error) = write_chunk_into(sink, &job_id, chunk_index, &data) {
+                    return Err(tell_storage_full_single(
+                        EngineError::Io(error),
+                        tx,
+                        &mut rx,
+                        idle,
+                    )
+                    .await);
+                }
                 if let Some(slot) = record.files.get_mut(file_index as usize) {
                     slot.verified_prefix_chunks = sink.verified_prefix_chunks();
                 }
@@ -4853,7 +5056,15 @@ async fn receive_single_stream(
                 let tick = cadence.on_ack(Instant::now());
                 if tick.save {
                     record.updated_unix_ms = now_ms();
-                    store.save(record).map_err(EngineError::Checkpoint)?;
+                    if let Err(error) = store.save(record) {
+                        return Err(tell_storage_full_single(
+                            EngineError::Checkpoint(error),
+                            tx,
+                            &mut rx,
+                            idle,
+                        )
+                        .await);
+                    }
                 }
                 if tick.progress {
                     if let Some(entry) = manifest.entries.get(file_index as usize) {
@@ -4884,6 +5095,17 @@ async fn receive_single_stream(
                     return Err(protocol_error("control frame names a different job"));
                 }
                 return Err(EngineError::Cancelled);
+            }
+            // The sender's liveness signal (both Hellos carried
+            // CAP_SENDER_KEEPALIVE): a no-op whose arrival already restarted
+            // this loop's idle wait. Without the bit it stays unexpected.
+            Message::Control {
+                job_id: control_job,
+                control: Control::Resume,
+            } if sender_keepalive => {
+                if control_job != job_id {
+                    return Err(protocol_error("control frame names a different job"));
+                }
             }
             Message::Error { code, message } => {
                 return Err(EngineError::PeerError { code, message })
@@ -4919,6 +5141,17 @@ enum StreamEvent {
     /// Finalize observed on the control stream.
     Finalize,
     Cancelled,
+    /// The sender's liveness signal on the control stream
+    /// (`CAP_SENDER_KEEPALIVE`): nothing to process, but like every event
+    /// it refreshes the driver's idle budget.
+    KeepAlive,
+    /// A stream task's chunk write found the disk full and the task told
+    /// the sender (see [`tell_storage_full_on_stream`]); `drained` resolves
+    /// when the task stops draining that stream.
+    DiskFull {
+        error: EngineError,
+        drained: tokio::sync::oneshot::Receiver<()>,
+    },
 }
 
 /// Abort handles of a multistream receive's helper tasks (control reader,
@@ -4974,6 +5207,7 @@ async fn multistream_receive(
     record: &mut TaskRecord,
     store: &FileCheckpointStore,
     idle: Duration,
+    sender_keepalive: bool,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, EngineError> {
     let limits = engine_limits();
@@ -5067,6 +5301,25 @@ async fn multistream_receive(
                             }
                             let _ = control_tx.send(StreamEvent::Cancelled).await;
                             break;
+                        }
+                        // The sender's liveness signal (CAP_SENDER_KEEPALIVE in
+                        // both Hellos) while it re-checks its sources: every
+                        // data stream is finished by then, so pass the
+                        // activity on to the driver, whose own idle budget
+                        // nothing else refreshes. A pulse dropped because the
+                        // channel is full is covered by the pending events.
+                        Message::Control { job_id: control_job, control: Control::Resume }
+                            if sender_keepalive && !finalized =>
+                        {
+                            if control_job != job_id {
+                                let _ = control_tx
+                                    .send(StreamEvent::Failed(protocol_error(
+                                        "control frame names a different job",
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            let _ = control_tx.try_send(StreamEvent::KeepAlive);
                         }
                         Message::Error { code, message } => {
                             let _ = control_tx
@@ -5218,14 +5471,30 @@ async fn multistream_receive(
                         ));
                     }
                     StreamEvent::Failed(error) => return Err(error),
+                    // The sender was just told on the failing file's stream:
+                    // keep the connection (and that stream's task) until the
+                    // task's drain ends, then fail with the local error.
+                    StreamEvent::DiskFull { error, drained } => {
+                        let _ =
+                            tokio::time::timeout(STORAGE_FULL_DRAIN_WAIT.min(idle), drained).await;
+                        return Err(error);
+                    }
                     StreamEvent::Finalize => finalized = true,
                     StreamEvent::Cancelled => return Err(EngineError::Cancelled),
+                    // The idle budget was refreshed above; nothing else.
+                    StreamEvent::KeepAlive => {}
                 }
             }
             accepted = tokio::time::timeout(budget, channel.accept_bi()), if !finalized => {
                 match accepted {
                     Err(_elapsed) => return Err(EngineError::IdleTimeout(idle)),
-                    Ok(Err(e)) => return Err(EngineError::Stream(e)),
+                    // The sender closing after a full disk was told races
+                    // the stream task's report through the event channel:
+                    // the full disk is the real cause.
+                    Ok(Err(e)) => {
+                        return Err(pending_storage_full(&mut events_rx)
+                            .unwrap_or(EngineError::Stream(e)))
+                    }
                     Ok(Ok(stream)) => {
                         last_activity = Instant::now();
                         let _ = activity_tx.try_send(());
@@ -5321,8 +5590,14 @@ fn receive_stream_task(
                     if frame_file_index != file_index {
                         break Err(protocol_error("chunk arrives on a different file's stream"));
                     }
-                    if let Err(e) = sink.write_chunk(chunk_index, &data) {
-                        break Err(EngineError::Io(e));
+                    if let Err(e) = write_chunk_into(&mut sink, &job_id, chunk_index, &data) {
+                        let error = EngineError::Io(e);
+                        if is_storage_full(&error) {
+                            // Reports the failure itself (see there).
+                            tell_storage_full_on_stream(&mut stream, error, idle, &events).await;
+                            return;
+                        }
+                        break Err(error);
                     }
                     // Durability contract (see module docs): the ack
                     // confirms a verified digest in the part file's page
@@ -5385,6 +5660,76 @@ pub async fn receive(
 ) -> Result<Report, EngineError> {
     let (_tx, _rx) = tokio::sync::oneshot::channel::<SocketAddr>();
     receive_with_addr(spec, progress, _tx).await
+}
+
+/// Unit-test seams for two conditions a test cannot produce cheaply: a
+/// final source check longer than the peer's idle budget (it would take
+/// hundreds of thousands of files) and a disk that fills up mid-transfer.
+/// Compiled into the unit tests only. Every entry is keyed by the job's
+/// root name — a test's own temporary directory name — so tests running
+/// in parallel never see each other's entries.
+#[cfg(test)]
+mod seams {
+    use super::JobId;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static SLOW_SOURCE_CHECK: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+    static FULL_AFTER_WRITES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+    /// Receives armed from `FULL_AFTER_WRITES` (by job id): chunk writes
+    /// left before the simulated full disk.
+    static ARMED: Mutex<Vec<(JobId, u64)>> = Mutex::new(Vec::new());
+
+    /// Make the final source check of sends rooted at `root_name` take
+    /// `delay` longer.
+    pub(crate) fn slow_source_check(root_name: &str, delay: Duration) {
+        SLOW_SOURCE_CHECK
+            .lock()
+            .unwrap()
+            .push((root_name.to_owned(), delay));
+    }
+
+    pub(super) fn source_check_delay(names: &[String]) -> Option<Duration> {
+        SLOW_SOURCE_CHECK
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| names.contains(name))
+            .map(|(_, delay)| *delay)
+    }
+
+    /// Let receives of jobs rooted at `root_name` store `writes` chunks,
+    /// then fail every further chunk write as a full disk does.
+    pub(crate) fn fill_disk_after(root_name: &str, writes: u64) {
+        FULL_AFTER_WRITES
+            .lock()
+            .unwrap()
+            .push((root_name.to_owned(), writes));
+    }
+
+    pub(super) fn arm_receive(root_name: &str, job_id: JobId) {
+        let writes = FULL_AFTER_WRITES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == root_name)
+            .map(|(_, writes)| *writes);
+        if let Some(writes) = writes {
+            ARMED.lock().unwrap().push((job_id, writes));
+        }
+    }
+
+    pub(super) fn chunk_write(job_id: &JobId) -> std::io::Result<()> {
+        let mut armed = ARMED.lock().unwrap();
+        match armed.iter_mut().find(|(armed_job, _)| armed_job == job_id) {
+            Some((_, 0)) => Err(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            Some((_, left)) => {
+                *left -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

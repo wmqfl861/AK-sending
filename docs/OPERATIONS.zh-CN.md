@@ -58,7 +58,7 @@ WantedBy=multi-user.target
 ### 1. 版本可观测性（本轮已落地的代码部分）
 
 - **构建期注入**：`crates/ak-cli/build.rs` 在编译时把源码修订号写进二进制——`git rev-parse --short HEAD`，工作树相对 HEAD 有已跟踪改动（含暂存）加 `-dirty` 后缀；环境变量 `AK_GIT_SHA` 非空则原样优先（CI 无 git 也可注入）；git 不可用/无 `.git`（源码导出）回退 `unknown`，绝不因取不到版本而构建失败。重打包提示：若发布产物显示 `git unknown`，说明构建机没有 git 或不在仓库内，按 `AK_GIT_SHA=<commit>` 显式注入重建。
-- **CLI 查询**：`ak-cli --version`（长格式）输出 `ak-cli 0.1.0 (wire v1, caps 0x0007 [resume|pause-resume|multistream], release build, git <sha>[-dirty])`；顶层与**所有子命令**同答（`ak-cli registry-server --version`、`ak-cli signal-server --version`……），`-V` 短格式仍是裸版本号。格式化函数按注入 sha 纯函数化并有单测（`crates/ak-cli/src/main.rs` 的 `version_line_with`）。
+- **CLI 查询**：`ak-cli --version`（长格式）输出 `ak-cli 0.1.0 (wire v1, caps 0x0017 [resume|pause-resume|multistream|sender-keepalive], release build, git <sha>[-dirty])`；顶层与**所有子命令**同答（`ak-cli registry-server --version`、`ak-cli signal-server --version`……），`-V` 短格式仍是裸版本号。格式化函数按注入 sha 纯函数化并有单测（`crates/ak-cli/src/main.rs` 的 `version_line_with`）。
 - **服务器启动日志**：`ak-cli registry-server` 启动即初始化 env_logger（默认 Info，`RUST_LOG` 环境变量可覆盖）并打出一行版本日志 `registry-server version: <同上载荷>`；engine 原有的 `v2 registry server listening on tls … (registry …)` 行随之可见（此前 CLI 从未初始化 logger，这行在线上一直不可见）。systemd 默认 stdout/stderr 进 journal，见 §3 验证步骤。
 - **核实线上版本的操作**（所有者执行）：`/opt/ak-sending/ak-cli registry-server --version`（路径未核实，以现网为准）；或 `journalctl -u <unit> | grep 'registry-server version:'`。把输出（含 git sha）记录进部署工单，与预期提交对齐即完成"线上=某个提交"的核实。
 - **客户端远程查询**：当前**不可行**——v2 `Welcome` 帧不带版本，详见 §7 设计提案（未实施）。

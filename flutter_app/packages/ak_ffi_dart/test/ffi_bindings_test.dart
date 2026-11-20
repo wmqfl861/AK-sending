@@ -47,7 +47,7 @@ void main() {
   _declareTests();
 }
 
-const _versionString = 'ak-ffi 1 (wire v1, caps 0x0007)';
+const _versionString = 'ak-ffi 1 (wire v1, caps 0x0017)';
 
 /// RFC 8032 test 1 seed; fp = blake3(d75a9801..511a)[0..32].
 const _seed1Hex = '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60';

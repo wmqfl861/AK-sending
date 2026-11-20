@@ -251,6 +251,10 @@ pub struct TransferOpts {
     /// of `try_run_transfer_opts` / `try_run_transfer_parties` decides; when
     /// that is 0 as well, the specs keep the engine default (1 MiB).
     pub chunk_size: Option<NonZeroU32>,
+    /// Idle budget for BOTH endpoints (`SendSpec::idle_timeout` and
+    /// `ReceiveSpec::idle_timeout`); `None` (the default) keeps the engine
+    /// default.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for TransferOpts {
@@ -261,6 +265,7 @@ impl Default for TransferOpts {
             multistream: false,
             in_flight_window: 8,
             chunk_size: None,
+            idle_timeout: None,
         }
     }
 }
@@ -353,6 +358,9 @@ pub async fn try_run_transfer_parties(
     send_spec.checkpoint_dir = send_ckpt.path().to_path_buf();
     send_spec.multistream = opts.multistream;
     send_spec.in_flight_window = opts.in_flight_window;
+    if let Some(idle) = opts.idle_timeout {
+        send_spec.idle_timeout = idle;
+    }
 
     let mut recv_spec = ReceiveSpec::new(dst.to_path_buf(), receiver_bundle);
     recv_spec.device_name = "ak-itests-receiver".into();
@@ -362,6 +370,9 @@ pub async fn try_run_transfer_parties(
     recv_spec.chunk_size = send_spec.chunk_size;
     recv_spec.conflict = conflict;
     recv_spec.checkpoint_dir = recv_ckpt.path().to_path_buf();
+    if let Some(idle) = opts.idle_timeout {
+        recv_spec.idle_timeout = idle;
+    }
     if let Some(authorize) = parties.authorize {
         recv_spec.authorize = authorize;
     }

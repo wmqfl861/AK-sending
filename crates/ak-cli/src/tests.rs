@@ -2160,17 +2160,18 @@ fn version_line_carries_wire_facts_and_profile() {
         (
             ak_wire::CAP_RESUME,
             ak_wire::CAP_PAUSE_RESUME,
-            ak_wire::CAP_MULTISTREAM
+            ak_wire::CAP_MULTISTREAM,
+            ak_wire::CAP_SENDER_KEEPALIVE
         ),
-        (0x0001, 0x0002, 0x0004)
+        (0x0001, 0x0002, 0x0004, 0x0010)
     );
-    assert_eq!(WIRE_CAPS, 0x0007);
+    assert_eq!(WIRE_CAPS, 0x0017);
 
     let line = version_line();
     assert!(line.starts_with(&format!("{} (", env!("CARGO_PKG_VERSION"))));
     assert!(line.contains("wire v1"));
-    assert!(line.contains("caps 0x0007"));
-    assert!(line.contains("[resume|pause-resume|multistream]"));
+    assert!(line.contains("caps 0x0017"));
+    assert!(line.contains("[resume|pause-resume|multistream|sender-keepalive]"));
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {

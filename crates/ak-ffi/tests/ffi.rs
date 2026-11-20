@@ -404,7 +404,7 @@ fn make_source_tree(base: &Path) -> (u64, u64) {
 #[test]
 fn version_new_free_last_error_roundtrip() {
     // Version: exact string, NUL termination, negative length semantics.
-    let expected = "ak-ffi 1 (wire v1, caps 0x0007)";
+    let expected = "ak-ffi 1 (wire v1, caps 0x0017)";
     let mut buf = [0 as c_char; 128];
     let code = unsafe { ak_version(buf.as_mut_ptr(), buf.len()) };
     assert_eq!(code, expected.len() as i32);

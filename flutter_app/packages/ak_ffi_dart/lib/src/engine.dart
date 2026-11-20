@@ -135,7 +135,7 @@ class AkEngineDart {
   // Non-job entry points.
   // -------------------------------------------------------------------------
 
-  /// The library version string, e.g. `ak-ffi 1 (wire v1, caps 0x0007)`.
+  /// The library version string, e.g. `ak-ffi 1 (wire v1, caps 0x0017)`.
   String version() {
     _ensureLive();
     return _readInto(_maxVersionBytes, (buf, cap) => bindings.version(buf, cap),

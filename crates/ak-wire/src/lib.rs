@@ -110,6 +110,15 @@ pub const CAP_MULTISTREAM: u16 = 0x0004;
 /// [`scheduler_frames_allowed`]; the codec itself decodes them uniformly,
 /// and the engine (wave 21 wiring) enforces the gate.
 pub const CAP_SCHEDULER: u16 = 0x0008;
+/// Capability bit (batch S review, 2026-11-20): this end understands the
+/// sender's liveness signal — a no-op `Control::Resume` the sender sends
+/// while the receiver waits for its next frame before Finalize (today:
+/// during the sender's final source check, a per-file pass that grows with
+/// the file count). Like [`CAP_SCHEDULER`] it takes effect only when BOTH
+/// Hellos carry it (see [`sender_keepalive_allowed`]): a sender never sends
+/// the signal to a peer without the bit, and a receiver still refuses the
+/// frame from a sender whose Hello lacked it. No new message type.
+pub const CAP_SENDER_KEEPALIVE: u16 = 0x0010;
 
 /// Per-frame ceiling for resume entries in one ResumeRequest frame. The
 /// receiver shards its resume answer into consecutive frames of at most
@@ -663,6 +672,14 @@ pub fn type_name(r#type: u16) -> Option<&'static str> {
 /// closed set uniformly.
 pub fn scheduler_frames_allowed(local: u16, remote: u16) -> bool {
     local & CAP_SCHEDULER != 0 && remote & CAP_SCHEDULER != 0
+}
+
+/// Whether the sender's liveness signal (a no-op `Control::Resume` before
+/// Finalize) may flow between two ends whose Hello `capabilities` were
+/// `local` and `remote`: BOTH must carry [`CAP_SENDER_KEEPALIVE`]. Pure
+/// predicate; the engine applies it on both sides.
+pub fn sender_keepalive_allowed(local: u16, remote: u16) -> bool {
+    local & CAP_SENDER_KEEPALIVE != 0 && remote & CAP_SENDER_KEEPALIVE != 0
 }
 
 /// Exact payload upper bound for one message type under `limits`, or `None`
@@ -2849,6 +2866,38 @@ mod tests {
             device_name: "scheduler-peer".to_owned(),
             public_key: digest(5),
             capabilities: previous | CAP_SCHEDULER,
+        });
+    }
+
+    #[test]
+    fn cap_sender_keepalive_bit_is_disjoint_and_negotiation_needs_both_ends() {
+        assert_eq!(CAP_SENDER_KEEPALIVE, 0x0010);
+        let previous = CAP_RESUME | CAP_PAUSE_RESUME | CAP_MULTISTREAM | CAP_SCHEDULER;
+        assert_eq!(previous, 0x000F);
+        assert_eq!(previous & CAP_SENDER_KEEPALIVE, 0, "bit must not collide");
+
+        assert!(sender_keepalive_allowed(
+            CAP_SENDER_KEEPALIVE,
+            CAP_SENDER_KEEPALIVE
+        ));
+        assert!(sender_keepalive_allowed(
+            previous | CAP_SENDER_KEEPALIVE,
+            CAP_RESUME | CAP_SENDER_KEEPALIVE
+        ));
+        // An old peer on either side: no signal.
+        assert!(!sender_keepalive_allowed(previous, CAP_SENDER_KEEPALIVE));
+        assert!(!sender_keepalive_allowed(CAP_SENDER_KEEPALIVE, previous));
+        assert!(!sender_keepalive_allowed(0, 0));
+        // The signal itself is the existing Control::Resume frame.
+        assert_round_trips(Message::Control {
+            job_id: [3; 16],
+            control: Control::Resume,
+        });
+        assert_round_trips(Message::Hello {
+            proto_version: 1,
+            device_name: "keepalive-peer".to_owned(),
+            public_key: digest(6),
+            capabilities: previous | CAP_SENDER_KEEPALIVE,
         });
     }
 

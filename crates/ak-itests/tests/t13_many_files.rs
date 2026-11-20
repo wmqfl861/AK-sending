@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{assert_trees_identical, run_transfer_full, try_run_transfer_full, write_file, Lcg};
+use common::{assert_trees_identical, run_transfer_full, write_file, Lcg};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -179,10 +179,29 @@ async fn assert_many_files_transfer(
 /// Dual-path outcome for scales above the known ResumeRequest budget defect:
 /// completion (engine fixed) or the exact documented failure (defect present).
 async fn run_scale_run(base: &Path, non_dir_entries: u64, budget_secs: u64, label: &str) {
+    run_scale_run_opts(
+        base,
+        non_dir_entries,
+        budget_secs,
+        label,
+        common::TransferOpts::default(),
+    )
+    .await;
+}
+
+/// [`run_scale_run`] with explicit transfer options (e.g. an idle budget).
+async fn run_scale_run_opts(
+    base: &Path,
+    non_dir_entries: u64,
+    budget_secs: u64,
+    label: &str,
+    opts: common::TransferOpts,
+) {
     let dst = tempfile::tempdir().unwrap();
     let started = Instant::now();
     let outcome =
-        try_run_transfer_full(base, dst.path(), 1, ConflictPolicy::Fail, budget_secs).await;
+        common::try_run_transfer_opts(base, dst.path(), 1, ConflictPolicy::Fail, budget_secs, opts)
+            .await;
     let elapsed = started.elapsed();
     let pages = count_events(&outcome.events, is_page);
     // Phase timeline first, whatever the outcome: on a failure it shows
@@ -294,4 +313,24 @@ async fn sixty_five_thousand_five_hundred_thirty_seven_files_release_boundary_ru
     let base = tempfile::tempdir().unwrap();
     build_flat(base.path(), 65_537);
     run_scale_run(base.path(), 65_537, 10_800, "T13-65537").await;
+}
+
+/// S-N1 (batch S review, 2026-11-20): the same 65,537 files with a 4 s idle
+/// budget on both ends. The sender's final source check — one stat per
+/// file, with nothing sent meanwhile — took about 8 s of this job on local
+/// Windows (R handoff §8, "last chunk received" to "verify phase started"),
+/// so without the sender's liveness signal the receiver gave up waiting for
+/// Finalize. The other long silent stretches (the receiver's prepare and
+/// verify passes) are covered by the receiver's own signal at the same
+/// cadence (a quarter of the budget).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "65,537-file run with a 4 s idle budget; release only"]
+async fn sixty_five_thousand_files_with_a_four_second_idle_budget() {
+    let base = tempfile::tempdir().unwrap();
+    build_flat(base.path(), 65_537);
+    let opts = common::TransferOpts {
+        idle_timeout: Some(std::time::Duration::from_secs(4)),
+        ..common::TransferOpts::default()
+    };
+    run_scale_run_opts(base.path(), 65_537, 10_800, "T13-65537-idle4s", opts).await;
 }

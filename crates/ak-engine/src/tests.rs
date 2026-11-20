@@ -6128,3 +6128,343 @@ async fn preadmitted_refuses_a_recv_direction_task_open() {
         panic!("no Admission may be answered, saw {:?}", frame.message);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Batch S review (BACKLOG P3-02): the sender's liveness signal during its
+// final source check (CAP_SENDER_KEEPALIVE), and the receiver's report of
+// a disk that fills up mid-transfer.
+// ---------------------------------------------------------------------------
+
+/// The root name a send of `src` offers (its directory name); it keys the
+/// test seams, so parallel tests never share an entry.
+fn root_name_of(src: &Path) -> String {
+    src.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// Engine to engine, with a final source check three idle budgets long.
+/// Before the signal the receiver, waiting for Finalize under its
+/// per-frame idle budget, gave up with `IdleTimeout` while the sender was
+/// still checking — on a real disk from about a quarter of a million
+/// files on. Multi-thread runtime: the receiver's timer runs while the
+/// check sleeps on the sender's blocking pool.
+async fn slow_source_check_round(multistream: bool) {
+    let idle = Duration::from_millis(800);
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    for i in 0..6u8 {
+        write(&src.path().join(format!("s{i}.bin")), &[i; 5000]);
+    }
+    seams::slow_source_check(&root_name_of(src.path()), idle * 3);
+    let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1);
+    send_spec.idle_timeout = idle;
+    send_spec.multistream = multistream;
+    recv.idle_timeout = idle;
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    send_spec.peer = addr_rx.await.unwrap();
+    let started = Instant::now();
+    let sender = tokio::spawn(async move { send(send_spec, &noop).await });
+    let recv_outcome = receiver.await.unwrap();
+    let send_outcome = sender.await.unwrap();
+    recv_outcome.expect("the receiver must wait out the sender's source check");
+    let report = send_outcome.expect("the send completes");
+    assert_eq!(report.files, 6);
+    assert!(
+        started.elapsed() >= idle * 3,
+        "the check must really outlast the idle budget: {:?}",
+        started.elapsed()
+    );
+    for i in 0..6u8 {
+        assert_eq!(
+            fs::read(dst.path().join(format!("s{i}.bin"))).unwrap(),
+            vec![i; 5000]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_source_check_keeps_the_receiver_waiting() {
+    slow_source_check_round(false).await;
+}
+
+/// Multistream: the signal arrives on the control stream after every data
+/// stream finished, and must refresh the driver's idle budget too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_source_check_keeps_a_multistream_receiver_waiting() {
+    slow_source_check_round(true).await;
+}
+
+/// The engine sender against a fake receiver advertising `fake_caps`, with
+/// a 900 ms source check at a 100 ms liveness cadence (sender idle budget
+/// 400 ms). Returns how many signals the fake saw before Finalize; any
+/// other frame is a failure, and no signal may come before the last chunk.
+async fn signals_before_finalize(fake_caps: u16) -> u64 {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write(&src.path().join("k.bin"), &[7u8; 3000]);
+    seams::slow_source_check(&root_name_of(src.path()), Duration::from_millis(900));
+    let (mut send_spec, recv_spec, receiver_fp) = specs(src.path(), dst.path(), 1);
+    send_spec.idle_timeout = Duration::from_millis(400);
+    let bundle = recv_spec.identity;
+    let endpoint = DirectEndpoint::bind(SocketAddr::from(([127, 0, 0, 1], 0)), &bundle)
+        .await
+        .unwrap();
+    send_spec.peer = endpoint.local_addr().unwrap();
+    send_spec.pinned = receiver_fp;
+
+    let fake = tokio::spawn(async move {
+        let channel = endpoint.accept(&|_| true).await.unwrap();
+        let mut stream = channel.accept_bi().await.unwrap();
+        let job_id = fake_receiver_preamble(&mut stream, &bundle, fake_caps).await;
+        let limits = engine_limits();
+        let mut signals = 0u64;
+        loop {
+            match stream.recv_frame(&limits).await.unwrap().message {
+                Message::Chunk {
+                    file_index,
+                    chunk_index,
+                    ..
+                } => {
+                    assert_eq!(signals, 0, "the signal only covers the source check");
+                    stream
+                        .send_frame(&wire(Message::ChunkAck {
+                            job_id,
+                            file_index,
+                            chunk_index,
+                        }))
+                        .await
+                        .unwrap();
+                }
+                Message::Control {
+                    job_id: signal_job,
+                    control: Control::Resume,
+                } => {
+                    assert_eq!(signal_job, job_id, "the signal names the job");
+                    signals += 1;
+                }
+                Message::Finalize { .. } => {
+                    stream
+                        .send_frame(&wire(Message::FinalAck {
+                            job_id,
+                            verified: true,
+                        }))
+                        .await
+                        .unwrap();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        while stream.recv_frame(&limits).await.is_ok() {}
+                    })
+                    .await;
+                    return signals;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    });
+    let report = send(send_spec, &noop).await.expect("the send completes");
+    assert_eq!(report.files, 1);
+    fake.await.unwrap()
+}
+
+/// Only a receiver whose Hello carried CAP_SENDER_KEEPALIVE gets the
+/// signal: an older receiver would refuse the frame, so it sees the
+/// frozen silence instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_check_signals_only_a_receiver_that_negotiated_it() {
+    let signalled =
+        signals_before_finalize(CAP_RESUME | CAP_PAUSE_RESUME | CAP_SENDER_KEEPALIVE).await;
+    assert!(
+        signalled >= 3,
+        "a 900 ms check at a 100 ms cadence signals several times: {signalled}"
+    );
+    let silent = signals_before_finalize(CAP_RESUME | CAP_PAUSE_RESUME).await;
+    assert_eq!(
+        silent, 0,
+        "a receiver without the bit never sees the signal"
+    );
+}
+
+/// The engine receiver against a fake sender whose Hello carries
+/// `capabilities` and that sends one no-op Control::Resume naming
+/// `signal_job` right after the resume answer, then its chunks and
+/// Finalize. Returns the receiver's outcome, its destination directory
+/// and the payload the fake sent.
+async fn receive_with_sender_signal(
+    capabilities: u16,
+    signal_job: Option<JobId>,
+) -> (Result<Report, EngineError>, tempfile::TempDir, Vec<u8>) {
+    let dst = tempfile::tempdir().unwrap();
+    let receiver_key = DeviceKeyPair::generate();
+    let receiver_bundle = ak_identity::tls::make_self_signed(&receiver_key);
+    let mut recv = on_channel_recv_spec(dst.path(), receiver_bundle);
+    recv.idle_timeout = Duration::from_secs(5);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    let addr = addr_rx.await.unwrap();
+    let mut fake = fake_sender_side(addr, receiver_key.fingerprint(), capabilities).await;
+    let limits = engine_limits();
+    let job_id: JobId = [0x5A; 16];
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+    let entry = chunked_wire_entry("kept.bin", &payload, 1024);
+    fake.tx
+        .send_frame(&wire(Message::Offer {
+            job_id,
+            root_name: "sender-signal".to_owned(),
+            file_count: 1,
+            total_bytes: entry.size,
+            chunk_size: 1024,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fake.rx.recv_frame(&limits).await.unwrap().message,
+        Message::Accept { .. }
+    ));
+    fake.tx
+        .send_frame(&wire(Message::ManifestPage {
+            job_id,
+            page_index: 0,
+            last_page: true,
+            entries: vec![entry],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match fake.rx.recv_frame(&limits).await.unwrap().message {
+            Message::ResumeRequest { more: false, .. } => break,
+            Message::ResumeRequest { .. } => {}
+            other => panic!("expected ResumeRequest, got {other:?}"),
+        }
+    }
+    fake.tx
+        .send_frame(&wire(Message::Control {
+            job_id: signal_job.unwrap_or(job_id),
+            control: Control::Resume,
+        }))
+        .await
+        .unwrap();
+    // A receiver that refused the signal is gone by now; the rest of the
+    // script simply stops at the first failed read or write.
+    let mut delivered = true;
+    for (chunk_index, data) in payload.chunks(1024).enumerate() {
+        let sent = fake
+            .tx
+            .send_frame(&wire(Message::Chunk {
+                job_id,
+                file_index: 0,
+                chunk_index: chunk_index as u64,
+                data: data.to_vec(),
+            }))
+            .await;
+        let acked = match sent {
+            Ok(()) => matches!(
+                fake.rx.recv_frame(&limits).await.map(|frame| frame.message),
+                Ok(Message::ChunkAck { .. })
+            ),
+            Err(_) => false,
+        };
+        if !acked {
+            delivered = false;
+            break;
+        }
+    }
+    if delivered {
+        fake.tx
+            .send_frame(&wire(Message::Finalize { job_id }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fake.rx.recv_frame(&limits).await.unwrap().message,
+            Message::FinalAck { verified: true, .. }
+        ));
+        let _ = fake.tx.finish();
+    }
+    (receiver.await.unwrap(), dst, payload)
+}
+
+/// The receiver side of the negotiation: the signal is accepted and
+/// ignored from a sender that announced CAP_SENDER_KEEPALIVE, refused as
+/// an unexpected frame from one that did not (the strictness every older
+/// receiver has), and refused when it names another job.
+#[tokio::test]
+async fn receiver_takes_the_sender_signal_only_when_negotiated() {
+    let (outcome, dst, payload) =
+        receive_with_sender_signal(CAP_RESUME | CAP_SENDER_KEEPALIVE, None).await;
+    let report = outcome.expect("a negotiated signal is a no-op");
+    assert_eq!(report.files, 1);
+    assert_eq!(fs::read(dst.path().join("kept.bin")).unwrap(), payload);
+
+    let (outcome, _dst, _) = receive_with_sender_signal(CAP_RESUME, None).await;
+    match outcome.expect_err("an unnegotiated signal stays unexpected") {
+        EngineError::PeerError {
+            code: ErrorCode::ProtocolUnsupported,
+            message,
+        } => assert!(message.contains("unexpected frame"), "{message}"),
+        other => panic!("got {other:?}"),
+    }
+
+    let (outcome, _dst, _) =
+        receive_with_sender_signal(CAP_RESUME | CAP_SENDER_KEEPALIVE, Some([0x11; 16])).await;
+    match outcome.expect_err("a signal naming another job is a protocol error") {
+        EngineError::PeerError {
+            code: ErrorCode::ProtocolUnsupported,
+            message,
+        } => assert!(message.contains("different job"), "{message}"),
+        other => panic!("got {other:?}"),
+    }
+}
+
+/// Engine to engine, the destination fills up after five chunk writes
+/// (BACKLOG P3-02). The receiver tells the sender before it lets go of the
+/// connection, so the sender reports the peer's StorageFull rather than a
+/// lost connection, and the receiver's own verdict is its io error. The
+/// hold ends as soon as the sender closes, well inside its bound.
+async fn disk_full_round(multistream: bool) {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+    write(&src.path().join("big.bin"), &payload);
+    seams::fill_disk_after(&root_name_of(src.path()), 5);
+    let (mut send_spec, mut recv, _) = specs(src.path(), dst.path(), 1); // 40 chunks
+    send_spec.multistream = multistream;
+    // Bounds: single-stream hold min(10 s, idle), multistream the same.
+    send_spec.idle_timeout = Duration::from_secs(10);
+    recv.idle_timeout = Duration::from_secs(10);
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(receive_with_addr(recv, &noop, addr_tx));
+    send_spec.peer = addr_rx.await.unwrap();
+    let started = Instant::now();
+    let sender = tokio::spawn(async move { send(send_spec, &noop).await });
+    let recv_error = receiver
+        .await
+        .unwrap()
+        .expect_err("the receive fails on the full disk");
+    let send_error = sender.await.unwrap().expect_err("so does the send");
+    match &send_error {
+        EngineError::PeerError {
+            code: ErrorCode::StorageFull,
+            message,
+        } => assert_eq!(message, STORAGE_FULL_MESSAGE),
+        other => panic!("the sender must name the peer's full disk, got {other:?}"),
+    }
+    assert!(
+        matches!(&recv_error, EngineError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull),
+        "the receiver keeps its local verdict, got {recv_error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the hold must end with the sender's close: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_full_mid_transfer_reaches_the_sender() {
+    disk_full_round(false).await;
+}
+
+/// Multistream: the frame goes on the failing file's own stream, which the
+/// sender's task for that file reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_full_mid_transfer_reaches_a_multistream_sender() {
+    disk_full_round(true).await;
+}

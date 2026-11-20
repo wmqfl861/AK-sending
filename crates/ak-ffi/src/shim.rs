@@ -859,7 +859,7 @@ pub unsafe extern "C" fn ak_peer_remove(
 }
 
 /// Write the library version string (UTF-8 + NUL) into `buf`, e.g.
-/// `ak-ffi 1 (wire v1, caps 0x0007)`. Returns the written byte length
+/// `ak-ffi 1 (wire v1, caps 0x0017)`. Returns the written byte length
 /// (excluding the NUL), `AK_ERR_NULL`, or `AK_ERR_BUFFER`.
 ///
 /// # Safety

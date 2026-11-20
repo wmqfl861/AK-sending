@@ -167,7 +167,10 @@ pub fn last_error_text() -> String {
 /// Version string written by `ak_version`, built from the `ak-wire`
 /// constants so it can never drift from the protocol implementation.
 pub fn version_string() -> String {
-    let caps = ak_wire::CAP_RESUME | ak_wire::CAP_PAUSE_RESUME | ak_wire::CAP_MULTISTREAM;
+    let caps = ak_wire::CAP_RESUME
+        | ak_wire::CAP_PAUSE_RESUME
+        | ak_wire::CAP_MULTISTREAM
+        | ak_wire::CAP_SENDER_KEEPALIVE;
     format!(
         "ak-ffi {FFI_API_VERSION} (wire v{}, caps 0x{caps:04x})",
         ak_wire::VERSION

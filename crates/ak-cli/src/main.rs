@@ -54,7 +54,10 @@ use ak_identity::{DeviceKeyPair, Fingerprint, PeerBook, PeerRecord};
 /// truth; the version test pins the shipped values).
 const WIRE_VERSION: u8 = ak_wire::VERSION;
 /// Every capability this build speaks (the engine advertises exactly these).
-const WIRE_CAPS: u16 = ak_wire::CAP_RESUME | ak_wire::CAP_PAUSE_RESUME | ak_wire::CAP_MULTISTREAM;
+const WIRE_CAPS: u16 = ak_wire::CAP_RESUME
+    | ak_wire::CAP_PAUSE_RESUME
+    | ak_wire::CAP_MULTISTREAM
+    | ak_wire::CAP_SENDER_KEEPALIVE;
 
 /// Compile profile of this binary (cargo's default profiles only).
 fn build_profile() -> &'static str {
@@ -83,7 +86,7 @@ fn build_git_sha() -> &'static str {
 fn version_line_with(git_sha: &str) -> String {
     format!(
         "{} (wire v{}, caps 0x{WIRE_CAPS:04x} \
-         [resume|pause-resume|multistream], {} build, git {git_sha})",
+         [resume|pause-resume|multistream|sender-keepalive], {} build, git {git_sha})",
         env!("CARGO_PKG_VERSION"),
         WIRE_VERSION,
         build_profile()

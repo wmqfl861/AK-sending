@@ -6,9 +6,11 @@
 //! Why: Q-N2 runs up to eight files' finish() at once. On the ext4 CI
 //! runner that cut the verify phase of the 65,537-file run to about a
 //! third; on the Windows runner only by about a quarter, which says the
-//! main cost there does not overlap. Candidates: the per-file flush
-//! (FlushFileBuffers) being serialised below the file system, or the
-//! metadata operations (link, unlink, timestamps) in one large directory.
+//! main cost there does not overlap. The first Windows run of this
+//! benchmark found flushing an already closed file cheap there, and
+//! creating, writing and flushing on one handle expensive and serial; the
+//! last two measurements compare finish()'s order (flush, link, next
+//! file) with the same work in two passes (every flush, then every link).
 //!
 //! Each measurement runs over `FILES` one-byte files in a fresh directory,
 //! on one thread and on `THREADS` threads, and prints one line:
@@ -184,5 +186,59 @@ fn per_file_commit_cost() {
             file.sync_all().unwrap();
         });
         report("create+write+sync_all+close", threads, FILES, wall);
+
+        // finish()'s order, one file after another: flush the part, then
+        // claim the final name, before the next file's flush. This is what
+        // the verify phase does now.
+        let files = fresh(".akpart");
+        write_closed(&files);
+        let wall = run(&files, threads, |_, path| {
+            sync_existing(path);
+            claim(path);
+        });
+        report(
+            "per file: sync_all, then hard_link+remove_file",
+            threads,
+            FILES,
+            wall,
+        );
+
+        // The same work in two passes: every file's flush, then every
+        // file's final name. Each file's data is still flushed before its
+        // final name appears.
+        let files = fresh(".akpart");
+        write_closed(&files);
+        let start = Instant::now();
+        run(&files, threads, |_, path| sync_existing(path));
+        run(&files, threads, |_, path| claim(path));
+        report(
+            "all sync_all, then all hard_link+remove_file",
+            threads,
+            FILES,
+            start.elapsed(),
+        );
     }
+}
+
+/// One-byte files created, written through the cache and closed (not timed).
+fn write_closed(paths: &[PathBuf]) {
+    run(paths, THREADS, |i, path| {
+        File::create(path).unwrap().write_all(&[i as u8]).unwrap();
+    });
+}
+
+/// Open an existing file for writing and flush it, as finish() does.
+fn sync_existing(path: &Path) {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+}
+
+/// Claim the final name the way finish() does: link it, drop the part name.
+fn claim(part: &Path) {
+    fs::hard_link(part, part.with_extension("")).unwrap();
+    fs::remove_file(part).unwrap();
 }

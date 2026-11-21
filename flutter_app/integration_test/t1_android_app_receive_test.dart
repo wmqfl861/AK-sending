@@ -141,8 +141,15 @@ void main() {
         engine = facade.borrowEngine(); // throws when the .so cannot open
         final version = engine.version();
         _log('engine.version(): $version');
-        expect(version, contains('0x0017'),
-            reason: 'the bundled libak_ffi.so must carry S-N1 (T 交接 §2.2)');
+        // Batch S added CAP_SENDER_KEEPALIVE (0x0010, S-N1) in the same
+        // batch as the S-N3 commit path, so the bit marks a library built
+        // from batch S or later. Check the bit, not the whole value: later
+        // capability bits must not fail this test (T review, T-N2).
+        final caps = RegExp(r'caps 0x([0-9a-fA-F]{4})').firstMatch(version);
+        expect(caps, isNotNull, reason: 'version string carries the caps');
+        expect(int.parse(caps!.group(1)!, radix: 16) & 0x0010, 0x0010,
+            reason: 'the bundled libak_ffi.so must be built from batch S or '
+                'later (CAP_SENDER_KEEPALIVE; T 交接 §2.2)');
 
         final support = await getApplicationSupportDirectory();
         final round = Directory(

@@ -36,6 +36,11 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+/// How long scenario (a) waits for the aborted receiver's port to be
+/// released before the takeover counts as failed. A deadline, not a delay:
+/// the takeover binds as soon as the port is free.
+const PORT_RELEASE_WAIT: Duration = Duration::from_secs(30);
+
 /// (a) Identity swap on the SAME port. Interrupt a transfer mid-flight, let a
 /// different key's receiver take over the freed port, then retry the resume:
 /// the sender still pins the ORIGINAL fingerprint, so the TLS handshake must
@@ -94,7 +99,9 @@ async fn mid_transfer_port_takeover_by_another_key_is_refused_by_pinning() {
         chunks_rx.changed().await.unwrap();
     }
     receiver.abort();
-    let _ = receiver.await; // cancelled: its UDP socket is closed, port freed
+    // Cancelled. Its UDP socket is not closed yet: Quinn closes it
+    // asynchronously, once the dropped connection has drained (below).
+    let _ = receiver.await;
     let leg1 = sender.await.unwrap();
     assert!(
         matches!(
@@ -111,14 +118,24 @@ async fn mid_transfer_port_takeover_by_another_key_is_refused_by_pinning() {
 
     // The impostor: a DIFFERENT device key's receiver squatting on the same
     // port, waiting for the sender's resume attempt. Quinn's UDP driver
-    // releases the aborted receiver's socket asynchronously, so the takeover
-    // bind may need a few attempts before the port is free again.
+    // releases the aborted receiver's socket asynchronously: the dropped
+    // connection first drains for three probe timeouts, and on a loaded
+    // machine the probe timeout grows with the measured round-trip time.
+    // On an idle Linux box the port is free after about 0.3 s, under CPU
+    // load after up to about 0.7 s, and a busy Windows CI runner once needed
+    // more than the 2 s that a fixed 20 x 100 ms loop allowed (batch T
+    // review, T-N1). So the takeover keeps retrying until a deadline; a
+    // socket that is never released still fails the test, with the wait in
+    // the message.
     let impostor_key = DeviceKeyPair::generate();
     let impostor_bundle = make_self_signed(&impostor_key);
     let impostor_ckpt = tempfile::tempdir().unwrap();
     let mut impostor = None;
     let mut impostor_addr = None;
-    for _ in 0..20 {
+    let takeover_started = Instant::now();
+    let mut attempts = 0u32;
+    while impostor.is_none() && takeover_started.elapsed() < PORT_RELEASE_WAIT {
+        attempts += 1;
         let mut impostor_spec =
             ReceiveSpec::new(dst_impostor.path().to_path_buf(), impostor_bundle.clone());
         impostor_spec.bind = loopback(real_addr.port());
@@ -130,7 +147,6 @@ async fn mid_transfer_port_takeover_by_another_key_is_refused_by_pinning() {
             Ok(addr) => {
                 impostor = Some(task);
                 impostor_addr = Some(addr);
-                break;
             }
             Err(_) => {
                 // Bind refused (port not yet released): drain and back off.
@@ -139,7 +155,12 @@ async fn mid_transfer_port_takeover_by_another_key_is_refused_by_pinning() {
             }
         }
     }
-    let impostor = impostor.expect("impostor must take over the freed port");
+    let impostor = impostor.unwrap_or_else(|| {
+        panic!(
+            "impostor must take over the freed port: still taken after {:?} ({attempts} attempts)",
+            takeover_started.elapsed()
+        )
+    });
     let impostor_addr = impostor_addr.expect("impostor address");
     assert_eq!(
         impostor_addr, real_addr,

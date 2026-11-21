@@ -258,3 +258,17 @@ bash scripts/cross_nat_test.sh --self-test
 | V4 Android 覆盖升级 | 模拟器（本机 debug 签名，两 APK 证书 SHA-256 相同 1df81fe0…，apksigner verify 通过） | 序列原样要点：`adb uninstall` 时包本就不在（报 DELETE_FAILED_INTERNAL_ERROR，包计数 0，视为干净）；装旧 APK（c40cf90 构建）`Success`，`am start` 后**约 30-75 秒主界面才渲染**（冷启动首帧很慢，debug 构建；两次实测 14s 时亮度 11.2（闪屏）、30s/75s 时 40.1（主界面））；旧版数据目录：`files/` 仅 `profileInstalled`（24 B）——**冷启动不创建身份文件**（首次任务/配对才建），shared_prefs 为空，`cache/ak-stage.log`（402 B）；执行方在 files/ 放标记文件 `v4-marker.txt`（21 B，内容 v4-marker-<epoch>）作为保留性证据；`adb install -r` 新 APK `Success`，启动主界面同样约 30 秒渲染；升级后数据：`v4-marker.txt` **内容逐字保留**、目录结构一致、`profileInstalled` 刷新；崩溃缓冲仅 1 条且是系统蓝牙进程（09:55，与本应用无关）——**应用无崩溃**；`adb uninstall` `Success`，`pm list packages | grep ak_sending` 计数 0。边界：身份文件保留性检查因冷启动不建身份而降级为标记文件检查，如实记录 |
 | V5 全量门槛 | 本地 Windows（rustc 1.99.1） | fmt/clippy/rustdoc/workspace（69 组，1231/0/11）/sqlite（54/0）/server-persistence（221/0）/Python（372 OK）/repo/contracts（5/5 PASS）/部署自检（PASS）/跨NAT自检（PASS）全部通过；`flutter analyze`（flutter_app 下，含本批改过的 u2 runner）`No issues found!`；`check_repository.py` 在回填本表提交号后通过（回填前只报状态表提交列占位） |
 | V 批次最终 CI | `e65fccc` run [44926202524](https://github.com/wmqfl861/AK-sending/actions/runs/44926202524) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
+
+## 9. 复核方证据（2026-11-22）
+
+复核方在云端 Linux 工作区执行（rustc 1.97.0 在机，钉的 1.99.1 下载不到，Rust 与 Flutter 门槛没有在本机跑）；Windows 与 Android 上的结果只来自 CI 与 §8。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 分支活动 | GitHub activity API | 2026-11-21T13:33:29Z 删除 `dev/batch-u-20261121`（此前 13:16:04Z main 已快进到 `328d06d`）；16:44:21Z 一次推送创建 `dev/batch-v-20261121` @ `e65fccc`（含 `40ad84e`、`e65fccc`）；16:55:57Z 推送 `652c4f9`。没有强推 |
+| 执行方推送的 CI | `e65fccc` run [44926202524](https://github.com/wmqfl861/AK-sending/actions/runs/44926202524) | success：12 项常规任务 success，2 项手动深测 skipped（§8 最后一行与之一致） |
+| 执行方最后一次推送的 CI | `652c4f9` run [44927246462](https://github.com/wmqfl861/AK-sending/actions/runs/44927246462) | success |
+| 改动范围 | `git diff --stat origin/main origin/dev/batch-v-20261121` | 4 个文件：V 交接、状态表、STATUS、`u2_android_lifecycle_test.dart`（只加 `AK_U2_WATCH_MIN` 与随之放宽的超时）；没有产品代码改动，与交接 §2.3 的边界一致 |
+| V-N1 定位 | Python 逐行扫描 | §8 有 4 处 U+0007（BEL）：`flutter\a…`、`%TEMP%\a…`、`dev.ak\a…`、`target\r` 之后的 `elease\a…`；`\r` 被写成换行，打包冒烟一行被拆开，后半段落到表格最后一行之后。按上下文恢复为 `flutter\ak_ffi.dll unified with target\release\ak_ffi.dll`、`%TEMP%\ak-stage.log`、`dev.ak\ak_sending_app` |
+| V-N1 修复 | `0cc9baa` | `python scripts/check_repository.py`：修复前在本文件报 3 行控制字符错误，修复后 `passed: true`、`errors: []`；`python -m unittest discover -s scripts/tests`：375 项 OK（原 372 项加新增 3 项）；`python scripts/check_contracts.py` 退出码 0 |
+| 黑屏、僵尸行、错误文案的依据 | §8 的 V2-b、V2-d 两行；`flutter_app/lib/ui/pages/connection_detail_page.dart`；`flutter_app/lib/ui/service/simple_transfer_service.dart` | “配对已闲置过久，请重新配对。”只在连接带 `idleExpired`（引擎的 `idle_expired` 原因）时显示；V2-d 的后台时长约 123 秒，短于 10 分钟的配对闲置预算，所以原因本身可疑，交 W1 一并查清 |

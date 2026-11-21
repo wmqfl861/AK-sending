@@ -759,6 +759,29 @@ def status_number_issues(status_text: str) -> list[str]:
     return errors
 
 
+# V-N1 (REVIEW_2026-11-22-batchV.zh-CN.md §2): batch V's evidence table was
+# written through a shell that expanded the backslash escapes in Windows
+# paths (`\r` -> CR, `\a` -> BEL), which split a table row across lines and
+# silently ate path characters. Markdown in this repo is LF-only text
+# (.gitattributes), so any C0 control other than TAB and LF — CR included —
+# is corruption, never content.
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def control_char_issues(text: str, name: str) -> list[str]:
+    """One error per line of [text] that carries a forbidden control char."""
+    issues = []
+    for i, line in enumerate(text.split("\n")):
+        match = CONTROL_CHAR_RE.search(line)
+        if match:
+            issues.append(
+                f"{name}:{i + 1}: control character U+{ord(match.group()):04X} "
+                "in markdown (shell-expanded backslash escape? write the file "
+                "with an editor or a quoted heredoc)"
+            )
+    return issues
+
+
 def check(root: Path) -> dict:
     errors: list[str] = []
     required = [
@@ -807,6 +830,9 @@ def check(root: Path) -> dict:
     )
     for path in markdowns:
         text = path.read_text(encoding="utf-8")
+        errors.extend(
+            control_char_issues(text, path.relative_to(root).as_posix())
+        )
         for link in MARKDOWN_LINK_RE.findall(text):
             if "://" in link or link.startswith(("mailto:", "#")):
                 continue

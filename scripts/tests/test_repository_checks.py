@@ -1301,5 +1301,23 @@ class RecordRuleTests(unittest.TestCase):
         )
 
 
+class ControlCharTests(unittest.TestCase):
+    """V-N1: shell-expanded backslash escapes must not reach markdown."""
+
+    def test_clean_text_passes(self):
+        text = "| a | b |\n\t缩进与中文 `C:\\\\Users\\\\x` 都可以\n"
+        self.assertEqual(checks.control_char_issues(text, "d.md"), [])
+
+    def test_bel_and_cr_are_rejected_with_line_numbers(self):
+        text = "ok\n`flutter\x07k_ffi.dll`\nfine\nwin\r\n"
+        errors = checks.control_char_issues(text, "d.md")
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(errors[0].startswith("d.md:2: control character U+0007"))
+        self.assertTrue(errors[1].startswith("d.md:4: control character U+000D"))
+
+    def test_del_and_nul_are_rejected(self):
+        self.assertEqual(len(checks.control_char_issues("a\x7f\nb\x00", "d.md")), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

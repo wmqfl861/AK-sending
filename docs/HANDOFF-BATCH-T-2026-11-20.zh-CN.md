@@ -203,3 +203,20 @@ bash scripts/cross_nat_test.sh --self-test
 | T1 过程记录 | 本地 Windows + 模拟器 | （1）`flutter analyze` 首次报 4 处（1 error：`FileMode` 未导入；1 error：`result.map` 可空返回；1 warning：多余判空；1 info：文档注释尖括号）与 1 处漏改，全部修掉后 `No issues found!`；（2）第 1 轮首次运行因本机 `JAVA_HOME` 未设置失败（`Gradle task assembleDebug failed`，已指向本机 jdk 重试）；（3）Gradle 9.3.1 发行版下载两次停滞（40MB、95MB 处），终止后用 curl 断点续传补齐并手工就位，属本机环境问题，不是仓库问题；（4）测试自身两处笔误（子目录未递归创建、`_awaitListening` 漏 `await`）各失败一次后修复，失败输出都已核对，不改产品代码；（5）可选的 strace 取证**未做**：应用进程属 untrusted_app 域，adb shell 的 strace（以 shell 身份）无法附着，不 root、不改 SELinux 模式就做不到，按 T 交接 §2.3 的口径写明原因 |
 | T4 全量门槛 | 本地 Windows（rustc 1.99.1） | fmt/clippy/rustdoc/workspace（69 组，1231/0/11，较批次 S 多出的项来自复核方的新测试）/sqlite（54/0）/server-persistence（221/0）/Python（372 OK）/repo/contracts（5/5 PASS）/部署自检（PASS）/跨NAT自检（PASS）全部通过；`flutter analyze`（flutter_app 下，含新增的 T1 测试文件）`No issues found!`；`check_repository.py` 在回填本表提交号后通过（回填前只报状态表提交列占位） |
 | T 批次最终 CI | `5c7c742` run [44870317557](https://github.com/wmqfl861/AK-sending/actions/runs/44870317557) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
+
+## 9. 复核方证据（2026-11-21）
+
+复核方在云端 Linux 工作区（2 vCPU，rustc 1.97.0，钉的 1.99.1 下载不到）执行；Windows 上的结果只来自 CI，Android 上的结果来自 §8。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 分支活动 | GitHub activity API | 2026-11-21T01:26:20Z 删除 `dev/batch-s-20261120`（`095f7d8`，main 此时也是 `095f7d8`）；05:19:05Z 一次推送创建 `dev/batch-t-20261121` @ `5c7c742`（含 `7d010d4`、`5c7c742`）；05:33:21Z 推送 `61b3143`；之后复核方推送 `0b8c288`（T-N1、T-N2）与复核文档提交。全部是快进的普通推送，没有强推。执行方报完成是本地 14:12（06:12Z），此时最后一次推送的 CI 已于 05:45:21Z 跑完 |
+| 执行方推送的 CI | `5c7c742` run [44870317557](https://github.com/wmqfl861/AK-sending/actions/runs/44870317557) | success：12 项常规任务 success，2 项手动深测 skipped（§8 最后一行与之一致） |
+| 执行方最后一次推送的 CI | `61b3143` run [44871426085](https://github.com/wmqfl861/AK-sending/actions/runs/44871426085) | success：12 项常规任务 success，2 项手动深测 skipped |
+| main 上 `095f7d8` 的 CI | run [44776125791](https://github.com/wmqfl861/AK-sending/actions/runs/44776125791) | 第 1 次尝试 failure：只有 Rust 1.99.1 (windows-latest)，t06 的 `mid_transfer_port_takeover_by_another_key_is_refused_by_pinning`（`impostor must take over the freed port`）；第 2 次尝试只重跑该任务，success。§8 第一行与 API 一致 |
+| T-N1 端口释放时间 | Linux 云端工作区，debug 构建，t06 场景 (a) 加临时计时（未提交），每组 10 次 | 当前树（`095f7d8`）：空闲时每次都在第 4 次尝试绑上，305–308 ms；3 个占满 CPU 的进程下 5–8 次尝试，412–716 ms。旧树 `db51363`（独立 worktree 与独立 target）：空闲 305–308 ms；同样负载下 4–7 次尝试，305–611 ms。两棵树分布相同。原测试的上限是 20 次尝试，约 2 s 加绑定开销 |
+| T-N1 修改后 | `0b8c288` | 整个 t06 测试文件连续 20 次通过：10 次空闲，10 次在 4 个占满 CPU 的进程下。截止时间临时改为 50 ms 时测试失败，报错原文 `impostor must take over the freed port: still taken after 100.784107ms (1 attempts)`；改动已还原、未提交 |
+| T-N2 | `0b8c288` | 本工作区没有 Flutter SDK，Dart 改动未在本地分析或运行；由 CI 的 Flutter gate（`flutter analyze`）检查，U1 在模拟器上重跑 |
+| S-N3 的 seccomp 核对 | AOSP bionic | android-8.0.0_r1 的 [`libc/SECCOMP_WHITELIST.TXT`](https://android.googlesource.com/platform/bionic/+/refs/tags/android-8.0.0_r1/libc/SECCOMP_WHITELIST.TXT) 在 `# Useful new syscalls which we don't yet use in bionic.` 之下列有 `renameat2`；按 [blame](https://gerrit.omnirom.org/plugins/gitiles/android_bionic/+blame/a34817457feee026e8702a1d2dffe9e92b51d7d1/libc/SECCOMP_WHITELIST.TXT)，这一行由 `de9262e`（2017-04-18）加入，文件头由 `3dd3d55`（2017-04-12）建立。当前 bionic 的 [`libc/SYSCALLS.TXT`](https://android.googlesource.com/platform/bionic/+/HEAD/libc/SYSCALLS.TXT) 有 `renameat2(int, const char*, int, const char*, unsigned) all`。应用的 seccomp 过滤自 Android 8.0 起才有 |
+| 本地全部门槛 | `0b8c288` 加本次文档 | 全部通过（789s）：fmt、clippy、workspace 69 组 1231 passed / 0 failed / 11 ignored、rustdoc、ak-store sqlite 52 passed、ak-signal server-persistence 221 passed、Python 372 OK、check_contracts、部署自检、跨 NAT 自检。check_repository 在这次运行里报了三处，都是新文档还没写进 STATUS，写完 STATUS 后通过 |
+| 复核方推送的 CI | — | 复核文档提交随本文入库，它的运行编号由执行方在 U0 回填 |

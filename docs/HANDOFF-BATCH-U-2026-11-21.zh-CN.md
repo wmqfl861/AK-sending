@@ -252,3 +252,21 @@ bash scripts/cross_nat_test.sh --self-test
 | U4 全量门槛 | 本地 Windows（rustc 1.99.1） | fmt/clippy/rustdoc/workspace（69 组，1231/0/11，与批次 T 同一代码树一致）/sqlite（54/0）/server-persistence（221/0）/Python（372 OK）/repo/contracts（5/5 PASS）/部署自检（PASS）/跨NAT自检（PASS）全部通过；`flutter analyze`（flutter_app 下，含新增的 U2 runner）`No issues found!`——门槛套件脚本里 analyze 一行最初写错调用方式瞬时失败（cmd 下没有 flutter），已用正确调用单独重跑并通过，如实记录；`check_repository.py` 在回填本表提交号后通过（回填前只报状态表提交列占位） |
 | U 批次最终 CI | `1da6ddf` run [44899341718](https://github.com/wmqfl861/AK-sending/actions/runs/44899341718) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
 
+
+## 9. 复核方证据（2026-11-21）
+
+复核方在云端 Linux 工作区（2 vCPU，rustc 1.97.0，钉的 1.99.1 下载不到）执行；Windows 上的结果只来自 CI，Android 上的结果来自 §8。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 分支活动 | GitHub activity API | 2026-11-21T07:14:06Z 删除 `dev/batch-t-20261121`（`c40cf90`，main 此时也是 `c40cf90`）；11:29:27Z 一次推送创建 `dev/batch-u-20261121` @ `1da6ddf`（含 `91cf30c`、`1da6ddf`）；11:43:45Z 推送 `ce6b3d1`；之后复核方推送 `fee698c`（CR-P2-08、T-N3）与复核文档提交。全部是快进的普通推送，没有强推。执行方报完成是本地 20:26（12:26Z），此时最后一次推送的 CI 已于 11:55:12Z 跑完 |
+| 执行方推送的 CI | `1da6ddf` run [44899341718](https://github.com/wmqfl861/AK-sending/actions/runs/44899341718) | success：12 项常规任务 success，2 项手动深测 skipped（§8 最后一行与之一致） |
+| 执行方最后一次推送的 CI | `ce6b3d1` run [44900479721](https://github.com/wmqfl861/AK-sending/actions/runs/44900479721) | success：12 项常规任务 success，2 项手动深测 skipped |
+| main 上 `c40cf90` 的 CI | run [44877778996](https://github.com/wmqfl861/AK-sending/actions/runs/44877778996) | 第 1 次尝试 success：12 项常规任务 success，2 项手动深测 skipped（§8 第一行与 API 一致） |
+| U-N1 的依据 | §8 的 L1、L2 两行；runner 源码；`crates/ak-net/src/tls.rs` | L1：`KEYCODE_HOME` 16:05:59，`am start` 16:07:00，恢复前台 16:07:03，在后台约 64 s；宿主切出时、+30 s、+60 s 都是 `48.00 MiB acknowledged`，最后确认 80.00 MiB；应用侧 `maxStallMs=65857`。L2：`KEYCODE_POWER` 16:24:45，`KEYCODE_WAKEUP` 16:25:47、`dismiss-keyguard` 16:25:48；三次采样都是 48.00 MiB，最后 80.00 MiB；`maxStallMs=68436`。runner 的观察窗是 `_watchBudget = Duration(minutes: 10)`，从点击发送算起；200 MiB 按约 0.28 MiB/s 光数据就要约 714 s。QUIC：`MAX_IDLE_TIMEOUT` 60 s（两端都这样宣告，取较小值），`KEEP_ALIVE_INTERVAL` 10 s |
+| CR-P2-08：拆分规模 | `fee698c` | `ak-engine/src/lib.rs` 5,736 → 1,351 行，子模块 handshake 474、manifest 292、sender 1,207、receiver 1,624、recv_single 291、recv_multi 542；`ak-ffi/src/task.rs` 4,251 → 1,287，`task/` 下 stack 747、lease 245、ops 819、runs 543、join_send 518、events 152；`ak-cli/src/main.rs` 4,689 → 839，cli 477、args 149、peers 460、jobs 183、output 323、bench 343、pair_jobs 214、receive_cmd 469、send_cmd 809、services 514；`ak-signal/src/server_v2/engine.rs` 3,468 → 527，`engine/` 下 state 1,056、conn 437、hello 257、invites 251、pairing 809、sessions 190。28 个子文件里共 336 行带 `pub(super)` |
+| CR-P2-08：记号级证明 | `scripts/tokcmp split`（`fee698c` 新增） | 四个文件都是 `item multiset identical (visibility normalized): true`，条目数 158/158、112/112、188/188、110/110；`parent inner attributes identical: true`。源码行（含注释）：引擎 `true`；ak-ffi 只差 `parse_candidates`、`probe_result_line`、`spawn_receiver_punch`、`spawn_sender_opener` 四个签名被 rustfmt 折行；ak-cli 只差 `BENCH_DISCLAIMER`、`pair_add`、`send_failures_error`、`upsert_peer` 四处折行；ak-signal 只差 `redeem_allows`、`connection_loop`、`notify_pairing_unavailable` 三处折行。反向验证：把 `manifest.rs` 里的 `max_per_frame.max(1)` 临时改成 `max(2)`，报 `only in old/new: fn resume_request_frames`；把 `assemble_pages` 临时改成 `pub fn`，报 `only in old/new: fn assemble_pages`（两处临时改动都在副本上做，未提交） |
+| CR-P2-08：特性构建 | `fee698c` | `cargo check --locked --all-targets -p ak-signal -p ak-itests --features legacy-plaintext-signal`、`cargo check -p ak-cli --tests --features legacy-plaintext-signal`、`cargo check --locked -p ak-cli --features exp-knobs --all-targets` 都没有错误和警告 |
+| T-N3 | `fee698c` | `distributionSha256Sum=17f277867f6914d61b1aa02efab1ba7bb439ad652ca485cd8ca6842fccec6e43`，即 §8 U0 一行的两个值。CI 的 Android 任务没有 Gradle 缓存步骤，`flutter build apk --debug` 每次都经 wrapper 下载 |
+| CR-P2-08：测试名单与本地门槛 | `fee698c` 加本次文档 | 全部通过（914s）：fmt、clippy、workspace 69 组 1231 passed / 0 failed / 11 ignored、rustdoc、ak-store sqlite 52 passed、ak-signal server-persistence 221 passed、Python 372 OK、check_repository、check_contracts、部署自检、跨 NAT 自检。工作区测试的名单（`test … ok/ignored` 行，共 1,242 行）与批次 T 复核时（`0b8c288`，拆分之前）逐行相同 |
+| 复核方推送的 CI | — | 复核文档提交随本文入库，它的运行编号由执行方在 V0 回填 |

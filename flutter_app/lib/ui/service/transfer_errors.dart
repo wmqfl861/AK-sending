@@ -1,0 +1,335 @@
+/// W3 (V-N4): the error-copy mapping — a PURE function family (no Flutter
+/// imports, so plain `dart test` can drive it) that turns any error object
+/// thrown by the transfer stack plus a SCENE into the four copy lines the
+/// failure cards render:
+///
+/// * 标题（结果）— what happened, one short phrase;
+/// * 原因 — one sentence, plain language, never blaming the user;
+/// * 建议 — one actionable sentence (a verb, not 确定/知道了);
+/// * 详情原文 — the untouched original text (`AkFfiException(...)` etc.),
+///   shown ONLY inside the expandable 「详情」 with a copy button.
+///
+/// Classification is honest by ERROR CODE FIRST (ffi-v2 §3: `-2` invalid
+/// input, …) and message vocabulary second (the engine's fixed error
+/// strings, e.g. `stream failed: connection lost`). Idle expiry
+/// (`idle_expired` / `idle timeout`) and connection interruption
+/// (`connection lost` …) are DISTINCT kinds — V-N4 showed the idle copy on
+/// a connection-lost failure; the mapping layer now keeps them apart so
+/// the caller can display each honestly (W1 owns the engine-side truth).
+///
+/// Copy follows 审核 §4.3's 失败与恢复 table (five situations + the
+/// unknown fallback 「出了点问题」) and §4.5 (对方 not 对端, actions as
+/// buttons, no raw text outside 详情).
+library;
+
+import 'dart:async' show TimeoutException;
+
+/// Where the failure surfaced — picks the wording nuances (who can act).
+enum TransferErrorScene {
+  /// The pairing flows (create/join) on the home page.
+  pairing,
+
+  /// A send failed on the connection detail page.
+  sending,
+
+  /// A receive failed (the banner).
+  receiving,
+
+  /// The settings page's 「导出连接诊断」 failed.
+  diagnosticsExport,
+}
+
+/// The classified cause. Public so callers can branch on it (e.g. the
+/// detail page shows the idle copy only for [idleExpired]).
+enum TransferErrorKind {
+  /// 码无效或过期 — the code is unknown/used-up/expired (`-2`, `unknown
+  /// task code`, the service's own readable variants).
+  invalidCode,
+
+  /// 两端无法直连 — no candidate accepted the connection / connect
+  /// failed (the §4.3 direct-unavailable row).
+  directUnavailable,
+
+  /// 传输中断 — the connection broke (connection lost / stream failed /
+  /// peer vanished …). Resume from the checkpoint on re-send.
+  interrupted,
+
+  /// 配对闲置过久 — the engine's idle budget expired (`idle_expired`,
+  /// `idle timeout`). A LOCAL time-driven terminal, distinct from
+  /// [interrupted].
+  idleExpired,
+
+  /// 对方拒绝 — the receiving user declined (DECLINED semantics).
+  peerDeclined,
+
+  /// 保存位置不可写 — storage full / storage error on the receive side.
+  saveDirNotWritable,
+
+  /// 长时间无进展 — a stall budget ran out (发送/接收/加入超时,
+  /// `TimeoutException`).
+  stalled,
+
+  /// Anything else — the 「出了点问题」 fallback.
+  unknown,
+}
+
+/// The four rendered copy lines of one failure.
+class TransferErrorView {
+  const TransferErrorView({
+    required this.kind,
+    required this.title,
+    required this.reason,
+    required this.suggestion,
+    required this.detail,
+  });
+
+  final TransferErrorKind kind;
+
+  /// 标题：说结果，一句短语。
+  final String title;
+
+  /// 原因：一句人话，不责备用户。
+  final String reason;
+
+  /// 建议：一句可执行的动作。
+  final String suggestion;
+
+  /// 详情原文：错误码与原始消息，只进可展开的「详情」。
+  final String detail;
+}
+
+/// The fallback title every unknown error shares (审核 §4.3).
+const String unknownErrorTitle = '出了点问题';
+
+/// The fallback suggestion (审核 §4.3): retry, then export diagnostics.
+const String unknownErrorSuggestion = '重试；仍不行请导出连接诊断。';
+
+/// The idle-expiry status copy the connection detail page shows ONLY for
+/// idle-class endings (J2 wording, kept verbatim).
+const String idleExpiryTitle = '配对已闲置过久';
+const String idleExpirySuggestion = '请重新配对。';
+
+/// The interruption copy (W1/W3.3): a connection that broke — as opposed
+/// to an idle expiry.
+const String interruptedTitle = '连接已中断';
+const String interruptedSuggestion = '重新发送，会从断点续传';
+
+/// The one-line status the connection detail page shows for a dropped
+/// (non-idle) connection: the interruption title plus the resume hint.
+const String interruptedStatusLine = '连接已中断，重新发送会从断点续传。';
+
+/// Maps [error] (ANY object — `AkFfiException`, `TimeoutException`,
+/// `StateError`, a plain service-authored String …) in [scene] to the
+/// four copy lines. Pure: same input, same output, no side effects.
+TransferErrorView transferErrorView(Object error, TransferErrorScene scene) {
+  final kind = classifyTransferError(error);
+  return viewForKind(kind, scene, detail: detailTextOf(error));
+}
+
+/// The copy table lookup for a known [kind] (the detail line defaults to
+/// empty — callers that own an original text pass it in).
+TransferErrorView viewForKind(
+  TransferErrorKind kind,
+  TransferErrorScene scene, {
+  String detail = '',
+}) {
+  final copy = switch (kind) {
+    TransferErrorKind.invalidCode => const (
+          '这个码用不了',
+          '码可能输错了，或已过期/已被使用（10 分钟内有效）。',
+          '请让对方重新生成，再输入新的码。',
+        ),
+    TransferErrorKind.directUnavailable => const (
+          '无法直接连接到对方',
+          '两台设备的网络都不允许外部直接连入。连同一个 Wi-Fi 通常就能解决。'
+              '文件不会经过服务器中转。',
+          '请再试一次；仍不行时查看连接帮助。',
+        ),
+    TransferErrorKind.interrupted => switch (scene) {
+          TransferErrorScene.receiving => const (
+            '传输中断了',
+            '与对方的连接断开了（例如对方应用在后台太久）。',
+            '请让对方重新发送，会从断点继续。',
+          ),
+          TransferErrorScene.pairing => const (
+            interruptedTitle,
+            '与对方的连接断开了。',
+            '请重新配对；重新发送会从断点续传。',
+          ),
+          _ => const (
+            '传输中断了',
+            '连接断开了（例如应用在后台太久）。',
+            '重新发送，会从断点续传。',
+          ),
+        },
+    TransferErrorKind.idleExpired => const (
+          idleExpiryTitle,
+          '配对后长时间没有传输，本次配对已自动结束。',
+          idleExpirySuggestion,
+        ),
+    TransferErrorKind.peerDeclined => const (
+          '对方没有接受',
+          '对方拒绝了这次传输，文件没有发出。',
+          '可与对方确认后重新发送。',
+        ),
+    TransferErrorKind.saveDirNotWritable => const (
+          '无法保存到所选文件夹',
+          '保存位置不可写，或剩余空间不够。',
+          '请在「设置」里更换保存文件夹后重试。',
+        ),
+    TransferErrorKind.stalled => switch (scene) {
+          TransferErrorScene.receiving => const (
+            '接收长时间没有进展',
+            '接收过程中长时间没有数据流动，已停止。',
+            '请让对方重新发送，会从断点继续。',
+          ),
+          TransferErrorScene.pairing => const (
+            '配对超时',
+            '配对长时间没有完成。',
+            '请重试。',
+          ),
+          _ => const (
+            '传输长时间没有进展',
+            '传输过程中长时间没有数据流动，已停止。',
+            '重新发送，会从断点续传。',
+          ),
+        },
+    TransferErrorKind.unknown => (
+          unknownErrorTitle,
+          '出现了意料之外的错误。',
+          scene == TransferErrorScene.diagnosticsExport
+              ? '请重试；仍然失败时请重启应用。'
+              : unknownErrorSuggestion,
+        ),
+  };
+  return TransferErrorView(
+    kind: kind,
+    title: copy.$1,
+    reason: copy.$2,
+    suggestion: copy.$3,
+    detail: detail,
+  );
+}
+
+/// Classifies [error] into a [TransferErrorKind]. Error code first
+/// (an `AkFfiException`-shaped `code` field), then the message
+/// vocabulary (the engine's fixed strings), then the fallback.
+TransferErrorKind classifyTransferError(Object error) {
+  final text = messageTextOf(error).toLowerCase();
+  // Error-code facts: the negative FFI statuses (ffi-v2 §3). `-2`
+  // (AK_ERR_INVALID) on the pairing path is the used-up/unknown code
+  // shape the adapter reports; other negative codes carry their own
+  // message vocabulary below.
+  final code = errorCodeOf(error);
+  if (code != null && code < 0) {
+    if (code == -2) {
+      // AK_ERR_INVALID: malformed/invalid input — on every transfer
+      // scene here that means the task code (spec/JSON validation of
+      // the join).
+      return TransferErrorKind.invalidCode;
+    }
+    // -1/-3/-5 are programming/buffer/internal faults with no user
+    // action beyond the fallback; -4 (not found) falls through to the
+    // message vocabulary (unknown task code says it better).
+  }
+  // Idle expiry FIRST: it must never be swallowed by the interruption
+  // vocabulary (V-N4) — `idle_expired` (event reason), `idle timeout`
+  // (EngineError::IdleTimeout), the J2 UI copy.
+  if (text.contains('idle_expired') ||
+      text.contains('idle timeout') ||
+      text.contains('配对已闲置')) {
+    return TransferErrorKind.idleExpired;
+  }
+  if (text.contains('declined') ||
+      text.contains('对方拒绝') ||
+      text.contains('peer rejected the offer')) {
+    return TransferErrorKind.peerDeclined;
+  }
+  if (text.contains('unknown task code') ||
+      text.contains('任务码无效') ||
+      text.contains('配对码不存在') ||
+      text.contains('配对码格式不正确') ||
+      text.contains('该请求已失效')) {
+    return TransferErrorKind.invalidCode;
+  }
+  if (text.contains('storage full') ||
+      text.contains('storage error') ||
+      text.contains('磁盘空间不足') ||
+      text.contains('空间不足') ||
+      text.contains('无法保存')) {
+    return TransferErrorKind.saveDirNotWritable;
+  }
+  // Direct-unavailable BEFORE interrupted/stalled: a connect-phase
+  // failure that happens to mention a timeout is still 「无法直连」.
+  if (text.contains('no candidate accepted') ||
+      text.contains('connect failed') ||
+      text.contains('无法建立直连') ||
+      text.contains('连通测试未通过')) {
+    return TransferErrorKind.directUnavailable;
+  }
+  if (text.contains('connection lost') ||
+      text.contains('connection reset') ||
+      text.contains('connection closed') ||
+      text.contains('broken pipe') ||
+      text.contains('stream failed') ||
+      text.contains('peer vanished') ||
+      text.contains('连接已断开') ||
+      text.contains('接收已中断') ||
+      text.contains('连接中断') ||
+      text.contains('中断了连接') ||
+      text.contains('对端中断')) {
+    return TransferErrorKind.interrupted;
+  }
+  if (error is TimeoutException ||
+      text.contains('timed out') ||
+      text.contains('timeout') ||
+      text.contains('超时') ||
+      text.contains('无进展')) {
+    return TransferErrorKind.stalled;
+  }
+  return TransferErrorKind.unknown;
+}
+
+/// The int status code when [error] carries one (`AkFfiException.code`);
+/// null otherwise. Dynamic by design: the mapping layer must not import
+/// the FFI package (pure Dart, `dart test` friendly) while still reading
+/// the exception's facts.
+int? errorCodeOf(Object error) {
+  try {
+    final dynamic code = (error as dynamic).code;
+    if (code is int) {
+      return code;
+    }
+  } on Object {
+    // No `code` member (String errors, StateError, …) — not an error.
+  }
+  return null;
+}
+
+/// The exception's own message when it has one (`AkFfiException.message`);
+/// a plain String error IS its message; else the empty string.
+String messageTextOf(Object error) {
+  if (error is String) {
+    return error;
+  }
+  try {
+    final dynamic message = (error as dynamic).message;
+    if (message is String) {
+      return message;
+    }
+  } on Object {
+    // Fall through to the toString shape.
+  }
+  return '';
+}
+
+/// The 详情原文 line: the ORIGINAL text with its error code —
+/// `AkFfiException(AK_FAILED 2): …` already renders both; a plain String
+/// error (a service-authored reason) is itself; everything else falls
+/// back to `toString()`.
+String detailTextOf(Object error) {
+  if (error is String) {
+    return error;
+  }
+  return '$error';
+}

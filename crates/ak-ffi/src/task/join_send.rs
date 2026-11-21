@@ -379,12 +379,43 @@ pub(super) async fn run_send(
             ));
         }
         if let Some((addr, failure)) = outcome.fatal {
-            if let AttemptOutcome::FailedAfterConnect { reason, peer_gone } = failure {
-                if peer_gone {
-                    // The peer's data plane is gone — the pairing is
-                    // ending ByPeer through the event pump; a resumed
-                    // keepalive would only hold a dead mapping.
-                    report_peer_gone(rt, &conn);
+            if let AttemptOutcome::FailedAfterConnect { reason, verdict } = failure {
+                // W1 (batch W, 2026-11-22, V-N2): a post-connect failure
+                // is terminal for the CONNECTION — EXCEPT the declined
+                // offer, which the frozen ffi-v2 §8.4 keeps retryable on
+                // the same code. Before this fix only `PeerClosed`
+                // reported the pairing; every other post-connect error
+                // left the op a plain failure and the connection a
+                // zombie — the V2-b walkthrough shape (the sender's QUIC
+                // connection died of its idle budget while Android froze
+                // the process; after thaw the send op failed, no
+                // `disconnected` event ever fired, and the row stayed
+                // `connected` from t=121 s until the 10-minute pairing
+                // budget's `idle_expired` at t=719.6 s). Each verdict
+                // ends (or deliberately spares) the connection exactly
+                // once: a verifiable peer departure keeps the ByPeer
+                // reporting (the event pump's `disconnected`/`peer`), a
+                // decline spares the pairing, and the rest close through
+                // [`TaskRt::push_disconnected_once`] with the honest
+                // `conn_lost` reason — a connection interrupted
+                // mid-flight, NOT the pairing idle budget's
+                // `idle_expired` (ffi-v2 §8.3, 批次 W 增补).
+                match verdict {
+                    PostConnectVerdict::PeerGone => {
+                        // The peer's data plane is gone — the pairing is
+                        // ending ByPeer through the event pump; a resumed
+                        // keepalive would only hold a dead mapping.
+                        report_peer_gone(rt, &conn);
+                    }
+                    PostConnectVerdict::Declined => {
+                        // The receiver's protocol Reject (ffi-v2 §8.4:
+                        // 拒绝不是任务终态): the listener keeps serving,
+                        // a fresh send on the same code is legal — the
+                        // connection survives the failed op.
+                    }
+                    PostConnectVerdict::Lost => {
+                        rt.push_disconnected_once(&conn_id, "conn_lost");
+                    }
                 }
                 return Err(format!(
                     "transfer failed after connecting via {addr}: {reason}"
@@ -414,11 +445,30 @@ enum AttemptOutcome {
     Done(Report),
     FailedAfterConnect {
         reason: String,
-        /// The engine named the peer's departure (`PeerClosed`): the
-        /// pairing is reported ByPeer after the op fails.
-        peer_gone: bool,
+        /// W1 (batch W): what the failure means for the CONNECTION —
+        /// see [`PostConnectVerdict`].
+        verdict: PostConnectVerdict,
     },
     ConnectFailed(String),
+}
+
+/// What one post-connect failure means for the connection's lifecycle
+/// (W1, batch W 2026-11-22): every variant except the decline ends the
+/// connection — the pairing is unusable or the peer is verifiably gone —
+/// while a DECLINED offer keeps it for the frozen same-code retry.
+enum PostConnectVerdict {
+    /// The engine named the peer's departure (`PeerClosed`): the pairing
+    /// is reported ByPeer after the op fails (the event pump's
+    /// `disconnected`/`peer`).
+    PeerGone,
+    /// The receiver's protocol Reject — the offer was declined. NOT a
+    /// task terminal state (ffi-v2 §8.4: 同码可重试): the failed op
+    /// leaves the connection and its listener alone.
+    Declined,
+    /// Everything else (the idle-timeout death of a frozen process, IO
+    /// and protocol failures): the connection is interrupted — terminal
+    /// `disconnected`/`conn_lost`.
+    Lost,
 }
 
 /// One candidate attempt under the split connect budget (the wave-25/26
@@ -476,7 +526,15 @@ async fn attempt_task_send(
     }
     spec.checkpoint_dir = rt.id_dir.join("checkpoints");
     spec.device_name = format!("ak-task-{}", rt.device_fp.short_id());
-    spec.idle_timeout = TASK_SEND_IDLE;
+    // W1: the runtime's idle budget (TASK_SEND_IDLE in production; a
+    // per-runtime test override exists for the conn_lost scenario — see
+    // the field docs on TaskRt). A poisoned lock falls back to the
+    // production constant — the budget is never worth a panic.
+    spec.idle_timeout = rt
+        .send_idle_timeout
+        .lock()
+        .map(|slot| *slot)
+        .unwrap_or(TASK_SEND_IDLE);
 
     let progress_queue = Arc::clone(&rt.engine_progress);
     let conn_hex = core::hex_encode(&conn.conn_id);
@@ -506,10 +564,25 @@ async fn attempt_task_send(
         Err(error) => {
             let reason = one_line_reason(&error);
             if after_connect {
-                AttemptOutcome::FailedAfterConnect {
-                    peer_gone: matches!(error, EngineError::PeerClosed),
-                    reason,
-                }
+                // W1 (batch W): classify the failure's meaning for the
+                // connection — the declined offer is the one post-connect
+                // failure that must NOT end the pairing (ffi-v2 §8.4).
+                // The decline rides an Error frame with the DECLINED wire
+                // code (the receiver's consent refusal), and the peer's
+                // authenticated TASK-CLOSE is a deliberate departure —
+                // both classified exactly like the CLI's task adapter.
+                let verdict = match &error {
+                    EngineError::PeerClosed => PostConnectVerdict::PeerGone,
+                    EngineError::PeerError { message, .. } if message == TASK_CLOSE_MESSAGE => {
+                        PostConnectVerdict::PeerGone
+                    }
+                    EngineError::PeerError { code, .. } if *code == DECLINED_WIRE_CODE => {
+                        PostConnectVerdict::Declined
+                    }
+                    EngineError::Rejected(_) => PostConnectVerdict::Declined,
+                    _ => PostConnectVerdict::Lost,
+                };
+                AttemptOutcome::FailedAfterConnect { verdict, reason }
             } else {
                 AttemptOutcome::ConnectFailed(reason)
             }

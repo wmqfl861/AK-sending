@@ -80,18 +80,26 @@ void main() {
     expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    // Pairing + probe to success still fits at phone width.
+    // Pairing + probe to success still fits at phone width. W7.2: the
+    // sender success auto-opens the detail page with the picker.
     final id = fake.simulatePeerJoin(peerName: '特别长特别长的对端设备名称X');
     await pumpEvents(tester);
     await tester.pump();
     fake.completeProbe(id);
     await pumpEvents(tester);
     await tester.pump();
-    expect(find.byKey(const ValueKey('flow_success')), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.byKey(const ValueKey('pick_files_option')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    await tester.tap(find.byKey(const ValueKey('flow_done_button')));
+    // Dismiss the auto-opened sheet; back home the card is listed.
+    await tester.tapAt(const Offset(10, 10));
     await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pageBack();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
     expect(find.byKey(ValueKey('conn_card_name_$id')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

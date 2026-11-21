@@ -76,6 +76,13 @@ void main() {
     await tester.pump();
     expect(find.byKey(const ValueKey('incoming_error_job-1')),
         findsOneWidget);
+    // W3: the mapped interruption card; the verbatim reason only inside
+    // the expandable 详情.
+    expect(find.text('传输中断了'), findsOneWidget);
+    expect(find.textContaining('对端中断了连接'), findsNothing);
+    await tester.tap(
+        find.byKey(const ValueKey('incoming_error_job-1_toggle')));
+    await tester.pump();
     expect(find.textContaining('对端中断了连接'), findsOneWidget);
 
     await tester.tap(

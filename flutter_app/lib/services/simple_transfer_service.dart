@@ -45,12 +45,18 @@
 ///   and a late `connected` event never downgrades a row the probe
 ///   already settled.
 /// * `disconnected` events only kill a row for the DATA-PLANE reasons
-///   (`local` | `peer` | `receiver_failed` | `done`, wave-29 P2-08 +
-///   wave-30 P2-05): a coordination-plane notice (any other reason, e.g.
-///   a registry link loss) leaves still-healthy direct connections
-///   untouched. `done` marks the one-task transfer COMPLETED — the row
-///   converges to a completed state that no longer offers sends (the
-///   `done` EVENT converges the row the same way).
+///   (`local` | `peer` | `receiver_failed` | `done` | `idle_expired` |
+///   `conn_lost`, wave-29 P2-08 + wave-30 P2-05 + J2 + W1): a
+///   coordination-plane notice (any other reason, e.g. a registry link
+///   loss) leaves still-healthy direct connections untouched. `done`
+///   marks the one-task transfer COMPLETED — the row converges to a
+///   completed state that no longer offers sends (the `done` EVENT
+///   converges the row the same way). `conn_lost` (W1, batch W) is the
+///   engine's "connection interrupted mid-flight" verdict (a send that
+///   died after connecting — e.g. the QUIC idle death of a frozen
+///   process); the resume reconciliation and the no-progress stall
+///   watchdog below mark rows the same way when the engine's own event
+///   never arrived.
 /// * disconnecting the last live connection returns to `idle`;
 ///   `failed(reason)` carries the engine's last-error detail.
 ///
@@ -89,6 +95,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskProbeResultEvent,
         TaskRequestClosedEvent,
         TaskEventDoorbell,
+        TaskListSnapshot,
         TaskRuntimeFfi,
         TaskFfi;
 
@@ -616,6 +623,7 @@ final class SimpleTransferService {
         const Duration(milliseconds: activeEventPollMs),
     this.opPollInterval = const Duration(milliseconds: activeOpPollMs),
     this.idlePollInterval = const Duration(milliseconds: idleEventPollMs),
+    this.transferStallBudget = const Duration(seconds: 150),
     AkTaskDoorbellRegistrar? doorbellRegistrar,
     Future<void> Function(Duration)? delay,
     DateTime Function()? clock,
@@ -684,6 +692,19 @@ final class SimpleTransferService {
   /// [eventPollInterval] (tests stretching it to `days:1` to pump
   /// manually) stays that slow at idle too.
   final Duration idlePollInterval;
+
+  /// W1 (batch W, 2026-11-22, V-N2): the no-progress STALL budget of an
+  /// in-progress transfer — mirrors the sender-side [sendFiles] stall
+  /// budget and the engine's `TASK_SEND_IDLE` (150 s). A transfer whose
+  /// fold is in the transferring/verifying phase and has produced NO
+  /// progress line for this long is marked failed with reason
+  /// `conn_lost` (传输中断) by the pump's watchdog — the zombie-row fix
+  /// for the side whose engine events never arrive (a frozen peer, a
+  /// lost event). Waits that legitimately produce no progress lines
+  /// (the 120 s consent window) are NOT in the watchdog's scope: only
+  /// `transferring`/`verifying` folds are checked, and those phases
+  /// exist only after real bytes started moving.
+  final Duration transferStallBudget;
 
   /// Injectable delay (tests drive the loops synchronously with a
   /// zero-delay stand-in).
@@ -778,6 +799,27 @@ final class SimpleTransferService {
   /// send/receive stall loops). A tick advancing means "bytes moved since
   /// the last look" — the deadline-renewal fact.
   final Map<String, int> _progressTicks = <String, int>{};
+
+  /// W1 (batch W): per-connection clock time of the LAST progress fact
+  /// (a tick advance) — the stall watchdog's baseline. Cleaned with the
+  /// transfer fold ([_settleTransfer]).
+  final Map<String, DateTime> _lastProgressAt = <String, DateTime>{};
+
+  /// W7.3 (batch W, 交接 §4.7 第 3 条): the connections with a transfer
+  /// IN PROGRESS — a send op between entry and settle, or a live
+  /// progress fold. The shared "any transfer active" fact the
+  /// keep-screen-on channel keys on (see [isTransferInProgress] /
+  /// [transferActivity]).
+  final Set<String> _inProgressTransfers = <String>{};
+
+  /// W7.3: the last value fanned out on [transferActivity].
+  bool _transferActivityOn = false;
+
+  /// W7.3: the "any transfer in progress" fan-out (snapshot + live, like
+  /// [engineHealth] — a late subscriber learns the current state without
+  /// waiting for the next transition).
+  final StreamController<bool> _transferActivityController =
+      StreamController<bool>.broadcast();
 
   /// Client UI U1: the live transfers' progress folds, by connection id
   /// (created by the first progress line, dropped when the connection
@@ -910,7 +952,10 @@ final class SimpleTransferService {
     _idleExpiryController.close();
     _healthController.close();
     _progressController.close();
+    _transferActivityController.close(); // W7.3
     _transfers.clear();
+    _inProgressTransfers.clear(); // W7.3
+    _lastProgressAt.clear(); // W1
   }
 
   // -- the three actions --------------------------------------------------
@@ -1113,6 +1158,9 @@ final class SimpleTransferService {
     final runtime = _runtimeOrThrow();
     _ensureLive();
     _beginOp(); // CR-P2-05: a pending op is activity — fast cadence NOW
+    // W7.3: a send in flight IS a transfer in progress (the shared
+    // keep-screen-on fact) — even before the first progress fold.
+    _trackTransferBegin(connId);
     final lastSeen = <String, int>{}; // THIS waiter's cross-poll ledger
     try {
       final report = await runtime.send(connId, AkTaskSendSpec(paths: paths)).wait(
@@ -1147,6 +1195,9 @@ final class SimpleTransferService {
         timeout,
       );
     } finally {
+      // W7.3: the send settled — its in-progress vote goes with it (a
+      // later fold for the same conn, if any, re-adds it).
+      _trackTransferEnd(connId);
       _endOp();
     }
   }
@@ -1287,6 +1338,9 @@ final class SimpleTransferService {
             final job = decoded['job'];
             if (job is String && job.isNotEmpty) {
               _progressTicks[job] = (_progressTicks[job] ?? 0) + 1;
+              // W1: the stall watchdog's baseline — a fresh progress fact
+              // re-arms the transfer's no-progress budget.
+              _lastProgressAt[job] = _clock();
               fields = decoded;
             }
           }
@@ -1318,6 +1372,55 @@ final class SimpleTransferService {
   Stream<SimpleTransferProgress> get transferProgress =>
       _progressController.stream;
 
+  /// W7.3 (batch W, 交接 §4.7 第 3 条): is any transfer IN PROGRESS right
+  /// now — a [sendFiles] between entry and settle, or a live progress
+  /// fold? The shared state-machine judgment the keep-screen-on channel
+  /// (Android) and the transfer hints key on; transitions fan out on
+  /// [transferActivity].
+  bool get isTransferInProgress => _inProgressTransfers.isNotEmpty;
+
+  /// W7.3: the [isTransferInProgress] transitions — EVERY listen first
+  /// receives the CURRENT snapshot, then the live changes (the
+  /// [engineHealth] replay pattern).
+  Stream<bool> get transferActivity => Stream.multi((controller) {
+        // Live tap FIRST — a transition fired after this point queues
+        // behind the snapshot below (FIFO delivery, no gap).
+        final live = _transferActivityController.stream.listen(
+          controller.add,
+          onError: controller.addError,
+          onDone: controller.close,
+        );
+        controller.add(_transferActivityOn);
+        controller.onCancel = () => live.cancel();
+      });
+
+  /// W7.3: one connection's transfer entered the in-progress set.
+  void _trackTransferBegin(String connId) {
+    if (_inProgressTransfers.add(connId)) {
+      _emitTransferActivity();
+    }
+  }
+
+  /// W7.3: one connection's transfer left the in-progress set (settled,
+  /// failed, cancelled or its row went terminal).
+  void _trackTransferEnd(String connId) {
+    if (_inProgressTransfers.remove(connId)) {
+      _emitTransferActivity();
+    }
+  }
+
+  /// W7.3: fan out the "any transfer in progress" edge transitions.
+  void _emitTransferActivity() {
+    final active = _inProgressTransfers.isNotEmpty;
+    if (active == _transferActivityOn) {
+      return; // no edge — no event
+    }
+    _transferActivityOn = active;
+    if (!_transferActivityController.isClosed) {
+      _transferActivityController.add(active);
+    }
+  }
+
   /// Folds one decoded progress line into its transfer's tracker. NEVER
   /// throws and never feeds the C12 streak: a line whose payload fields
   /// are missing (an engine predating the ffi-v2 §8.4 U1 revision) or
@@ -1344,6 +1447,10 @@ final class SimpleTransferService {
         // UI can say what the send waits for before any byte moves.
         tracker = _TransferTracker(job)..dirty = true;
         _transfers[job] = tracker;
+        // W7.3: the fold existing IS the in-progress fact (a receive, or
+        // the engine's own send fold) — shared with the keep-screen-on
+        // judgment.
+        _trackTransferBegin(job);
       } else if (tracker.phaseRank >= 4) {
         // v1: one pairing carries ONE transfer — a completed tracker
         // stays until its row goes terminal, and nothing reopens it.
@@ -1466,6 +1573,10 @@ final class SimpleTransferService {
   /// `done` line) gets it now; an aborted transfer simply stops.
   void _settleTransfer(String connId, String state) {
     final tracker = _transfers.remove(connId);
+    // W1/W7.3: the fold's death ends both the stall baseline and the
+    // in-progress fact (the send op's own finally handles its half).
+    _lastProgressAt.remove(connId);
+    _trackTransferEnd(connId);
     if (tracker == null || state != 'done' || tracker.phaseRank >= 4) {
       return;
     }
@@ -1666,7 +1777,12 @@ final class SimpleTransferService {
   ///
   /// Foreground again: the connection/task state refreshes IMMEDIATELY
   /// (one synchronous drain of everything that queued while hidden),
-  /// then the pump re-arms at the activity-decided cadence.
+  /// the rows are RECONCILED against the engine's own connection
+  /// snapshot (W1: an event lost while the process was frozen/suspended
+  /// must not leave a zombie row — a connection the engine no longer
+  /// knows, or already reports `disconnected`, is marked failed with
+  /// `conn_lost` right here), then the pump re-arms at the
+  /// activity-decided cadence.
   void setAppBackgrounded(bool backgrounded) {
     if (_disposed || _appBackgrounded == backgrounded) {
       return;
@@ -1674,8 +1790,42 @@ final class SimpleTransferService {
     _appBackgrounded = backgrounded;
     if (!backgrounded) {
       _pumpOnce(); // refresh first: drain what queued while hidden
+      _reconcileWithEngineSnapshot(); // W1: no zombie rows survive a resume
     }
     _syncPump();
+  }
+
+  /// W1 (batch W, 2026-11-22, V-N2): compare the local rows with the
+  /// engine's `ak_task_list` snapshot ONCE per resume. A live row whose
+  /// connection the engine no longer lists, or already reports
+  /// `disconnected`, is terminal NOW with reason `conn_lost` — the
+  /// honest verdict for an event that died in a frozen/suspended
+  /// process (the V2-b zombie: connected at t=121 s, no terminal event
+  /// until `idle_expired` at t=719.6 s). A failed or missing snapshot
+  /// degrades silently: the next pump/resume reconciles again.
+  void _reconcileWithEngineSnapshot() {
+    final runtime = _runtime;
+    if (runtime == null || _disposed || _engineFailed) {
+      return;
+    }
+    final TaskListSnapshot snapshot;
+    try {
+      snapshot = runtime.list();
+    } on Object {
+      return; // transient snapshot failure — never block the resume
+    }
+    final engineStates = <String, String>{
+      for (final row in snapshot.connections) row.connId: row.state,
+    };
+    for (final row in _connections.values.toList()) {
+      if (_stateRank(row.state) >= 2) {
+        continue; // already terminal locally
+      }
+      final engineState = engineStates[row.connId];
+      if (engineState == null || engineState == 'disconnected') {
+        _markTerminal(row.connId, 'disconnected', reason: 'conn_lost');
+      }
+    }
   }
 
   // -- internals ----------------------------------------------------------
@@ -1956,6 +2106,10 @@ final class SimpleTransferService {
     // pairing completion, never reset by recovery) ran out — terminal
     // for the pairing, with a dedicated UI copy.
     'idle_expired',
+    // W1 (batch W, 2026-11-22): the engine's "connection interrupted"
+    // verdict — a send that died after connecting (ffi-v2 §8.3 批次 W
+    // 增补). The UI copy layer maps it to 传输中断.
+    'conn_lost',
   };
 
   /// Converge the row to a TERMINAL state (`disconnected`, or `done` —
@@ -2082,6 +2236,39 @@ final class SimpleTransferService {
     final drain = drainProgress();
     if (drain.clean && _consecutivePollFailures > 0) {
       _consecutivePollFailures = 0; // BOTH channels clean: clear the streak
+    }
+    // W1 (batch W): the no-progress stall watchdog rides THIS tick (no
+    // extra thread/timer of its own — the pump already runs at the
+    // activity-decided cadence, foreground and background alike).
+    _checkStalledTransfers();
+  }
+
+  /// W1 (batch W, 2026-11-22, V-N2): a transfer whose fold is mid-flight
+  /// (transferring/verifying — real bytes already moved) and has produced
+  /// NO progress line for [transferStallBudget] is marked failed with
+  /// reason `conn_lost`. Scope is deliberately narrow: a fold waiting
+  /// for consent or still connecting produces no progress lines BY
+  /// DESIGN (their waits have their own budgets — the sender's
+  /// [sendFiles] stall and the receiver's 120 s native window), so only
+  /// the transferring/verifying ranks are checked. The mark is local:
+  /// the engine discovers its own dead connection (now with the honest
+  /// `conn_lost` event of the W1 Rust fix) and a late genuine `done`
+  /// still converges the row.
+  void _checkStalledTransfers() {
+    if (_transfers.isEmpty || _lastProgressAt.isEmpty) {
+      return;
+    }
+    final now = _clock();
+    for (final entry in _transfers.entries.toList()) {
+      final tracker = entry.value;
+      if (tracker.phaseRank < 2 || tracker.phaseRank >= 4) {
+        continue; // not mid-flight / already completed
+      }
+      final lastAt = _lastProgressAt[entry.key];
+      if (lastAt == null || now.difference(lastAt) < transferStallBudget) {
+        continue;
+      }
+      _markTerminal(entry.key, 'disconnected', reason: 'conn_lost');
     }
   }
 

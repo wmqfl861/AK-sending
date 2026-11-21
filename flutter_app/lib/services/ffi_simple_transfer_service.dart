@@ -90,6 +90,7 @@ import '../ui/service/simple_transfer_service.dart'
         formatBytes;
 
 import 'direct_path_label.dart' show directPathLabel;
+import 'screen_keep_awake.dart' show ScreenKeepAwake;
 import 'simple_transfer_service.dart' as task_engine;
 
 /// The real wave-28 service for the frozen UI contract.
@@ -132,7 +133,19 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     identityDirReady = _isAndroidPlatform
         ? _resolveAndroidIdentityDir(_androidIdentityDir)
         : Future<void>.value();
+    // W7.3 (batch W 交接 §4.7 第 3 条): the keep-screen-on coordinator
+    // over the ENGINE service's shared in-progress judgment — Android
+    // only (the injected gate mirrors this adapter's own platform
+    // seam), best-effort channel, released in [dispose] before the
+    // engine service goes.
+    _screenKeepAwake = ScreenKeepAwake(
+      service: _engine,
+      isAndroid: () => _isAndroidPlatform,
+    );
   }
+
+  /// W7.3: the `dev.ak/screen` coordinator (see [ScreenKeepAwake]).
+  late final ScreenKeepAwake _screenKeepAwake;
 
   /// Explicit registry endpoint override (tests/operators); null resolves
   /// from the environment/compiled defaults at [start].
@@ -220,12 +233,16 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     _requestSub = _engine.incomingRequests.listen((request) {
       _connOfJob[request.jobId] = request.connId;
     });
+    // W7.3: follow the transfers for the keep-screen-on flag from here
+    // on (idempotent; the first event is the current snapshot).
+    _screenKeepAwake.start();
   }
 
   @override
   void dispose() {
     _requestSub?.cancel();
     _requestSub = null;
+    _screenKeepAwake.dispose(); // W7.3: release the screen flag first
     _engine.dispose();
     engineOwner?.call(); // the native engine goes LAST (borrowers first)
   }

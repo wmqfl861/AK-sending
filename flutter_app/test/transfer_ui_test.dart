@@ -108,8 +108,8 @@ void main() {
     expect(find.byKey(const ValueKey('conn_state_ended')), findsOneWidget);
     expect(find.text('本次传输已完成，配对随之结束。如需再次传输，请重新配对。'),
         findsOneWidget);
-    expect(find.textContaining('此连接已断开'), findsNothing,
-        reason: '正常结束不能说成对端离开或网络变化');
+    expect(find.textContaining('连接已中断'), findsNothing,
+        reason: '正常结束不能说成连接中断');
     expect(find.byKey(const ValueKey('conn_send_result')), findsOneWidget,
         reason: '发送卡保留结果，不翻成接收卡');
     expect(find.text('此连接用于接收'), findsNothing);
@@ -301,7 +301,9 @@ void main() {
         findsNothing);
     expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
     expect(find.text('配对已闲置过久，请重新配对。'), findsOneWidget);
-    expect(find.text('此连接已断开（对端离开或网络变化）。'), findsNothing);
+    // W3.3: the idle copy is exclusive to the idle reason — the W1
+    // interruption wording must NOT appear (and vice versa below).
+    expect(find.textContaining('连接已中断'), findsNothing);
     expect(find.byKey(const ValueKey('conn_state_ended')), findsNothing,
         reason: 'an idle expiry is never a completed transfer');
     expect(find.byKey(const ValueKey('conn_send_result')), findsNothing);
@@ -324,14 +326,17 @@ void main() {
     expect(closed, isTrue);
   });
 
-  testWidgets('J2: a plain drop keeps the generic copy', (tester) async {
+  testWidgets('J2: a plain drop keeps the interruption copy (W3.3)',
+      (tester) async {
     final fake = await pumpApp(tester);
     final id = await openSendDetail(tester, fake);
 
     fake.disconnect(id);
     await pumpEvents(tester);
     await tester.pump();
-    expect(find.text('此连接已断开（对端离开或网络变化）。'), findsOneWidget);
+    // W3.3 (V-N4): a drop WITHOUT the idle reason is an interruption —
+    // the idle wording must never appear.
+    expect(find.text('连接已中断，重新发送会从断点续传。'), findsOneWidget);
     expect(find.text('配对已闲置过久，请重新配对。'), findsNothing);
   });
 }

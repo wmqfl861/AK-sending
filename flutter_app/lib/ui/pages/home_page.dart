@@ -21,11 +21,13 @@ import 'package:flutter/services.dart'
 import '../service/file_pick_gateway.dart';
 import '../service/pairing_flow_controller.dart';
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_errors.dart';
 import '../service/transfer_format.dart';
 import '../service/transfer_history.dart';
 import '../theme.dart';
 import '../widgets/engine_error_card.dart';
 import '../widgets/task_connection_views.dart';
+import '../widgets/transfer_error_card.dart';
 import 'connection_detail_page.dart';
 
 /// Home page: pairing flows + current connections.
@@ -62,6 +64,11 @@ class _HomePageState extends State<HomePage> {
 
   /// True while the join-code input panel is open (the 输入配对码 action).
   bool _joinInputOpen = false;
+
+  /// W7.2: the connection whose detail page this flow already
+  /// auto-opened (one auto-open per pairing — a re-latch of the same
+  /// connection never pushes twice).
+  String? _autoOpenedConnectionId;
 
   @override
   void initState() {
@@ -117,7 +124,41 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onFlowChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    // W7.2: 连接成功直达 — when THIS device is the sender, the flow's
+    // success state hands over to the connection detail page with the
+    // file picker already opening (a cancelled pick simply leaves the
+    // page). The flow panel stays as-is beneath the pushed page and
+    // resets when the user comes back, so back lands on the home
+    // actions with the connection card listed.
+    final connection = _flow.connection;
+    if (_flow.phase == PairingFlowPhase.success &&
+        connection != null &&
+        connection.role == TaskRole.send &&
+        _autoOpenedConnectionId != connection.id) {
+      _autoOpenedConnectionId = connection.id;
+      final id = connection.id;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        Navigator.of(context)
+            .push(
+          MaterialPageRoute<void>(
+            builder: (_) => ConnectionDetailPage(
+              service: widget.service,
+              connectionId: id,
+              picker: widget.picker,
+              autoPickOnOpen: true,
+            ),
+          ),
+        )
+            .whenComplete(() {
+          if (mounted) {
+            _flow.reset();
+          }
+        });
+      });
+    }
+    setState(() {});
   }
 
   Future<void> _chooseRoleAndCreate() async {
@@ -168,6 +209,7 @@ class _HomePageState extends State<HomePage> {
         if (_flow.active)
           _PairingFlowView(
             controller: _flow,
+            service: widget.service,
             showDirectUnavailableGuidance: _connections.any((connection) =>
                 connection.id == _flow.connection?.id &&
                 connection.state == TaskConnectionState.unreachable),
@@ -175,7 +217,15 @@ class _HomePageState extends State<HomePage> {
           )
         else if (_joinInputOpen)
           _JoinInputPanel(
-            onSubmit: (code, role) => _flow.startJoin(code, role: role),
+            // W7.1 (AUD-05): the joiner no longer picks a direction —
+            // the contract grants the joiner the OPPOSITE of the code's
+            // creator role; `joinCode` runs without a role. The panel
+            // closes on submit so the later flow reset (W7.2 auto-open)
+            // returns to the actions, not back into this form.
+            onSubmit: (code) {
+              setState(() => _joinInputOpen = false);
+              _flow.startJoin(code);
+            },
             onCancel: () => setState(() => _joinInputOpen = false),
           )
         else
@@ -282,16 +332,20 @@ class _RoleSheet extends StatelessWidget {
 }
 
 /// The join-code input form (加入流 first step): auto-uppercase,
-/// hyphen/space-tolerant paste of the FULL `AKI1-…` code (wave-29 P1-02),
-/// live normalized-length counter, and the joiner's direction pick — the
-/// user's explicit intent forwarded with the join (P1-05).
+/// hyphen/space-tolerant paste of the FULL `AKI1-…` code (wave-29 P1-02)
+/// and a live normalized-length counter.
+///
+/// W7.1 (AUD-05): NO direction pick anymore — the contract grants the
+/// joiner the code creator's OPPOSITE role, so the choice was redundant
+/// (and a wrong pick failed the join). The pairing-success prompt tells
+/// the user their ACTUAL role instead.
 class _JoinInputPanel extends StatefulWidget {
   const _JoinInputPanel({
     required this.onSubmit,
     required this.onCancel,
   });
 
-  final void Function(String code, TaskRole role) onSubmit;
+  final void Function(String code) onSubmit;
   final VoidCallback onCancel;
 
   @override
@@ -300,7 +354,6 @@ class _JoinInputPanel extends StatefulWidget {
 
 class _JoinInputPanelState extends State<_JoinInputPanel> {
   final TextEditingController _controller = TextEditingController();
-  TaskRole? _role;
 
   static final TextInputFormatter _upperCase = TextInputFormatter.withFunction(
     (oldValue, newValue) => newValue.copyWith(text: newValue.text.toUpperCase()),
@@ -317,8 +370,7 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
     final theme = Theme.of(context);
     final normalized = normalizeJoinCode(_controller.text);
     final codeValid = isValidTaskCode(normalized);
-    final role = _role;
-    final ready = codeValid && role != null;
+    final ready = codeValid;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -337,9 +389,8 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
               ],
               textCapitalization: TextCapitalization.characters,
               onChanged: (_) => setState(() {}),
-              onSubmitted: ready
-                  ? (_) => widget.onSubmit(_controller.text, role)
-                  : null,
+              onSubmitted:
+                  ready ? (_) => widget.onSubmit(_controller.text) : null,
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 hintText: 'AKI1-XXXX-XXXX-XXXX-…（完整复制粘贴即可）',
@@ -363,38 +414,10 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
               style: theme.textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
-            Text('这次配对我要：', style: theme.textTheme.bodyMedium),
-            const SizedBox(height: 4),
-            SegmentedButton<TaskRole>(
-              key: const ValueKey('join_role_selector'),
-              segments: const [
-                ButtonSegment(
-                  value: TaskRole.send,
-                  icon: Icon(Icons.upload),
-                  label: Text('发送文件'),
-                ),
-                ButtonSegment(
-                  value: TaskRole.receive,
-                  icon: Icon(Icons.download),
-                  label: Text('接收文件'),
-                ),
-              ],
-              selected: role == null ? const <TaskRole>{} : <TaskRole>{role},
-              // `emptySelectionAllowed` is required for the INITIAL
-              // nothing-picked state (SegmentedButton asserts non-empty
-              // otherwise). R29-P2-04: an empty selection still can never
-              // reach the join — the callback guards the empty set (a
-              // null role keeps the submit DISABLED), so a re-tap that
-              // deselects is honest, not a StateError crash.
-              emptySelectionAllowed: true,
-              onSelectionChanged: (selection) => setState(
-                  () => _role = selection.isEmpty ? null : selection.first),
-            ),
-            const SizedBox(height: 12),
             FilledButton.icon(
               key: const ValueKey('join_submit_button'),
               onPressed: ready
-                  ? () => widget.onSubmit(_controller.text, role)
+                  ? () => widget.onSubmit(_controller.text)
                   : null,
               icon: const Icon(Icons.link),
               label: const Text('配对'),
@@ -416,11 +439,13 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
 class _PairingFlowView extends StatelessWidget {
   const _PairingFlowView({
     required this.controller,
+    required this.service,
     required this.showDirectUnavailableGuidance,
     required this.onJoinRetry,
   });
 
   final PairingFlowController controller;
+  final SimpleTransferService service;
   final bool showDirectUnavailableGuidance;
   final VoidCallback onJoinRetry;
 
@@ -442,7 +467,8 @@ class _PairingFlowView extends StatelessWidget {
                 key: ValueKey('flow_paired'), label: '配对成功，正在建立连接…'),
             PairingFlowPhase.probing => const _FlowProgress(
                 key: ValueKey('flow_probing'), label: '正在测试连通性…'),
-            PairingFlowPhase.success => _FlowSuccessView(controller: controller),
+            PairingFlowPhase.success => _FlowSuccessView(
+                controller: controller, service: service),
             PairingFlowPhase.failed || null => _FlowFailedView(
                 controller: controller,
                 showDirectUnavailableGuidance: showDirectUnavailableGuidance,
@@ -582,16 +608,24 @@ class _CodeShownView extends StatelessWidget {
 }
 
 /// 连接成功（连通测试通过）.
+///
+/// W7.1/W7.2: the card explains the user's ACTUAL role (the joiner no
+/// longer picked one). The RECEIVER waits here — no 完成 click needed;
+/// the sender variant only renders for the one frame before the home
+/// page auto-opens the connection's detail page with the file picker
+/// (see `_HomePageState._onFlowChanged`).
 class _FlowSuccessView extends StatelessWidget {
-  const _FlowSuccessView({required this.controller});
+  const _FlowSuccessView({required this.controller, required this.service});
 
   final PairingFlowController controller;
+  final SimpleTransferService service;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final connection = controller.connection;
     final success = successColor(theme.colorScheme);
+    final sending = connection?.role == TaskRole.send;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -609,8 +643,7 @@ class _FlowSuccessView extends StatelessWidget {
                           ?.copyWith(color: success)),
                   if (connection != null)
                     Text(
-                      '连通测试通过：${connection.peerName}'
-                      '（${taskRoleShortLabel(connection.role)}）',
+                      '连通测试通过：${connection.peerName}',
                       style: theme.textTheme.bodySmall,
                     ),
                 ],
@@ -618,12 +651,43 @@ class _FlowSuccessView extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 16),
-        FilledButton.icon(
-          key: const ValueKey('flow_done_button'),
+        const SizedBox(height: 8),
+        Text(
+          sending ? '现在可以选择文件发给对方' : '对方将把文件发给你',
+          key: const ValueKey('flow_success_role_hint'),
+          style: theme.textTheme.bodyMedium,
+        ),
+        if (!sending) ...[
+          const SizedBox(height: 4),
+          Text(
+            '等待对方发送文件…',
+            key: const ValueKey('flow_waiting_peer_send'),
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: theme.colorScheme.outline),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '接收的文件将保存到：${service.saveDir}',
+            key: const ValueKey('flow_success_save_dir'),
+            style: theme.textTheme.bodySmall,
+          ),
+        ] else ...[
+          const SizedBox(height: 4),
+          Text(
+            '正在打开文件选择…',
+            key: const ValueKey('flow_opening_picker'),
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.outline),
+          ),
+        ],
+        const SizedBox(height: 8),
+        // W7.2: no 完成 button — the receiver simply waits (the receive
+        // banner takes over when the peer sends); the sender already
+        // moved on. 返回 dismisses ONLY the panel (the pairing stays).
+        TextButton(
+          key: const ValueKey('flow_back_button'),
           onPressed: controller.reset,
-          icon: const Icon(Icons.check),
-          label: const Text('完成'),
+          child: const Text('返回'),
         ),
       ],
     );
@@ -631,6 +695,12 @@ class _FlowSuccessView extends StatelessWidget {
 }
 
 /// 失败态：可读原因 + 重试/重新输入.
+///
+/// W3 (V-N4): when the controller carries the RAW error object
+/// (`errorCause`), the mapped failure card replaces the plain line —
+/// title/reason/suggestion from the error code, original text only in
+/// the expandable 「详情」. Controller-worded failures (probe verdict,
+/// drop) keep their plain, already §4.5-compliant line.
 class _FlowFailedView extends StatelessWidget {
   const _FlowFailedView({
     required this.controller,
@@ -646,24 +716,33 @@ class _FlowFailedView extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isJoin = controller.kind == PairingFlowKind.join;
+    final cause = controller.errorCause;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Row(
-          children: [
-            Icon(Icons.error_outline, color: theme.colorScheme.error, size: 32),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                controller.error ?? '配对失败，请重试。',
-                key: const ValueKey('flow_error'),
-                style: theme.textTheme.bodyLarge?.copyWith(
-                  color: theme.colorScheme.error,
+        if (cause != null)
+          TransferErrorCard(
+            error: cause,
+            scene: TransferErrorScene.pairing,
+            keyPrefix: 'flow_error',
+            titleKey: const ValueKey('flow_error'),
+          )
+        else
+          Row(
+            children: [
+              Icon(Icons.error_outline, color: theme.colorScheme.error, size: 32),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  controller.error ?? '配对失败，请重试。',
+                  key: const ValueKey('flow_error'),
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    color: theme.colorScheme.error,
+                  ),
                 ),
               ),
-            ),
-          ],
-        ),
+            ],
+          ),
         if (showDirectUnavailableGuidance) ...[
           const SizedBox(height: 12),
           const DirectUnavailableGuidance(),

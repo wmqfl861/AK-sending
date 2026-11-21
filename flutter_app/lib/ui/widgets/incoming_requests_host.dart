@@ -31,9 +31,12 @@ import 'dart:async' show StreamSubscription, Timer;
 import 'package:flutter/material.dart';
 
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_errors.dart';
 import '../service/transfer_format.dart';
 import '../service/transfer_history.dart';
 import '../theme.dart';
+import 'keep_foreground_hint.dart';
+import 'transfer_error_card.dart';
 import 'transfer_progress_view.dart';
 
 enum _Stage { pending, receiving, done, failed }
@@ -43,7 +46,10 @@ class _BannerState {
 
   final IncomingRequest request;
   _Stage stage;
-  String? error;
+
+  /// W3: the raw failure OBJECT of a failed receive (mapped to
+  /// title/reason/suggestion; the original only in 「详情」).
+  Object? error;
 
   /// How long the accepted receive took, from the 接受 click to the end
   /// (set when it finished).
@@ -175,7 +181,7 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
       if (!mounted) return;
       setState(() {
         banner.stage = _Stage.failed;
-        banner.error = '$e';
+        banner.error = e;
       });
     }
   }
@@ -413,6 +419,9 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
                 barKey: ValueKey('incoming_progress_$jobId'),
                 keyPrefix: 'incoming_progress_$jobId',
               ),
+              const SizedBox(height: 6),
+              // W7.3: the Android foreground hint while bytes flow.
+              KeepForegroundHint(keyName: 'incoming_keep_foreground_$jobId'),
             ],
             if (widget.banner.stage == _Stage.done) ...[
               const SizedBox(height: 8),
@@ -459,20 +468,15 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
             ],
             if (widget.banner.stage == _Stage.failed) ...[
               const SizedBox(height: 8),
-              Row(
-                children: [
-                  Icon(Icons.error_outline, color: scheme.error, size: 20),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      '接收失败：${widget.banner.error ?? '未知错误'}',
-                      key: ValueKey('incoming_error_$jobId'),
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: scheme.error,
-                      ),
-                    ),
-                  ),
-                ],
+              // W3 (V-N4): the mapped failure card — title/reason/
+              // suggestion by error code; the original text only in the
+              // expandable 「详情」. Keeps the frozen `incoming_error_<job>`
+              // key on the wrapper.
+              TransferErrorCard(
+                key: ValueKey('incoming_error_$jobId'),
+                error: widget.banner.error ?? StateError('接收失败'),
+                scene: TransferErrorScene.receiving,
+                keyPrefix: 'incoming_error_$jobId',
               ),
               Align(
                 alignment: Alignment.centerRight,

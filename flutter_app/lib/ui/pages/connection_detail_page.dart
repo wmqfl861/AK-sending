@@ -25,10 +25,13 @@ import 'package:flutter/material.dart';
 
 import '../service/file_pick_gateway.dart';
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_errors.dart';
 import '../service/transfer_format.dart';
 import '../service/transfer_history.dart';
 import '../theme.dart';
+import '../widgets/keep_foreground_hint.dart';
 import '../widgets/task_connection_views.dart';
+import '../widgets/transfer_error_card.dart';
 import '../widgets/transfer_progress_view.dart';
 
 enum _SendStage { idle, sending, done, failed }
@@ -39,11 +42,17 @@ class ConnectionDetailPage extends StatefulWidget {
     required this.service,
     required this.connectionId,
     this.picker = const PluginFilePickGateway(),
+    this.autoPickOnOpen = false,
   });
 
   final SimpleTransferService service;
   final String connectionId;
   final FilePickGateway picker;
+
+  /// W7.2: open the file/folder picker ONCE on entry (the pairing-flow
+  /// success shortcut — the sender lands here ready to choose files). A
+  /// cancelled pick simply leaves the page as-is.
+  final bool autoPickOnOpen;
 
   @override
   State<ConnectionDetailPage> createState() => _ConnectionDetailPageState();
@@ -67,6 +76,11 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   final List<PickedEntry> _picked = [];
   _SendStage _sendStage = _SendStage.idle;
   String? _sendSummary;
+
+  /// W3: the raw error object of the last failed send — the failure card
+  /// maps it (title/reason/suggestion) and keeps the original text ONLY
+  /// inside the expandable 「详情」.
+  Object? _sendError;
 
   /// U1: the latest progress snapshot of THIS connection's transfer.
   TransferProgress? _progress;
@@ -107,6 +121,15 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       },
       onError: (Object _) {},
     );
+    if (widget.autoPickOnOpen) {
+      // W7.2: one post-frame auto pick — the sheet needs a frame of the
+      // page beneath it. Cancelling keeps the page (nothing selected).
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _pickSource(roleHint: true);
+        }
+      });
+    }
   }
 
   @override
@@ -117,7 +140,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     super.dispose();
   }
 
-  Future<void> _pickSource() async {
+  Future<void> _pickSource({bool roleHint = false}) async {
     final mode = await showModalBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
@@ -127,6 +150,16 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // W7.1/W7.2: the auto-opened picker (the sender handover
+              // from a pairing success) leads with the role statement.
+              if (roleHint) ...[
+                Text(
+                  '现在可以选择文件发给对方',
+                  key: const ValueKey('pick_sheet_role_hint'),
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 8),
+              ],
               Text('选择要发送的内容',
                   style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 16),
@@ -165,6 +198,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         ..addAll(entries);
       _sendStage = _SendStage.idle;
       _sendSummary = null;
+      _sendError = null;
       _progress = null;
     });
   }
@@ -183,6 +217,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     setState(() {
       _sendStage = _SendStage.sending;
       _sendSummary = null;
+      _sendError = null;
       _progress = null;
     });
     try {
@@ -220,7 +255,9 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       if (!mounted) return;
       setState(() {
         _sendStage = _SendStage.failed;
-        _sendSummary = '$e';
+        // W3: keep the OBJECT — the card maps it; the original text only
+        // renders inside the expandable 「详情」.
+        _sendError = e;
       });
     }
   }
@@ -341,11 +378,18 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                   Text(
                     ended
                         ? '本次传输已完成，配对随之结束。如需再次传输，请重新配对。'
-                        : _idleExpired ||
-                                (connection?.idleExpired ?? false)
+                        : _idleExpired || (connection?.idleExpired ?? false)
+                            // W3.3 (V-N4): the idle copy ONLY for the
+                            // engine's idle-expiry reason (the dedicated
+                            // idleExpiries stream / row flag) — a plain
+                            // break is the interruption copy below.
                             ? '配对已闲置过久，请重新配对。'
                             : connection == null
-                                ? '此连接已断开（对端离开或网络变化）。'
+                                // W3.3: a dropped row without the idle
+                                // reason is an INTERRUPTION — W1's copy
+                                // (title + resume suggestion), never the
+                                // misleading idle wording.
+                                ? interruptedStatusLine
                                 : '方向：${taskRoleLabel(connection.role)}',
                     key: const ValueKey('conn_detail_role'),
                     style: theme.textTheme.bodySmall,
@@ -394,6 +438,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
               picked: _picked,
               stage: _sendStage,
               summary: _sendSummary,
+              error: _sendError,
               progress: _progress,
               elapsed: _sendElapsed,
               sentBytes: _sentBytes,
@@ -403,6 +448,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
                 _picked.clear();
                 _sendStage = _SendStage.idle;
                 _sendSummary = null;
+                _sendError = null;
                 _progress = null;
               }),
             )
@@ -471,6 +517,7 @@ class _SendCard extends StatelessWidget {
     required this.picked,
     required this.stage,
     required this.summary,
+    required this.error,
     required this.progress,
     required this.elapsed,
     required this.sentBytes,
@@ -487,6 +534,11 @@ class _SendCard extends StatelessWidget {
   final List<PickedEntry> picked;
   final _SendStage stage;
   final String? summary;
+
+  /// W3: the raw error of the failed send (null in every other stage) —
+  /// rendered through the mapping, never verbatim outside 「详情」.
+  final Object? error;
+
   final TransferProgress? progress;
   final Duration? elapsed;
   final int? sentBytes;
@@ -582,7 +634,7 @@ class _SendCard extends StatelessWidget {
                     ),
                   ),
               const SizedBox(height: 12),
-              if (stage == _SendStage.sending)
+              if (stage == _SendStage.sending) ...[
                 // U1: live progress (the bar keeps the pre-U1
                 // `conn_send_progress` key).
                 TransferProgressView(
@@ -590,7 +642,13 @@ class _SendCard extends StatelessWidget {
                   role: TaskRole.send,
                   barKey: const ValueKey('conn_send_progress'),
                   keyPrefix: 'conn_send_progress',
-                )
+                ),
+                const SizedBox(height: 6),
+                // W7.3: Android foreground hint under a running send.
+                const KeepForegroundHint(
+                  keyName: 'conn_send_keep_foreground',
+                ),
+              ]
               else if (!ended)
                 FilledButton.icon(
                   key: const ValueKey('conn_send_button'),
@@ -637,25 +695,17 @@ class _SendCard extends StatelessWidget {
                 ),
               ),
             if (stage == _SendStage.failed)
-              Container(
+              // W3 (V-N4): the mapped failure card — title/reason/
+              // suggestion from the error code; the original text only
+              // inside the expandable 「详情」 (with copy). Keeps the
+              // frozen `conn_send_error` key on the card's wrapper.
+              Padding(
                 key: const ValueKey('conn_send_error'),
-                margin: const EdgeInsets.only(top: 12),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: scheme.errorContainer,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.error_outline, color: scheme.onErrorContainer),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '发送失败：$summary',
-                        style: TextStyle(color: scheme.onErrorContainer),
-                      ),
-                    ),
-                  ],
+                padding: const EdgeInsets.only(top: 12),
+                child: TransferErrorCard(
+                  error: error ?? StateError('发送失败'),
+                  scene: TransferErrorScene.sending,
+                  keyPrefix: 'conn_send_error',
                 ),
               ),
             if (!live && !ended)

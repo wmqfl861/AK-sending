@@ -43,30 +43,58 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
 import 'dll_path.dart' show resolveAkDllPath;
 
 // ---------------------------------------------------------------------------
-// E2/E4 startup phase log (`%TEMP%\ak-stage.log`).
+// E2/E4 startup phase log (`<identity dir>/logs/ak-stage.log` on desktop,
+// the app cache dir on Android).
 // ---------------------------------------------------------------------------
 
 /// Append-only startup phase log (crash-analysis E2/E4): one line per
 /// event, `<epoch-milliseconds> <phase>`, written SYNCHRONOUSLY (flushed)
 /// so the last line brackets a native crash against wall-clock dump
-/// times. Best-effort by contract — a broken log (missing `%TEMP%`,
-/// unwritable) disables itself and NEVER disturbs startup.
+/// times. Best-effort by contract — a broken log (no resolvable
+/// location, unwritable) disables itself and NEVER disturbs startup.
+///
+/// W5 (2026-11-22, V-N6): Windows/Linux runs write under the identity
+/// directory (`.ak-sending`) `logs/` subdirectory — a `%TEMP%` location
+/// is OS-wiped and outlived the app on uninstall; Android keeps the
+/// cache-dir tier (the Zygote exports the app cache dir as `TMPDIR`).
+/// A log grown past 256 KiB is reset by the FIRST write of a process,
+/// so the file only ever holds the most recent startup.
 final class AkStageLog {
   AkStageLog._(this._path);
 
-  /// The log file path, or null when the environment names no temp dir
-  /// (the log is then a permanent no-op).
+  /// The log file path, or null when no location can be resolved from
+  /// the environment (the log is then a permanent no-op).
   final String? _path;
 
   /// Set after the first failed write; further [write]s are skipped.
   bool _broken = false;
 
+  /// Whether the oversize rotation already ran (at most once per
+  /// instance — on its first successful write path).
+  bool _rotated = false;
+
+  /// Rotation cap (W5): a pre-existing log above this size is reset
+  /// before the instance's first append, keeping only the current
+  /// startup's lines.
+  static const int _maxLogBytes = 256 * 1024;
+
   static AkStageLog? _shared;
 
-  /// The process-wide instance (`%TEMP%\ak-stage.log`, resolved lazily
-  /// from [Platform.environment]; resolved ONCE so every writer agrees).
-  static AkStageLog shared() =>
-      _shared ??= AkStageLog._(defaultAkStageLogPath(Platform.environment));
+  /// The process-wide instance, resolved lazily from
+  /// [Platform.environment] and resolved ONCE so every writer agrees:
+  /// `<identity dir>/logs/ak-stage.log` on Windows/Linux, the temp
+  /// (cache) tier on Android.
+  ///
+  /// Under `flutter test` (FLUTTER_TEST=true) the instance is a NO-OP:
+  /// the default target is the REAL user identity directory since W5,
+  /// and a test suite must never append into it. Tests that assert log
+  /// content inject their own [AkStageLog.file].
+  static AkStageLog shared() {
+    if (Platform.environment['FLUTTER_TEST'] == 'true') {
+      return AkStageLog._(null);
+    }
+    return _shared ??= AkStageLog._(defaultAkStageLogPath(Platform.environment));
+  }
 
   /// A log writing to an explicit [path] (tests inject a temp file).
   factory AkStageLog.file(String path) => AkStageLog._(path);
@@ -79,6 +107,11 @@ final class AkStageLog {
       return;
     }
     try {
+      _rotateIfOversized(path);
+      final parent = File(path).parent;
+      if (!parent.existsSync()) {
+        parent.createSync(recursive: true);
+      }
       File(path).writeAsStringSync(
         '${DateTime.now().millisecondsSinceEpoch} $phase\n',
         mode: FileMode.append,
@@ -89,9 +122,47 @@ final class AkStageLog {
     }
   }
 
-  /// The default log location: `ak-stage.log` under the platform temp
-  /// dir (`TEMP`/`TMP` on Windows, `TMPDIR` elsewhere).
-  static String? defaultAkStageLogPath(Map<String, String> environment) {
+  /// W5 rotation: on the instance's first write, a pre-existing file
+  /// above [_maxLogBytes] is deleted so the log keeps only the CURRENT
+  /// (most recent) startup. Runs at most once per instance; a failure
+  /// here flows into [write]'s disable-the-log handling.
+  void _rotateIfOversized(String path) {
+    if (_rotated) {
+      return;
+    }
+    _rotated = true;
+    final file = File(path);
+    if (file.existsSync() && file.lengthSync() > _maxLogBytes) {
+      file.deleteSync();
+    }
+  }
+
+  /// The default log location. Android keeps the platform temp tier
+  /// (`TEMP`/`TMP`/`TMPDIR` — the Zygote points `TMPDIR` at the app
+  /// cache dir, W5: cache stays this file's Android home). Windows and
+  /// Linux write under the identity directory's `logs/` subdirectory,
+  /// resolving the identity dir like
+  /// `FfiSimpleTransferService._resolveIdentityDir`: an `AK_ID_DIR`
+  /// override, else the user-profile `.ak-sending` (`USERPROFILE` on
+  /// Windows, `HOME` elsewhere; a relative `.ak-sending` when the
+  /// environment names no home — best-effort, like the service).
+  static String? defaultAkStageLogPath(
+    Map<String, String> environment, {
+    bool? isAndroid,
+  }) {
+    if (isAndroid ?? Platform.isAndroid) {
+      return _tempTierLogPath(environment);
+    }
+    final separator = Platform.isWindows ? r'\' : '/';
+    return _join(_join(_desktopIdentityDir(environment), 'logs', separator),
+        'ak-stage.log', separator);
+  }
+
+  /// `ak-stage.log` under the platform temp dir (`TEMP`/`TMP` on
+  /// Windows, `TMPDIR` elsewhere); null when the environment names no
+  /// temp dir (the Android branch of [defaultAkStageLogPath], and the
+  /// pre-W5 behavior everywhere).
+  static String? _tempTierLogPath(Map<String, String> environment) {
     final dir = environment['TEMP'] ?? environment['TMP'] ?? environment['TMPDIR'];
     if (dir == null || dir.isEmpty) {
       return null;
@@ -101,6 +172,27 @@ final class AkStageLog {
         : Platform.pathSeparator;
     return '$dir${separator}ak-stage.log';
   }
+
+  /// The desktop identity directory (env tier only — the Android
+  /// path_provider tier does not apply here): `AK_ID_DIR` override,
+  /// else `USERPROFILE`/`HOME` + `.ak-sending`.
+  static String _desktopIdentityDir(Map<String, String> environment) {
+    final overridden = environment['AK_ID_DIR']?.trim();
+    if (overridden != null && overridden.isNotEmpty) {
+      return overridden;
+    }
+    final home = environment['USERPROFILE'] ?? environment['HOME'] ?? '';
+    if (home.isEmpty) {
+      return '.ak-sending';
+    }
+    final separator = Platform.isWindows ? r'\' : '/';
+    return '$home$separator.ak-sending';
+  }
+
+  /// Joins [name] onto [dir], tolerating a dir that already ends in
+  /// either separator style.
+  static String _join(String dir, String name, String separator) =>
+      dir.endsWith('/') || dir.endsWith(r'\') ? '$dir$name' : '$dir$separator$name';
 }
 
 /// The native-lifecycle steps `bootstrapAppService` drives, one method

@@ -10,6 +10,14 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -IncludeAndroid -AllowStaleAndroid
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -OutDir D:\tmp\ak-sending
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -ValidateParameters
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -AllowDirty
+#
+# NOTE (Git Bash callers): when invoking this script FROM Git Bash, quote
+# boolean parameters so Bash does not expand them, e.g. pass
+#   '-SkipFlutter:$false'   (WITH the quotes)
+# Unquoted, Git Bash expands '$false' to an EMPTY string, the flag falls
+# back to its default, and the switch silently does the opposite of what
+# was intended (batch V3 hit exactly this).
 #
 # Parameters:
 #   -OutDir       Staging directory (wiped and recreated if it already exists).
@@ -55,6 +63,13 @@
 #                 "no git revision (untracked)" warning. Never combine with
 #                 the expectation of fresh binaries - fix the NDK/SDK/bash
 #                 cause instead.
+#   -AllowDirty   Opt-in escape hatch for the worktree hygiene gate (W5/V-N6):
+#                 by default the script FAILS when `git status --porcelain`
+#                 reports anything - a package must be traceable to a committed
+#                 revision. With this switch a dirty worktree is packaged
+#                 anyway and MANIFEST.txt records it (a
+#                 "WARNING: built from a dirty worktree" line plus the
+#                 porcelain entry count). Prefer committing/stashing instead.
 #   -ValidateParameters
 #                 Dry-run: validate and print the effective configuration, then
 #                 exit 0 without building anything (CR-P2-06 fix 5 verification
@@ -78,6 +93,7 @@ param(
     [object]$SkipFlutter = $true,
     [switch]$IncludeAndroid,
     [switch]$AllowStaleAndroid,
+    [switch]$AllowDirty,
     [switch]$ValidateParameters
 )
 
@@ -132,6 +148,33 @@ function Invoke-GitQuery([string[]]$GitArgs) {
     }
 }
 
+# W5 (V-N6) worktree hygiene: read-only `git status --porcelain` run from
+# $RepoRoot, returning the LINES (unlike Invoke-GitQuery, the line count is
+# the payload). Same Start-Process/plain-Win32-redirect pattern for the same
+# PS 5.1 NativeCommandError reason. Returns $null when git is absent or exits
+# non-zero (treated as "cannot tell" by the gate, with a loud warning); a
+# CLEAN tree returns an EMPTY array — the comma operator keeps PowerShell's
+# pipeline unrolling from collapsing that to $null.
+function Get-GitStatusPorcelain {
+    $gitExe = (Get-Command git -ErrorAction SilentlyContinue)
+    if (-not $gitExe) { return $null }
+    $out = Join-Path $env:TEMP ('ak_git_status_' + [Guid]::NewGuid().ToString('N') + '.log')
+    $err = Join-Path $env:TEMP ('ak_git_err_' + [Guid]::NewGuid().ToString('N') + '.log')
+    try {
+        $proc = Start-Process -FilePath $gitExe.Source -ArgumentList @('status', '--porcelain') `
+            -WorkingDirectory $RepoRoot -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        if ($proc.ExitCode -ne 0) { return $null }
+        return ,@(Get-Content -LiteralPath $out -ErrorAction SilentlyContinue)
+    }
+    catch {
+        return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # One provenance line per packaged jniLibs .so for MANIFEST.txt: SHA256 +
 # size always, plus the last git revision that touched the file when git
 # knows one ($State = 'fresh' | 'stale'). The jniLibs .so files are UNTRACKED
@@ -172,6 +215,7 @@ if ($ValidateParameters) {
     Write-Host ("    SkipFlutter      : {0}" -f $SkipFlutter)
     Write-Host ("    IncludeAndroid   : {0}" -f $(if ($IncludeAndroid) { 'true' } else { 'false' }))
     Write-Host ("    AllowStaleAndroid: {0}" -f $(if ($AllowStaleAndroid) { 'true (stale .so permitted; provenance recorded in MANIFEST.txt)' } else { 'false (an android FFI refresh failure is fatal)' }))
+    Write-Host ("    AllowDirty       : {0}" -f $(if ($AllowDirty) { 'true (a dirty worktree is packaged with a WARNING in MANIFEST.txt)' } else { 'false (a dirty worktree fails the run)' }))
     exit 0
 }
 
@@ -197,6 +241,26 @@ try {
     $OutDirFull = [System.IO.Path]::GetFullPath($OutDir)
     if ($OutDirFull.TrimEnd('\') -eq $RepoRoot.TrimEnd('\')) {
         Fail '-OutDir must not be the repository root (it gets wiped)'
+    }
+
+    # --- 1b. worktree hygiene gate (W5 / V-N6) ---------------------------
+    # A package must be traceable to a committed revision: any
+    # `git status --porcelain` entry fails the run unless -AllowDirty
+    # explicitly opts in (the opt-in is then recorded in MANIFEST.txt).
+    $dirtyLines = Get-GitStatusPorcelain
+    $dirtyCount = -1
+    if ($null -eq $dirtyLines) {
+        Write-Warning 'git status --porcelain could not run (git missing or failed) - the worktree state is UNVERIFIED; the package may not be traceable to a committed revision'
+    }
+    else {
+        $dirtyLines = @($dirtyLines | Where-Object { $_ -ne '' })
+        $dirtyCount = $dirtyLines.Count
+    }
+    if ($dirtyCount -gt 0) {
+        if (-not $AllowDirty) {
+            Fail ("the worktree is dirty (git status --porcelain reports $dirtyCount entrie(s)) - a package must be traceable to a committed revision. Commit or stash them, or pass -AllowDirty to package anyway (the dirty state is then recorded as a WARNING line in MANIFEST.txt)")
+        }
+        Write-Warning "the worktree is dirty ($dirtyCount git status --porcelain entrie(s)) - packaging anyway because -AllowDirty was passed; MANIFEST.txt will carry the WARNING line"
     }
 
     # --- 2. cargo build (any failure => non-zero exit) ---
@@ -504,6 +568,10 @@ try {
     }
     $manifest.Add('registry: ak_sending_registry.db (empty SQLite template) + ak_sending_registry.db.README.txt + start-registry-server.bat')
     $manifest.Add("created : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') local time; local packaging only, not uploaded")
+    # W5 (V-N6): an -AllowDirty package must be honest about its origin.
+    if ($AllowDirty -and $dirtyCount -gt 0) {
+        $manifest.Add("WARNING: built from a dirty worktree ($dirtyCount uncommitted git status --porcelain entrie(s))")
+    }
     $manifest.Add('format  : SHA256  bytes  relative-path (SHA256 via PowerShell Get-FileHash)')
     $manifest.Add('')
     foreach ($file in $staged) {

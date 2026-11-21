@@ -96,6 +96,7 @@ import android.os.Environment
 import android.os.StatFs
 import android.provider.DocumentsContract
 import android.util.Log
+import android.view.WindowManager
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.contract.ActivityResultContract
@@ -115,6 +116,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "AKStorage"
         private const val CHANNEL = "dev.ak/storage"
+        private const val SCREEN_CHANNEL = "dev.ak/screen"
         private const val PICK_FOLDER_KEY = "dev.ak/storage:pickFolder"
         private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
     }
@@ -202,6 +204,27 @@ class MainActivity : FlutterActivity() {
                         safWriteTest(call.argument<String>("treeUri"))
                     )
                     "listSafPersisted" -> result.success(listSafPersisted())
+                    else -> result.notImplemented()
+                }
+            }
+
+        // W7.3（批次 W 交接 §4.7 第 3 条）：传输期间保持屏幕常亮的窄通道。
+        // 只有两个方法：on 加 FLAG_KEEP_SCREEN_ON、off 清除之。不加第三方
+        // 插件；Dart 侧（ScreenKeepAwake）在任一传输进行中调 on、全部结束
+        // 调 off，Windows/Linux 上不调用。重复 on/off 是幂等的窗口 flag
+        // 操作；Activity 重建时 flag 随窗口一起消失，Dart 侧的下一次状态
+        // 翻转（或 dispose 的兜底 off）重新对齐。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCREEN_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "on" -> {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        result.success(null)
+                    }
+                    "off" -> {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }

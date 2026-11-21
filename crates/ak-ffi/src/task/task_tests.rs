@@ -4254,3 +4254,209 @@ fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     }
     walk(root, name)
 }
+
+// -- W1 (batch W, 2026-11-22, V-N2): post-connect failure convergence ------
+
+/// The W1 scenario state (see [`run_silent_peer_send`]).
+struct SilentPeerScenario {
+    /// The receiver-side engine, held alive (silent) for the scenario's
+    /// whole lifetime — never read directly.
+    _owner: AkEngine,
+    sender: AkEngine,
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    sender_runtime: [u8; 16],
+    conn: [u8; 16],
+    send_op: [u8; 16],
+    send_answer: (bool, String),
+    started: Instant,
+}
+
+/// W1 (batch W, 2026-11-22, V-N2): pair a receiver-owner with a
+/// sender-joiner over a live registry, shorten ONLY the sender runtime's
+/// engine idle budget (the per-runtime test knob — production keeps
+/// `TASK_SEND_IDLE`, 150 s), then start a real send whose peer goes
+/// SILENT after the QUIC connection is established: the offer parks on
+/// the receiver's consent gate and is never answered, and no close frame
+/// is ever sent — the exact wire shape of the Android freezer incident
+/// (the sender's connection died of its idle budget while the process
+/// was frozen). Resolves when the send op settles; the receiver engine
+/// stays alive and silent throughout.
+fn run_silent_peer_send(idle: Duration) -> SilentPeerScenario {
+    let registry = TestRegistry::spawn();
+    let owner = AkEngine::new().expect("owner engine");
+    let sender = AkEngine::new().expect("sender engine");
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let owner_runtime =
+        task_start(&owner, &registry_spec(&registry, dir_a.path())).expect("owner runtime");
+    let sender_runtime =
+        task_start(&sender, &registry_spec(&registry, dir_b.path())).expect("sender runtime");
+    let create_op = task_create_code_start(
+        &owner,
+        &owner_runtime,
+        "{\"spec_version\":1,\"role\":\"receiver\"}",
+    )
+    .expect("create accepted");
+    let (ok, json) = wait_op_owned(&owner, &owner_runtime, &create_op);
+    assert!(ok, "receiver-role create (real bind): {json}");
+    let code = code_of(&json);
+    let join_op = task_join_start(
+        &sender,
+        &sender_runtime,
+        &format!("{{\"spec_version\":1,\"code\":\"{code}\",\"role\":\"sender\"}}"),
+    )
+    .expect("join accepted");
+    let (join_ok, join_json) = wait_op_owned(&sender, &sender_runtime, &join_op);
+    assert!(join_ok, "sender-side join: {join_json}");
+    let conn = conn_of(&join_json);
+    // W1: the per-runtime TEST idle. The silent peer's wait must exhaust
+    // it inside the CI budget; no production constant changes and no
+    // other test's runtime is affected.
+    *task_runtime_of(&sender, &sender_runtime)
+        .expect("sender TaskRt")
+        .send_idle_timeout
+        .lock()
+        .expect("send idle slot") = idle;
+    let payload = dir_b.path().join("w1-silent.bin");
+    std::fs::write(&payload, b"w1 silent-peer payload".repeat(64)).expect("source file");
+    let started = Instant::now();
+    let send_op = task_send_start(&sender, &sender_runtime, &conn, &json_paths(&payload))
+        .expect("send accepted");
+    // The receiver's consent gate fires; NEVER answer it — the peer is
+    // silent from the offer on (no close frame, no decline).
+    let send_answer = wait_op_owned(&sender, &sender_runtime, &send_op);
+    SilentPeerScenario {
+        _owner: owner,
+        sender,
+        _dirs: (dir_a, dir_b),
+        sender_runtime,
+        conn,
+        send_op,
+        send_answer,
+        started,
+    }
+}
+
+/// W1 (batch W, 2026-11-22, V-N2): the peer endpoint goes SILENT after
+/// the QUIC connection is established (no close frame — the freezer
+/// shape). The sender's send op dies on the engine idle budget, and the
+/// connection must end with `disconnected`/`conn_lost` within the
+/// (test-shortened) idle cap plus margin — NOT `idle_expired` (the
+/// 10-minute pairing budget), and never a silently-`connected` zombie
+/// row: the pre-fix behavior the V2-b walkthrough measured (connected at
+/// t=121 s, the send failed on thaw, no terminal event until
+/// `idle_expired` at t=719.6 s — 598 s of zombie).
+#[test]
+fn silent_peer_after_connect_ends_the_connection_with_conn_lost() {
+    let idle = Duration::from_secs(2);
+    let scene = run_silent_peer_send(idle);
+    assert!(
+        !scene.send_answer.0,
+        "the send must fail against the silent peer: {}",
+        scene.send_answer.1
+    );
+    assert!(
+        scene.send_answer.1.contains("after connecting"),
+        "a post-connect failure, not a dial failure: {}",
+        scene.send_answer.1
+    );
+    let rt = task_runtime_of(&scene.sender, &scene.sender_runtime).expect("sender TaskRt");
+    let line = wait_owned_event(&rt, "\"event\":\"disconnected\"");
+    assert!(
+        line.contains("\"reason\":\"conn_lost\""),
+        "the honest terminal reason is conn_lost, not the pairing budget: {line}"
+    );
+    assert_eq!(conn_of(&line), scene.conn, "attributed to the connection");
+    // Bounded by the idle cap plus margin (CI headroom) — not the
+    // 10-minute pairing budget the zombie row used to wait out.
+    assert!(
+        scene.started.elapsed() < idle + Duration::from_secs(30),
+        "the terminal verdict must land within the idle cap plus margin"
+    );
+    // The engine's own snapshot is honestly terminal (no zombie row).
+    let snapshot = task_list(&scene.sender, &scene.sender_runtime).expect("task list");
+    let conn_hex = core::hex_encode(&scene.conn);
+    assert!(
+        snapshot.contains(&format!("\"conn\":\"{conn_hex}\"")),
+        "the row is still listed: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("\"state\":\"disconnected\""),
+        "the row is terminal in the engine snapshot: {snapshot}"
+    );
+    // The pairing budget NEVER fired for this connection (the settle
+    // wait also guarantees the op_failed announcement is already queued,
+    // so the drained set below is the complete story).
+    wait_owned_event(&rt, "\"event\":\"op_failed\"");
+    let queue: Vec<String> = rt
+        .events
+        .lock()
+        .map(|events| events.iter().cloned().collect())
+        .unwrap_or_default();
+    assert!(
+        !queue
+            .iter()
+            .any(|line| line.contains("idle_expired") && line.contains(&conn_hex)),
+        "idle_expired stays reserved for the pairing budget: {queue:?}"
+    );
+}
+
+/// W1 (batch W): pin the EVENT PAIR of a post-connect failure — the
+/// connection's terminal `disconnected`/`conn_lost` line AND the op's
+/// own `op_failed` announcement are BOTH emitted; the disconnected line
+/// arrives first here (the close precedes the op's settle publication;
+/// same-frame arrival would be equally legal — the contract demands
+/// both exist, ffi-v2 §8.3 批次 W 增补).
+#[test]
+fn post_connect_failure_emits_both_conn_lost_and_op_failed() {
+    let scene = run_silent_peer_send(Duration::from_secs(2));
+    assert!(
+        !scene.send_answer.0,
+        "the send must fail against the silent peer: {}",
+        scene.send_answer.1
+    );
+    let rt = task_runtime_of(&scene.sender, &scene.sender_runtime).expect("sender TaskRt");
+    let conn_hex = core::hex_encode(&scene.conn);
+    let op_hex = core::hex_encode(&scene.send_op);
+    let is_conn_lost = |line: &String| {
+        line.contains("\"event\":\"disconnected\"")
+            && line.contains(&format!("\"conn\":\"{conn_hex}\""))
+            && line.contains("\"reason\":\"conn_lost\"")
+    };
+    let is_op_failed = |line: &String| {
+        line.contains("\"event\":\"op_failed\"")
+            && line.contains(&format!("\"op_id\":\"{op_hex}\""))
+    };
+    // Drain until BOTH lines are observable (bounded like every helper).
+    let mut lines: Vec<String> = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        while let Some(line) = rt
+            .events
+            .lock()
+            .ok()
+            .and_then(|mut events| events.pop_front())
+        {
+            lines.push(line);
+        }
+        if lines.iter().any(is_conn_lost) && lines.iter().any(is_op_failed) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both events must arrive; saw {lines:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+    let disconnected_at = lines.iter().position(is_conn_lost).expect("drained above");
+    let failed_at = lines.iter().position(is_op_failed).expect("drained above");
+    assert!(
+        disconnected_at <= failed_at,
+        "disconnected lands at (or before) op_failed — both exist either way: {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| is_conn_lost(line)).count(),
+        1,
+        "the connection's terminal line fires exactly once: {lines:?}"
+    );
+}

@@ -112,6 +112,9 @@ pub fn task_start(engine: &AkEngine, spec: &str) -> Result<[u8; 16], FfiError> {
         notify: StdMutex::new(None),
         hole_sockets: StdMutex::new(HashMap::new()),
         sender_lifetimes: StdMutex::new(HashMap::new()),
+        // W1: the production send idle budget; task tests shorten this
+        // per runtime only (see the field docs on TaskRt).
+        send_idle_timeout: StdMutex::new(TASK_SEND_IDLE),
         executor: engine.runtime().handle().clone(),
     });
     {

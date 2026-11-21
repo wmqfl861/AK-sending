@@ -20,7 +20,7 @@
         android:allowBackup="false"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/data_extraction_rules"
-        android:label="ak_sending_app"
+        android:label="AK互传"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

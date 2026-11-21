@@ -1,6 +1,11 @@
 /// Wave-28 home page: empty state, 发起流 (create code → peer joins →
 /// auto probe → success) and 加入流 (tolerant input → join → probe →
 /// success; readable failure + retry). All driven by the fake service.
+///
+/// W7.1/W7.2 (2026-11-22): the join panel no longer picks a direction,
+/// and a SENDER-side success AUTO-OPENS the connection detail page with
+/// the file picker (no 完成 button); the receiver waits on the success
+/// card.
 library;
 
 import 'package:flutter/material.dart';
@@ -20,6 +25,17 @@ Future<void> chooseRole(WidgetTester tester, Key key) async {
   await tester.pump(const Duration(seconds: 1));
 }
 
+/// Dismisses the auto-opened pick sheet (barrier tap) and pops the
+/// auto-opened detail page — back to the home actions.
+Future<void> leaveAutoOpenedDetail(WidgetTester tester) async {
+  await tester.tapAt(const Offset(10, 10));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+  await tester.pageBack();
+  await tester.pump();
+  await tester.pump(const Duration(seconds: 1));
+}
+
 void main() {
   testWidgets('empty home: the two big actions and the empty '
       'connections hint', (tester) async {
@@ -34,7 +50,8 @@ void main() {
   });
 
   testWidgets('create flow: role sheet → big monospace code with copy → '
-      'peer join → probe phases → 连接成功 → card listed', (tester) async {
+      'peer join → probe phases → 连接成功 → sender auto-opens the detail '
+      'page with the picker', (tester) async {
     final clipboard = MockClipboard()..install();
     final fake = await pumpApp(tester);
 
@@ -76,13 +93,20 @@ void main() {
     fake.completeProbe(connId);
     await pumpEvents(tester);
     await tester.pump();
-    expect(find.byKey(const ValueKey('flow_success')), findsOneWidget);
-    expect(find.byKey(const ValueKey('flow_done_button')), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
+    // W7.2: the sender's success hands over to the detail page with the
+    // picker already open (no 完成 button anywhere).
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.byKey(const ValueKey('pick_files_option')), findsOneWidget,
+        reason: 'W7.2：文件选择应自动弹出');
+    expect(find.byKey(const ValueKey('pick_sheet_role_hint')), findsOneWidget,
+        reason: '自动弹出的选择面板先说明实际角色（W7.1）');
+    expect(find.byKey(const ValueKey('flow_done_button')), findsNothing,
+        reason: 'W7.2：发送方不再需要点「完成」');
 
-    // Done → back to the actions; the connection is listed with its
-    // frozen direction (I declared send).
-    await tester.tap(find.byKey(const ValueKey('flow_done_button')));
-    await tester.pump();
+    // Cancelling the pick leaves the user ON the detail page.
+    await leaveAutoOpenedDetail(tester);
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing);
     expect(find.byKey(const ValueKey('home_create_code_button')),
         findsOneWidget);
     expect(find.byKey(ValueKey('conn_card_name_$connId')),
@@ -91,18 +115,22 @@ void main() {
   });
 
   testWidgets('join flow: full AKI1 code with case/hyphen/space '
-      'tolerance, explicit direction, probe, success',
+      'tolerance, NO direction pick, probe, sender auto-open',
       (tester) async {
     final fake = await pumpApp(tester);
 
-    // The other device minted a "我要接收" code — we join it declaring
-    // OUR intent (send), so the connection direction is send.
+    // The other device minted a "我要接收" code — joining grants US the
+    // sender side (the creator's opposite; W7.1 removed the pick).
     final minted = await fake.createCode(TaskRole.receive);
     expect(minted.code.startsWith('AKI1-'), isTrue);
 
     await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
+
+    // W7.1 (AUD-05): no direction selector at all.
+    expect(find.byKey(const ValueKey('join_role_selector')), findsNothing);
+    expect(find.text('这次配对我要：'), findsNothing);
 
     // Lowercase + ungrouped + spaced input of the FULL code: the
     // formatter uppercases, the controller strips separators.
@@ -112,15 +140,10 @@ void main() {
     await tester.pump();
     expect(find.text('36/36 位'), findsOneWidget);
 
-    // The join direction picker (P1-05): submit stays disabled until the
-    // user declares their intent.
-    final submitDisabled = tester.widget<FilledButton>(
+    // A well-formed code alone enables the submit (no role gate).
+    final submit = tester.widget<FilledButton>(
         find.byKey(const ValueKey('join_submit_button')));
-    expect(submitDisabled.onPressed, isNull);
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('发送文件')));
-    await tester.pump();
+    expect(submit.onPressed, isNotNull);
 
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -129,16 +152,19 @@ void main() {
     fake.completeProbe('conn-1');
     await pumpEvents(tester);
     await tester.pump();
-    expect(find.byKey(const ValueKey('flow_success')), findsOneWidget);
-
-    await tester.tap(find.byKey(const ValueKey('flow_done_button')));
-    await tester.pump();
-    expect(find.text('我发送 → 对方'), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
+    // W7.2: the joiner is the SENDER here — same auto-open handover.
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.byKey(const ValueKey('conn_pick_files_button')),
+        findsOneWidget);
+    expect(find.textContaining('我发送 → 对方'), findsAtLeastNWidgets(1),
+        reason: '详情页（与下层连接卡）都标出发送方向');
     // One-time code: consumed by the join; the typed (normalized) form
-    // reached the service with the explicit role.
+    // reached the service WITHOUT a role (W7.1).
     expect(fake.pendingCode, isNull);
     expect(fake.joinRequests.single, normalizeJoinCode(minted.code));
-    expect(fake.joinRoleRequests.single, TaskRole.send);
+    expect(fake.joinRoleRequests.single, isNull,
+        reason: 'W7.1：加入不再传方向，由契约给对侧角色');
   });
 
   testWidgets('R36-P2-03: the engine-failure latch shows the recoverable '
@@ -165,8 +191,8 @@ void main() {
         find.byKey(const ValueKey('home_create_code_button')), findsOneWidget);
   });
 
-  testWidgets('join flow failure: readable reason, retry reopens the '
-      'input panel', (tester) async {
+  testWidgets('join flow failure: mapped 这个码用不了 card with the reason '
+      'in 详情; retry reopens the input panel', (tester) async {
     final fake = await pumpApp(tester);
     fake.nextJoinError = '配对码不存在或已过期';
     final minted = await fake.createCode(TaskRole.send);
@@ -177,16 +203,19 @@ void main() {
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
     await tester.pump();
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('接收文件')));
-    await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
+    // W3: the mapped card (the frozen flow_error key sits on its title);
+    // the verbatim service reason only inside 详情.
     expect(find.byKey(const ValueKey('flow_error')), findsOneWidget);
-    expect(find.textContaining('配对码不存在或已过期'), findsOneWidget);
+    expect(find.text('这个码用不了'), findsOneWidget);
+    expect(find.textContaining('重新生成'), findsOneWidget);
+    expect(find.textContaining('配对码不存在或已过期'), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('flow_error_toggle')));
+    await tester.pump();
+    expect(find.text('配对码不存在或已过期'), findsOneWidget);
 
     // Retry returns to the input form (not the two buttons).
     await tester.tap(find.byKey(const ValueKey('flow_retry_button')));
@@ -284,48 +313,9 @@ void main() {
         findsOneWidget);
   });
 
-  testWidgets('R29-P2-04: re-tapping the selected role deselects cleanly '
-      '(no empty-set crash) and the submit disables until re-picked',
-      (tester) async {
-    final fake = await pumpApp(tester);
-    final minted = await fake.createCode(TaskRole.send);
-
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
-    await tester.enterText(
-        find.byKey(const ValueKey('join_code_field')), minted.code);
-    await tester.pump();
-
-    final segment = find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('发送文件'));
-    await tester.tap(segment);
-    await tester.pump();
-    var submit = tester.widget<FilledButton>(
-        find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNotNull, reason: '选定角色后提交可用');
-
-    // Re-tap the SAME segment: the empty selection must resolve to a null
-    // role (never `selection.first` on an empty set), and the submit
-    // disables — an empty selection can never enter the join.
-    await tester.tap(segment);
-    await tester.pump();
-    expect(tester.takeException(), isNull,
-        reason: '再次点击已选角色不得抛出空集合异常（R29-P2-04）');
-    submit = tester.widget<FilledButton>(
-        find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNull,
-        reason: '取消选择后提交必须禁用（空选择不得进入配对）');
-    expect(fake.joinCodeCalls, 0, reason: '空选择绝不应发起 join');
-
-    // Re-picking restores the submit.
-    await tester.tap(segment);
-    await tester.pump();
-    submit = tester.widget<FilledButton>(
-        find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNotNull, reason: '重新选定后提交恢复可用');
-  });
+  // R29-P2-04 (re-tap deselects the join role) retired with the selector
+  // itself: W7.1 (AUD-05) removed the join direction pick — there is no
+  // selection state left to crash on.
 
   testWidgets('network change drops connections: the list follows',
       (tester) async {
@@ -338,8 +328,10 @@ void main() {
     fake.completeProbe(connId);
     await pumpEvents(tester);
     await tester.pump();
-    await tester.tap(find.byKey(const ValueKey('flow_done_button')));
-    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    // W7.2: the sender success auto-opened the detail page — leave it.
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    await leaveAutoOpenedDetail(tester);
     expect(find.byKey(ValueKey('conn_card_name_$connId')),
         findsOneWidget);
 

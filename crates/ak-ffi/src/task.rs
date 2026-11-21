@@ -234,7 +234,7 @@ use std::time::Duration;
 
 use ak_engine::{
     receive_accepted_consent, send, ConsentAnswer, ConsentInfo, EngineError, Progress, ReceiveSpec,
-    Report, SendSpec, TransferConsent,
+    Report, SendSpec, TransferConsent, DECLINED_WIRE_CODE,
 };
 use ak_identity::pairing_txn::{random_id16, VerifiedPairing};
 use ak_identity::tls::make_self_signed;
@@ -665,6 +665,14 @@ pub(crate) struct TaskRt {
     /// Finished publication + lease release, expiry and terminal close all
     /// serialize here; UDP resources are optional, lifecycle state is not.
     sender_lifetimes: StdMutex<HashMap<[u8; 16], SenderLifetime>>,
+    /// W1 (batch W, 2026-11-22, V-N2): the QUIC idle budget the send op
+    /// configures on its engine `SendSpec`. Production always keeps
+    /// [`TASK_SEND_IDLE`] (150 s); the field exists ONLY so the in-crate
+    /// task tests can shorten it PER RUNTIME — the conn_lost scenario
+    /// needs a silent peer's wait to exhaust a short idle inside the CI
+    /// budget without touching the production constant or any other
+    /// test's runtime.
+    pub(crate) send_idle_timeout: StdMutex<Duration>,
     executor: tokio::runtime::Handle,
 }
 

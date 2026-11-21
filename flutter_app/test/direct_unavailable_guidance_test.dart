@@ -33,13 +33,7 @@ Future<void> _join(WidgetTester tester, String code) async {
   await _tap(tester, 'home_join_code_button');
   await tester.enterText(find.byKey(const ValueKey('join_code_field')), code);
   await tester.pump();
-  await tester.tap(
-    find.descendant(
-      of: find.byKey(const ValueKey('join_role_selector')),
-      matching: find.text('发送文件'),
-    ),
-  );
-  await tester.pump();
+  // W7.1: no direction pick anymore — a well-formed code submits directly.
   await _tap(tester, 'join_submit_button');
 }
 
@@ -261,7 +255,8 @@ void main() {
     _expectGuidance();
     service.simulateNetworkChange();
     await _renderEvents(tester);
-    expect(find.textContaining('此连接已断开'), findsOneWidget);
+    // W3.3: the drop copy is the W1 interruption wording now.
+    expect(find.textContaining('连接已中断'), findsOneWidget);
     _expectNoGuidance();
   });
 
@@ -278,6 +273,12 @@ void main() {
       );
       await tester.pump();
       await _create(tester);
+      // W3: the mapped card (出了点问题) carries the verbatim cause only
+      // inside the expandable 详情.
+      expect(find.text('出了点问题'), findsOneWidget);
+      expect(find.textContaining(reason), findsNothing);
+      await _tap(tester, 'flow_error_toggle');
+      await tester.pump();
       expect(find.textContaining(reason), findsOneWidget);
       _expectNoGuidance();
       await _tap(tester, 'flow_back_button');
@@ -305,6 +306,11 @@ void main() {
       final code = await service.createCode(TaskRole.receive);
       service.nextJoinError = reason;
       await _join(tester, code.code);
+      // W3: the verbatim reason lives in the mapped card's 详情.
+      expect(find.byKey(const ValueKey('flow_error')), findsOneWidget);
+      expect(find.text(reason), findsNothing);
+      await _tap(tester, 'flow_error_toggle');
+      await tester.pump();
       expect(find.text(reason), findsOneWidget);
       _expectNoGuidance();
       await _tap(tester, 'flow_retry_button');
@@ -335,6 +341,10 @@ void main() {
       service.failSend(reason);
       await _renderEvents(tester);
       expect(find.byKey(const ValueKey('conn_send_error')), findsOneWidget);
+      // W3: the verbatim reason only inside the expandable 详情.
+      expect(find.textContaining(reason), findsNothing);
+      await _tap(tester, 'conn_send_error_toggle');
+      await tester.pump();
       expect(find.textContaining(reason), findsOneWidget);
       _expectNoGuidance();
       final retry = tester.widget<FilledButton>(

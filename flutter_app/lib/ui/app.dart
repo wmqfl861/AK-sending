@@ -84,7 +84,7 @@ class _AkSendingAppState extends State<AkSendingApp> {
     return TransferHistoryScope(
       history: _history,
       child: MaterialApp(
-        title: 'AK-sending',
+        title: 'AK互传',
         theme: buildAppTheme(Brightness.light),
         darkTheme: buildAppTheme(Brightness.dark),
         themeMode: ThemeMode.system,

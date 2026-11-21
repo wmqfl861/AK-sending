@@ -1,6 +1,7 @@
 /// C08 (single-resolution, probe-before-create loading) and E4 (the
-/// A–G staged diagnostic host) + E2 (the `%TEMP%\ak-stage.log` phase
-/// timing) coverage from the 2026-11-07 crash-analysis fix round.
+/// A–G staged diagnostic host) + E2 (the startup stage log phase
+/// timing; W5: identity-dir `logs/` on desktop, cache tier on Android)
+/// coverage from the 2026-11-07 crash-analysis fix round.
 ///
 /// The staged widget tests inject a fake [AkStagedEngineOwner] (depth
 /// interception at open / probe / engine_new) and a recording
@@ -626,7 +627,8 @@ void main() {
     });
   });
 
-  group('E2: %TEMP%\\ak-stage.log phase timing', () {
+  group('E2: startup stage log phase timing (W5: identity-dir logs/ on '
+      'desktop, cache tier on Android)', () {
     test('a staged run logs its stage line and task_start timing '
         '(millisecond-prefixed)', () {
       final (path, log) = freshStageLog('e2');
@@ -660,29 +662,104 @@ void main() {
         'write', () {
       final broken = AkStageLog.file(
         '${Directory.systemTemp.path}${Platform.pathSeparator}'
-        'ak-diag-no-such-dir-9f3\\ak-stage.log',
+            'ak-diag-no-such-dir-9f3\\ak-stage.log',
       );
       broken.write('should_not_throw');
       broken.write('still_not_throwing');
     });
 
-    test('defaultAkStageLogPath: TEMP/TMP/TMPDIR tiers, separator-aware',
-        () {
-      final dir = <String>['C:', 'users', 'temp'].join(Platform.pathSeparator);
+    test('shared() is a no-op under flutter test (W5: the test suite '
+        'never writes the real identity-dir log)', () {
+      // FLUTTER_TEST is set by `flutter test`; the shared instance must
+      // then be the permanent no-op so unguarded bootstrap calls in ANY
+      // test file cannot append into the real user identity directory.
+      final path = AkStageLog.defaultAkStageLogPath(Platform.environment,
+          isAndroid: false);
+      AkStageLog.shared().write('guard_probe_must_not_land');
+      if (path != null && File(path).existsSync()) {
+        expect(File(path).readAsLinesSync().last,
+            isNot(contains('guard_probe_must_not_land')));
+      }
+    });
+
+    test('defaultAkStageLogPath (W5): desktop = identity dir logs/, '
+        'Android = the TEMP/TMP/TMPDIR cache tier', () {
+      final sep = Platform.pathSeparator;
+      final dirSep = Platform.isWindows ? r'\' : '/';
+      // Desktop: the AK_ID_DIR override wins, logs/ is joined on.
+      final idDir = <String>['C:', 'id'].join(sep);
       expect(
-        AkStageLog.defaultAkStageLogPath(<String, String>{'TEMP': dir}),
-        <String>['C:', 'users', 'temp', 'ak-stage.log']
-            .join(Platform.pathSeparator),
+        AkStageLog.defaultAkStageLogPath(
+          <String, String>{'AK_ID_DIR': idDir},
+          isAndroid: false,
+        ),
+        <String>['C:', 'id', 'logs', 'ak-stage.log'].join(sep),
+      );
+      // Desktop default: USERPROFILE (Windows) / HOME (else) + .ak-sending.
+      final home = Platform.isWindows ? r'C:\users\me' : '/home/me';
+      final homeKey = Platform.isWindows ? 'USERPROFILE' : 'HOME';
+      expect(
+        AkStageLog.defaultAkStageLogPath(
+          <String, String>{homeKey: home},
+          isAndroid: false,
+        ),
+        '$home$dirSep.ak-sending${dirSep}logs${dirSep}ak-stage.log',
       );
       // A dir already ending in a separator gets no second one.
-      final trailing = <String>[dir, ''].join(Platform.pathSeparator);
+      final trailing = '$idDir$sep';
       expect(
-        AkStageLog.defaultAkStageLogPath(<String, String>{'TMP': trailing}),
-        '$trailing'
-            'ak-stage.log',
+        AkStageLog.defaultAkStageLogPath(
+          <String, String>{'AK_ID_DIR': trailing},
+          isAndroid: false,
+        ),
+        <String>['C:', 'id', 'logs', 'ak-stage.log'].join(sep),
       );
-      expect(AkStageLog.defaultAkStageLogPath(const <String, String>{}),
-          isNull);
+      // Android keeps the pre-W5 temp/cache tier (fake-platform branch).
+      final tempDir = <String>['C:', 'users', 'temp'].join(sep);
+      expect(
+        AkStageLog.defaultAkStageLogPath(
+          <String, String>{'TEMP': tempDir},
+          isAndroid: true,
+        ),
+        <String>['C:', 'users', 'temp', 'ak-stage.log'].join(sep),
+      );
+      expect(
+        AkStageLog.defaultAkStageLogPath(
+            const <String, String>{}, isAndroid: true),
+        isNull,
+        reason: 'Android with no temp env: the log stays a no-op (W5 keeps '
+            'the cache tier, never the identity dir)',
+      );
+    });
+
+    test('AkStageLog oversize rotation (W5): >256 KiB resets on the first '
+        'write — only the current startup stays; smaller logs are kept',
+        () {
+      final dir = Directory.systemTemp.createTempSync('ak-diag-rotate-');
+      addTearDown(() {
+        if (dir.existsSync()) {
+          dir.deleteSync(recursive: true);
+        }
+      });
+      final path = '${dir.path}${Platform.pathSeparator}ak-stage.log';
+
+      // Below the cap: pre-existing (previous-startup) lines survive.
+      File(path).writeAsStringSync('0 previous_startup\n');
+      AkStageLog.file(path).write('below_cap');
+      final kept = File(path).readAsLinesSync();
+      expect(kept.first, '0 previous_startup');
+      expect(kept.last, matches(RegExp(r'^\d+ below_cap$')));
+      expect(kept, hasLength(2));
+
+      // Above the cap: the instance's first write deletes the old file,
+      // so exactly the current startup's line remains.
+      File(path).writeAsBytesSync(List<int>.filled(300 * 1024, 0x61));
+      expect(File(path).lengthSync(), greaterThan(256 * 1024));
+      AkStageLog.file(path).write('fresh_startup');
+      final rotated = File(path).readAsLinesSync();
+      expect(rotated, hasLength(1));
+      expect(rotated.single, matches(RegExp(r'^\d+ fresh_startup$')));
+      expect(File(path).lengthSync(), lessThan(256 * 1024));
     });
   });
 

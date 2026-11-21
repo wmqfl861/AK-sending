@@ -412,6 +412,7 @@ void main() {
     var resultUi = '';
     var phaseName = '';
     var connId = '';
+    var lastRowSig = '';
     var rowSeen = false;
     var rowGone = false;
     var doneSeen = false;
@@ -533,17 +534,23 @@ void main() {
           }
           return;
         }
-        var present = false;
         for (final row in rows) {
           if (row.id == connId) {
-            present = true;
-            break;
+            rowSeen = true;
+            final sig = '${row.state}|idle=${row.idleExpired}';
+            if (sig != lastRowSig) {
+              lastRowSig = sig;
+              evidence('CONN_ROW|t=${_sec(clock.elapsedMilliseconds)}s'
+                  '|state=${row.state}'
+                  '|idleExpired=${row.idleExpired}');
+            }
+            return;
           }
         }
-        if (present) {
-          rowSeen = true;
-        } else if (rowSeen) {
+        if (rowSeen) {
           rowGone = true; // terminal: filtered out of the live snapshot
+          evidence('CONN_ROW|t=${_sec(clock.elapsedMilliseconds)}s'
+              '|state=<gone-from-snapshot>');
         }
       }));
       subs.add(service.engineHealth.listen((health) {
@@ -589,7 +596,10 @@ void main() {
       await tester.ensureVisible(homeButton);
       await tester.tap(homeButton);
       await _pump(tester, lifecycle, const Duration(milliseconds: 700));
-      await tester.tap(find.byKey(const ValueKey('role_send_button')));
+      final roleButton = find.byKey(const ValueKey('role_send_button'));
+      await tester.ensureVisible(roleButton);
+      await _pump(tester, lifecycle, const Duration(milliseconds: 300));
+      await tester.tap(roleButton);
       await _until(
           tester,
           lifecycle,
@@ -618,12 +628,26 @@ void main() {
         codePath.deleteSync(); // consumed by the join; dies with the code
         evidence('TASK_CODE_FILE|consumed-and-deleted');
       }
-      await tester.ensureVisible(connection.first);
-      await tester.tap(connection.first);
-      await _pump(tester, lifecycle, const Duration(milliseconds: 800));
+      // W7.2: the sender flow now AUTO-OPENS the detail page and the
+      // file-picker sheet once the peer joins — no manual card tap, no
+      // manual pick button. Wait for the auto-opened sheet directly.
+      await _until(
+          tester,
+          lifecycle,
+          () => find
+              .byKey(const ValueKey('pick_files_option'))
+              .evaluate()
+              .isNotEmpty,
+          'auto-opened pick sheet (W7.2)',
+          seconds: 30);
       expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-      await _pump(tester, lifecycle, const Duration(milliseconds: 600));
+      // The auto-opened bottom sheet animates in; settle before tapping
+      // (a mid-animation tap lands outside the render tree bounds).
+      for (var i = 0; i < 6; i++) {
+        await _pump(tester, lifecycle, const Duration(milliseconds: 300));
+      }
+      await tester
+          .ensureVisible(find.byKey(const ValueKey('pick_files_option')));
       await tester.tap(find.byKey(const ValueKey('pick_files_option')));
       await _until(tester, lifecycle,
           () => textAt(tester, 'picked_count') == '已选 1 项', 'picked entry');

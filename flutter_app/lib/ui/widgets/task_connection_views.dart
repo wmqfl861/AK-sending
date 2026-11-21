@@ -5,6 +5,7 @@ library;
 import 'package:flutter/material.dart';
 
 import '../service/simple_transfer_service.dart';
+import 'keep_foreground_hint.dart';
 
 /// Direction label from MY point of view (frozen one-way connection).
 String taskRoleLabel(TaskRole role) =>
@@ -189,6 +190,12 @@ class ConnectionCard extends StatelessWidget {
                         key: ValueKey('conn_card_caption_${connection.id}'),
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: theme.colorScheme.primary),
+                      ),
+                      // W7.3: the Android foreground hint rides the
+                      // running-transfer caption (nothing when idle).
+                      KeepForegroundHint(
+                        keyName:
+                            'conn_card_keep_foreground_${connection.id}',
                       ),
                     ],
                   ],

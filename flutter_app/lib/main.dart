@@ -39,8 +39,8 @@
 ///
 /// Every staged run shows a banner with the stage name (test key
 /// `diag_stage_X`) and writes the stage plus per-phase millisecond
-/// timestamps to `%TEMP%\ak-stage.log` (E2 — the facade/gate log the
-/// phases; see [AkStageLog]).
+/// timestamps to the startup stage log — `<identity dir>/logs/ak-stage.log`
+/// on Windows/Linux, the app cache dir on Android (W5; see [AkStageLog]).
 ///
 /// The facade's engine handle is RELEASED by the adapter's dispose (the
 /// `engineOwner` hook — borrowers first, native owner last, the P1-05
@@ -213,7 +213,8 @@ final class DiagTaskCallsGate implements AkTaskCalls {
   /// The stage this gate enforces (E/F truncation, G observation).
   final DiagStage stage;
 
-  /// Where allowed calls are timed (E2, same `%TEMP%\ak-stage.log`).
+  /// Where allowed calls are timed (E2, same identity-dir
+  /// `logs/ak-stage.log` — see [AkStageLog]).
   final AkStageLog log;
 
   /// Pure observation (explicit diagnostic G): never blocks.

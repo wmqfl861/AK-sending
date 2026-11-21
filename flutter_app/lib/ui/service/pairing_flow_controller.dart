@@ -67,6 +67,14 @@ class PairingFlowController extends ChangeNotifier {
   PairingFlowPhase? phase;
   TaskCode? code;
   String? error;
+
+  /// W3 (V-N4): the RAW error object behind [error] when the failure
+  /// came from an exception (or a passthrough service string) — the
+  /// failed view maps THIS through `transferErrorView` (title/reason/
+  /// suggestion) and keeps the original text only in the expandable
+  /// 「详情」. Null for failures the controller words itself (probe
+  /// verdict, drop) — those strings already follow 审核 §4.5.
+  Object? errorCause;
   TaskConnection? connection;
 
   /// The joiner's EXPLICIT direction of the running join flow (wave-29
@@ -86,7 +94,7 @@ class PairingFlowController extends ChangeNotifier {
       code = await _service.createCode(role);
       _set(PairingFlowPhase.awaitingPeer);
     } on Object catch (e) {
-      _fail('生成配对码失败：$e');
+      _fail('生成配对码失败', cause: e);
     }
   }
 
@@ -112,7 +120,10 @@ class PairingFlowController extends ChangeNotifier {
     try {
       final result = await _service.joinCode(normalized, role: role);
       if (!result.ok) {
-        _fail(result.error ?? '配对失败，请重试。');
+        // W3: the service's failure reason is the raw cause — the failed
+        // view maps it by content (unknown-code/timeout vocabulary) and
+        // keeps the verbatim text in 「详情」.
+        _fail('配对失败', cause: result.error ?? '配对失败，请重试。');
         return;
       }
       _expectedConnectionId = result.connectionId;
@@ -140,7 +151,7 @@ class PairingFlowController extends ChangeNotifier {
         }
       }
     } on Object catch (e) {
-      _fail('配对失败：$e');
+      _fail('配对失败', cause: e);
     }
   }
 
@@ -171,7 +182,7 @@ class PairingFlowController extends ChangeNotifier {
       await _service.disconnect(codeId);
       reset();
     } on Object catch (e) {
-      _fail('取消配对失败：$e（配对码可能仍然有效，请重试取消）');
+      _fail('取消配对失败（配对码可能仍然有效，请重试取消）', cause: e);
     }
   }
 
@@ -186,6 +197,7 @@ class PairingFlowController extends ChangeNotifier {
     this.phase = phase;
     code = null;
     error = null;
+    errorCause = null;
     connection = null;
     _expectedConnectionId = null;
     if (kind != PairingFlowKind.join) {
@@ -199,9 +211,14 @@ class PairingFlowController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _fail(String reason) {
+  /// [reason] is the controller's short label; [cause] (W3) is the RAW
+  /// error object/string the failed view maps — when set, the mapped
+  /// card replaces the label and the original text only renders inside
+  /// the expandable 「详情」.
+  void _fail(String reason, {Object? cause}) {
     phase = PairingFlowPhase.failed;
     error = reason;
+    errorCause = cause;
     notifyListeners();
   }
 

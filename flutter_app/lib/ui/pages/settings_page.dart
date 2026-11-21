@@ -12,6 +12,8 @@ import '../../services/connection_diagnostics.dart';
 import '../service/file_pick_gateway.dart';
 import '../service/save_dir_store.dart';
 import '../service/simple_transfer_service.dart';
+import '../service/transfer_errors.dart';
+import '../widgets/transfer_error_card.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -47,6 +49,12 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   bool _busy = false;
   bool _exporting = false;
+
+  /// W3 (V-N4): the raw error of a FAILED diagnostics export — the
+  /// inline mapped card below the button words it (title/suggestion);
+  /// the original text only shows in the expandable 「详情」. Cleared on
+  /// the next export attempt.
+  Object? _exportError;
 
   /// G6b: the registry server's build revision (null = unknown — an old
   /// server without the revision-query capability, a failed query, or
@@ -135,7 +143,10 @@ class _SettingsPageState extends State<SettingsPage> {
   /// save-then-show-the-path.
   Future<void> _exportDiagnostics() async {
     if (_exporting) return;
-    setState(() => _exporting = true);
+    setState(() {
+      _exporting = true;
+      _exportError = null; // W3: a fresh attempt clears the old card
+    });
     try {
       final body =
           buildDiagnosticsExport(ConnectionDiagnosticsLog.shared.lines);
@@ -150,12 +161,10 @@ class _SettingsPageState extends State<SettingsPage> {
       );
     } on Object catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-        SnackBar(
-          content: Text('连接诊断导出失败：$error'),
-          duration: const Duration(seconds: 4),
-        ),
-      );
+      // W3 (V-N4): the mapped inline card — title/suggestion first; the
+      // ORIGINAL error text only inside the expandable 「详情」 with the
+      // copy button (a transient snackbar cannot host either).
+      setState(() => _exportError = error);
     } finally {
       if (mounted) {
         setState(() => _exporting = false);
@@ -265,6 +274,15 @@ class _SettingsPageState extends State<SettingsPage> {
                       : const Icon(Icons.file_download_outlined),
                   label: const Text('导出连接诊断'),
                 ),
+                if (_exportError != null) ...[
+                  const SizedBox(height: 12),
+                  TransferErrorCard(
+                    key: const ValueKey('settings_export_diag_error'),
+                    error: _exportError!,
+                    scene: TransferErrorScene.diagnosticsExport,
+                    keyPrefix: 'settings_export_diag_error',
+                  ),
+                ],
               ],
             ),
           ),

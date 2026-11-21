@@ -31,6 +31,10 @@
 //     is the observation); anything else = clear it, the fresh-send
 //     default of the base runner.
 //   AK_U2_MIB              payload size in MiB, default 200.
+//   AK_U2_WATCH_MIN        observation window in minutes, default 10; the
+//     watch deadline and the overall test timeout (window + 10 min, so
+//     the default stays 20 min) derive from it. Batch V runs with
+//     AK_U2_MIB=32 AK_U2_WATCH_MIN=30.
 //   AK_U2_CASE             optional evidence tag for log parsing (L1, L2,
 //     L3-seg1, L3-seg2, ...); default "unnamed".
 //
@@ -111,6 +115,8 @@ const String _registryIdHex = String.fromEnvironment('AK_REGISTRY_ID');
 const bool _keepCheckpoint =
     String.fromEnvironment('AK_U2_KEEP_CHECKPOINT') == '1';
 const int _mib = int.fromEnvironment('AK_U2_MIB', defaultValue: 200);
+const int _watchMin =
+    int.fromEnvironment('AK_U2_WATCH_MIN', defaultValue: 10);
 const String _caseTag =
     String.fromEnvironment('AK_U2_CASE', defaultValue: 'unnamed');
 
@@ -118,10 +124,11 @@ const String _workDirName = 'u2_lifecycle';
 const String _payloadName = 'u2-payload.bin';
 const String _appId = 'dev.ak.ak_sending_app';
 
-/// Phase-2 budget: transfer + 60 s background + slack (the engine's own
+/// Phase-2 budget: the observation window, AK_U2_WATCH_MIN minutes
+/// (default 10 = transfer + 60 s background + slack; the engine's own
 /// send stall budget is 150 s, so a backgrounded-but-alive transfer must
-/// settle well inside this).
-const Duration _watchBudget = Duration(minutes: 10);
+/// settle well inside the default window).
+const Duration _watchBudget = Duration(minutes: _watchMin);
 
 /// How long to wait for the foreground before returning (see the header's
 /// teardown caveat).
@@ -751,5 +758,5 @@ void main() {
         unconsumed.deleteSync(); // an unconsumed code dies with the runtime
       }
     }
-  }, timeout: const Timeout(Duration(minutes: 20)));
+  }, timeout: const Timeout(Duration(minutes: _watchMin + 10)));
 }

@@ -419,9 +419,11 @@ Future<void> _scenarioRecv(WidgetTester tester, J1Picker picker) async {
     'join-send', code, '$_work/synthetic_200mib.bin',
   ]);
 
-  // Incoming banner appears; accept it.
+  // Incoming banner appears; accept it. X5: the title now names the
+  // sender (self-reported name · fp short code, or 「对方的设备」), so the
+  // needle matches the stable payload half only.
   final offered = await _waitFor(tester,
-      () => tester.any(find.textContaining('对方请求发送 1 个文件')),
+      () => tester.any(find.textContaining('请求发送 1 个文件')),
       const Duration(seconds: 60));
   expect(offered, isTrue, reason: 'no incoming request banner');
   await tester.pump(const Duration(milliseconds: 300));

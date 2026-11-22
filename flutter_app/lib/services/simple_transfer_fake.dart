@@ -375,13 +375,15 @@ class LocalSimpleTransferService implements SimpleTransferService {
 
   /// Simulates the remote joining my pending code (create-flow): consumes
   /// the code and adds a `connecting` connection with my declared role.
-  /// Returns the new connection id.
-  String simulatePeerJoin({String? peerName}) {
+  /// Returns the new connection id. X5: [peerShortId] optionally arms the
+  /// row's verified-fingerprint short code (null = the engine lacks it).
+  String simulatePeerJoin({String? peerName, String? peerShortId}) {
     final pending = _pendingCode;
     if (pending == null) {
       throw StateError('fake: no pending code to join (call createCode)');
     }
-    final connection = _consumePendingCode(peerName: peerName ?? remotePeerName);
+    final connection = _consumePendingCode(
+        peerName: peerName ?? remotePeerName, peerShortId: peerShortId);
     return connection.id;
   }
 
@@ -418,7 +420,10 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// at OFFER time unless scripted — the receive lands there even if the
   /// settings change before the user answers. The offer also carries the
   /// consent window it waits on (E2/G4, `windowSecs`): default 120 s,
-  /// scriptable per offer (null = an engine predating the field).
+  /// scriptable per offer (null = an engine predating the field). X5:
+  /// [rootName] and [peerName] optionally arm the payload's top-level
+  /// label and the sender's self-reported device name (null = an engine
+  /// predating those fields).
   String emitIncomingRequest({
     String? jobId,
     required int fileCount,
@@ -426,6 +431,8 @@ class LocalSimpleTransferService implements SimpleTransferService {
     String? saveDir,
     int? windowSecs = 120,
     String? connId,
+    String? rootName,
+    String? peerName,
   }) {
     final id = jobId ?? 'job-${_jobSeq += 1}';
     _incomingController.add(IncomingRequest(
@@ -435,6 +442,8 @@ class LocalSimpleTransferService implements SimpleTransferService {
       saveDir: saveDir ?? _saveDir,
       windowSecs: windowSecs,
       connId: connId, // U1: the receive's progress key (null = unknown)
+      rootName: rootName, // X5: the payload's top-level label
+      peerName: peerName, // X5: the sender's self-reported name
     ));
     return id;
   }
@@ -506,6 +515,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
 
   TaskConnection _consumePendingCode({
     required String peerName,
+    String? peerShortId,
     TaskRole? role,
   }) {
     final pending = _pendingCode!;
@@ -515,6 +525,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
       peerName: peerName,
       role: role ?? pending.role,
       state: TaskConnectionState.connecting,
+      peerShortId: peerShortId, // X5: verified-fp short code (nullable)
     );
     _connections.add(connection);
     _emitConnections();
@@ -540,6 +551,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
       role: _connections[index].role,
       state: state,
       idleExpired: _connections[index].idleExpired,
+      peerShortId: _connections[index].peerShortId,
     );
     _emitConnections();
   }

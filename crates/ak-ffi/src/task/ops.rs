@@ -570,8 +570,22 @@ fn render_conn(conn: &TaskConn) -> String {
         Some(addr) => quoted(&addr.to_string()),
         None => "null".to_string(),
     };
+    // X5 (batch X, 2026-11-22, ffi-v2 §8.3 批次 X 增补): the row carries
+    // the peer's SELF-REPORTED device name and the VERIFIED fingerprint's
+    // first 8 hex — the name is display-only (never an identity proof),
+    // the short code is the identity anchor the UI annotates it with.
+    // Both render `null` when the record lacks the fact (additive: older
+    // readers ignore unknown keys).
+    let peer_name = conn
+        .peer_name
+        .as_deref()
+        .map_or_else(|| "null".to_string(), quoted);
+    let peer_fp_short = conn
+        .peer_fp
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |fp| quoted(&fp.short_id()));
     format!(
-        "{{\"conn\":\"{}\",\"role\":{},\"state\":{},\"peer_endpoint\":{endpoint},\"code\":{}}}",
+        "{{\"conn\":\"{}\",\"role\":{},\"state\":{},\"peer_endpoint\":{endpoint},\"code\":{},\"peer_name\":{peer_name},\"peer_fp_short\":{peer_fp_short}}}",
         core::hex_encode(&conn.conn_id),
         quoted(conn.role.as_str()),
         quoted(conn.state.as_str()),

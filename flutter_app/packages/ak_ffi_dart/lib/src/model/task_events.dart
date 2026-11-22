@@ -11,10 +11,11 @@
 /// {"event":"op_failed","op_id":"<32hex>","op":"..."}
 /// {"event":"connected","conn":"<32hex>","role":"sender|receiver",
 ///  "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
-///  "code_id":"<32hex>"}
+///  "code_id":"<32hex>","peer_name":"phone","peer_fp_short":"a1b2c3d4"}
 /// {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":true|false|null}
 /// {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
-///  "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox"}
+///  "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox",
+///  "peer":"phone"}
 /// {"event":"done","conn":"<32hex>","files":3,"bytes":123456}
 /// {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done"}
 /// {"event":"handshake_failed","code_id":"<32hex>",
@@ -50,6 +51,15 @@
 ///   correlation key the creator minted (receive progress rows
 ///   themselves are keyed by the CONNECTION id — see ffi-v2 §8.4's
 ///   wave-31 revision).
+///
+/// Batch-X notes (X5, 2026-11-22, ffi-v2 §8.3 批次 X 增补 — additive):
+/// * `connected.peer_name` / `connected.peer_fp_short` and
+///   `incoming_request.peer`: the peer's SELF-REPORTED device name plus
+///   the first 8 hex of the VERIFIED peer fingerprint. The name is a
+///   display label, NEVER an identity proof — consumers pair it with the
+///   short code rather than calling it verified. All three are nullable:
+///   an engine predating the fields carries none (parse to null, same
+///   tolerance as `windowSecs`).
 ///
 /// Wave-29 note on `disconnected` reasons (P2-08, wave-30 P2-05 widened):
 /// `local`, `peer`, `receiver_failed` and `done` are DATA-PLANE terminal
@@ -97,6 +107,9 @@ sealed class TaskEvent {
           peerEndpoint: _optionalString(json, 'peer_endpoint'),
           code: _optionalString(json, 'code'),
           codeId: _optionalString(json, 'code_id'),
+          // X5 (batch X): nullable — an engine predating the fields.
+          peerName: _optionalString(json, 'peer_name'),
+          peerFpShort: _optionalString(json, 'peer_fp_short'),
         );
       case 'probe_result':
         return TaskProbeResultEvent(
@@ -116,6 +129,9 @@ sealed class TaskEvent {
           saveDir: _optionalString(json, 'saveDir'),
           // E2/G4: nullable int — older engines carry no window.
           windowSecs: _optionalInt(json, 'windowSecs'),
+          // X5 (batch X): the sender's self-reported device name —
+          // nullable, an engine predating the field carries none.
+          peerName: _optionalString(json, 'peer'),
         );
       case 'done':
         return TaskDoneEvent(
@@ -220,6 +236,8 @@ final class TaskConnectedEvent extends TaskEvent {
     this.peerEndpoint,
     this.code,
     this.codeId,
+    this.peerName,
+    this.peerFpShort,
   });
 
   /// Hex connection id (32 chars) — the UI correlation key.
@@ -240,6 +258,17 @@ final class TaskConnectedEvent extends TaskEvent {
   /// engine predating the field.
   final String? codeId;
 
+  /// The peer's SELF-REPORTED device name (X5, batch X 2026-11-22, wire
+  /// `peer_name`): the endpoint blob's display label. Display only —
+  /// never an identity proof; consumers annotate it with [peerFpShort].
+  /// Null = an engine predating the field (or an unknown name).
+  final String? peerName;
+
+  /// First 8 hex of the peer's VERIFIED device fingerprint (X5, wire
+  /// `peer_fp_short`) — the identity anchor shown beside the self-
+  /// reported name. Null = an engine predating the field.
+  final String? peerFpShort;
+
   @override
   String get name => 'connected';
 
@@ -250,6 +279,8 @@ final class TaskConnectedEvent extends TaskEvent {
         if (peerEndpoint != null) 'peer_endpoint': peerEndpoint,
         if (code != null) 'code': code,
         if (codeId != null) 'code_id': codeId,
+        if (peerName != null) 'peer_name': peerName,
+        if (peerFpShort != null) 'peer_fp_short': peerFpShort,
       };
 }
 
@@ -292,6 +323,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
     this.bytes = 0,
     this.saveDir,
     this.windowSecs,
+    this.peerName,
   });
 
   /// Hex pending-request id (32 chars) — the `ak_task_consent` key.
@@ -320,6 +352,13 @@ final class TaskIncomingRequestEvent extends TaskEvent {
   /// field (callers show no countdown rather than a wrong one).
   final int? windowSecs;
 
+  /// The sender's SELF-REPORTED device name (X5, batch X 2026-11-22, wire
+  /// key `peer`): taken from the offer's attributed connection record —
+  /// the receiving user learns WHO wants to send before deciding. Display
+  /// only, never an identity proof. Null = an engine predating the field
+  /// (callers fall back to the connection row's label).
+  final String? peerName;
+
   @override
   String get name => 'incoming_request';
 
@@ -332,6 +371,7 @@ final class TaskIncomingRequestEvent extends TaskEvent {
         'bytes': bytes,
         if (saveDir != null) 'saveDir': saveDir,
         if (windowSecs != null) 'windowSecs': windowSecs,
+        if (peerName != null) 'peer': peerName,
       };
 }
 

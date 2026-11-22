@@ -82,18 +82,27 @@ class TaskConnection {
     required this.role,
     required this.state,
     this.idleExpired = false,
+    this.peerShortId,
   });
 
   /// Opaque connection id (also the `sendFiles`/`disconnect` argument).
   final String id;
 
-  /// Display name of the remote device.
+  /// Display name of the remote device (X5: the peer's SELF-REPORTED
+  /// name when the engine carries it — never an identity proof; pair it
+  /// with [peerShortId]).
   final String peerName;
 
   /// MY direction for this connection (frozen at pairing).
   final TaskRole role;
 
   final TaskConnectionState state;
+
+  /// X5 (batch X, 2026-11-22, additive nullable): first 8 hex of the
+  /// peer's VERIFIED device fingerprint — the identity anchor shown
+  /// beside the (self-reported, never "verified") [peerName]. Null = the
+  /// implementation lacks the fact; the name renders alone.
+  final String? peerShortId;
 
   /// J2 (2026-11-13): this pairing ended because it sat IDLE past the
   /// engine's total 10-minute budget (`disconnected` event, reason
@@ -168,6 +177,8 @@ class IncomingRequest {
     this.saveDir,
     this.windowSecs,
     this.connId,
+    this.rootName,
+    this.peerName,
   });
 
   final String jobId;
@@ -195,6 +206,23 @@ class IncomingRequest {
   /// the implementation lacks the fact; show no countdown rather than a
   /// wrong one.
   final int? windowSecs;
+
+  /// X5 (batch X, 2026-11-22, additive nullable): the payload's
+  /// top-level label (the offer's root name). PRIVACY: a single-file
+  /// offer's root IS the file name — consumers must render a "1 个文件"
+  /// summary for it, never the name itself; multi-item offers show
+  /// 「root」等 N 项. Null = the implementation lacks the fact; the
+  /// summary falls back to the bare count.
+  final String? rootName;
+
+  /// X5 (batch X, 2026-11-22, additive nullable): the SENDER's
+  /// self-reported device name (the event's `peer` field). A name is
+  /// display-only, NEVER an identity proof — consumers annotate it with
+  /// the connection's verified-fingerprint short code
+  /// ([TaskConnection.peerShortId]), not with "已验证" wording. Null =
+  /// the implementation lacks the fact; show 「对方的设备」 instead of a
+  /// guessed name.
+  final String? peerName;
 }
 
 /// Phase of one live transfer as the UI renders it (client UI U1,

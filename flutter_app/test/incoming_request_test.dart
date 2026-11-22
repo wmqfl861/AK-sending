@@ -2,10 +2,19 @@
 /// receive progress, the success card with the save path, and the
 /// failure card. Driven by the fake's `emitIncomingRequest` +
 /// `finishIncoming`/`failIncoming` knobs.
+///
+/// X5 (batch X, 2026-11-22): the banner names the SENDER — the offer's
+/// self-reported device name annotated with the verified fingerprint's
+/// short code (or 「对方的设备」 when nothing is known) — and the payload
+/// summary shows the top-level label for multi-item offers while a
+/// single file's NAME never appears.
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'package:ak_sending_app/ui/service/simple_transfer_service.dart'
+    show TaskRole;
 
 import 'w28_test_helpers.dart';
 
@@ -19,7 +28,8 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const ValueKey('incoming_host')), findsOneWidget);
-    expect(find.text('对方请求发送 3 个文件（共 2.0 MB）'), findsOneWidget);
+    // X5: no name facts on the offer → the 对方的设备 fallback.
+    expect(find.text('对方的设备 请求发送 3 个文件（共 2.0 MB）'), findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_accept_job-1')),
         findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_reject_job-1')),
@@ -237,5 +247,89 @@ void main() {
     expect(find.byKey(const ValueKey('incoming_accept_old')), findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_countdown_old')), findsNothing,
         reason: '事件无窗口字段时不得显示猜测的倒计时');
+  });
+
+  testWidgets('X5: the banner names the sender (self-reported name · '
+      'verified-fp short code) and the payload\'s top-level label',
+      (tester) async {
+    final fake = await pumpApp(tester);
+
+    // A live connection row supplies the verified-fp short code; the
+    // offer itself carries the sender's self-reported name.
+    await fake.createCode(TaskRole.receive);
+    final connId =
+        fake.simulatePeerJoin(peerName: '张三的手机', peerShortId: 'a1b2c3d4');
+    await pumpEvents(tester);
+    await tester.pump();
+
+    fake.emitIncomingRequest(
+      jobId: 'who',
+      connId: connId,
+      peerName: '张三的手机',
+      rootName: '相册',
+      fileCount: 3,
+      totalBytes: 2 * 1024 * 1024,
+    );
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(
+      find.text('张三的手机 · a1b2c3d4 请求发送 「相册」等 3 个文件（共 2.0 MB）'),
+      findsOneWidget,
+      reason: '名称旁标注指纹短码；多项请求显示顶层名称摘要',
+    );
+    // The name is self-reported, never "verified" wording.
+    expect(find.textContaining('已验证'), findsNothing);
+  });
+
+  testWidgets('X5: PRIVACY — a single-file offer never shows the file '
+      'name, even when the event carries it as the root', (tester) async {
+    final fake = await pumpApp(tester);
+
+    // Single file: the offer's root IS the file name — the summary must
+    // be the bare count, never the name itself.
+    fake.emitIncomingRequest(
+      jobId: 'one',
+      rootName: '秘密文件.pdf',
+      peerName: '张三的手机',
+      fileCount: 1,
+      totalBytes: 42,
+    );
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.text('张三的手机 请求发送 1 个文件（共 42 B）'), findsOneWidget);
+    expect(find.textContaining('秘密文件.pdf'), findsNothing,
+        reason: '单文件名是隐私边界，横幅不得显示');
+  });
+
+  testWidgets('X5: a late identity fact refreshes an already-rendered '
+      'banner (the connection row lands after the offer)', (tester) async {
+    final fake = await pumpApp(tester);
+
+    // The offer names its connection, but the row has not landed yet:
+    // the banner renders the 对方的设备 fallback first. (The fake's first
+    // join deterministically books `conn-1`.)
+    fake.emitIncomingRequest(
+        jobId: 'late', connId: 'conn-1', fileCount: 2, totalBytes: 2048);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.text('对方的设备 请求发送 2 个文件（共 2.0 KB）'), findsOneWidget,
+        reason: '连接行未到时先用「对方的设备」缺名文案');
+
+    // The connection row arrives AFTERWARDS carrying the peer identity
+    // (self-reported name + verified-fp short code): the already-rendered
+    // banner's title refreshes to name · short-code.
+    await fake.createCode(TaskRole.receive);
+    fake.simulatePeerJoin(peerName: '李四的平板', peerShortId: '9f8e7d6c');
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(
+      find.text('李四的平板 · 9f8e7d6c 请求发送 2 个文件（共 2.0 KB）'),
+      findsOneWidget,
+      reason: '迟到到达的连接身份必须刷新横幅',
+    );
+    expect(find.text('对方的设备 请求发送 2 个文件（共 2.0 KB）'), findsNothing);
+    expect(find.byKey(const ValueKey('incoming_accept_late')), findsOneWidget);
   });
 }

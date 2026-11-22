@@ -449,10 +449,12 @@ CR-P1-07（batchH，2026-11-13，复核 REVIEW_2026-11-13-batchG §4.4 改法 1/
 {"event":"op_done","op_id":"<32hex>","op":"task_create_code|task_join|task_send"}
 {"event":"op_failed","op_id":"<32hex>","op":"…"}
 {"event":"connected","conn":"<32hex>","code_id":"<32hex>","role":"sender|receiver",
- "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}
+ "peer_endpoint":"ip:port","code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
+ "peer_name":"phone","peer_fp_short":"a1b2c3d4"}
 {"event":"probe_result","conn":"<32hex>","endpoint":"ip:port","reachable":null}
 {"event":"incoming_request","job":"<32hex>","conn":"<32hex>",
- "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox","windowSecs":120}
+ "root":"photos","files":3,"bytes":123456,"saveDir":"D:/inbox","windowSecs":120,
+ "peer":"phone"}
 {"event":"done","conn":"<32hex>","saveDir":"D:/inbox","files":3,"bytes":123456}
 {"event":"disconnected","conn":"<32hex>","reason":"local|peer|receiver_failed|done|idle_expired|conn_lost"}
 {"event":"code_cancelled","code_id":"<32hex>"}
@@ -477,12 +479,15 @@ batchF-G4 修订（2026-11-13，验收决定 E2——review 2026-11-12 §6）：
 
 批次 J2 增补（2026-11-13，CR-P3-15——review 2026-11-13-batchH §4）：`disconnected` 新增 **`idle_expired`** 理由。发送侧的配对保活（CR-P1-07 的 pairing-time opener + mapping keepalive）**总预算自配对完成起算 10 分钟**（`task_net::OPENER_KEEPALIVE_BUDGET`），发送 op **失败或被拒后保活在剩余预算内恢复**（共享 `task_net::sender_pairing_keeper` 每配对仅一个常驻任务；忙时暂停探测、空闲时恢复 keepalive 半边——不再重跑低 TTL opener、不再发第二个 `reflexive_opener` 事件，每配对恰一个的事件语义不变）；预算**不因恢复而重置**。配对生命周期 gate 原子化发送准入登记、op `Finished` 发布后的占用移除及到期决定：只有最后一个活跃发送退出且连接未终态时才恢复或到期，与发送启动/完成先后顺序无关。无 adopted socket、仅 plain-loopback 候选或 family 过滤后无目标仍保持同一绝对期限计时（可发包能力不是预算开关）。预算耗尽时该侧连接收敛为终态 `disconnected`/`idle_expired`（事件由发送侧 FFI 直推，ak-session 侧的 `TaskDisconnected{Local}` 照既有先例由泵跳过），建议 UI 文案“配对已闲置过久，请重新配对”。语义边界（如实）：预算是**本地策略上限**——它断言的是本侧停止刷新映射，不断言网络必然已回收映射；**活跃传输永远不会被预算终止**（到期时 gate 中有活跃发送则延后终结；最后一个失败结果发布并释放占用后才收敛。取消也等任务实际退出才释放占用；连接关闭/teardown 先设终态，迟到结算不能复活 keeper）。对端获知路径沿用 `ak_task_disconnect` 先例：同引擎对端即时缓存通知（`disconnected`/`peer`）；跨设备侧照既有诚实边界——刷新节奏停止后对端映射不再可靠可达，TASK-CLOSE 拨号本就是尽力通知而非正确性门槛（§8.4 既有口径）故不发起，持有监听的对端以既有途径（下一次入站连接失败或本地 teardown）收敛。
 
+批次 X 增补（2026-11-22，X5——接收确认显示设备名与内容摘要，纯加法）：`connected` 事件（双端各一）与 `ak_task_list` 连接行新增可选 **`peer_name`**（字符串：对端 endpoint blob 自报的设备名，即 `PeerEndpoint.name`）与 **`peer_fp_short`**（8 hex：配对 transcript **已验证**对端设备指纹的前 8 位十六进制，`Fingerprint::short_id`）；`incoming_request` 新增可选 **`peer`**（字符串：发送方自报设备名，取自该 Offer 归属连接的连接记录）。语义边界：**设备名是对端自报，不是身份证明**——UI 展示时名称旁标注 `peer_fp_short` 短码（已验证指纹），不得把名称表述为"已验证"；引擎侧对未知值输出 `null`，Dart 解析器对旧引擎缺字段以 null/缺省容忍（同 `windowSecs` 先例）。隐私边界不变：不显示单个文件名（单文件请求的 `root` 就是文件名，UI 摘要显示"1 个文件"而非名字），历史记录不存 root 名。
+
 批次 W 增补（2026-11-22，W1——僵尸连接行 V-N2；同日外部裁决补帧识别双匹配）：`disconnected` 新增 **`conn_lost`** 理由（**连接中断**，与 `idle_expired` 的配对闲置预算语义分开）。触发点：`ak_task_send` 的**连接后失败**（引擎已报告 `Connected` 之后 op 失败）里，非 `PeerClosed` 的一切错误——仅除下面两个**码+消息双匹配**例外——典型实测形态是发送端进程被移动端冻结（freezer）期间 QUIC 连接因空闲超时死亡、解冻后发送 op 以 idle timeout 失败。此前该路径只让 op 返回错误（`op_failed` 事件），引擎从不为该连接发任何终止事件，连接表里它保持 `connected`（V2-b 实测僵尸行），唯一的迟到终止是 10 分钟配对闲置预算的 `idle_expired`——原因错标。修复后该路径经既有 `close` 收敛（`push_disconnected_once`）：连接表翻 `disconnected`、发送侧生命周期终态（keeper 停止、hole socket 释放）、事件直推 `disconnected`/`conn_lost`，且发生在 op 结算（`op_failed`）之前或同帧；`PeerClosed` 分支保持既有 `peer` 上报路径不变。**例外（冻结语义保持；2026-11-22 裁决改为码+消息双匹配）**：对端**拒绝 Offer**（DECLINED 错误帧——`EngineError::PeerError` 且 code 为 `DECLINED_WIRE_CODE` **且 message 为 `DECLINED_MESSAGE` 固定文本**——封闭码集把 DECLINED 复用在 `LocalPermissionDenied` 上，**同码异文**（如对端转发的真实本地权限拒绝）不构成用户拒绝、落回 `conn_lost`；或协议 Reject 帧 `EngineError::Rejected`）不是任务终态——监听器继续服务、同码重试合法（§8.4“拒绝不是任务终态”），该错误只失败 op、不断连接；对端的认证 TASK-CLOSE 帧（`EngineError::PeerError` 且 code 为 `Cancelled`、**且 message 为 TASK-CLOSE 固定文本**——**同文异码**不构成 TASK-CLOSE、落回 `conn_lost`）照 `PeerClosed` 归入 `peer` 上报路径。**`idle_expired` 语义不变**（仍只表示 10 分钟配对闲置预算耗尽这一时间驱动的本地终态）。建议 UI 文案按“传输中断/连接中断”一类（与闲置过久分开）。
 
 `ak_task_list` 快照：`{"runtime":"<32hex>","save_dir":"D:/inbox",
 "connections":[{"conn":"<32hex>","role":"sender","state":
 "probing|connected|unreachable|disconnected","peer_endpoint":"ip:port",
-"code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"}]}`。
+"code":"AKI1-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX",
+"peer_name":"phone","peer_fp_short":"a1b2c3d4"}]}`（`peer_name`/`peer_fp_short` 可选，批次 X 增补）。
 
 ### 8.4 行为语义（冻结；wave-29 修订处标注）
 

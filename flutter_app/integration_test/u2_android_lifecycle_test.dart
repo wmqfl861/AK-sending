@@ -700,8 +700,14 @@ void main() {
           break;
         }
         if (rowGone) {
+          // X3: hold the app installed through the full observation window
+          // even after the row is terminal — the host-side scenario and
+          // evidence sampler still need the app alive at resume +5s/+30s
+          // (V-N3 rounds). Batch W's runner did the same by construction.
           ended = 'row-gone';
-          break;
+          if (nowMs - watchStartMs > _watchBudget.inMilliseconds) {
+            break;
+          }
         }
         if (engineFailure.isNotEmpty) {
           ended = 'engine-failed';

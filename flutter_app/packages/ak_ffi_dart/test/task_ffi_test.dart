@@ -455,6 +455,55 @@ void main() {
           throwsA(isA<FormatException>()));
     });
 
+    test('X5: connected/incoming_request carry the peer identity fields '
+        '(peer_name/peer_fp_short/peer); old shapes parse to null', () {
+      final connected = TaskEvent.fromJson({
+        'event': 'connected',
+        'conn': 'cd' * 16,
+        'role': 'receiver',
+        'peer_endpoint': '192.168.1.2:7100',
+        'code': 'AKI1-AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH',
+        'peer_name': 'phone-beta',
+        'peer_fp_short': 'a1b2c3d4',
+      }) as TaskConnectedEvent;
+      expect(connected.peerName, 'phone-beta');
+      expect(connected.peerFpShort, 'a1b2c3d4');
+      expect(connected.fields['peer_name'], 'phone-beta');
+      expect(connected.fields['peer_fp_short'], 'a1b2c3d4');
+
+      final incoming = TaskEvent.fromJson({
+        'event': 'incoming_request',
+        'job': 'ef' * 16,
+        'conn': 'cd' * 16,
+        'root': 'photos',
+        'files': 3,
+        'bytes': 99,
+        'saveDir': 'D:/inbox',
+        'windowSecs': 120,
+        'peer': 'phone-beta',
+      }) as TaskIncomingRequestEvent;
+      expect(incoming.peerName, 'phone-beta');
+      expect(incoming.fields['peer'], 'phone-beta');
+
+      // Old-engine tolerance (the pre-X5 shapes carry none of the three):
+      // the fields parse to null, never throw — same policy as windowSecs.
+      final oldConnected = TaskEvent.fromJson({
+        'event': 'connected',
+        'conn': 'cd' * 16,
+        'role': 'sender',
+      }) as TaskConnectedEvent;
+      expect(oldConnected.peerName, isNull);
+      expect(oldConnected.peerFpShort, isNull);
+      final oldIncoming = TaskEvent.fromJson({
+        'event': 'incoming_request',
+        'job': 'ef' * 16,
+        'root': 'photos',
+        'files': 1,
+        'bytes': 1,
+      }) as TaskIncomingRequestEvent;
+      expect(oldIncoming.peerName, isNull);
+    });
+
     test('unknown event names fall forward, broken payloads throw', () {
       final unknown =
           TaskEvent.fromJson({'event': 'future_thing', 'x': 1});

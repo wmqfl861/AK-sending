@@ -98,6 +98,54 @@ void main() {
     service.dispose();
   });
 
+  test('X5: the peer identity rides the connection row and the incoming '
+      'request (self-reported name + verified-fp short code + root label)',
+      () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.send)).code;
+    final JoinResult joined = await service.joinCode(code);
+    service.engine.pumpEvents();
+    final runtimeId = fake.runtimes.keys.first;
+
+    // An X5 engine's `connected` event carrying the identity fields (the
+    // fake's own join events model the PRE-X5 shape — that tolerance is
+    // the rows test above).
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'connected',
+      'conn': joined.connectionId,
+      'role': 'receiver',
+      'peer_name': 'phone-beta',
+      'peer_fp_short': 'a1b2c3d4',
+    });
+    // And an X5 `incoming_request` carrying the sender's self-reported
+    // name (`peer`) plus the payload's root label.
+    final requests = <IncomingRequest>[];
+    service.incomingRequests.listen(requests.add);
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'incoming_request',
+      'job': 'ab' * 16,
+      'conn': joined.connectionId,
+      'root': 'photos',
+      'files': 3,
+      'bytes': 123456,
+      'saveDir': 'C:/ak/bridge/downloads',
+      'windowSecs': 120,
+      'peer': 'phone-beta',
+    });
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+
+    final rows = await service.connections.first;
+    expect(rows.first.peerName, 'phone-beta',
+        reason: '引擎自报名优先于码尾标签');
+    expect(rows.first.peerShortId, 'a1b2c3d4');
+    expect(requests.single.rootName, 'photos',
+        reason: 'X5 修复：映射不再丢 rootName');
+    expect(requests.single.peerName, 'phone-beta');
+    service.dispose();
+  });
+
   test('consent accept waits for the receive; decline resolves immediately',
       () async {
     final fake = FakeAkTaskCalls();

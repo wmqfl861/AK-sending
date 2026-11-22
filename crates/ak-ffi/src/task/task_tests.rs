@@ -221,6 +221,29 @@ fn start_task_on(
     runtime_id
 }
 
+/// X5 (batch X, 2026-11-22): [`start_task_on`] with an explicit device
+/// name — the synthetic two-end identity tests pair two DISTINCT names so
+/// each side's `peer_name` provably names the OTHER device, never itself.
+fn start_task_on_as(
+    engine: *mut AkEngine,
+    registry: &TestRegistry,
+    id_dir: &std::path::Path,
+    device_name: &str,
+) -> [u8; 16] {
+    let spec = CString::new(format!(
+        "{{\"spec_version\":1,\"registry\":\"{}\",\"registry_id\":\"{}\",\"id_dir\":\"{}\",\"device_name\":\"{device_name}\"}}",
+        registry.addr,
+        registry.id_hex(),
+        id_dir.to_string_lossy().replace('\\', "/"),
+    ))
+    .expect("spec CString");
+    let mut runtime_id = [0u8; 16];
+    let code = ak_task_start(engine, spec.as_ptr(), runtime_id.as_mut_ptr());
+    let detail = last_error_of(engine);
+    assert_eq!(code, 0, "ak_task_start failed: {detail}");
+    runtime_id
+}
+
 /// Poll `ak_pairing_poll_event` until one event whose body contains
 /// `needle` arrives (draining older events into a log).
 fn wait_event(engine: *mut AkEngine, runtime_id: &[u8; 16], needle: &str) -> String {
@@ -766,6 +789,140 @@ fn join_links_both_sides_and_lists_the_connection() {
         "{joiner_list}"
     );
     assert!(joiner_list.contains("\"code\":\""), "{joiner_list}");
+    ak_engine_free(engine);
+}
+
+/// X5 (batch X, 2026-11-22, ffi-v2 §8.3 批次 X 增补): both sides' events
+/// and `ak_task_list` rows carry the PEER's self-reported device name and
+/// the VERIFIED fingerprint's first 8 hex. Two ends with DISTINCT
+/// synthetic names pair through the real registry; each side must name
+/// the OTHER device (never itself), and the short code must equal the
+/// peer's device-key fingerprint prefix — the name is display-only, the
+/// fingerprint is the identity anchor.
+#[test]
+fn connected_events_and_rows_carry_peer_identity() {
+    let registry = TestRegistry::spawn();
+    let engine = ak_engine_new();
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let owner = start_task_on_as(engine, &registry, dir_a.path(), "desktop-alpha");
+    let joiner = start_task_on_as(engine, &registry, dir_b.path(), "phone-beta");
+    // The device keys `ak_task_start` bootstrapped — the fingerprint each
+    // end's peer VERIFIES through the pairing transcript.
+    let fp_a = DeviceKeyPair::load_or_create(&dir_a.path().join("device.key"))
+        .expect("owner device key")
+        .0
+        .fingerprint();
+    let fp_b = DeviceKeyPair::load_or_create(&dir_b.path().join("device.key"))
+        .expect("joiner device key")
+        .0
+        .fingerprint();
+    let (_, ok, json) = create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"sender\"}");
+    assert!(ok, "{json}");
+    let code = code_of(&json);
+    let (join_ok, join_json) = join_code(engine, &joiner, &code);
+    assert!(join_ok, "{join_json}");
+    // The owner names the JOINER; the joiner names the OWNER. Both short
+    // codes match the respective VERIFIED device fingerprints.
+    let on_owner = wait_event(engine, &owner, "\"event\":\"connected\"");
+    assert!(
+        on_owner.contains("\"peer_name\":\"phone-beta\""),
+        "the owner's event names the joiner: {on_owner}"
+    );
+    assert!(
+        on_owner.contains(&format!("\"peer_fp_short\":\"{}\"", fp_b.short_id())),
+        "the owner's short code is the joiner's verified fingerprint: {on_owner}"
+    );
+    let on_joiner = wait_event(engine, &joiner, "\"event\":\"connected\"");
+    assert!(
+        on_joiner.contains("\"peer_name\":\"desktop-alpha\""),
+        "the joiner's event names the owner: {on_joiner}"
+    );
+    assert!(
+        on_joiner.contains(&format!("\"peer_fp_short\":\"{}\"", fp_a.short_id())),
+        "the joiner's short code is the owner's verified fingerprint: {on_joiner}"
+    );
+    // The same facts ride both sides' list rows.
+    let mut buf = cbuf(CAP);
+    assert_eq!(
+        ak_task_list(engine, owner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        1
+    );
+    let owner_list = text_of(&buf);
+    assert!(
+        owner_list.contains("\"peer_name\":\"phone-beta\"")
+            && owner_list.contains(&format!("\"peer_fp_short\":\"{}\"", fp_b.short_id())),
+        "the owner's row carries the joiner identity: {owner_list}"
+    );
+    buf.iter_mut().for_each(|slot| *slot = 0);
+    assert_eq!(
+        ak_task_list(engine, joiner.as_ptr(), buf.as_mut_ptr(), buf.len()),
+        1
+    );
+    let joiner_list = text_of(&buf);
+    assert!(
+        joiner_list.contains("\"peer_name\":\"desktop-alpha\"")
+            && joiner_list.contains(&format!("\"peer_fp_short\":\"{}\"", fp_a.short_id())),
+        "the joiner's row carries the owner identity: {joiner_list}"
+    );
+    ak_engine_free(engine);
+}
+
+/// X5: the `incoming_request` event carries the SENDER's self-reported
+/// device name (`peer`, from the offer's attributed connection record) —
+/// the receiving user learns WHO wants to send before deciding. The name
+/// matches the joining sender's start spec, not the receiver's own.
+#[test]
+fn incoming_request_carries_sender_device_name() {
+    let registry = TestRegistry::spawn();
+    let engine = ak_engine_new();
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let owner = start_task_on_as(engine, &registry, dir_a.path(), "receiver-alpha");
+    let joiner = start_task_on_as(engine, &registry, dir_b.path(), "sender-beta");
+    let (_, ok, json) = create_code(engine, &owner, "{\"spec_version\":1,\"role\":\"receiver\"}");
+    assert!(ok, "{json}");
+    let code = code_of(&json);
+    let (join_ok, join_json) = join_code(engine, &joiner, &code);
+    assert!(join_ok, "{join_json}");
+    let conn = conn_of(&join_json);
+    std::fs::write(dir_b.path().join("named.bin"), b"named sender").unwrap();
+    let paths = CString::new(json_paths(&dir_b.path().join("named.bin"))).unwrap();
+    let mut send_op = [0u8; 16];
+    assert_eq!(
+        ak_task_send(
+            engine,
+            joiner.as_ptr(),
+            conn.as_ptr(),
+            paths.as_ptr(),
+            send_op.as_mut_ptr()
+        ),
+        0,
+        "send accepted: {}",
+        last_error_of(engine)
+    );
+    let request = wait_event(engine, &owner, "incoming_request");
+    assert!(
+        request.contains("\"peer\":\"sender-beta\""),
+        "the request names the sending device: {request}"
+    );
+    assert!(
+        !request.contains("receiver-alpha"),
+        "the request never names the LOCAL device: {request}"
+    );
+    assert!(request.contains("\"files\":1"), "{request}");
+    // Decline (nothing lands) and let the op settle — the send fails over
+    // the wire with the DECLINED semantics.
+    let job = hex16_id(
+        request
+            .split("\"job\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("job id"),
+    );
+    assert_eq!(ak_task_consent(engine, owner.as_ptr(), job.as_ptr(), 0), 0);
+    let (send_ok, send_json) = wait_op(engine, &joiner, &send_op);
+    assert!(!send_ok, "the declined offer fails the op: {send_json}");
     ak_engine_free(engine);
 }
 
@@ -2401,6 +2558,7 @@ fn synthetic_sender(engine: &AkEngine) -> (tempfile::TempDir, Arc<TaskRt>, TaskC
         candidates: vec!["127.0.0.1:9".parse().unwrap()],
         peer_endpoint: None,
         peer_fp: None,
+        peer_name: None,
         code: "synthetic".to_string(),
     };
     rt.conns.lock().unwrap().insert(conn.conn_id, conn.clone());
@@ -3389,6 +3547,7 @@ fn consent_requests_close_visibly_on_expiry_and_disconnect() {
                 candidates: Vec::new(),
                 peer_endpoint: None,
                 peer_fp: Some(sender_fp),
+                peer_name: None,
                 code_id,
                 code: "AKI1-TEST".into(),
             },
@@ -3686,6 +3845,7 @@ fn register_consent_on_a_closed_connection_publishes_nothing() {
                 candidates: Vec::new(),
                 peer_endpoint: None,
                 peer_fp: Some(sender_fp),
+                peer_name: None,
                 code_id,
                 code: "AKI1-TEST".into(),
             },
@@ -3768,6 +3928,7 @@ fn windows_receiver_refuses_unsavable_root_name_before_registration() {
                 candidates: Vec::new(),
                 peer_endpoint: None,
                 peer_fp: Some(sender_fp),
+                peer_name: None,
                 code_id,
                 code: "AKI1-TEST".into(),
             },
@@ -3860,6 +4021,7 @@ fn disconnect_register_race_never_surfaces_a_late_incoming() {
                 candidates: Vec::new(),
                 peer_endpoint: None,
                 peer_fp: Some(sender_fp),
+                peer_name: None,
                 code_id,
                 code: "AKI1-TEST".into(),
             },

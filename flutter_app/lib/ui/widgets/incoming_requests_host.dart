@@ -1,8 +1,19 @@
 /// Wave-28 receive prompts: a top banner stack driven by
-/// `SimpleTransferService.incomingRequests` — 「对方请求发送 N 个文件」
-/// with 接受/拒绝, an indeterminate progress row while receiving, and a
+/// `SimpleTransferService.incomingRequests` — 「谁要发什么」 with
+/// 接受/拒绝, an indeterminate progress row while receiving, and a
 /// success card carrying the save path. Visible on both tabs (mounted by
 /// the shell above the page content).
+///
+/// X5 (batch X, 2026-11-22): the pending banner names the SENDER — the
+/// offer's self-reported device name (`IncomingRequest.peerName`),
+/// falling back to the connection row's label, falling back to
+/// 「对方的设备」. The name is SELF-REPORTED, never an identity proof, so
+/// it is annotated with the verified fingerprint's first 8 hex
+/// (`TaskConnection.peerShortId`, from the connections stream) rather
+/// than any 已验证 wording. The payload summary shows the top-level
+/// label for multi-item offers (「photos」等 3 个文件) and — PRIVACY: a
+/// single-file offer's root IS the file name — a bare 「1 个文件」 for
+/// single files (never the name itself).
 ///
 /// Wave-29 P2-11: banners whose consent window closed undecided are
 /// REMOVED via `expiredIncomingRequests` (the engine auto-declined them),
@@ -40,6 +51,17 @@ import 'transfer_error_card.dart';
 import 'transfer_progress_view.dart';
 
 enum _Stage { pending, receiving, done, failed }
+
+/// X5: the payload summary — the top-level label for multi-item offers
+/// (「photos」等 3 个文件), a bare count otherwise. PRIVACY: a
+/// single-file offer's root IS the file name, so it is NEVER shown.
+String _payloadLabelOf(IncomingRequest request) {
+  final root = request.rootName;
+  if (request.fileCount > 1 && root != null && root.isNotEmpty) {
+    return '「$root」等 ${request.fileCount} 个文件';
+  }
+  return '${request.fileCount} 个文件';
+}
 
 class _BannerState {
   _BannerState(this.request, this.stage);
@@ -79,6 +101,10 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
   /// sender; the offer itself carries no peer name).
   final Map<String, String> _peerNames = {};
 
+  /// X5: the verified-fingerprint short codes by connection id — the
+  /// identity anchor annotated beside the self-reported peer names.
+  final Map<String, String> _peerShortIds = {};
+
   @override
   void initState() {
     super.initState();
@@ -107,14 +133,26 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
       }
     }, onError: (Object _) {});
     _connectionsSub = widget.service.connections.listen((rows) {
+      // X5: a LATE identity fact (the connection row landing after the
+      // banner rendered) must refresh the pending banners' peer labels.
+      var identityChanged = false;
       for (final row in rows) {
+        identityChanged |= _peerNames[row.id] != row.peerName;
         _peerNames[row.id] = row.peerName;
+        final short = row.peerShortId;
+        identityChanged |= short != null && _peerShortIds[row.id] != short;
+        if (short != null) {
+          _peerShortIds[row.id] = short;
+        }
       }
       // Keep progress only for live rows and rows a banner still shows.
       final live = {for (final row in rows) row.id};
       final bannered = {for (final banner in _banners) banner.request.connId};
       _progress.removeWhere(
           (connId, _) => !live.contains(connId) && !bannered.contains(connId));
+      if (identityChanged && _banners.isNotEmpty) {
+        setState(() {});
+      }
     }, onError: (Object _) {});
   }
 
@@ -131,6 +169,25 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
   String _peerOf(_BannerState banner) {
     final connId = banner.request.connId;
     return (connId == null ? null : _peerNames[connId]) ?? '对端设备';
+  }
+
+  /// X5: the sender identity the pending banner names — the offer's
+  /// self-reported device name (first choice), the connection row's
+  /// label, or 「对方的设备」 when neither is known. The name is
+  /// SELF-REPORTED, so the verified fingerprint's short code rides along
+  /// when the connection row carries it (never any 已验证 wording).
+  String _peerLabelOf(_BannerState banner) {
+    final connId = banner.request.connId;
+    final name = banner.request.peerName ??
+        (connId == null ? null : _peerNames[connId]);
+    final short = connId == null ? null : _peerShortIds[connId];
+    if (name == null || name.isEmpty) {
+      return '对方的设备';
+    }
+    if (short == null || short.isEmpty) {
+      return name;
+    }
+    return '$name · $short';
   }
 
   Future<void> _respond(_BannerState banner, bool accept) async {
@@ -212,6 +269,7 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
               banner: banner,
               saveDir: widget.service.saveDir,
               progress: _progressOf(banner),
+              peerLabel: _peerLabelOf(banner),
               onAccept: () => _respond(banner, true),
               onReject: () => _respond(banner, false),
               onDismiss: () => _dismiss(banner),
@@ -233,6 +291,7 @@ class _IncomingBannerCard extends StatefulWidget {
     required this.banner,
     required this.saveDir,
     required this.progress,
+    required this.peerLabel,
     required this.onAccept,
     required this.onReject,
     required this.onDismiss,
@@ -243,6 +302,11 @@ class _IncomingBannerCard extends StatefulWidget {
 
   /// U1: the receive's latest progress snapshot (null = none yet).
   final TransferProgress? progress;
+
+  /// X5: the sender identity line — the self-reported device name with
+  /// the verified fingerprint's short code annotated (or the fallbacks
+  /// the host resolves; see `_peerLabelOf`).
+  final String peerLabel;
 
   final VoidCallback onAccept;
   final VoidCallback onReject;
@@ -345,7 +409,11 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
                   // Phone-width guard: the whole sentence ellipsizes after
                   // the size instead of overflowing.
                   child: Text(
-                    '对方请求发送 ${request.fileCount} 个文件'
+                    // X5: WHO (self-reported name · verified-fp short
+                    // code, or the fallbacks) sends WHAT (top-level
+                    // summary; a single file's name is never shown).
+                    '${widget.peerLabel} 请求发送'
+                    ' ${_payloadLabelOf(request)}'
                     '（共 ${formatBytes(request.totalBytes)}）',
                     key: ValueKey('incoming_title_$jobId'),
                     style: theme.textTheme.titleSmall,

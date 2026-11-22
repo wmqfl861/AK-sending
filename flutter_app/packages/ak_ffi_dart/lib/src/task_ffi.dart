@@ -1200,6 +1200,8 @@ final class TaskConnectionView {
     required this.state,
     this.peerEndpoint,
     this.code,
+    this.peerName,
+    this.peerFpShort,
   });
 
   /// Hex connection id (32 chars).
@@ -1215,6 +1217,16 @@ final class TaskConnectionView {
 
   final String? code;
 
+  /// The peer's SELF-REPORTED device name (X5, batch X 2026-11-22, wire
+  /// `peer_name`): display only, never an identity proof — consumers
+  /// annotate it with [peerFpShort]. Null = an engine predating the
+  /// field (or an unknown name, rendered as JSON `null`).
+  final String? peerName;
+
+  /// First 8 hex of the peer's VERIFIED device fingerprint (X5, wire
+  /// `peer_fp_short`). Null = an engine predating the field.
+  final String? peerFpShort;
+
   factory TaskConnectionView.fromJson(Map<String, dynamic> json) =>
       TaskConnectionView(
         connId: json['conn'] as String? ?? '',
@@ -1222,11 +1234,14 @@ final class TaskConnectionView {
         state: json['state'] as String? ?? '',
         peerEndpoint: json['peer_endpoint'] as String?,
         code: json['code'] as String?,
+        peerName: json['peer_name'] as String?,
+        peerFpShort: json['peer_fp_short'] as String?,
       );
 
   @override
   String toString() =>
-      'TaskConnectionView($connId $role $state→$peerEndpoint code=$code)';
+      'TaskConnectionView($connId $role $state→$peerEndpoint code=$code '
+      'peer=$peerName/${peerFpShort ?? '-'})';
 }
 
 /// The `ak_task_list` snapshot: connections plus the save folder.

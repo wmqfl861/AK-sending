@@ -49,9 +49,12 @@
 ///   contract's `unreachable` (wave-29 P2-09 — never to "success");
 ///   dropped rows are filtered out of the `connections` snapshot per the
 ///   contract.
-/// * **peerName**: the zero-identity v1 model carries no peer name — the
-///   row shows the task code's short label until registry-relayed device
-///   names land with agent B.
+/// * **peerName**: X5 (batch X, 2026-11-22) — the engine's
+///   self-reported peer name (`connected.peer_name`) rides the row,
+///   annotated by the verified fingerprint's short code
+///   (`peer_fp_short`); an engine predating the fields keeps the
+///   zero-identity v1 stand-in (the task code's short label) and no
+///   short code.
 /// * **consent**: with `accept: true` the returned future completes when
 ///   the receive finishes (the engine's `done` event for that
 ///   connection), rejects on failure/disconnect and — past
@@ -290,6 +293,8 @@ final class FfiSimpleTransferService implements SimpleTransferService {
             saveDir: request.saveDir, // P2-06: the request's real target
             windowSecs: request.windowSecs, // E2/G4: countdown's source
             connId: request.connId, // U1: this receive's progress key
+            rootName: request.rootName, // X5: the payload's top label
+            peerName: request.peerName, // X5: the sender's self-report
           ));
 
   /// Client UI U1: the engine service's folded progress, in the UI
@@ -631,11 +636,15 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   TaskConnection _rowOf(task_engine.SimpleConnection row) => TaskConnection(
         id: row.connId,
-        peerName: _peerNameOf(row),
+        // X5: the engine's self-reported peer name wins; the code's short
+        // label stands in only when the engine carries none (an old DLL).
+        peerName: row.peerName ?? _peerNameOf(row),
         role: _uiRole(row.role),
         state: _uiState(row.state),
         // J2: the idle-budget expiry keeps its own visible copy.
         idleExpired: row.disconnectReason == 'idle_expired',
+        // X5: the verified fingerprint's short code (null on old engines).
+        peerShortId: row.peerShortId,
       );
 
   /// The zero-identity v1 model carries no peer name: the code's short

@@ -163,6 +163,9 @@ pub(super) async fn run_join(
                 candidates: dial_candidates.clone(),
                 peer_endpoint: order_candidates(dial_candidates.clone()).first().copied(),
                 peer_fp: Some(peer_fp),
+                // X5: the peer's self-reported blob name rides the record
+                // (display-only; the verified `peer_fp` is the identity).
+                peer_name: Some(paired.peer.name.clone()),
                 code_id,
                 code: code.to_string(),
             },
@@ -194,7 +197,7 @@ pub(super) async fn run_join(
         .map(|addr| quoted(&addr.to_string()))
         .unwrap_or_else(|| "null".to_string());
     rt.push_event(format!(
-        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"code\":{}}}",
+        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{},\"code\":{},\"peer_name\":{},\"peer_fp_short\":{}}}",
         core::hex_encode(&conn_id),
         // Wave-31 R30-P2-02: the shared code id rides the joiner's
         // `connected` event too (same value as the owner's).
@@ -202,6 +205,12 @@ pub(super) async fn run_join(
         quoted(my_role.as_str()),
         endpoint,
         quoted(code),
+        // X5 (batch X, 2026-11-22, ffi-v2 §8.3 批次 X 增补): the peer's
+        // self-reported device name plus the VERIFIED fingerprint's short
+        // form — the name is display-only, the short code is the identity
+        // anchor the UI annotates it with.
+        quoted(&paired.peer.name),
+        quoted(&peer_fp.short_id()),
     ));
     // The REAL reachability probe; the settle is honest (P2-09):
     // all-failed leaves the entry `unreachable`, matching the join

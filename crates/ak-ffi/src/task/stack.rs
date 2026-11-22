@@ -463,6 +463,10 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
                 candidates: candidates.clone(),
                 peer_endpoint: order_candidates(candidates.clone()).first().copied(),
                 peer_fp: Some(paired.verified.redeemer_fingerprint()),
+                // X5: the joiner's self-reported blob name rides the
+                // record (display-only; the verified `peer_fp` above is
+                // the identity anchor).
+                peer_name: Some(paired.peer.name.clone()),
                 code_id,
                 code: display.clone(),
             },
@@ -472,7 +476,7 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
         ensure_sender_lifetime(rt, &conn);
     }
     rt.push_event(format!(
-        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{endpoint},\"code\":{}}}",
+        "{{\"event\":\"connected\",\"conn\":\"{}\",\"code_id\":\"{}\",\"role\":{},\"peer_endpoint\":{endpoint},\"code\":{},\"peer_name\":{},\"peer_fp_short\":{}}}",
         core::hex_encode(&conn_id),
         // Wave-31 R30-P2-02: both sides of the pairing share the SAME
         // code id — the joiner (which never saw the create result) fills
@@ -480,6 +484,12 @@ fn owner_side_bookkeeping(rt: &Arc<TaskRt>, code_id: [u8; 16], paired: &TaskPair
         core::hex_encode(&code_id),
         quoted(role.as_str()),
         quoted(&display),
+        // X5 (batch X, 2026-11-22, ffi-v2 §8.3 批次 X 增补): the joiner's
+        // self-reported device name plus the VERIFIED fingerprint's short
+        // form — the name is display-only, the short code is the identity
+        // anchor the UI annotates it with.
+        quoted(&paired.peer.name),
+        quoted(&paired.verified.redeemer_fingerprint().short_id()),
     ));
 }
 

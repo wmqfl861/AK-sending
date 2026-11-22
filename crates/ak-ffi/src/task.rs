@@ -407,6 +407,12 @@ pub(crate) struct TaskConn {
     /// The verified peer key to pin when dialing — the transcript-verified
     /// device fingerprint ak-session relayed with the pairing.
     peer_fp: Option<Fingerprint>,
+    /// The peer's SELF-REPORTED device name (X5, batch X 2026-11-22): the
+    /// `PeerEndpoint.name` the pairing's endpoint blob carried. Display
+    /// only — never an identity proof; the identity anchor is the
+    /// VERIFIED `peer_fp` above (its first 8 hex ride along as
+    /// `peer_fp_short` in the `connected` event and `ak_task_list` rows).
+    peer_name: Option<String>,
     code_id: [u8; 16],
     code: String,
 }
@@ -1147,6 +1153,18 @@ fn register_consent(
         // the NATIVE deadline — the fact source per ffi-v2 §8.3 — instead
         // of hard-coding a guess that would drift on the next change.
         line.push_str(&format!(",\"windowSecs\":{}", window.as_secs()));
+        // X5 (batch X, 2026-11-22): the sender's SELF-REPORTED device name
+        // from the attributed connection's record (the endpoint blob's
+        // `PeerEndpoint.name`). Optional per ffi-v2 §8.3 批次 X 增补 —
+        // `null` when the record carries none; a NAME is never an identity
+        // proof, which is why the `connected` event/list rows pair it with
+        // the verified fingerprint's short form.
+        line.push_str(&format!(
+            ",\"peer\":{}",
+            conn.peer_name
+                .as_deref()
+                .map_or_else(|| "null".to_string(), quoted),
+        ));
         line.push('}');
         rt.push_event(line);
     }

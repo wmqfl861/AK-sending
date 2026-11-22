@@ -192,6 +192,8 @@ final class SimpleConnection {
       this.peerEndpoint,
       this.code,
       this.disconnectReason,
+      this.peerName,
+      this.peerShortId,
     });
 
     /// Hex connection id (32 chars) — the send/disconnect key.
@@ -215,6 +217,17 @@ final class SimpleConnection {
   /// expiry the UI shows with its own copy); null for rows that went
   /// terminal any other way (and for engines predating the field).
   final String? disconnectReason;
+
+  /// X5 (batch X, 2026-11-22): the peer's SELF-REPORTED device name (the
+  /// `connected` event's `peer_name`). Display only — never an identity
+  /// proof; consumers annotate it with [peerShortId]. Null = an engine
+  /// predating the field (the adapter falls back to the code label).
+  final String? peerName;
+
+  /// X5: first 8 hex of the peer's VERIFIED device fingerprint (the
+  /// `connected` event's `peer_fp_short`) — the identity anchor shown
+  /// beside the self-reported name. Null = an engine predating the field.
+  final String? peerShortId;
 
   @override
   String toString() =>
@@ -252,6 +265,7 @@ final class SimpleIncomingRequest {
     required this.bytes,
     this.saveDir,
     this.windowSecs,
+    this.peerName,
   });
 
   /// The pending-request id — the [SimpleTransferService.consent] key.
@@ -268,8 +282,8 @@ final class SimpleIncomingRequest {
 
   /// The save directory THIS request will use, snapshotted native-side at
   /// offer time (wave-30 P2-06, the event's `saveDir` field): the files
-  /// land there even when the settings change before the user answers,
-  /// so the UI shows this value as the request's real target. Null = an
+  /// land there even if the settings change before the user answers, so
+  /// the UI shows this value as the request's real target. Null = an
   /// engine predating the field (fall back to the live [saveDir]).
   final String? saveDir;
 
@@ -280,10 +294,17 @@ final class SimpleIncomingRequest {
   /// one).
   final int? windowSecs;
 
+  /// X5 (batch X, 2026-11-22): the sender's SELF-REPORTED device name
+  /// (the event's `peer` field, from the offer's attributed connection
+  /// record) — the receiving user learns WHO wants to send before
+  /// deciding. Display only, never an identity proof. Null = an engine
+  /// predating the field (the UI falls back to the connection row).
+  final String? peerName;
+
   @override
   String toString() =>
       'SimpleIncomingRequest($jobId root=$rootName files=$files bytes=$bytes '
-      'saveDir=$saveDir windowSecs=$windowSecs)';
+      'saveDir=$saveDir windowSecs=$windowSecs peer=$peerName)';
 }
 
 /// Client UI U1 (2026-11-13): one progress snapshot of the transfer on
@@ -2056,6 +2077,8 @@ final class SimpleTransferService {
     String? role,
     String? peerEndpoint,
     String? code,
+    String? peerName,
+    String? peerShortId,
   }) {
     final existing = _connections[connId];
     if (existing == null) {
@@ -2065,6 +2088,8 @@ final class SimpleTransferService {
         state: state,
         peerEndpoint: peerEndpoint,
         code: code,
+        peerName: peerName,
+        peerShortId: peerShortId,
       );
       _notifyConnections();
     } else {
@@ -2074,7 +2099,9 @@ final class SimpleTransferService {
       if (merged == existing.state &&
           (role == null || role == existing.role) &&
           (peerEndpoint == null || peerEndpoint == existing.peerEndpoint) &&
-          (code == null || code == existing.code)) {
+          (code == null || code == existing.code) &&
+          (peerName == null || peerName == existing.peerName) &&
+          (peerShortId == null || peerShortId == existing.peerShortId)) {
         return; // nothing new — no notification
       }
       _connections[connId] = SimpleConnection(
@@ -2083,6 +2110,8 @@ final class SimpleTransferService {
         state: merged,
         peerEndpoint: peerEndpoint ?? existing.peerEndpoint,
         code: code ?? existing.code,
+        peerName: peerName ?? existing.peerName,
+        peerShortId: peerShortId ?? existing.peerShortId,
       );
       _notifyConnections();
     }
@@ -2137,6 +2166,10 @@ final class SimpleTransferService {
       peerEndpoint: existing.peerEndpoint,
       code: existing.code,
       disconnectReason: reason ?? existing.disconnectReason,
+      // X5: the known peer facts survive the terminal flip (the banner
+      // and the history record still name the peer afterwards).
+      peerName: existing.peerName,
+      peerShortId: existing.peerShortId,
     );
     _notifyConnections();
     if (reason == 'idle_expired' && !_idleExpiryController.isClosed) {
@@ -2342,6 +2375,8 @@ final class SimpleTransferService {
         role: event.role,
         peerEndpoint: event.peerEndpoint,
         code: event.code,
+        peerName: event.peerName, // X5: self-reported, display only
+        peerShortId: event.peerFpShort, // X5: verified-fp short code
         state: 'probing',
       );
       final codeId = event.codeId;
@@ -2390,6 +2425,7 @@ final class SimpleTransferService {
           bytes: event.bytes,
           saveDir: event.saveDir, // P2-06: the request's real target
           windowSecs: event.windowSecs, // E2/G4: the countdown's source
+          peerName: event.peerName, // X5: the sender's self-reported name
         ));
       }
       return;

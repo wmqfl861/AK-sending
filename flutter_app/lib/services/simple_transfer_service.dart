@@ -697,11 +697,14 @@ final class SimpleTransferService {
   /// in-progress transfer — mirrors the sender-side [sendFiles] stall
   /// budget and the engine's `TASK_SEND_IDLE` (150 s). A transfer whose
   /// fold is in the transferring/verifying phase and has produced NO
-  /// progress line for this long is marked failed with reason
-  /// `conn_lost` (传输中断) by the pump's watchdog — the zombie-row fix
-  /// for the side whose engine events never arrive (a frozen peer, a
-  /// lost event). Waits that legitimately produce no progress lines
-  /// (the 120 s consent window) are NOT in the watchdog's scope: only
+  /// progress line for this long is a stall CANDIDATE of the pump's
+  /// watchdog — the zombie-row backstop for the side whose engine events
+  /// never arrive (a frozen peer, a lost event). W-N2 (batch X): a
+  /// candidate is only marked `conn_lost` (传输中断) after the engine's
+  /// own `ak_task_list` snapshot confirms the connection gone (see
+  /// [_checkStalledTransfers] — a silent verify phase re-arms instead).
+  /// Waits that legitimately produce no progress lines (the 120 s
+  /// consent window) are NOT in the watchdog's scope: only
   /// `transferring`/`verifying` folds are checked, and those phases
   /// exist only after real bytes started moving.
   final Duration transferStallBudget;
@@ -801,8 +804,11 @@ final class SimpleTransferService {
   final Map<String, int> _progressTicks = <String, int>{};
 
   /// W1 (batch W): per-connection clock time of the LAST progress fact
-  /// (a tick advance) — the stall watchdog's baseline. Cleaned with the
-  /// transfer fold ([_settleTransfer]).
+  /// (a tick advance) — the stall watchdog's baseline. W-N2 (batch X):
+  /// the baseline is also re-armed WITHOUT a progress fact when the
+  /// engine's snapshot vouches for a silent-but-live connection (see
+  /// [_checkStalledTransfers]). Cleaned with the transfer fold
+  /// ([_settleTransfer]).
   final Map<String, DateTime> _lastProgressAt = <String, DateTime>{};
 
   /// W7.3 (batch W, 交接 §4.7 第 3 条): the connections with a transfer
@@ -2245,20 +2251,39 @@ final class SimpleTransferService {
 
   /// W1 (batch W, 2026-11-22, V-N2): a transfer whose fold is mid-flight
   /// (transferring/verifying — real bytes already moved) and has produced
-  /// NO progress line for [transferStallBudget] is marked failed with
-  /// reason `conn_lost`. Scope is deliberately narrow: a fold waiting
-  /// for consent or still connecting produces no progress lines BY
-  /// DESIGN (their waits have their own budgets — the sender's
-  /// [sendFiles] stall and the receiver's 120 s native window), so only
-  /// the transferring/verifying ranks are checked. The mark is local:
-  /// the engine discovers its own dead connection (now with the honest
-  /// `conn_lost` event of the W1 Rust fix) and a late genuine `done`
-  /// still converges the row.
+  /// NO progress line for [transferStallBudget] is a stall CANDIDATE.
+  /// Scope is deliberately narrow: a fold waiting for consent or still
+  /// connecting produces no progress lines BY DESIGN (their waits have
+  /// their own budgets — the sender's [sendFiles] stall and the
+  /// receiver's 120 s native window), so only the transferring/verifying
+  /// ranks are checked.
+  ///
+  /// W-N2 (batch X, 2026-11-22): a candidate is NOT marked directly. The
+  /// verifying phase can be legitimately silent for far longer than the
+  /// budget — since Q-N2 the receiver verifies files IN PARALLEL with
+  /// the transfer, and each whole-file digest re-read lands progress
+  /// only per completed file (the sender then waits for the final ack
+  /// with no progress at all). Simply EXCLUDING verifying from the
+  /// watchdog would drop the backstop for a connection that genuinely
+  /// dies in that phase, so the expiry first asks the ENGINE instead:
+  /// one `ak_task_list` snapshot per tick WITH candidates (the same
+  /// judgment as [_reconcileWithEngineSnapshot]) —
+  /// * the engine still lists the connection live → the watchdog's
+  ///   baseline is RESET (the budget starts over; no terminal state —
+  ///   the engine owns the dead/alive verdict, the Dart timer is only a
+  ///   backstop);
+  /// * the snapshot is missing the row or already says `disconnected`
+  ///   → `_markTerminal(conn_lost)` (the W1 shape: an event that died
+  ///   while the app could not observe it);
+  /// * the snapshot read itself throws → nothing is marked and nothing
+  ///   is reset; the transfer stays expired, so the next pump tick
+  ///   consults the engine again (deferred retry).
   void _checkStalledTransfers() {
     if (_transfers.isEmpty || _lastProgressAt.isEmpty) {
       return;
     }
     final now = _clock();
+    final expired = <String>[];
     for (final entry in _transfers.entries.toList()) {
       final tracker = entry.value;
       if (tracker.phaseRank < 2 || tracker.phaseRank >= 4) {
@@ -2268,7 +2293,37 @@ final class SimpleTransferService {
       if (lastAt == null || now.difference(lastAt) < transferStallBudget) {
         continue;
       }
-      _markTerminal(entry.key, 'disconnected', reason: 'conn_lost');
+      expired.add(entry.key);
+    }
+    if (expired.isEmpty) {
+      return; // nobody at budget — the engine is not asked either
+    }
+    final runtime = _runtime;
+    if (runtime == null || _disposed || _engineFailed) {
+      return; // nothing to ask (C12: never poll a latched-broken engine)
+    }
+    final TaskListSnapshot snapshot;
+    try {
+      snapshot = runtime.list();
+    } on Object {
+      return; // transient snapshot failure — the next tick retries
+    }
+    final engineStates = <String, String>{
+      for (final row in snapshot.connections) row.connId: row.state,
+    };
+    for (final connId in expired) {
+      final tracker = _transfers[connId];
+      if (tracker == null || tracker.phaseRank < 2 || tracker.phaseRank >= 4) {
+        continue; // settled while the snapshot was being read
+      }
+      final engineState = engineStates[connId];
+      if (engineState == null || engineState == 'disconnected') {
+        _markTerminal(connId, 'disconnected', reason: 'conn_lost');
+      } else {
+        // The engine vouches for the connection (a parallel verify, a
+        // slow final ack): re-arm this transfer's no-progress budget.
+        _lastProgressAt[connId] = now;
+      }
     }
   }
 

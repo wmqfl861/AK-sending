@@ -22,14 +22,33 @@
 /// Copy follows 审核 §4.3's 失败与恢复 table (five situations + the
 /// unknown fallback 「出了点问题」) and §4.5 (对方 not 对端, actions as
 /// buttons, no raw text outside 详情).
+///
+/// Batch X2 tightened three spots (W 复核 §2): W-N9 — the pairing/join
+/// invalidCode copy lists EVERY cause the engine's unified refusal covers
+/// (typo/expired/revoked/used, owner offline, both sides picking the same
+/// direction); W-N10 — the vocabulary knows the engine's real STORAGE_FULL
+/// texts (copied from the Rust constants, provenance in the classifier)
+/// and the sending scene gets its own copy (the PEER's device is full,
+/// re-pair then resume); W-N4 — status -2 claims invalidCode ONLY on the
+/// pairing/join scenes, the transfer scenes go through the vocabulary and
+/// the fallback.
 library;
 
 import 'dart:async' show TimeoutException;
 
 /// Where the failure surfaced — picks the wording nuances (who can act).
 enum TransferErrorScene {
-  /// The pairing flows (create/join) on the home page.
+  /// The pairing flows (create/join) on the home page. Today the home
+  /// page passes THIS one scene for both flows, and an invalidCode-shaped
+  /// failure there is a join-flow phenomenon (the create flow's failures
+  /// are never code-shaped), so the join copy below also serves it.
   pairing,
+
+  /// The JOIN flow specifically — the user typed someone else's code
+  /// (W-N9). Callers that know the flow kind (home's `_FlowFailedView`
+  /// already has `isJoin`) can pass this to be precise; every kind's copy
+  /// treats it like [pairing] except where a real distinction exists.
+  joining,
 
   /// A send failed on the connection detail page.
   sending,
@@ -44,8 +63,9 @@ enum TransferErrorScene {
 /// The classified cause. Public so callers can branch on it (e.g. the
 /// detail page shows the idle copy only for [idleExpired]).
 enum TransferErrorKind {
-  /// 码无效或过期 — the code is unknown/used-up/expired (`-2`, `unknown
-  /// task code`, the service's own readable variants).
+  /// 码无效或过期 — the code is unknown/used-up/expired (`unknown
+  /// task code`, the service's own readable variants; `-2` ONLY on the
+  /// pairing/join scenes, W-N4).
   invalidCode,
 
   /// 两端无法直连 — no candidate accepted the connection / connect
@@ -65,7 +85,9 @@ enum TransferErrorKind {
   /// 对方拒绝 — the receiving user declined (DECLINED semantics).
   peerDeclined,
 
-  /// 保存位置不可写 — storage full / storage error on the receive side.
+  /// 保存位置不可写 — storage full / storage error. Receiving means MY
+  /// save folder; sending means the PEER's device is full (W-N10: the
+  /// copy differs by scene).
   saveDirNotWritable,
 
   /// 长时间无进展 — a stall budget ran out (发送/接收/加入超时,
@@ -125,7 +147,7 @@ const String interruptedStatusLine = '连接已中断，重新发送会从断点
 /// `StateError`, a plain service-authored String …) in [scene] to the
 /// four copy lines. Pure: same input, same output, no side effects.
 TransferErrorView transferErrorView(Object error, TransferErrorScene scene) {
-  final kind = classifyTransferError(error);
+  final kind = classifyTransferError(error, scene);
   return viewForKind(kind, scene, detail: detailTextOf(error));
 }
 
@@ -137,11 +159,31 @@ TransferErrorView viewForKind(
   String detail = '',
 }) {
   final copy = switch (kind) {
-    TransferErrorKind.invalidCode => const (
-          '这个码用不了',
-          '码可能输错了，或已过期/已被使用（10 分钟内有效）。',
-          '请让对方重新生成，再输入新的码。',
-        ),
+    TransferErrorKind.invalidCode => switch (scene) {
+        // W-N9（批次 X2）：加入场景的三层文案。引擎的统一拒绝文本
+        // `unknown task code (or expired, revoked, owner offline)`
+        // （crates/ak-session/src/pairing/task_net.rs:651；同向加入在
+        // 提交前得到的也是这个统一应答）出于防枚举不区分原因，文案必须
+        // 把可能性列全：输错、过期、已撤销、已使用、对方不在线、双方
+        // 同向。`pairing` 与 `joining` 同文案：首页两条配对流共用
+        // pairing 场景（见 enum 注释），而发起流的失败不会是码形问题。
+        TransferErrorScene.pairing ||
+        TransferErrorScene.joining => const (
+              '这个码用不了',
+              '配对码可能输错、已过期、已撤销或已使用，也可能是对方不在线，'
+                  '或双方选了同一个方向。',
+              '请让对方保持应用打开并停留在前台，确认一方发送、一方接收，'
+                  '再核对配对码。需要时请对方重新生成。',
+            ),
+        // W-N4（批次 X2）：-2 不再把发送/接收场景带到这里；传输场景里
+        // 命中词表的失效码（例如重发时配对已过期）是传输失败——重新
+        // 配对，而不是让用户去“输入新的码”。
+        _ => const (
+            '这个码用不了',
+            '配对码已过期或已被使用，本次传输没有完成。',
+            '请重新配对后再试。',
+          ),
+      },
     TransferErrorKind.directUnavailable => const (
           '无法直接连接到对方',
           '两台设备的网络都不允许外部直接连入。连同一个 Wi-Fi 通常就能解决。'
@@ -154,7 +196,8 @@ TransferErrorView viewForKind(
             '与对方的连接断开了（例如对方应用在后台太久）。',
             '请让对方重新发送，会从断点继续。',
           ),
-          TransferErrorScene.pairing => const (
+          TransferErrorScene.pairing ||
+          TransferErrorScene.joining => const (
             interruptedTitle,
             '与对方的连接断开了。',
             '请重新配对；重新发送会从断点续传。',
@@ -175,18 +218,31 @@ TransferErrorView viewForKind(
           '对方拒绝了这次传输，文件没有发出。',
           '可与对方确认后重新发送。',
         ),
-    TransferErrorKind.saveDirNotWritable => const (
-          '无法保存到所选文件夹',
-          '保存位置不可写，或剩余空间不够。',
-          '请在「设置」里更换保存文件夹后重试。',
-        ),
+    TransferErrorKind.saveDirNotWritable => switch (scene) {
+        // W-N10（批次 X2）：发送场景的专用文案——空间不足的是对方的
+        // 设备（接收方以 STORAGE_FULL 错误帧报告，发送方引擎把它渲染
+        // 成 `peer sent error STORAGE_FULL: …`）。连接已随之结束，必须
+        // 重新配对再发送；已有进度从断点续传。
+        TransferErrorScene.sending => const (
+            '对方的设备空间不足',
+            '对方设备的剩余空间不够，本次传输没有完成。',
+            '请对方清理空间后重新配对再发送，已有进度会从断点续传。',
+          ),
+        // 接收（与其余场景）：空间不足的是本机的保存文件夹。
+        _ => const (
+            '无法保存到所选文件夹',
+            '保存位置不可写，或剩余空间不够。',
+            '请在「设置」里更换保存文件夹后重试。',
+          ),
+      },
     TransferErrorKind.stalled => switch (scene) {
           TransferErrorScene.receiving => const (
             '接收长时间没有进展',
             '接收过程中长时间没有数据流动，已停止。',
             '请让对方重新发送，会从断点继续。',
           ),
-          TransferErrorScene.pairing => const (
+          TransferErrorScene.pairing ||
+          TransferErrorScene.joining => const (
             '配对超时',
             '配对长时间没有完成。',
             '请重试。',
@@ -217,10 +273,13 @@ TransferErrorView viewForKind(
   );
 }
 
-/// Classifies [error] into a [TransferErrorKind]. Error code first
-/// (an `AkFfiException`-shaped `code` field), then the message
-/// vocabulary (the engine's fixed strings), then the fallback.
-TransferErrorKind classifyTransferError(Object error) {
+/// Classifies [error] in [scene] into a [TransferErrorKind]. Error code
+/// first (an `AkFfiException`-shaped `code` field), then the message
+/// vocabulary (the engine's fixed strings), then the fallback. The scene
+/// decides which code facts apply (W-N4: `-2` only claims invalidCode on
+/// the pairing/join scenes).
+TransferErrorKind classifyTransferError(
+    Object error, TransferErrorScene scene) {
   final text = messageTextOf(error).toLowerCase();
   // Error-code facts: the negative FFI statuses (ffi-v2 §3). `-2`
   // (AK_ERR_INVALID) on the pairing path is the used-up/unknown code
@@ -228,10 +287,13 @@ TransferErrorKind classifyTransferError(Object error) {
   // message vocabulary below.
   final code = errorCodeOf(error);
   if (code != null && code < 0) {
-    if (code == -2) {
-      // AK_ERR_INVALID: malformed/invalid input — on every transfer
-      // scene here that means the task code (spec/JSON validation of
-      // the join).
+    if (code == -2 &&
+        (scene == TransferErrorScene.pairing ||
+            scene == TransferErrorScene.joining)) {
+      // AK_ERR_INVALID: malformed/invalid input — on the pairing/join
+      // scenes that means the task code (spec/JSON validation of the
+      // join). W-N4（批次 X2）：发送/接收场景的 -2 是输入拼装/参数
+      // 错误，不再是“这个码用不了”——落回下面的词表与兜底。
       return TransferErrorKind.invalidCode;
     }
     // -1/-3/-5 are programming/buffer/internal faults with no user
@@ -262,6 +324,25 @@ TransferErrorKind classifyTransferError(Object error) {
     return TransferErrorKind.invalidCode;
   }
   if (text.contains('storage full') ||
+      // W-N10（批次 X2）：以下三条是引擎真实产生的文本（先在 Rust
+      // 里核对过再抄，词表原先认的是 `storage full`（中间空格），这三
+      // 句一句都不命中，于是落到兜底“出了点问题”）：
+      // - `storage_full` — wire 错误码 ErrorCode::StorageFull 的 Display
+      //   （crates/ak-core/src/error.rs:66），发送方引擎把收到的 Error
+      //   帧渲染成 `peer sent error STORAGE_FULL: …`
+      //   （EngineError::PeerError 的 Display，
+      //   crates/ak-engine/src/lib.rs:1036）；
+      // - `insufficient free space` — 接收方预检（headroom）不过时
+      //   Error 帧的 message（crates/ak-engine/src/receiver.rs:955）；
+      // - `ran out of disk space` — 传输中途磁盘写满时 STORAGE_FULL 帧
+      //   的固定文本 STORAGE_FULL_MESSAGE
+      //   （crates/ak-engine/src/recv_single.rs:18）。
+      // `storage full`（空格）则盖住接收方本地的
+      // `destination storage full: … bytes available, … needed`
+      // （EngineError::StorageFull 的 Display，lib.rs:1046）。
+      text.contains('storage_full') ||
+      text.contains('insufficient free space') ||
+      text.contains('ran out of disk space') ||
       text.contains('storage error') ||
       text.contains('磁盘空间不足') ||
       text.contains('空间不足') ||

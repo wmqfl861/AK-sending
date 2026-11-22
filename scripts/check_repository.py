@@ -763,9 +763,13 @@ def status_number_issues(status_text: str) -> list[str]:
 # written through a shell that expanded the backslash escapes in Windows
 # paths (`\r` -> CR, `\a` -> BEL), which split a table row across lines and
 # silently ate path characters. Markdown in this repo is LF-only text
-# (.gitattributes), so any C0 control other than TAB and LF — CR included —
-# is corruption, never content.
-CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# (.gitattributes), so any C0 control other than LF — CR included — is
+# corruption, never content.
+# W-N14 (W review 2026-11-22): TAB is corruption too, not indentation —
+# handoffs are written with an editor or a quoted heredoc, never
+# tab-indented, and the repo carries none — so \x09 joined the forbidden
+# set (LF stays the only allowed C0 control).
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
 
 def control_char_issues(text: str, name: str) -> list[str]:
@@ -787,6 +791,12 @@ def control_char_issues(text: str, name: str) -> list[str]:
 # behind — only a path whose separator went missing. Two signatures: a path
 # placeholder (`%VAR%`, `<home>`, `<repo>`, `<tmp>`) glued to a letter, and the
 # known `\\ak-stage.log` casualty (`k-stage.log` not preceded by `a`).
+# X2 decision (W-N14): the hardcoded-filename half is KEPT — W-N13 only makes
+# CR visible when it survives in the file, while a stripped escape leaves no
+# character for CONTROL_CHAR_RE to catch at all, and the placeholder half only
+# covers known placeholders. The name-specific rule is a narrow tripwire for
+# the observed casualty: every legitimate mention is `ak-stage.log` (the `k`
+# preceded by `a`), so it fires only on the damaged shape.
 STRIPPED_SEPARATOR_RE = re.compile(
     r"(?:%[A-Z_]{3,}%|<(?:home|repo|tmp)>)[A-Za-z]|(?<!a)k-stage\.log"
 )
@@ -853,7 +863,16 @@ def check(root: Path) -> dict:
         and "archive" not in path.relative_to(root).parts  # frozen history
     )
     for path in markdowns:
-        text = path.read_text(encoding="utf-8")
+        # W-N13 (W review 2026-11-22): read_text() decodes in universal-
+        # newlines mode, so CR and CRLF are turned into \n BEFORE
+        # control_char_issues ever runs — the V-N1 CR gate never fired on a
+        # real file. Read the raw bytes and decode strictly (invalid UTF-8
+        # still raises, exactly like read_text(encoding="utf-8") did) so
+        # U+000D survives to the rule. The per-line rules keep splitting on
+        # \n, so a CR shows up at the end of its own line with the correct
+        # line number. Other file kinds (json/toml/rs) keep read_text —
+        # their rules are not newline-sensitive.
+        text = path.read_bytes().decode("utf-8")
         errors.extend(
             control_char_issues(text, path.relative_to(root).as_posix())
         )

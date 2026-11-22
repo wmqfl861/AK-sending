@@ -24,6 +24,34 @@
 /// killed by their connection dropping); connections are one-way
 /// (the frozen [TaskRole]); several connections coexist; the default
 /// save dir is a plain field.
+///
+/// Join semantics (batch X1 step 3, W-N7): [joinCode] models a
+/// CROSS-DEVICE join — the joining device cannot see the creator's
+/// engine-local code cache, so a missing `role` resolves to the engine's
+/// v1 default `TaskRole.receive` (NOT the creator's opposite), and any
+/// join (explicit or defaulted) declaring the SAME direction as the code
+/// is refused BEFORE the code is consumed, with the engine's unified
+/// unavailable answer verbatim: `unknown task code (or expired,
+/// revoked, owner offline)`. Grounded in the real engine:
+///
+/// * `run_join` resolves explicit role → same-engine cache opposite →
+///   receiver default (`crates/ak-ffi/src/task/join_send.rs:23`);
+/// * `veto_task_offer` refuses same-direction redeems pre-commit and
+///   the refusal does not consume the code's single redeem
+///   (`crates/ak-session/src/pairing/task.rs:980`; the answer text is
+///   the constant at `crates/ak-session/src/pairing/task_net.rs:651`);
+/// * `production_owner_loop_refuses_same_direction_joins_before_commit`
+///   (`crates/ak-ffi/src/task/task_tests.rs:2913`): a cross-engine
+///   default-receiver join of a receiver code is refused, no connection
+///   appears, and an explicit complementary join of the SAME code pairs;
+/// * `task_codes_relay_across_engines_via_the_registry` (same file,
+///   `:1405`): a cross-engine no-hint join of a sender code succeeds
+///   with the joiner as receiver.
+///
+/// The LOW-LEVEL fake (`packages/ak_ffi_dart/lib/src/fake_task_ffi.dart`)
+/// models the OTHER scope — one engine with its code cache — and keeps
+/// the cache-hit opposite default there; the two scopes differ exactly
+/// there (see that file's header).
 library;
 
 import 'dart:async'
@@ -169,6 +197,26 @@ class LocalSimpleTransferService implements SimpleTransferService {
     return code;
   }
 
+  /// Cross-device join (batch X1 step 3, W-N7 — see the library doc for
+  /// the Rust grounding):
+  ///
+  /// * `role == null` resolves to the engine's v1 default
+  ///   `TaskRole.receive` — the joining device cannot see the creator's
+  ///   engine-local code cache (`run_join`,
+  ///   crates/ak-ffi/src/task/join_send.rs:23);
+  /// * a join (explicit OR defaulted) declaring the SAME direction as
+  ///   the code is refused BEFORE the code is consumed — no connection
+  ///   is created, the single redeem survives — with the engine's
+  ///   unified unavailable answer VERBATIM (`veto_task_offer`,
+  ///   crates/ak-session/src/pairing/task.rs:980; text from
+  ///   crates/ak-session/src/pairing/task_net.rs:651). Pinned by
+  ///   `production_owner_loop_refuses_same_direction_joins_before_commit`
+  ///   (crates/ak-ffi/src/task/task_tests.rs:2913) and mirrored by
+  ///   `task_codes_relay_across_engines_via_the_registry` (:1405) for
+  ///   the complementary success path.
+  ///
+  /// [simulatePeerJoin] (the create-flow's creator perspective) is NOT
+  /// affected: the remote peer joining my code is always complementary.
   @override
   Future<JoinResult> joinCode(String code, {TaskRole? role}) async {
     joinCodeCalls += 1;
@@ -185,10 +233,20 @@ class LocalSimpleTransferService implements SimpleTransferService {
       return JoinResult.failure('配对码不存在或已失效，请向对方确认最新配对码。');
     }
     // The joiner's direction: the user's EXPLICIT intent (wave-29 P1-05)
-    // when given, else the complement of the creator's declaration (the
-    // creator of a "我要接收" code receives; we send).
-    final connection = _consumePendingCode(
-        peerName: remotePeerName, role: role ?? _opposite(pending.role));
+    // when given, else the engine's v1 cross-device DEFAULT — receiver
+    // (the creator's engine-cache mirror is unreachable from another
+    // device; run_join, crates/ak-ffi/src/task/join_send.rs:23).
+    final effective = role ?? TaskRole.receive;
+    // Same-direction veto, BEFORE consuming the code (W-N7): the engine
+    // refuses the redeem pre-commit with its unified unavailable answer,
+    // so the refusal books NOTHING and the code's single redeem survives
+    // for a complementary join of the SAME code.
+    if (effective == pending.role) {
+      return JoinResult.failure(
+          'unknown task code (or expired, revoked, owner offline)');
+    }
+    final connection =
+        _consumePendingCode(peerName: remotePeerName, role: effective);
     return JoinResult.success(connection.id);
   }
 
@@ -326,9 +384,6 @@ class LocalSimpleTransferService implements SimpleTransferService {
     final connection = _consumePendingCode(peerName: peerName ?? remotePeerName);
     return connection.id;
   }
-
-  static TaskRole _opposite(TaskRole role) =>
-      role == TaskRole.send ? TaskRole.receive : TaskRole.send;
 
   /// Moves connection [connId] into `testing` (probe running).
   void beginProbe(String connId) {

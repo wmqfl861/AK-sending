@@ -2,6 +2,7 @@
 from __future__ import annotations
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -1302,10 +1303,14 @@ class RecordRuleTests(unittest.TestCase):
 
 
 class ControlCharTests(unittest.TestCase):
-    """V-N1: shell-expanded backslash escapes must not reach markdown."""
+    """V-N1: shell-expanded backslash escapes must not reach markdown.
+
+    W-N14 (W review 2026-11-22): TAB is forbidden too — LF stays the only
+    allowed C0 control, so the clean fixture below uses spaces only.
+    """
 
     def test_clean_text_passes(self):
-        text = "| a | b |\n\t缩进与中文 `C:\\\\Users\\\\x` 都可以\n"
+        text = "| a | b |\n缩进与中文 `C:\\\\Users\\\\x` 都可以\n"
         self.assertEqual(checks.control_char_issues(text, "d.md"), [])
 
     def test_bel_and_cr_are_rejected_with_line_numbers(self):
@@ -1314,6 +1319,12 @@ class ControlCharTests(unittest.TestCase):
         self.assertEqual(len(errors), 2, errors)
         self.assertTrue(errors[0].startswith("d.md:2: control character U+0007"))
         self.assertTrue(errors[1].startswith("d.md:4: control character U+000D"))
+
+    def test_tab_is_rejected_with_line_number(self):
+        # W-N14: TAB (\x09) joined the forbidden set.
+        errors = checks.control_char_issues("ok\na\tb\n", "d.md")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith("d.md:2: control character U+0009"), errors[0])
 
     def test_del_and_nul_are_rejected(self):
         self.assertEqual(len(checks.control_char_issues("a\x7f\nb\x00", "d.md")), 2)
@@ -1342,6 +1353,136 @@ class StrippedSeparatorTests(unittest.TestCase):
         self.assertTrue(errors[0].startswith("d.md:2: path separator looks eaten"))
         self.assertTrue(errors[1].startswith("d.md:4:"))
         self.assertTrue(errors[2].startswith("d.md:5:"))
+
+
+class MarkdownFileScanTests(unittest.TestCase):
+    """W-N13/W-N14: check()'s markdown walk reads raw bytes, not read_text.
+
+    read_text() decodes in universal-newlines mode, so CR and CRLF became
+    \n BEFORE control_char_issues could run — the CR half of the V-N1 gate
+    never fired on a real file (W-N13; the reviewer reproduced this). TAB
+    was outside CONTROL_CHAR_RE's forbidden set entirely (W-N14). These
+    tests exercise the REAL file-reading path: payload bytes are written
+    to a temporary .md inside a minimal-but-complete repository skeleton,
+    check(root) runs over it, and the verdict is read from its result
+    dict. The skeleton must itself stay clean, so the pure-LF case asserts
+    result["passed"] over the whole pipeline (zero false positives), and
+    the rejection cases assert the ONLY error is the payload's, with the
+    codepoint and line number the per-line split('\n') numbering produces.
+    """
+
+    # Same list check() requires; kept in sync deliberately — a drift here
+    # fails the missing-required-file gate and the LF test names it.
+    REQUIRED_FILES = [
+        "README.md", "AGENTS.md", "docs/BLUEPRINT.zh-CN.md", "docs/PRD.zh-CN.md",
+        "docs/adr/001-direct-only.zh-CN.md",
+        "docs/adr/002-protocol-stack-and-order.zh-CN.md",
+        "docs/ARCHITECTURE.zh-CN.md", "docs/ROADMAP.zh-CN.md",
+        "docs/TEST_PLAN.zh-CN.md", "docs/HANDOFF.zh-CN.md",
+        "crates/ak-core/src/lib.rs", "crates/ak-core/src/policy.rs",
+        "crates/ak-core/src/chunk.rs", "crates/ak-core/src/job.rs",
+        "crates/ak-wire/src/lib.rs", "crates/ak-identity/src/lib.rs",
+        "crates/ak-storage/src/lib.rs", "crates/ak-net/src/lib.rs",
+        "crates/ak-discovery/src/lib.rs", "crates/ak-store/src/lib.rs",
+        "crates/ak-signal/src/lib.rs", "crates/ak-engine/src/lib.rs",
+        "crates/ak-cli/src/main.rs", "crates/ak-itests/src/lib.rs",
+        "crates/ak-ffi/src/lib.rs",
+    ]
+
+    STATUS = (
+        "# 项目状态\n\n## 当前状态\n\n- 阶段结论。\n\n"
+        "## 最新验证\n\n- 无新 run。\n\n## 交接入口\n\n"
+        "- [J 交接](HANDOFF-BATCH-J-2026-11-13.zh-CN.md) · "
+        "[状态表](REVIEW_2026-11-11.zh-CN.md) · [HANDOFF](HANDOFF.zh-CN.md) · "
+        "[ROADMAP](ROADMAP.zh-CN.md) · [规则](../AGENTS.md)\n"
+    )
+
+    REVIEW = (
+        "# 复核\n\n## 7. 状态表\n\n"
+        "| 编号 | 批次 | 状态 | 提交 | 证据摘要 |\n"
+        "|---|---|---|---|---|\n"
+        "| CR-P1-01 | A | 已完成 | 3b3eb64 | CI 绿 |\n\n"
+        "## 8. 其他\n"
+    )
+
+    @staticmethod
+    def _write_md(root: Path, name: str, text: str) -> None:
+        # write_bytes everywhere the scanned files are built: on Windows
+        # write_text() would translate \n into CRLF, and check() now
+        # decodes .md bytes strictly — a CRLF skeleton would trip the very
+        # rule under test on every fixture file.
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_bytes(text.encode("utf-8"))
+
+    def _repo(self, root: Path) -> None:
+        for name in self.REQUIRED_FILES:
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_bytes(b"")
+        (root / "config").mkdir(parents=True, exist_ok=True)
+        (root / "config/architecture.json").write_bytes(
+            json.dumps(checks.EXPECTED_ARCHITECTURE).encode("utf-8")
+        )
+        members = "".join(f'  "{member}",\n' for member in checks.WORKSPACE_MEMBERS)
+        (root / "Cargo.toml").write_bytes(
+            f"[workspace]\nmembers = [\n{members}]\n".encode("utf-8")
+        )
+        (root / "crates/ak-core/Cargo.toml").write_bytes(b"[package]\npublish = false\n")
+        (root / "Cargo.lock").write_bytes(b"")
+        self._write_md(root, "docs/HANDOFF-BATCH-J-2026-11-13.zh-CN.md", "# 交接文档：批次 J\n")
+        self._write_md(root, checks.REVIEW_DOC, self.REVIEW)
+        self._write_md(root, checks.STATUS_DOC, self.STATUS)
+
+    def _check(self, payload: bytes) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._repo(root)
+            (root / "docs").mkdir(parents=True, exist_ok=True)
+            (root / "docs/scan-target.md").write_bytes(payload)
+            return checks.check(root)
+
+    def test_lone_cr_file_is_rejected_with_codepoint_and_line(self):
+        # W-N13: b"a\rb" after a clean first line — the lone CR must reach
+        # the rule and be reported on ITS line (2), not swallowed by
+        # universal-newlines translation as before.
+        result = self._check(b"# title\na\rb\n")
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["errors"]), 1, result["errors"])
+        self.assertTrue(
+            result["errors"][0].startswith("docs/scan-target.md:2: control character U+000D"),
+            result["errors"],
+        )
+
+    def test_crlf_file_is_rejected_with_codepoint_and_line(self):
+        # W-N13: b"a\r\nb" — with byte-true reading the CR stays at the end
+        # of line 2 ('a\r'), so split('\n') numbering reports line 2.
+        result = self._check(b"# title\na\r\nb\n")
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["errors"]), 1, result["errors"])
+        self.assertTrue(
+            result["errors"][0].startswith("docs/scan-target.md:2: control character U+000D"),
+            result["errors"],
+        )
+
+    def test_lf_only_file_passes_the_whole_check(self):
+        # Zero false positives through the complete pipeline: the skeleton
+        # plus a pure-LF markdown must leave check() with no errors at all.
+        result = self._check(b"# title\nplain body\n")
+        self.assertTrue(result["passed"], result["errors"])
+        expected_md = (
+            sum(1 for name in self.REQUIRED_FILES if name.endswith(".md")) + 4
+        )  # + handoff, review, STATUS, scan-target
+        self.assertEqual(result["markdown_files_checked"], expected_md)
+
+    def test_tab_file_is_rejected_with_codepoint_and_line(self):
+        # W-N14: a TAB inside the markdown body is corruption, reported
+        # with U+0009 and the split('\n') line number.
+        result = self._check(b"# title\nbo\tdy\n")
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["errors"]), 1, result["errors"])
+        self.assertTrue(
+            result["errors"][0].startswith("docs/scan-target.md:2: control character U+0009"),
+            result["errors"],
+        )
 
 
 if __name__ == "__main__":

@@ -157,8 +157,9 @@ void main() {
       expect(probe.reachable, isTrue);
     });
 
-    test('join role hint: the explicit user intent wins over the mirror '
-        'guess (P1-05 seam)', () async {
+    test('join role hint: an explicit same-direction join is refused '
+        'pre-commit; the hint still reaches the spec and the mirror '
+        'default stays (P1-05 seam, X1/W-N7)', () async {
       final fake = FakeAkTaskCalls();
       final task = TaskFfi(calls: fake);
       final owner = task.start(AkTaskStartSpec(
@@ -169,15 +170,25 @@ void main() {
           .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.receiver))
           .wait(delay: immediateDelay);
       // The mirror-complement of a receiver code would be "sender"; the
-      // joiner EXPLICITLY declared receiver — the hint must win.
-      final joined = await joiner
-          .join(AkTaskJoinSpec(
-              code: created['code'] as String, role: AkTaskRole.receiver))
-          .wait(delay: immediateDelay);
-      expect(joined['role'], 'receiver');
+      // joiner EXPLICITLY declared receiver — the hint must reach the
+      // spec, but the engine vetoes the same-direction redeem BEFORE
+      // the commit (veto_task_offer,
+      // crates/ak-session/src/pairing/task.rs:980) and the fake mirrors
+      // the refusal with the engine's unified answer.
+      await expectLater(
+        joiner
+            .join(AkTaskJoinSpec(
+                code: created['code'] as String, role: AkTaskRole.receiver))
+            .wait(delay: immediateDelay),
+        throwsA(isA<AkFfiException>().having(
+            (e) => e.message,
+            'message',
+            'unknown task code (or expired, revoked, owner offline)')),
+      );
       // The wire spec carried the hint verbatim.
       expect(fake.acceptedSpecs.last, contains('"role":"receiver"'));
-      // Without a hint the mirror complement still applies.
+      // Without a hint the mirror complement still applies (one fake ==
+      // one engine's code cache).
       final secondCode = await owner
           .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.sender))
           .wait(delay: immediateDelay);
@@ -185,6 +196,56 @@ void main() {
           .join(AkTaskJoinSpec(code: secondCode['code'] as String))
           .wait(delay: immediateDelay);
       expect(mirrored['role'], 'receiver');
+    });
+
+    test('same-direction join veto (X1/W-N7): the op fails with the '
+        'engine answer, nothing is booked, and the code still redeems',
+        () async {
+      final fake = FakeAkTaskCalls();
+      final task = TaskFfi(calls: fake);
+      final owner = task.start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/k'));
+      final joiner = task.start(AkTaskStartSpec(
+          registry: '127.0.0.1:7200', registryIdHex: regId64, idDir: 'C:/ak/l'));
+      owner.pollEvent(); // drain runtime_ready
+      joiner.pollEvent(); // drain runtime_ready
+      final created = await owner
+          .createCode(AkTaskCreateCodeSpec(role: AkTaskRole.receiver))
+          .wait(delay: immediateDelay);
+      final code = created['code'] as String;
+      final ownerOpDone = owner.pollEvent(); // the create's op_done
+      expect(ownerOpDone, isA<TaskOpSettledEvent>());
+
+      // An explicit same-direction redeem is vetoed BEFORE the commit:
+      // the async op fails with the engine's unified answer (mirrors
+      // production_owner_loop_refuses_same_direction_joins_before_commit,
+      // crates/ak-ffi/src/task/task_tests.rs:2913 — the fake's port of
+      // veto_task_offer, crates/ak-session/src/pairing/task.rs:980).
+      await expectLater(
+        joiner
+            .join(AkTaskJoinSpec(code: code, role: AkTaskRole.receiver))
+            .wait(delay: immediateDelay),
+        throwsA(isA<AkFfiException>().having(
+            (e) => e.message,
+            'message',
+            'unknown task code (or expired, revoked, owner offline)')),
+      );
+      // No connection is booked on either side...
+      expect(joiner.list().connections, isEmpty);
+      expect(owner.list().connections, isEmpty);
+      // ...and the owner heard nothing beyond its own create settle:
+      // no `connected` ever fired for the refused join.
+      expect(joiner.pollEvent(), isA<TaskOpSettledEvent>()); // op_failed
+      expect(owner.pollEvent(), isNull);
+
+      // The single redeem survived: a complementary join of the SAME
+      // code still pairs (a consumed code would answer exhausted).
+      final paired = await joiner
+          .join(AkTaskJoinSpec(code: code, role: AkTaskRole.sender))
+          .wait(delay: immediateDelay);
+      expect(paired['role'], 'sender');
+      expect(owner.list().connections, hasLength(1));
+      expect(owner.list().connections.first.role, 'receiver');
     });
 
     test('list snapshot reflects connections and the save dir', () async {

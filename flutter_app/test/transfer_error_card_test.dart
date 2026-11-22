@@ -164,22 +164,19 @@ void main() {
     fake.nextJoinError = '配对码不存在或已过期';
     final minted = await fake.createCode(TaskRole.send);
 
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    // X4: the receive MAIN entry declares the direction (no selector).
+    await tester.tap(find.byKey(const ValueKey('home_receive_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
     await tester.pump();
-    // W-N1: the joiner declares its direction (the submit needs it).
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('接收文件')));
-    await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    // The frozen flow_error key now sits on the mapped title.
+    // The frozen flow_error key now sits on the mapped title; X4 wired
+    // the JOIN scene (W-N9's three-layer copy).
     expect(find.byKey(const ValueKey('flow_error')), findsOneWidget);
     expect(find.text('这个码用不了'), findsOneWidget);
     expect(find.textContaining('重新生成'), findsOneWidget);

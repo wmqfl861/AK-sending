@@ -30,7 +30,29 @@
 /// * `ak_task_disconnect` covers UN-JOINED code cancellation by
 ///   `code_id` (wave-30 P2-04): the code is revoked (later joins fail)
 ///   and a `code_cancelled` event is emitted; every disconnect call is
-///   recorded in [disconnectCalls] for assertions.
+///   recorded in [disconnectCalls] for assertions;
+/// * an EXPLICIT join `role` matching the code's own direction is
+///   vetoed PRE-COMMIT (batch X1 step 3, W-N7): the async join op
+///   fails with the engine's unified answer
+///   `unknown task code (or expired, revoked, owner offline)`, no
+///   connection is booked, no `connected` event fires, and the code's
+///   single redeem survives — a complementary join of the SAME code
+///   still pairs (`veto_task_offer`,
+///   crates/ak-session/src/pairing/task.rs:980; answer text from
+///   crates/ak-session/src/pairing/task_net.rs:651; pinned by
+///   `production_owner_loop_refuses_same_direction_joins_before_commit`,
+///   crates/ak-ffi/src/task/task_tests.rs:2913).
+///
+/// Scope note (the TWO fake layers, batch X1 step 3): THIS fake models
+/// ONE engine — all of its runtimes share the same code cache — so a
+/// join WITHOUT a role hint keeps the engine-cache OPPOSITE default
+/// (`task_codes_relay_across_engines_via_the_registry`,
+/// crates/ak-ffi/src/task/task_tests.rs:1405, pins the cross-engine
+/// receiver default instead). The UI-level fake
+/// (`flutter_app/lib/services/simple_transfer_fake.dart`) models the
+/// CROSS-DEVICE join, where the no-hint default is `receive` and
+/// same-direction joins are refused outright — do not port one layer's
+/// default to the other.
 ///
 /// What it deliberately does NOT model: real sockets, real bytes, the
 /// 30 s consent timer (decide via [consent] or leave it — no auto-decline
@@ -245,14 +267,31 @@ class FakeAkTaskCalls implements AkTaskCalls {
     final ownerEntry = runtimes.entries
         .where((entry) => entry.value.codes.contains(normalized))
         .toList();
-    if (ownerEntry.isEmpty) {
+    final owner = ownerEntry.isEmpty ? null : ownerEntry.first.value;
+    // Same-direction veto (batch X1 step 3, W-N7): an EXPLICIT role
+    // matching the code's own direction is refused BEFORE the commit —
+    // `veto_task_offer` (crates/ak-session/src/pairing/task.rs:980) — so
+    // the async op fails with the engine's unified unavailable answer
+    // (crates/ak-session/src/pairing/task_net.rs:651), nothing is booked
+    // (no connection, no `connected` event) and the code's single redeem
+    // survives for a complementary retry — pinned by
+    // `production_owner_loop_refuses_same_direction_joins_before_commit`
+    // (crates/ak-ffi/src/task/task_tests.rs:2913). A MISSING hint keeps
+    // the same-engine cache OPPOSITE default (this fake is one engine;
+    // the cross-device receiver default belongs to the UI fake — see
+    // the library doc's scope note).
+    final sameDirection = owner != null &&
+        roleHint is String &&
+        roleHint == owner.roleOfCode[normalized];
+    if (owner == null || sameDirection) {
       op.ok = false;
       op.result = <String, dynamic>{
         'op': 'task_join',
-        'error': 'unknown task code "$normalized"',
+        'error': owner == null
+            ? 'unknown task code "$normalized"'
+            : 'unknown task code (or expired, revoked, owner offline)',
       };
     } else {
-      final owner = ownerEntry.first.value;
       final role = roleHint is String
           ? roleHint // explicit user intent wins
           : (owner.roleOfCode[normalized] == 'sender' ? 'receiver' : 'sender');

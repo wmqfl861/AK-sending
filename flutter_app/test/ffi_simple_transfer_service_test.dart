@@ -158,15 +158,33 @@ void main() {
   // Wave-29 review fixes on the adapter seam.
   // -------------------------------------------------------------------------
 
-  test('joinCode forwards the explicit user role (P1-05 seam)', () async {
+  test('joinCode forwards the explicit user role; a same-direction join '
+      'is refused pre-commit and the code still pairs (P1-05 seam, X1/W-N7)',
+      () async {
     final fake = FakeAkTaskCalls();
     final service = booted(fake);
     // The creator declared RECEIVER; the joiner EXPLICITLY declares
-    // receiver too (their intent) — the hint must reach the spec.
+    // receiver too (their intent) — the hint must reach the spec...
     final code = (await service.createCode(TaskRole.receive)).code;
-    final ok = await service.joinCode(code, role: TaskRole.receive);
-    expect(ok.ok, isTrue);
+    final refused = await service.joinCode(code, role: TaskRole.receive);
+    // ...but the engine vetoes a same-direction redeem BEFORE the
+    // commit with its unified unavailable answer — nothing is booked
+    // and the single redeem survives
+    // (production_owner_loop_refuses_same_direction_joins_before_commit,
+    // crates/ak-ffi/src/task/task_tests.rs:2913; the fake mirrors it).
+    expect(refused.ok, isFalse);
+    expect(refused.error,
+        'unknown task code (or expired, revoked, owner offline)');
+    // The wire spec still carried the hint verbatim.
     expect(fake.acceptedSpecs.last, contains('"role":"receiver"'));
+    // No connection was booked by the refusal.
+    service.engine.pumpEvents();
+    await pumpEventQueue();
+    expect(await service.connections.first, isEmpty);
+    // The complementary role still redeems the SAME code.
+    final ok = await service.joinCode(code, role: TaskRole.send);
+    expect(ok.ok, isTrue);
+    expect(ok.connectionId, isNotNull);
     service.dispose();
   });
 

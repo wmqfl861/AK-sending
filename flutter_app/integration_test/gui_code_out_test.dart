@@ -1,3 +1,9 @@
+// LIVE GUI helper (deployed desktop app): create a code, dump it to a
+// temp file, STAY ALIVE so an external joiner can redeem it. X4 (batch
+// X): the new home has no role sheet — this uses the receive SECONDARY
+// entry (生成接收码), which mints a receiver-role code without any file
+// pick, so the external joiner redeems it as the sender
+// (`ak-cli task join-send <code> <file>`).
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart' show Text, ValueKey, EditableText;
 import 'package:integration_test/integration_test.dart';
@@ -11,9 +17,7 @@ void main() {
   testWidgets('live: GUI creates a code, dump it, STAY ALIVE for the joiner', (tester) async {
     app.main();
     await tester.pumpAndSettle(const Duration(seconds: 3));
-    await tester.tap(find.text('生成配对码'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey('role_receive_button')));
+    await tester.tap(find.byKey(const ValueKey('home_receive_create_code_button')));
     await tester.pump();
     final deadline = DateTime.now().add(const Duration(seconds: 30));
     String? code;

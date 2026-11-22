@@ -10,8 +10,8 @@
 ///  1. real engine bootstrap — DLL probe tier evidence + which branch
 ///     `bootstrapAppService` took (live service vs the readable
 ///     construction failure);
-///  2. home page smoke — the two pairing actions (生成配对码 / 输入配对码,
-///     keys `home_create_code_button` / `home_join_code_button`) plus the
+///  2. home page smoke — the two MAIN entries (发送文件 / 接收文件, keys
+///     `home_send_button` / `home_receive_button` — X4's new home) plus the
 ///     「当前连接」 empty state (`connections_empty`);
 ///  3. settings page — reachable via the navigation, the save-folder card
 ///     (`settings_save_dir`) renders, and when the engine actually
@@ -411,14 +411,14 @@ void main() {
           _log('engine settle: startupErrorCard=$cardShown '
               'saveDir="${service.saveDir}"');
           expect(
-            _key('home_create_code_button').evaluate(),
+            _key('home_send_button').evaluate(),
             isNotEmpty,
-            reason: 'the 生成配对码 action renders (frozen key)',
+            reason: 'the 发送文件 action renders (frozen key)',
           );
           expect(
-            _key('home_join_code_button').evaluate(),
+            _key('home_receive_button').evaluate(),
             isNotEmpty,
-            reason: 'the 输入配对码 action renders (frozen key)',
+            reason: 'the 接收文件 action renders (frozen key)',
           );
           expect(
             _key('connections_header').evaluate(),
@@ -500,7 +500,7 @@ void main() {
                 '${_textData(tester, _key('app_startup_error_detail'))}');
             await _goTab(tester, label: '连接', onstageMarker: '当前连接');
             expect(
-              _key('home_create_code_button').evaluate(),
+              _key('home_send_button').evaluate(),
               isNotEmpty,
               reason: 'navigation keeps working in the degraded state',
             );

@@ -375,7 +375,7 @@ void main() {
       await pumpDiag(tester, result);
       expect(find.byKey(const ValueKey('diag_stage_A')), findsOneWidget);
       expect(find.byKey(const ValueKey('app_startup_error')), findsOneWidget);
-      expect(find.byKey(const ValueKey('home_create_code_button')),
+      expect(find.byKey(const ValueKey('home_send_button')),
           findsOneWidget);
       expect(tester.takeException(), isNull);
     });
@@ -479,7 +479,7 @@ void main() {
       expect(find.byKey(const ValueKey('diag_stage_E')), findsOneWidget);
       expect(find.byKey(const ValueKey('app_startup_error')), findsNothing,
           reason: 'the truncated start itself succeeded');
-      expect(find.byKey(const ValueKey('home_create_code_button')),
+      expect(find.byKey(const ValueKey('home_send_button')),
           findsOneWidget);
       expect(tester.takeException(), isNull);
       result.service?.dispose(); // cancels the (inert) pump timer

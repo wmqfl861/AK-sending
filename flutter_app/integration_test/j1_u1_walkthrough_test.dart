@@ -163,11 +163,13 @@ Future<bool> _waitFor(WidgetTester tester, bool Function() predicate,
   return predicate();
 }
 
-/// Creates a pairing code via the real UI and returns its display text.
-Future<String> _createCode(WidgetTester tester, String roleButtonKey) async {
-  await tester.tap(find.byKey(const ValueKey('home_create_code_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(ValueKey(roleButtonKey)));
+/// X4 发送文件主路径: creates a sender-role code via the real UI. The
+/// multi-select pick rides the injected gateway — the caller STAGES
+/// `picker.files`/`picker.dir` BEFORE this call (a directory rides the
+/// files list as an isDirectory entry; the home pick is the multi-file
+/// one). Only the picked selection mints the code.
+Future<String> _createSendCode(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('home_send_button')));
   await tester.pump(const Duration(milliseconds: 300));
   final ok = await _waitFor(tester,
       () => tester.any(find.textContaining('AKI1-')), const Duration(seconds: 45));
@@ -177,6 +179,45 @@ Future<String> _createCode(WidgetTester tester, String roleButtonKey) async {
     if (t != null && t.startsWith('AKI1-')) return t;
   }
   fail('AKI1 code widget had no readable text');
+}
+
+/// X4 接收文件次要入口: creates a receiver-role code via the real UI
+/// (生成接收码 — no pick).
+Future<String> _createReceiveCode(WidgetTester tester) async {
+  await tester.tap(
+      find.byKey(const ValueKey('home_receive_create_code_button')));
+  await tester.pump(const Duration(milliseconds: 300));
+  final ok = await _waitFor(tester,
+      () => tester.any(find.textContaining('AKI1-')), const Duration(seconds: 45));
+  expect(ok, isTrue, reason: 'no AKI1 code appeared within 45s');
+  for (final w in tester.widgetList(find.textContaining('AKI1-'))) {
+    final t = _plainTextOf(w);
+    if (t != null && t.startsWith('AKI1-')) return t;
+  }
+  fail('AKI1 code widget had no readable text');
+}
+
+/// X4: the sender handover — once the peer's join establishes the
+/// connection, the detail page AUTO-OPENS with the preselected payload
+/// and the send starts by itself (审核 §4.3: no pick sheet, no send
+/// button). Waits until the send is observable (progress lines, a
+/// result card, or a failure card).
+Future<void> _waitForAutoSend(WidgetTester tester) async {
+  final opened = await _waitFor(
+      tester,
+      () => tester.any(find.byKey(const ValueKey('conn_detail_page'))),
+      const Duration(seconds: 170));
+  expect(opened, isTrue, reason: 'detail page did not auto-open (X4)');
+  final started = await _waitFor(
+      tester,
+      () =>
+          _textOf(tester, const ValueKey('conn_send_progress_status')) !=
+              null ||
+          tester.any(find.byKey(const ValueKey('conn_send_result'))) ||
+          tester.any(find.byKey(const ValueKey('conn_send_error'))),
+      const Duration(seconds: 60));
+  expect(started, isTrue, reason: 'automatic send never started (X4)');
+  _log('auto-send started (X4)');
 }
 
 /// Spawns the CLI peer with the local registry pin; [consent] is typed
@@ -222,16 +263,6 @@ Future<void> _scrollToHistory(WidgetTester tester) async {
   }
 }
 
-Future<void> _openDetailOfFirstConnection(WidgetTester tester) async {  final ok = await _waitFor(
-      tester, () => _anyKeyPrefix(tester, 'conn_card_name_'), const Duration(seconds: 60));
-  expect(ok, isTrue, reason: 'no connection card appeared');
-  await tester.tap(find.byWidgetPredicate(
-      (w) => w.key != null && w.key.toString().contains('conn_card_name_')));
-  await tester.pump(const Duration(milliseconds: 500));
-  expect(tester.any(find.byKey(const ValueKey('conn_detail_page'))), isTrue,
-      reason: 'detail page did not open');
-}
-
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   binding.framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.fullyLive;
@@ -263,7 +294,7 @@ void main() {
         AkSendingApp(service: bootstrap.service!, picker: picker));
     // Home renders.
     final home = await _waitFor(tester,
-        () => tester.any(find.byKey(const ValueKey('home_create_code_button'))),
+        () => tester.any(find.byKey(const ValueKey('home_send_button'))),
         const Duration(seconds: 20));
     expect(home, isTrue, reason: 'home actions did not render');
 
@@ -299,25 +330,20 @@ void main() {
 const _noCli = String.fromEnvironment('AK_J1_NO_CLI');
 
 /// J1-1/2 (and 10 when AK_J1_OLD_DLL=1): GUI sends -> CLI receives.
+/// X4: the preselected payload sends AUTOMATICALLY once the CLI joins.
 Future<void> _scenarioSend(WidgetTester tester, J1Picker picker) async {
   picker.files = [_file('synthetic_200mib.bin', 200 * 1024 * 1024)];
-  final code = await _createCode(tester, 'role_send_button');
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = _noCli == '1'
       ? null
       : await _spawnCli(['join-recv', code, '--out', '$_work/recv_out']);
 
-  await _openDetailOfFirstConnection(tester);
-  // Pick via the injected gateway.
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
+  await _waitForAutoSend(tester);
   expect(_textOf(tester, const ValueKey('picked_count')), '已选 1 项');
 
   // The awaiting-consent phase: the CLI must not have consented yet — it
   // did (auto y), so sample fast and record whatever phases are visible.
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
   final samples = <String>[];
   final deadline = DateTime.now().add(const Duration(seconds: 150));
   while (DateTime.now().isBefore(deadline)) {
@@ -384,9 +410,10 @@ Future<void> _scenarioSend(WidgetTester tester, J1Picker picker) async {
   }
 }
 
-/// J1-3: CLI sends -> GUI receives via the banner.
+/// J1-3: CLI sends -> GUI receives via the banner (X4 receive secondary
+/// entry mints the receiver-role code).
 Future<void> _scenarioRecv(WidgetTester tester, J1Picker picker) async {
-  final code = await _createCode(tester, 'role_receive_button');
+  final code = await _createReceiveCode(tester);
   _log('code: $code');
   final cli = _noCli == '1' ? null : await _spawnCli([
     'join-send', code, '$_work/synthetic_200mib.bin',
@@ -451,26 +478,24 @@ Future<void> _scenarioRecv(WidgetTester tester, J1Picker picker) async {
   }
 }
 
-/// J1-4: send a directory of small files; (i/N) bounded by N.
+/// J1-4: send a directory of small files; (i/N) bounded by N. X4: the
+/// home pick is the multi-select one — the directory rides the files
+/// list as an isDirectory entry (sendFiles accepts files and/or one
+/// directory) and sends automatically once the CLI joins.
 Future<void> _scenarioDir(WidgetTester tester, J1Picker picker) async {
-  picker.dir = PickedEntry(
-      path: '$_work/synthetic_dir',
-      name: 'synthetic_dir',
-      isDirectory: true);
-  final code = await _createCode(tester, 'role_send_button');
+  picker.files = [PickedEntry(
+    path: '$_work/synthetic_dir',
+    name: 'synthetic_dir',
+    isDirectory: true)];
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = await _spawnCli([
     'join-recv', code, '--out', '$_work/recv_out2',
   ]);
 
-  await _openDetailOfFirstConnection(tester);
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_dir_option')));
-  await tester.pump(const Duration(milliseconds: 400));
+  await _waitForAutoSend(tester);
   expect(_textOf(tester, const ValueKey('picked_count')), '已选 1 项');
 
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
   final samples = <String>[];
   final deadline = DateTime.now().add(const Duration(seconds: 90));
   while (DateTime.now().isBefore(deadline)) {
@@ -503,21 +528,18 @@ Future<void> _scenarioDir(WidgetTester tester, J1Picker picker) async {
   _log('cli exit: $exit');
 }
 
-/// J1-5a: receiver declines -> sender card shows the failure.
+/// J1-5a: receiver declines -> sender card shows the failure. X4: the
+/// preselected file sends automatically; the decline lands on the
+/// auto-opened detail page.
 Future<void> _scenarioReject(WidgetTester tester, J1Picker picker) async {
   picker.files = [_file('synthetic_small_1.bin', 5 * 1024 * 1024)];
-  final code = await _createCode(tester, 'role_send_button');
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = await _spawnCli([
     'join-recv', code, '--out', '$_work/recv_out3',
   ], consent: 'n');
 
-  await _openDetailOfFirstConnection(tester);
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+  await _waitForAutoSend(tester);
   final failed = await _waitFor(tester,
       () => tester.any(find.byKey(const ValueKey('conn_send_error'))),
       const Duration(seconds: 90));
@@ -544,20 +566,16 @@ Future<void> _scenarioReject(WidgetTester tester, J1Picker picker) async {
 }
 
 /// J1-5b: receiver killed mid-transfer -> sender fails, never "completed".
+/// X4: the preselected file sends automatically.
 Future<void> _scenarioKill(WidgetTester tester, J1Picker picker) async {
   picker.files = [_file('synthetic_200mib.bin', 200 * 1024 * 1024)];
-  final code = await _createCode(tester, 'role_send_button');
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = await _spawnCli([
     'join-recv', code, '--out', '$_work/recv_out4',
   ]);
 
-  await _openDetailOfFirstConnection(tester);
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+  await _waitForAutoSend(tester);
   // Wait until bytes move, then kill the receiver mid-flight.
   var moved = false;
   final killDeadline = DateTime.now().add(const Duration(seconds: 60));
@@ -624,7 +642,7 @@ Future<void> _scenarioRestart(WidgetTester tester) async {
   final root = tester.widget<AkSendingApp>(find.byType(AkSendingApp));
   expect(root.history, isNull, reason: 'must use the app-owned history');
   final history = TransferHistoryScope.read(
-      tester.element(find.byKey(const ValueKey('home_create_code_button'))));
+      tester.element(find.byKey(const ValueKey('home_send_button'))));
   expect(history, isNotNull);
   expect(history!.records, isEmpty, reason: 'history present at cold startup');
   if (Platform.environment['AK_J1_RESTART_PHASE'] == 'seed') {
@@ -660,20 +678,16 @@ Future<void> _scenarioRestart(WidgetTester tester) async {
   _restartEvidence('assertions_passed', historyCount: history.records.length);
 }
 
-/// J1-6 clear-only check; process restart is the separate restart scenario.
+/// J1-6 clear-only check; process restart is the separate restart
+/// scenario. X4: the preselected file sends automatically.
 Future<void> _scenarioClear(WidgetTester tester, J1Picker picker) async {
   picker.files = [_file('synthetic_small_1.bin', 5 * 1024 * 1024)];
-  final code = await _createCode(tester, 'role_send_button');
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = await _spawnCli([
     'join-recv', code, '--out', '$_work/recv_out5',
   ]);
-  await _openDetailOfFirstConnection(tester);
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+  await _waitForAutoSend(tester);
   final done = await _waitFor(tester,
       () => tester.any(find.byKey(const ValueKey('conn_send_result'))),
       const Duration(seconds: 90));
@@ -699,20 +713,16 @@ Future<void> _scenarioClear(WidgetTester tester, J1Picker picker) async {
 
 /// J1-10: run with the OLD (97fac96) DLL — indeterminate progress, honest
 /// completion, no engine-failure banner. The runner swaps the DLL in
-/// target/release before this run.
+/// target/release before this run. X4: the preselected file sends
+/// automatically.
 Future<void> _scenarioOldDll(WidgetTester tester, J1Picker picker) async {
   picker.files = [_file('synthetic_small_1.bin', 5 * 1024 * 1024)];
-  final code = await _createCode(tester, 'role_send_button');
+  final code = await _createSendCode(tester);
   _log('code: $code');
   final cli = await _spawnCli([
     'join-recv', code, '--out', '$_work/recv_out6',
   ]);
-  await _openDetailOfFirstConnection(tester);
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+  await _waitForAutoSend(tester);
   final seen = <String>[];
   final deadline = DateTime.now().add(const Duration(seconds: 90));
   while (DateTime.now().isBefore(deadline)) {

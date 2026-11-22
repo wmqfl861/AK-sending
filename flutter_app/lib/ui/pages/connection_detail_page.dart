@@ -17,6 +17,14 @@
 ///   send card with its result rather than flipping to the receive card;
 /// * every finished or failed send is recorded in the session's
 ///   「最近传输」 list.
+///
+/// X4 (batch X, audit §4.3) — the primary send path's automatic send:
+/// the home page hands the PRESELECTED entries in [initialPicked] and
+/// [autoSendOnReady]; once the connection row is live (connected, or the
+/// paired-but-unreachable probe verdict — the send phase runs its own
+/// probe round and dial, so that verdict does not block), the page sends
+/// them automatically EXACTLY ONCE (审核 §4.3 发送方主路径: 对方加入且
+/// 连通后自动开始发送，不再需要点任何按钮).
 library;
 
 import 'dart:async' show StreamSubscription;
@@ -43,6 +51,8 @@ class ConnectionDetailPage extends StatefulWidget {
     required this.connectionId,
     this.picker = const PluginFilePickGateway(),
     this.autoPickOnOpen = false,
+    this.initialPicked = const <PickedEntry>[],
+    this.autoSendOnReady = false,
   });
 
   final SimpleTransferService service;
@@ -53,6 +63,17 @@ class ConnectionDetailPage extends StatefulWidget {
   /// success shortcut — the sender lands here ready to choose files). A
   /// cancelled pick simply leaves the page as-is.
   final bool autoPickOnOpen;
+
+  /// X4: the primary send path's preselected entries (chosen BEFORE the
+  /// code was minted) — seeds the review list so [autoSendOnReady] has
+  /// its payload.
+  final List<PickedEntry> initialPicked;
+
+  /// X4: send [initialPicked] automatically, exactly once, as soon as the
+  /// connection row is live (connected or paired-unreachable). The
+  /// automatic send goes through the SAME [_send] path as the manual
+  /// button (progress, W3 error card, 「最近传输」 recording).
+  final bool autoSendOnReady;
 
   @override
   State<ConnectionDetailPage> createState() => _ConnectionDetailPageState();
@@ -77,6 +98,9 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   _SendStage _sendStage = _SendStage.idle;
   String? _sendSummary;
 
+  /// X4: the exactly-once latch of the automatic send.
+  bool _autoSendDone = false;
+
   /// W3: the raw error object of the last failed send — the failure card
   /// maps it (title/reason/suggestion) and keeps the original text ONLY
   /// inside the expandable 「详情」.
@@ -95,15 +119,23 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   @override
   void initState() {
     super.initState();
+    // X4: the primary send path's preselected payload.
+    _picked.addAll(widget.initialPicked);
     _sub = widget.service.connections.listen(
       (snapshot) {
         if (!mounted) return;
+        TaskConnection? current;
+        for (final connection in snapshot) {
+          if (connection.id == widget.connectionId) {
+            current = connection;
+            break;
+          }
+        }
         setState(() {
-          _connection = snapshot
-              .where((c) => c.id == widget.connectionId)
-              .firstOrNullSafe;
+          _connection = current;
           _lastKnown = _connection ?? _lastKnown;
         });
+        _maybeAutoSend(current);
       },
       onError: (Object _) {},
     );
@@ -138,6 +170,23 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     _progressSub?.cancel();
     _idleExpirySub?.cancel();
     super.dispose();
+  }
+
+  /// X4: the primary send path's automatic send — fires exactly once, on
+  /// the first connections snapshot whose row for THIS page is live.
+  /// "Live" includes the paired-but-unreachable probe verdict: the send
+  /// phase runs its own probe round and dial on the real socket
+  /// (CR-P1-07), so the pairing-time verdict never blocks the send
+  /// (审核 §4.3: 对方加入且连通后自动开始发送).
+  void _maybeAutoSend(TaskConnection? row) {
+    if (!widget.autoSendOnReady || _autoSendDone || _picked.isEmpty) {
+      return;
+    }
+    if (row == null || row.state == TaskConnectionState.disconnected) {
+      return;
+    }
+    _autoSendDone = true;
+    _send();
   }
 
   Future<void> _pickSource({bool roleHint = false}) async {
@@ -759,9 +808,4 @@ class _ReceiveCard extends StatelessWidget {
       ),
     );
   }
-}
-
-/// `firstOrNull` without package:collection.
-extension<T> on Iterable<T> {
-  T? get firstOrNullSafe => isEmpty ? null : first;
 }

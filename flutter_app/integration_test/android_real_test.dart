@@ -14,8 +14,8 @@
 /// required steps, after all evidence has been collected.
 ///
 /// Steps:
-///  a. app launch + home empty state: the two pairing actions
-///     (生成配对码 / 输入配对码) and the 「当前连接」 empty state render
+///  a. app launch + home empty state: the two MAIN entries
+///     (发送文件 / 接收文件) and the 「当前连接」 empty state render
 ///     (key-located);
 ///  b. `libak_ffi.so` load — the borrowed engine's `version()` answers
 ///     the real `ak-ffi … (wire v…, caps 0x…)` string AND the task-plane
@@ -26,13 +26,15 @@
 ///     fabricated placeholder;
 ///  d. OPTIONAL real-registry task-code create (真 TLS, server-deployed
 ///     registry): only when `AK_REGISTRY_ADDR`+`AK_REGISTRY_ID` are passed
-///     as Dart compile constants — the UI path (生成配对码 → role sheet →
-///     我要发送) mints a code whose NORMALIZED form is exactly 36 symbols
-///     (`AKI1` + 32 Crockford Base32) and the canonical grouped display
-///     regroups to itself. Followed by the OPTIONAL connection-state
-///     progression watch: with no second device the one-shot code simply
-///     waits — that is SKIP, not failure; only an on-screen failure
-///     (`flow_error`) or a dead row is a failure;
+///     as Dart compile constants — the UI path (X4: the receive
+///     SECONDARY entry 生成接收码 — no file pick needed on a headless
+///     journey, and its pairing simply waits) mints a code whose
+///     NORMALIZED form is exactly 36 symbols (`AKI1` + 32 Crockford
+///     Base32) and the canonical grouped display regroups to itself.
+///     Followed by the OPTIONAL connection-state progression watch: with
+///     no second device the one-shot code simply waits — that is SKIP,
+///     not failure; only an on-screen failure (`flow_error`) or a dead
+///     row is a failure;
 ///  e. SAF storage channel probe — `MethodChannel('dev.ak/storage')`
 ///     `getStorageInfo` → appDownloadDir / freeBytes / safPersisted
 ///     (kept from the wave-25 version).
@@ -518,14 +520,14 @@ void main() {
             isSatisfied: () => _key('home_page').evaluate().isNotEmpty,
           );
           expect(
-            _key('home_create_code_button').evaluate(),
+            _key('home_send_button').evaluate(),
             isNotEmpty,
-            reason: 'the 生成配对码 action renders with the frozen key',
+            reason: 'the 发送文件 action renders with the frozen key',
           );
           expect(
-            _key('home_join_code_button').evaluate(),
+            _key('home_receive_button').evaluate(),
             isNotEmpty,
-            reason: 'the 输入配对码 action renders with the frozen key',
+            reason: 'the 接收文件 action renders with the frozen key',
           );
           expect(
             _key('connections_empty').evaluate(),
@@ -613,10 +615,11 @@ void main() {
 
       // -----------------------------------------------------------------
       // Step d1 — OPTIONAL real-registry task-code create (真 TLS) via the
-      // REAL UI path: 生成配对码 → 我要发送. Skipped unless BOTH
-      // AK_REGISTRY_ADDR and AK_REGISTRY_ID were compiled in; a failure
-      // here is only a verdict failure when the operator configured the
-      // real server.
+      // REAL UI path: X4's receive SECONDARY entry (生成接收码) — no file
+      // pick on this headless journey, and the minted code simply waits.
+      // Skipped unless BOTH AK_REGISTRY_ADDR and AK_REGISTRY_ID were
+      // compiled in; a failure here is only a verdict failure when the
+      // operator configured the real server.
       // -----------------------------------------------------------------
       final registryConfigured =
           _registryAddr.isNotEmpty && _registryIdHex.isNotEmpty;
@@ -651,17 +654,9 @@ void main() {
                 'already started it — continuing)');
           }
 
-          // Back to the home tab, then the real UI path.
+          // Back to the home tab, then the real UI path (X4).
           await _goTab(tester, label: '连接', onstageMarker: '当前连接');
-          await tester.tap(_key('home_create_code_button'));
-          await _pumpUntil(
-            tester,
-            what: 'the role bottom sheet (role_send_button)',
-            timeout: const Duration(seconds: 30),
-            isSatisfied: () =>
-                _key('role_send_button').evaluate().isNotEmpty,
-          );
-          await tester.tap(_key('role_send_button'));
+          await tester.tap(_key('home_receive_create_code_button'));
           // The real registry claim: a TLS round-trip to the deployed
           // server (budget generous for the slow emulator uplink).
           await _pumpUntil(

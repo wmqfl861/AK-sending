@@ -3,6 +3,13 @@
 // Only seam: synthetic files in this app's own support directory via picker.
 // This DOES NOT verify Android SAF/shared-storage access or release settings.
 //
+// X4 (batch X, 2026-11-22): the send flow rides the new home's 发送文件
+// MAIN path — the synthetic picker hands the payload at the entry tap
+// (先选文件再生码), and once the CLI peer joins the app sends AUTOMATICALLY
+// (审核 §4.3: no pick sheet, no send button). The rounds below therefore
+// drive home_send_button only and watch the detail page's progress from
+// the send's natural start.
+//
 // K1 fix (2026-11-14, batch K item d): the previous runner asserted that one
 // SAMPLE simultaneously carried the rate line and the file line
 // (sawThreeLines). In the 2026-11-14 light round the sampler (500 ms pumps)
@@ -130,7 +137,7 @@ void main() {
           '|total=${p.totalBytes}|bps=${p.bytesPerSecond}');
     });
     await tester.pumpWidget(AkSendingApp(service: bootstrap.service!, picker: SyntheticPicker(file)));
-    await until(tester, () => find.byKey(const ValueKey('home_create_code_button')).evaluate().isNotEmpty, 'home');
+    await until(tester, () => find.byKey(const ValueKey('home_send_button')).evaluate().isNotEmpty, 'home');
     final view = tester.view;
     evidence('VIEW|physical=${view.physicalSize}|dpr=${view.devicePixelRatio}|logicalWidth=${view.physicalSize.width / view.devicePixelRatio}');
 
@@ -153,33 +160,30 @@ void main() {
       // rerun, dark round: tap found 0 widgets). Wait for the button like
       // the first round does, then scroll it into view.
       await until(tester,
-          () => find.byKey(const ValueKey('home_create_code_button')).evaluate().isNotEmpty,
+          () => find.byKey(const ValueKey('home_send_button')).evaluate().isNotEmpty,
           'home actions between rounds');
-      final homeButton = find.byKey(const ValueKey('home_create_code_button'));
+      // X4 发送文件主路径: the tap runs the synthetic pick FIRST, the
+      // picked selection mints the sender code.
+      final homeButton = find.byKey(const ValueKey('home_send_button'));
       await tester.ensureVisible(homeButton);
       await tester.tap(homeButton);
-      await tester.pump(const Duration(milliseconds: 700));
-      await tester.tap(find.byKey(const ValueKey('role_send_button')));
       await until(tester, () => find.byKey(const ValueKey('flow_pairing_code')).evaluate().isNotEmpty, 'real task code');
+      await until(tester, () => find.byKey(const ValueKey('flow_selected_summary')).evaluate().isNotEmpty, 'selection summary');
       final codeWidget = tester.widget<SelectableText>(find.byKey(const ValueKey('flow_pairing_code')));
       final code = codeWidget.data ?? codeWidget.textSpan?.toPlainText() ?? '';
       expect(code.startsWith('AKI1-'), isTrue);
       evidence('CODE|$mode|$code');
-      final connection = find.byWidgetPredicate((w) => w.key.toString().contains('conn_card_name_'));
-      await until(tester, () => connection.evaluate().isNotEmpty, 'CLI receiver connection', seconds: 170);
-      await tester.ensureVisible(connection.first);
-      await tester.tap(connection.first);
-      await tester.pump(const Duration(milliseconds: 800));
-      expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-      await tester.pump(const Duration(milliseconds: 600));
-      await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-      await tester.pump(const Duration(milliseconds: 600));
-      expect(textAt('picked_count'), '已选 1 项');
-      await tester.ensureVisible(find.byKey(const ValueKey('conn_send_button')));
-      evidence('READY_TO_SEND|$mode');
-      await hold(tester, 3);
-      await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+      // X4: the CLI peer's join establishes the connection and the app
+      // starts the AUTOMATIC send — no card tap, no pick sheet, no send
+      // button. Wait for the detail page's progress lines directly.
+      await until(tester, () => find.byKey(const ValueKey('conn_detail_page')).evaluate().isNotEmpty, 'auto-opened detail page (X4)', seconds: 170);
+      expect(textAt('picked_count'), '已选 1 项',
+          reason: '预选内容随自动打开发送');
+      await until(tester,
+          () => textAt('conn_send_progress_status').isNotEmpty ||
+              find.byKey(const ValueKey('conn_send_result')).evaluate().isNotEmpty,
+          'automatic send start', seconds: 60);
+      evidence('SEND_STARTED|$mode|automatic-no-tap');
       final end = DateTime.now().add(const Duration(minutes: 4));
       var previous = '';
       // K1 fix: accumulate each line's presence over the WHOLE loop; the
@@ -267,31 +271,20 @@ void main() {
             'rate-line evidence lives in the J-era 200 MiB aux round');
       }
       expect(find.byKey(const ValueKey('conn_state_ended')), findsOneWidget);
-      expect(find.text('此连接已断开（对端离开或网络变化）。'), findsNothing);
+      // A COMPLETED transfer must not show the interruption copy (the
+      // pre-X4 wording no longer exists; the current detail-page line).
+      expect(find.text('连接已中断，重新发送会从断点续传。'), findsNothing);
       await tester.ensureVisible(find.byKey(const ValueKey('conn_back_home_button')));
       await tester.tap(find.byKey(const ValueKey('conn_back_home_button')));
       await tester.pump(const Duration(milliseconds: 900));
-      // K1R: popping the connection detail leaves the pairing flow ACTIVE
-      // on home (_PairingFlowView replaces _HomeActions while
-      // _flow.active), so the next round's create-code button never comes
-      // back by itself. The flow view's own exit is flow_done_button
-      // (controller.reset); the waiting view's is flow_cancel_button.
-      // Reset whichever exists, then wait for the home actions for real.
-      final done = find.byKey(const ValueKey('flow_done_button'));
-      final cancel = find.byKey(const ValueKey('flow_cancel_button'));
-      if (done.evaluate().isNotEmpty) {
-        await tester.ensureVisible(done);
-        await tester.tap(done);
-        evidence('FLOW_RESET|$mode|flow_done_button');
-      } else if (cancel.evaluate().isNotEmpty) {
-        await tester.ensureVisible(cancel);
-        await tester.tap(cancel);
-        evidence('FLOW_RESET|$mode|flow_cancel_button');
-      } else {
-        evidence('FLOW_RESET|$mode|none-active');
-      }
-      await tester.pump(const Duration(milliseconds: 700));
-      final list = find.byKey(const ValueKey('home_create_code_button'));
+      // X4: the detail page was AUTO-OPENED by the flow, so its pop
+      // already reset the pairing flow — the home actions come back by
+      // themselves. (The defensive flow-exit taps of the pre-X4 rounds
+      // are gone with the manual detail open.)
+      await until(tester,
+          () => find.byKey(const ValueKey('home_send_button')).evaluate().isNotEmpty,
+          'home actions after round');
+      final list = find.byKey(const ValueKey('home_send_button'));
       if (list.evaluate().isNotEmpty) { await tester.ensureVisible(list); }
       evidence('ROUND_DONE|$mode');
     }

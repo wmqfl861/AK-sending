@@ -13,6 +13,13 @@
 // against the LOCAL registry/STUN (AK_REGISTRY_ADDR etc. from the process
 // environment), and synthetic files only (AK_K1_SYNTH dir).
 //
+// X4 (batch X, 2026-11-22): both rounds ride the new home's 发送文件 MAIN
+// path — the staged synthetic file rides the entry's pick (先选文件再生
+// 码), and once the CLI peer joins the app sends it AUTOMATICALLY (审核
+// §4.3: no pick sheet, no send button). The awaiting-consent / decline
+// shots therefore watch the auto-opened detail page from the send's
+// natural start.
+//
 // Per theme (light, dark — test-injected platform brightness, same seam the
 // Android aux runner uses) it exports six PNGs to AK_K1_SHOTS (outside the
 // repository):
@@ -228,10 +235,6 @@ String _textsOf(WidgetTester tester, Key key) {
   return out.join(' / ');
 }
 
-bool _anyKeyPrefix(WidgetTester tester, String prefix) => tester.any(
-    find.byWidgetPredicate(
-        (w) => w.key != null && w.key.toString().contains(prefix)));
-
 Future<bool> _waitFor(
     WidgetTester tester, bool Function() predicate, Duration budget) async {
   final deadline = DateTime.now().add(budget);
@@ -366,10 +369,11 @@ Future<_HeldCli> _spawnHeldCli(String code, String outDir) async {
   return cli;
 }
 
-Future<String> _createCode(WidgetTester tester) async {
-  await tester.tap(find.byKey(const ValueKey('home_create_code_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('role_send_button')));
+/// X4 发送文件主路径: the caller STAGES picker.files BEFORE this call;
+/// the tap runs the multi-select pick and only the picked selection
+/// mints the sender-role code.
+Future<String> _createSendCode(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('home_send_button')));
   await tester.pump(const Duration(milliseconds: 300));
   final ok = await _waitFor(
       tester, () => tester.any(find.textContaining('AKI1-')), const Duration(seconds: 45));
@@ -381,25 +385,17 @@ Future<String> _createCode(WidgetTester tester) async {
   fail('AKI1 code widget had no readable text');
 }
 
-Future<void> _openDetail(WidgetTester tester) async {
-  final ok = await _waitFor(tester, () => _anyKeyPrefix(tester, 'conn_card_name_'),
-      const Duration(seconds: 60));
-  expect(ok, isTrue, reason: 'no connection card appeared');
-  await tester.tap(find.byWidgetPredicate(
-      (w) => w.key != null && w.key.toString().contains('conn_card_name_')));
-  await tester.pump(const Duration(milliseconds: 500));
-  expect(tester.any(find.byKey(const ValueKey('conn_detail_page'))), isTrue);
-}
-
-Future<void> _pickAndSend(WidgetTester tester, K1Picker picker) async {
-  await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-  await tester.pump(const Duration(milliseconds: 400));
-  await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-  await tester.pump(const Duration(milliseconds: 400));
-  expect(_textOf(tester, const ValueKey('picked_count')), '已选 1 项');
-  await tester.ensureVisible(find.byKey(const ValueKey('conn_send_button')));
-  await tester.pump(const Duration(milliseconds: 300));
-  await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+/// X4: once the peer's join establishes the connection, the detail page
+/// AUTO-OPENS with the preselected payload and the send starts by
+/// itself (审核 §4.3: no pick sheet, no send button). Waits for the
+/// page; the awaiting-consent watch below observes the send.
+Future<void> _waitForAutoOpen(WidgetTester tester) async {
+  final ok = await _waitFor(
+      tester,
+      () => tester.any(find.byKey(const ValueKey('conn_detail_page'))),
+      const Duration(seconds: 170));
+  expect(ok, isTrue, reason: 'detail page did not auto-open (X4)');
+  _log('AUTO_OPEN|detail page (X4)');
 }
 
 Future<void> _scrollToHistory(WidgetTester tester) async {
@@ -489,7 +485,7 @@ void main() {
       child: AkSendingApp(service: bootstrap.service!, picker: picker),
     ));
     final home = await _waitFor(tester,
-        () => tester.any(find.byKey(const ValueKey('home_create_code_button'))),
+        () => tester.any(find.byKey(const ValueKey('home_send_button'))),
         const Duration(seconds: 20));
     expect(home, isTrue, reason: 'home actions did not render');
 
@@ -508,13 +504,14 @@ void main() {
       _log('THEME_VERIFIED|$mode|test-platform-brightness');
 
       // -- success flow with a held consent prompt --------------------------
+      // X4: the staged files ride the home send entry's pick; once the
+      // CLI joins, the app sends them AUTOMATICALLY.
       picker.files = [_file('synthetic_k1_200mib.bin', 200 * 1024 * 1024)];
-      final code = await _createCode(tester);
+      final code = await _createSendCode(tester);
       _log('CODE|$mode|$code');
       final out = mode == 'light' ? 'recv-light' : 'recv-dark';
       final cli = await _spawnHeldCli(code, out);
-      await _openDetail(tester);
-      await _pickAndSend(tester, picker);
+      await _waitForAutoOpen(tester);
 
       // K1R diagnostics (2026-11-14 rerun): two light rounds timed out
       // here with the CLI fully paired/probed but no app-side state ever
@@ -613,17 +610,12 @@ void main() {
       // -- failure flow: receiver declines ----------------------------------
       await tester.tap(find.byKey(const ValueKey('conn_back_home_button')));
       await tester.pump(const Duration(milliseconds: 800));
-      if (tester.any(find.byKey(const ValueKey('flow_done_button')))) {
-        await tester.tap(find.byKey(const ValueKey('flow_done_button')));
-        await tester.pump(const Duration(milliseconds: 400));
-      }
       picker.files = [_file('synthetic_k1_small.bin', 5 * 1024 * 1024)];
-      final code2 = await _createCode(tester);
+      final code2 = await _createSendCode(tester);
       _log('CODE|$mode|$code2 (decline round)');
       final out2 = mode == 'light' ? 'recv-light-decline' : 'recv-dark-decline';
       final cli2 = await _spawnHeldCli(code2, out2);
-      await _openDetail(tester);
-      await _pickAndSend(tester, picker);
+      await _waitForAutoOpen(tester);
       await cli2.consent('n');
       final failed = await _waitFor(tester,
           () => tester.any(find.byKey(const ValueKey('conn_send_error'))),

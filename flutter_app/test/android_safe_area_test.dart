@@ -133,17 +133,26 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   }, variant: android);
 
-  testWidgets('role sheet keeps its own bottom inset outside the shell body',
-      (tester) async {
-    await _pumpApp(tester);
-    await tester.tap(find.byKey(const ValueKey('home_create_code_button')));
+  testWidgets('source pick sheet keeps its own bottom inset outside the '
+      'shell body', (tester) async {
+    // X4 removed the role sheet; the home flow's remaining bottom sheet
+    // is the connection detail page's source-selection sheet (W7.2).
+    final fake = await _pumpApp(tester);
+    await fake.createCode(TaskRole.send);
+    final id = fake.simulatePeerJoin(peerName: '合成测试设备');
+    await pumpEvents(tester);
+    fake.completeProbe(id);
+    await pumpEvents(tester);
+    await tester.tap(find.byKey(ValueKey('conn_card_name_$id')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
     await tester.pumpAndSettle();
 
     expect(tester.getRect(find.byType(BottomSheet)).bottom, 844);
-    final receive = tester.getRect(find.byKey(const ValueKey('role_receive_button')));
-    expect(receive.bottom, 796,
+    final dir = tester.getRect(find.byKey(const ValueKey('pick_dir_option')));
+    expect(dir.bottom, 796,
         reason: '24dp system inset plus the existing 24dp sheet padding.');
-    expect(receive.top, greaterThanOrEqualTo(32));
+    expect(dir.top, greaterThanOrEqualTo(32));
     expect(tester.takeException(), isNull);
   }, variant: android);
 

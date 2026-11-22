@@ -24,23 +24,18 @@ Future<void> _tap(WidgetTester tester, String key) async {
   await tester.pump(const Duration(milliseconds: 400));
 }
 
-Future<void> _create(WidgetTester tester) async {
-  await _tap(tester, 'home_create_code_button');
-  await _tap(tester, 'role_send_button');
+/// X4: the receive-create secondary entry (生成接收码) — no picker, and
+/// its probe failure stays ON the home page (only the send MAIN path's
+/// preselected flow auto-opens on a paired-but-unreachable verdict).
+Future<void> _createReceive(WidgetTester tester) async {
+  await _tap(tester, 'home_receive_create_code_button');
 }
 
-Future<void> _join(WidgetTester tester, String code) async {
-  await _tap(tester, 'home_join_code_button');
+/// X4: the join panel declares the direction by ENTRY (no selector).
+Future<void> _join(WidgetTester tester, String code,
+    {String entryKey = 'home_send_join_code_button'}) async {
+  await _tap(tester, entryKey);
   await tester.enterText(find.byKey(const ValueKey('join_code_field')), code);
-  await tester.pump();
-  // W-N1: the joiner declares its direction again (the engine cannot
-  // infer it across devices) — the submit stays disabled until picked.
-  await tester.tap(
-    find.descendant(
-      of: find.byKey(const ValueKey('join_role_selector')),
-      matching: find.text('发送文件'),
-    ),
-  );
   await tester.pump();
   await _tap(tester, 'join_submit_button');
 }
@@ -109,7 +104,10 @@ void main() {
         AkSendingApp(service: service, store: InMemorySaveDirStore()),
       );
       await tester.pump();
-      await _create(tester);
+      // X4: the receive-create entry (生成接收码) — its probe failure
+      // stays on the home failure card (only the send MAIN path's
+      // preselected flow auto-opens on the unreachable verdict).
+      await _createReceive(tester);
       expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
       _expectNoGuidance();
 
@@ -120,7 +118,7 @@ void main() {
       runtime.events.add({
         'event': 'connected',
         'conn': connId,
-        'role': 'sender',
+        'role': 'receiver',
         'peer_endpoint': '127.0.0.1:45678',
         'code': runtime.codes.single,
         'code_id': runtime.codeIdOfCode.values.single,
@@ -141,7 +139,7 @@ void main() {
       });
       service.engine.pumpEvents();
       await _renderEvents(tester);
-      expect(find.textContaining('连通测试未通过'), findsOneWidget);
+      expect(find.textContaining('无法直接连接到对方'), findsOneWidget);
       expect(find.byKey(const ValueKey('flow_success')), findsNothing);
       _expectGuidance();
       expect(tester.takeException(), isNull);
@@ -151,7 +149,7 @@ void main() {
       _expectNoGuidance();
       await _tap(tester, 'flow_cancel_button');
       expect(
-        find.byKey(const ValueKey('home_create_code_button')),
+        find.byKey(const ValueKey('home_receive_button')),
         findsOneWidget,
       );
       _expectNoGuidance();
@@ -177,7 +175,9 @@ void main() {
     expect(find.byKey(const ValueKey('join_code_field')), findsOneWidget);
     _expectNoGuidance();
     await _tap(tester, 'join_cancel_button');
-    expect(find.byKey(const ValueKey('home_join_code_button')), findsOneWidget);
+    expect(
+        find.byKey(const ValueKey('home_send_join_code_button')),
+        findsOneWidget);
   });
 
   for (final role in TaskRole.values) {
@@ -224,7 +224,7 @@ void main() {
       'help on the home failure', (tester) async {
     final service = await pumpApp(tester);
     addTearDown(service.dispose);
-    await _create(tester);
+    await _createReceive(tester);
     final id = service.simulatePeerJoin();
     await _renderEvents(tester);
     service.failProbe(id);
@@ -233,11 +233,11 @@ void main() {
 
     service.simulateNetworkChange();
     await _renderEvents(tester);
-    expect(find.textContaining('连接已断开'), findsOneWidget);
+    expect(find.textContaining('与对方的连接断开了'), findsOneWidget);
     _expectNoGuidance();
     await _tap(tester, 'flow_back_button');
     expect(
-      find.byKey(const ValueKey('home_create_code_button')),
+      find.byKey(const ValueKey('home_receive_button')),
       findsOneWidget,
     );
   });
@@ -280,7 +280,7 @@ void main() {
         AkSendingApp(service: service, store: InMemorySaveDirStore()),
       );
       await tester.pump();
-      await _create(tester);
+      await _createReceive(tester);
       // W3: the mapped card (出了点问题) carries the verbatim cause only
       // inside the expandable 详情.
       expect(find.text('出了点问题'), findsOneWidget);
@@ -291,7 +291,7 @@ void main() {
       _expectNoGuidance();
       await _tap(tester, 'flow_back_button');
       expect(
-        find.byKey(const ValueKey('home_create_code_button')),
+        find.byKey(const ValueKey('home_receive_button')),
         findsOneWidget,
       );
     });

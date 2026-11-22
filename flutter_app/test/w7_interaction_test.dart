@@ -1,12 +1,15 @@
-/// W7 (2026-11-22) widget tests for the three interaction changes:
+/// W7 (2026-11-22) widget tests, updated by X4 (batch X) for the
+/// direction-declared-once home:
 ///
-/// * W7.1 — the join panel carries NO direction selector; the join runs
-///   without a role and the success prompt names the ACTUAL role
-///   (对方将把文件发给你 / 现在可以选择文件发给对方);
+/// * W7.1/X4 — the join panel carries NO direction selector: the entry
+///   the user tapped already declared the direction (发送文件 / 接收文件),
+///   and the success prompt names the ACTUAL role (对方将把文件发给你 /
+///   现在可以选择文件发给对方);
 /// * W7.2 — a SENDER-side success auto-opens the connection detail page
-///   with the file picker (cancel keeps the page); a RECEIVER-side
-///   success waits on the card (等待对方发送文件… + the save location,
-///   no 完成 button);
+///   with the file picker (cancel keeps the page). Since X4 this lives on
+///   for the JOIN-send secondary path (输入对方的码 as sender) — the
+///   create-send main path preselects its files and auto-SENDS instead
+///   (covered by home_flow_test);
 /// * W7.3 — Android-only 「传输期间请保持本应用在前台」 hint on the
 ///   running-transfer cards (injected [UiPlatform], no channel).
 library;
@@ -22,64 +25,77 @@ import 'w28_test_helpers.dart';
 const int mib = 1024 * 1024;
 
 void main() {
-  testWidgets('W-N1: the join panel KEEPS the direction selector; 配对 '
-      'needs a picked direction and the join carries it (never null)',
+  testWidgets('X4: the join panel has NO direction selector — the '
+      'ENTRY\'s declared direction reaches joinCode (never null)',
       (tester) async {
-    // Review 2026-11-22 withdrew W7.1 step 1: across devices the engine
-    // cannot infer the joiner's direction from the code (a role-less join
-    // resolves to the v1 receiver default → a 「我要接收」 code would be
-    // refused as a same-direction pair). The UI must declare it.
     final fake = await pumpApp(tester);
     addTearDown(fake.dispose);
     final minted = await fake.createCode(TaskRole.send);
 
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    // The receive MAIN entry opens the panel with the direction fixed.
+    await tester.tap(find.byKey(const ValueKey('home_receive_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.byKey(const ValueKey('join_role_selector')), findsOneWidget,
-        reason: 'W-N1：加入方向由用户声明，不能省略');
-    expect(find.text('这次配对我要：'), findsOneWidget);
+    expect(find.byKey(const ValueKey('join_role_selector')), findsNothing,
+        reason: 'X4：方向已由入口声明，面板不再选择');
+    expect(find.text('这次配对我要：'), findsNothing);
+    expect(find.text('对方将把文件发给你。'), findsOneWidget,
+        reason: '面板按入口声明的方向说明');
+    expect(fake.joinCodeCalls, 0, reason: '面板未提交不发起 join');
 
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
     await tester.pump();
     var submit = tester.widget<FilledButton>(
         find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNull, reason: '合法码但未选方向：提交保持禁用');
-
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('接收文件')));
-    await tester.pump();
-    submit = tester.widget<FilledButton>(
-        find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNotNull, reason: '选定方向后提交可用');
+    expect(submit.onPressed, isNotNull,
+        reason: 'X4：合法码即可提交——方向不是面板的一步');
 
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
     await pumpEvents(tester);
     expect(fake.joinCodeCalls, 1);
     expect(fake.joinRoleRequests.single, TaskRole.receive,
-        reason: 'W-N1：用户声明的方向随 joinCode 传下去，绝不传 null');
+        reason: 'X4：接收入口的 join 角色为接收且绝不为 null');
+
+    // Close the receiver-side waiting card, then try the other entry.
+    fake.completeProbe('conn-1');
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('flow_back_button')));
+    await tester.pump();
+    final second = await fake.createCode(TaskRole.receive);
+    await tester.tap(
+        find.byKey(const ValueKey('home_send_join_code_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('你将把文件发给对方。'), findsOneWidget);
+    await tester.enterText(
+        find.byKey(const ValueKey('join_code_field')), second.code);
+    await tester.pump();
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull);
+    await tester.tap(find.byKey(const ValueKey('join_submit_button')));
+    await tester.pump();
+    await pumpEvents(tester);
+    expect(fake.joinRoleRequests.last, TaskRole.send,
+        reason: 'X4：发送次要入口的 join 角色为发送且绝不为 null');
   });
 
   testWidgets('W7.1/W7.2: receiver-side join success says 对方将把文件发给 '
       '你 and waits (no 完成 button)', (tester) async {
     final fake = await pumpApp(tester);
     addTearDown(fake.dispose);
-    // Creator declared SEND → the joiner receives.
+    // The receive MAIN entry joins a sender's code.
     await fake.createCode(TaskRole.send);
 
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    await tester.tap(find.byKey(const ValueKey('home_receive_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(find.byKey(const ValueKey('join_code_field')),
         fake.createdCodes.single.code);
-    await tester.pump();
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('接收文件')));
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -99,23 +115,26 @@ void main() {
     expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing);
   });
 
-  testWidgets('W7.2: create-send success auto-opens the detail page with '
-      'the picker; cancelling the pick keeps the page', (tester) async {
+  testWidgets('W7.2 (join-send secondary path): success auto-opens the '
+      'detail page with the picker; cancelling the pick keeps the page',
+      (tester) async {
     final picker = FakeFilePickGateway(filesResult: kTwoFiles);
     final fake = await pumpApp(tester, picker: picker);
     addTearDown(fake.dispose);
+    // Creator declared RECEIVE → the joiner (us) sends via the send
+    // SECONDARY entry (输入对方的码).
+    await fake.createCode(TaskRole.receive);
 
-    await tester.tap(find.byKey(const ValueKey('home_create_code_button')));
+    await tester.tap(
+        find.byKey(const ValueKey('home_send_join_code_button')));
     await tester.pump();
-    await tester.pump(const Duration(seconds: 1));
-    await tester.tap(find.byKey(const ValueKey('role_send_button')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(find.byKey(const ValueKey('join_code_field')),
+        fake.createdCodes.single.code);
     await tester.pump();
-    await tester.pump(const Duration(seconds: 1));
-
-    final id = fake.simulatePeerJoin(peerName: '办公本-ThinkPad');
-    await pumpEvents(tester);
+    await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
-    fake.completeProbe(id);
+    fake.completeProbe('conn-1');
     await pumpEvents(tester);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
@@ -135,36 +154,6 @@ void main() {
     expect(find.byKey(const ValueKey('pick_files_option')), findsNothing);
     expect(find.text('已选 2 项'), findsNothing,
         reason: '取消后没有已选内容');
-  });
-
-  testWidgets('W7.2: join-send success also auto-opens (the joiner '
-      'inherited the sender role)', (tester) async {
-    final fake = await pumpApp(tester);
-    addTearDown(fake.dispose);
-    // Creator declared RECEIVE → the joiner (us) sends.
-    await fake.createCode(TaskRole.receive);
-
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
-    await tester.enterText(find.byKey(const ValueKey('join_code_field')),
-        fake.createdCodes.single.code);
-    await tester.pump();
-    await tester.tap(find.descendant(
-        of: find.byKey(const ValueKey('join_role_selector')),
-        matching: find.text('发送文件')));
-    await tester.pump();
-    await tester.tap(find.byKey(const ValueKey('join_submit_button')));
-    await tester.pump();
-    fake.completeProbe('conn-1');
-    await pumpEvents(tester);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
-
-    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget,
-        reason: '加入方为发送方时同样直达详情页');
-    expect(find.byKey(const ValueKey('conn_pick_files_button')),
-        findsOneWidget);
   });
 
   testWidgets('W7.3: Android shows 保持前台 on the running-transfer card; '

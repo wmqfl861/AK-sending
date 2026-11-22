@@ -39,8 +39,8 @@ void main() {
     await tester.tap(find.text('连接'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
-    expect(find.byKey(const ValueKey('home_create_code_button')),
-        findsOneWidget);
+    expect(
+        find.byKey(const ValueKey('home_send_button')), findsOneWidget);
   });
 
   testWidgets('390dp phone regression: bottom NavigationBar, both tabs '
@@ -49,8 +49,7 @@ void main() {
 
     expect(find.byType(NavigationBar), findsOneWidget);
     expect(find.byType(NavigationRail), findsNothing);
-    expect(find.byKey(const ValueKey('home_create_code_button')),
-        findsOneWidget);
+    expect(find.byKey(const ValueKey('home_send_button')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     // Settings also fits.
@@ -66,22 +65,23 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('390dp phone regression: the whole create flow fits '
-      '(code display + waiting)', (tester) async {
-    final fake = await pumpApp(tester, size: kPhoneSize);
+  testWidgets('390dp phone regression: the whole send flow fits '
+      '(pick → code display → auto-send detail)', (tester) async {
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, size: kPhoneSize, picker: picker);
 
-    await tester.tap(find.byKey(const ValueKey('home_create_code_button')));
-    await tester.pump();
-    await tester.pump(const Duration(seconds: 1));
-    await tester.tap(find.byKey(const ValueKey('role_send_button')));
-    await tester.pump();
+    // X4: the send main path picks FIRST, then mints the sender code.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
     await tester.pump(const Duration(seconds: 1));
 
     expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
+    expect(find.byKey(const ValueKey('flow_selected_summary')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
-    // Pairing + probe to success still fits at phone width. W7.2: the
-    // sender success auto-opens the detail page with the picker.
+    // Pairing + probe to success still fits at phone width. X4: the
+    // sender success auto-opens the detail page with the preselected
+    // files already sending.
     final id = fake.simulatePeerJoin(peerName: '特别长特别长的对端设备名称X');
     await pumpEvents(tester);
     await tester.pump();
@@ -89,14 +89,14 @@ void main() {
     await pumpEvents(tester);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
     expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
-    expect(find.byKey(const ValueKey('pick_files_option')), findsOneWidget);
+    expect(find.text('已选 2 项'), findsOneWidget);
+    expect(fake.sendFilesCalls, 1,
+        reason: 'X4：预选内容自动发送（不需要点任何按钮）');
     expect(tester.takeException(), isNull);
 
-    // Dismiss the auto-opened sheet; back home the card is listed.
-    await tester.tapAt(const Offset(10, 10));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
+    // Back home the card is listed (the flow resets with the pop).
     await tester.pageBack();
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
@@ -164,7 +164,7 @@ void main() {
     expect(find.textContaining('引擎启动失败：注册中心不可达'), findsOneWidget);
     // The shell stays navigable in the degraded state.
     expect(
-        find.byKey(const ValueKey('home_create_code_button')), findsOneWidget);
+        find.byKey(const ValueKey('home_send_button')), findsOneWidget);
   });
 
   testWidgets('a construction-time startupError renders the card and the '
@@ -178,7 +178,7 @@ void main() {
     expect(find.byKey(const ValueKey('app_startup_error')), findsOneWidget);
     expect(find.textContaining('未找到 ak_ffi'), findsOneWidget);
     expect(
-        find.byKey(const ValueKey('home_create_code_button')), findsOneWidget);
+        find.byKey(const ValueKey('home_send_button')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

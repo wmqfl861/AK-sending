@@ -6,6 +6,13 @@
 /// join:   joining → paired → probing → success | failed
 /// ```
 ///
+/// X4 (batch X, audit §4.3): the direction is declared exactly ONCE by
+/// the home entry the user taps — `startCreate(role)` from a 发送文件 /
+/// 接收文件 entry, `startJoin(code, role: …)` from a typed-code entry.
+/// [startJoin]'s role is REQUIRED: a role-less join resolves to the
+/// engine's v1 receiver default across devices, so the UI never leaves
+/// the direction undeclared (W-N1).
+///
 /// The auto connectivity probe (spec 3) is tracked through the
 /// `connections` stream: the latched connection's state maps
 /// connecting→paired, testing→probing, connected→success.
@@ -78,8 +85,9 @@ class PairingFlowController extends ChangeNotifier {
   TaskConnection? connection;
 
   /// The joiner's EXPLICIT direction of the running join flow (wave-29
-  /// P1-05): the user's intent picked alongside the code — forwarded to
-  /// `joinCode` so the engine never guesses the direction.
+  /// P1-05, made required by X4): the direction the user declared by the
+  /// home entry they tapped — forwarded to `joinCode` so the engine never
+  /// guesses the direction.
   TaskRole? joinRole;
 
   /// The connection id a join flow waits for (from [JoinResult]).
@@ -102,8 +110,10 @@ class PairingFlowController extends ChangeNotifier {
   /// (uppercase, hyphen/space tolerance) and validated against the REAL
   /// task-code format (wave-29 P1-02: `AKI1` + 32 Crockford Base32
   /// symbols) before hitting the service. [role] is the joiner's declared
-  /// direction; the submit affordance requires one.
-  Future<void> startJoin(String input, {TaskRole? role}) async {
+  /// direction — REQUIRED since X4: the home entry the user tapped owns
+  /// the one-time declaration (the engine's role-less cross-device join
+  /// defaults to receiver, W-N1), so the UI has no direction-less path.
+  Future<void> startJoin(String input, {required TaskRole role}) async {
     joinRole = role;
     final normalized = normalizeJoinCode(input);
     if (!isValidTaskCode(normalized)) {
@@ -201,7 +211,7 @@ class PairingFlowController extends ChangeNotifier {
     connection = null;
     _expectedConnectionId = null;
     if (kind != PairingFlowKind.join) {
-      joinRole = null; // a fresh join re-picks the direction
+      joinRole = null; // a fresh join re-declares its direction (X4)
     }
     notifyListeners();
   }
@@ -261,7 +271,7 @@ class PairingFlowController extends ChangeNotifier {
         // success, where the panel is already done and the list card
         // simply disappears.
         if (phase != PairingFlowPhase.success) {
-          _fail('连接已断开（对端离开或网络变化），请重新配对。');
+          _fail('与对方的连接断开了，请重新配对。');
         }
       } else if (current.state != latched.state) {
         connection = current;
@@ -280,10 +290,13 @@ class PairingFlowController extends ChangeNotifier {
         _set(PairingFlowPhase.success);
       case TaskConnectionState.unreachable:
         // Wave-29 P2-09: the probe FAILED — an honest negative verdict
-        // ends the flow with a readable reason (never "success").
-        _fail('连通测试未通过：无法与对端建立数据直连，请检查网络后重新配对。');
+        // ends the flow with a readable reason (never "success"). X4: the
+        // HOME layer may still hand this paired-but-unreachable row to the
+        // automatic send of the primary send path (the send phase runs its
+        // own probe round and dial — 审核 §4.5 wording: 无法直接连接).
+        _fail('无法直接连接到对方，请检查网络后重试。');
       case TaskConnectionState.disconnected:
-        _fail('连接已断开（对端离开或网络变化），请重新配对。');
+        _fail('与对方的连接断开了，请重新配对。');
     }
   }
 }

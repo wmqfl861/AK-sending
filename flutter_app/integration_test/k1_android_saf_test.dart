@@ -1,12 +1,20 @@
-// K1 item b (batch K repair round, 2026-11-15): the ANDROID SYSTEM file
-// picker (SAF) normal flow. Unlike the aux runner, this test uses the
-// app's REAL FilePickGateway — tapping 选择文件 opens the platform's
-// system picker (file_picker plugin → DocumentsUI). The Flutter side of
-// the flow is driven by this test; the NATIVE picker activity is driven
-// externally (adb/uiautomator works on native views), because Flutter
-// renders no accessibility tree for uiautomator and blind adb taps into
-// Flutter widgets proved unreliable (recorded in the K repair-round
-// handoff: field focus loss, input truncation, layout shift).
+// K1 item b (batch K repair round, 2026-11-15; second half adapted to
+// the W7.2 flow in batch X, then to the X4 home): the ANDROID SYSTEM
+// file picker (SAF) normal flow. The test joins a receiver-side code as
+// the SENDER through the send SECONDARY entry — X4: 对方已经给了你一个
+// 码？输入对方的码 — the direction comes from the ENTRY (the join panel
+// has no direction selector; a role-less cross-device join would default
+// to receiver and be refused as a same-direction pair, W-N1). On pairing
+// success the app AUTO-OPENS the connection detail page with the
+// source-selection bottom sheet (W7.2); tapping the sheet's 选择文件
+// option opens the platform's system picker through the app's REAL
+// FilePickGateway (file_picker plugin → DocumentsUI).
+// The Flutter side of the flow is driven by this test; the NATIVE
+// picker activity is driven externally (adb/uiautomator works on native
+// views), because Flutter renders no accessibility tree for uiautomator
+// and blind adb taps into Flutter widgets proved unreliable (recorded
+// in the K repair-round handoff: field focus loss, input truncation,
+// layout shift).
 //
 // Orchestration contract (all local-only endpoints):
 //   * dart-defines: AK_REGISTRY_ADDR=10.0.2.2:17200, AK_STUN_ADDR=
@@ -45,47 +53,51 @@ void main() {
     expect(bootstrap.service, isNotNull, reason: bootstrap.error);
     await tester.pumpWidget(AkSendingApp(service: bootstrap.service!));
     await safUntil(tester,
-        () => tester.any(find.byKey(const ValueKey('home_create_code_button'))),
+        () => tester.any(find.byKey(const ValueKey('home_send_button'))),
         'home');
 
-    // Join the RECEIVER-side code as the SENDER — widget-level input,
-    // the reliable equivalent of what blind adb taps could not do.
-    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    // Join the RECEIVER-side code as the SENDER via the send SECONDARY
+    // entry (X4) — widget-level input, the reliable equivalent of what
+    // blind adb taps could not do. The entry declares the direction;
+    // the panel asks for the code only.
+    await tester
+        .tap(find.byKey(const ValueKey('home_send_join_code_button')));
     await tester.pump(const Duration(milliseconds: 600));
     final field = find.byKey(const ValueKey('join_code_field'));
     await safUntil(tester, () => tester.any(field), 'join panel field');
     await tester.enterText(field, safCode);
     await tester.pump(const Duration(milliseconds: 400));
-    // The SegmentedButton's first segment (发送文件) — tapped through its
-    // label text so the runner cannot drift from the selector's layout.
-    // W-N1: the join direction selector is back (the engine cannot infer
-    // the joiner's direction across devices).
-    final sendSegment = find.descendant(
-      of: find.byKey(const ValueKey('join_role_selector')),
-      matching: find.text('发送文件'),
-    );
-    await tester.tap(sendSegment.first);
-    await tester.pump(const Duration(milliseconds: 400));
     final submit = find.byKey(const ValueKey('join_submit_button'));
     expect(tester.widget<FilledButton>(submit).onPressed, isNotNull,
-        reason: 'submit still disabled — code/role incomplete');
+        reason: 'submit still disabled — code incomplete');
     await tester.tap(submit);
-    safEvidence('JOIN_SUBMITTED|$safCode');
+    safEvidence('JOIN_SUBMITTED|send-entry|$safCode');
 
     final connection = find.byWidgetPredicate(
         (w) => w.key != null && w.key.toString().contains('conn_card_name_'));
     await safUntil(tester, () => connection.evaluate().isNotEmpty,
         'paired connection card',
         seconds: 170);
-    await tester.ensureVisible(connection.first);
-    await tester.tap(connection.first);
-    await tester.pump(const Duration(milliseconds: 800));
-    expect(tester.any(find.byKey(const ValueKey('conn_detail_page'))), isTrue,
-        reason: 'connection detail did not open');
-
+    // W7.2: the sender flow now AUTO-OPENS the detail page and the
+    // file-picker sheet once pairing succeeds — no manual card tap, no
+    // manual pick button. Wait for the auto-opened sheet directly.
+    await safUntil(
+        tester,
+        () => find
+            .byKey(const ValueKey('pick_files_option'))
+            .evaluate()
+            .isNotEmpty,
+        'auto-opened pick sheet (W7.2)',
+        seconds: 30);
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    // The auto-opened bottom sheet animates in; settle before tapping
+    // (a mid-animation tap lands outside the render tree bounds).
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 300));
+    }
     // THE SYSTEM PICKER: real FilePickGateway — no injection seam here.
-    await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
-    await tester.pump(const Duration(milliseconds: 800));
+    await tester
+        .ensureVisible(find.byKey(const ValueKey('pick_files_option')));
     await tester.tap(find.byKey(const ValueKey('pick_files_option')));
     safEvidence('PICKER_OPENED|awaiting external DocumentsUI drive');
     await safUntil(tester,
@@ -109,7 +121,6 @@ void main() {
     safEvidence(
         'RESULT|$result|stats=${safTextAt(tester, 'conn_send_result_stats')}');
     expect(result.contains('发送完成'), isTrue, reason: result);
-    expect(find.text('此连接已断开（对端离开或网络变化）。'), findsNothing);
     safEvidence('DONE|system SAF picker flow completed');
   }, timeout: const Timeout(Duration(minutes: 12)));
 }

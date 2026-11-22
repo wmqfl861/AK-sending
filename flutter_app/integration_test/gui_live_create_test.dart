@@ -1,6 +1,9 @@
 // LIVE GUI test against the deployed desktop app: drive the REAL app
 // process through a real code creation. Runs via flutter test -d windows
 // with the real bootstrap (dart-defines come from this command line).
+// X4 (batch X): the new home has no role sheet — the receive SECONDARY
+// entry (生成接收码) mints a receiver-role code without any file pick;
+// an external peer redeems it as the sender (`task join-send`).
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:ak_sending_app/main.dart' as app;
@@ -10,18 +13,12 @@ void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   binding.framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.fullyLive;
 
-  testWidgets('live: home -> create code (sender) -> code appears', (tester) async {
+  testWidgets('live: home -> create receive code -> code appears', (tester) async {
     app.main();
     await tester.pumpAndSettle(const Duration(seconds: 3));
 
-    // Home: two big buttons.
-    expect(find.text('生成配对码'), findsOneWidget, reason: 'home create button');
-    await tester.tap(find.text('生成配对码'));
-    await tester.pumpAndSettle();
-
-    // Role sheet: pick 我要发送.
-    expect(find.byKey(const ValueKey('role_send_button')), findsWidgets);
-    await tester.tap(find.byKey(const ValueKey('role_send_button')).first);
+    // Home: the receive secondary entry (X4).
+    await tester.tap(find.byKey(const ValueKey('home_receive_create_code_button')));
     await tester.pump();
 
     // The pairing flow now dials the real registry; wait up to 40s for

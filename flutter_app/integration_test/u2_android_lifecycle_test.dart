@@ -17,6 +17,16 @@
 // FfiSimpleTransferService → ak_task_* on the bundled libak_ffi.so) and
 // drives the real pages exactly like j1_android_u1_aux_test.dart.
 //
+// X4 (batch X, 2026-11-22) — the new home's send MAIN path: the runner
+// taps 发送文件, the synthetic picker hands the payload, and the code is
+// minted WITH that selection (发送文件主路径：先选文件再生码). When the
+// host CLI joins and the connection is established, the app starts the
+// send AUTOMATICALLY (审核 §4.3 — no pick sheet, no send button); the
+// SEND_STARTED evidence below marks the moment the transfer actually
+// began (observed from the service layer), and the checkpoint switch
+// runs BEFORE the code is handed to the host (the file write), which is
+// still before any send could start.
+//
 // dart-defines (compile-time, on the `flutter test` command):
 //   AK_REGISTRY_ADDR       default 10.0.2.2:17200 (local registry-server)
 //   AK_STUN_ADDR           default 10.0.2.2:17101 (local stun-server)
@@ -58,8 +68,9 @@
 // & 255 per byte, per 1 MiB block) into a .tmp sibling that is renamed
 // over the target only when complete.
 //
-// Background discipline (handoff runner requirement 1): from the send tap
-// to the end of the run this runner performs NO tester.pump, no tap, no
+// Background discipline (handoff runner requirement 1): from the moment
+// the automatic send actually STARTS (the SEND_STARTED evidence below) to
+// the end of the run this runner performs NO tester.pump, no tap, no
 // widget read — the transfer is observed purely from the service layer
 // (transferProgress / connections / engineHealth / engine.doneEvents) and
 // every wait is Future.delayed. A pump while the activity is hidden waits
@@ -588,18 +599,16 @@ void main() {
           tester,
           lifecycle,
           () => find
-              .byKey(const ValueKey('home_create_code_button'))
+              .byKey(const ValueKey('home_send_button'))
               .evaluate()
               .isNotEmpty,
           'home');
-      final homeButton = find.byKey(const ValueKey('home_create_code_button'));
+      // X4 发送文件主路径: the tap runs the synthetic multi-select FIRST
+      // (the picker is injected at pumpWidget) and only the picked
+      // selection mints the sender-role code.
+      final homeButton = find.byKey(const ValueKey('home_send_button'));
       await tester.ensureVisible(homeButton);
       await tester.tap(homeButton);
-      await _pump(tester, lifecycle, const Duration(milliseconds: 700));
-      final roleButton = find.byKey(const ValueKey('role_send_button'));
-      await tester.ensureVisible(roleButton);
-      await _pump(tester, lifecycle, const Duration(milliseconds: 300));
-      await tester.tap(roleButton);
       await _until(
           tester,
           lifecycle,
@@ -613,6 +622,22 @@ void main() {
       final code = codeWidget.data ?? codeWidget.textSpan?.toPlainText() ?? '';
       expect(code.startsWith('AKI1-'), isTrue,
           reason: 'task code never rendered');
+      // X4: the 已选 summary on the code card proves the preselection
+      // rode along (the automatic send below sends THIS file).
+      await _until(
+          tester,
+          lifecycle,
+          () => find
+              .byKey(const ValueKey('flow_selected_summary'))
+              .evaluate()
+              .isNotEmpty,
+          'selection summary on the code card');
+
+      // The checkpoint switch BEFORE the code is handed to the host (the
+      // file write) — still ahead of any possible send start, and ahead
+      // of the join that would trigger it.
+      checkpointRecordsBefore = applyCheckpointSwitch(checkpoints);
+
       await codePath.writeAsString(code, flush: true);
       evidence('TASK_CODE_FILE|written|len=${code.length}|never-printed'
           '|host: adb exec-out run-as $_appId cat '
@@ -628,40 +653,17 @@ void main() {
         codePath.deleteSync(); // consumed by the join; dies with the code
         evidence('TASK_CODE_FILE|consumed-and-deleted');
       }
-      // W7.2: the sender flow now AUTO-OPENS the detail page and the
-      // file-picker sheet once the peer joins — no manual card tap, no
-      // manual pick button. Wait for the auto-opened sheet directly.
-      await _until(
-          tester,
-          lifecycle,
-          () => find
-              .byKey(const ValueKey('pick_files_option'))
-              .evaluate()
-              .isNotEmpty,
-          'auto-opened pick sheet (W7.2)',
-          seconds: 30);
-      expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
-      // The auto-opened bottom sheet animates in; settle before tapping
-      // (a mid-animation tap lands outside the render tree bounds).
-      for (var i = 0; i < 6; i++) {
-        await _pump(tester, lifecycle, const Duration(milliseconds: 300));
-      }
-      await tester
-          .ensureVisible(find.byKey(const ValueKey('pick_files_option')));
-      await tester.tap(find.byKey(const ValueKey('pick_files_option')));
-      await _until(tester, lifecycle,
-          () => textAt(tester, 'picked_count') == '已选 1 项', 'picked entry');
-      await tester
-          .ensureVisible(find.byKey(const ValueKey('conn_send_button')));
-
-      // The checkpoint switch, immediately before the send.
-      checkpointRecordsBefore = applyCheckpointSwitch(checkpoints);
-
+      // X4: once the connection is established the app sends the
+      // preselected file AUTOMATICALLY (no pick sheet, no send button —
+      // 审核 §4.3). The send start is observed from the SERVICE layer:
+      // the first progress snapshot for this connection.
+      await _until(tester, lifecycle, () => latest != null,
+          'automatic send start (X4)',
+          seconds: 170);
       sendStarted = true;
-      evidence('SEND_TAPPED|t=${_sec(clock.elapsedMilliseconds)}s'
+      evidence('SEND_STARTED|t=${_sec(clock.elapsedMilliseconds)}s'
           '|wall=${_wall()}|bytes=${_mib * 1024 * 1024}'
-          '|no-pumps-from-here');
-      await tester.tap(find.byKey(const ValueKey('conn_send_button')));
+          '|automatic-no-tap|no-pumps-from-here');
 
       // -- phase 2: service-layer watch — Future.delayed only, NO pumps --
       evidence('WATCH|started|budget=${_watchBudget.inSeconds}s');

@@ -170,6 +170,11 @@ void main() {
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
     await tester.pump();
+    // W-N1: the joiner declares its direction (the submit needs it).
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('接收文件')));
+    await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));

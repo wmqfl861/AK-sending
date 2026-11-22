@@ -22,8 +22,13 @@ import 'w28_test_helpers.dart';
 const int mib = 1024 * 1024;
 
 void main() {
-  testWidgets('W7.1: the join panel has no direction selector; a valid '
-      'code alone enables 配对 and the join carries NO role', (tester) async {
+  testWidgets('W-N1: the join panel KEEPS the direction selector; 配对 '
+      'needs a picked direction and the join carries it (never null)',
+      (tester) async {
+    // Review 2026-11-22 withdrew W7.1 step 1: across devices the engine
+    // cannot infer the joiner's direction from the code (a role-less join
+    // resolves to the v1 receiver default → a 「我要接收」 code would be
+    // refused as a same-direction pair). The UI must declare it.
     final fake = await pumpApp(tester);
     addTearDown(fake.dispose);
     final minted = await fake.createCode(TaskRole.send);
@@ -32,24 +37,31 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.byKey(const ValueKey('join_role_selector')), findsNothing,
-        reason: 'AUD-05：加入不再选方向');
-    expect(find.text('这次配对我要：'), findsNothing);
+    expect(find.byKey(const ValueKey('join_role_selector')), findsOneWidget,
+        reason: 'W-N1：加入方向由用户声明，不能省略');
+    expect(find.text('这次配对我要：'), findsOneWidget);
 
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
     await tester.pump();
-    final submit = tester.widget<FilledButton>(
+    var submit = tester.widget<FilledButton>(
         find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNotNull,
-        reason: '合法码本身即可提交（无角色门槛）');
+    expect(submit.onPressed, isNull, reason: '合法码但未选方向：提交保持禁用');
+
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('接收文件')));
+    await tester.pump();
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull, reason: '选定方向后提交可用');
 
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
     await pumpEvents(tester);
     expect(fake.joinCodeCalls, 1);
-    expect(fake.joinRoleRequests.single, isNull,
-        reason: 'W7.1：joinCode 不传 role，由契约给对侧角色');
+    expect(fake.joinRoleRequests.single, TaskRole.receive,
+        reason: 'W-N1：用户声明的方向随 joinCode 传下去，绝不传 null');
   });
 
   testWidgets('W7.1/W7.2: receiver-side join success says 对方将把文件发给 '
@@ -64,6 +76,10 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(find.byKey(const ValueKey('join_code_field')),
         fake.createdCodes.single.code);
+    await tester.pump();
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('接收文件')));
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -133,6 +149,10 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(find.byKey(const ValueKey('join_code_field')),
         fake.createdCodes.single.code);
+    await tester.pump();
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('发送文件')));
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();

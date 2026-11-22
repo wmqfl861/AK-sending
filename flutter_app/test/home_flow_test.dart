@@ -115,22 +115,19 @@ void main() {
   });
 
   testWidgets('join flow: full AKI1 code with case/hyphen/space '
-      'tolerance, NO direction pick, probe, sender auto-open',
+      'tolerance, explicit direction, probe, sender auto-open',
       (tester) async {
     final fake = await pumpApp(tester);
 
-    // The other device minted a "我要接收" code — joining grants US the
-    // sender side (the creator's opposite; W7.1 removed the pick).
+    // The other device minted a "我要接收" code — we join it declaring
+    // OUR intent (send), so the connection direction is send. W-N1: the
+    // direction pick is back — the engine cannot infer it across devices.
     final minted = await fake.createCode(TaskRole.receive);
     expect(minted.code.startsWith('AKI1-'), isTrue);
 
     await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
-
-    // W7.1 (AUD-05): no direction selector at all.
-    expect(find.byKey(const ValueKey('join_role_selector')), findsNothing);
-    expect(find.text('这次配对我要：'), findsNothing);
 
     // Lowercase + ungrouped + spaced input of the FULL code: the
     // formatter uppercases, the controller strips separators.
@@ -140,10 +137,15 @@ void main() {
     await tester.pump();
     expect(find.text('36/36 位'), findsOneWidget);
 
-    // A well-formed code alone enables the submit (no role gate).
-    final submit = tester.widget<FilledButton>(
+    // The join direction picker (P1-05): submit stays disabled until the
+    // user declares their intent.
+    final submitDisabled = tester.widget<FilledButton>(
         find.byKey(const ValueKey('join_submit_button')));
-    expect(submit.onPressed, isNotNull);
+    expect(submitDisabled.onPressed, isNull);
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('发送文件')));
+    await tester.pump();
 
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -160,11 +162,11 @@ void main() {
     expect(find.textContaining('我发送 → 对方'), findsAtLeastNWidgets(1),
         reason: '详情页（与下层连接卡）都标出发送方向');
     // One-time code: consumed by the join; the typed (normalized) form
-    // reached the service WITHOUT a role (W7.1).
+    // reached the service with the explicit role (W-N1).
     expect(fake.pendingCode, isNull);
     expect(fake.joinRequests.single, normalizeJoinCode(minted.code));
-    expect(fake.joinRoleRequests.single, isNull,
-        reason: 'W7.1：加入不再传方向，由契约给对侧角色');
+    expect(fake.joinRoleRequests.single, TaskRole.send,
+        reason: 'W-N1：加入方向由用户显式声明并随 join 传下去');
   });
 
   testWidgets('R36-P2-03: the engine-failure latch shows the recoverable '
@@ -202,6 +204,10 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     await tester.enterText(
         find.byKey(const ValueKey('join_code_field')), minted.code);
+    await tester.pump();
+    await tester.tap(find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('接收文件')));
     await tester.pump();
     await tester.tap(find.byKey(const ValueKey('join_submit_button')));
     await tester.pump();
@@ -313,9 +319,48 @@ void main() {
         findsOneWidget);
   });
 
-  // R29-P2-04 (re-tap deselects the join role) retired with the selector
-  // itself: W7.1 (AUD-05) removed the join direction pick — there is no
-  // selection state left to crash on.
+  testWidgets('R29-P2-04: re-tapping the selected role deselects cleanly '
+      '(no empty-set crash) and the submit disables until re-picked',
+      (tester) async {
+    final fake = await pumpApp(tester);
+    final minted = await fake.createCode(TaskRole.send);
+
+    await tester.tap(find.byKey(const ValueKey('home_join_code_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(
+        find.byKey(const ValueKey('join_code_field')), minted.code);
+    await tester.pump();
+
+    final segment = find.descendant(
+        of: find.byKey(const ValueKey('join_role_selector')),
+        matching: find.text('发送文件'));
+    await tester.tap(segment);
+    await tester.pump();
+    var submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull, reason: '选定角色后提交可用');
+
+    // Re-tap the SAME segment: the empty selection must resolve to a null
+    // role (never `selection.first` on an empty set), and the submit
+    // disables — an empty selection can never enter the join.
+    await tester.tap(segment);
+    await tester.pump();
+    expect(tester.takeException(), isNull,
+        reason: '再次点击已选角色不得抛出空集合异常（R29-P2-04）');
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNull,
+        reason: '取消选择后提交必须禁用（空选择不得进入配对）');
+    expect(fake.joinCodeCalls, 0, reason: '空选择绝不应发起 join');
+
+    // Re-picking restores the submit.
+    await tester.tap(segment);
+    await tester.pump();
+    submit = tester.widget<FilledButton>(
+        find.byKey(const ValueKey('join_submit_button')));
+    expect(submit.onPressed, isNotNull, reason: '重新选定后提交恢复可用');
+  });
 
   testWidgets('network change drops connections: the list follows',
       (tester) async {

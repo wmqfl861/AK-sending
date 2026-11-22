@@ -56,11 +56,19 @@ void main() {
     await safUntil(tester, () => tester.any(field), 'join panel field');
     await tester.enterText(field, safCode);
     await tester.pump(const Duration(milliseconds: 400));
-    // W7.1 removed the join direction selector (the joiner gets the
-    // code creator's opposite role) — the code alone completes the panel.
+    // The SegmentedButton's first segment (发送文件) — tapped through its
+    // label text so the runner cannot drift from the selector's layout.
+    // W-N1: the join direction selector is back (the engine cannot infer
+    // the joiner's direction across devices).
+    final sendSegment = find.descendant(
+      of: find.byKey(const ValueKey('join_role_selector')),
+      matching: find.text('发送文件'),
+    );
+    await tester.tap(sendSegment.first);
+    await tester.pump(const Duration(milliseconds: 400));
     final submit = find.byKey(const ValueKey('join_submit_button'));
     expect(tester.widget<FilledButton>(submit).onPressed, isNotNull,
-        reason: 'submit still disabled — code incomplete');
+        reason: 'submit still disabled — code/role incomplete');
     await tester.tap(submit);
     safEvidence('JOIN_SUBMITTED|$safCode');
 

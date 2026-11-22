@@ -217,14 +217,16 @@ class _HomePageState extends State<HomePage> {
           )
         else if (_joinInputOpen)
           _JoinInputPanel(
-            // W7.1 (AUD-05): the joiner no longer picks a direction —
-            // the contract grants the joiner the OPPOSITE of the code's
-            // creator role; `joinCode` runs without a role. The panel
-            // closes on submit so the later flow reset (W7.2 auto-open)
-            // returns to the actions, not back into this form.
-            onSubmit: (code) {
+            // W-N1 (review 2026-11-22, W7.1 step 1 withdrawn): the joiner
+            // declares its OWN direction again — the engine cannot infer
+            // it from the code across devices (a role-less join resolves
+            // to the v1 receiver default, so a code created as 「我要接收」
+            // was refused as a same-direction pair). The panel closes on
+            // submit so the later flow reset (W7.2 auto-open) returns to
+            // the actions, not back into this form.
+            onSubmit: (code, role) {
               setState(() => _joinInputOpen = false);
-              _flow.startJoin(code);
+              _flow.startJoin(code, role: role);
             },
             onCancel: () => setState(() => _joinInputOpen = false),
           )
@@ -332,20 +334,26 @@ class _RoleSheet extends StatelessWidget {
 }
 
 /// The join-code input form (加入流 first step): auto-uppercase,
-/// hyphen/space-tolerant paste of the FULL `AKI1-…` code (wave-29 P1-02)
-/// and a live normalized-length counter.
+/// hyphen/space-tolerant paste of the FULL `AKI1-…` code (wave-29 P1-02),
+/// live normalized-length counter, and the joiner's direction pick — the
+/// user's explicit intent forwarded with the join (P1-05).
 ///
-/// W7.1 (AUD-05): NO direction pick anymore — the contract grants the
-/// joiner the code creator's OPPOSITE role, so the choice was redundant
-/// (and a wrong pick failed the join). The pairing-success prompt tells
-/// the user their ACTUAL role instead.
+/// W-N1 (review 2026-11-22): the direction pick STAYS. Batch W's step to
+/// drop it (W7.1 step 1) assumed the engine hands the joiner the OPPOSITE
+/// of the creator's role; it does not across devices — the creator's role
+/// is not in the code, a role-less join defaults to receiver, and a
+/// same-direction pair is refused by the creator's owner loop. The
+/// friction is removed properly by choosing the direction ONCE up front
+/// (the 发送文件 / 接收文件 main paths of batch X, audit §4.3), not by
+/// dropping the declaration. The pairing-success prompt (W7.1 step 2)
+/// still tells the user their ACTUAL role.
 class _JoinInputPanel extends StatefulWidget {
   const _JoinInputPanel({
     required this.onSubmit,
     required this.onCancel,
   });
 
-  final void Function(String code) onSubmit;
+  final void Function(String code, TaskRole role) onSubmit;
   final VoidCallback onCancel;
 
   @override
@@ -354,6 +362,7 @@ class _JoinInputPanel extends StatefulWidget {
 
 class _JoinInputPanelState extends State<_JoinInputPanel> {
   final TextEditingController _controller = TextEditingController();
+  TaskRole? _role;
 
   static final TextInputFormatter _upperCase = TextInputFormatter.withFunction(
     (oldValue, newValue) => newValue.copyWith(text: newValue.text.toUpperCase()),
@@ -370,7 +379,8 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
     final theme = Theme.of(context);
     final normalized = normalizeJoinCode(_controller.text);
     final codeValid = isValidTaskCode(normalized);
-    final ready = codeValid;
+    final role = _role;
+    final ready = codeValid && role != null;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -389,8 +399,9 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
               ],
               textCapitalization: TextCapitalization.characters,
               onChanged: (_) => setState(() {}),
-              onSubmitted:
-                  ready ? (_) => widget.onSubmit(_controller.text) : null,
+              onSubmitted: ready
+                  ? (_) => widget.onSubmit(_controller.text, role)
+                  : null,
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 hintText: 'AKI1-XXXX-XXXX-XXXX-…（完整复制粘贴即可）',
@@ -414,10 +425,38 @@ class _JoinInputPanelState extends State<_JoinInputPanel> {
               style: theme.textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
+            Text('这次配对我要：', style: theme.textTheme.bodyMedium),
+            const SizedBox(height: 4),
+            SegmentedButton<TaskRole>(
+              key: const ValueKey('join_role_selector'),
+              segments: const [
+                ButtonSegment(
+                  value: TaskRole.send,
+                  icon: Icon(Icons.upload),
+                  label: Text('发送文件'),
+                ),
+                ButtonSegment(
+                  value: TaskRole.receive,
+                  icon: Icon(Icons.download),
+                  label: Text('接收文件'),
+                ),
+              ],
+              selected: role == null ? const <TaskRole>{} : <TaskRole>{role},
+              // `emptySelectionAllowed` is required for the INITIAL
+              // nothing-picked state (SegmentedButton asserts non-empty
+              // otherwise). R29-P2-04: an empty selection still can never
+              // reach the join — the callback guards the empty set (a
+              // null role keeps the submit DISABLED), so a re-tap that
+              // deselects is honest, not a StateError crash.
+              emptySelectionAllowed: true,
+              onSelectionChanged: (selection) => setState(
+                  () => _role = selection.isEmpty ? null : selection.first),
+            ),
+            const SizedBox(height: 12),
             FilledButton.icon(
               key: const ValueKey('join_submit_button'),
               onPressed: ready
-                  ? () => widget.onSubmit(_controller.text)
+                  ? () => widget.onSubmit(_controller.text, role)
                   : null,
               icon: const Icon(Icons.link),
               label: const Text('配对'),
@@ -609,8 +648,9 @@ class _CodeShownView extends StatelessWidget {
 
 /// 连接成功（连通测试通过）.
 ///
-/// W7.1/W7.2: the card explains the user's ACTUAL role (the joiner no
-/// longer picked one). The RECEIVER waits here — no 完成 click needed;
+/// W7.1/W7.2: the card explains the user's ACTUAL role (for a joiner that
+/// is the direction declared at the panel — W-N1). The RECEIVER waits
+/// here — no 完成 click needed;
 /// the sender variant only renders for the one frame before the home
 /// page auto-opens the connection's detail page with the file picker
 /// (see `_HomePageState._onFlowChanged`).

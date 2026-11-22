@@ -33,7 +33,15 @@ Future<void> _join(WidgetTester tester, String code) async {
   await _tap(tester, 'home_join_code_button');
   await tester.enterText(find.byKey(const ValueKey('join_code_field')), code);
   await tester.pump();
-  // W7.1: no direction pick anymore — a well-formed code submits directly.
+  // W-N1: the joiner declares its direction again (the engine cannot
+  // infer it across devices) — the submit stays disabled until picked.
+  await tester.tap(
+    find.descendant(
+      of: find.byKey(const ValueKey('join_role_selector')),
+      matching: find.text('发送文件'),
+    ),
+  );
+  await tester.pump();
   await _tap(tester, 'join_submit_button');
 }
 

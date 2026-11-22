@@ -1319,5 +1319,30 @@ class ControlCharTests(unittest.TestCase):
         self.assertEqual(len(checks.control_char_issues("a\x7f\nb\x00", "d.md")), 2)
 
 
+class StrippedSeparatorTests(unittest.TestCase):
+    """W review: a STRIPPED backslash escape leaves a path with no separator."""
+
+    def test_intact_paths_pass(self):
+        text = (
+            r"`<home>\.ak-sending\logs\ak-stage.log`，原 %TEMP%\ak-stage.log" "\n"
+            "cache/ak-stage.log 与 %TEMP% 无新写入，`<repo>` 下的目录，printf %s%d\n"
+        )
+        self.assertEqual(checks.stripped_separator_issues(text, "d.md"), [])
+
+    def test_eaten_separators_are_rejected_with_line_numbers(self):
+        text = (
+            "ok\n"
+            r"`<home>\.ak-sending\logsk-stage.log`" "\n"
+            "fine\n"
+            "原 %TEMP%k-stage.log 不再产生\n"
+            "`<repo>flutter` 目录\n"
+        )
+        errors = checks.stripped_separator_issues(text, "d.md")
+        self.assertEqual(len(errors), 3, errors)
+        self.assertTrue(errors[0].startswith("d.md:2: path separator looks eaten"))
+        self.assertTrue(errors[1].startswith("d.md:4:"))
+        self.assertTrue(errors[2].startswith("d.md:5:"))
+
+
 if __name__ == "__main__":
     unittest.main()

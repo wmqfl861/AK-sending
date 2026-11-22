@@ -782,6 +782,30 @@ def control_char_issues(text: str, name: str) -> list[str]:
     return issues
 
 
+# W review 2026-11-22 (V-N1 recurrence): a shell-expanded escape can also be
+# STRIPPED on write (`\\a` -> BEL -> dropped), leaving no control character
+# behind — only a path whose separator went missing. Two signatures: a path
+# placeholder (`%VAR%`, `<home>`, `<repo>`, `<tmp>`) glued to a letter, and the
+# known `\\ak-stage.log` casualty (`k-stage.log` not preceded by `a`).
+STRIPPED_SEPARATOR_RE = re.compile(
+    r"(?:%[A-Z_]{3,}%|<(?:home|repo|tmp)>)[A-Za-z]|(?<!a)k-stage\.log"
+)
+
+
+def stripped_separator_issues(text: str, name: str) -> list[str]:
+    """One error per line of [text] whose path looks like it lost a separator."""
+    issues = []
+    for i, line in enumerate(text.split("\n")):
+        match = STRIPPED_SEPARATOR_RE.search(line)
+        if match:
+            issues.append(
+                f"{name}:{i + 1}: path separator looks eaten near "
+                f"{match.group()!r} (shell-expanded backslash escape? write "
+                "the file with an editor or a quoted heredoc)"
+            )
+    return issues
+
+
 def check(root: Path) -> dict:
     errors: list[str] = []
     required = [
@@ -832,6 +856,9 @@ def check(root: Path) -> dict:
         text = path.read_text(encoding="utf-8")
         errors.extend(
             control_char_issues(text, path.relative_to(root).as_posix())
+        )
+        errors.extend(
+            stripped_separator_issues(text, path.relative_to(root).as_posix())
         )
         for link in MARKDOWN_LINK_RE.findall(text):
             if "://" in link or link.startswith(("mailto:", "#")):

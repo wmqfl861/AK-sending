@@ -1,4 +1,6 @@
 use super::*;
+use ak_core::error::ErrorCode;
+use ak_engine::DECLINED_MESSAGE;
 // C02: the C exports are `unsafe extern "C" fn` now; this module is
 // `#![forbid(unsafe_code)]` (whole file), so the audited one-line
 // unsafe calls live in `task_ext::testabi` and are imported here under
@@ -4458,5 +4460,121 @@ fn post_connect_failure_emits_both_conn_lost_and_op_failed() {
         lines.iter().filter(|line| is_conn_lost(line)).count(),
         1,
         "the connection's terminal line fires exactly once: {lines:?}"
+    );
+}
+
+// -- W1 (batch W, 2026-11-22, external ruling): the verdict's CODE+MESSAGE
+//    double match — the frame-recognition counter-examples ----------------
+//
+// The closed wire code set reuses LocalPermissionDenied for DECLINED and
+// Cancelled for TASK-CLOSE, so the three-state verdict must match BOTH
+// the code and the message before reading a peer Error frame as a decline
+// or a deliberate departure. The pure function is the exact match the
+// async send body runs (a structural extraction only — behavior
+// unchanged); the Lost wiring it feeds (`conn_lost` via
+// `push_disconnected_once`) is the W1 path the silent-peer tests above
+// already drive end-to-end.
+
+/// Same-code-different-text: a PeerError carrying the DECLINED wire code
+/// but a FOREIGN message (the shape of a REAL local permission refusal
+/// relayed by the peer — same `LocalPermissionDenied` code, filesystem
+/// text) must NOT read as a user decline: the verdict is Lost (the
+/// connection ends `conn_lost`), never Declined (which would keep a
+/// dead pairing retryable). Pinned after the external ruling found the
+/// code-only match too wide.
+#[test]
+fn declined_code_with_foreign_message_is_lost_not_declined() {
+    let error = EngineError::PeerError {
+        code: DECLINED_WIRE_CODE,
+        message: "open(…): permission denied (os error 5)".to_string(),
+    };
+    assert_eq!(
+        post_connect_verdict(&error),
+        PostConnectVerdict::Lost,
+        "same code, foreign text: a relayed permission failure is a lost connection"
+    );
+    // The crossed pairing (declined code carrying the TASK-CLOSE text)
+    // is neither double match either.
+    let crossed = EngineError::PeerError {
+        code: DECLINED_WIRE_CODE,
+        message: TASK_CLOSE_MESSAGE.to_string(),
+    };
+    assert_eq!(
+        post_connect_verdict(&crossed),
+        PostConnectVerdict::Lost,
+        "declined code + task-close text matches neither frame exactly"
+    );
+}
+
+/// Same-text-different-code: a PeerError carrying the TASK-CLOSE message
+/// under a FOREIGN code (here `Internal`) must NOT read as the peer's
+/// authenticated close notification: the verdict is Lost, so the
+/// connection reports the honest `conn_lost` instead of the ByPeer
+/// `peer` path. Pinned after the external ruling found the
+/// message-only match too wide.
+#[test]
+fn task_close_message_with_foreign_code_is_lost() {
+    let error = EngineError::PeerError {
+        code: ErrorCode::Internal,
+        message: TASK_CLOSE_MESSAGE.to_string(),
+    };
+    assert_eq!(
+        post_connect_verdict(&error),
+        PostConnectVerdict::Lost,
+        "task-close text under a foreign code is a lost connection, not a ByPeer report"
+    );
+    // The crossed pairing (Cancelled code carrying the DECLINED text).
+    let crossed = EngineError::PeerError {
+        code: ErrorCode::Cancelled,
+        message: DECLINED_MESSAGE.to_string(),
+    };
+    assert_eq!(
+        post_connect_verdict(&crossed),
+        PostConnectVerdict::Lost,
+        "cancelled code + declined text matches neither frame exactly"
+    );
+}
+
+/// The positive pairs pinned at the unit level — every double match and
+/// the two frame-kind branches that need no message inspection. The
+/// DECLINED positive is ALSO driven end-to-end by
+/// [`declined_offer_keeps_the_listener_and_done_converges_both_sides`]
+/// (a real consent decline rides the wire as DECLINED code + message,
+/// fails only the op, keeps the listener, and accepts the same-code
+/// retry); this test pins the classifier itself.
+#[test]
+fn post_connect_verdict_double_match_positives() {
+    // Engine-named departure.
+    assert_eq!(
+        post_connect_verdict(&EngineError::PeerClosed),
+        PostConnectVerdict::PeerGone
+    );
+    // TASK-CLOSE: Cancelled code AND the fixed message (task_net's
+    // close-notify frame is the only sender of this exact pair).
+    assert_eq!(
+        post_connect_verdict(&EngineError::PeerError {
+            code: ErrorCode::Cancelled,
+            message: TASK_CLOSE_MESSAGE.to_string(),
+        }),
+        PostConnectVerdict::PeerGone
+    );
+    // DECLINED: LocalPermissionDenied code AND the fixed message.
+    assert_eq!(
+        post_connect_verdict(&EngineError::PeerError {
+            code: DECLINED_WIRE_CODE,
+            message: DECLINED_MESSAGE.to_string(),
+        }),
+        PostConnectVerdict::Declined
+    );
+    // The protocol Reject frame keeps its own independent branch — a
+    // distinct frame kind, never an Error-frame code reuse.
+    assert_eq!(
+        post_connect_verdict(&EngineError::Rejected(ErrorCode::ProtocolUnsupported)),
+        PostConnectVerdict::Declined
+    );
+    // Any other post-connect engine error stays the honest Lost.
+    assert_eq!(
+        post_connect_verdict(&EngineError::Cancelled),
+        PostConnectVerdict::Lost
     );
 }

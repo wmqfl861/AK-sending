@@ -3,6 +3,8 @@
 //! Moved out of `task.rs` unchanged (CR-P2-08, batch U review).
 
 use super::*;
+use ak_core::error::ErrorCode;
+use ak_engine::DECLINED_MESSAGE;
 
 /// Join one live code AT THE REGISTRY: resolve the joiner's side (spec
 /// hint → engine-cache mirror → the v1 receiver default), bind the
@@ -456,7 +458,10 @@ enum AttemptOutcome {
 /// (W1, batch W 2026-11-22): every variant except the decline ends the
 /// connection — the pairing is unusable or the peer is verifiably gone —
 /// while a DECLINED offer keeps it for the frozen same-code retry.
-enum PostConnectVerdict {
+/// `pub(super)` + derives for the unit tests of
+/// [`post_connect_verdict`] (task_tests.rs); behavior is untouched.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PostConnectVerdict {
     /// The engine named the peer's departure (`PeerClosed`): the pairing
     /// is reported ByPeer after the op fails (the event pump's
     /// `disconnected`/`peer`).
@@ -469,6 +474,38 @@ enum PostConnectVerdict {
     /// and protocol failures): the connection is interrupted — terminal
     /// `disconnected`/`conn_lost`.
     Lost,
+}
+
+/// W1 (batch W, 2026-11-22, external ruling): the three-state verdict as
+/// a pure function — a post-connect `PeerError` is only a DECLINE or a
+/// TASK-CLOSE when BOTH the wire code and the message text match. The
+/// closed `ErrorCode` set reuses `LocalPermissionDenied` for DECLINED
+/// ([`DECLINED_WIRE_CODE`]) and `Cancelled` for TASK-CLOSE, so a
+/// single-attribute match misreads the peer: same-code-different-text
+/// (a REAL local permission refusal relayed by the peer) must not pose
+/// as a user decline, and same-text-different-code must not pose as a
+/// TASK-CLOSE — both mismatches fall back to [`PostConnectVerdict::Lost`]
+/// (`conn_lost`). The protocol Reject frame ([`EngineError::Rejected`])
+/// keeps its own independent Declined branch: it is a distinct frame
+/// kind, not an Error-frame code reuse. Extracted from the async send
+/// body (behavior unchanged) so the counter-examples pin the match at
+/// the unit level (ffi-v2 §8.3 批次 W 增补的双匹配例外).
+pub(super) fn post_connect_verdict(error: &EngineError) -> PostConnectVerdict {
+    match error {
+        EngineError::PeerClosed => PostConnectVerdict::PeerGone,
+        EngineError::PeerError { code, message, .. }
+            if *code == ErrorCode::Cancelled && message == TASK_CLOSE_MESSAGE =>
+        {
+            PostConnectVerdict::PeerGone
+        }
+        EngineError::PeerError { code, message, .. }
+            if *code == DECLINED_WIRE_CODE && message == DECLINED_MESSAGE =>
+        {
+            PostConnectVerdict::Declined
+        }
+        EngineError::Rejected(_) => PostConnectVerdict::Declined,
+        _ => PostConnectVerdict::Lost,
+    }
 }
 
 /// One candidate attempt under the split connect budget (the wave-25/26
@@ -570,18 +607,11 @@ async fn attempt_task_send(
                 // The decline rides an Error frame with the DECLINED wire
                 // code (the receiver's consent refusal), and the peer's
                 // authenticated TASK-CLOSE is a deliberate departure —
-                // both classified exactly like the CLI's task adapter.
-                let verdict = match &error {
-                    EngineError::PeerClosed => PostConnectVerdict::PeerGone,
-                    EngineError::PeerError { message, .. } if message == TASK_CLOSE_MESSAGE => {
-                        PostConnectVerdict::PeerGone
-                    }
-                    EngineError::PeerError { code, .. } if *code == DECLINED_WIRE_CODE => {
-                        PostConnectVerdict::Declined
-                    }
-                    EngineError::Rejected(_) => PostConnectVerdict::Declined,
-                    _ => PostConnectVerdict::Lost,
-                };
+                // both recognized ONLY on the code+message double match
+                // (see [`post_connect_verdict`]): same-code-foreign-text
+                // (a real local permission refusal) and same-text-foreign-
+                // code both fall back to Lost/`conn_lost`.
+                let verdict = post_connect_verdict(&error);
                 AttemptOutcome::FailedAfterConnect { verdict, reason }
             } else {
                 AttemptOutcome::ConnectFailed(reason)

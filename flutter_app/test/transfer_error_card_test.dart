@@ -208,8 +208,11 @@ void main() {
     expect(find.byKey(const ValueKey('settings_export_diag_error')),
         findsOneWidget);
     expect(find.text('出了点问题'), findsOneWidget);
-    expect(find.textContaining('重启应用'), findsOneWidget,
-        reason: '导出诊断失败时不建议再导出诊断');
+    // codex 裁决：重启会清空进程内诊断缓冲 — 改为展开「详情」复制错误信息。
+    expect(find.textContaining('请再试一次'), findsOneWidget);
+    expect(find.textContaining('请展开「详情」并复制'), findsOneWidget,
+        reason: '导出诊断失败时不建议重启应用，也不再建议导出诊断');
+    expect(find.textContaining('重启应用'), findsNothing);
     // Collapsed: nothing raw.
     expect(find.textContaining('AkFfiException'), findsNothing);
     expect(find.textContaining('AK_ERR_INTERNAL'), findsNothing);

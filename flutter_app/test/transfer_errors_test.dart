@@ -90,9 +90,10 @@ void main() {
         TransferErrorKind.idleExpired,
       ),
       (
-        '闲置过期：EngineError::IdleTimeout 文案',
-        _FakeAkFfiException(2, 'idle timeout: no frame within 150s'),
-        TransferErrorKind.idleExpired,
+        '传输中断：EngineError::IdleTimeout（发送/接收 op 的空闲超时是'
+        '传输中断，不是配对闲置）',
+        _FakeAkFfiException(2, 'idle timeout: no frame within 10s'),
+        TransferErrorKind.interrupted,
       ),
       (
         '对方拒绝：DECLINED',
@@ -194,6 +195,19 @@ void main() {
       expect(view.suggestion, contains('对方重新发送'));
     });
 
+    test('发送 op 的 idle timeout 是传输中断，不是配对闲置（codex 裁决）', () {
+      final view = transferErrorView(
+        _FakeAkFfiException(
+            2, 'idle timeout: no frame within 10s (checkpoint kept)'),
+        TransferErrorScene.sending,
+      );
+      expect(view.kind, TransferErrorKind.interrupted);
+      expect(view.title, '传输中断了');
+      expect(view.suggestion, contains('断点续传'));
+      // 不是配对闲置文案。
+      expect(view.title, isNot(contains('闲置')));
+    });
+
     test('闲置过期与连接中断的文案分开（V-N4 的核心）', () {
       final idle = transferErrorView(
         _FakeAkFfiException(2, 'pairing ended: idle_expired'),
@@ -237,11 +251,14 @@ void main() {
       expect(view.detail, contains('身份认证失败'));
     });
 
-    test('未知错误兜底（导出诊断场景）→ 不再建议导出诊断', () {
+    test('未知错误兜底（导出诊断场景）→ 展开详情复制错误信息', () {
       final view = transferErrorView(
           StateError('disk full'), TransferErrorScene.diagnosticsExport);
       expect(view.title, '出了点问题');
-      expect(view.suggestion, contains('重启应用'));
+      expect(view.suggestion, contains('详情'));
+      expect(view.suggestion, contains('复制'));
+      // 重启会清空进程内诊断缓冲，不得再建议重启；也不建议再导出诊断。
+      expect(view.suggestion, isNot(contains('重启')));
       expect(view.suggestion, isNot(contains('导出连接诊断')));
     });
 

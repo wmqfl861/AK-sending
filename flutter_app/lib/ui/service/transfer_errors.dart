@@ -12,10 +12,12 @@
 /// Classification is honest by ERROR CODE FIRST (ffi-v2 §3: `-2` invalid
 /// input, …) and message vocabulary second (the engine's fixed error
 /// strings, e.g. `stream failed: connection lost`). Idle expiry
-/// (`idle_expired` / `idle timeout`) and connection interruption
-/// (`connection lost` …) are DISTINCT kinds — V-N4 showed the idle copy on
-/// a connection-lost failure; the mapping layer now keeps them apart so
-/// the caller can display each honestly (W1 owns the engine-side truth).
+/// (`idle_expired`) and connection interruption (`connection lost` …, plus
+/// an op-level `idle timeout: no frame …` — a transfer that stopped
+/// carrying frames, not the pairing idle budget) are DISTINCT kinds — V-N4
+/// showed the idle copy on a connection-lost failure; the mapping layer
+/// now keeps them apart so the caller can display each honestly (W1 owns
+/// the engine-side truth).
 ///
 /// Copy follows 审核 §4.3's 失败与恢复 table (five situations + the
 /// unknown fallback 「出了点问题」) and §4.5 (对方 not 对端, actions as
@@ -51,12 +53,13 @@ enum TransferErrorKind {
   directUnavailable,
 
   /// 传输中断 — the connection broke (connection lost / stream failed /
-  /// peer vanished …). Resume from the checkpoint on re-send.
+  /// peer vanished / an op-level `idle timeout: no frame …` …). Resume
+  /// from the checkpoint on re-send.
   interrupted,
 
-  /// 配对闲置过久 — the engine's idle budget expired (`idle_expired`,
-  /// `idle timeout`). A LOCAL time-driven terminal, distinct from
-  /// [interrupted].
+  /// 配对闲置过久 — the engine's pairing idle budget expired (the
+  /// `idle_expired` event reason). A LOCAL time-driven terminal, distinct
+  /// from [interrupted].
   idleExpired,
 
   /// 对方拒绝 — the receiving user declined (DECLINED semantics).
@@ -197,8 +200,11 @@ TransferErrorView viewForKind(
     TransferErrorKind.unknown => (
           unknownErrorTitle,
           '出现了意料之外的错误。',
+          // diagnosticsExport: restarting would CLEAR the in-process
+          // diagnostics buffer the user is trying to export — point at
+          // 「详情」+copy instead of a restart.
           scene == TransferErrorScene.diagnosticsExport
-              ? '请重试；仍然失败时请重启应用。'
+              ? '请再试一次。如果仍无法导出，请展开「详情」并复制错误信息。'
               : unknownErrorSuggestion,
         ),
   };
@@ -233,10 +239,13 @@ TransferErrorKind classifyTransferError(Object error) {
     // message vocabulary (unknown task code says it better).
   }
   // Idle expiry FIRST: it must never be swallowed by the interruption
-  // vocabulary (V-N4) — `idle_expired` (event reason), `idle timeout`
-  // (EngineError::IdleTimeout), the J2 UI copy.
+  // vocabulary (V-N4) — `idle_expired` (the pairing-idle event reason)
+  // and the J2 UI copy. NOTE: `idle timeout: no frame …`
+  // (EngineError::IdleTimeout, an op-level idle timeout) is NOT here —
+  // during a send/receive op it means the transfer stopped carrying
+  // frames, so it belongs to the interruption vocabulary below; the
+  // pairing idle budget ends with the `idle_expired` event instead.
   if (text.contains('idle_expired') ||
-      text.contains('idle timeout') ||
       text.contains('配对已闲置')) {
     return TransferErrorKind.idleExpired;
   }
@@ -273,6 +282,10 @@ TransferErrorKind classifyTransferError(Object error) {
       text.contains('broken pipe') ||
       text.contains('stream failed') ||
       text.contains('peer vanished') ||
+      // An op-level idle timeout (`idle timeout: no frame within 10s …`):
+      // no frames flowing means the transfer was interrupted — in the
+      // pairing scene the interrupted copy still says 请重新配对.
+      text.contains('idle timeout') ||
       text.contains('连接已断开') ||
       text.contains('接收已中断') ||
       text.contains('连接中断') ||

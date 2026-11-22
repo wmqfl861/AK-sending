@@ -293,4 +293,23 @@ cd flutter_app/packages/ak_ffi_dart && dart test && cd ../../..
 | 裁决一/二追改（Dart，本批追加提交） | 子代理执行 | `transfer_errors.dart` 把 `idle timeout` 从 idleExpired 词表移入 interrupted 词表（发送 op 的空闲超时是传输中断而非配对闲置；配对闲置的真实引擎信号 `idle_expired` 仍归 idleExpired 不丢）——发送场景下 `idle timeout: no frame within 10s` 现映射为"传输中断了/重新发送，会从断点续传"；诊断导出兜底建议改为定稿文案"请再试一次。如果仍无法导出，请展开「详情」并复制错误信息。"（重启会清空进程内诊断缓冲）。被改断言三处（分类表 idle timeout 行、导出兜底建议行、错误卡 widget 的"重启应用"行）旧新对照见测试文件；flutter analyze 零告警、flutter test 276/276（基线 275+新增 1） |
 | W8 归档 | — | **整项不做**，原因：W0–W7 与走查已占满本批，归档需要移动几十份文档并修复全部断链，风险与收益不成比例；留给下一批（交接允许"做不完就整项不做"） |
 | W9 全量门槛与回归 | 本地 Windows（rustc 1.99.1）+ 模拟器 | fmt/clippy/rustdoc/workspace（69 组，1233/0/11，较批次 V 多出的两项为 W1 新增 Rust 测试）/sqlite（54/0）/server-persistence（221/0）/Python（375 OK）/repo/contracts（5/5 PASS）/部署自检/跨NAT自检全部通过；`flutter analyze` No issues；`flutter test` **275/275 全过**（W3/W7/W1 共新增 22 项；套件脚本首跑因工作目录笔误报 "Test directory not found"，改在 flutter_app 下重跑通过，如实记录）；`dart test`（ak_ffi_dart）170/170；`build_android_ffi.sh` 重建后 x86_64 一行原样：`==> x86_64    libak_ffi.so     9699384 bytes  sha256 7b490a7f48d6cf88d3fb4d6b5ea7baa3a00aeac9b7f3b9f7f846422e8a1f5951`；T1 回归（8 MiB，模拟器）在新库上通过：指纹 12467c19，三文件 SHA-256 相等（a37b426c/5abef6f0/4e7267fd），`All tests passed!` |
-| W 批次最终 CI | `18b1ecc` run [44958103587](https://github.com/wmqfl861/AK-sending/actions/runs/44958103587) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
+| W 批次主体提交 `18b1ecc` 的 CI（不是最终提交，最终提交 `f581ebd` 的 CI 见 §9） | `18b1ecc` run [44958103587](https://github.com/wmqfl861/AK-sending/actions/runs/44958103587) | **completed success**（12 项常规任务 success，2 项手动深测 skipped） |
+
+## 9. 复核方证据（2026-11-22）
+
+由复核方（Claude）填写。复核方的环境只有 Python 3、git 与 gh，没有 Rust 1.99.1、Flutter、Dart：Rust 与 Flutter 的结论来自 CI 与上面 §8，代码结论来自阅读，下表分开标注。路径只写正斜杠或占位符。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 复核分支 | 远端 `dev/batch-w-20261122` 的 `f581ebd`（执行方最终提交） | 本地从 `f581ebd` 切出复核分支；复核方的提交是 `da70e5f`、`38a6f46` 和随后的文档提交，只推 `dev/batch-w-20261122`，不强推 |
+| W0 的先后顺序（仓库活动记录） | GitHub 仓库活动接口 | main 在 2026-11-21 17:47 UTC 快进到 `7afa291`，`dev/batch-v-20261121` 在 17:55 UTC 删除，先合入后删除，与 §8 一致；`dev/batch-w-20261122` 在 22:42 UTC 创建，首次推送的头是 `18b1ecc` |
+| 执行方三次 CI（逐个用接口核对任务清单） | `18b1ecc` run [44958103587](https://github.com/wmqfl861/AK-sending/actions/runs/44958103587)、`25fb606` run [44959263712](https://github.com/wmqfl861/AK-sending/actions/runs/44959263712)、`f581ebd` run [44968474490](https://github.com/wmqfl861/AK-sending/actions/runs/44968474490) | 三次都是 completed，14 个任务里 12 个 success、2 个手动深测 skipped。§8 最后一行原先标成“W 批次最终 CI”，引用的是 `18b1ecc` 的那次，复核方已改标签；最终提交 `f581ebd` 的 CI 是第三次 |
+| 复核方提交的 CI | `38a6f46`（含 `da70e5f`）run [44975726077](https://github.com/wmqfl861/AK-sending/actions/runs/44975726077) | completed success：14 个任务里 12 个 success、2 个手动深测 skipped，以接口逐个核对；Flutter 门槛任务（还原后的全部 Flutter 测试）、仓库检查任务（含新增的路径分隔符检查与两条单元测试）、两个平台的 Rust 任务都在其中。这是 W-N1 还原与 W-N6 检查的自动验证，没有真机走查 |
+| 契约检查（复核方本机，Python 3） | 复核方本机，本文所在提交的工作区 | `python3 scripts/check_contracts.py`：`RESULT: 5/5 checks PASS`，退出码 0 |
+| 仓库检查（复核方本机，Python 3） | 同上 | `python3 scripts/check_repository.py`：写完本节之后再跑的一次 `errors: []` |
+| Python 全套单元测试（复核方本机） | 与 CI 相同的 discover 命令，目录 scripts/tests | `Ran 377 tests in 124.928s`，`OK`，退出码 0；§8 记的是 375 条，差的 2 条是复核方给“路径分隔符被吃掉”检查新增的两条单元测试 |
+| 代码阅读：W-N1 的根因 | 复核方本机，只读 | `crates/ak-ffi/src/task/join_send.rs` 的 `run_join`：角色顺序是 join spec 的 `role`、本引擎码缓存里创建方角色取对侧、缺省 `Receiver`；`crates/ak-ffi/src/task.rs` 的模块说明与 `ops.rs` 对 `role` 的解析（缺省为不带 hint）与之一致。这是阅读结论，复核方没有运行 Rust |
+| W-N1 修复的验证边界 | `da70e5f` | 只经 CI（Flutter 门槛任务通过）；**没有真机走查，没有跨设备验证**；批次 X 的 X1 补 |
+| 外部裁决追改的阅读 | `f581ebd` | `post_connect_verdict` 的双匹配、`idle timeout` 归入 interrupted 词表、诊断导出兜底文案三处都读过，成立；CLI 侧单属性匹配（W-N5）与文案问题（W-N3、W-N4、W-N8）见 W 复核 §2 |
+| 复核方没有做的事 | — | 没有重跑执行方的走查与性能测量（模拟器与 Windows 机器不在复核方环境）；§8 里放在 /tmp 的原始证据复核方看不到，结论只信 §8 原样贴出的关键行；没有运行 Rust、Flutter、Dart |
+| main 快进 | 本文所在的最终文档提交 | 复核方在该提交的 CI 全绿后快进 main；该提交的运行编号由执行方在 X0 回填到 X 交接 §8，不写在本行，避免本行成为新的提交 |

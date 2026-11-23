@@ -6,7 +6,8 @@
 /// there in three attempts), while engine events keep arriving on the
 /// Dart isolate — observing them is the point of this experiment.
 ///
-/// Orchestration (host side /tmp/ak-x/wn11.sh): screen stays awake until
+/// Orchestration (host side: the orchestration scripts live outside the
+/// repo — placeholder `<host-script-dir>/wn11.sh`): screen stays awake until
 /// this test's code file appears, then the host sets a 30 s sleep, waits
 /// for `mWakefulness=Asleep`, and joins ~60 s later with
 /// `ak-cli task join-recv` (the code's COMPLEMENT — a same-direction
@@ -95,9 +96,11 @@ void main() {
     }
     w.closeSync();
 
-    // The host hand-off file (app→host contract; machine form, u2 dir).
-    Directory('${support.path}/u2_lifecycle').createSync(recursive: true);
-    final codePath = File('${support.path}/u2_lifecycle/task_code.txt');
+    // The host hand-off file (app→host contract; machine form). P2-C
+    // (third review): a ROUND-UNIQUE path — the shared u2_lifecycle dir
+    // let a stale script from another round race this file.
+    Directory('${support.path}/wn11_round').createSync(recursive: true);
+    final codePath = File('${support.path}/wn11_round/task_code.txt');
 
     final conns = <String, TaskConnection>{};
     final sub = service.connections.listen((rows) {
@@ -152,7 +155,13 @@ void main() {
           'within the budget (screen slept through the wait — the pairing '
           'died with the paused/frozen app, or the host join failed)');
       sub.cancel();
-      return;
+      // P2-C (third review): a no-pairing round is a FAILED round — the
+      // W-N11 verdict is exactly what this runner exists to observe, so
+      // returning normally (a green exit) lied about the outcome.
+      fail('W-N11: no pairing landed within the budget — the round FAILED. '
+          'Either the screen-off killed the pairing (the bug this runner '
+          'guards against), or the host join never completed. See the '
+          'WN11|RESULT line above for the detail.');
     }
     _log('PAIRED|$pairedState|conn(8)=${connId.substring(0, 8)}');
 
@@ -162,6 +171,10 @@ void main() {
       _log('SEND|done|summary=$summary');
     } on Object catch (e) {
       _log('SEND|failed|$e');
+      sub.cancel();
+      // P2-C: the send was the point of the paired connection — a throw
+      // on a PAIRED connection fails the round, never a green exit.
+      fail('W-N11: the send threw on a PAIRED connection: $e');
     }
     sub.cancel();
     try {

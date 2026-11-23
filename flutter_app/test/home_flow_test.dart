@@ -27,6 +27,12 @@
 /// * P1-2: a failed create retries with the direction it declared (a
 ///   接收-create retry never becomes a send-create), and the PRODUCTION
 ///   pick gateway really offers a whole folder after the file pick.
+///
+/// Third-review fixes — pinned by the tests named `P1-A:` below: a
+/// picker left open across a flow reset (取消配对) or another entry's
+/// flow beginning is discarded by the flow-generation guard — its
+/// selection never lands in the NEXT flow's state (B's auto-send would
+/// otherwise carry A's files over B's connection).
 library;
 
 import 'dart:async' show Completer, StreamController, StreamSubscription;
@@ -855,6 +861,97 @@ void main() {
     await pumpEvents(tester);
     expect(find.textContaining('已选：1 项'), findsOneWidget,
         reason: '更改结果不丢：重试后的码卡片带新选择');
+  });
+
+  testWidgets('P1-A: the change pick returning after the flow reset is '
+      'DISCARDED — the next flow\'s auto-send carries only ITS OWN '
+      'selection', (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+
+    // Flow A: pick files, the sender code card waits for its peer.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    expect(find.textContaining('已选：2 项'), findsOneWidget);
+
+    // The 更改 pick opens and STAYS open (the system picker is up).
+    await tester
+        .tap(find.byKey(const ValueKey('flow_change_selection_button')));
+    await tester.pump();
+
+    // The user navigates back while the picker is up: 取消配对 resets flow
+    // A (the generation moves on).
+    await tester.tap(find.byKey(const ValueKey('flow_cancel_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('home_send_button')), findsOneWidget,
+        reason: '前置：流 A 已复位，回到主入口');
+
+    // Flow B starts while A's picker is still open: two picks in flight.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+    expect(gateway.openPicks, 2, reason: '前置：A 的更改选择器仍开着，B 的初选又开了');
+
+    // A's stale picker returns first (A's files): the generation moved on
+    // — the result must die here, never reach the pending selection.
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    // B's pick returns: ITS selection is the one the flow carries.
+    gateway.answer(_replacement);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.textContaining('已选：1 项'), findsOneWidget,
+        reason: 'P1-A：B 的流携带 B 自己的选择');
+
+    // B's pairing completes: the auto-send carries B's paths — never A's
+    // files over B's connection.
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(connId);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(fake.sendFilesCalls, 1, reason: 'B 的自动发送恰一次');
+    expect(fake.sendRequests.single.$2, [_replacement.single.path],
+        reason: 'P1-A：绝不用 A 流的文件发送');
+  });
+
+  testWidgets('P1-A: the send pick returning after ANOTHER flow began is '
+      'DISCARDED — it mints no code and leaves that flow untouched',
+      (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+
+    // The send main path's pick opens and STAYS open.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+
+    // The user moves on: 生成接收码 starts another flow (the generation
+    // moves on behind the picker).
+    await tester.tap(
+        find.byKey(const ValueKey('home_receive_create_code_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget,
+        reason: '前置：接收码流程已在等待');
+
+    // The abandoned send pick returns with a real selection: the
+    // generation moved on — nothing is minted with it.
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(fake.createCodeCalls, 1, reason: 'P1-A：作废的选择不再生码');
+    expect(fake.createdCodes.single.role, TaskRole.receive,
+        reason: '生码的只有接收流程');
+    expect(find.textContaining('已选：'), findsNothing,
+        reason: '接收码卡片不显示作废选择的摘要');
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget,
+        reason: '接收流程不受作废选择干扰');
   });
 
   testWidgets('P1-1(c): the detail page\'s automatic send fires ONLY on a '

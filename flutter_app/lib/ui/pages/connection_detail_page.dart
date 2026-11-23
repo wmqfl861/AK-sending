@@ -646,6 +646,19 @@ class _SendCard extends StatelessWidget {
                 icon: const Icon(Icons.library_add_check),
                 label: const Text('选择文件发送'),
               ),
+            // P2-B (third review): paired and WAITING for the file
+            // selection is a keep-foreground stage too (the pairing dies
+            // with a backgrounded process — the W-N11 reproduction).
+            // Android-only, the W7.3 copy adapted per stage; a picked
+            // review list or a running send shows its own state instead.
+            if (live && picked.isEmpty)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: KeepForegroundHint(
+                  keyName: 'conn_pick_keep_foreground',
+                  text: '等待选择文件期间请保持本应用在前台',
+                ),
+              ),
             if (picked.isNotEmpty) ...[
               const SizedBox(height: 12),
               Row(

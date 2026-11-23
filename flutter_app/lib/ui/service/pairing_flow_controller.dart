@@ -113,6 +113,17 @@ class PairingFlowController extends ChangeNotifier {
   /// to eliminate). Null outside a create flow.
   TaskRole? createRole;
 
+  /// P1-A (third review): the monotonically increasing FLOW generation —
+  /// bumped on EVERY [_begin] (each [startCreate]/[startJoin]/[reset]: a
+  /// cancel, a 返回, or another entry's flow beginning). The home layer
+  /// captures it before an async picker round-trip and discards the
+  /// result when it has moved on, so a picker left open across a reset
+  /// can never write its selection into the NEXT flow's state (B's
+  /// auto-send would carry A's files over B's connection).
+  int get generation => _generation;
+
+  int _generation = 0;
+
   /// The connection id a join flow waits for (from [JoinResult]).
   String? _expectedConnectionId;
 
@@ -229,6 +240,7 @@ class PairingFlowController extends ChangeNotifier {
   }
 
   void _begin({required PairingFlowKind? kind, PairingFlowPhase? phase}) {
+    _generation++; // P1-A: every begin/reset invalidates in-flight picks
     this.kind = kind;
     this.phase = phase;
     code = null;

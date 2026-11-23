@@ -847,9 +847,17 @@ final class SimpleTransferService {
   /// keeper dies with the paused process and the code becomes
   /// unredeemable (`unknown task code ... owner offline`) — reproduced
   /// 2026-11-23, X handoff §8 W-N11 row. Cleared when the code pairs
-  /// (its connection arrives), is cancelled/revoked, or the service
-  /// tears down.
-  final Set<String> _awaitedCodes = <String>{};
+  /// (its connection arrives), is cancelled/revoked, EXPIRES engine-side
+  /// (P1-B, third review: [code id] → the expiry deadline — a code
+  /// nobody joins dies at its TTL and must not keep the screen lit for
+  /// a pairing that can no longer happen), or the service tears down.
+  final Map<String, DateTime> _awaitedCodes = <String, DateTime>{};
+
+  /// P1-B: the fallback wait budget of an awaited code whose create
+  /// result carried no usable `expires_ms` — the engine's task-code TTL
+  /// default (`TASK_CODE_TTL_SECS`, crates/ak-session/src/pairing/
+  /// task.rs: 600 s).
+  static const Duration _awaitedCodeFallbackTtl = Duration(seconds: 600);
 
   /// W7.3: the last value fanned out on [transferActivity].
   bool _transferActivityOn = false;
@@ -1033,8 +1041,13 @@ final class SimpleTransferService {
       if (codeId != null && codeId.isNotEmpty) {
         _codeIdOfKey[_codeKey(code)] = codeId;
         // W-N11: the created code now WAITS for its peer — the
-        // keep-awake gate must hold through that wait.
-        if (_awaitedCodes.add(codeId)) {
+        // keep-awake gate must hold through that wait, no longer than it
+        // (P1-B: the deadline is the engine's `expires_ms` epoch-ms fact
+        // when the create result carries one, else created-at + the
+        // engine's default task-code TTL).
+        final fresh = !_awaitedCodes.containsKey(codeId);
+        _awaitedCodes[codeId] = _awaitedCodeDeadline(result['expires_ms']);
+        if (fresh) {
           _emitTransferActivity();
         }
       }
@@ -1153,7 +1166,7 @@ final class SimpleTransferService {
     // W-N11: revoking an UN-JOINED code ends its wait (the engine's
     // `code_cancelled` event would do the same; the op result is the
     // deterministic moment).
-    if (_awaitedCodes.remove(connId)) {
+    if (_awaitedCodes.remove(connId) != null) {
       _emitTransferActivity();
     }
     try {
@@ -1460,13 +1473,49 @@ final class SimpleTransferService {
     }
   }
 
+  /// P1-B (third review): the expiry deadline of one awaited code. The
+  /// engine's own verdict is the create result's `expires_ms` (epoch ms;
+  /// the task create always carries the effective TTL) — absent, zero or
+  /// malformed falls back to created-at + the engine's default task-code
+  /// TTL (see [_awaitedCodeFallbackTtl]).
+  DateTime _awaitedCodeDeadline(Object? expiresMs) {
+    final ms = expiresMs;
+    if (ms is int && ms > 0) {
+      return DateTime.fromMillisecondsSinceEpoch(ms);
+    }
+    return _clock().add(_awaitedCodeFallbackTtl);
+  }
+
+  /// P1-B: drop every awaited code whose deadline has passed. A code
+  /// nobody joined EXPIRES engine-side at its TTL (the join then answers
+  /// `unknown task code`), but nothing else removes the wait — without
+  /// this purge the keep-awake gate would hold the screen lit forever
+  /// for a pairing that can no longer happen. Returns whether anything
+  /// was purged (the caller re-evaluates the activity edge).
+  bool _purgeExpiredAwaitedCodes() {
+    if (_awaitedCodes.isEmpty) {
+      return false;
+    }
+    final now = _clock();
+    final expired = <String>[
+      for (final entry in _awaitedCodes.entries)
+        if (!entry.value.isAfter(now)) entry.key,
+    ];
+    for (final codeId in expired) {
+      _awaitedCodes.remove(codeId);
+    }
+    return expired.isNotEmpty;
+  }
+
   /// W7.3 (W-N11 extended, 2026-11-23): fan out the "task activity" edge
   /// transitions — a transfer in progress, OR a created-but-unpaired code
   /// waiting for its peer, OR any live (non-terminal) connection (the
   /// paired-but-picking wait). All three are stages where a screen-off
   /// kills the pairing (the registry keeper dies with the paused
-  /// process — the W-N11 reproduction).
+  /// process — the W-N11 reproduction). P1-B: an awaited code whose TTL
+  /// has passed stops counting first (see [_purgeExpiredAwaitedCodes]).
   void _emitTransferActivity() {
+    _purgeExpiredAwaitedCodes();
     final active = _inProgressTransfers.isNotEmpty ||
         _awaitedCodes.isNotEmpty ||
         _connections.values.any((row) => _stateRank(row.state) < 2);
@@ -1961,10 +2010,15 @@ final class SimpleTransferService {
   /// re-arms at the new interval, so activity starts/stops take effect
   /// IMMEDIATELY instead of waiting out the previous (possibly slow)
   /// tick. Also the pause point: backgrounded with no activity disarms
-  /// the pump entirely.
+  /// the pump entirely. P1-B: expired awaited codes purge here too (the
+  /// pump re-arms through this path on every tick) — a TTL-ed-out code
+  /// releases the keep-awake gate without any engine event.
   void _syncPump() {
     if (_disposed || _engineFailed || _runtime == null) {
       return;
+    }
+    if (_purgeExpiredAwaitedCodes()) {
+      _emitTransferActivity(); // the purge moved the gate — emit its edge
     }
     if (_appBackgrounded && !hasActivity) {
       _haltPump(); // hidden and quiet: no wake-ups at all
@@ -2424,7 +2478,7 @@ final class SimpleTransferService {
       // W-N11: the engine revoked an un-joined code (creator disconnect,
       // or teardown's bounded revocation sweep) — its wait is over.
       final codeId = event.fields['code_id'];
-      if (codeId is String && _awaitedCodes.remove(codeId)) {
+      if (codeId is String && _awaitedCodes.remove(codeId) != null) {
         _emitTransferActivity();
       }
       return;
@@ -2452,7 +2506,7 @@ final class SimpleTransferService {
         _codeIdOfKey[_codeKey(code)] = codeId;
         // W-N11: the code PAIRED — the wait is over (the gate stays held
         // by the now-live connection until the pairing ends).
-        if (_awaitedCodes.remove(codeId)) {
+        if (_awaitedCodes.remove(codeId) != null) {
           _emitTransferActivity();
         }
       }

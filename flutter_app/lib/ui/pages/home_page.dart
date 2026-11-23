@@ -45,6 +45,7 @@ import '../service/transfer_format.dart';
 import '../service/transfer_history.dart';
 import '../theme.dart';
 import '../widgets/engine_error_card.dart';
+import '../widgets/keep_foreground_hint.dart';
 import '../widgets/task_connection_views.dart';
 import '../widgets/transfer_error_card.dart';
 import 'connection_detail_page.dart';
@@ -101,13 +102,19 @@ class _HomePageState extends State<HomePage> {
   /// connection never pushes twice).
   String? _autoOpenedConnectionId;
 
-  /// X4 P1-1 (codex review): true while the code card's 更改 pick is in
+  /// X4 P1-1 (codex review): how many 更改 picks are currently in
   /// flight. The automatic-send handover is DEFERRED meanwhile — the
   /// connection completing behind the system picker must not hand over
   /// the OLD pending entries. [_changeSelection] runs it when the pick
   /// returns, with the selection the user ended up with: the NEW one, or
   /// the kept one after a cancelled change.
-  bool _changingSelection = false;
+  ///
+  /// P1-A (third review): a COUNTER, not a bool — the flow-generation
+  /// guard makes two concurrent picks reachable (a stale flow's picker
+  /// still open when another flow's own 更改 opens), and the first
+  /// returning pick must not un-defer the handover while the second is
+  /// still in flight.
+  int _picksInFlight = 0;
 
   @override
   void initState() {
@@ -194,7 +201,7 @@ class _HomePageState extends State<HomePage> {
     if (connection != null &&
         connection.role == TaskRole.send &&
         _autoOpenedConnectionId != connection.id &&
-        !_changingSelection) {
+        _picksInFlight == 0) {
       final pending = _pendingEntries;
       final established = _flow.phase == PairingFlowPhase.success ||
           // X4: paired-but-unreachable counts as established for the
@@ -238,10 +245,20 @@ class _HomePageState extends State<HomePage> {
   /// X4 发送文件主路径: pick the files FIRST (multi-select); only a
   /// non-empty selection mints the (sender-role) code. A cancelled pick
   /// (empty list) creates nothing — the home actions stay.
+  ///
+  /// P1-A (third review): the pick must land in the flow generation it
+  /// started under. A create/join beginning while the picker is open (the
+  /// user tapped another entry, or an earlier flow's stale pick returned)
+  /// bumps [PairingFlowController.generation] — this selection is then
+  /// discarded instead of minting a code the user already moved past.
   Future<void> _startSendFlow() async {
+    final generation = _flow.generation;
     final entries = await widget.picker.pickFiles();
     if (!mounted || entries.isEmpty) {
       return; // cancelled: no code
+    }
+    if (_flow.generation != generation) {
+      return; // the flow moved on behind the picker — no code of ours
     }
     setState(() => _pendingEntries = entries);
     await _flow.startCreate(TaskRole.send);
@@ -259,12 +276,18 @@ class _HomePageState extends State<HomePage> {
   /// * the pick returns FIRST — the selection is replaced (or kept) here
   ///   and the later completion hands over that selection as usual;
   /// * the completion lands between the tap's pointer-down and
-  ///   pointer-up — the handover has already taken the selection when the
-  ///   tap fires, so the tap starts no pick at all (the guard below;
-  ///   whichever of the two the app processes first wins).
+  /// pointer-up — the handover has already taken the selection when the
+  /// tap fires, so the tap starts no pick at all (the guard below;
+  /// whichever of the two the app processes first wins).
   ///
-  /// Only one pick can be in flight at a time (the system picker is
-  /// modal), so the flag needs no counter.
+  /// P1-A (third review): the pick belongs to the flow generation that
+  /// owns the pending selection RIGHT NOW — remembered before the await,
+  /// verified after. A 返回 (reset) or another flow's `_begin` while the
+  /// picker is open moves [PairingFlowController.generation], and the
+  /// result is DISCARDED: it must never land in the next flow's state
+  /// (B's auto-send would carry A's files over B's connection). The
+  /// handover count still drops in the `finally`, and a handover the
+  /// open pick deferred for the CURRENT flow flushes either way.
   Future<void> _changeSelection() async {
     if (_pendingEntries == null) {
       // Nothing left to change: the selection was already handed over
@@ -272,18 +295,25 @@ class _HomePageState extends State<HomePage> {
       // ended — either way it now belongs to someone else.
       return;
     }
-    _changingSelection = true;
+    final generation = _flow.generation;
+    _picksInFlight += 1;
     List<PickedEntry> entries = const <PickedEntry>[];
     try {
       entries = await widget.picker.pickFiles();
     } finally {
       // Settles on BOTH outcomes — a result, or a picker error — so a
-      // deferred handover is never stranded behind a stuck flag. An error
-      // keeps the last selection like a cancelled change, then propagates
-      // exactly as it did before this change.
-      _changingSelection = false;
+      // deferred handover is never stranded behind a stuck count. An
+      // error keeps the last selection like a cancelled change, then
+      // propagates exactly as it did before this change.
+      _picksInFlight -= 1;
       if (mounted) {
-        _settleSelectionChange(entries);
+        if (_flow.generation == generation) {
+          _settleSelectionChange(entries);
+        } else {
+          // A stale flow's pick: the result dies here — but the handover
+          // check re-runs for whoever owns the pending selection now.
+          _onFlowChanged();
+        }
       }
     }
   }
@@ -786,6 +816,15 @@ class _CodeShownView extends StatelessWidget {
               ),
             ),
           ],
+        ),
+        // P2-B (third review): the peer-join wait is a keep-foreground
+        // stage too (a backgrounded process kills the registry keeper —
+        // the W-N11 reproduction; W-N11 extended keep-awake, the hint
+        // family follows). Android-only, W7.3 copy adapted per stage.
+        const SizedBox(height: 6),
+        const KeepForegroundHint(
+          keyName: 'flow_waiting_keep_foreground',
+          text: '等待对方加入期间请保持本应用在前台',
         ),
         const SizedBox(height: 12),
         Align(

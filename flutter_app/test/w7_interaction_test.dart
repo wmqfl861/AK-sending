@@ -11,7 +11,10 @@
 ///   create-send main path preselects its files and auto-SENDS instead
 ///   (covered by home_flow_test);
 /// * W7.3 — Android-only 「传输期间请保持本应用在前台」 hint on the
-///   running-transfer cards (injected [UiPlatform], no channel).
+///   running-transfer cards (injected [UiPlatform], no channel);
+/// * P2-B (third review) — the same hint family on the WAITING stages:
+///   the code card's peer-join wait and the detail page's file-selection
+///   wait, each with stage-adapted copy, Android-only like W7.3.
 library;
 
 import 'package:flutter/material.dart';
@@ -234,5 +237,83 @@ void main() {
     expect(find.byKey(const ValueKey('conn_send_keep_foreground')),
         findsOneWidget,
         reason: '发送进度区在 Android 上显示前台提示');
+  });
+
+  testWidgets('P2-B: the WAITING stages carry the Android hint too — the '
+      'code card\'s peer-join wait and the detail page\'s pick wait',
+      (tester) async {
+    UiPlatform.androidOverride = true;
+    addTearDown(() => UiPlatform.androidOverride = null);
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+    addTearDown(fake.dispose);
+
+    // Waiting stage 1 — the create flow's peer-join wait on the code card.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_waiting')), findsOneWidget,
+        reason: '前置：码卡片在等待对方加入');
+    expect(find.text('等待对方加入期间请保持本应用在前台'), findsOneWidget,
+        reason: 'Android 等待加入期间显示前台提示（P2-B）');
+    expect(find.text('传输期间请保持本应用在前台'), findsNothing,
+        reason: '等待阶段不是传输中：W7.3 原文案不出现');
+
+    // Waiting stage 2 — the paired detail page waiting for the file
+    // selection (before any send starts).
+    await fake.createCode(TaskRole.send);
+    final id = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(id);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.tap(find.byKey(ValueKey('conn_card_name_$id')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.text('等待选择文件期间请保持本应用在前台'), findsOneWidget,
+        reason: 'Android 等待选择文件期间显示前台提示（P2-B）');
+
+    // Files picked: the pick-wait hint leaves with the stage (the review
+    // list shows instead; the running-transfer hint still waits for a
+    // real send).
+    await tester.tap(find.byKey(const ValueKey('conn_pick_files_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('pick_files_option')));
+    await tester.pump();
+    expect(find.text('等待选择文件期间请保持本应用在前台'), findsNothing,
+        reason: '已选文件后不再是选择等待阶段');
+    expect(find.text('传输期间请保持本应用在前台'), findsNothing,
+        reason: '尚未发送：W7.3 的传输中提示也不出现');
+  });
+
+  testWidgets('P2-B: the waiting-stage hints stay off on other platforms',
+      (tester) async {
+    UiPlatform.androidOverride = false;
+    addTearDown(() => UiPlatform.androidOverride = null);
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+    addTearDown(fake.dispose);
+
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_waiting')), findsOneWidget,
+        reason: '前置：等待卡片在场');
+    expect(find.byKey(const ValueKey('flow_waiting_keep_foreground')),
+        findsNothing, reason: '非 Android：等待加入不提示');
+
+    await fake.createCode(TaskRole.send);
+    final id = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(id);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.tap(find.byKey(ValueKey('conn_card_name_$id')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget);
+    expect(find.byKey(const ValueKey('conn_pick_keep_foreground')),
+        findsNothing, reason: '非 Android：等待选择文件不提示');
   });
 }

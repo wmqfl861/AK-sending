@@ -76,6 +76,7 @@ library;
 
 import 'dart:async'
     show FutureOr, Stream, StreamSubscription, TimeoutException;
+import 'dart:convert' show utf8;
 import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart' show MethodChannel;
@@ -198,6 +199,13 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   /// X5 P1-3: resolves this device's self-reported name when [start]
   /// carries none — injectable so tests stay off the platform channel.
   final FutureOr<String?> Function(bool isAndroid) _deviceNameResolver;
+
+  /// P2-A (third review): the budget of the Android device-name
+  /// resolution — a channel round-trip against a dead platform thread
+  /// must not hang [start] forever; on timeout the engine's own default
+  /// name ('ak-task') stands.
+  static const Duration deviceNameResolveTimeout = Duration(seconds: 3);
+
   final task_engine.SimpleTransferService _engine;
 
   /// How often the accepted-receive stall loop wakes to check settled
@@ -252,10 +260,18 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     // DESKTOP answer resolves SYNCHRONOUSLY (see the resolver), so a
     // desktop start() still boots the engine in its synchronous prefix —
     // the fire-and-forget start pattern of the shell/tests keeps
-    // working; only the Android channel round-trip awaits.
+    // working; only the Android channel round-trip awaits. P2-A: that
+    // await carries a 3 s budget — a resolution that never completes
+    // (a dead platform thread) degrades to null instead of hanging
+    // start() forever. The `.then` re-types the future first: a
+    // resolver's concrete Future<String>/Future<Null> must not
+    // parametrize `timeout`'s T (the onTimeout answer is null, a String?).
     final resolved = deviceName ?? _deviceNameResolver(_isAndroidPlatform);
-    final String? selfName =
-        resolved is Future<String?> ? await resolved : resolved;
+    final String? selfName = resolved is Future<String?>
+        ? await resolved
+            .then<String?>((name) => name)
+            .timeout(deviceNameResolveTimeout, onTimeout: () => null)
+        : resolved;
     await _engine.start(
       registry: address,
       registryIdHex: pin,
@@ -646,17 +662,24 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   /// * Android: the existing `dev.ak/storage` channel's `deviceName`
   ///   method (MainActivity — `Build.MODEL`, `Build.MANUFACTURER`
   ///   fallback, trimmed; a host activity without the method — an old
-  ///   install — throws and degrades to null);
+  ///   install — throws and degrades to null). P2-A: the round-trip
+  ///   carries a 3 s budget — a dead platform thread degrades to null
+  ///   instead of hanging [start] forever.
   /// * every other platform: `Platform.localHostname` when non-empty and
   ///   not 'localhost' — answered SYNCHRONOUSLY (a plain getter), so a
   ///   desktop [start] keeps booting the engine in its synchronous
-  ///   prefix (the shell's fire-and-forget contract call);
-  /// * an over-long result is cut to 64 runes (the task-plane spec's
-  ///   `device_name` ceiling, `AkTaskStartSpec`) — display-only, never
-  ///   a fatal start.
+  ///   prefix (the shell's fire-and-forget contract call). P2-A: the
+  ///   getter can THROW on some hosts — its own try degrades to null
+  ///   instead of throwing out of [start].
+  /// * the result is validated against the ENGINE's wire rules (see
+  ///   [_presentableDeviceName]) — display-only, never a fatal start.
   static FutureOr<String?> resolvePlatformDeviceName(bool isAndroid) {
     if (!isAndroid) {
-      return _presentableDeviceName(Platform.localHostname);
+      try {
+        return _presentableDeviceName(Platform.localHostname);
+      } on Object {
+        return null; // localHostname failure — engine default
+      }
     }
     return _androidDeviceName();
   }
@@ -665,21 +688,57 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     try {
       return _presentableDeviceName(await const MethodChannel(
               storageChannelName)
-          .invokeMethod<String>('deviceName'));
+          .invokeMethod<String>('deviceName')
+          .timeout(deviceNameResolveTimeout, onTimeout: () => null));
     } on Object {
-      return null; // missing method / channel failure — engine default
+      return null; // missing method / channel failure / timeout — engine default
     }
   }
 
+  /// The wire-legal ceiling of a self-reported name (`device_name`): the
+  /// registry client's `check_display_name` (crates/ak-session/src/
+  /// pairing/client.rs — `MAX_NAME_BYTES`) — at most 64 UTF-8 BYTES and
+  /// NO C0 control, DEL or C1 byte — is enforced engine-side on create
+  /// AND join, so a name the engine would REJECT must never reach it
+  /// (P1-C, third review: a platform's raw name broke both flows).
+  ///
   /// Trims and validates the raw platform answer: empty/'localhost' →
-  /// null; over-long names are cut to the 64-rune spec ceiling.
+  /// null; any rejected control byte → null (the engine default stands
+  /// instead of a start-breaking name); an over-long name drops whole
+  /// trailing characters until its UTF-8 form fits the byte ceiling
+  /// (never a mid-rune cut); nothing presentable left → null.
+  static const int _deviceNameMaxBytes = 64;
+
   static String? _presentableDeviceName(String? raw) {
     final name = (raw ?? '').trim();
     if (name.isEmpty || name == 'localhost') {
       return null;
     }
-    final runes = name.runes;
-    return runes.length <= 64 ? name : String.fromCharCodes(runes.take(64));
+    final bytes = utf8.encode(name);
+    for (final byte in bytes) {
+      // The Rust side reads the same bytes: b < 0x20, DEL (0x7F), and
+      // the C1 range as UTF-8 continuation bytes (0x80..=0x9F) are all
+      // wire-illegal.
+      if (byte < 0x20 || byte == 0x7F || (byte >= 0x80 && byte <= 0x9F)) {
+        return null;
+      }
+    }
+    if (bytes.length <= _deviceNameMaxBytes) {
+      return name;
+    }
+    final kept = StringBuffer();
+    var budget = _deviceNameMaxBytes;
+    for (final rune in name.runes) {
+      final char = String.fromCharCode(rune);
+      final size = utf8.encode(char).length;
+      if (size > budget) {
+        break; // drop whole trailing characters — no mid-rune cut
+      }
+      budget -= size;
+      kept.write(char);
+    }
+    final cut = kept.toString();
+    return cut.isEmpty ? null : cut;
   }
 
   task_engine.SimpleTransferRole _engineRole(TaskRole role) =>

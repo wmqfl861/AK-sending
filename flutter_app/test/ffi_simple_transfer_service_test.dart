@@ -8,6 +8,7 @@ import 'dart:async' show Completer, Timer, TimeoutException;
 import 'dart:convert' show jsonDecode, jsonEncode, utf8;
 import 'dart:typed_data' show Uint8List;
 
+
 import 'package:ak_ffi_dart/ak_ffi_dart.dart'
     show AkStatus, AkTaskCalls, FakeAkTaskCalls;
 import 'package:flutter/services.dart' show MethodChannel;
@@ -235,8 +236,9 @@ void main() {
     service.dispose();
   });
 
-  test('P1-3: resolvePlatformDeviceName trims, refuses empty/localhost and '
-      'caps at the 64-rune spec ceiling', () async {
+  test('P1-C: resolvePlatformDeviceName mirrors the engine\'s wire rules '
+      '— trims, refuses empty/localhost, rejects the engine\'s control '
+      'bytes, and caps at 64 UTF-8 BYTES on whole characters', () async {
     const channel = MethodChannel('dev.ak/storage');
     Future<String?> ask(Object? answer) async {
       TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
@@ -253,11 +255,59 @@ void main() {
       }
     }
 
+    // Plain ASCII within the ceiling: trimmed, verbatim.
     expect(await ask('  Pixel 8 Pro '), 'Pixel 8 Pro');
+    expect(await ask('X' * 64), 'X' * 64, reason: '恰 64 字节：原样保留');
     expect(await ask(''), isNull);
     expect(await ask('  '), isNull);
-    expect((await ask('X' * 100))?.runes.length, 64,
-        reason: 'AkTaskStartSpec 的 device_name 至多 64 字符');
+
+    // Control bytes the Rust check_display_name REJECTS (crates/
+    // ak-session/src/pairing/client.rs): the name would fail the engine's
+    // create AND join — it is refused entirely and the engine default
+    // ('ak-task') stands.
+    expect(await ask('a\u{7}b'), isNull, reason: 'BEL 是引擎拒绝的 C0 控制符');
+    expect(await ask('ok\u{7F}'), isNull, reason: 'DEL（0x7F）被拒绝');
+    expect(await ask('a\u{85}b'), isNull, reason: 'C1 的 UTF-8 含 0x85 字节');
+    expect(await ask('\u{800}'), isNull,
+        reason: 'U+0800 编码的尾字节 0x80 落在引擎拒绝的字节区间（逐字节同判）');
+
+    // Over the ceiling: whole trailing characters drop (never a mid-rune
+    // cut) until the UTF-8 form fits 64 bytes.
+    final cjk = '设' * 40; // 40 × 3 = 120 bytes
+    final cjkCut = await ask(cjk);
+    expect(utf8.encode(cjkCut!).length, 63,
+        reason: '21 × 3 = 63 字节 ≤ 64 字节上限');
+    expect(cjkCut, '设' * 21, reason: '整字符截断，不切半个字符');
+    expect(await ask('X' * 100), 'X' * 64,
+        reason: '100 字节 ASCII 截到 64 字节');
+  });
+
+  testWidgets('P2-A: a device-name resolution that never completes cannot '
+      'hang start() — the 3 s budget degrades to the engine default name',
+      (tester) async {
+    final fake = FakeAkTaskCalls();
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      isAndroid: true,
+      androidIdentityDir: () async => '/data/user/0/dev.ak/.ak-sending',
+      deviceNameResolver: (_) => Completer<String?>().future,
+    );
+    final starting = service.start();
+    await tester.pump();
+    expect(fake.acceptedSpecs, isEmpty,
+        reason: '前置：start 停在永不完成的名字解析上');
+
+    await tester.pump(FfiSimpleTransferService.deviceNameResolveTimeout +
+        const Duration(milliseconds: 1));
+    await starting;
+    expect(fake.acceptedSpecs, hasLength(1), reason: 'P2-A：超时后 start 继续');
+    expect(fake.acceptedSpecs.single, isNot(contains('device_name')),
+        reason: '超时退回引擎默认名（ak-task），绝不悬挂 start');
+    service.dispose();
   });
 
   test('P1-3: the resume reconcile fills peerName/peerShortId from the '

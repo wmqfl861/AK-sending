@@ -1523,6 +1523,34 @@ void main() {
         reason: 'P1-H：msd: URI 不可发送——按取消选文件夹处理，整体空结果');
   });
 
+  testWidgets('P1-H (round 5): a /storage/msd/… FUSE path (the Android 11+ '
+      'Downloads provider\'s filesystem-SHAPED form) is excluded like the '
+      'bare URI', (tester) async {
+    var directoryPicks = 0;
+    List<PickedEntry>? picked;
+    final gateway = PluginFilePickGateway(
+      filePicker: () async => const <_PlatformFile>[],
+      directoryPicker: () async {
+        directoryPicks += 1;
+        return '/storage/msd/2184/Documents/相册';
+      },
+    );
+    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+
+    await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(
+        find.byKey(const ValueKey('folder_only_offer_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(directoryPicks, 1);
+    expect(picked, isNotNull);
+    expect(picked, isEmpty,
+        reason: 'P1-H：/storage/msd/ 形态同样不可发送——按取消处理');
+  });
+
   testWidgets('P1-H: a file list with one normal file and one msd: file '
       'returns ONLY the normal file', (tester) async {
     List<PickedEntry>? picked;

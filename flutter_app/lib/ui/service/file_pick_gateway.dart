@@ -13,6 +13,7 @@
 /// (handoff §4.4), yet the platform multi-file pick selects FILES only —
 /// only an injected fake could pick a folder.
 /// [PluginFilePickGateway.pickFiles] therefore follows every NON-EMPTY
+/// (and fully filesystem-pathed — see the provider-URI exclusions below)
 /// file pick with ONE optional app-side offer to add a whole folder:
 ///
 /// * 「添加文件夹」 runs the same single `getDirectoryPath()` as
@@ -134,9 +135,10 @@ class PluginFilePickGateway implements FilePickGateway {
           ),
     ];
     if (entries.isEmpty) {
-      // P1-H: the WHOLE selection was provider URIs — nothing sendable
-      // came back. The empty result is the honest answer; no folder
-      // offer follows (there was no real file selection to build on).
+      // P1-H: the WHOLE (platform-non-empty) selection was provider URIs —
+      // nothing sendable came back, so the pick returns the empty list
+      // DIRECTLY: the append offer never fires (there was no real file
+      // selection to build on) and the caller treats it as a cancel.
       return const <PickedEntry>[];
     }
     // X4 P1-2: ONE optional whole folder after a real selection.
@@ -181,6 +183,13 @@ class PluginFilePickGateway implements FilePickGateway {
   static bool _isFileSystemPath(String path) {
     final trimmed = path.trim();
     if (trimmed.isEmpty) {
+      return false;
+    }
+    // Review round 5: the Android 11+ Downloads provider ALSO surfaces its
+    // emulated subdirectories through the `/storage/msd/…` FUSE mount —
+    // filesystem-SHAPED but not sendable by the engine. Same exclusion as
+    // the bare provider URIs.
+    if (trimmed.startsWith('/storage/msd/')) {
       return false;
     }
     if (trimmed.startsWith('/') || trimmed.startsWith(r'\\')) {

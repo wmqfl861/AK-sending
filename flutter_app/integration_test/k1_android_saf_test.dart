@@ -100,10 +100,23 @@ void main() {
         .ensureVisible(find.byKey(const ValueKey('pick_files_option')));
     await tester.tap(find.byKey(const ValueKey('pick_files_option')));
     safEvidence('PICKER_OPENED|awaiting external DocumentsUI drive');
+    // P1-2 (codex X fix): the production gateway now offers ONE optional
+    // folder append INSIDE pickFiles() after a non-empty file pick — the
+    // selection (picked_count) only lands after the offer resolves, so
+    // decline it first to keep this walkthrough's single-file shape.
+    await safUntil(tester,
+        () => find.byKey(const ValueKey('folder_offer_decline_button'))
+            .evaluate()
+            .isNotEmpty,
+        'folder offer after the system pick',
+        seconds: 150);
+    await tester
+        .tap(find.byKey(const ValueKey('folder_offer_decline_button')));
+    safEvidence('FOLDER_OFFER_DECLINED');
     await safUntil(tester,
         () => safTextAt(tester, 'picked_count') == '已选 1 项',
         'external picker selection',
-        seconds: 150);
+        seconds: 30);
     safEvidence('PICKED|1 item|bytes=$safBytes');
 
     await tester.ensureVisible(find.byKey(const ValueKey('conn_send_button')));

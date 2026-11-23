@@ -5,9 +5,12 @@
 library;
 
 import 'dart:async' show Completer, Timer, TimeoutException;
+import 'dart:convert' show jsonDecode, jsonEncode, utf8;
 import 'dart:typed_data' show Uint8List;
 
-import 'package:ak_ffi_dart/ak_ffi_dart.dart' show AkTaskCalls, FakeAkTaskCalls;
+import 'package:ak_ffi_dart/ak_ffi_dart.dart'
+    show AkStatus, AkTaskCalls, FakeAkTaskCalls;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ak_sending_app/services/ffi_simple_transfer_service.dart';
@@ -89,7 +92,9 @@ void main() {
     expect(rows.first.id, joined.connectionId);
     expect(rows.first.role, TaskRole.receive);
     expect(rows.first.state, TaskConnectionState.connected);
-    expect(rows.first.peerName, isNotEmpty);
+    // X5 §4.5 item 5: a nameless (old-engine) row shows the mandated
+    // default 「对方的设备」, never a code-tail label.
+    expect(rows.first.peerName, '对方的设备');
 
     await service.disconnect(joined.connectionId!);
     service.engine.pumpEvents();
@@ -143,6 +148,175 @@ void main() {
     expect(requests.single.rootName, 'photos',
         reason: 'X5 修复：映射不再丢 rootName');
     expect(requests.single.peerName, 'phone-beta');
+    service.dispose();
+  });
+
+  test('X5 §4.5-5: a nameless (old-engine) row renders the mandated '
+      'default 「对方的设备」— never a code-tail label', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.send)).code;
+    await service.joinCode(code);
+    service.engine.pumpEvents(); // the fake's events carry NO peer name
+
+    final rows = await service.connections.first;
+    expect(rows.first.peerName, '对方的设备');
+    service.dispose();
+  });
+
+  test('P1-3 (codex X fix): start(deviceName:) forwards the self-reported '
+      'name into the ak_task_start spec', () async {
+    final fake = FakeAkTaskCalls();
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+    );
+    await service.start(deviceName: 'desk-alpha');
+    expect(
+        fake.acceptedSpecs.single, contains('"device_name":"desk-alpha"'));
+    service.dispose();
+  });
+
+  test('P1-3: a start() without a name resolves the platform default '
+      '(the frozen contract call) and forwards it; a null resolution keeps '
+      'the engine default (no device_name key)', () async {
+    var sawAndroid = false;
+    final namedFake = FakeAkTaskCalls();
+    final named = FfiSimpleTransferService(
+      calls: namedFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      deviceNameResolver: (isAndroid) async {
+        sawAndroid = isAndroid;
+        return 'resolved-host';
+      },
+    );
+    await named.start();
+    expect(sawAndroid, isFalse, reason: '桌面测试环境的平台分支');
+    expect(namedFake.acceptedSpecs.single,
+        contains('"device_name":"resolved-host"'));
+    named.dispose();
+
+    final unnamedFake = FakeAkTaskCalls();
+    final unnamed = FfiSimpleTransferService(
+      calls: unnamedFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      deviceNameResolver: (_) async => null,
+    );
+    await unnamed.start();
+    expect(unnamedFake.acceptedSpecs.single, isNot(contains('device_name')),
+        reason: '解析失败必须退回引擎默认名（ak-task），不得伪造');
+    unnamed.dispose();
+  });
+
+  test('P1-3: Android resolution tolerates a missing channel method '
+      '(the engine default stands)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = FfiSimpleTransferService(
+      calls: fake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      delay: immediate,
+      isAndroid: true,
+      androidIdentityDir: () async => '/data/user/0/dev.ak/.ak-sending',
+      // The DEFAULT resolver: no mock handler on dev.ak/storage in tests —
+      // MissingPluginException must degrade to null, never throw.
+    );
+    await service.start();
+    expect(fake.acceptedSpecs.single, isNot(contains('device_name')));
+    service.dispose();
+  });
+
+  test('P1-3: resolvePlatformDeviceName trims, refuses empty/localhost and '
+      'caps at the 64-rune spec ceiling', () async {
+    const channel = MethodChannel('dev.ak/storage');
+    Future<String?> ask(Object? answer) async {
+      TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        expect(call.method, 'deviceName');
+        return answer;
+      });
+      try {
+        return await FfiSimpleTransferService.resolvePlatformDeviceName(
+            true);
+      } finally {
+        TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null);
+      }
+    }
+
+    expect(await ask('  Pixel 8 Pro '), 'Pixel 8 Pro');
+    expect(await ask(''), isNull);
+    expect(await ask('  '), isNull);
+    expect((await ask('X' * 100))?.runes.length, 64,
+        reason: 'AkTaskStartSpec 的 device_name 至多 64 字符');
+  });
+
+  test('P1-3: the resume reconcile fills peerName/peerShortId from the '
+      'engine snapshot (a nameless connected event heals on resume, and a '
+      'null never clobbers a learned name)', () async {
+    final fake = FakeAkTaskCalls();
+    final calls = PeerFactsListCalls(fake);
+    final service = FfiSimpleTransferService(
+      calls: calls,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      deviceNameResolver: (_) async => null,
+    );
+    await service.start();
+    final code = (await service.createCode(TaskRole.send)).code;
+    await service.joinCode(code);
+    service.engine.pumpEvents(); // connected + probe land WITHOUT names
+
+    var rows = await service.connections.first;
+    expect(rows.first.peerName, '对方的设备',
+        reason: '前置：恢复前引擎事件确实没带名字');
+    expect(rows.first.peerShortId, isNull);
+
+    // Resume (backgrounded → foregrounded): the reconcile re-reads the
+    // engine's ak_task_list snapshot, whose rows carry the X5 facts.
+    service.engine.setAppBackgrounded(true);
+    service.engine.setAppBackgrounded(false);
+    await pumpEventQueue();
+    rows = await service.connections.first;
+    expect(rows.first.peerName, 'phone-beta',
+        reason: '恢复快照必须把 peer_name 刷新到本地行');
+    expect(rows.first.peerShortId, 'a1b2c3d4');
+
+    // Engine truth may not go BACKWARDS: a null snapshot fact never
+    // clobbers the learned name.
+    calls.injectPeerFacts = false;
+    service.engine.setAppBackgrounded(true);
+    service.engine.setAppBackgrounded(false);
+    await pumpEventQueue();
+    rows = await service.connections.first;
+    expect(rows.first.peerName, 'phone-beta');
+    expect(rows.first.peerShortId, 'a1b2c3d4');
+    service.dispose();
+  });
+
+  test('P1-3: UI TaskConnection rows carry the pairing code end-to-end '
+      '(the adapter stamps the engine event\'s normalized code fact)',
+      () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final code = (await service.createCode(TaskRole.send)).code;
+    await service.joinCode(code);
+    service.engine.pumpEvents();
+
+    final rows = await service.connections.first;
+    expect(rows.first.code, code.replaceAll('-', ''),
+        reason: 'connected 事件的 code（归一化键）要落到 UI 行上');
     service.dispose();
   });
 
@@ -719,6 +893,100 @@ void main() {
     await expSub.cancel();
     service.dispose();
   });
+}
+
+/// P1-3 test seam: delegates every call to the wrapped fake, but injects
+/// the X5 peer-identity fields (`peer_name`/`peer_fp_short`) into the
+/// `ak_task_list` snapshot rows — the resume reconcile's engine truth
+/// (the low-level fake models the PRE-X5 snapshot shape). Toggling
+/// [injectPeerFacts] off proves a null fact never clobbers a learned
+/// name.
+class PeerFactsListCalls implements AkTaskCalls {
+  PeerFactsListCalls(this._inner);
+
+  final AkTaskCalls _inner;
+
+  /// Whether list() rows gain [peerName]/[peerFpShort].
+  bool injectPeerFacts = true;
+  String peerName = 'phone-beta';
+  String peerFpShort = 'a1b2c3d4';
+
+  @override
+  int list(Uint8List runtimeId, Uint8List buffer, int cap) {
+    // Ask the inner fake into a big scratch buffer first (the -3
+    // grow-retry contract stays the inner fake's), then rewrite.
+    const scratchCap = 1 << 20;
+    final scratch = Uint8List(scratchCap);
+    final code = _inner.list(runtimeId, scratch, scratchCap);
+    if (code != AkStatus.done) {
+      return code; // -3 pass-through: the caller grows and retries
+    }
+    final text = utf8.decode(
+        scratch.takeWhile((byte) => byte != 0).toList(growable: false));
+    final snapshot = jsonDecode(text) as Map<String, dynamic>;
+    if (injectPeerFacts) {
+      for (final row in snapshot['connections'] as List) {
+        (row as Map<String, dynamic>)['peer_name'] = peerName;
+        row['peer_fp_short'] = peerFpShort;
+      }
+    }
+    final payload = utf8.encode(jsonEncode(snapshot));
+    if (payload.length + 1 > cap) {
+      return AkStatus.errBuffer;
+    }
+    buffer.setAll(0, payload);
+    buffer[payload.length] = 0;
+    return AkStatus.done;
+  }
+
+  @override
+  String? lastError() => _inner.lastError();
+
+  @override
+  int start(String specJson, Uint8List runtimeIdOut) =>
+      _inner.start(specJson, runtimeIdOut);
+
+  @override
+  int createCode(Uint8List runtimeId, String specJson, Uint8List opIdOut) =>
+      _inner.createCode(runtimeId, specJson, opIdOut);
+
+  @override
+  int join(Uint8List runtimeId, String specJson, Uint8List opIdOut) =>
+      _inner.join(runtimeId, specJson, opIdOut);
+
+  @override
+  int send(Uint8List runtimeId, Uint8List connId, String pathsJson,
+          Uint8List opIdOut) =>
+      _inner.send(runtimeId, connId, pathsJson, opIdOut);
+
+  @override
+  int disconnect(Uint8List runtimeId, Uint8List connId) =>
+      _inner.disconnect(runtimeId, connId);
+
+  @override
+  int setSaveDir(Uint8List runtimeId, String path) =>
+      _inner.setSaveDir(runtimeId, path);
+
+  @override
+  int consent(Uint8List runtimeId, Uint8List jobId, int accept) =>
+      _inner.consent(runtimeId, jobId, accept);
+
+  @override
+  int serverInfo(Uint8List runtimeId, Uint8List opIdOut) =>
+      _inner.serverInfo(runtimeId, opIdOut);
+
+  @override
+  int opResult(
+          Uint8List runtimeId, Uint8List opId, Uint8List buffer, int cap) =>
+      _inner.opResult(runtimeId, opId, buffer, cap);
+
+  @override
+  int pollEvent(Uint8List runtimeId, Uint8List buffer, int cap) =>
+      _inner.pollEvent(runtimeId, buffer, cap);
+
+  @override
+  int pollProgress(Uint8List buffer, int cap) =>
+      _inner.pollProgress(buffer, cap);
 }
 
 /// Counts every seam call that crosses to the wrapped fake (R30-P1-01:

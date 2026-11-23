@@ -8,12 +8,18 @@
 ///
 /// | 入口 | 主路径 | 次要入口 |
 /// |---|---|---|
-/// | 发送文件 | 先选文件（可多选），再生成为发送方的码；对方加入且连通后自动开始发送 | 「对方已经给了你一个码？输入对方的码」（加入方为发送方） |
+/// | 发送文件 | 先选文件（可多选，含文件夹），再生成为发送方的码；对方加入且连通后自动开始发送 | 「对方已经给了你一个码？输入对方的码」（加入方为发送方） |
 /// | 接收文件 | 输入对方的码（加入方为接收方），成功后等待对方发送 | 「想让对方输入你的码？生成接收码」（创建方为接收方） |
 ///
 /// No role sheet before creating, no direction selector in the join
 /// panel — the interface has no direction-less path (`startJoin` takes a
-/// REQUIRED role).
+/// REQUIRED role). A failed create retries with the direction it declared
+/// (`PairingFlowController.createRole`), never an implicit one.
+///
+/// The preselected payload is handed ONLY to the connection the shown
+/// code produced (the flow controller correlates the latch by code), and
+/// never while the code card's 更改 pick is in flight — see
+/// `_HomePageState._changeSelection`.
 ///
 /// Client UI U1 (2026-11-13): connection cards show the live progress of
 /// a running transfer, and a 「最近传输」 section lists this session's
@@ -95,6 +101,14 @@ class _HomePageState extends State<HomePage> {
   /// connection never pushes twice).
   String? _autoOpenedConnectionId;
 
+  /// X4 P1-1 (codex review): true while the code card's 更改 pick is in
+  /// flight. The automatic-send handover is DEFERRED meanwhile — the
+  /// connection completing behind the system picker must not hand over
+  /// the OLD pending entries. [_changeSelection] runs it when the pick
+  /// returns, with the selection the user ended up with: the NEW one, or
+  /// the kept one after a cancelled change.
+  bool _changingSelection = false;
+
   @override
   void initState() {
     super.initState();
@@ -171,10 +185,16 @@ class _HomePageState extends State<HomePage> {
     // The flow panel stays as-is beneath the pushed page and resets when
     // the user comes back, so back lands on the home actions with the
     // connection card listed.
+    //
+    // P1-1: a 更改 pick in flight defers the handover — `_pendingEntries`
+    // is about to be replaced, and handing the old list over now would
+    // send what the user is in the middle of changing. The deferred
+    // handover runs from `_settleSelectionChange` when the pick returns.
     final connection = _flow.connection;
     if (connection != null &&
         connection.role == TaskRole.send &&
-        _autoOpenedConnectionId != connection.id) {
+        _autoOpenedConnectionId != connection.id &&
+        !_changingSelection) {
       final pending = _pendingEntries;
       final established = _flow.phase == PairingFlowPhase.success ||
           // X4: paired-but-unreachable counts as established for the
@@ -229,12 +249,58 @@ class _HomePageState extends State<HomePage> {
 
   /// X4 码卡片「更改」: re-run the multi-select. A cancelled change (empty
   /// list) KEEPS the last selection — only a real pick replaces it.
+  ///
+  /// X4 P1-1 (codex review): the automatic-send handover waits while this
+  /// pick is in flight, which makes every interleaving deterministic:
+  ///
+  /// * the connection completes DURING the pick — nothing is handed over
+  ///   with the OLD entries; when the pick returns the handover runs with
+  ///   the NEW entries (or the kept ones after a cancelled change);
+  /// * the pick returns FIRST — the selection is replaced (or kept) here
+  ///   and the later completion hands over that selection as usual;
+  /// * the completion lands between the tap's pointer-down and
+  ///   pointer-up — the handover has already taken the selection when the
+  ///   tap fires, so the tap starts no pick at all (the guard below;
+  ///   whichever of the two the app processes first wins).
+  ///
+  /// Only one pick can be in flight at a time (the system picker is
+  /// modal), so the flag needs no counter.
   Future<void> _changeSelection() async {
-    final entries = await widget.picker.pickFiles();
-    if (!mounted || entries.isEmpty) {
-      return; // cancelled: keep the last selection
+    if (_pendingEntries == null) {
+      // Nothing left to change: the selection was already handed over
+      // (a tap landing in the same frame as the completion) or the flow
+      // ended — either way it now belongs to someone else.
+      return;
     }
-    setState(() => _pendingEntries = entries);
+    _changingSelection = true;
+    List<PickedEntry> entries = const <PickedEntry>[];
+    try {
+      entries = await widget.picker.pickFiles();
+    } finally {
+      // Settles on BOTH outcomes — a result, or a picker error — so a
+      // deferred handover is never stranded behind a stuck flag. An error
+      // keeps the last selection like a cancelled change, then propagates
+      // exactly as it did before this change.
+      _changingSelection = false;
+      if (mounted) {
+        _settleSelectionChange(entries);
+      }
+    }
+  }
+
+  /// Applies the outcome of a 更改 pick and runs the handover it deferred.
+  void _settleSelectionChange(List<PickedEntry> entries) {
+    if (_pendingEntries == null) {
+      // The flow ended while the picker was open (the selection dies with
+      // it — see `_onFlowChanged`): the pick belongs to no flow.
+      return;
+    }
+    if (entries.isNotEmpty) {
+      _pendingEntries = entries;
+    }
+    // Empty = cancelled: the last selection stays. Either way the flow may
+    // have completed behind the picker — re-run the handover check now.
+    _onFlowChanged();
   }
 
   /// The code card's 已选 summary line (null when nothing is pending).
@@ -846,6 +912,15 @@ class _FlowFailedView extends StatelessWidget {
     final theme = Theme.of(context);
     final isJoin = controller.kind == PairingFlowKind.join;
     final cause = controller.errorCause;
+    // X4 P1-2: the create flow retries with the direction it DECLARED.
+    // The role used to be read off `code`/`connection`, but a failed
+    // `createCode` has neither — the retry then fell through to an
+    // implicit `TaskRole.send`, turning a 接收-create retry into a
+    // send-create. The controller remembers the role from before the
+    // engine call; when even that is unknown there is no honest
+    // direction to retry into, so the button stays disabled rather than
+    // guess.
+    final createRetryRole = controller.createRole;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -888,9 +963,11 @@ class _FlowFailedView extends StatelessWidget {
               // flow's declared join direction BEFORE reset() clears it,
               // so the reopened panel keeps the entry's direction.
               ? onJoinRetry
-              : () => controller.startCreate(controller.code?.role ??
-                  controller.connection?.role ??
-                  TaskRole.send),
+              // P1-2: the create flow's remembered direction — never an
+              // implicit default (null disables the button).
+              : createRetryRole == null
+                  ? null
+                  : () => controller.startCreate(createRetryRole),
           icon: const Icon(Icons.refresh),
           label: Text(isJoin ? '重新输入配对码' : '重试'),
         ),

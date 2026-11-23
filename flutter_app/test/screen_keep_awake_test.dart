@@ -59,8 +59,9 @@ void main() {
     return service;
   }
 
-  test('W7.3: a send turning in-progress calls on, settling calls off',
-      () async {
+  test(
+      'W7.3/W-N11: the gate holds from pairing through the send and '
+      'releases when the task ends (v1: one code = one task)', () async {
     final mock = installScreenMock();
     final fake = FakeAkTaskCalls();
     final service = booted(fake);
@@ -72,18 +73,48 @@ void main() {
     final joined = await service.join(created.code);
     service.pumpEvents();
     expect(service.isTransferInProgress, isFalse);
-    expect(mock.calls, isEmpty,
-        reason: 'pairing alone never holds the screen');
+    // W-N11 (2026-11-23) reverses W7.3's "pairing alone never holds the
+    // screen": the two WAITING stages hold it too — a screen-off there
+    // kills the registry keeper and the code becomes unredeemable (the
+    // reproduced defect; see wn11_keep_awake_test for the judgment).
+    await pumpEventQueue(); // stream edges land asynchronously
+    expect(mock.calls, equals(<String>['on']),
+        reason: 'waiting for the peer (or paired, picking) holds the gate');
 
-    // The send op: in-progress at entry, settled when the report lands.
+    // The send op runs to completion while the row stays live.
     await service.sendFiles(joined.connId, <String>['C:/ak/w73/a.bin']);
     await pumpEventQueue();
-    expect(mock.calls, equals(<String>['on', 'off']),
-        reason: 'the transfer held the screen for exactly its duration');
-    expect(keep.isOn, isFalse);
+    expect(mock.calls, equals(<String>['on']),
+        reason: 'the send adds no NEW edge — the live row already held it');
 
-    // A SECOND transfer cycle does it again (the coordinator re-arms).
-    await service.sendFiles(joined.connId, <String>['C:/ak/w73/b.bin']);
+    // The task ends (v1: a settled task's connection goes terminal).
+    final runtimeId = fake.runtimes.values.first.id;
+    final runtime = fake.runtimes[runtimeId]!;
+    runtime.events.add(<String, dynamic>{
+      'event': 'disconnected',
+      'conn': joined.connId,
+      'reason': 'done',
+    });
+    runtime.connections.remove(joined.connId);
+    service.pumpEvents();
+    await pumpEventQueue(); // stream edges land asynchronously
+    expect(mock.calls, equals(<String>['on', 'off']),
+        reason: 'the terminal row released the gate');
+
+    // A SECOND cycle pairs a NEW code (one code = one task) and the
+    // coordinator re-arms.
+    final created2 = await service.createCode(SimpleTransferRole.receiver);
+    final joined2 = await service.join(created2.code);
+    service.pumpEvents();
+    await pumpEventQueue();
+    expect(mock.calls, equals(<String>['on', 'off', 'on']));
+    runtime.events.add(<String, dynamic>{
+      'event': 'disconnected',
+      'conn': joined2.connId,
+      'reason': 'done',
+    });
+    runtime.connections.remove(joined2.connId);
+    service.pumpEvents();
     await pumpEventQueue();
     expect(mock.calls, equals(<String>['on', 'off', 'on', 'off']));
     service.dispose();
@@ -192,8 +223,31 @@ void main() {
     await pumpEventQueue();
     expect(mock.calls, isNotEmpty,
         reason: 'the adapter-driven flow held the screen');
+    // W-N11: the gate also keys on live rows — the send settling alone no
+    // longer releases it; the task's terminal event does (v1: one code =
+    // one task).
+    final runtimeId = fake.runtimes.values.first.id;
+    fake.emitDone(runtimeId, connId: joined.connectionId!);
+    fake.runtimes[runtimeId]!.events.add(<String, dynamic>{
+      'event': 'disconnected',
+      'conn': joined.connectionId,
+      'reason': 'done',
+    });
+    fake.runtimes[runtimeId]!.connections.remove(joined.connectionId);
+    // An op forces the event pump NOW (the cadence timer is real-time in
+    // this plain test); the queued terminal events settle the row inside
+    // the op's pump.
+    await adapter.disconnect(joined.connectionId!);
+    await pumpEventQueue();
+    // The off edge is stream-delivered (asynchronous by contract); under
+    // a busy isolate it can land after pumpEventQueue's flush — wait for
+    // it with a bound instead of asserting an instant.
+    final offDeadline = DateTime.now().add(const Duration(seconds: 2));
+    while (mock.calls.last != 'off' && DateTime.now().isBefore(offDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
     expect(mock.calls.last, 'off',
-        reason: 'and released it when every transfer ended');
+        reason: 'and released it when the task ended');
     adapter.dispose();
     mock.uninstall();
   });

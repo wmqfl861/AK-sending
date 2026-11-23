@@ -28,6 +28,11 @@
 ///   defaults (the only way a standalone phone install gets a real
 ///   registry), the same precedence as
 ///   `FfiTransferService.inviteConfigFromEnvironment`.
+/// * **deviceName**: X5 P1-3 — [start] announces THIS device's
+///   self-reported name to the engine (`device_name`; the frozen contract
+///   call passes none, so the adapter resolves the platform default —
+///   see [resolvePlatformDeviceName]; every failure leaves the engine's
+///   own default standing).
 /// * **identity directory** (wave-29 P1-01): desktop resolves `AK_ID_DIR`,
 ///   else the user-profile `.ak-sending` (`FfiTransferService
 ///   .defaultIdentityDir`'s pattern); Android has NO usable environment,
@@ -53,8 +58,8 @@
 ///   self-reported peer name (`connected.peer_name`) rides the row,
 ///   annotated by the verified fingerprint's short code
 ///   (`peer_fp_short`); an engine predating the fields keeps the
-///   zero-identity v1 stand-in (the task code's short label) and no
-///   short code.
+///   spec-mandated no-name default 「对方的设备」 (handoff §4.5 item 5)
+///   and no short code.
 /// * **consent**: with `accept: true` the returned future completes when
 ///   the receive finishes (the engine's `done` event for that
 ///   connection), rejects on failure/disconnect and — past
@@ -69,8 +74,11 @@
 ///   rejection says so (wave-29 P2-10).
 library;
 
-import 'dart:async' show Stream, StreamSubscription, TimeoutException;
+import 'dart:async'
+    show FutureOr, Stream, StreamSubscription, TimeoutException;
 import 'dart:io' show Platform;
+
+import 'package:flutter/services.dart' show MethodChannel;
 
 import 'package:path_provider/path_provider.dart'
     show getApplicationSupportDirectory;
@@ -108,6 +116,7 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     Future<void> Function(Duration)? delay,
     bool? isAndroid,
     Future<String> Function()? androidIdentityDir,
+    FutureOr<String?> Function(bool isAndroid)? deviceNameResolver,
     this.receiveTimeout = const Duration(seconds: 180),
     // E2/G4: a STALL budget that must clear the 120 s consent window
     // (the wait produces no progress lines) — 150 s, same headroom as
@@ -119,6 +128,8 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         _isAndroidPlatform = isAndroid ?? Platform.isAndroid,
         _androidIdentityDir =
             androidIdentityDir ?? defaultAndroidIdentityDir,
+        _deviceNameResolver =
+            deviceNameResolver ?? resolvePlatformDeviceName,
         _engine = task_engine.SimpleTransferService(
           calls: calls,
           delay: delay,
@@ -183,6 +194,10 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   final Map<String, String> Function() _environment;
   final bool _isAndroidPlatform;
   final Future<String> Function() _androidIdentityDir;
+
+  /// X5 P1-3: resolves this device's self-reported name when [start]
+  /// carries none — injectable so tests stay off the platform channel.
+  final FutureOr<String?> Function(bool isAndroid) _deviceNameResolver;
   final task_engine.SimpleTransferService _engine;
 
   /// How often the accepted-receive stall loop wakes to check settled
@@ -205,8 +220,17 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   // -- lifecycle ---------------------------------------------------------
 
+  /// X5 P1-3: [deviceName] is this device's SELF-REPORTED name for the
+  /// engine's `device_name` (what the peer's UI shows — display only,
+  /// never an identity proof). Null (the shell's plain contract call)
+  /// resolves the platform default first — Android asks the existing
+  /// `dev.ak/storage` channel (`deviceName`, MainActivity's Build.MODEL),
+  /// desktop uses the local hostname — and every failure degrades to
+  /// null, leaving the engine's own default ('ak-task',
+  /// crates/ak-ffi/src/task/stack.rs) standing. An explicit name (tests,
+  /// operator overrides) skips the resolution entirely.
   @override
-  Future<void> start() async {
+  Future<void> start({String? deviceName}) async {
     if (_isAndroidPlatform) {
       await identityDirReady; // the real dir gates the engine's id_dir
     }
@@ -224,10 +248,19 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     // value opts out (the Rust side fails open without a reflexive
     // candidate; ffi-v2.md §8.1).
     final stun = _envOrCompiled(env, 'AK_STUN_ADDR') ?? _defaultStunAddr;
+    // X5 P1-3: the explicit name wins; else the platform default. The
+    // DESKTOP answer resolves SYNCHRONOUSLY (see the resolver), so a
+    // desktop start() still boots the engine in its synchronous prefix —
+    // the fire-and-forget start pattern of the shell/tests keeps
+    // working; only the Android channel round-trip awaits.
+    final resolved = deviceName ?? _deviceNameResolver(_isAndroidPlatform);
+    final String? selfName =
+        resolved is Future<String?> ? await resolved : resolved;
     await _engine.start(
       registry: address,
       registryIdHex: pin,
       idDir: dir,
+      deviceName: selfName,
       saveDir: _saveDirOverride,
       stunAddr: stun.isEmpty ? null : stun,
     );
@@ -602,6 +635,53 @@ final class FfiSimpleTransferService implements SimpleTransferService {
         : '$base/.ak-sending';
   }
 
+  /// The storage/platform channel MainActivity already owns
+  /// (dev.ak/storage — its `deviceName` method is X5 P1-3's addition).
+  static const String storageChannelName = 'dev.ak/storage';
+
+  /// X5 P1-3: the default device-name resolution behind [start] — the
+  /// name is a self-report for display, so EVERY failure degrades to
+  /// null and the engine announces its own default ('ak-task'):
+  ///
+  /// * Android: the existing `dev.ak/storage` channel's `deviceName`
+  ///   method (MainActivity — `Build.MODEL`, `Build.MANUFACTURER`
+  ///   fallback, trimmed; a host activity without the method — an old
+  ///   install — throws and degrades to null);
+  /// * every other platform: `Platform.localHostname` when non-empty and
+  ///   not 'localhost' — answered SYNCHRONOUSLY (a plain getter), so a
+  ///   desktop [start] keeps booting the engine in its synchronous
+  ///   prefix (the shell's fire-and-forget contract call);
+  /// * an over-long result is cut to 64 runes (the task-plane spec's
+  ///   `device_name` ceiling, `AkTaskStartSpec`) — display-only, never
+  ///   a fatal start.
+  static FutureOr<String?> resolvePlatformDeviceName(bool isAndroid) {
+    if (!isAndroid) {
+      return _presentableDeviceName(Platform.localHostname);
+    }
+    return _androidDeviceName();
+  }
+
+  static Future<String?> _androidDeviceName() async {
+    try {
+      return _presentableDeviceName(await const MethodChannel(
+              storageChannelName)
+          .invokeMethod<String>('deviceName'));
+    } on Object {
+      return null; // missing method / channel failure — engine default
+    }
+  }
+
+  /// Trims and validates the raw platform answer: empty/'localhost' →
+  /// null; over-long names are cut to the 64-rune spec ceiling.
+  static String? _presentableDeviceName(String? raw) {
+    final name = (raw ?? '').trim();
+    if (name.isEmpty || name == 'localhost') {
+      return null;
+    }
+    final runes = name.runes;
+    return runes.length <= 64 ? name : String.fromCharCodes(runes.take(64));
+  }
+
   task_engine.SimpleTransferRole _engineRole(TaskRole role) =>
       role == TaskRole.send
           ? task_engine.SimpleTransferRole.sender
@@ -636,26 +716,21 @@ final class FfiSimpleTransferService implements SimpleTransferService {
 
   TaskConnection _rowOf(task_engine.SimpleConnection row) => TaskConnection(
         id: row.connId,
-        // X5: the engine's self-reported peer name wins; the code's short
-        // label stands in only when the engine carries none (an old DLL).
-        peerName: row.peerName ?? _peerNameOf(row),
+        // X5: the engine's self-reported peer name wins; an engine
+        // predating the field (an old DLL) gets the spec-mandated
+        // no-name default 「对方的设备」 (handoff §4.5 item 5 — never a
+        // code-tail label).
+        peerName: row.peerName ?? '对方的设备',
         role: _uiRole(row.role),
         state: _uiState(row.state),
         // J2: the idle-budget expiry keeps its own visible copy.
         idleExpired: row.disconnectReason == 'idle_expired',
         // X5: the verified fingerprint's short code (null on old engines).
         peerShortId: row.peerShortId,
+        // The task code that produced this connection — the correlation
+        // key shared by both sides of the pairing.
+        code: row.code,
       );
-
-  /// The zero-identity v1 model carries no peer name: the code's short
-  /// label stands in (device names arrive with the registry relay).
-  String _peerNameOf(task_engine.SimpleConnection row) {
-    final code = row.code;
-    if (code == null || code.length < 8) {
-      return '对端设备';
-    }
-    return '对端 ${code.substring(code.length - 8)}';
-  }
 
   String _readable(AkFfiException error) {
     if (error.code == AkStatus.errInvalid) {

@@ -8,8 +8,10 @@
 /// the storage vocabulary and copy tests use the engine's REAL texts
 /// (copied from the Rust constants/Display impls, provenance noted per
 /// constant — never self-invented strings); W-N4 — status -2 claims
-/// invalidCode only on the pairing/join scenes, table-driven across the
-/// scenes.
+/// invalidCode only on the join scenes (codex P2 tightened: since X4 the
+/// home page passes `joining` for the join flow, so `pairing` IS the
+/// create scene and its -2 falls to the vocabulary/fallback),
+/// table-driven across the scenes.
 ///
 /// Plain `flutter test` (the mapping has no Flutter imports; the FFI
 /// exception is mimicked by a structurally identical private class so
@@ -114,10 +116,11 @@ void main() {
         TransferErrorKind.invalidCode,
       ),
       (
-        'W-N4：FFI -2 在加入场景（pairing）→ invalidCode',
+        'W-N4＋codex P2：FFI -2 在创建场景（pairing，X4 起加入流传入的是 '
+        'joining）走词表与兜底 → unknown',
         _FakeAkFfiException(-2, 'join spec validation failed'),
         TransferErrorScene.pairing,
-        TransferErrorKind.invalidCode,
+        TransferErrorKind.unknown,
       ),
       (
         'W-N4：FFI -2 在 joining 场景同样 → invalidCode',
@@ -255,14 +258,15 @@ void main() {
   });
 
   group('transferErrorView: four output lines per situation', () {
-    test('W-N9：加入场景的 invalidCode 三层文案列全原因（pairing 与 '
-        'joining 同文案）', () {
+    test('W-N9＋codex P2：加入场景（joining）的 invalidCode 三层文案列全'
+        '原因', () {
       const reason = '配对码可能输错、已过期、已撤销或已使用，也可能是对方'
           '不在线，或双方选了同一个方向。';
       const suggestion = '请让对方保持应用打开并停留在前台，确认一方发送、'
           '一方接收，再核对配对码。需要时请对方重新生成。';
+      // codex P2：只有 joining 用这组文案（X4 起首页把加入流接成
+      // joining；pairing 是创建流，用户没有在输码，不得看到输错/同向）。
       for (final scene in [
-        TransferErrorScene.pairing,
         TransferErrorScene.joining,
       ]) {
         final view = transferErrorView(_unifiedRefusal, scene);
@@ -283,9 +287,10 @@ void main() {
       );
     });
 
-    test('W-N4：状态码 -2 三个场景的标题（表驱动）', () {
+    test('W-N4＋codex P2：状态码 -2 各场景的标题（表驱动；创建场景 '
+        'pairing 不再是输码场景）', () {
       final table = <(TransferErrorScene, String)>[
-        (TransferErrorScene.pairing, '这个码用不了'),
+        (TransferErrorScene.pairing, '出了点问题'),
         (TransferErrorScene.joining, '这个码用不了'),
         (TransferErrorScene.sending, '出了点问题'),
         (TransferErrorScene.receiving, '出了点问题'),
@@ -394,17 +399,25 @@ void main() {
       }
     });
 
-    test('W-N10：接收场景维持“无法保存到所选文件夹……更换保存文件夹”', () {
-      // 接收方本地引擎的 Display（lib.rs:1046）。
-      final view =
-          transferErrorView(_localStorageFull, TransferErrorScene.receiving);
-      expect(view.kind, TransferErrorKind.saveDirNotWritable);
-      expect(view.title, '无法保存到所选文件夹');
-      expect(view.suggestion, contains('更换保存文件夹'));
-      // 同一句引擎文本在发送场景给发送文案——文案随场景分开，不随文本变。
-      final peer = transferErrorView(
-          _peerStorageFullPrecheck, TransferErrorScene.receiving);
-      expect(peer.title, '无法保存到所选文件夹');
+    test('W-N10＋codex P2：接收场景的空间不足是本机盘满——本机文案'
+        '（三个真实文本都命中）', () {
+      // 接收方自己的磁盘满了：本机文案（清本机空间或换保存文件夹，对方
+      // 重发后从断点继续），不再是“无法保存到所选文件夹”的通用话术。
+      for (final error in [
+        _localStorageFull,
+        _peerStorageFullPrecheck,
+        _peerStorageFullMidTransfer,
+      ]) {
+        final view = transferErrorView(error, TransferErrorScene.receiving);
+        expect(view.kind, TransferErrorKind.saveDirNotWritable,
+            reason: '$error');
+        expect(view.title, '本机存储空间不足', reason: '$error');
+        expect(view.reason, contains('没法保存'), reason: '$error');
+        expect(view.suggestion, contains('清理本机'), reason: '$error');
+        expect(view.suggestion, contains('更换保存文件夹'), reason: '$error');
+        expect(view.suggestion, contains('断点继续'), reason: '$error');
+        expect(view.title, isNot('无法保存到所选文件夹'), reason: '$error');
+      }
     });
 
     test('未知错误兜底 → 出了点问题 + 导出连接诊断（传输场景）', () {

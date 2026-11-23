@@ -30,18 +30,24 @@
 /// texts (copied from the Rust constants, provenance in the classifier)
 /// and the sending scene gets its own copy (the PEER's device is full,
 /// re-pair then resume); W-N4 — status -2 claims invalidCode ONLY on the
-/// pairing/join scenes, the transfer scenes go through the vocabulary and
-/// the fallback.
+/// join scenes, the others go through the vocabulary and the fallback.
+/// Codex review P2 (2026-11-22) tightened two more: since X4 the home
+/// page passes [TransferErrorScene.joining] for the join flow, so `pairing`
+/// IS the create scene and its `-2` is a parameter/config error (fallback
+/// copy, never invalid-code wording); and storage-full is split by side —
+/// sending = the peer's disk, receiving = THIS device's disk.
 library;
 
 import 'dart:async' show TimeoutException;
 
 /// Where the failure surfaced — picks the wording nuances (who can act).
 enum TransferErrorScene {
-  /// The pairing flows (create/join) on the home page. Today the home
-  /// page passes THIS one scene for both flows, and an invalidCode-shaped
-  /// failure there is a join-flow phenomenon (the create flow's failures
-  /// are never code-shaped), so the join copy below also serves it.
+  /// The CREATE pairing flow on the home page. Since X4 the home page
+  /// passes [joining] for the join flow, so a failure arriving here is a
+  /// create-flow fact: no code is being typed, so `-2` is a parameter /
+  /// config error and must fall through to the vocabulary and the
+  /// fallback — never the invalid-code copy (codex P2 tightening of
+  /// W-N4).
   pairing,
 
   /// The JOIN flow specifically — the user typed someone else's code
@@ -165,9 +171,9 @@ TransferErrorView viewForKind(
         // （crates/ak-session/src/pairing/task_net.rs:651；同向加入在
         // 提交前得到的也是这个统一应答）出于防枚举不区分原因，文案必须
         // 把可能性列全：输错、过期、已撤销、已使用、对方不在线、双方
-        // 同向。`pairing` 与 `joining` 同文案：首页两条配对流共用
-        // pairing 场景（见 enum 注释），而发起流的失败不会是码形问题。
-        TransferErrorScene.pairing ||
+        // 同向。codex P2 收紧：只有 joining 用这组文案——X4 起首页把加入
+        // 流接成 joining，pairing 场景（创建流）的用户没有在输码，不得
+        // 看到“输错/同向”字样。
         TransferErrorScene.joining => const (
               '这个码用不了',
               '配对码可能输错、已过期、已撤销或已使用，也可能是对方不在线，'
@@ -175,9 +181,10 @@ TransferErrorView viewForKind(
               '请让对方保持应用打开并停留在前台，确认一方发送、一方接收，'
                   '再核对配对码。需要时请对方重新生成。',
             ),
-        // W-N4（批次 X2）：-2 不再把发送/接收场景带到这里；传输场景里
-        // 命中词表的失效码（例如重发时配对已过期）是传输失败——重新
-        // 配对，而不是让用户去“输入新的码”。
+        // W-N4（批次 X2）：-2 不再把传输/创建场景带到这里；命中词表的
+        // 失效码（例如重发时配对已过期）是传输失败——重新配对，而不是
+        // 让用户去“输入新的码”。创建场景若经词表走到这里（正常流程到
+        // 不了），也用这组不提“输码”的文案。
         _ => const (
             '这个码用不了',
             '配对码已过期或已被使用，本次传输没有完成。',
@@ -228,7 +235,22 @@ TransferErrorView viewForKind(
             '对方设备的剩余空间不够，本次传输没有完成。',
             '请对方清理空间后重新配对再发送，已有进度会从断点续传。',
           ),
-        // 接收（与其余场景）：空间不足的是本机的保存文件夹。
+        // codex P2（2026-11-22）：接收场景的空间不足是本机的盘满了。
+        // 同一组引擎文本（接收方预检/中途的 STORAGE_FULL 错误帧
+        // `insufficient free space at destination`、
+        // `receiver ran out of disk space during the transfer`，以及
+        // 接收方本地的 `destination storage full: …`）在接收横幅里必须
+        // 落到“本机”文案：收到的文件保存不下来，清本机空间或换保存
+        // 文件夹，对方重发后从断点继续——不是“更换保存文件夹”的通用
+        // 话术，更不是“对方的设备空间不足”。
+        TransferErrorScene.receiving => const (
+            '本机存储空间不足',
+            '本机的剩余空间不够，收到的文件没法保存，本次接收没有完成。',
+            '请清理本机存储空间，或在「设置」里更换保存文件夹，'
+                '再让对方重新发送；已有进度会从断点继续。',
+          ),
+        // 其余场景（配对/诊断导出）：空间不足的是本机的保存文件夹，
+        // 维持审核 §4.3 的通用文案。
         _ => const (
             '无法保存到所选文件夹',
             '保存位置不可写，或剩余空间不够。',
@@ -287,13 +309,13 @@ TransferErrorKind classifyTransferError(
   // message vocabulary below.
   final code = errorCodeOf(error);
   if (code != null && code < 0) {
-    if (code == -2 &&
-        (scene == TransferErrorScene.pairing ||
-            scene == TransferErrorScene.joining)) {
-      // AK_ERR_INVALID: malformed/invalid input — on the pairing/join
-      // scenes that means the task code (spec/JSON validation of the
-      // join). W-N4（批次 X2）：发送/接收场景的 -2 是输入拼装/参数
-      // 错误，不再是“这个码用不了”——落回下面的词表与兜底。
+    if (code == -2 && scene == TransferErrorScene.joining) {
+      // AK_ERR_INVALID: malformed/invalid input — on the JOIN scene that
+      // means the task code the user typed (spec/JSON validation of the
+      // join). W-N4（批次 X2）＋codex P2 收紧：-2 只在加入场景认领
+      // invalidCode——创建场景（pairing，X4 起由创建流传入，用户没有在
+      // 输码）与发送/接收场景的 -2 是输入拼装/参数/配置错误，不再是
+      // “这个码用不了”——落回下面的词表与兜底。
       return TransferErrorKind.invalidCode;
     }
     // -1/-3/-5 are programming/buffer/internal faults with no user

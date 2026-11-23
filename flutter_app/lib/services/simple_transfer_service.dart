@@ -87,6 +87,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         AkTaskSendSpec,
         AkTaskStartSpec,
         TaskConnectedEvent,
+        TaskConnectionView,
         TaskConsentExpiredEvent,
         TaskDisconnectedEvent,
         TaskDoneEvent,
@@ -94,6 +95,7 @@ import 'package:ak_ffi_dart/ak_ffi_dart.dart'
         TaskIncomingRequestEvent,
         TaskProbeResultEvent,
         TaskRequestClosedEvent,
+        TaskUnknownEvent,
         TaskEventDoorbell,
         TaskListSnapshot,
         TaskRuntimeFfi,
@@ -839,6 +841,16 @@ final class SimpleTransferService {
   /// [transferActivity]).
   final Set<String> _inProgressTransfers = <String>{};
 
+  /// W-N11 (batch X fix wave, 2026-11-23): created-but-unpaired codes —
+  /// the「waiting for the peer to join」pairing stage. The screen
+  /// keep-awake gate extends to it: with the screen off, the registry
+  /// keeper dies with the paused process and the code becomes
+  /// unredeemable (`unknown task code ... owner offline`) — reproduced
+  /// 2026-11-23, X handoff §8 W-N11 row. Cleared when the code pairs
+  /// (its connection arrives), is cancelled/revoked, or the service
+  /// tears down.
+  final Set<String> _awaitedCodes = <String>{};
+
   /// W7.3: the last value fanned out on [transferActivity].
   bool _transferActivityOn = false;
 
@@ -982,6 +994,7 @@ final class SimpleTransferService {
     _transferActivityController.close(); // W7.3
     _transfers.clear();
     _inProgressTransfers.clear(); // W7.3
+    _awaitedCodes.clear(); // W-N11
     _lastProgressAt.clear(); // W1
   }
 
@@ -1019,6 +1032,11 @@ final class SimpleTransferService {
       final codeId = result['code_id'] as String?;
       if (codeId != null && codeId.isNotEmpty) {
         _codeIdOfKey[_codeKey(code)] = codeId;
+        // W-N11: the created code now WAITS for its peer — the
+        // keep-awake gate must hold through that wait.
+        if (_awaitedCodes.add(codeId)) {
+          _emitTransferActivity();
+        }
       }
       return SimpleCreatedCode(code: code, role: role, codeId: codeId);
     } on Object catch (error) {
@@ -1132,6 +1150,12 @@ final class SimpleTransferService {
   Future<void> disconnect(String connId) async {
     final runtime = _runtimeOrThrow();
     _ensureLive();
+    // W-N11: revoking an UN-JOINED code ends its wait (the engine's
+    // `code_cancelled` event would do the same; the op result is the
+    // deterministic moment).
+    if (_awaitedCodes.remove(connId)) {
+      _emitTransferActivity();
+    }
     try {
       runtime.disconnect(connId);
     } on AkFfiException catch (error) {
@@ -1436,9 +1460,16 @@ final class SimpleTransferService {
     }
   }
 
-  /// W7.3: fan out the "any transfer in progress" edge transitions.
+  /// W7.3 (W-N11 extended, 2026-11-23): fan out the "task activity" edge
+  /// transitions — a transfer in progress, OR a created-but-unpaired code
+  /// waiting for its peer, OR any live (non-terminal) connection (the
+  /// paired-but-picking wait). All three are stages where a screen-off
+  /// kills the pairing (the registry keeper dies with the paused
+  /// process — the W-N11 reproduction).
   void _emitTransferActivity() {
-    final active = _inProgressTransfers.isNotEmpty;
+    final active = _inProgressTransfers.isNotEmpty ||
+        _awaitedCodes.isNotEmpty ||
+        _connections.values.any((row) => _stateRank(row.state) < 2);
     if (active == _transferActivityOn) {
       return; // no edge — no event
     }
@@ -1830,6 +1861,11 @@ final class SimpleTransferService {
   /// process (the V2-b zombie: connected at t=121 s, no terminal event
   /// until `idle_expired` at t=719.6 s). A failed or missing snapshot
   /// degrades silently: the next pump/resume reconciles again.
+  ///
+  /// X5 (P1-3, batch X): the snapshot rows also carry the peer identity
+  /// facts (`peer_name`/`peer_fp_short`) — a resume refreshes them onto
+  /// the local rows through the [_upsert] merge (engine truth wins when
+  /// non-null; a null never clobbers a name this side already learned).
   void _reconcileWithEngineSnapshot() {
     final runtime = _runtime;
     if (runtime == null || _disposed || _engineFailed) {
@@ -1841,16 +1877,31 @@ final class SimpleTransferService {
     } on Object {
       return; // transient snapshot failure — never block the resume
     }
-    final engineStates = <String, String>{
-      for (final row in snapshot.connections) row.connId: row.state,
+    final engineRows = <String, TaskConnectionView>{
+      for (final row in snapshot.connections) row.connId: row,
     };
     for (final row in _connections.values.toList()) {
       if (_stateRank(row.state) >= 2) {
         continue; // already terminal locally
       }
-      final engineState = engineStates[row.connId];
-      if (engineState == null || engineState == 'disconnected') {
+      final engineRow = engineRows[row.connId];
+      if (engineRow == null || engineRow.state == 'disconnected') {
         _markTerminal(row.connId, 'disconnected', reason: 'conn_lost');
+        continue;
+      }
+      // X5: refresh the peer identity from the engine's own truth (the
+      // resume may have missed the `connected` event that carried it).
+      // The row's state passes through unchanged — only the engine's
+      // MISSING/disconnected verdict is terminal, exactly like W1.
+      if ((engineRow.peerName != null && engineRow.peerName != row.peerName) ||
+          (engineRow.peerFpShort != null &&
+              engineRow.peerFpShort != row.peerShortId)) {
+        _upsert(
+          connId: row.connId,
+          state: row.state,
+          peerName: engineRow.peerName,
+          peerShortId: engineRow.peerFpShort,
+        );
       }
     }
   }
@@ -2172,6 +2223,9 @@ final class SimpleTransferService {
       peerShortId: existing.peerShortId,
     );
     _notifyConnections();
+    // W-N11: a row going terminal can drop the LAST live connection —
+    // re-evaluate the keep-awake gate.
+    _emitTransferActivity();
     if (reason == 'idle_expired' && !_idleExpiryController.isClosed) {
       _idleExpiryController.add(connId);
     }
@@ -2366,6 +2420,15 @@ final class SimpleTransferService {
     // bind/probe/connect/disconnect facts ride to the settings page's
     // export; everything else drops, exactly like the branches below).
     ConnectionDiagnosticsLog.shared.record(event);
+    if (event is TaskUnknownEvent && event.name == 'code_cancelled') {
+      // W-N11: the engine revoked an un-joined code (creator disconnect,
+      // or teardown's bounded revocation sweep) — its wait is over.
+      final codeId = event.fields['code_id'];
+      if (codeId is String && _awaitedCodes.remove(codeId)) {
+        _emitTransferActivity();
+      }
+      return;
+    }
     if (event is TaskConnectedEvent) {
       // The engine announces the CONNECTION (pairing bookkeeping) before
       // probing: a fresh row starts at `probing`; a row the pump already
@@ -2379,12 +2442,19 @@ final class SimpleTransferService {
         peerShortId: event.peerFpShort, // X5: verified-fp short code
         state: 'probing',
       );
+      // W-N11: a fresh LIVE row can raise the keep-awake gate.
+      _emitTransferActivity();
       final codeId = event.codeId;
       final code = event.code;
       if (codeId != null && code != null && code.isNotEmpty) {
         // R30-P2-02: the `connected` event teaches a JOINER the pairing's
         // code_id (the creator fills the same table at mint time).
         _codeIdOfKey[_codeKey(code)] = codeId;
+        // W-N11: the code PAIRED — the wait is over (the gate stays held
+        // by the now-live connection until the pairing ends).
+        if (_awaitedCodes.remove(codeId)) {
+          _emitTransferActivity();
+        }
       }
       return;
     }

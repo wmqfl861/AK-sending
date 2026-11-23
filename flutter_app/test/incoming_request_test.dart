@@ -28,8 +28,9 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const ValueKey('incoming_host')), findsOneWidget);
-    // X5: no name facts on the offer → the 对方的设备 fallback.
-    expect(find.text('对方的设备 请求发送 3 个文件（共 2.0 MB）'), findsOneWidget);
+    // X5: no name facts on the offer → the 对方的设备 fallback. codex P2:
+    // multi-item counts say 「项」 (file_count includes directories).
+    expect(find.text('对方的设备 请求发送 3 项内容（共 2.0 MB）'), findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_accept_job-1')),
         findsOneWidget);
     expect(find.byKey(const ValueKey('incoming_reject_job-1')),
@@ -47,7 +48,7 @@ void main() {
     expect(find.byKey(const ValueKey('incoming_success_job-1')),
         findsOneWidget);
     expect(
-        find.textContaining('已接收 3 个文件，保存在：'), findsOneWidget);
+        find.textContaining('已接收 3 项内容，保存在：'), findsOneWidget);
     // The save path is the service's current save dir.
     expect(find.textContaining('Download/AK-接收'), findsOneWidget);
 
@@ -274,10 +275,11 @@ void main() {
     await tester.pump();
 
     expect(
-      find.text('张三的手机 · a1b2c3d4 请求发送 「相册」等 3 个文件（共 2.0 MB）'),
-      findsOneWidget,
-      reason: '名称旁标注指纹短码；多项请求显示顶层名称摘要',
-    );
+        find.text('张三的手机 · a1b2c3d4 请求发送 「相册」等 3 项内容（共 2.0 MB）'),
+        findsOneWidget,
+        reason: '名称旁标注指纹短码；多项请求显示顶层名称摘要（codex P2：'
+            'file_count 含目录，多项用「项」）',
+      );
     // The name is self-reported, never "verified" wording.
     expect(find.textContaining('已验证'), findsNothing);
   });
@@ -314,7 +316,7 @@ void main() {
         jobId: 'late', connId: 'conn-1', fileCount: 2, totalBytes: 2048);
     await pumpEvents(tester);
     await tester.pump();
-    expect(find.text('对方的设备 请求发送 2 个文件（共 2.0 KB）'), findsOneWidget,
+    expect(find.text('对方的设备 请求发送 2 项内容（共 2.0 KB）'), findsOneWidget,
         reason: '连接行未到时先用「对方的设备」缺名文案');
 
     // The connection row arrives AFTERWARDS carrying the peer identity
@@ -325,11 +327,44 @@ void main() {
     await pumpEvents(tester);
     await tester.pump();
     expect(
-      find.text('李四的平板 · 9f8e7d6c 请求发送 2 个文件（共 2.0 KB）'),
-      findsOneWidget,
-      reason: '迟到到达的连接身份必须刷新横幅',
-    );
-    expect(find.text('对方的设备 请求发送 2 个文件（共 2.0 KB）'), findsNothing);
+        find.text('李四的平板 · 9f8e7d6c 请求发送 2 项内容（共 2.0 KB）'),
+        findsOneWidget,
+        reason: '迟到到达的连接身份必须刷新横幅',
+      );
+    expect(find.text('对方的设备 请求发送 2 项内容（共 2.0 KB）'), findsNothing);
     expect(find.byKey(const ValueKey('incoming_accept_late')), findsOneWidget);
+  });
+
+  testWidgets('codex P2: a merged-roots offer reports the internal token '
+      '"multi" as its root — the banner shows the count only, never the '
+      'token', (tester) async {
+    final fake = await pumpApp(tester);
+
+    // The engine's display_name is "multi" when several roots were merged
+    // (crates/ak-engine/src/sender.rs) — an implementation word, not a
+    // user-facing label.
+    fake.emitIncomingRequest(
+        jobId: 'merged', rootName: 'multi', fileCount: 4, totalBytes: 4096);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.text('对方的设备 请求发送 4 项内容（共 4.0 KB）'), findsOneWidget);
+    // The internal token must never render anywhere on the banner.
+    expect(find.textContaining('multi'), findsNothing);
+  });
+
+  testWidgets('codex P2: a multi-item offer with no usable root shows the '
+      'count only', (tester) async {
+    final fake = await pumpApp(tester);
+
+    // An empty root (a pre-multi engine, or an offer without a label) is
+    // not a name: 「项」 count alone, no 「」-quoted placeholder.
+    fake.emitIncomingRequest(
+        jobId: 'anon', rootName: '', fileCount: 2, totalBytes: 2048);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.text('对方的设备 请求发送 2 项内容（共 2.0 KB）'), findsOneWidget);
+    expect(find.textContaining('「」'), findsNothing);
   });
 }

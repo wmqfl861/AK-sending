@@ -638,7 +638,12 @@ void main() {
       // of the join that would trigger it.
       checkpointRecordsBefore = applyCheckpointSwitch(checkpoints);
 
-      await codePath.writeAsString(code, flush: true);
+      // P1-5 (codex X fix): the file is the app→host contract and host
+      // CLIs reject ANY whitespace in the invite code. The card renders
+      // the raw hyphenated code today, but the contract is defended
+      // here regardless — a future grouped display must never leak
+      // spacing into what the host redeems.
+      await codePath.writeAsString(code.replaceAll(' ', ''), flush: true);
       evidence('TASK_CODE_FILE|written|len=${code.length}|never-printed'
           '|host: adb exec-out run-as $_appId cat '
           'files/$_workDirName/task_code.txt');

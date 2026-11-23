@@ -11,9 +11,12 @@
 /// it is annotated with the verified fingerprint's first 8 hex
 /// (`TaskConnection.peerShortId`, from the connections stream) rather
 /// than any 已验证 wording. The payload summary shows the top-level
-/// label for multi-item offers (「photos」等 3 个文件) and — PRIVACY: a
+/// label for multi-item offers (「photos」等 3 项内容) and — PRIVACY: a
 /// single-file offer's root IS the file name — a bare 「1 个文件」 for
-/// single files (never the name itself).
+/// single files (never the name itself). Multi-item counts say 「项」
+/// because the engine's file_count includes directory entries; a merged-
+/// roots offer reports the internal token 'multi' as its root, which
+/// must never reach the screen (codex P2, 2026-11-22).
 ///
 /// Wave-29 P2-11: banners whose consent window closed undecided are
 /// REMOVED via `expiredIncomingRequests` (the engine auto-declined them),
@@ -52,15 +55,28 @@ import 'transfer_progress_view.dart';
 
 enum _Stage { pending, receiving, done, failed }
 
-/// X5: the payload summary — the top-level label for multi-item offers
-/// (「photos」等 3 个文件), a bare count otherwise. PRIVACY: a
-/// single-file offer's root IS the file name, so it is NEVER shown.
+/// X5 + codex P2: the payload summary — the top-level label for
+/// multi-item offers (「photos」等 3 项内容), a bare count otherwise.
+/// PRIVACY: a single-file offer's root IS the file name, so it is NEVER
+/// shown. Multi-item counts say 「项」 because the engine's file_count
+/// includes directory entries (crates/ak-core/src/manifest.rs:347) —
+/// claiming N 个文件 would be wrong when folders ride along. A root of
+/// 'multi' (the engine's display_name for merged roots,
+/// crates/ak-engine/src/sender.rs:182) or an empty one is an internal
+/// token, not a name: the count label alone.
 String _payloadLabelOf(IncomingRequest request) {
-  final root = request.rootName;
-  if (request.fileCount > 1 && root != null && root.isNotEmpty) {
-    return '「$root」等 ${request.fileCount} 个文件';
+  final count = request.fileCount;
+  if (count == 1) {
+    // The frozen single-file rule: the root IS the filename — bare count.
+    return '1 个文件';
   }
-  return '${request.fileCount} 个文件';
+  final root = request.rootName;
+  final namedRoot =
+      (root != null && root.isNotEmpty && root != 'multi') ? root : null;
+  if (namedRoot == null) {
+    return '$count 项内容';
+  }
+  return '「$namedRoot」等 $count 项内容';
 }
 
 class _BannerState {
@@ -165,10 +181,11 @@ class _IncomingRequestsHostState extends State<IncomingRequestsHost> {
     super.dispose();
   }
 
-  /// The sender's label for [banner]'s record.
+  /// The sender's label for [banner]'s record (「对方的设备」 when no
+  /// name is known — 审核 §4.5: 对方, never 对端).
   String _peerOf(_BannerState banner) {
     final connId = banner.request.connId;
-    return (connId == null ? null : _peerNames[connId]) ?? '对端设备';
+    return (connId == null ? null : _peerNames[connId]) ?? '对方的设备';
   }
 
   /// X5: the sender identity the pending banner names — the offer's
@@ -369,6 +386,12 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
     super.dispose();
   }
 
+  /// codex P2: the success card's count label — 「项」 for multi-item
+  /// offers (file_count includes directory entries, so 个文件 would be a
+  /// false claim), the frozen 「1 个文件」 for single files.
+  String _receivedLabelOf(IncomingRequest request) =>
+      request.fileCount == 1 ? '1 个文件' : '${request.fileCount} 项内容';
+
   /// U1: `用时 12 秒 · 平均 3.2 MB/s` for a finished receive (null when
   /// the duration was not measured).
   String? _summaryLine(IncomingRequest request) {
@@ -503,7 +526,7 @@ class _IncomingBannerCardState extends State<_IncomingBannerCard> {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      '已接收 ${request.fileCount} 个文件，'
+                      '已接收 ${_receivedLabelOf(request)}，'
                       '保存在：${request.saveDir ?? widget.saveDir}',
                       key: ValueKey('incoming_success_$jobId'),
                       style: theme.textTheme.bodyMedium?.copyWith(

@@ -526,6 +526,10 @@ class LocalSimpleTransferService implements SimpleTransferService {
       role: role ?? pending.role,
       state: TaskConnectionState.connecting,
       peerShortId: peerShortId, // X5: verified-fp short code (nullable)
+      // P1-3: the mirror carries the SAME task code the pairing used —
+      // the real adapter stamps the engine's `code` fact here; the fake
+      // mirrors that correlation key from the consumed [TaskCode].
+      code: pending.code,
     );
     _connections.add(connection);
     _emitConnections();
@@ -552,6 +556,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
       state: state,
       idleExpired: _connections[index].idleExpired,
       peerShortId: _connections[index].peerShortId,
+      code: _connections[index].code, // the pairing's correlation key
     );
     _emitConnections();
   }

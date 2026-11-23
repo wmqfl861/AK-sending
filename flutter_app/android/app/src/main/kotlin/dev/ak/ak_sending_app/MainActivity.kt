@@ -40,6 +40,11 @@ package dev.ak.ak_sending_app
  *      每项 { uri: String, read: Bool, write: Bool, tree: Bool, persistedTimeMs: Long }
  *      persistedTimeMs 在 API<30 上为 -1；tree 由 DocumentsContract.isTreeUri 判定。
  *
+ * 5) deviceName() -> String|null
+ *      本机自报设备名（X5，批次 X 交接 §4.5：仅展示用，不是身份证明）。
+ *      Build.MODEL 优先，为空回退 Build.MANUFACTURER，均 trim；
+ *      两侧皆空返回 null（Dart 侧随之走引擎默认名 'ak-task'）。
+ *
  * ── ActivityResult 路由说明 ─────────────────────────────────────────────
  * FlutterActivity 继承的是 android.app.Activity（非 ComponentActivity），
  * 不能直接用 registerForActivityResult。此处自建 ActivityResultRegistry，
@@ -204,6 +209,7 @@ class MainActivity : FlutterActivity() {
                         safWriteTest(call.argument<String>("treeUri"))
                     )
                     "listSafPersisted" -> result.success(listSafPersisted())
+                    "deviceName" -> result.success(deviceName())
                     else -> result.notImplemented()
                 }
             }
@@ -403,4 +409,20 @@ class MainActivity : FlutterActivity() {
                 }
             )
         }
+
+    // ── deviceName ────────────────────────────────────────────────────────
+
+    /**
+     * X5（批次 X 交接 §4.5 第 5 条）：本机自报设备名，仅展示用，不是身份证明。
+     * Build.MODEL 优先，trim 后为空回退 Build.MANUFACTURER；两侧皆空返回
+     * null（Dart 侧不传 device_name，引擎用默认名 'ak-task'）。
+     */
+    private fun deviceName(): String? {
+        val model = Build.MODEL.orEmpty().trim()
+        if (model.isNotEmpty()) {
+            return model
+        }
+        val manufacturer = Build.MANUFACTURER.orEmpty().trim()
+        return manufacturer.ifEmpty { null }
+    }
 }

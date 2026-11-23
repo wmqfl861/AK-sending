@@ -16,6 +16,19 @@
 /// The auto connectivity probe (spec 3) is tracked through the
 /// `connections` stream: the latched connection's state maps
 /// connecting→paired, testing→probing, connected→success.
+///
+/// X4 P1-1 (batch X codex review): the create flow's latch is CORRELATED.
+/// While a code is shown, ONLY the connection that code produced may
+/// complete the flow — the row's `TaskConnection.code` must equal the
+/// created code (a same-engine mirror carries the same string and
+/// completes it too, which is the intended case). The first-unseen rule
+/// survives only as the fallback for an implementation that cannot name
+/// the created code.
+///
+/// X4 P1-2 (same review): the direction is remembered per flow —
+/// [PairingFlowController.joinRole] for a join, [PairingFlowController.createRole]
+/// for a create — so a retry repeats the declared direction instead of
+/// reading it back off state a failure has already cleared.
 library;
 
 import 'dart:async' show StreamSubscription;
@@ -90,6 +103,16 @@ class PairingFlowController extends ChangeNotifier {
   /// guesses the direction.
   TaskRole? joinRole;
 
+  /// X4 P1-2: the direction the CREATE flow declared — the entry the user
+  /// tapped (`startCreate(role)`). Recorded BEFORE the engine call so it
+  /// SURVIVES a failed `createCode`: that failure leaves neither a
+  /// [TaskCode] nor a [connection] to read the role from, and the failed
+  /// view's 重试 repeats THIS direction. Before this the retry fell
+  /// through to an implicit `TaskRole.send`, silently turning a failed
+  /// 接收-create retry into a send-create (the direction flip X4 exists
+  /// to eliminate). Null outside a create flow.
+  TaskRole? createRole;
+
   /// The connection id a join flow waits for (from [JoinResult]).
   String? _expectedConnectionId;
 
@@ -97,6 +120,9 @@ class PairingFlowController extends ChangeNotifier {
 
   /// Creates a code with MY direction [role] (发起流).
   Future<void> startCreate(TaskRole role) async {
+    // P1-2: remembered first, like [startJoin] does — `_begin` keeps it
+    // for a create flow and clears it for every other kind.
+    createRole = role;
     _begin(kind: PairingFlowKind.create, phase: PairingFlowPhase.creating);
     try {
       code = await _service.createCode(role);
@@ -213,6 +239,9 @@ class PairingFlowController extends ChangeNotifier {
     if (kind != PairingFlowKind.join) {
       joinRole = null; // a fresh join re-declares its direction (X4)
     }
+    if (kind != PairingFlowKind.create) {
+      createRole = null; // a fresh create re-declares its direction (P1-2)
+    }
     notifyListeners();
   }
 
@@ -237,13 +266,23 @@ class PairingFlowController extends ChangeNotifier {
     final latched = connection;
     TaskConnection? candidate;
     final expectedId = _expectedConnectionId;
+    // X4 P1-1 (codex review): a create flow waiting for its peer is
+    // completed ONLY by the connection its OWN code produced (see
+    // [_completesCreateFlow]). An unrelated pairing that lands meanwhile —
+    // another code of this device redeemed, a mirror of some other code —
+    // is accounted for like a pre-existing row and never latched. The
+    // first UNSEEN row used to complete the flow, and the home layer then
+    // handed the preselected files to THAT connection.
+    final awaitingPeer = kind == PairingFlowKind.create &&
+        phase == PairingFlowPhase.awaitingPeer;
     for (final row in snapshot) {
       if (_knownConnectionIds.contains(row.id)) {
         continue;
       }
-      final completesFlow =
-          (kind == PairingFlowKind.create && phase == PairingFlowPhase.awaitingPeer) ||
-              (expectedId != null && row.id == expectedId);
+      // Join flows keep their id check: the row [JoinResult] named.
+      final completesFlow = awaitingPeer
+          ? _completesCreateFlow(row)
+          : expectedId != null && row.id == expectedId;
       if (completesFlow) {
         candidate = row;
         break;
@@ -278,6 +317,35 @@ class PairingFlowController extends ChangeNotifier {
         _applyConnectionState(current);
       }
     }
+  }
+
+  /// X4 P1-1: whether [row] is the connection the waiting create flow's
+  /// OWN code produced — the only row allowed to complete that flow.
+  ///
+  /// * Created code known (always, with the current model: `TaskCode.code`
+  ///   is non-null and set before `awaitingPeer`): the row must carry the
+  ///   SAME code. A same-engine mirror does — the pairing used this very
+  ///   code — and completes the flow; a row whose code differs, or that
+  ///   carries none, never does. Failing closed costs a waiting card;
+  ///   failing open would send the preselected files to the wrong
+  ///   connection.
+  /// * Created code unknown (an implementation that cannot name it):
+  ///   nothing to correlate with, so the pre-P1-1 FIRST-UNSEEN rule decides
+  ///   — the declared fallback. Unreachable with the current model, kept
+  ///   so a future code-less implementation degrades to the old behavior
+  ///   instead of never completing.
+  ///
+  /// Codes compare in their normalized form ([normalizeJoinCode]: case and
+  /// separators ignored), so a display-form drift can never split a
+  /// pairing that is in fact the same code.
+  bool _completesCreateFlow(TaskConnection row) {
+    final expected = code?.code;
+    if (expected == null) {
+      return true;
+    }
+    final rowCode = row.code;
+    return rowCode != null &&
+        normalizeJoinCode(rowCode) == normalizeJoinCode(expected);
   }
 
   void _applyConnectionState(TaskConnection candidate) {

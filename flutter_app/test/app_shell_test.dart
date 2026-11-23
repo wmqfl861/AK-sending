@@ -11,6 +11,8 @@ import 'package:ak_sending_app/main.dart'
     show UnusableSimpleTransferService, bootstrapAppService;
 import 'package:ak_sending_app/services/dll_path.dart'
     show DllResolution, resolveAkDllPath;
+import 'package:ak_sending_app/services/simple_transfer_fake.dart'
+    show LocalSimpleTransferService;
 import 'package:ak_sending_app/services/ffi_simple_transfer_service.dart';
 import 'package:ak_sending_app/ui/app.dart' show AkSendingApp;
 import 'package:ak_sending_app/ui/service/save_dir_store.dart'
@@ -206,6 +208,20 @@ void main() {
     },
     skip: dllProbe == null ? 'ak_ffi.dll 未找到（先 cargo build -p ak-ffi --release）' : false,
   );
+
+  test('P1-3 (codex X fix): the dev fake\'s connection rows mirror the '
+      'SAME pairing code the real adapter stamps (correlation key '
+      'end-to-end)', () async {
+    final fake = LocalSimpleTransferService();
+    final code = await fake.createCode(TaskRole.send);
+    final id = fake.simulatePeerJoin();
+    expect(fake.connectionsSnapshot.single.code, code.code,
+        reason: '镜像语义：假服务的行携带产生该连接的同一个任务码');
+    // The row keeps the code across probe/state transitions too.
+    fake.completeProbe(id);
+    expect(fake.connectionsSnapshot.single.code, code.code);
+    fake.dispose();
+  });
 }
 
 /// Read-only alias so the conditional-skip reads like services_test.dart.

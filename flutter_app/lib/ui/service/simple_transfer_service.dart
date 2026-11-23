@@ -83,6 +83,7 @@ class TaskConnection {
     required this.state,
     this.idleExpired = false,
     this.peerShortId,
+    this.code,
   });
 
   /// Opaque connection id (also the `sendFiles`/`disconnect` argument).
@@ -111,6 +112,12 @@ class TaskConnection {
   /// `disconnected` one. False on every other cause (and on engines
   /// predating the reason field).
   final bool idleExpired;
+
+  /// The task code that produced this connection — the correlation key
+  /// BOTH sides of the pairing share (the creator minted it, the joiner
+  /// typed it). Additive nullable (X5 follow-up, P1-3): null = the
+  /// implementation lacks the fact.
+  final String? code;
 }
 
 /// Result of joining a code: ok carries the new connection id; failure

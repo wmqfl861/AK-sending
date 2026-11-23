@@ -178,11 +178,24 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   /// phase runs its own probe round and dial on the real socket
   /// (CR-P1-07), so the pairing-time verdict never blocks the send
   /// (审核 §4.3: 对方加入且连通后自动开始发送).
+  ///
+  /// Exactly once is latched by `_autoSendDone` BEFORE the async send
+  /// starts (a second snapshot can never start a parallel send), and the
+  /// payload is seeded from [ConnectionDetailPage.initialPicked] exactly
+  /// once — in `initState`, which a rebuild of the pushed route never
+  /// re-runs (the route's builder may build again, the State is kept).
   void _maybeAutoSend(TaskConnection? row) {
     if (!widget.autoSendOnReady || _autoSendDone || _picked.isEmpty) {
       return;
     }
     if (row == null || row.state == TaskConnectionState.disconnected) {
+      return;
+    }
+    // X4 P1-1(c): only a SEND-direction row may carry the automatic send —
+    // `sendFiles` is invalid on every other connection. The home layer
+    // hands over for send connections only; this keeps that true for any
+    // future caller instead of failing inside the send.
+    if (row.role != TaskRole.send) {
       return;
     }
     _autoSendDone = true;

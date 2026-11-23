@@ -72,6 +72,7 @@ class PluginFilePickGateway implements FilePickGateway {
     this._filePicker,
     this._directoryPicker,
     this._folderOffer,
+    this._folderOnlyOffer,
   });
 
   /// The platform multi-file pick (`FilePicker.pickFiles`): an empty list
@@ -86,12 +87,26 @@ class PluginFilePickGateway implements FilePickGateway {
   /// 「添加文件夹」. Defaults to [_showFolderOffer].
   final Future<bool> Function()? _folderOffer;
 
+  /// The app-side offer after a CANCELLED file pick:「只发送一个文件夹
+  /// 吗？」— true = pick one folder and send only it. Defaults to
+  /// [_showFolderOnlyOffer].
+  final Future<bool> Function()? _folderOnlyOffer;
+
   @override
   Future<List<PickedEntry>> pickFiles() async {
     final files = await (_filePicker ?? fp.FilePicker.pickFiles)();
     if (files.isEmpty) {
-      // Cancelled file pick = overall cancel: no selection, and no folder
-      // offer either — the user is leaving, not adding.
+      // X4 P1-2 (review round 3): a cancelled FILE pick is NOT yet the
+      // end — the user may have come here to send ONLY a folder (§4.4
+      // 「可多选，含文件夹」includes the folder-only case). One offer
+      // follows; declining it (or cancelling the folder pick) is the
+      // overall cancel, exactly as before.
+      if (await (_folderOnlyOffer ?? _showFolderOnlyOffer)()) {
+        final folder = await pickDirectory();
+        if (folder != null) {
+          return <PickedEntry>[folder];
+        }
+      }
       return const <PickedEntry>[];
     }
     final entries = <PickedEntry>[
@@ -152,6 +167,24 @@ Future<bool> _showFolderOffer() async {
   return add == true;
 }
 
+/// X4 P1-2 (review round 3): the offer after a CANCELLED file pick — the
+/// folder-ONLY path of the send main entry. Same rules as
+/// [_showFolderOffer]: nowhere to ask answers false (the pick returns
+/// empty, never blocks).
+Future<bool> _showFolderOnlyOffer() async {
+  final navigator = _rootNavigator();
+  if (navigator == null || !navigator.mounted) {
+    return false;
+  }
+  final pick = await navigator.push<bool>(
+    DialogRoute<bool>(
+      context: navigator.context,
+      builder: (context) => const _FolderOnlyOfferDialog(),
+    ),
+  );
+  return pick == true;
+}
+
 /// The app's root navigator, wherever it sits in the element tree (the
 /// outermost `Navigator` — a depth-first walk meets it first).
 NavigatorState? _rootNavigator() {
@@ -198,6 +231,38 @@ class _FolderOfferDialog extends StatelessWidget {
           key: const ValueKey('folder_offer_add_button'),
           onPressed: () => Navigator.of(context).pop(true),
           child: const Text('添加文件夹'),
+        ),
+      ],
+    );
+  }
+}
+
+/// X4 P1-2 (review round 3): the folder-ONLY offer — the same copy
+/// discipline as [_FolderOfferDialog].
+class _FolderOnlyOfferDialog extends StatelessWidget {
+  const _FolderOnlyOfferDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text(
+        '只发送一个文件夹吗？',
+        key: ValueKey('folder_only_offer_title'),
+      ),
+      content: const Text(
+        '可以选一个文件夹，里面的全部内容会单独发送。',
+        key: ValueKey('folder_only_offer_body'),
+      ),
+      actions: [
+        TextButton(
+          key: const ValueKey('folder_only_offer_cancel_button'),
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          key: const ValueKey('folder_only_offer_pick_button'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('选择文件夹'),
         ),
       ],
     );

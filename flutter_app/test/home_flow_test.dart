@@ -1328,29 +1328,61 @@ void main() {
     ]);
   });
 
-  testWidgets('P1-2: production gateway — a cancelled FILE pick is an '
-      'overall cancel: empty result and NO offer', (tester) async {
+  testWidgets('P1-2 (round 3): a cancelled FILE pick offers the '
+      'folder-ONLY path — declining (or a cancelled folder pick) is the '
+      'overall cancel', (tester) async {
     var directoryPicks = 0;
     List<PickedEntry>? picked;
     final gateway = PluginFilePickGateway(
       filePicker: () async => const <_PlatformFile>[],
       directoryPicker: () async {
         directoryPicks += 1;
-        return _folderPath;
+        return null; // the user backs out of the folder picker
       },
     );
     await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
 
     await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
-    await pumpEvents(tester);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    // The folder-ONLY offer (the round-2 semantics — cancel = leave with
+    // nothing — is REPLACED by the round-3 requirement: folder-only
+    // sending must be reachable from the send main entry).
+    expect(find.byKey(const ValueKey('folder_only_offer_title')),
+        findsOneWidget,
+        reason: '取消选文件后给出只发文件夹的出口');
+    await tester.tap(
+        find.byKey(const ValueKey('folder_only_offer_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    // The folder picker was itself cancelled: overall cancel, empty
+    // result, exactly one folder pick attempted.
+    expect(picked, isNotNull);
+    expect(picked, isEmpty);
+    expect(directoryPicks, 1);
+  });
+
+  testWidgets('P1-2 (round 3): a folder-ONLY selection from the send '
+      'main entry — cancel files, choose the folder, send just it',
+      (tester) async {
+    List<PickedEntry>? picked;
+    final gateway = PluginFilePickGateway(
+      filePicker: () async => const <_PlatformFile>[], // cancelled
+      directoryPicker: () async => _folderPath,
+    );
+    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+
+    await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(
+        find.byKey(const ValueKey('folder_only_offer_pick_button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
 
     expect(picked, isNotNull);
-    expect(picked, isEmpty, reason: '取消选文件＝整体取消（既有规则）');
-    expect(find.text('还要添加整个文件夹吗？'), findsNothing,
-        reason: '取消选文件后不再追问文件夹');
-    expect(directoryPicks, 0);
+    expect(_shapeOf(picked), [(_folderPath, '相册', true, null)],
+        reason: '纯文件夹选择：一个目录条目，没有文件');
   });
 
   testWidgets('P1-2: production gateway — a cancelled FOLDER pick keeps '

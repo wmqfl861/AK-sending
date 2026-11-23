@@ -1106,6 +1106,116 @@ void main() {
         reason: '接收流程不受作废选择干扰');
   });
 
+  // -----------------------------------------------------------------------
+  // Fourth-review fixes: P2-J (join panel invalidates in-flight picks),
+  // P2-K (a terminal row never hands over), P2-L (the engine-failed
+  // latch fails the active flow).
+  // -----------------------------------------------------------------------
+
+  testWidgets('P2-J: opening the join panel invalidates an in-flight send '
+      'pick — the stale pick confirms into NOTHING (no createCode, the '
+      'panel stays)', (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+
+    // The send main path's pick opens and STAYS open (the Windows picker
+    // covering the window without owning it).
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+    expect(gateway.openPicks, 1, reason: '前置：发送初选仍开着');
+
+    // The user activates the parent window and opens the join panel
+    // (接收文件 main entry) — a NEW intent that must retire the pick.
+    await tester.tap(find.byKey(const ValueKey('home_receive_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey('join_code_field')), findsOneWidget);
+
+    // The stale pick finally confirms — discarded: no sender code is
+    // minted over the panel being typed into.
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(fake.createCodeCalls, 0, reason: 'P2-J：作废的发送选择绝不生码');
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsNothing);
+    expect(find.byKey(const ValueKey('join_code_field')), findsOneWidget,
+        reason: 'P2-J：输入面板不受过期选择干扰');
+  });
+
+  testWidgets('P2-K: unreachable verdict → the row goes TERMINAL before the '
+      'deferred handover — no detail page, no send, the KEPT selection '
+      'survives for the retry', (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+    await _openChangePick(tester, gateway); // the change pick defers
+
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    // The probe FAILED: paired-but-unreachable counts as established for
+    // the send — but the open pick defers the handover.
+    fake.failProbe(connId);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(fake.sendFilesCalls, 0, reason: '前置：更改进行中，交接被推迟');
+
+    // The connection goes terminal BEFORE the pick returns — the stale
+    // unreachable row must never read as established.
+    fake.simulateNetworkChange();
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.textContaining('与对方的连接断开了'), findsOneWidget);
+
+    // The pick returns: no handover onto the dead connection.
+    gateway.answer(_replacement);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: 'P2-K：终态行不得交接到详情页');
+    expect(fake.sendFilesCalls, 0, reason: 'P2-K：死连接上绝不发送');
+    expect(find.byKey(const ValueKey('flow_error')), findsOneWidget,
+        reason: '断线失败卡保持可见');
+
+    // The existing drop-during-pick semantics: the KEPT selection (the
+    // one from before the change attempt) survives the failure + retry.
+    await tester.tap(find.byKey(const ValueKey('flow_retry_button')));
+    await pumpEvents(tester);
+    expect(find.textContaining('已选：2 项'), findsOneWidget,
+        reason: 'P2-K：按既有断线-重试语义保留选择');
+    expect(find.textContaining('已选：1 项'), findsNothing,
+        reason: '过期选择（更改挑中的 1 项）绝不落入重试后的流');
+  });
+
+  testWidgets('P2-L: the engine-failed latch FAILS the active waiting flow '
+      '— flow panel gone, engine-failed card visible, no copyable code',
+      (tester) async {
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+
+    // The waiting card with the copyable code is up when the engine dies.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
+    expect(find.byKey(const ValueKey('flow_copy_code')), findsOneWidget);
+
+    fake.failEngine('连续 10 次任务事件轮询失败（fake: poll_event 持续故障）。');
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('engine_failed_card')), findsOneWidget,
+        reason: 'P2-L：引擎故障卡可见');
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsNothing,
+        reason: 'P2-L：引擎故障后不得继续渲染等待卡');
+    expect(find.byKey(const ValueKey('flow_copy_code')), findsNothing,
+        reason: 'P2-L：故障后没有可复制的配对码');
+    expect(find.byKey(const ValueKey('flow_waiting')), findsNothing);
+    expect(find.byKey(const ValueKey('home_send_button')), findsOneWidget,
+        reason: '页面保持可用（降级可导航，如启动错误卡）');
+  });
+
   testWidgets('P1-1(c): the detail page\'s automatic send fires ONLY on a '
       'SEND-direction row, and consumes initialPicked exactly once across '
       'rebuilds and duplicate snapshots', (tester) async {
@@ -1383,6 +1493,83 @@ void main() {
     expect(picked, isNotNull);
     expect(_shapeOf(picked), [(_folderPath, '相册', true, null)],
         reason: '纯文件夹选择：一个目录条目，没有文件');
+  });
+
+  testWidgets('P1-H: an msd: folder pick (Android 11+ Downloads provider '
+      'URI) behaves like a CANCELLED folder pick — the folder-only path '
+      'yields the empty overall result', (tester) async {
+    var directoryPicks = 0;
+    List<PickedEntry>? picked;
+    final gateway = PluginFilePickGateway(
+      filePicker: () async => const <_PlatformFile>[], // cancelled
+      directoryPicker: () async {
+        directoryPicks += 1;
+        return 'msd:2184'; // selectable but unsendable provider URI
+      },
+    );
+    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+
+    await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(
+        find.byKey(const ValueKey('folder_only_offer_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(directoryPicks, 1, reason: '前置：文件夹选择确实发生了');
+    expect(picked, isNotNull);
+    expect(picked, isEmpty,
+        reason: 'P1-H：msd: URI 不可发送——按取消选文件夹处理，整体空结果');
+  });
+
+  testWidgets('P1-H: a file list with one normal file and one msd: file '
+      'returns ONLY the normal file', (tester) async {
+    List<PickedEntry>? picked;
+    final gateway = PluginFilePickGateway(
+      filePicker: () async => [
+        _PlatformFile('照片.zip', _filePath1, 1536),
+        _PlatformFile('下载项', 'msd:2184', 4096),
+      ],
+      directoryPicker: () async => _folderPath,
+    );
+    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+
+    await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    // The append offer still follows (a real selection exists): decline
+    // it — the remaining files alone are the result.
+    await tester.tap(find.byKey(const ValueKey('folder_offer_decline_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(_shapeOf(picked), [
+      (_filePath1, '照片.zip', false, 1536),
+    ], reason: 'P1-H：msd: 文件被剔除，正常文件保留（追加路径保留剩余文件）');
+  });
+
+  testWidgets('P1-H: the append path with an msd: FOLDER pick keeps the '
+      'files (the unsendable folder is a cancelled folder pick)',
+      (tester) async {
+    List<PickedEntry>? picked;
+    final gateway = PluginFilePickGateway(
+      filePicker: () async => _twoPlatformFiles,
+      directoryPicker: () async => 'msd:2184',
+    );
+    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+
+    await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('folder_offer_add_button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(_shapeOf(picked), [
+      (_filePath1, '照片.zip', false, 1536),
+      (_filePath2, '报告.pdf', false, 512 * 1024),
+    ], reason: 'P1-H：追加的 msd: 文件夹按取消处理——已选文件保留');
   });
 
   testWidgets('P1-2: production gateway — a cancelled FOLDER pick keeps '

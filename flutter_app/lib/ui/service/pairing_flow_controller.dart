@@ -211,6 +211,19 @@ class PairingFlowController extends ChangeNotifier {
     _begin(kind: null, phase: null);
   }
 
+  /// P2-J (fourth review): invalidate every in-flight pick WITHOUT
+  /// touching the flow state — the join-code panel being opened is a NEW
+  /// user intent on the home surface, and a send-pick still open behind
+  /// it (the Windows parent-window activation shape: the picker covers
+  /// the window but does not own it) must never confirm into a sender
+  /// code that covers the panel being typed into. Bumps [generation]
+  /// exactly like [_begin]/[_fail] do, so the home layer's
+  /// captured-generation guards discard the stale pick's result whenever
+  /// it returns.
+  void invalidatePicks() {
+    _generation++;
+  }
+
   /// Wave-30 P2-04: the 取消等待 of a shown code — cancels the flow AND
   /// revokes the unconsumed code engine-side (`disconnect(codeId)`: the
   /// registry row is revoked, the code can never be redeemed). Flows
@@ -343,6 +356,21 @@ class PairingFlowController extends ChangeNotifier {
         // success, where the panel is already done and the list card
         // simply disappears.
         if (phase != PairingFlowPhase.success) {
+          // P2-K (fourth review): carry the TERMINAL fact on the row.
+          // The snapshot no longer lists it, but the latched copy keeps
+          // whatever state it died in — a stale `unreachable` carry
+          // must never read as "established" to the home handover after
+          // the row is gone (a deferred handover would otherwise open a
+          // dead connection's page with the preselected files).
+          connection = TaskConnection(
+            id: latched.id,
+            peerName: latched.peerName,
+            role: latched.role,
+            state: TaskConnectionState.disconnected,
+            idleExpired: latched.idleExpired,
+            peerShortId: latched.peerShortId,
+            code: latched.code,
+          );
           _fail('与对方的连接断开了，请重新配对。');
         }
       } else if (current.state != latched.state) {

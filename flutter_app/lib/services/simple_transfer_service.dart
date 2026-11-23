@@ -1510,24 +1510,78 @@ final class SimpleTransferService {
   /// waiting flow on it), and a service with no other activity facts
   /// (no live rows, no transfers, no other awaited code) settles its
   /// phase back to `idle`: the pairing that code represented is over.
+  ///
+  /// P2-H (belt and braces, fourth review): a code whose pairing LANDED
+  /// is not expired — an expired-deadline candidate with a LIVE row
+  /// carrying the same code string leaves silently (no [codeExpired]
+  /// reset for a flow that just paired, no disconnect: the connection's
+  /// own cleanup path owns a paired code).
+  ///
+  /// P2-I (fourth review): an expired UN-JOINED code is revoked
+  /// engine-side on the purge — one best-effort `disconnect(codeId)`
+  /// releases the native pairing listener that lives until cancel or
+  /// teardown; the engine's `-4` for an id it no longer knows folds
+  /// away benignly (the [disconnect] op's errNotFound shape).
   bool _purgeExpiredAwaitedCodes() {
     if (_awaitedCodes.isEmpty) {
       return false;
     }
     final now = _clock();
-    final expired = <String>[
-      for (final entry in _awaitedCodes.entries)
-        if (!entry.value.isAfter(now)) entry.key,
-    ];
+    // P2-H: the code ids whose pairing is LIVE (a live row carries the
+    // code whose normalized key maps to the id — the correlation both
+    // createCode and the `connected` event fill).
+    final pairedCodeIds = <String>{};
+    for (final row in _connections.values) {
+      final rowCode = row.code;
+      if (_stateRank(row.state) < 2 && rowCode != null) {
+        final id = _codeIdOfKey[_codeKey(rowCode)];
+        if (id != null) {
+          pairedCodeIds.add(id);
+        }
+      }
+    }
+    final expired = <String>[];
+    final paired = <String>[];
+    for (final entry in _awaitedCodes.entries) {
+      if (entry.value.isAfter(now)) {
+        continue; // still inside its TTL
+      }
+      if (pairedCodeIds.contains(entry.key)) {
+        paired.add(entry.key); // P2-H: the pairing superseded the wait
+      } else {
+        expired.add(entry.key);
+      }
+    }
     for (final codeId in expired) {
       _awaitedCodes.remove(codeId);
     }
-    if (expired.isEmpty) {
+    for (final codeId in paired) {
+      // P2-H: silently — the live row holds the keep-awake gate now and
+      // its own terminal path ends everything later; announcing an
+      // expiry here would reset a pairing that just landed.
+      _awaitedCodes.remove(codeId);
+    }
+    if (paired.isEmpty && expired.isEmpty) {
       return false;
     }
-    if (!_codeExpiredController.isClosed) {
+    if (expired.isNotEmpty && !_codeExpiredController.isClosed) {
       for (final codeId in expired) {
         _codeExpiredController.add(codeId);
+      }
+    }
+    // P2-I: release the native listener of every UN-JOINED expired code.
+    // Best-effort by design: the Dart bookkeeping above already holds,
+    // and an engine that already reaped the id answers `-4` (errNotFound
+    // — the same benign fold as the cancel op); any other failure is
+    // swallowed rather than failing the purge.
+    final runtime = _runtime;
+    if (expired.isNotEmpty && runtime != null && !_engineFailed) {
+      for (final codeId in expired) {
+        try {
+          runtime.disconnect(codeId);
+        } on Object {
+          // best-effort — nothing about the purge depends on it
+        }
       }
     }
     final nothingElseLive = _awaitedCodes.isEmpty &&
@@ -2536,6 +2590,23 @@ final class SimpleTransferService {
       return;
     }
     if (event is TaskConnectedEvent) {
+      // P2-H (fourth review): the code PAIRED — end its TTL wait BEFORE
+      // anything below can observe the expiry. A `connected` event queued
+      // before the deadline but drained after it must land as a pairing,
+      // never as a `codeExpired` reset: the row upsert and every activity
+      // re-evaluation behind it (`_upsert` → `_syncPump`, the explicit
+      // `_emitTransferActivity` below) all pass through the purge, which
+      // used to fire the expiry for a code that JUST paired.
+      final codeId = event.codeId;
+      final code = event.code;
+      if (codeId != null && code != null && code.isNotEmpty) {
+        // R30-P2-02: the `connected` event teaches a JOINER the pairing's
+        // code_id (the creator fills the same table at mint time).
+        _codeIdOfKey[_codeKey(code)] = codeId;
+        // W-N11: the code PAIRED — the wait is over (the gate stays held
+        // by the now-live connection until the pairing ends).
+        _awaitedCodes.remove(codeId);
+      }
       // The engine announces the CONNECTION (pairing bookkeeping) before
       // probing: a fresh row starts at `probing`; a row the pump already
       // settled (probe verdict / terminal) keeps its state (P2-09).
@@ -2548,20 +2619,9 @@ final class SimpleTransferService {
         peerShortId: event.peerFpShort, // X5: verified-fp short code
         state: 'probing',
       );
-      // W-N11: a fresh LIVE row can raise the keep-awake gate.
+      // W-N11: a fresh LIVE row can raise the keep-awake gate — and a
+      // wait that ended above drops its own vote here.
       _emitTransferActivity();
-      final codeId = event.codeId;
-      final code = event.code;
-      if (codeId != null && code != null && code.isNotEmpty) {
-        // R30-P2-02: the `connected` event teaches a JOINER the pairing's
-        // code_id (the creator fills the same table at mint time).
-        _codeIdOfKey[_codeKey(code)] = codeId;
-        // W-N11: the code PAIRED — the wait is over (the gate stays held
-        // by the now-live connection until the pairing ends).
-        if (_awaitedCodes.remove(codeId) != null) {
-          _emitTransferActivity();
-        }
-      }
       return;
     }
     if (event is TaskProbeResultEvent) {

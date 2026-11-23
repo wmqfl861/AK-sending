@@ -162,8 +162,18 @@ class _HomePageState extends State<HomePage> {
     // stale waiting/connecting UI on screen.
     _engineHealthSub = widget.service.engineHealth.listen(
       (health) {
-        if (mounted) {
-          setState(() => _engineHealth = health);
+        if (!mounted) {
+          return;
+        }
+        setState(() => _engineHealth = health);
+        // P2-L (fourth review): the latch also FAILS every active flow —
+        // the waiting card (with its copyable code) is a lie on a dead
+        // engine: no peer can join a code the engine can no longer
+        // redeem. Resetting the flow retires the panel (and its pending
+        // selection) so the engine-failed card below is the one honest
+        // state left on the page.
+        if (health.isEngineFailed && _flow.active) {
+          _flow.reset(); // notifies _onFlowChanged (picks invalidate too)
         }
       },
       onError: (Object _) {},
@@ -241,12 +251,19 @@ class _HomePageState extends State<HomePage> {
         _autoOpenedConnectionId != connection.id &&
         !_picksInFlightFor(_flow.generation)) {
       final pending = _pendingEntries;
-      final established = _flow.phase == PairingFlowPhase.success ||
-          // X4: paired-but-unreachable counts as established for the
-          // send — the controller's row state is the fresh fact here
-          // (home's own snapshot may lag this notification by a
-          // microtask).
-          connection.state == TaskConnectionState.unreachable;
+      // P2-K (fourth review): a TERMINAL row is never established — the
+      // controller's state carry marks the row `disconnected` when the
+      // connection dies after the unreachable verdict, so a deferred
+      // handover must not open a dead connection's page and consume the
+      // preselection.
+      final terminal = connection.state == TaskConnectionState.disconnected;
+      final established = !terminal &&
+          (_flow.phase == PairingFlowPhase.success ||
+              // X4: paired-but-unreachable counts as established for the
+              // send — the controller's row state is the fresh fact here
+              // (home's own snapshot may lag this notification by a
+              // microtask).
+              connection.state == TaskConnectionState.unreachable);
       if (established && (pending != null && pending.isNotEmpty ||
           _flow.phase == PairingFlowPhase.success)) {
         _autoOpenedConnectionId = connection.id;
@@ -427,6 +444,17 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// P2-J (fourth review): opening the join-code input panel is a NEW
+  /// user intent on the home surface — invalidate every in-flight pick
+  /// first. A send-pick still open behind the panel (the Windows
+  /// parent-window activation shape: activating the app under the picker
+  /// does not close it) must never confirm into a sender code that
+  /// covers the panel being typed into.
+  void _openJoinInput(TaskRole role) {
+    _flow.invalidatePicks();
+    setState(() => _joinInputRole = role);
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -494,10 +522,9 @@ class _HomePageState extends State<HomePage> {
         else
           _HomeActions(
             onSend: _startSendFlow,
-            onJoinSendCode: () =>
-                setState(() => _joinInputRole = TaskRole.send),
-            onReceive: () =>
-                setState(() => _joinInputRole = TaskRole.receive),
+            // P2-J: both join-panel entries retire any in-flight pick.
+            onJoinSendCode: () => _openJoinInput(TaskRole.send),
+            onReceive: () => _openJoinInput(TaskRole.receive),
             onCreateReceiveCode: () => _flow.startCreate(TaskRole.receive),
           ),
         const SizedBox(height: 24),

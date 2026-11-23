@@ -19,11 +19,22 @@
 ///   [PluginFilePickGateway.pickDirectory] and appends that entry;
 /// * 「不用了」 — or dismissing the dialog, or cancelling the folder pick —
 ///   keeps the files alone;
-/// * a cancelled FILE pick stays an overall cancel: empty list, and no
-///   offer at all (the existing rule).
+/// * a cancelled FILE pick opens the folder-ONLY offer (round 3): choosing
+///   it sends just one folder; declining it — or cancelling the folder
+///   pick — is the overall cancel (empty list).
 ///
 /// The [FilePickGateway] interface is unchanged, so fakes and walkthroughs
 /// that inject their own gateway never see the offer.
+///
+/// P1-H (fourth review): only FILESYSTEM paths leave the gateway. A pick
+/// result (file or folder) whose path is not absolute-on-disk — no leading
+/// `/`, no `X:\`/`X:/` drive letter, no `\\` UNC root, or a scheme-like
+/// `xxx:` provider URI — is EXCLUDED from the returned entries: Android
+/// 11+ Downloads-provider folder picks can return `msd:<numeric id>` URIs
+/// that are selectable but UNSENDABLE (`sendFiles` needs filesystem
+/// paths). If the whole selection is excluded, the folder-only path
+/// behaves like a cancelled folder pick (empty overall result) and the
+/// append path keeps the remaining files.
 library;
 
 import 'package:file_picker/file_picker.dart' as fp;
@@ -110,14 +121,24 @@ class PluginFilePickGateway implements FilePickGateway {
       return const <PickedEntry>[];
     }
     final entries = <PickedEntry>[
+      // P1-H: EXCLUDE every non-filesystem path (e.g. an `msd:` provider
+      // URI) — selectable but unsendable. A null platform path fails the
+      // same check and is excluded too.
       for (final file in files)
-        PickedEntry(
-          path: file.path ?? '',
-          name: file.name,
-          isDirectory: false,
-          sizeBytes: file.lengthSync(),
-        ),
+        if (_isFileSystemPath(file.path ?? ''))
+          PickedEntry(
+            path: file.path!,
+            name: file.name,
+            isDirectory: false,
+            sizeBytes: file.lengthSync(),
+          ),
     ];
+    if (entries.isEmpty) {
+      // P1-H: the WHOLE selection was provider URIs — nothing sendable
+      // came back. The empty result is the honest answer; no folder
+      // offer follows (there was no real file selection to build on).
+      return const <PickedEntry>[];
+    }
     // X4 P1-2: ONE optional whole folder after a real selection.
     if (await (_folderOffer ?? _showFolderOffer)()) {
       final folder = await pickDirectory();
@@ -135,12 +156,37 @@ class PluginFilePickGateway implements FilePickGateway {
     if (path == null) {
       return null;
     }
+    if (!_isFileSystemPath(path)) {
+      // P1-H: a provider URI (e.g. an Android 11+ Downloads `msd:<id>`)
+      // is not a sendable folder — behave exactly like a cancelled
+      // folder pick: the folder-only path yields the empty overall
+      // result, the append path keeps the files.
+      return null;
+    }
     final name = path.split(RegExp(r'[\\/]')).last;
     return PickedEntry(
       path: path,
       name: name.isEmpty ? path : name,
       isDirectory: true,
     );
+  }
+
+  /// P1-H (fourth review): is [path] a FILESYSTEM path the engine can
+  /// send? True only for an absolute on-disk path — a POSIX root
+  /// (`/…`), a Windows drive (``C:\…` / `C:/…``), or a UNC root
+  /// (`\\…`). Everything else — a relative path, an empty path, or a
+  /// scheme-like provider URI (`msd:123`, `content://…`) — is excluded:
+  /// the Downloads provider on Android 11+ hands out `msd:<numeric id>`
+  /// URIs that `sendFiles` cannot use.
+  static bool _isFileSystemPath(String path) {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) {
+      return false;
+    }
+    if (trimmed.startsWith('/') || trimmed.startsWith(r'\\')) {
+      return true;
+    }
+    return RegExp(r'^[A-Za-z]:[\\/]').hasMatch(trimmed);
   }
 }
 

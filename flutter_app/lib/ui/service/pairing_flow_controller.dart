@@ -115,11 +115,15 @@ class PairingFlowController extends ChangeNotifier {
 
   /// P1-A (third review): the monotonically increasing FLOW generation —
   /// bumped on EVERY [_begin] (each [startCreate]/[startJoin]/[reset]: a
-  /// cancel, a 返回, or another entry's flow beginning). The home layer
-  /// captures it before an async picker round-trip and discards the
-  /// result when it has moved on, so a picker left open across a reset
-  /// can never write its selection into the NEXT flow's state (B's
-  /// auto-send would carry A's files over B's connection).
+  /// cancel, a 返回, or another entry's flow beginning) AND on every
+  /// [_fail] (P1-D, fourth review: a pick opened while the flow was
+  /// healthy belongs to THAT flow — a connection drop followed by a
+  /// 重试 mints a fresh flow, and the stale picker's result must never
+  /// land in it). The home layer captures it before an async picker
+  /// round-trip and discards the result when it has moved on, so a
+  /// picker left open across a reset, failure or retry can never write
+  /// its selection into the NEXT flow's state (B's auto-send would carry
+  /// A's files over B's connection).
   int get generation => _generation;
 
   int _generation = 0;
@@ -266,7 +270,24 @@ class PairingFlowController extends ChangeNotifier {
   /// error object/string the failed view maps — when set, the mapped
   /// card replaces the label and the original text only renders inside
   /// the expandable 「详情」.
-  void _fail(String reason, {Object? cause}) {
+  ///
+  /// P1-D (fourth review): failing ALSO bumps the flow generation
+  /// ([invalidatesPicks], the default). The pending selection itself is
+  /// NOT flow-scoped, so it still survives a failure+重试 for the home
+  /// layer to reuse (the tested behavior) — but any picker still open
+  /// from the failed flow now reads a moved generation and its result
+  /// dies, whenever it returns: a 更改 opened before the drop used to
+  /// ride the unchanged generation into the RETRIED flow, and the
+  /// retried pairing would then auto-send the stale-picked set. The ONE
+  /// exception is the paired-but-unreachable probe verdict: the pairing
+  /// is committed and the automatic-send handover still runs FROM the
+  /// failed state, so an open 更改 pick still belongs to THIS flow
+  /// there.
+  void _fail(String reason, {Object? cause, bool invalidatesPicks = true}) {
+    if (invalidatesPicks) {
+      // P1-D: the failed flow's pick windows close with it.
+      _generation++;
+    }
     phase = PairingFlowPhase.failed;
     error = reason;
     errorCause = cause;
@@ -373,8 +394,11 @@ class PairingFlowController extends ChangeNotifier {
         // ends the flow with a readable reason (never "success"). X4: the
         // HOME layer may still hand this paired-but-unreachable row to the
         // automatic send of the primary send path (the send phase runs its
-        // own probe round and dial — 审核 §4.5 wording: 无法直接连接).
-        _fail('无法直接连接到对方，请检查网络后重试。');
+        // own probe round and dial — 审核 §4.5 wording: 无法直接连接), so
+        // the verdict does NOT close the flow's pick windows (P1-D): a
+        // 更改 still open across the verdict still settles into THIS
+        // flow's pending selection for that handover.
+        _fail('无法直接连接到对方，请检查网络后重试。', invalidatesPicks: false);
       case TaskConnectionState.disconnected:
         _fail('与对方的连接断开了，请重新配对。');
     }

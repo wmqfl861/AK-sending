@@ -253,6 +253,9 @@ class _ThrowingStartService implements SimpleTransferService {
   Stream<String> get idleExpiries => const Stream.empty();
 
   @override
+  Stream<String> get codeExpired => const Stream.empty();
+
+  @override
   Stream<IncomingRequest> get incomingRequests => const Stream.empty();
 
   @override

@@ -193,6 +193,101 @@ void main() {
         reason: 'P1-B：TTL 已过——无事件也要释放 keep-awake 门');
     service.dispose();
   });
+
+  test(
+      'P1-E: the engine-failed latch releases the gate held by an awaited '
+      'code (the dead pump can never run the TTL purge)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final created = await service.createCode(SimpleTransferRole.sender);
+    expect(created.codeId, isNotNull);
+    expect(await gateHeld(service), true,
+        reason: '前置：等待对方加入的码点亮屏幕');
+
+    // The terminal engine-failure latch (10 consecutive native poll
+    // failures — the C12 mechanism).
+    for (var i = 0; i < SimpleTransferService.pollFailureThreshold; i++) {
+      fake.failPollEventCalls = 1;
+      service.pumpEvents();
+    }
+    expect(service.isEngineFailed, isTrue, reason: '前置：引擎故障闩已闩上');
+
+    // The pump is dead — the TTL purge inside it will never fire again,
+    // so the LATCH itself must release the gate (P1-E).
+    expect(await gateHeld(service), false,
+        reason: 'P1-E：引擎已故障——任何等待不得再点亮屏幕');
+    service.dispose();
+  });
+
+  test(
+      'P1-E: the engine-failed latch marks every live row terminal and '
+      'releases the gate (honest: the engine is gone)', () async {
+    final fake = FakeAkTaskCalls();
+    final service = booted(fake);
+    final created = await service.createCode(SimpleTransferRole.sender);
+    await service.join(created.code);
+    service.pumpEvents();
+    expect(service.currentConnections.first.state, 'connected',
+        reason: '前置：先有一条存活连接');
+    expect(await gateHeld(service), true,
+        reason: '前置：配对等待阶段门保持');
+
+    for (var i = 0; i < SimpleTransferService.pollFailureThreshold; i++) {
+      fake.failPollEventCalls = 1;
+      service.pumpEvents();
+    }
+    expect(service.isEngineFailed, isTrue);
+
+    expect(
+      service.currentConnections
+          .every((row) => row.state == 'disconnected'),
+      isTrue,
+      reason: 'P1-E：引擎已亡——存活行必须全部终结，不得永久点亮屏幕',
+    );
+    expect(await gateHeld(service), false,
+        reason: 'P1-E：无等待、无存活行——门立即释放');
+    service.dispose();
+  });
+
+  test(
+      'P2-E: the TTL purge announces the expired code on codeExpired and '
+      'settles the phase to idle when nothing else is live', () async {
+    var now = DateTime(2026, 11, 23, 12);
+    final service = SimpleTransferService(
+      calls: FakeAkTaskCalls(), // create results carry expires_ms: 0
+      delay: immediate,
+      eventPollInterval: const Duration(days: 1), // tests pump manually
+      clock: () => now,
+    );
+    service.start(
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/wn11-test',
+    );
+    final created = await service.createCode(SimpleTransferRole.sender);
+    expect(created.codeId, isNotNull);
+    expect(service.phase, SimpleTransferPhase.paired,
+        reason: '前置：生码后服务停在 paired（过去会一直停在这里）');
+
+    final expired = <String>[];
+    final sub = service.codeExpired.listen(expired.add);
+
+    // The clock alone passes the fallback TTL; the next evaluation
+    // purges the wait — the purge must ANNOUNCE the code id and settle
+    // the phase (the home card ends on the same fact).
+    now = now.add(const Duration(seconds: 601));
+    service.setAppBackgrounded(true);
+    await pumpEventQueue();
+
+    expect(expired, [created.codeId],
+        reason: 'P2-E：TTL 清除必须在 codeExpired 上广播被清除的 code_id');
+    expect(service.phase, SimpleTransferPhase.idle,
+        reason: 'P2-E：无其它活动事实时相位必须回到 idle');
+    expect(await gateHeld(service), false,
+        reason: 'P2-E：过期码不再点亮屏幕（门已释放）');
+    await sub.cancel();
+    service.dispose();
+  });
 }
 
 /// P1-B test seam: rewrites every `task_create_code` op result of the

@@ -129,6 +129,11 @@ class LocalSimpleTransferService implements SimpleTransferService {
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
 
+  /// P2-E (fourth review): awaited-code TTL expiries (driven explicitly
+  /// by tests via [expireCode] — no timers in the fake).
+  final StreamController<String> _codeExpiredController =
+      StreamController<String>.broadcast();
+
   /// R36-P2-03: the engine-health fan-out (see [engineHealth] /
   /// [failEngine]).
   final StreamController<EngineHealth> _engineHealthController =
@@ -348,6 +353,7 @@ class LocalSimpleTransferService implements SimpleTransferService {
     _incomingController.close();
     _expiredIncomingController.close();
     _idleExpiryController.close();
+    _codeExpiredController.close();
     _engineHealthController.close();
     _progressController.close();
   }
@@ -567,6 +573,24 @@ class LocalSimpleTransferService implements SimpleTransferService {
   /// J2: conn ids whose pairing ended by idle expiry.
   @override
   Stream<String> get idleExpiries => _idleExpiryController.stream;
+
+  /// P2-E (fourth review): code ids whose created-but-unpaired code
+  /// expired at its TTL.
+  @override
+  Stream<String> get codeExpired => _codeExpiredController.stream;
+
+  /// P2-E test hook: announce [codeId]'s TTL expiry and kill the pending
+  /// code (the real engine refuses the join of an expired code with its
+  /// unified unavailable answer — the fake's pending code goes with the
+  /// announcement so a later join fails like the engine's would).
+  void expireCode(String codeId) {
+    if (_pendingCode != null && _pendingCode!.codeId == codeId) {
+      _pendingCode = null;
+    }
+    if (!_codeExpiredController.isClosed) {
+      _codeExpiredController.add(codeId);
+    }
+  }
 
   /// J2 test hook: announce the expiry, then remove [connId] from the
   /// live list, matching the real adapter's terminal-row filtering. The

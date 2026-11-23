@@ -75,6 +75,7 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<List<TaskConnection>>? _connectionsSub;
   StreamSubscription<EngineHealth>? _engineHealthSub;
   StreamSubscription<TransferProgress>? _progressSub;
+  StreamSubscription<String>? _codeExpiredSub;
   List<TaskConnection> _connections = const [];
 
   /// U1: the latest progress snapshot per LIVE connection id.
@@ -114,7 +115,17 @@ class _HomePageState extends State<HomePage> {
   /// still open when another flow's own 更改 opens), and the first
   /// returning pick must not un-defer the handover while the second is
   /// still in flight.
-  int _picksInFlight = 0;
+  ///
+  /// P2-D (fourth review): the counters are PER FLOW GENERATION. A stale
+  /// flow's still-open picker must not defer (or, by returning, release)
+  /// the CURRENT flow's handover — the guard below counts only picks the
+  /// current generation opened.
+  final Map<int, int> _picksInFlightByGeneration = <int, int>{};
+
+  /// P2-E (fourth review): the shown code that expired at its TTL (the
+  /// service's `codeExpired` fact) — the waiting card was reset for it
+  /// and this notice card explains why, until the next flow begins.
+  String? _expiredCodeNotice;
 
   @override
   void initState() {
@@ -157,6 +168,12 @@ class _HomePageState extends State<HomePage> {
       },
       onError: (Object _) {},
     );
+    // P2-E (fourth review): the shown code's TTL expiry — the service's
+    // `codeExpired` fact ends the waiting flow and surfaces the expiry
+    // copy (the code card would otherwise wait forever on a code the
+    // engine already refuses to redeem).
+    _codeExpiredSub = widget.service.codeExpired.listen(_onCodeExpired,
+        onError: (Object _) {});
   }
 
   @override
@@ -166,7 +183,23 @@ class _HomePageState extends State<HomePage> {
     _connectionsSub?.cancel();
     _engineHealthSub?.cancel();
     _progressSub?.cancel();
+    _codeExpiredSub?.cancel();
     super.dispose();
+  }
+
+  /// P2-E: the awaited code THIS flow is showing died at its TTL — the
+  /// waiting card is a lie now. Reset the flow (the pending selection
+  /// dies with it, like every other flow end) and show the expiry notice
+  /// until the next flow begins. Events for other codes (a stale flow's,
+  /// or one already paired) change nothing.
+  void _onCodeExpired(String codeId) {
+    if (!mounted) return;
+    if (_flow.code?.codeId != codeId ||
+        _flow.phase != PairingFlowPhase.awaitingPeer) {
+      return;
+    }
+    _flow.reset(); // notifies _onFlowChanged: the pending selection goes
+    setState(() => _expiredCodeNotice = codeId);
   }
 
   void _onFlowChanged() {
@@ -175,6 +208,9 @@ class _HomePageState extends State<HomePage> {
       // The flow ended (reset/cancel) — the pending selection of the
       // primary send path dies with it; the next send re-picks.
       _pendingEntries = null;
+    } else {
+      // A new flow began — the previous flow's expiry notice retires.
+      _expiredCodeNotice = null;
     }
     // X4/W7.2 连接成功直达 — when THIS device is the sender, the flow's
     // established state hands over to the connection detail page:
@@ -197,11 +233,13 @@ class _HomePageState extends State<HomePage> {
     // is about to be replaced, and handing the old list over now would
     // send what the user is in the middle of changing. The deferred
     // handover runs from `_settleSelectionChange` when the pick returns.
+    // P2-D: only the CURRENT generation's picks defer it — a stale flow's
+    // still-open picker never blocked (or released) this flow's handover.
     final connection = _flow.connection;
     if (connection != null &&
         connection.role == TaskRole.send &&
         _autoOpenedConnectionId != connection.id &&
-        _picksInFlight == 0) {
+        !_picksInFlightFor(_flow.generation)) {
       final pending = _pendingEntries;
       final established = _flow.phase == PairingFlowPhase.success ||
           // X4: paired-but-unreachable counts as established for the
@@ -241,6 +279,29 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() {});
   }
+
+  /// P2-D: opens one in-flight pick window for [generation] — the
+  /// automatic-send handover of THAT generation (and no other) defers
+  /// until the window closes.
+  void _beginPick(int generation) {
+    _picksInFlightByGeneration[generation] =
+        (_picksInFlightByGeneration[generation] ?? 0) + 1;
+  }
+
+  /// P2-D: closes one in-flight pick window of [generation] (a stale
+  /// generation's window closing never touches the current one's count).
+  void _endPick(int generation) {
+    final remaining = (_picksInFlightByGeneration[generation] ?? 1) - 1;
+    if (remaining <= 0) {
+      _picksInFlightByGeneration.remove(generation);
+    } else {
+      _picksInFlightByGeneration[generation] = remaining;
+    }
+  }
+
+  /// P2-D: does [generation] have any 更改 pick in flight?
+  bool _picksInFlightFor(int generation) =>
+      (_picksInFlightByGeneration[generation] ?? 0) > 0;
 
   /// X4 发送文件主路径: pick the files FIRST (multi-select); only a
   /// non-empty selection mints the (sender-role) code. A cancelled pick
@@ -282,12 +343,16 @@ class _HomePageState extends State<HomePage> {
   ///
   /// P1-A (third review): the pick belongs to the flow generation that
   /// owns the pending selection RIGHT NOW — remembered before the await,
-  /// verified after. A 返回 (reset) or another flow's `_begin` while the
+  /// verified after. A 返回 (reset), a FAILURE (P1-D: `_fail` bumps the
+  /// generation too, so a 更改 opened before a connection drop never
+  /// lands in the RETRIED flow) or another flow's `_begin` while the
   /// picker is open moves [PairingFlowController.generation], and the
   /// result is DISCARDED: it must never land in the next flow's state
   /// (B's auto-send would carry A's files over B's connection). The
-  /// handover count still drops in the `finally`, and a handover the
-  /// open pick deferred for the CURRENT flow flushes either way.
+  /// handover window still closes in the `finally` (P2-D: keyed by the
+  /// CAPTURED generation, so it never clears another flow's deferral),
+  /// and a handover the open pick deferred for the CURRENT flow flushes
+  /// either way.
   Future<void> _changeSelection() async {
     if (_pendingEntries == null) {
       // Nothing left to change: the selection was already handed over
@@ -296,7 +361,7 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final generation = _flow.generation;
-    _picksInFlight += 1;
+    _beginPick(generation);
     List<PickedEntry> entries = const <PickedEntry>[];
     try {
       entries = await widget.picker.pickFiles();
@@ -305,7 +370,7 @@ class _HomePageState extends State<HomePage> {
       // deferred handover is never stranded behind a stuck count. An
       // error keeps the last selection like a cancelled change, then
       // propagates exactly as it did before this change.
-      _picksInFlight -= 1;
+      _endPick(generation);
       if (mounted) {
         if (_flow.generation == generation) {
           _settleSelectionChange(entries);
@@ -380,6 +445,14 @@ class _HomePageState extends State<HomePage> {
             title: '传输引擎故障，请重启应用',
             detail: _engineHealth.failureReason ?? '连续原生轮询失败。',
             detailKey: const ValueKey('engine_failed_card_detail'),
+          ),
+        if (_expiredCodeNotice != null && !_flow.active)
+          // P2-E: the shown code's TTL expiry — the waiting flow was
+          // reset the moment the service announced it; this card is the
+          // honest reason until the next flow begins.
+          _CodeExpiredNotice(
+            key: const ValueKey('flow_code_expired'),
+            onDismiss: () => setState(() => _expiredCodeNotice = null),
           ),
         Text('连接', style: theme.textTheme.headlineSmall),
         const SizedBox(height: 4),
@@ -498,6 +571,64 @@ class _HomeActions extends StatelessWidget {
           child: const Text('想让对方输入你的码？生成接收码'),
         ),
       ],
+    );
+  }
+}
+
+/// P2-E (fourth review): the shown code's TTL-expiry notice — the
+/// failure-card shape (W-N9 family: 结果 + 原因 + 建议) with the
+/// transfer_errors copy, shown after the service's `codeExpired` fact
+/// reset the waiting flow. 返回 dismisses it; starting any new flow
+/// retires it too.
+class _CodeExpiredNotice extends StatelessWidget {
+  const _CodeExpiredNotice({super.key, required this.onDismiss});
+
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.timer_off, color: theme.colorScheme.error,
+                      size: 32),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      codeExpiredTitle,
+                      key: const ValueKey('flow_code_expired_title'),
+                      style: theme.textTheme.titleMedium
+                          ?.copyWith(color: theme.colorScheme.error),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(codeExpiredReason, style: theme.textTheme.bodyMedium),
+              const SizedBox(height: 4),
+              Text(codeExpiredSuggestion,
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: theme.colorScheme.outline)),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton(
+                  key: const ValueKey('flow_code_expired_dismiss'),
+                  onPressed: onDismiss,
+                  child: const Text('返回'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

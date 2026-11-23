@@ -145,6 +145,14 @@ const String idleExpirySuggestion = '请重新配对。';
 const String interruptedTitle = '连接已中断';
 const String interruptedSuggestion = '重新发送，会从断点续传';
 
+/// P2-E (fourth review): the SHOWN code's TTL expiry — the home code
+/// card's terminal copy when the service purges an awaited code nobody
+/// joined (审核 §4.5 wording: the result, one plain sentence, one
+/// actionable suggestion — W-N9 family, additive like the idle copy).
+const String codeExpiredTitle = '配对码已过期';
+const String codeExpiredReason = '配对码超过有效期仍未有人加入，本次发起已结束。';
+const String codeExpiredSuggestion = '请重新生成。';
+
 /// The one-line status the connection detail page shows for a dropped
 /// (non-idle) connection: the interruption title plus the resume hint.
 const String interruptedStatusLine = '连接已中断，重新发送会从断点续传。';

@@ -266,12 +266,28 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     // start() forever. The `.then` re-types the future first: a
     // resolver's concrete Future<String>/Future<Null> must not
     // parametrize `timeout`'s T (the onTimeout answer is null, a String?).
-    final resolved = deviceName ?? _deviceNameResolver(_isAndroidPlatform);
-    final String? selfName = resolved is Future<String?>
-        ? await resolved
-            .then<String?>((name) => name)
-            .timeout(deviceNameResolveTimeout, onTimeout: () => null)
-        : resolved;
+    //
+    // P2-F (fourth review): EVERY name is validated against the engine's
+    // wire rules before it reaches the engine — the explicit param used
+    // to skip [_presentableDeviceName] entirely, so an engine-rejected
+    // name (66 raw bytes, control characters) broke create/join on the
+    // registry. An invalid EXPLICIT name degrades to null (the engine
+    // default stands; never truncates the caller's exact string, never
+    // throws); a resolver's answer runs through the same byte-exact
+    // mirror as the built-in platform defaults (trim / control-check /
+    // truncate to the ceiling).
+    final String? selfName;
+    if (deviceName != null) {
+      selfName = _explicitDeviceName(deviceName);
+    } else {
+      final resolved = _deviceNameResolver(_isAndroidPlatform);
+      final String? raw = resolved is Future<String?>
+          ? await resolved
+              .then<String?>((name) => name)
+              .timeout(deviceNameResolveTimeout, onTimeout: () => null)
+          : resolved;
+      selfName = _presentableDeviceName(raw);
+    }
     await _engine.start(
       registry: address,
       registryIdHex: pin,
@@ -324,6 +340,11 @@ final class FfiSimpleTransferService implements SimpleTransferService {
   /// J2: pairing idle expiries pass through the engine service.
   @override
   Stream<String> get idleExpiries => _engine.idleExpiries;
+
+  /// P2-E (fourth review): awaited-code TTL expiries pass through the
+  /// engine service (the home code card's expiry fact).
+  @override
+  Stream<String> get codeExpired => _engine.codeExpired;
 
   @override
   Stream<List<TaskConnection>> get connections => _engine.connections.map(
@@ -739,6 +760,22 @@ final class FfiSimpleTransferService implements SimpleTransferService {
     }
     final cut = kept.toString();
     return cut.isEmpty ? null : cut;
+  }
+
+  /// P2-F (fourth review): the EXPLICIT [start] name — the same engine
+  /// wire rules as [_presentableDeviceName] (trim, empty/'localhost'
+  /// refuse, control bytes refuse), but a name OVER the byte ceiling is
+  /// refused ENTIRELY rather than truncated: an explicit name is the
+  /// caller's exact string (a test identity, an operator override), and
+  /// silently renaming it would hide the very thing the caller tried to
+  /// announce. An invalid name degrades to null — the engine's own
+  /// default ('ak-task') stands, [start] never throws on it.
+  static String? _explicitDeviceName(String? raw) {
+    final name = (raw ?? '').trim();
+    if (utf8.encode(name).length > _deviceNameMaxBytes) {
+      return null;
+    }
+    return _presentableDeviceName(name);
   }
 
   task_engine.SimpleTransferRole _engineRole(TaskRole role) =>

@@ -801,6 +801,11 @@ final class SimpleTransferService {
   final StreamController<String> _idleExpiryController =
       StreamController<String>.broadcast();
 
+  /// P2-E (fourth review): fan-out of AWAITED-CODE TTL expiries (code
+  /// ids) to the UI — the purge fact of [_purgeExpiredAwaitedCodes].
+  final StreamController<String> _codeExpiredController =
+      StreamController<String>.broadcast();
+
   final StreamController<String> _expiredIncomingController =
       StreamController<String>.broadcast();
 
@@ -997,6 +1002,7 @@ final class SimpleTransferService {
     _doneController.close();
     _expiredIncomingController.close();
     _idleExpiryController.close();
+    _codeExpiredController.close(); // P2-E
     _healthController.close();
     _progressController.close();
     _transferActivityController.close(); // W7.3
@@ -1307,6 +1313,12 @@ final class SimpleTransferService {
   /// J2 (2026-11-13): conn ids whose pairing ended by idle expiry.
   Stream<String> get idleExpiries => _idleExpiryController.stream;
 
+  /// P2-E (fourth review): code ids whose created-but-unpaired code
+  /// expired at its TTL (see [_purgeExpiredAwaitedCodes]) — the fact the
+  /// home code card ends its waiting flow on, instead of showing an
+  /// expired code with a waiting hint forever.
+  Stream<String> get codeExpired => _codeExpiredController.stream;
+
   /// Successful transfer completions (either side) with files/bytes.
   /// A `done` also converges its connection row to the terminal
   /// completed state (wave-30 P2-05: the row no longer offers sends).
@@ -1492,6 +1504,12 @@ final class SimpleTransferService {
   /// this purge the keep-awake gate would hold the screen lit forever
   /// for a pairing that can no longer happen. Returns whether anything
   /// was purged (the caller re-evaluates the activity edge).
+  ///
+  /// P2-E (fourth review): the purge is also a UI FACT — every purged
+  /// code id is announced on [codeExpired] (the home code card ends its
+  /// waiting flow on it), and a service with no other activity facts
+  /// (no live rows, no transfers, no other awaited code) settles its
+  /// phase back to `idle`: the pairing that code represented is over.
   bool _purgeExpiredAwaitedCodes() {
     if (_awaitedCodes.isEmpty) {
       return false;
@@ -1504,7 +1522,24 @@ final class SimpleTransferService {
     for (final codeId in expired) {
       _awaitedCodes.remove(codeId);
     }
-    return expired.isNotEmpty;
+    if (expired.isEmpty) {
+      return false;
+    }
+    if (!_codeExpiredController.isClosed) {
+      for (final codeId in expired) {
+        _codeExpiredController.add(codeId);
+      }
+    }
+    final nothingElseLive = _awaitedCodes.isEmpty &&
+        _inProgressTransfers.isEmpty &&
+        !_connections.values.any((row) => _stateRank(row.state) < 2);
+    if (nothingElseLive) {
+      // Honest settle: nothing pairs, transfers or waits anymore. The
+      // engineFailed latch (if tripped) keeps the phase — `_setPhase`
+      // itself refuses to leave that sink.
+      _setPhase(SimpleTransferPhase.idle);
+    }
+    return true;
   }
 
   /// W7.3 (W-N11 extended, 2026-11-23): fan out the "task activity" edge
@@ -2139,6 +2174,14 @@ final class SimpleTransferService {
   /// latch is DELIVERED — [engineHealth] fans the failure out to every
   /// listener the moment it trips (a getter-only latch never reaches a
   /// real GUI).
+  ///
+  /// P1-E (fourth review): the latch also releases every activity fact
+  /// the dead pump can no longer retire on its own — the TTL purge and
+  /// the row watcher both live inside the pump, so without this an
+  /// awaited code or a live row would keep the keep-awake gate (and the
+  /// waiting UI) lit FOREVER. The awaited codes clear, every live row
+  /// goes terminal (honest: the engine is gone), and the activity edge
+  /// is re-evaluated right here.
   void _latchEngineFailed(String what, Object detail) {
     if (_engineFailed) {
       return;
@@ -2153,6 +2196,15 @@ final class SimpleTransferService {
     if (!_healthController.isClosed) {
       _healthController.add(_currentHealth);
     }
+    // P1-E: the engine is gone — no wait, row or transfer may keep the
+    // screen lit for facts the pump will never retire now.
+    _awaitedCodes.clear();
+    for (final connId in _connections.keys.toList()) {
+      if (_stateRank(_connections[connId]!.state) < 2) {
+        _markTerminal(connId, 'disconnected');
+      }
+    }
+    _emitTransferActivity();
   }
 
   void _notifyConnections() {

@@ -522,6 +522,44 @@ void main() {
     expect(find.byKey(const ValueKey('home_send_button')), findsOneWidget);
   });
 
+  testWidgets('P2-E: a TTL-expired shown code resets the waiting flow and '
+      'surfaces the 配对码已过期 card (W-N9-family copy)', (tester) async {
+    final picker = FakeFilePickGateway(filesResult: kTwoFiles);
+    final fake = await pumpApp(tester, picker: picker);
+
+    // The primary send path waits on its code (the waiting card with the
+    // 已选 summary — the shape that used to wait forever past the TTL).
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
+    final codeId = fake.createdCodes.single.codeId;
+    expect(codeId, isNotNull);
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
+    expect(find.byKey(const ValueKey('flow_code_expired')), findsNothing);
+
+    // The service purges the awaited code at its TTL and announces it.
+    fake.expireCode(codeId!);
+    await pumpEvents(tester);
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsNothing,
+        reason: 'P2-E：过期码不得继续当作等待卡展示');
+    expect(find.byKey(const ValueKey('flow_waiting')), findsNothing);
+    expect(find.byKey(const ValueKey('flow_code_expired')), findsOneWidget,
+        reason: 'P2-E：过期事实以失败卡形式可见');
+    expect(find.text('配对码已过期'), findsOneWidget);
+    expect(find.textContaining('请重新生成'), findsOneWidget);
+    expect(find.byKey(const ValueKey('home_send_button')), findsOneWidget,
+        reason: 'P2-E：流程已复位——主入口立即可用');
+    expect(find.textContaining('已选：'), findsNothing,
+        reason: '复位后不再残留已选摘要');
+
+    // The notice retires when the next flow begins.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_code_expired')), findsNothing,
+        reason: 'P2-E：新流程开始即撤下过期通知卡');
+  });
+
   testWidgets('network change drops connections: the list follows',
       (tester) async {
     final picker = FakeFilePickGateway(filesResult: kTwoFiles);
@@ -831,8 +869,8 @@ void main() {
   });
 
   testWidgets('P1-1 更改 race: the connection DROPS during the change '
-      'pick — nothing is handed over, and the new selection survives for '
-      'the retry', (tester) async {
+      'pick — nothing is handed over, and the pick opened before the drop '
+      'is DISCARDED (P1-D): the retry carries the KEPT selection', (tester) async {
     final gateway = _HoldingPickGateway();
     final fake = await pumpApp(tester, picker: gateway);
     await _openChangePick(tester, gateway);
@@ -846,6 +884,10 @@ void main() {
     expect(find.byKey(ValueKey('conn_card_name_$connId')), findsNothing,
         reason: '网络变化：那条连接的卡片也退场了');
 
+    // The pick returns with a NEW selection — but it was opened by the
+    // flow that just FAILED (P1-D: `_fail` moves the generation), so it
+    // must be discarded whenever it returns: never into the failed flow,
+    // never into its retry.
     gateway.answer(_replacement);
     await pumpEvents(tester);
     await tester.pump();
@@ -856,11 +898,121 @@ void main() {
     expect(find.byKey(const ValueKey('flow_error')), findsOneWidget,
         reason: '失败卡保持可见');
 
-    // The failed flow still owns the NEW selection: its retry shows it.
+    // The failed flow still owns the KEPT selection (the one from before
+    // the change attempt): its retry shows THAT — not the stale pick.
     await tester.tap(find.byKey(const ValueKey('flow_retry_button')));
     await pumpEvents(tester);
+    expect(find.textContaining('已选：2 项'), findsOneWidget,
+        reason: 'P1-D：失败前打开的选择绝不落入重试后的流——保留的旧选择随重试保留');
+    expect(find.textContaining('已选：1 项'), findsNothing,
+        reason: 'P1-D：过期选择（1 项的新文件）绝不出现在重试后的码卡片上');
+  });
+
+  testWidgets('P1-D (Windows shape): 更改 open → connection drops → 重试 → '
+      'the stale pick returns — DISCARDED; the retried pairing sends the '
+      'KEPT selection, never the stale pick', (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+    await _openChangePick(tester, gateway); // 已选：2 项, change pick open
+
+    // The connection completes... and drops: the flow fails while the
+    // system picker is still up.
+    final droppedConn = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.simulateNetworkChange();
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.textContaining('与对方的连接断开了'), findsOneWidget);
+    expect(fake.sendFilesCalls, 0);
+
+    // 重试: a FRESH flow (a new generation — P1-D), still carrying the
+    // KEPT selection the failed flow owned.
+    await tester.tap(find.byKey(const ValueKey('flow_retry_button')));
+    await pumpEvents(tester);
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
+    expect(find.textContaining('已选：2 项'), findsOneWidget,
+        reason: '前置：无选择进行中时，保留的选择随失败+重试存活（既有行为）');
+
+    // The STALE pick (opened before the failure) finally returns with a
+    // NEW selection — it belongs to the dead flow: discarded.
+    gateway.answer(_replacement);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(find.textContaining('已选：2 项'), findsOneWidget,
+        reason: 'P1-D：失败前打开的选择绝不落入重试后的流');
+    expect(find.textContaining('已选：1 项'), findsNothing);
+
+    // The retried pairing completes: the auto-send carries the KEPT
+    // selection — never the stale pick's files.
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(connId);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(fake.sendFilesCalls, 1, reason: '重试配对成功：自动发送恰一次');
+    expect(fake.sendRequests.single.$1, connId,
+        reason: '发给重试码建立的连接（不是已断的那条）');
+    expect(fake.sendRequests.single.$1, isNot(droppedConn));
+    expect(fake.sendRequests.single.$2,
+        kTwoFiles.map((entry) => entry.path).toList(),
+        reason: 'P1-D：发送的是保留的旧选择，绝不是过期选择挑中的文件');
+  });
+
+  testWidgets('P2-D: a STALE flow\'s still-open 更改 window never defers '
+      'the CURRENT flow\'s auto-send — B sends while A\'s picker is still '
+      'open, and A\'s late pick clears nothing', (tester) async {
+    final gateway = _HoldingPickGateway();
+    final fake = await pumpApp(tester, picker: gateway);
+
+    // Flow A: a sender code waits, and its 更改 pick opens and STAYS open.
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    await tester
+        .tap(find.byKey(const ValueKey('flow_change_selection_button')));
+    await tester.pump();
+    expect(gateway.openPicks, 1, reason: '前置：A 的更改选择器仍开着');
+
+    // The user gives up on A (取消配对 resets it) and runs flow B through
+    // the same main path — B's pick opens and returns while A's stale
+    // window is STILL in flight.
+    await tester.tap(find.byKey(const ValueKey('flow_cancel_button')));
+    await pumpEvents(tester);
+    await tester.tap(find.byKey(const ValueKey('home_send_button')));
+    await tester.pump();
+    expect(gateway.openPicks, 2, reason: '前置：B 的初选也开了（A 的还开着）');
+    gateway.answerLast(_replacement); // B's pick — A's stays open
+    await pumpEvents(tester);
     expect(find.textContaining('已选：1 项'), findsOneWidget,
-        reason: '更改结果不丢：重试后的码卡片带新选择');
+        reason: '前置：B 的流带 B 自己的选择');
+
+    // B's pairing completes BEHIND A's still-open picker — the handover
+    // must fire NOW (P2-D: only B's OWN generation's picks defer it; the
+    // single cross-generation counter used to block B until A returned).
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(connId);
+    await pumpEvents(tester);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsOneWidget,
+        reason: 'P2-D：过期更改窗口不得推迟 B 的交接');
+    expect(fake.sendFilesCalls, 1, reason: 'B 的自动发送在 A 的窗口仍开着时就发出');
+    expect(fake.sendRequests.single.$1, connId);
+    expect(fake.sendRequests.single.$2, [_replacement.single.path]);
+
+    // A's stale pick finally returns: discarded (the generation moved),
+    // and it must not clear or re-trigger anything of B's page.
+    gateway.answer(kTwoFiles);
+    await pumpEvents(tester);
+    await tester.pump();
+    expect(fake.sendFilesCalls, 1, reason: 'P2-D：过期选择绝不产生第二次发送');
   });
 
   testWidgets('P1-A: the change pick returning after the flow reset is '
@@ -1415,6 +1567,12 @@ class _HoldingPickGateway implements FilePickGateway {
   /// cancelled it).
   void answer(List<PickedEntry> entries) {
     _open.removeAt(0).complete(entries);
+  }
+
+  /// Answers the NEWEST open pick with [entries] — a stale EARLIER window
+  /// stays open (the P2-D shape: B answers while A's picker is still up).
+  void answerLast(List<PickedEntry> entries) {
+    _open.removeLast().complete(entries);
   }
 
   @override

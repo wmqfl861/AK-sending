@@ -71,7 +71,10 @@ void main() {
     expect(tester.widget<FilledButton>(submit).onPressed, isNotNull,
         reason: 'submit still disabled — code incomplete');
     await tester.tap(submit);
-    safEvidence('JOIN_SUBMITTED|send-entry|$safCode');
+    // P2-G (fourth review): codes never print in full — only the masked
+    // tail (the repo red line: last 4 symbols at most).
+    safEvidence(
+        'JOIN_SUBMITTED|send-entry|****${safCode.substring(safCode.length - 4)}');
 
     final connection = find.byWidgetPredicate(
         (w) => w.key != null && w.key.toString().contains('conn_card_name_'));

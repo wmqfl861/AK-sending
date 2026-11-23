@@ -558,6 +558,10 @@ class UnusableSimpleTransferService implements SimpleTransferService {
   @override
   Stream<String> get idleExpiries => const Stream.empty();
 
+  /// P2-E: no engine, no codes — the stream stays empty.
+  @override
+  Stream<String> get codeExpired => const Stream.empty();
+
   @override
   Stream<IncomingRequest> get incomingRequests => const Stream.empty();
 

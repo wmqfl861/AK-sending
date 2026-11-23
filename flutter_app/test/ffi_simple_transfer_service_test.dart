@@ -310,6 +310,76 @@ void main() {
     service.dispose();
   });
 
+  test('P2-F: an EXPLICIT start(deviceName:) the engine would reject never '
+      'reaches the engine — it degrades to null (the engine default), '
+      'never truncates and never throws', () async {
+    // 22 CJK chars = 66 UTF-8 bytes — over the registry client's
+    // 64-byte ceiling (check_display_name); the engine rejects it on
+    // create AND join, so it must never ride the start spec.
+    final overFake = FakeAkTaskCalls();
+    final over = FfiSimpleTransferService(
+      calls: overFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+    );
+    await over.start(deviceName: '设' * 22);
+    expect(overFake.acceptedSpecs.single, isNot(contains('device_name')),
+        reason: 'P2-F：超长显式名字整体退回引擎默认名（不截断、不进 spec）');
+    over.dispose();
+
+    // Control characters: same refuse-to-null degrade.
+    final ctrlFake = FakeAkTaskCalls();
+    final ctrl = FfiSimpleTransferService(
+      calls: ctrlFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+    );
+    await ctrl.start(deviceName: 'a\u{7}b');
+    expect(ctrlFake.acceptedSpecs.single, isNot(contains('device_name')),
+        reason: 'P2-F：控制字符显式名字同样退回引擎默认名');
+    ctrl.dispose();
+  });
+
+  test('P2-F: an INJECTED resolver\'s return is validated in start() too '
+      '(an over-long answer is capped by the byte-exact mirror, a '
+      'control-char answer degrades to null)', () async {
+    final truncFake = FakeAkTaskCalls();
+    final trunc = FfiSimpleTransferService(
+      calls: truncFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      deviceNameResolver: (_) async => '设' * 40, // 120 raw bytes
+    );
+    await trunc.start();
+    final truncSpec =
+        jsonDecode(truncFake.acceptedSpecs.single) as Map<String, dynamic>;
+    final truncName = truncSpec['device_name'] as String?;
+    expect(truncName, isNotNull, reason: '前置：合法（截断后）名字进了 spec');
+    expect(utf8.encode(truncName!).length, 63,
+        reason: 'P2-F：注入解析器的返回同样走 64 字节镜像（21×3=63）');
+    trunc.dispose();
+
+    final ctrlFake = FakeAkTaskCalls();
+    final ctrl = FfiSimpleTransferService(
+      calls: ctrlFake,
+      registry: '127.0.0.1:7200',
+      registryIdHex: regId,
+      idDir: 'C:/ak/bridge',
+      delay: immediate,
+      deviceNameResolver: (_) async => 'ok\u{7F}',
+    );
+    await ctrl.start();
+    expect(ctrlFake.acceptedSpecs.single, isNot(contains('device_name')),
+        reason: 'P2-F：注入解析器返回的控制字符必须退回引擎默认名');
+    ctrl.dispose();
+  });
+
   test('P1-3: the resume reconcile fills peerName/peerShortId from the '
       'engine snapshot (a nameless connected event heals on resume, and a '
       'null never clobbers a learned name)', () async {

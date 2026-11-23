@@ -370,6 +370,15 @@ abstract class SimpleTransferService {
   /// whoever listens when it fires.
   Stream<String> get idleExpiries => const Stream<String>.empty();
 
+  /// P2-E (fourth review, additive member like [idleExpiries]): code ids
+  /// of created-but-unpaired codes that EXPIRED at their TTL (the
+  /// service's purge fact — nobody joined, nobody revoked, the deadline
+  /// simply passed; the engine then answers any join with its unified
+  /// unavailable text). One event per expired code; the home code card
+  /// listens and ends its waiting flow with the 配对码已过期 copy. No
+  /// replay.
+  Stream<String> get codeExpired => const Stream<String>.empty();
+
   /// Incoming transfer offers (jobId/文件数/总字节), one event per offer.
   Stream<IncomingRequest> get incomingRequests;
 

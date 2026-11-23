@@ -38,6 +38,8 @@
 /// append path keeps the remaining files.
 library;
 
+import 'dart:io' show Platform;
+
 import 'package:file_picker/file_picker.dart' as fp;
 import 'package:flutter/material.dart';
 
@@ -85,6 +87,7 @@ class PluginFilePickGateway implements FilePickGateway {
     this._directoryPicker,
     this._folderOffer,
     this._folderOnlyOffer,
+    this._isAndroidPlatform,
   });
 
   /// The platform multi-file pick (`FilePicker.pickFiles`): an empty list
@@ -103,6 +106,11 @@ class PluginFilePickGateway implements FilePickGateway {
   /// 吗？」— true = pick one folder and send only it. Defaults to
   /// [_showFolderOnlyOffer].
   final Future<bool> Function()? _folderOnlyOffer;
+
+  /// Review round 6: the Android-only provider-path exclusions gate on
+  /// this (injectable so tests on a desktop host can drive the Android
+  /// branch deterministically). Defaults to `Platform.isAndroid`.
+  final bool Function()? _isAndroidPlatform;
 
   @override
   Future<List<PickedEntry>> pickFiles() async {
@@ -180,16 +188,18 @@ class PluginFilePickGateway implements FilePickGateway {
   /// scheme-like provider URI (`msd:123`, `content://…`) — is excluded:
   /// the Downloads provider on Android 11+ hands out `msd:<numeric id>`
   /// URIs that `sendFiles` cannot use.
-  static bool _isFileSystemPath(String path) {
+  bool _isFileSystemPath(String path) {
     final trimmed = path.trim();
     if (trimmed.isEmpty) {
       return false;
     }
-    // Review round 5: the Android 11+ Downloads provider ALSO surfaces its
-    // emulated subdirectories through the `/storage/msd/…` FUSE mount —
-    // filesystem-SHAPED but not sendable by the engine. Same exclusion as
-    // the bare provider URIs.
-    if (trimmed.startsWith('/storage/msd/')) {
+    // Review rounds 5/6: the Android file_picker plugin can also hand
+    // back a path BUILT from a provider document id (`msd:2184` →
+    // `/storage/msd/2184/…`) — filesystem-SHAPED but not engine-sendable.
+    // Android-only: a desktop user with a genuinely named `/storage/msd`
+    // directory keeps it.
+    if ((_isAndroidPlatform?.call() ?? Platform.isAndroid) &&
+        trimmed.startsWith('/storage/msd/')) {
       return false;
     }
     if (trimmed.startsWith('/') || trimmed.startsWith(r'\\')) {

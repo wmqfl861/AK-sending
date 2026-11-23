@@ -1523,19 +1523,27 @@ void main() {
         reason: 'P1-H：msd: URI 不可发送——按取消选文件夹处理，整体空结果');
   });
 
-  testWidgets('P1-H (round 5): a /storage/msd/… FUSE path (the Android 11+ '
-      'Downloads provider\'s filesystem-SHAPED form) is excluded like the '
-      'bare URI', (tester) async {
+  testWidgets('P1-H (round 5/6): a /storage/msd/… provider-built path (the '
+      'Android 11+ filesystem-SHAPED form) is excluded on Android — and a '
+      'desktop keeps a genuinely named /storage/msd directory',
+      (tester) async {
     var directoryPicks = 0;
     List<PickedEntry>? picked;
-    final gateway = PluginFilePickGateway(
+    PickedEntry? desktopPicked;
+    final androidGateway = PluginFilePickGateway(
+      isAndroidPlatform: () => true,
       filePicker: () async => const <_PlatformFile>[],
       directoryPicker: () async {
         directoryPicks += 1;
         return '/storage/msd/2184/Documents/相册';
       },
     );
-    await _pumpPickHarness(tester, gateway, (entries) => picked = entries);
+    final desktopGateway = PluginFilePickGateway(
+      isAndroidPlatform: () => false,
+      filePicker: () async => const <_PlatformFile>[],
+      directoryPicker: () async => '/storage/msd/my-real-dir',
+    );
+    await _pumpPickHarness(tester, androidGateway, (e) => picked = e);
 
     await tester.tap(find.byKey(const ValueKey('harness_pick_button')));
     await tester.pump();
@@ -1548,7 +1556,16 @@ void main() {
     expect(directoryPicks, 1);
     expect(picked, isNotNull);
     expect(picked, isEmpty,
-        reason: 'P1-H：/storage/msd/ 形态同样不可发送——按取消处理');
+        reason: 'P1-H：Android 上 /storage/msd/ 形态不可发送——按取消处理');
+
+    // The desktop branch: the same path shape is a REAL directory the
+    // engine can send (round 6: the exclusion is Android-only).
+    final desktop =
+        await desktopGateway.pickDirectory();
+    desktopPicked = desktop;
+    expect(desktopPicked, isNotNull,
+        reason: 'P1-H（第六轮）：桌面端同名真实目录不误杀');
+    expect(desktopPicked!.isDirectory, isTrue);
   });
 
   testWidgets('P1-H: a file list with one normal file and one msd: file '

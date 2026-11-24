@@ -67,11 +67,10 @@ void main() {
     await safUntil(tester, () => tester.any(field), 'join panel field');
     final submit = find.byKey(const ValueKey('join_submit_button'));
     await tester.enterText(field, safCode);
-    // The live binding does NOT stub the text-input channel: the value
-    // travels through the real connection and the panel enables 配对 only
-    // on the rebuild that follows. Wait for that state instead of checking
-    // 400 ms after the entry — the first profile round (2026-11-24) found
-    // the button still disabled there.
+    // Wait for the enabled state instead of checking 400 ms after the
+    // entry: the first profile round (2026-11-24) found the button still
+    // disabled there. Why `enterText` did not take effect in a profile
+    // build is not known (the same step works in debug builds).
     var entryPath = 'test-input-stub';
     if (!await submitEnabledWithin(tester, submit, 3)) {
       // Same widget-level callback the keyboard path drives (onChanged →

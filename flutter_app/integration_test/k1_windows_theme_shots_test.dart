@@ -188,6 +188,12 @@ class K1Picker implements FilePickGateway {
   Future<List<PickedEntry>> pickFiles() async => files;
 
   @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  @override
   Future<PickedEntry?> pickDirectory() async => dir;
 }
 

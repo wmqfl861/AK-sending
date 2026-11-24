@@ -55,6 +55,12 @@ class SyntheticPicker implements FilePickGateway {
     path: file.path, name: name, isDirectory: false, sizeBytes: bytes,
   )];
   @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  @override
   Future<PickedEntry?> pickDirectory() async => null;
 }
 

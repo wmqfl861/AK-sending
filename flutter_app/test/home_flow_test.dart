@@ -1847,6 +1847,12 @@ class _HoldingPickGateway implements FilePickGateway {
   }
 
   @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  @override
   Future<PickedEntry?> pickDirectory() async => null;
 }
 

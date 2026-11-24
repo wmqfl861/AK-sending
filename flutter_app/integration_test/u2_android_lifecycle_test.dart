@@ -224,6 +224,12 @@ final class _SyntheticPicker implements FilePickGateway {
       ];
 
   @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  @override
   Future<PickedEntry?> pickDirectory() async => null;
 }
 

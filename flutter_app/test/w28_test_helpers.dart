@@ -89,6 +89,12 @@ class FakeFilePickGateway implements FilePickGateway {
   }
 
   @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  @override
   Future<PickedEntry?> pickDirectory() async {
     pickDirectoryCalls += 1;
     return directoryResult;

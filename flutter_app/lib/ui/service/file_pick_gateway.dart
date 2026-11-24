@@ -52,6 +52,9 @@ class PickedEntry {
     required this.name,
     required this.isDirectory,
     this.sizeBytes,
+    this.stagingId,
+    this.stagedFileCount,
+    this.stagedByteCount,
   });
 
   final String path;
@@ -60,6 +63,17 @@ class PickedEntry {
 
   /// File size in bytes when known; null for directories/unknown.
   final int? sizeBytes;
+
+  /// Batch Z: non-null only for a folder the gateway staged into
+  /// app-private storage before handing it over (the Android SAF send
+  /// path). Whoever holds the entry owns the staged copy and hands it back
+  /// through [FilePickGateway.releaseStaged].
+  final String? stagingId;
+
+  /// Batch Z: what the native stager copied for [stagingId]; null when the
+  /// entry is not staged.
+  final int? stagedFileCount;
+  final int? stagedByteCount;
 }
 
 /// Chooser surface used by the connection-detail page and the settings
@@ -71,6 +85,22 @@ abstract class FilePickGateway {
 
   /// Single-folder pick. Returns null on cancel.
   Future<PickedEntry?> pickDirectory();
+
+  /// Batch Z: the SEND-side single-folder pick — what the send paths call
+  /// where [pickDirectory] used to. Same shape (an entry or null), but on
+  /// Android it goes through the SAF tree picker and a staged copy, since
+  /// the engine only takes filesystem paths. [pickDirectory] itself keeps
+  /// its plain meaning: the settings page uses it for the RECEIVE save
+  /// directory.
+  ///
+  /// Every class that `implements FilePickGateway` declares this method:
+  /// Dart does not inherit bodies through `implements`.
+  Future<PickedEntry?> pickSendDirectory();
+
+  /// Batch Z: hands the staged copies behind [entries] back to the
+  /// platform. Entries without a [PickedEntry.stagingId] are ignored; a
+  /// call is idempotent and never throws.
+  Future<void> releaseStaged(Iterable<PickedEntry> entries);
 }
 
 /// Production gateway over the `file_picker` plugin.
@@ -122,7 +152,7 @@ class PluginFilePickGateway implements FilePickGateway {
       // follows; declining it (or cancelling the folder pick) is the
       // overall cancel, exactly as before.
       if (await (_folderOnlyOffer ?? _showFolderOnlyOffer)()) {
-        final folder = await pickDirectory();
+        final folder = await pickSendDirectory();
         if (folder != null) {
           return <PickedEntry>[folder];
         }
@@ -151,13 +181,29 @@ class PluginFilePickGateway implements FilePickGateway {
     }
     // X4 P1-2: ONE optional whole folder after a real selection.
     if (await (_folderOffer ?? _showFolderOffer)()) {
-      final folder = await pickDirectory();
+      final folder = await pickSendDirectory();
       if (folder != null) {
         entries.add(folder); // a cancelled folder pick keeps the files
       }
     }
     return entries;
   }
+
+  /// Batch Z: compile-time switch of the Android folder-send entry. Off =
+  /// Android shows no folder offer and [pickSendDirectory] only says the
+  /// folder is unsupported — it never hands the engine a picker pseudo path.
+  static const bool kAndroidFolderSendEnabled = true;
+
+  @override
+  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+
+  /// Batch Z: removes staging leftovers of earlier runs (interrupted
+  /// copies, expired finished ones) and the read grants they left behind.
+  /// Android only; errors are swallowed.
+  static Future<void> cleanupStaleStaging() async {}
 
   @override
   Future<PickedEntry?> pickDirectory() async {

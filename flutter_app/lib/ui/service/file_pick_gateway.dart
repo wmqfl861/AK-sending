@@ -183,6 +183,12 @@ class PluginFilePickGateway implements FilePickGateway {
   /// `byteCount`), or the channel's `PlatformException`. It answers only
   /// once the platform side has stopped for good. Defaults to the real
   /// channel call.
+  ///
+  /// Two refusals worth knowing by name: an id that already carries a
+  /// finished staging is `STAGE_IO_FAILED` / `id-in-use` (nothing is
+  /// deleted), and a cancelled staging answers `STAGE_CANCELLED` only
+  /// when its directory is gone — otherwise `STAGE_IO_FAILED` /
+  /// `leftover`, so the refusal dialog can follow a 「取消」.
   final Future<Map<Object?, Object?>?> Function(String treeUri, String stageId)?
       _safStager;
 
@@ -190,12 +196,15 @@ class PluginFilePickGateway implements FilePickGateway {
   /// flag on the platform side only. Defaults to the real channel call.
   final Future<void> Function(String stageId)? _stagingCanceller;
 
-  /// Batch Z: removes one staged copy (`cleanupStagedSend(stageId)`,
-  /// idempotent). Defaults to the real channel call.
+  /// Batch Z: hands one staged copy back (`cleanupStagedSend(stageId)`,
+  /// idempotent). The platform answers `{"removed": true}` or
+  /// `{"removed": false}` (something is left behind), or refuses with
+  /// `STAGE_IO_FAILED` / `busy` while that staging still runs — this side
+  /// reads none of it. Defaults to the real channel call.
   final Future<void> Function(String stageId)? _stagedCleaner;
 
-  /// Batch Z: the stale cleanup the first staging of the process waits
-  /// for. Defaults to [cleanupStaleStaging] — once per process.
+  /// Batch Z: the stale cleanup the first staging of the isolate waits
+  /// for. Defaults to [cleanupStaleStaging] — once per Dart isolate.
   final Future<void> Function()? _staleStagingCleaner;
 
   /// Batch Z: the compile-time switch [kAndroidFolderSendEnabled],
@@ -313,7 +322,7 @@ class PluginFilePickGateway implements FilePickGateway {
   static bool _sendFolderPickOpen = false;
 
   /// Whether the `stagingProgress` listener is on the channel — installed
-  /// once per process, BEFORE the first `stageSafTree` call.
+  /// once per Dart isolate, BEFORE the first `stageSafTree` call.
   static bool _stagingProgressListening = false;
 
   /// The staging in flight (the id whose progress events are accepted)
@@ -325,8 +334,8 @@ class PluginFilePickGateway implements FilePickGateway {
   static final ValueNotifier<SafSendStagingProgress?> _stagingProgress =
       ValueNotifier<SafSendStagingProgress?>(null);
 
-  /// The stale cleanup of this process — started by its first caller and
-  /// shared by every later one.
+  /// The stale cleanup of this Dart isolate — started by its first caller
+  /// and shared by every later one.
   static Future<void>? _staleStagingCleanup;
 
   @override
@@ -345,7 +354,8 @@ class PluginFilePickGateway implements FilePickGateway {
       }
       // Nothing is staged before the leftovers of earlier runs are gone.
       // The app start already ran the cleanup — this await is satisfied
-      // at once then, and IS the run when it comes first.
+      // at once then, and IS the run when it comes first. Once per Dart
+      // isolate, see [cleanupStaleStaging].
       await (_staleStagingCleaner ?? cleanupStaleStaging)();
       final folder = await _pickStagedFolder();
       return folder;
@@ -391,8 +401,9 @@ class PluginFilePickGateway implements FilePickGateway {
         treeUri is! String ||
         treeUri.isEmpty ||
         displayName is! String ||
-        displayName.isEmpty) {
-      // Not a shape this side can stage.
+        !_isOneSegment(displayName)) {
+      // Not a shape this side can stage — a name that is not ONE segment
+      // could never be the staged root's name (see [_endsWithStaging]).
       throw const _StagingRefused(_ioFailed, 'io');
     }
     return _stageTree(treeUri, displayName);
@@ -444,39 +455,90 @@ class PluginFilePickGateway implements FilePickGateway {
     }
   }
 
-  /// The entry of a staged folder: the staged root — a FILESYSTEM path,
-  /// checked like any other (P1-H: never the tree URI that was picked,
-  /// never an `msd:` pseudo path) — named as the platform staged it, with
-  /// what it copied. Null when the answer is not the ok shape.
+  /// The entry of a staged folder — ONLY for an ok answer that is this
+  /// staging's own, see [_isStagedRootOf]: it must carry the requested
+  /// [stageId], the path of the copy made for [displayName], and its
+  /// three counts. The folder keeps the name the pick gave it, since
+  /// that is the name the staged root must carry. Null for anything
+  /// else: an answer this side cannot hand over.
   PickedEntry? _stagedEntryOf(
     String stageId,
     Map<Object?, Object?>? staged,
     String displayName,
   ) {
     final path = staged?['path'];
-    final name = staged?['displayName'];
+    final fileCount = _countOf(staged?['fileCount']);
+    final byteCount = _countOf(staged?['byteCount']);
+    final emptyDirectoryCount = _countOf(staged?['emptyDirectoryCount']);
     if (staged?['status'] != 'ok' ||
+        staged?['stageId'] != stageId ||
         path is! String ||
-        !_isStagedRootPath(path)) {
+        !_isStagedRootOf(stageId, displayName, path) ||
+        fileCount == null ||
+        byteCount == null ||
+        emptyDirectoryCount == null) {
       return null;
     }
     return PickedEntry(
       path: path,
-      name: name is String && name.isNotEmpty ? name : displayName,
+      name: displayName,
       isDirectory: true,
       stagingId: stageId,
-      stagedFileCount: _intOf(staged?['fileCount']),
-      stagedByteCount: _intOf(staged?['byteCount']),
+      stagedFileCount: fileCount,
+      stagedByteCount: byteCount,
     );
   }
 
-  /// P1-H for a staged root: the path the platform answers must be a
-  /// filesystem path like any other — never the tree URI that was picked
-  /// nor an `msd:` pseudo path.
-  bool _isStagedRootPath(String path) =>
+  /// Is [path] the staged root of THIS staging — the one [stageId] made
+  /// for the folder [displayName] names? Only such a path is handed over:
+  /// a filesystem path like any other (P1-H: never the tree URI that was
+  /// picked, never an `msd:` pseudo path) that ends with the staging's
+  /// own `<stageId>/payload/<displayName>`. Anything else — another
+  /// staging's path, a relative or a Windows one — is not this answer's
+  /// to give, however well-formed it looks.
+  bool _isStagedRootOf(String stageId, String displayName, String path) =>
       _isFileSystemPath(path) &&
-      !path.contains('content:') &&
-      !path.contains('msd:');
+      _endsWithStaging(stageId, displayName, path);
+
+  /// Does [path] end with `<stageId>/payload/<displayName>`, as an
+  /// absolute path of plain segments with a base in front of the three?
+  /// Plain means: no `\`, no `:` and no control character anywhere, and
+  /// no segment that is empty, `.` or `..`.
+  static bool _endsWithStaging(
+    String stageId,
+    String displayName,
+    String path,
+  ) {
+    if (!path.startsWith('/') ||
+        path.contains(r'\') ||
+        path.contains(':') ||
+        path.codeUnits.any((unit) => unit < 0x20 || unit == 0x7F)) {
+      return false;
+    }
+    final segments = path.substring(1).split('/');
+    if (segments.length < 4) {
+      return false; // a base, then the three of the suffix
+    }
+    for (final segment in segments) {
+      if (!_isOneSegment(segment)) {
+        return false;
+      }
+    }
+    return segments[segments.length - 3] == stageId &&
+        segments[segments.length - 2] == 'payload' &&
+        segments.last == displayName;
+  }
+
+  /// Is [name] ONE path segment — what the pick's `displayName` has to
+  /// be, since it names the staged root? What a name may otherwise
+  /// contain is the platform's own rule, with its own reasons to report.
+  static bool _isOneSegment(String name) =>
+      name.isNotEmpty && name != '.' && name != '..' && !name.contains('/');
+
+  /// One of the ok answer's three counts — null unless it is an integer
+  /// of 0 or more.
+  static int? _countOf(Object? value) =>
+      value is int && value >= 0 ? value : null;
 
   /// 「取消」: asks the platform to stop [stageId] — once. The staging
   /// call itself is what keeps the dialog up until it answers.
@@ -506,8 +568,10 @@ class PluginFilePickGateway implements FilePickGateway {
   /// copies, expired finished ones) and the read grants they left behind.
   /// Android only; errors are swallowed.
   ///
-  /// Runs ONCE per process: the app start calls it, and the first staging
-  /// waits for the same run instead of starting another.
+  /// Runs ONCE PER DART ISOLATE — not once per Android process: a rebuilt
+  /// engine is a new isolate with fresh statics, and runs it again. Within
+  /// an isolate the app start calls it, and the first staging waits for
+  /// the same run instead of starting another.
   static Future<void> cleanupStaleStaging() =>
       _staleStagingCleanup ??= _runStaleStagingCleanup();
 
@@ -523,10 +587,10 @@ class PluginFilePickGateway implements FilePickGateway {
     }
   }
 
-  /// Test seam: puts the per-process statics back to their state at the
-  /// start of a process (the stale-cleanup run, the listener guard, the
+  /// Test seam: puts the per-isolate statics back to their state at the
+  /// start of an isolate (the stale-cleanup run, the listener guard, the
   /// open-pick guard), so a test isolate can observe the FIRST staging of
-  /// a process more than once — and one test's abandoned pick cannot
+  /// an isolate more than once — and one test's abandoned pick cannot
   /// cancel the next test's. Tests call it from `setUp`; production never
   /// does.
   @visibleForTesting
@@ -618,9 +682,15 @@ class PluginFilePickGateway implements FilePickGateway {
         'stageId': stageId,
       });
 
+  /// 「取消」on the channel: sets the platform's flag — the staging call
+  /// itself is what answers.
   static Future<void> _cancelStagingOnChannel(String stageId) =>
       _storageChannel.invokeMethod<void>('cancelStaging', {'stageId': stageId});
 
+  /// The platform answers `{"removed": true}` or `{"removed": false}`;
+  /// this side asks for nothing back — the release is best effort either
+  /// way, and a refusal (`STAGE_IO_FAILED` / `busy` for a staging that
+  /// still runs) is swallowed by the caller.
   static Future<void> _cleanupStagedSendOnChannel(String stageId) =>
       _storageChannel
           .invokeMethod<void>('cleanupStagedSend', {'stageId': stageId});

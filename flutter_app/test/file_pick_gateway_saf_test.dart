@@ -56,25 +56,35 @@ const Map<String, Object?> _selected = {
   'displayName': _folderName,
 };
 
+/// The directories in front of a staged copy on the phone — the base
+/// the platform answers before `<stageId>/payload/<name>`.
+const String _stagingBase =
+    '/data/user/0/dev.ak.ak_sending_app/no_backup/ak-saf-staging';
+
 /// Where the platform stager puts the copy of [_treeUri].
 String _stagedRoot(String stageId) =>
-    '/data/user/0/dev.ak.ak_sending_app/no_backup'
-    '/ak-saf-staging/$stageId/payload/$_folderName';
+    '$_stagingBase/$stageId/payload/$_folderName';
+
+/// A VALID ok answer of `stageSafTree` for [stageId]: the copy of the
+/// folder [name] sits under that id, with its three counts.
+Map<String, Object?> _okFor(String stageId, [String name = _folderName]) => {
+      'status': 'ok',
+      'stageId': stageId,
+      'path': '$_stagingBase/$stageId/payload/$name',
+      'displayName': name,
+      'fileCount': 7,
+      'byteCount': 1536,
+      'emptyDirectoryCount': 2,
+    };
 
 /// The ok answer of a `stageSafTree` [call]: the copy sits under the id
 /// the call carried.
-Map<String, Object?> _ok(MethodCall call) {
-  final stageId = (call.arguments as Map<Object?, Object?>)['stageId'];
-  return {
-    'status': 'ok',
-    'stageId': stageId,
-    'path': _stagedRoot(stageId! as String),
-    'displayName': _folderName,
-    'fileCount': 7,
-    'byteCount': 1536,
-    'emptyDirectoryCount': 2,
-  };
-}
+Map<String, Object?> _ok(MethodCall call) => _okFor(_stageIdOf(call));
+
+/// Another staging's id — well-formed, and never the one asked for.
+String _otherId(String stageId) => stageId.startsWith('0')
+    ? '1${stageId.substring(1)}'
+    : '0${stageId.substring(1)}';
 
 const String _filePath1 =
     '/data/user/0/dev.ak.ak_sending_app/cache/file_picker/照片.zip';
@@ -91,7 +101,7 @@ List<fp.PlatformFile> get _twoPlatformFiles => [
 const List<(String, List<String>)> _refusals = [
   (
     'SAF_PERMISSION_DENIED',
-    ['no-persisted-grant', 'grant-limit', 'provider-security'],
+    ['no-persisted-grant', 'grant-limit', 'provider-security', 'grant-lookup'],
   ),
   ('SAF_PROVIDER_UNTRUSTED', ['authority']),
   (
@@ -119,7 +129,23 @@ const List<(String, List<String>)> _refusals = [
   ('STAGE_NO_SPACE', ['no-space', 'enospc']),
   (
     'STAGE_IO_FAILED',
-    ['create', 'open', 'read', 'write', 'containment', 'symlink', 'busy', 'io'],
+    [
+      'create',
+      'open',
+      'read',
+      'write',
+      'containment',
+      'symlink',
+      'busy',
+      'io',
+      // An id that already carries a finished staging.
+      'id-in-use',
+      // Verified after the copy: the folder is not what was planned.
+      'source-changed',
+      'size-mismatch',
+      // Stopped, and its directory could not be removed completely.
+      'leftover',
+    ],
   ),
   ('STAGE_INVALID_ID', ['format']),
 ];
@@ -138,6 +164,8 @@ const String _receiverReserved =
     '无法原样发送，请给它改名，或只发送其余的文件。';
 const String _sameAsPicked = '这个文件夹与已选的某个文件同名，请单独发送这个文件夹，或去掉那个文件。';
 const String _noSpace = '手机存储空间不足，无法复制这个文件夹，请清理出足够的空间后重试。';
+const String _changed = '准备期间文件夹里的内容有变动，无法按原样发送，请重新选择这个文件夹。';
+const String _leftover = '准备已中止，部分临时文件未能删除，会在下次启动时自动清理。';
 const String _failed = '准备文件夹失败，请重新选择这个文件夹。';
 
 void main() {
@@ -145,9 +173,9 @@ void main() {
   late _StorageChannel storage;
 
   setUp(() {
-    // A fresh "process": no stale-cleanup run and no listener guard — and
-    // no listener that an earlier test's staging left on the channel, so
-    // every test sees the FIRST staging of a process.
+    // A fresh Dart isolate: no stale-cleanup run and no listener guard —
+    // and no listener that an earlier test's staging left on the channel,
+    // so every test sees the FIRST staging of an isolate.
     PluginFilePickGateway.resetProcessStateForTest();
     _storage.setMethodCallHandler(null);
     storage = _StorageChannel()..install();
@@ -300,10 +328,9 @@ void main() {
     expect(storage.methods, ['cleanupStaleStaging']);
 
     cleanup.complete({'removed': 0});
-    expect(await pick, isNotNull);
+    expect(await _finished(tester, pick), isNotNull);
     expect(storage.methods,
         ['cleanupStaleStaging', 'pickSendFolder', 'stageSafTree']);
-    await tester.pumpAndSettle();
   });
 
   testWidgets('Android: a failing startup cleanup is swallowed and does '
@@ -350,8 +377,7 @@ void main() {
     expect(storage.methods, isNot(contains('cancelStaging')));
 
     staged.complete(_ok(storage.callsFor('stageSafTree').single));
-    expect(await pick, isNotNull);
-    await tester.pumpAndSettle();
+    expect(await _finished(tester, pick), isNotNull);
     expect(find.byKey(_progressDialog), findsNothing);
   });
 
@@ -422,8 +448,7 @@ void main() {
     expect(_bar(tester).value, isNull);
 
     staged.complete(_ok(storage.callsFor('stageSafTree').single));
-    expect(await pick, isNotNull);
-    await tester.pumpAndSettle();
+    expect(await _finished(tester, pick), isNotNull);
     expect(find.byKey(_progressDialog), findsNothing);
   });
 
@@ -484,8 +509,7 @@ void main() {
     staged.completeError(
       PlatformException(code: 'STAGE_CANCELLED', message: 'user'),
     );
-    expect(await pick, isNull);
-    await tester.pumpAndSettle();
+    expect(await _finished(tester, pick), isNull);
     expect(find.byKey(_progressDialog), findsNothing);
     expect(find.byKey(_errorDialog), findsNothing,
         reason: '取消是用户自己的答复，不是失败');
@@ -517,8 +541,7 @@ void main() {
     staged.completeError(
       PlatformException(code: 'STAGE_CANCELLED', message: 'user'),
     );
-    expect(await pick, isNull);
-    await tester.pumpAndSettle();
+    expect(await _finished(tester, pick), isNull);
     expect(find.text('home page'), findsOneWidget);
   });
 
@@ -526,6 +549,8 @@ void main() {
       'and answers null — never handed over', (tester) async {
     await _pumpApp(tester);
     final staged = storage.hold('stageSafTree');
+    // The platform's new answer: something of the copy is left behind.
+    storage.on('cleanupStagedSend', (_) => {'removed': false});
     storage.on('pickSendFolder', (_) => _selected);
 
     final pick = _androidGateway().pickSendDirectory();
@@ -536,8 +561,7 @@ void main() {
     expect(storage.methods, isNot(contains('cleanupStagedSend')));
 
     staged.complete(_ok(call));
-    expect(await pick, isNull);
-    await tester.pumpAndSettle();
+    expect(await _finished(tester, pick), isNull);
     expect(storage.argsOf('cleanupStagedSend'), [
       {'stageId': _stageIdOf(call)},
     ]);
@@ -564,9 +588,75 @@ void main() {
     expect(find.byKey(_progressDialog), findsOneWidget);
 
     staged.complete(_ok(storage.callsFor('stageSafTree').single));
-    expect(await pick, isNull, reason: '用户已请求取消：副本交回');
+    expect(await _finished(tester, pick), isNull,
+        reason: '用户已请求取消：副本交回');
     expect(storage.argsOf('cleanupStagedSend'), hasLength(1));
+  });
+
+  testWidgets('Android: a cancelled staging whose directory could not be '
+      'removed answers STAGE_IO_FAILED / leftover — the refusal dialog '
+      'FOLLOWS the 取消, and nothing is released', (tester) async {
+    await _pumpApp(tester);
+    final staged = storage.hold('stageSafTree');
+    storage.on('pickSendFolder', (_) => _selected);
+
+    final pick = _androidGateway().pickSendDirectory();
+    await _showDialog(tester);
+    final stageId = _stageIdOf(storage.callsFor('stageSafTree').single);
+    await tester.tap(find.byKey(_cancelButton));
+    await tester.pump();
+    expect(find.byKey(_progressDialog), findsOneWidget);
+
+    // Only a staging whose directory is gone answers STAGE_CANCELLED.
+    staged.completeError(
+      PlatformException(code: 'STAGE_IO_FAILED', message: 'leftover'),
+    );
     await tester.pumpAndSettle();
+
+    expect(find.byKey(_progressDialog), findsNothing);
+    expect(find.byKey(_errorDialog), findsOneWidget);
+    expect(_textOf(tester, _errorBody), _leftover);
+    // The platform could not remove it and said so: this side does not
+    // try again on its own.
+    expect(storage.argsOf('cancelStaging'), [
+      {'stageId': stageId},
+    ]);
+    expect(storage.methods, isNot(contains('cleanupStagedSend')));
+
+    await tester.tap(find.byKey(_errorCancelButton));
+    await tester.pumpAndSettle();
+    expect(await pick, isNull);
+    expect(find.text('home page'), findsOneWidget);
+  });
+
+  testWidgets('Android: 重新选择 after that leftover refusal picks again '
+      '— the next staging is a fresh id and is handed over',
+      (tester) async {
+    await _pumpApp(tester);
+    final staged = storage.hold('stageSafTree');
+    storage
+      ..on('pickSendFolder', (_) => _selected)
+      ..on('stageSafTree', _ok);
+
+    final pick = _androidGateway().pickSendDirectory();
+    await _showDialog(tester);
+    final refusedId = _stageIdOf(storage.callsFor('stageSafTree').single);
+    await tester.tap(find.byKey(_cancelButton));
+    await tester.pump();
+    staged.completeError(
+      PlatformException(code: 'STAGE_IO_FAILED', message: 'leftover'),
+    );
+    await tester.pumpAndSettle();
+    expect(_textOf(tester, _errorBody), _leftover);
+
+    await tester.tap(find.byKey(_retryButton));
+    final entry = await _finished(tester, pick);
+
+    expect(entry, isNotNull);
+    expect(entry!.stagingId, isNot(refusedId));
+    expect(storage.callsFor('pickSendFolder'), hasLength(2));
+    expect(storage.callsFor('stageSafTree'), hasLength(2));
+    expect(storage.methods, isNot(contains('cleanupStagedSend')));
   });
 
   // -----------------------------------------------------------------------
@@ -576,10 +666,11 @@ void main() {
   test('the refusal copy: one sentence per code and token, the generic '
       'one for anything unknown', () {
     const expected = <(String, String, String)>[
-      // SAF_PERMISSION_DENIED
+      // SAF_PERMISSION_DENIED — a failed grant lookup is one too.
       ('SAF_PERMISSION_DENIED', 'no-persisted-grant', _noAccess),
       ('SAF_PERMISSION_DENIED', 'grant-limit', _noAccess),
       ('SAF_PERMISSION_DENIED', 'provider-security', _noAccess),
+      ('SAF_PERMISSION_DENIED', 'grant-lookup', _noAccess),
       ('SAF_PERMISSION_DENIED', 'a-token-this-build-does-not-know', _noAccess),
       // SAF_PROVIDER_UNTRUSTED
       ('SAF_PROVIDER_UNTRUSTED', 'authority', _untrustedLocation),
@@ -611,7 +702,13 @@ void main() {
       ('STAGE_NO_SPACE', 'no-space', _noSpace),
       ('STAGE_NO_SPACE', 'enospc', _noSpace),
       ('STAGE_NO_SPACE', '', _noSpace),
-      // STAGE_IO_FAILED, STAGE_INVALID_ID, anything unknown.
+      // STAGE_IO_FAILED: the folder changed under the copy, twice over.
+      ('STAGE_IO_FAILED', 'source-changed', _changed),
+      ('STAGE_IO_FAILED', 'size-mismatch', _changed),
+      // Stopped with something left behind.
+      ('STAGE_IO_FAILED', 'leftover', _leftover),
+      // Everything else about the staging is the generic sentence.
+      ('STAGE_IO_FAILED', 'id-in-use', _failed),
       ('STAGE_IO_FAILED', 'create', _failed),
       ('STAGE_IO_FAILED', 'open', _failed),
       ('STAGE_IO_FAILED', 'read', _failed),
@@ -642,7 +739,7 @@ void main() {
     // the copy.
     for (final body in [_noAccess, _untrustedLocation, _cannotRead, _tooMany,
       _empty, _asIs, _names, _receiverReserved, _sameAsPicked, _noSpace,
-      _failed]) {
+      _changed, _leftover, _failed]) {
       expect(body, endsWith('。'));
       expect(body, isNot(contains('STAGE_')));
       expect(body, isNot(contains('SAF_')));
@@ -695,7 +792,7 @@ void main() {
         await tester.pumpAndSettle();
       }
 
-      final entry = await pick;
+      final entry = await _finished(tester, pick);
       expect(entry, isNotNull, reason: '重新选择之后成功的那次要交回条目');
       expect(storage.callsFor('stageSafTree'), hasLength(tokens.length + 1));
       expect(storage.callsFor('pickSendFolder'), hasLength(tokens.length + 1));
@@ -764,11 +861,10 @@ void main() {
     expect(find.text('home page'), findsOneWidget);
 
     await tester.tap(find.byKey(_retryButton));
-    final entry = await pick;
+    final entry = await _finished(tester, pick);
     expect(entry, isNotNull);
     expect(storage.methods,
         ['pickSendFolder', 'pickSendFolder', 'stageSafTree']);
-    await tester.pumpAndSettle();
     expect(find.text('home page'), findsOneWidget,
         reason: '弹窗下面那一页还在：没有盲目的 pop');
     expect(find.byKey(_errorDialog), findsNothing);
@@ -869,11 +965,8 @@ void main() {
     await tester.pumpAndSettle();
 
     staged.complete(_ok(call));
-    final entry = await pick;
+    final entry = await _finished(tester, pick);
     expect(entry?.stagingId, _stageIdOf(call));
-    // Let every route finish its transition: a page that was popped
-    // would only disappear now.
-    await tester.pumpAndSettle();
     expect(find.text('home page'), findsOneWidget,
         reason: '没有盲目的 pop：下面的页面还在');
     expect(navigator.canPop(), isFalse,
@@ -882,31 +975,275 @@ void main() {
   });
 
   // -----------------------------------------------------------------------
-  // Answers this side cannot hand over.
+  // G1: an ok answer must belong to THIS staging.
   // -----------------------------------------------------------------------
 
-  for (final (label, path) in [
-    ('the tree URI that was picked', _treeUri),
-    ('an msd: pseudo path', 'msd:2184'),
-    ('a /storage/msd/… provider-built path', '/storage/msd/2184/相册'),
-    ('a relative path', 'ak-saf-staging/payload/相册'),
-  ]) {
-    testWidgets('Android: an ok answer whose path is $label is refused — '
-        'released, never handed over', (tester) async {
-      await _pumpApp(tester);
-      storage
-        ..on('pickSendFolder', (_) => _selected)
-        ..on('stageSafTree', (call) => {..._ok(call), 'path': path});
+  testWidgets('G1: an ok answer that is this staging\'s own is accepted — '
+      'every rule at its boundary', (tester) async {
+    await _pumpApp(tester);
+    // One segment, with spaces and dots in it.
+    const name = '相册 2024.backup';
+    storage
+      ..on('pickSendFolder', (_) => {..._selected, 'displayName': name})
+      ..on('stageSafTree', (call) => {
+            ..._okFor(_stageIdOf(call), name),
+            // Every count may be zero.
+            'fileCount': 0,
+            'byteCount': 0,
+            'emptyDirectoryCount': 0,
+          });
 
+    final entry =
+        await _finished(tester, _androidGateway().pickSendDirectory());
+
+    expect(entry, isNotNull);
+    expect(entry!.name, name);
+    expect(entry.path, '$_stagingBase/${entry.stagingId}/payload/$name');
+    expect(entry.isDirectory, isTrue);
+    expect(entry.sizeBytes, isNull);
+    expect(entry.stagedFileCount, 0);
+    expect(entry.stagedByteCount, 0);
+    expect(storage.argsOf('stageSafTree').single, {
+      'treeUri': _treeUri,
+      'stageId': entry.stagingId,
+    });
+    // What was handed over is not released.
+    expect(storage.methods, isNot(contains('cleanupStagedSend')));
+    expect(find.byKey(_errorDialog), findsNothing);
+  });
+
+  testWidgets('G1: the folder keeps the name the PICK returned — the one '
+      'the staged path has to end with — whatever the answer\'s own '
+      'displayName says', (tester) async {
+    await _pumpApp(tester);
+    storage
+      ..on('pickSendFolder', (_) => _selected)
+      ..on('stageSafTree', (call) => {
+            ..._ok(call),
+            'displayName': 'not-what-was-picked',
+          });
+
+    final entry =
+        await _finished(tester, _androidGateway().pickSendDirectory());
+
+    expect(entry, isNotNull);
+    expect(entry!.name, _folderName);
+    expect(entry.path, _stagedRoot(entry.stagingId!));
+  });
+
+  testWidgets('G1: a picked name that is not ONE segment is refused before '
+      'anything is staged', (tester) async {
+    await _pumpApp(tester);
+    for (final name in <Object?>['a/b', '.', '..', '', null, 7]) {
+      storage.on('pickSendFolder', (_) => {..._selected, 'displayName': name});
       final pick = _androidGateway().pickSendDirectory();
       await tester.pumpAndSettle();
 
       expect(find.byKey(_errorDialog), findsOneWidget);
+      expect(_textOf(tester, _errorBody), _failed, reason: '$name');
+      // Nothing was staged, so there is nothing to give back either.
+      expect(storage.callsFor('stageSafTree'), isEmpty, reason: '$name');
+      expect(storage.callsFor('cleanupStagedSend'), isEmpty, reason: '$name');
+
+      await tester.tap(find.byKey(_errorCancelButton));
+      await tester.pumpAndSettle();
+      expect(await pick, isNull);
+    }
+  });
+
+  // How an ok answer can fail to be the staging's own. Each builder gets
+  // the id that was REQUESTED and returns the answer the platform gives.
+  final notThisStaging = <(String, Map<String, Object?> Function(String id))>[
+    // -- the path is not the one made for this id --------------------------
+    (
+      "another staging's absolute path",
+      (id) => {..._okFor(id), 'path': _stagedRoot(_otherId(id))},
+    ),
+    // The suffix shifts: these are refused because `<stageId>` no longer
+    // sits where it must.
+    (
+      'a `..` segment inside the staging directory',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase/$id/payload/../$_folderName',
+      },
+    ),
+    (
+      'a `..` segment in front of the staging directory',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase/../$id/payload/$_folderName',
+      },
+    ),
+    // The suffix is intact: only the rule against `..` as a segment
+    // refuses this one.
+    (
+      'a `..` segment inside the base',
+      (id) => {
+        ..._okFor(id),
+        'path': '/data/user/0/dev.ak.ak_sending_app/other/../no_backup'
+            '/ak-saf-staging/$id/payload/$_folderName',
+      },
+    ),
+    (
+      'a `.` segment',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase/./$id/payload/$_folderName',
+      },
+    ),
+    (
+      'an empty segment',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase//$id/payload/$_folderName',
+      },
+    ),
+    (
+      'a trailing slash',
+      (id) => {..._okFor(id), 'path': '${_stagedRoot(id)}/'},
+    ),
+    (
+      'a missing payload level',
+      (id) => {..._okFor(id), 'path': '$_stagingBase/$id/$_folderName'},
+    ),
+    // The id and the name sit where they must — only the `payload` level
+    // itself is not what it has to be.
+    (
+      'another directory where payload belongs',
+      (id) => {..._okFor(id), 'path': '$_stagingBase/$id/copy/$_folderName'},
+    ),
+    (
+      'the staging id one level too deep',
+      (id) => {..._okFor(id), 'path': '$_stagingBase/payload/$id/$_folderName'},
+    ),
+    (
+      'no base in front of the staging id',
+      (id) => {..._okFor(id), 'path': '/$id/payload/$_folderName'},
+    ),
+    (
+      'a wrong root name',
+      (id) => {..._okFor(id), 'path': '$_stagingBase/$id/payload/别的名字'},
+    ),
+    // -- the path is not an absolute POSIX path of plain segments ---------
+    (
+      'a Windows path with backslashes',
+      (id) => {
+        ..._okFor(id),
+        'path': r'C:\ak-saf-staging\' '$id\\payload\\$_folderName',
+      },
+    ),
+    (
+      'a Windows path with slashes',
+      (id) => {
+        ..._okFor(id),
+        'path': 'C:/ak-saf-staging/$id/payload/$_folderName',
+      },
+    ),
+    (
+      'a relative path',
+      (id) => {
+        ..._okFor(id),
+        'path': 'ak-saf-staging/$id/payload/$_folderName',
+      },
+    ),
+    (
+      'a colon in the path',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase/x:y/$id/payload/$_folderName',
+      },
+    ),
+    // The backslash sits where a slash would be legal — only the rule
+    // against `\` itself refuses this one.
+    (
+      'a backslash in the path',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase/x\\y/$id/payload/$_folderName',
+      },
+    ),
+    (
+      'a control character in the path',
+      (id) => {
+        ..._okFor(id),
+        'path': '$_stagingBase\u{1}/$id/payload/$_folderName',
+      },
+    ),
+    (
+      'the tree URI that was picked',
+      (id) => {..._okFor(id), 'path': _treeUri},
+    ),
+    (
+      'an msd: pseudo path',
+      (id) => {..._okFor(id), 'path': 'msd:2184'},
+    ),
+    (
+      'a /storage/msd/… base (P1-H on Android)',
+      (id) => {..._okFor(id), 'path': '/storage/msd/$id/payload/$_folderName'},
+    ),
+    // -- the answer is about another id, or not an ok one -----------------
+    (
+      'a foreign stageId',
+      (id) => {..._okFor(id), 'stageId': _otherId(id)},
+    ),
+    (
+      'no stageId at all',
+      (id) => {..._okFor(id)}..remove('stageId'),
+    ),
+    (
+      'a status other than ok',
+      (id) => {..._okFor(id), 'status': 'done'},
+    ),
+    // -- a count that is not an integer of 0 or more ----------------------
+    (
+      'a negative file count',
+      (id) => {..._okFor(id), 'fileCount': -1},
+    ),
+    (
+      'a negative byte count',
+      (id) => {..._okFor(id), 'byteCount': -1},
+    ),
+    (
+      'a negative empty-directory count',
+      (id) => {..._okFor(id), 'emptyDirectoryCount': -1},
+    ),
+    (
+      "a count that isn't an integer (text)",
+      (id) => {..._okFor(id), 'byteCount': '1536'},
+    ),
+    (
+      "a count that isn't an integer (a fraction)",
+      (id) => {..._okFor(id), 'fileCount': 1.5},
+    ),
+    (
+      'a missing count',
+      (id) => {..._okFor(id)}..remove('emptyDirectoryCount'),
+    ),
+  ];
+
+  for (final (label, shape) in notThisStaging) {
+    testWidgets('G1: an ok answer with $label is a refusal — the copy is '
+        'released under the REQUESTED id, nothing is handed over',
+        (tester) async {
+      await _pumpApp(tester);
+      storage
+        ..on('pickSendFolder', (_) => _selected)
+        ..on('stageSafTree', (call) => shape(_stageIdOf(call)));
+
+      final pick = _androidGateway().pickSendDirectory();
+      await tester.pumpAndSettle();
+
+      final requested = _stageIdOf(storage.callsFor('stageSafTree').single);
+      expect(find.byKey(_errorDialog), findsOneWidget);
       expect(_textOf(tester, _errorBody), _failed);
-      // The staging call answered ok: its copy exists and is released.
+      expect(find.byKey(_progressDialog), findsNothing);
+      // The staging call answered, so giving the copy back is safe — and
+      // only ever THIS staging's id is given back.
       expect(storage.argsOf('cleanupStagedSend'), [
-        {'stageId': _stageIdOf(storage.callsFor('stageSafTree').single)},
-      ]);
+        {'stageId': requested},
+      ], reason: '只交回这次请求的 id');
+
       await tester.tap(find.byKey(_errorCancelButton));
       await tester.pumpAndSettle();
       expect(await pick, isNull);
@@ -949,8 +1286,14 @@ void main() {
   // -----------------------------------------------------------------------
 
   test('releaseStaged: one cleanupStagedSend per distinct staging id, '
-      'none for an entry without one', () async {
+      'none for an entry without one — the platform\'s {"removed": …} '
+      'answers are fine', () async {
     const gateway = PluginFilePickGateway();
+    storage.on('cleanupStagedSend', (call) {
+      // What the platform answers: true, or false when something is
+      // left behind. Neither changes what this side does.
+      return {'removed': _stageIdOf(call) != 'a'};
+    });
     await gateway.releaseStaged([
       _staged('a'),
       _file('C:\\docs\\照片.zip'),
@@ -968,13 +1311,14 @@ void main() {
   });
 
   test('releaseStaged: a cleanup the channel refuses does not propagate '
-      '— the other ids are still cleaned', () async {
+      '— a staging still running (busy) is left alone, the other ids are '
+      'still cleaned', () async {
     const gateway = PluginFilePickGateway();
     storage.on('cleanupStagedSend', (call) {
       if (_stageIdOf(call) == 'a') {
         throw PlatformException(code: 'STAGE_IO_FAILED', message: 'busy');
       }
-      return null;
+      return {'removed': true};
     });
     await gateway.releaseStaged([_staged('a'), _staged('b'), _staged('c')]);
     expect(storage.argsOf('cleanupStagedSend'), [
@@ -983,12 +1327,19 @@ void main() {
       {'stageId': 'c'},
     ]);
 
+    // Any other refusal is just as harmless.
+    storage.on('cleanupStagedSend', (_) {
+      throw PlatformException(code: 'STAGE_IO_FAILED', message: 'id-in-use');
+    });
+    await gateway.releaseStaged([_staged('d')]);
+    expect(storage.argsOf('cleanupStagedSend'), hasLength(4));
+
     // A channel without the method at all.
     storage.on('cleanupStagedSend', (_) {
       throw MissingPluginException('cleanupStagedSend');
     });
-    await gateway.releaseStaged([_staged('d')]);
-    expect(storage.argsOf('cleanupStagedSend'), hasLength(4));
+    await gateway.releaseStaged([_staged('e')]);
+    expect(storage.argsOf('cleanupStagedSend'), hasLength(5));
   });
 
   test('cleanupStaleStaging: calls the channel on Android — once, '
@@ -1008,7 +1359,7 @@ void main() {
   });
 
   test('cleanupStaleStaging: a failing cleanup is swallowed and not run '
-      'again in the same process', () async {
+      'again in the same isolate', () async {
     UiPlatform.androidOverride = true;
     storage.on('cleanupStaleStaging', (_) {
       throw PlatformException(code: 'STAGE_IO_FAILED', message: 'io');
@@ -1178,7 +1529,7 @@ void main() {
     await _pumpApp(tester);
     storage
       ..on('pickSendFolder', (_) => {..._selected, 'displayName': '报告.pdf'})
-      ..on('stageSafTree', (call) => {..._ok(call), 'displayName': '报告.pdf'});
+      ..on('stageSafTree', (call) => _okFor(_stageIdOf(call), '报告.pdf'));
     final gateway = _androidGateway(
       filePicker: () async => _twoPlatformFiles,
       folderOffer: () async => true,
@@ -1218,16 +1569,8 @@ void main() {
           'displayName': picks == 1 ? '照片.zip' : _folderName,
         };
       })
-      ..on('stageSafTree', (call) {
-        final name = picks == 1 ? '照片.zip' : _folderName;
-        return {
-          ..._ok(call),
-          'displayName': name,
-          'path':
-              '/data/user/0/dev.ak.ak_sending_app/no_backup/ak-saf-staging'
-                  '/${_stageIdOf(call)}/payload/$name',
-        };
-      });
+      ..on('stageSafTree', (call) => _okFor(
+          _stageIdOf(call), picks == 1 ? '照片.zip' : _folderName));
     final gateway = _androidGateway(
       filePicker: () async => _twoPlatformFiles,
       folderOffer: () async => true,

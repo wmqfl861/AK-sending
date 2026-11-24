@@ -218,7 +218,7 @@ class SafSendFolderUnsupportedDialog extends StatelessWidget {
 ///
 /// | code | tokens | body |
 /// |---|---|---|
-/// | `SAF_PERMISSION_DENIED` | `no-persisted-grant` `grant-limit` `provider-security` | no read permission |
+/// | `SAF_PERMISSION_DENIED` | `no-persisted-grant` `grant-limit` `provider-security` `grant-lookup` | no read permission |
 /// | `SAF_PROVIDER_UNTRUSTED` | `authority` | not supported from this location |
 /// | `SAF_ENUMERATION_FAILED` | `query` `duplicate-id` `overflow` | cannot read everything inside |
 /// | | `too-many-entries` | too many items to send at once |
@@ -228,9 +228,14 @@ class SafSendFolderUnsupportedDialog extends StatelessWidget {
 /// | | `receiver-reserved` | a name the receiver reserves |
 /// | | `duplicate-with-picked` (this side only) | same name as a picked file |
 /// | `STAGE_NO_SPACE` | `no-space` `enospc` | not enough storage on this phone |
-/// | `STAGE_IO_FAILED` `STAGE_INVALID_ID`, anything unknown | any | preparing the folder failed |
+/// | `STAGE_IO_FAILED` | `source-changed` `size-mismatch` | the folder changed while it was prepared |
+/// | | `leftover` | stopped; temporary files are removed at the next start |
+/// | `STAGE_IO_FAILED` `STAGE_INVALID_ID`, anything unknown | any other | preparing the folder failed |
 ///
-/// `STAGE_CANCELLED` is not a refusal and never gets here.
+/// `STAGE_CANCELLED` is not a refusal and never gets here. A cancelled
+/// staging that could not remove everything of itself answers
+/// `STAGE_IO_FAILED` / `leftover` instead — so this dialog CAN follow a
+/// 「取消」, and says why.
 String safSendStagingErrorBody(String code, String token) {
   switch (code) {
     case 'SAF_PERMISSION_DENIED':
@@ -265,6 +270,20 @@ String safSendStagingErrorBody(String code, String token) {
     case 'STAGE_NO_SPACE':
       return '手机存储空间不足，无法复制这个文件夹，'
           '请清理出足够的空间后重试。';
+    case 'STAGE_IO_FAILED':
+      return switch (token) {
+        // Verified after the copy: a directory that gained or lost a
+        // child, or a file that did not have the length it announced.
+        'source-changed' || 'size-mismatch' =>
+          '准备期间文件夹里的内容有变动，无法按原样发送，'
+              '请重新选择这个文件夹。',
+        // The staging stopped and its directory could not be removed
+        // completely — nothing for the user to do, so it says when.
+        'leftover' =>
+          '准备已中止，部分临时文件未能删除，'
+              '会在下次启动时自动清理。',
+        _ => '准备文件夹失败，请重新选择这个文件夹。',
+      };
     default:
       return '准备文件夹失败，请重新选择这个文件夹。';
   }

@@ -47,6 +47,11 @@
 //     AK_U2_MIB=32 AK_U2_WATCH_MIN=30.
 //   AK_U2_CASE             optional evidence tag for log parsing (L1, L2,
 //     L3-seg1, L3-seg2, ...); default "unnamed".
+//   AK_U2_POST_DONE_SEC    optional (default 0): after the completion verdict
+//     is read the app STAYS in the foreground this many seconds before the
+//     test returns — the window in which the host's keep-awake sampler can
+//     see the lock released while the app is still alive (X4's "held and
+//     released as a pair" acceptance clause).
 //
 // Red lines honored in every printed line: task/pairing codes are NEVER
 // printed. The one-time task code is handed to the host through a file in
@@ -130,6 +135,15 @@ const int _watchMin =
     int.fromEnvironment('AK_U2_WATCH_MIN', defaultValue: 10);
 const String _caseTag =
     String.fromEnvironment('AK_U2_CASE', defaultValue: 'unnamed');
+
+/// X4 keep-awake pair (batch X review, 2026-11-24): how long the app STAYS
+/// in the foreground after the completion verdict was read. The teardown
+/// takes the screen-on flag away with the process, so without this dwell the
+/// host's `dumpsys power` sampler can never tell "released on completion"
+/// from "gone with the app". Opt-in; no pumps during the dwell — frames
+/// arrive live while the app is resumed.
+const Duration _postDoneDwell = Duration(
+    seconds: int.fromEnvironment('AK_U2_POST_DONE_SEC', defaultValue: 0));
 
 const String _workDirName = 'u2_lifecycle';
 const String _payloadName = 'u2-payload.bin';
@@ -751,6 +765,16 @@ void main() {
         evidence('RESULT_UI|ok=${_redact(ok)}|error=${_redact(err)}'
             '|endedPill=$pillSeen'
             '|role=${_redact(textAt(tester, 'conn_detail_role'))}');
+        if (_postDoneDwell > Duration.zero) {
+          // Keep the finished app in the foreground so the host sampler can
+          // observe the keep-awake lock going away while the app is alive.
+          evidence('POST_DONE_DWELL|started|secs=${_postDoneDwell.inSeconds}s'
+              '|wall=${_wall()}');
+          await Future<void>.delayed(_postDoneDwell);
+          evidence('POST_DONE_DWELL|done'
+              '|life=${WidgetsBinding.instance.lifecycleState?.name ?? '-'}'
+              '|wall=${_wall()}');
+        }
       } else {
         evidence('RESULT_UI|skipped|app-still-hidden'
             '|teardown-pump-may-hang-see-file-header');

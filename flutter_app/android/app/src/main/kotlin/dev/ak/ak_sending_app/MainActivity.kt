@@ -8,6 +8,9 @@ package dev.ak.ak_sending_app
  * 与评审 4.4：默认下载目录 + 用户改选走 SAF；SAF 每次操作经跨进程调用，
  * 十万级小文件会明显变慢，故正文路径的最终选择留给 P0 实测数据）。
  *
+ * 批次 Z 起增加发送侧目录暂存（方法 6–10，实现在 SafSendStager.kt）：SAF 目录树先
+ * 复制进应用私有存储，引擎仍只读文件系统路径；接收侧与 pickFolder 不变。
+ *
  * ── Channel 方法与返回 schema（MethodChannel "dev.ak/storage"）──────────────
  *
  * 1) getStorageInfo() -> Map
@@ -44,6 +47,28 @@ package dev.ak.ak_sending_app
  *      本机自报设备名（X5，批次 X 交接 §4.5：仅展示用，不是身份证明）。
  *      Build.MODEL 优先，为空回退 Build.MANUFACTURER，均 trim；
  *      两侧皆空返回 null（Dart 侧随之走引擎默认名 'ak-task'）。
+ *
+ * 6) pickSendFolder() -> Map                                         （批次 Z：发送侧选目录）
+ *      {status:"selected", treeUri, displayName} | {status:"cancelled"}
+ *      与 pickFolder 各用一个 launcher 和一个 pending result，互不影响。
+ *      只校验 authority，并借 Activity 的临时授权读出根目录名——不持久化任何授权。
+ *      选择器打不开（ActivityNotFoundException 等）或 launcher 不可用时答 cancelled。
+ *
+ * 7) stageSafTree(treeUri: String, stageId: String) -> Map
+ *      {status:"ok", stageId, path, displayName,
+ *       fileCount: Long, byteCount: Long, emptyDirectoryCount: Long}
+ *      path 是暂存后的根目录路径（<noBackupFilesDir>/ak-saf-staging/<stageId>/
+ *      payload/<displayName>）。失败一律 PlatformException(code, 固定 reason token)，
+ *      进度经同一通道的 stagingProgress 事件回传，应答在工作线程完全停下之后。
+ *
+ * 8) cancelStaging(stageId: String) -> null
+ *      只置取消标志；清理由在跑的暂存任务自己完成后再应答。
+ *
+ * 9) cleanupStagedSend(stageId: String) -> null
+ *      删除已暂存的副本，幂等（已经不在了也答 null）。
+ *
+ * 10) cleanupStaleStaging() -> Map
+ *      {removed: Long}   清掉以前各次运行留下的暂存目录与 READ-only 授权。
  *
  * ── ActivityResult 路由说明 ─────────────────────────────────────────────
  * FlutterActivity 继承的是 android.app.Activity（非 ComponentActivity），
@@ -98,6 +123,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.StatFs
 import android.provider.DocumentsContract
 import android.util.Log
@@ -123,6 +150,7 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "dev.ak/storage"
         private const val SCREEN_CHANNEL = "dev.ak/screen"
         private const val PICK_FOLDER_KEY = "dev.ak/storage:pickFolder"
+        private const val PICK_SEND_FOLDER_KEY = "dev.ak/storage:pickSendFolder"
         private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
     }
 
@@ -130,6 +158,14 @@ class MainActivity : FlutterActivity() {
     private var pendingPickResult: MethodChannel.Result? = null
 
     private var folderPicker: ActivityResultLauncher<Uri?>? = null
+
+    /** 进行中的 pickSendFolder 调用的 result（批次 Z）；与上面两个成员完全独立。 */
+    private var pendingSendPickResult: MethodChannel.Result? = null
+
+    private var sendFolderPicker: ActivityResultLauncher<Uri?>? = null
+
+    /** 发送侧目录暂存（批次 Z）：枚举、复制、取消与清理都在它里面。 */
+    private var sendStager: SafSendStager? = null
 
     private var engineRef: FlutterEngine? = null
 
@@ -200,19 +236,49 @@ class MainActivity : FlutterActivity() {
             ActivityResultContracts.OpenDocumentTree()
         ) { treeUri -> onFolderPicked(treeUri) }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "getStorageInfo" -> result.success(getStorageInfo())
-                    "pickFolder" -> onPickFolder(result)
-                    "safWriteTest" -> result.success(
-                        safWriteTest(call.argument<String>("treeUri"))
+        // 批次 Z：发送侧选目录用另一个 launcher（另一个 key 与 requestCode），
+        // 与 pickFolder 的 pending result / 回调互不影响。
+        sendFolderPicker = storageResultRegistry.register(
+            PICK_SEND_FOLDER_KEY,
+            ActivityResultContracts.OpenDocumentTree()
+        ) { treeUri -> onSendFolderPicked(treeUri) }
+
+        val storageChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        sendStager = SafSendStager(
+            applicationContext,
+            storageChannel,
+            Handler(Looper.getMainLooper())
+        )
+        storageChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getStorageInfo" -> result.success(getStorageInfo())
+                "pickFolder" -> onPickFolder(result)
+                "safWriteTest" -> result.success(
+                    safWriteTest(call.argument<String>("treeUri"))
+                )
+                "listSafPersisted" -> result.success(listSafPersisted())
+                "deviceName" -> result.success(deviceName())
+                "pickSendFolder" -> onPickSendFolder(result)
+                "stageSafTree" -> withSendStager(result) {
+                    stageSafTree(
+                        call.argument<Any?>("treeUri") as? String,
+                        call.argument<Any?>("stageId") as? String,
+                        result
                     )
-                    "listSafPersisted" -> result.success(listSafPersisted())
-                    "deviceName" -> result.success(deviceName())
-                    else -> result.notImplemented()
                 }
+                "cancelStaging" -> withSendStager(result) {
+                    cancelStaging(call.argument<Any?>("stageId") as? String)
+                    result.success(null)
+                }
+                "cleanupStagedSend" -> withSendStager(result) {
+                    cleanupStagedSend(call.argument<Any?>("stageId") as? String, result)
+                }
+                "cleanupStaleStaging" -> withSendStager(result) {
+                    cleanupStaleStaging(result)
+                }
+                else -> result.notImplemented()
             }
+        }
 
         // W7.3（批次 W 交接 §4.7 第 3 条）：传输期间保持屏幕常亮的窄通道。
         // 只有两个方法：on 加 FLAG_KEEP_SCREEN_ON、off 清除之。不加第三方
@@ -247,8 +313,23 @@ class MainActivity : FlutterActivity() {
             }
         }
         pendingPickResult = null
+        pendingSendPickResult?.let { pending ->
+            runCatching {
+                pending.error(
+                    "activity_destroyed",
+                    "host activity destroyed before send folder pick completed",
+                    null
+                )
+            }
+        }
+        pendingSendPickResult = null
+        // 批次 Z：还在跑的暂存一律取消（清理由任务自己完成），之后不再向通道应答。
+        runCatching { sendStager?.shutdown() }
+        sendStager = null
         runCatching { folderPicker?.unregister() }
         folderPicker = null
+        runCatching { sendFolderPicker?.unregister() }
+        sendFolderPicker = null
         runCatching { engineRef?.plugins?.remove(activityResultRouter::class.java) }
         engineRef = null
         super.onDestroy()
@@ -343,6 +424,64 @@ class MainActivity : FlutterActivity() {
     } catch (t: Throwable) {
         Log.w(TAG, "build initial Download URI failed: $t")
         null
+    }
+
+    // ── pickSendFolder（批次 Z）──────────────────────────────────────────
+
+    /**
+     * 发送侧选目录：与 pickFolder 各用各的 launcher、pending result 和回调。
+     * 应答只有 {status:"selected"} / {status:"cancelled"} 两种——launcher 不可用、
+     * 已有一次在途、或选择器打不开（Android TV 等没有文档选择器的环境，
+     * ActivityNotFoundException）都答 cancelled，绝不崩溃。
+     */
+    private fun onPickSendFolder(result: MethodChannel.Result) {
+        val launcher = sendFolderPicker
+        if (launcher == null || pendingSendPickResult != null) {
+            Log.w(TAG, "pickSendFolder declined (no launcher or already in flight)")
+            result.success(mapOf("status" to "cancelled"))
+            return
+        }
+        pendingSendPickResult = result
+        try {
+            launcher.launch(initialDownloadDocumentUri())
+        } catch (t: Throwable) {
+            Log.w(TAG, "launch OpenDocumentTree (send) failed: ${t.javaClass.simpleName}")
+            pendingSendPickResult = null
+            result.success(mapOf("status" to "cancelled"))
+        }
+    }
+
+    /** OpenDocumentTree 的结果回到 pickSendFolder 的调用方；校验与根目录名都在 stager 里。 */
+    private fun onSendFolderPicked(treeUri: Uri?) {
+        val pending = pendingSendPickResult
+        pendingSendPickResult = null
+        if (pending == null) {
+            // 没有在途的调用：丢弃（日志里不带 URI）。
+            Log.w(TAG, "send folder picked but no pending result")
+            return
+        }
+        val stager = sendStager
+        if (stager == null) {
+            runCatching {
+                pending.error(
+                    "activity_destroyed",
+                    "host activity destroyed before send folder pick completed",
+                    null
+                )
+            }
+            return
+        }
+        stager.onSendFolderPicked(treeUri, pending)
+    }
+
+    /** 批次 Z 各方法的统一入口：stager 只在 Activity 存活期间存在，兜底答 unavailable。 */
+    private fun withSendStager(result: MethodChannel.Result, block: SafSendStager.() -> Unit) {
+        val stager = sendStager
+        if (stager == null) {
+            result.error("unavailable", "send stager not initialized", null)
+            return
+        }
+        stager.block()
     }
 
     // ── safWriteTest ──────────────────────────────────────────────────────

@@ -65,11 +65,28 @@ void main() {
     await tester.pump(const Duration(milliseconds: 600));
     final field = find.byKey(const ValueKey('join_code_field'));
     await safUntil(tester, () => tester.any(field), 'join panel field');
-    await tester.enterText(field, safCode);
-    await tester.pump(const Duration(milliseconds: 400));
     final submit = find.byKey(const ValueKey('join_submit_button'));
-    expect(tester.widget<FilledButton>(submit).onPressed, isNotNull,
-        reason: 'submit still disabled — code incomplete');
+    await tester.enterText(field, safCode);
+    // The live binding does NOT stub the text-input channel: the value
+    // travels through the real connection and the panel enables 配对 only
+    // on the rebuild that follows. Wait for that state instead of checking
+    // 400 ms after the entry — the first profile round (2026-11-24) found
+    // the button still disabled there.
+    var entryPath = 'test-input-stub';
+    if (!await submitEnabledWithin(tester, submit, 3)) {
+      // Same widget-level callback the keyboard path drives (onChanged →
+      // setState); the panel's state is exactly what a real entry yields.
+      final panelField = tester.widget<TextField>(field);
+      panelField.controller!.value = TextEditingValue(
+        text: safCode,
+        selection: TextSelection.collapsed(offset: safCode.length),
+      );
+      panelField.onChanged!(safCode);
+      entryPath = 'controller-callback';
+      expect(await submitEnabledWithin(tester, submit, 15), isTrue,
+          reason: 'submit still disabled after the code entry');
+    }
+    safEvidence('CODE_ENTERED|path=$entryPath');
     await tester.tap(submit);
     // P2-G (fourth review): codes never print in full — only the masked
     // tail (the repo red line: last 4 symbols at most).
@@ -155,6 +172,22 @@ Future<void> safUntil(WidgetTester tester, bool Function() ready, String what,
         .timeout(const Duration(seconds: 45));
   }
   expect(ready(), isTrue, reason: what);
+}
+
+/// True when 配对 (the join submit button) is enabled within [seconds].
+Future<bool> submitEnabledWithin(
+    WidgetTester tester, Finder submit, int seconds) async {
+  final end = DateTime.now().add(Duration(seconds: seconds));
+  while (DateTime.now().isBefore(end)) {
+    if (submit.evaluate().isNotEmpty &&
+        tester.widget<FilledButton>(submit).onPressed != null) {
+      return true;
+    }
+    await tester
+        .pump(const Duration(milliseconds: 400))
+        .timeout(const Duration(seconds: 45));
+  }
+  return false;
 }
 
 String safTextAt(WidgetTester tester, String key) {

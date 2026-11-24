@@ -126,7 +126,10 @@ void main() {
 
     expect(find.text('已选 1 项'), findsOneWidget);
     expect(find.text('文件夹'), findsOneWidget);
-    expect(picker.pickDirectoryCalls, 1);
+    // Batch Z: the send-side folder pick is `pickSendDirectory()`; the
+    // plain `pickDirectory()` (the receive save-dir pick) is never asked.
+    expect(picker.pickSendDirectoryCalls, 1);
+    expect(picker.pickDirectoryCalls, 0);
 
     await tester.tap(find.byKey(const ValueKey('conn_send_button')));
     await tester.pump();

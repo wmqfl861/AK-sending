@@ -69,18 +69,29 @@ class MockClipboard {
 }
 
 /// Deterministic picker double: [filesResult] for the multi-file pick,
-/// [directoryResult] for the folder pick.
+/// [directoryResult] for the folder pick, [sendDirectoryResult] for the
+/// send-side folder pick.
 class FakeFilePickGateway implements FilePickGateway {
   FakeFilePickGateway({
     this.filesResult = const <PickedEntry>[],
     this.directoryResult,
+    this.sendDirectoryResult,
   });
 
   List<PickedEntry> filesResult;
   PickedEntry? directoryResult;
 
+  /// Batch Z: what the SEND-side single-folder pick (`pickSendDirectory`)
+  /// answers. Null (the default) falls back to [directoryResult], so a
+  /// test written before the split keeps its meaning.
+  PickedEntry? sendDirectoryResult;
+
   int pickFilesCalls = 0;
   int pickDirectoryCalls = 0;
+  int pickSendDirectoryCalls = 0;
+
+  /// Batch Z: every list handed to `releaseStaged`, in call order.
+  final List<List<PickedEntry>> released = [];
 
   @override
   Future<List<PickedEntry>> pickFiles() async {
@@ -89,10 +100,15 @@ class FakeFilePickGateway implements FilePickGateway {
   }
 
   @override
-  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+  Future<PickedEntry?> pickSendDirectory() async {
+    pickSendDirectoryCalls += 1;
+    return sendDirectoryResult ?? directoryResult;
+  }
 
   @override
-  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {
+    released.add(List.of(entries));
+  }
 
   @override
   Future<PickedEntry?> pickDirectory() async {

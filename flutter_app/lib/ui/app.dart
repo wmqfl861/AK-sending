@@ -72,6 +72,19 @@ class _AkSendingAppState extends State<AkSendingApp> {
   late final TransferHistory _history = widget.history ?? TransferHistory();
 
   @override
+  void initState() {
+    super.initState();
+    // Batch Z: remove the staging leftovers of earlier runs (interrupted
+    // copies, expired finished ones) and the read grants they left behind.
+    // Only the PRODUCTION gateway — an injected fake never touches the
+    // channel. Unawaited: the gateway swallows its errors, and the first
+    // staging of the process awaits its own copy of this anyway.
+    if (widget.picker is PluginFilePickGateway) {
+      unawaited(PluginFilePickGateway.cleanupStaleStaging());
+    }
+  }
+
+  @override
   void dispose() {
     if (widget.history == null) {
       _history.dispose(); // only the instance this widget created

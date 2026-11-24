@@ -25,9 +25,17 @@
 /// a running transfer, and a 「最近传输」 section lists this session's
 /// finished transfers (a v1 pairing carries one transfer and then leaves
 /// the connection list, so this is where the user looks back).
+///
+/// Batch Z: a folder picked on Android is a STAGED copy in app-private
+/// storage (the engine only takes filesystem paths). Whoever holds the
+/// `PickedEntry` owns that copy. This page owns the primary send path's
+/// preselected entries while they sit in `_pendingEntries`, and hands
+/// their staged folders back through [FilePickGateway.releaseStaged] at
+/// every point where that ownership ends — handing them to the connection
+/// detail page is a TRANSFER, not a release.
 library;
 
-import 'dart:async' show StreamSubscription;
+import 'dart:async' show StreamSubscription, unawaited;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
@@ -188,6 +196,10 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    // Batch Z: the page is gone — the selection it still owns goes back
+    // with it. One already handed to the connection detail page left
+    // `_pendingEntries` there and is that page's to release.
+    _releaseStaged(widget.picker, _pendingEntries);
     _flow.removeListener(_onFlowChanged);
     _flow.dispose();
     _connectionsSub?.cancel();
@@ -216,7 +228,9 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     if (!_flow.active) {
       // The flow ended (reset/cancel) — the pending selection of the
-      // primary send path dies with it; the next send re-picks.
+      // primary send path dies with it; the next send re-picks. Batch Z:
+      // its staged folders go back with it.
+      _releaseStaged(widget.picker, _pendingEntries);
       _pendingEntries = null;
     } else {
       // A new flow began — the previous flow's expiry notice retires.
@@ -270,8 +284,16 @@ class _HomePageState extends State<HomePage> {
         final autoSend = pending != null && pending.isNotEmpty;
         _pendingEntries = null; // exactly once
         final id = connection.id;
+        // Batch Z: read here — the callback below may find the page gone.
+        final picker = widget.picker;
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
+          if (!mounted) {
+            // Batch Z: the page left before this frame — the selection was
+            // already detached from `_pendingEntries` above, so nothing
+            // else will ever free its staged folders.
+            _releaseStaged(picker, pending);
+            return;
+          }
           Navigator.of(context)
               .push(
             MaterialPageRoute<void>(
@@ -320,6 +342,21 @@ class _HomePageState extends State<HomePage> {
   bool _picksInFlightFor(int generation) =>
       (_picksInFlightByGeneration[generation] ?? 0) > 0;
 
+  /// Batch Z: hands the staged folders behind [entries] back to [picker]
+  /// (null = nothing owned). Fire-and-forget — it never delays or reorders
+  /// the flow — and does nothing when no entry is staged.
+  static void _releaseStaged(
+      FilePickGateway picker, List<PickedEntry>? entries) {
+    if (entries == null) return;
+    final staged = [
+      for (final entry in entries)
+        if (entry.stagingId != null) entry,
+    ];
+    if (staged.isNotEmpty) {
+      unawaited(picker.releaseStaged(staged));
+    }
+  }
+
   /// X4 发送文件主路径: pick the files FIRST (multi-select); only a
   /// non-empty selection mints the (sender-role) code. A cancelled pick
   /// (empty list) creates nothing — the home actions stay.
@@ -331,11 +368,22 @@ class _HomePageState extends State<HomePage> {
   /// discarded instead of minting a code the user already moved past.
   Future<void> _startSendFlow() async {
     final generation = _flow.generation;
-    final entries = await widget.picker.pickFiles();
+    // Batch Z: read before the await — a result discarded below must still
+    // reach the gateway.
+    final picker = widget.picker;
+    final entries = await picker.pickFiles();
     if (!mounted || entries.isEmpty) {
+      if (!mounted) {
+        // Batch Z: the page left with the picker up — a selection it can no
+        // longer show belongs to no one: its staged folders go back.
+        _releaseStaged(picker, entries);
+      }
       return; // cancelled: no code
     }
     if (_flow.generation != generation) {
+      // Batch Z: the discarded selection belongs to no flow — its staged
+      // folders go back with it.
+      _releaseStaged(picker, entries);
       return; // the flow moved on behind the picker — no code of ours
     }
     setState(() => _pendingEntries = entries);
@@ -378,10 +426,13 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final generation = _flow.generation;
+    // Batch Z: read before the await — a result discarded in the `finally`
+    // must still reach the gateway, also once the page is gone.
+    final picker = widget.picker;
     _beginPick(generation);
     List<PickedEntry> entries = const <PickedEntry>[];
     try {
-      entries = await widget.picker.pickFiles();
+      entries = await picker.pickFiles();
     } finally {
       // Settles on BOTH outcomes — a result, or a picker error — so a
       // deferred handover is never stranded behind a stuck count. An
@@ -394,8 +445,15 @@ class _HomePageState extends State<HomePage> {
         } else {
           // A stale flow's pick: the result dies here — but the handover
           // check re-runs for whoever owns the pending selection now.
+          // Batch Z: a result that dies here belongs to no flow — its
+          // staged folders go back.
+          _releaseStaged(picker, entries);
           _onFlowChanged();
         }
+      } else if (entries.isNotEmpty) {
+        // Batch Z: the page left with the picker up — nothing can take the
+        // result any more, so its staged folders go back.
+        _releaseStaged(picker, entries);
       }
     }
   }
@@ -404,10 +462,15 @@ class _HomePageState extends State<HomePage> {
   void _settleSelectionChange(List<PickedEntry> entries) {
     if (_pendingEntries == null) {
       // The flow ended while the picker was open (the selection dies with
-      // it — see `_onFlowChanged`): the pick belongs to no flow.
+      // it — see `_onFlowChanged`): the pick belongs to no flow. Batch Z:
+      // nor do its staged folders — they go back.
+      _releaseStaged(widget.picker, entries);
       return;
     }
     if (entries.isNotEmpty) {
+      // Batch Z: the real pick replaces the last selection — the staged
+      // folders of the replaced one go back.
+      _releaseStaged(widget.picker, _pendingEntries);
       _pendingEntries = entries;
     }
     // Empty = cancelled: the last selection stays. Either way the flow may

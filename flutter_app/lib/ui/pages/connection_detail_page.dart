@@ -25,9 +25,18 @@
 /// probe round and dial, so that verdict does not block), the page sends
 /// them automatically EXACTLY ONCE (审核 §4.3 发送方主路径: 对方加入且
 /// 连通后自动开始发送，不再需要点任何按钮).
+///
+/// Batch Z: a folder picked on Android is a STAGED copy in app-private
+/// storage (the engine only takes filesystem paths). Whoever holds the
+/// [PickedEntry] owns that copy — this page hands the staged entries back
+/// through [FilePickGateway.releaseStaged] wherever its ownership of them
+/// ends: a SUCCESSFUL send (they also leave the review list, so nothing
+/// can send a released path again), 清空, a new pick replacing them, and
+/// `dispose` while no send is in flight. A FAILED send releases nothing
+/// on its own (see `_send`).
 library;
 
-import 'dart:async' show StreamSubscription;
+import 'dart:async' show StreamSubscription, TimeoutException, unawaited;
 
 import 'package:flutter/material.dart';
 
@@ -116,6 +125,18 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   /// the picked files' sizes when the engine reported none).
   int? _sentBytes;
 
+  /// Batch Z: the staged folders of the send in flight (empty when none) —
+  /// the engine's to read until that send settles. Nothing else hands them
+  /// back meanwhile: a pick that replaces the review list while the send
+  /// still runs leaves them to the send's own completion.
+  Set<String> _readingStagedIds = const <String>{};
+
+  /// Batch Z: a send is with the engine right now. Set with the sending
+  /// STAGE and cleared when the send settles — but unlike `_sendStage`,
+  /// which a pick landing during the send resets with the rest of the
+  /// card, it stays true until the engine has answered.
+  bool _sendInFlight = false;
+
   @override
   void initState() {
     super.initState();
@@ -169,6 +190,16 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     _sub?.cancel();
     _progressSub?.cancel();
     _idleExpirySub?.cancel();
+    // Batch Z: the page is gone and hands back the staged folders still in
+    // its review list — unless a send is in flight: that send's own
+    // completion decides (a SUCCESS releases, a failure never does), else
+    // the stale cleanup of a later process owns them. (A pick that landed
+    // during a send has replaced the list and reset the stage: what is
+    // listed then is NOT what the engine reads, so handing it back is
+    // safe — the entries being read are that send's, not the list's.)
+    if (_sendStage != _SendStage.sending) {
+      _releaseStaged(widget.picker, _picked);
+    }
     super.dispose();
   }
 
@@ -202,7 +233,36 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     _send();
   }
 
+  /// Batch Z: the staged folders among [entries] — the only ones anyone
+  /// owns (a plain file or folder pick is the user's own path).
+  static List<PickedEntry> _stagedOf(Iterable<PickedEntry> entries) => [
+        for (final entry in entries)
+          if (entry.stagingId != null) entry,
+      ];
+
+  /// Batch Z: hands the staged folders behind [entries] back to [picker].
+  /// Fire-and-forget — it never delays or reorders the flow — and does
+  /// nothing when [entries] holds no staged folder.
+  static void _releaseStaged(
+      FilePickGateway picker, Iterable<PickedEntry> entries) {
+    final staged = _stagedOf(entries);
+    if (staged.isNotEmpty) {
+      unawaited(picker.releaseStaged(staged));
+    }
+  }
+
+  /// Batch Z: a failed send that signals an UNCONFIRMED native cancel —
+  /// the `TimeoutException` `SimpleTransferService.sendFiles` rethrows when
+  /// cancelling the native task fails. The service has no typed error for
+  /// it, so the text of its message is the only signal.
+  static bool _isUnconfirmedNativeCancel(Object error) =>
+      error is TimeoutException &&
+      (error.message ?? '').contains('取消原生任务失败');
+
   Future<void> _pickSource({bool roleHint = false}) async {
+    // Batch Z: read before the awaits — the unmounted branch below must
+    // still reach the gateway.
+    final picker = widget.picker;
     final mode = await showModalBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
@@ -248,12 +308,30 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     }
     List<PickedEntry> entries;
     if (mode == 'dir') {
-      final dir = await widget.picker.pickDirectory();
+      // Batch Z: the SEND-side pick — on Android it goes through the SAF
+      // tree picker and a staged copy. The plain `pickDirectory()` stays
+      // with the receive save-dir pick of the settings page.
+      final dir = await picker.pickSendDirectory();
       entries = dir == null ? const <PickedEntry>[] : <PickedEntry>[dir];
     } else {
-      entries = await widget.picker.pickFiles();
+      entries = await picker.pickFiles();
     }
-    if (!mounted) return;
+    if (!mounted) {
+      // Batch Z: the page left while the picker was up — the entries it
+      // just obtained were never shown, so nothing else owns their staged
+      // copies.
+      _releaseStaged(picker, entries);
+      return;
+    }
+    // Batch Z: the new selection replaces the old one — the staged folders
+    // of the replaced selection go back with it. EXCEPT the ones a send in
+    // flight is still reading (a pick opened before that send started can
+    // return while it runs): those are the send's own completion to hand
+    // back, never a path that runs while the engine may still be reading.
+    final replaced = [
+      for (final entry in _picked)
+        if (!_readingStagedIds.contains(entry.stagingId)) entry,
+    ];
     setState(() {
       _picked
         ..clear()
@@ -263,28 +341,45 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       _sendError = null;
       _progress = null;
     });
+    _releaseStaged(picker, replaced);
   }
 
   Future<void> _send() async {
+    // Batch Z: one send at a time — while a send is in flight its entries
+    // are the engine's to read; a second start must not hand them over
+    // again (a double tap, a duplicate auto-send snapshot). `_sendInFlight`
+    // also covers a pick that landed during the send and reset the STAGE.
+    if (_sendStage == _SendStage.sending || _sendInFlight) return;
     if (_picked.isEmpty) return;
     // Read everything the record needs BEFORE the await (no context use
     // after an async gap).
     final history = TransferHistoryScope.read(context);
+    final service = widget.service;
+    final picker = widget.picker;
+    final connectionId = widget.connectionId;
     final peerName = (_connection ?? _lastKnown)?.peerName ?? '对端';
     final pickedBytes = _knownPickedBytes();
     final fileCount = _picked.every((entry) => !entry.isDirectory)
         ? _picked.length
         : null;
+    // Batch Z: the entries THIS send hands the engine — the ownership
+    // decisions when it settles are made on this snapshot.
+    final sending = List<PickedEntry>.of(_picked);
+    final stagedIds = {
+      for (final entry in _stagedOf(sending)) entry.stagingId!,
+    };
     final started = DateTime.now();
     setState(() {
       _sendStage = _SendStage.sending;
+      _sendInFlight = true;
+      _readingStagedIds = stagedIds;
       _sendSummary = null;
       _sendError = null;
       _progress = null;
     });
     try {
-      final summary = await widget.service
-          .sendFiles(widget.connectionId, _picked.map((e) => e.path).toList());
+      final summary = await service.sendFiles(
+          connectionId, [for (final entry in sending) entry.path]);
       final elapsed = DateTime.now().difference(started);
       final bytes = _progress?.totalBytes ?? pickedBytes;
       history?.add(TransferRecord(
@@ -297,14 +392,30 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         elapsed: elapsed,
         pathLabel: _pathLabelIn(summary),
       ));
+      // Batch Z: the engine is done reading — the staged folders of THIS
+      // send go back, also when the page is gone by now (its dispose
+      // released nothing: the send was in flight, so nothing else owns
+      // them).
+      _releaseStaged(picker, sending);
+      _readingStagedIds = const <String>{}; // the engine is done reading
+      _sendInFlight = false;
       if (!mounted) return;
       setState(() {
+        // …and they leave the review list: nothing can send a released
+        // path again. The result display stays.
+        _picked.removeWhere((entry) => stagedIds.contains(entry.stagingId));
         _sendStage = _SendStage.done;
         _sendSummary = summary;
         _sendElapsed = elapsed;
         _sentBytes = bytes;
       });
     } on Object catch (e) {
+      // Batch Z: the engine has answered — this send is no longer in
+      // flight. (An UNCONFIRMED native cancel may STILL be reading in the
+      // background; its copies are QUARANTINED below: they leave the review
+      // list, so no path that reads it can ever hand them back.)
+      _readingStagedIds = const <String>{};
+      _sendInFlight = false;
       history?.add(TransferRecord(
         role: TaskRole.send,
         peerName: peerName,
@@ -320,8 +431,36 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         // W3: keep the OBJECT — the card maps it; the original text only
         // renders inside the expandable 「详情」.
         _sendError = e;
+        // Batch Z: a failure releases NOTHING on its own — a returned
+        // Future does not prove the engine stopped reading; a mounted page
+        // keeps the entries for a retry, an unmounted one leaves them to
+        // the stale cleanup. One failure shape still changes the list: an
+        // UNCONFIRMED native cancel (the engine may STILL be reading these
+        // files in the background) QUARANTINES the staged folders of this
+        // send — they leave the review list (nothing can resend them) and
+        // are never handed back by any later path: 清空, a new pick and
+        // dispose all read this list. The stale cleanup of a later process
+        // removes the copies.
+        if (_isUnconfirmedNativeCancel(e)) {
+          _picked
+              .removeWhere((entry) => stagedIds.contains(entry.stagingId));
+        }
       });
     }
+  }
+
+  /// 清空: the review list goes. Batch Z: with it the page's ownership of
+  /// the staged folders that were in it.
+  void _clearPicked() {
+    final removed = List<PickedEntry>.of(_picked);
+    setState(() {
+      _picked.clear();
+      _sendStage = _SendStage.idle;
+      _sendSummary = null;
+      _sendError = null;
+      _progress = null;
+    });
+    _releaseStaged(widget.picker, removed);
   }
 
   /// The picked files' total when every entry is a plain file with a
@@ -506,13 +645,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
               sentBytes: _sentBytes,
               onPick: _pickSource,
               onSend: _send,
-              onClear: () => setState(() {
-                _picked.clear();
-                _sendStage = _SendStage.idle;
-                _sendSummary = null;
-                _sendError = null;
-                _progress = null;
-              }),
+              onClear: _clearPicked,
             )
           else
             _ReceiveCard(saveDir: widget.service.saveDir),

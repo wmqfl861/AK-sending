@@ -3,17 +3,23 @@
 ///
 /// On Android a picked folder is a STAGED copy in app-private storage (the
 /// engine only takes filesystem paths). The detail page owns the staged
-/// folders in its review list and hands them back through `releaseStaged`
-/// wherever that ownership ends: a SUCCESSFUL send (they also leave the
-/// list, so nothing can send a released path again), 清空, a new pick
-/// replacing them, and `dispose` while no send is in flight. A FAILED send
-/// releases nothing on its own — a mounted page keeps the entries for a
-/// retry, an unmounted one leaves them to the stale cleanup — except that
-/// an UNCONFIRMED native cancel QUARANTINES them. Each test pins one point.
+/// folders in its review list and hands them back through ONE release
+/// point wherever its ownership ends: a SUCCESSFUL send (they also leave
+/// the list, so nothing can send a released path again), 清空, a new pick
+/// replacing them, and `dispose` while no send is in flight. The release
+/// point never hands back a folder a send in flight is still reading.
+///
+/// A FAILED send releases nothing on its own (an unmounted page leaves
+/// everything to the stale cleanup). On a mounted page its staged folders
+/// stay for a retry ONLY when the failure confirms the native job ended —
+/// an engine-reported `AkFfiException`, or the stall timeout whose text
+/// says the native task was cancelled. Every other shape is UNCONFIRMED
+/// and QUARANTINES them. Each test pins one point.
 library;
 
 import 'dart:async' show Completer, TimeoutException;
 
+import 'package:ak_ffi_dart/ak_ffi_dart.dart' show AkFfiException;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -59,6 +65,27 @@ const PickedEntry _plainFolder = PickedEntry(
   name: '资料',
   isDirectory: true,
 );
+
+/// The text `SimpleTransferService.sendFiles` throws when its stall budget
+/// ran out and cancelling the native task FAILED — the engine may still be
+/// reading.
+final TimeoutException _stallCancelFailed = TimeoutException(
+  '发送超时（150 秒无进展），且取消原生任务失败（engine busy）'
+  '——传输可能仍在后台进行，请稍后重试或手动断开连接。',
+  const Duration(seconds: 150),
+);
+
+/// The same stall, with the cancel CONFIRMED: the native task was
+/// cancelled and the connection disconnected.
+final TimeoutException _stallCancelled = TimeoutException(
+  '发送超时（150 秒无进展），已取消原生发送任务并断开该连接。',
+  const Duration(seconds: 150),
+);
+
+/// How the engine-failed latch fails an in-flight waiter: a plain
+/// `StateError` carrying the failure reason.
+final Object _engineFailedError =
+    StateError('传输引擎故障：连续 10 次任务事件轮询失败。泵已停止，请重启应用恢复。');
 
 final Finder _sendButton = find.byKey(const ValueKey('conn_send_button'));
 final Finder _pickButton = find.byKey(const ValueKey('conn_pick_files_button'));
@@ -160,56 +187,78 @@ void main() {
     expect(picker.released, [[_stagedAlbum]]);
   });
 
-  testWidgets('staged_entry detail: an ordinary FAILED send releases '
-      'nothing while the page is mounted — the staged folder stays for the '
-      'retry', (tester) async {
-    final picker = FakeFilePickGateway();
-    final fake = await _showDetail(tester,
-        picker: picker, initialPicked: const [_stagedAlbum]);
+  for (final (shape, error) in <(String, Object)>[
+    (
+      'an engine-reported AkFfiException',
+      const AkFfiException(2, 'stream failed: connection lost'),
+    ),
+    (
+      'the stall timeout that confirms the cancel '
+      '(已取消原生发送任务并断开该连接)',
+      _stallCancelled,
+    ),
+  ]) {
+    testWidgets('staged_entry detail: a CONFIRMED failure — $shape — '
+        'releases nothing while the page is mounted; the staged folder '
+        'stays for the retry', (tester) async {
+      final picker = FakeFilePickGateway();
+      final fake = _ScriptedSendService();
+      await _showDetail(tester,
+          picker: picker, service: fake, initialPicked: const [_stagedAlbum]);
 
-    await tester.tap(_sendButton);
-    await tester.pump();
-    fake.failSend('对方拒绝了接收');
-    await pumpEvents(tester);
-    await tester.pump();
+      await tester.tap(_sendButton);
+      await tester.pump();
+      fake.failSendWith(error);
+      await pumpEvents(tester);
+      await tester.pump();
 
-    expect(find.byKey(const ValueKey('conn_send_error')), findsOneWidget);
-    expect(find.byKey(const ValueKey('picked_item_0')), findsOneWidget,
-        reason: 'Future 返回不等于引擎已停止读取：条目留给重试');
-    expect(picker.released, isEmpty);
+      expect(find.byKey(const ValueKey('conn_send_error')), findsOneWidget);
+      expect(find.byKey(const ValueKey('picked_item_0')), findsOneWidget,
+          reason: '引擎确认任务已结束：条目留给重试');
+      expect(picker.released, isEmpty, reason: '失败本身不释放');
 
-    // The retry sends the SAME staged path…
-    await tester.tap(_sendButton);
-    await tester.pump();
-    expect(fake.sendFilesCalls, 2);
-    expect(fake.sendRequests.last.$2, [_stagedAlbum.path]);
-    expect(picker.released, isEmpty);
+      // The retry sends the SAME staged path…
+      await tester.tap(_sendButton);
+      await tester.pump();
+      expect(fake.sendRequests, hasLength(2));
+      expect(fake.sendRequests.last.$2, [_stagedAlbum.path]);
+      expect(picker.released, isEmpty);
 
-    // …and only ITS success hands the folder back.
-    fake.completeSend();
-    await pumpEvents(tester);
-    expect(picker.released, [[_stagedAlbum]]);
-  });
+      // …and only ITS success hands the folder back.
+      fake.completeSendWith();
+      await pumpEvents(tester);
+      expect(picker.released, [[_stagedAlbum]]);
+    });
+  }
 
-  testWidgets('staged_entry detail: leaving the page while a send is in '
-      'flight releases NOTHING — and neither does that send then failing '
-      '(the stale cleanup owns the copy)', (tester) async {
-    final picker = FakeFilePickGateway();
-    final fake = await _showDetail(tester,
-        picker: picker, initialPicked: const [_stagedAlbum]);
+  for (final (shape, error) in <(String, Object)>[
+    (
+      'CONFIRMED, an engine-reported AkFfiException',
+      const AkFfiException(2, 'stream failed: connection lost'),
+    ),
+    ('UNCONFIRMED, a StateError', _engineFailedError),
+  ]) {
+    testWidgets('staged_entry detail: leaving the page while a send is in '
+        'flight releases NOTHING — and neither does that send then failing '
+        '($shape) (the stale cleanup owns the copy)', (tester) async {
+      final picker = FakeFilePickGateway();
+      final fake = _ScriptedSendService();
+      await _showDetail(tester,
+          picker: picker, service: fake, initialPicked: const [_stagedAlbum]);
 
-    await tester.tap(_sendButton);
-    await tester.pump();
-    expect(find.byKey(const ValueKey('conn_send_progress')), findsOneWidget);
+      await tester.tap(_sendButton);
+      await tester.pump();
+      expect(find.byKey(const ValueKey('conn_send_progress')), findsOneWidget);
 
-    await _leavePage(tester);
-    expect(picker.released, isEmpty, reason: '发送进行中：dispose 不释放');
+      await _leavePage(tester);
+      expect(picker.released, isEmpty, reason: '发送进行中：dispose 不释放');
 
-    fake.failSend('连接已断开，发送已中断。');
-    await pumpEvents(tester);
-    expect(picker.released, isEmpty,
-        reason: '页面已销毁 + 发送失败：交给以后的过期清理');
-  });
+      fake.failSendWith(error);
+      await pumpEvents(tester);
+      expect(picker.released, isEmpty,
+          reason: '页面已销毁 + 发送失败（无论是否确认结束）：交给以后的过期清理');
+    });
+  }
 
   testWidgets('staged_entry detail: a send left in flight that then '
       'SUCCEEDS is what hands the folder back — its page released nothing '
@@ -248,15 +297,45 @@ void main() {
     expect(picker.released, isEmpty);
   });
 
+  testWidgets('staged_entry detail: 「清空」 fired in the SAME frame as '
+      '「发送」 — the callback the OLD button still holds — releases nothing '
+      'of the folder the engine is reading', (tester) async {
+    final picker = FakeFilePickGateway();
+    final fake = await _showDetail(tester,
+        picker: picker, initialPicked: const [_stagedAlbum]);
+
+    // The 清空 button built BEFORE the send — the callback it still holds.
+    final staleClear = tester.widget<TextButton>(_clearButton).onPressed!;
+
+    // 「发送」, then — no frame in between, so the sending state (which
+    // hides 清空) is not shown yet — the old 「清空」.
+    await tester.tap(_sendButton);
+    staleClear();
+    await tester.pump();
+
+    expect(fake.sendRequests.single.$2, [_stagedAlbum.path],
+        reason: '前置：这次发送在引擎手里');
+    expect(picker.released, isEmpty,
+        reason: '引擎还在读这次发送的文件夹：清空不得把它交还');
+
+    // The send's own completion is what hands it back — once.
+    fake.completeSend();
+    await pumpEvents(tester);
+    expect(picker.released, [[_stagedAlbum]]);
+
+    await _leavePage(tester);
+    expect(picker.released, [[_stagedAlbum]]);
+  });
+
   // -----------------------------------------------------------------------
-  // The UNCONFIRMED native cancel.
+  // UNCONFIRMED failures: the staged folders of that send are quarantined.
   // -----------------------------------------------------------------------
 
   testWidgets('staged_entry detail: a failed send that signals an '
       'UNCONFIRMED native cancel QUARANTINES its staged folder — gone from '
       'the picked list, never released by any later path', (tester) async {
     final picker = FakeFilePickGateway();
-    final fake = _StalledSendService(cancelFailed: true);
+    final fake = _ScriptedSendService();
     await _showDetail(tester,
         picker: picker,
         service: fake,
@@ -265,6 +344,7 @@ void main() {
     await tester.tap(_sendButton);
     await tester.pump();
     expect(fake.sendRequests.single.$2, [_plainFile.path, _stagedAlbum.path]);
+    fake.failSendWith(_stallCancelFailed);
     await pumpEvents(tester);
     await tester.pump();
 
@@ -281,9 +361,11 @@ void main() {
     await tester.tap(_sendButton);
     await tester.pump();
     expect(fake.sendRequests.last.$2, [_plainFile.path]);
+    fake.completeSendWith();
+    await pumpEvents(tester);
+    expect(picker.released, isEmpty);
 
     // …and nothing that follows may hand the copy back.
-    await pumpEvents(tester);
     await tester.tap(_clearButton);
     await tester.pump();
     expect(find.byKey(const ValueKey('picked_count')), findsNothing);
@@ -303,27 +385,83 @@ void main() {
         reason: '被隔离的副本经任何后续路径都不交还');
   });
 
-  testWidgets('staged_entry detail: the same stall timeout WITHOUT the '
-      'unconfirmed-cancel text is an ordinary failure — the staged folder '
-      'stays for the retry', (tester) async {
+  for (final (shape, error) in <(String, Object)>[
+    (
+      'a StateError (how the engine-failed latch fails a waiter)',
+      _engineFailedError,
+    ),
+    ('an unknown error type', const FormatException('unexpected frame')),
+    (
+      'a TimeoutException carrying neither service text',
+      TimeoutException('发送无进展超时', const Duration(seconds: 150)),
+    ),
+  ]) {
+    testWidgets('staged_entry detail: $shape is UNCONFIRMED — the staged '
+        'folder is quarantined', (tester) async {
+      final picker = FakeFilePickGateway();
+      final fake = _ScriptedSendService();
+      await _showDetail(tester,
+          picker: picker,
+          service: fake,
+          initialPicked: const [_plainFile, _stagedAlbum]);
+
+      await tester.tap(_sendButton);
+      await tester.pump();
+      fake.failSendWith(error);
+      await pumpEvents(tester);
+      await tester.pump();
+
+      expect(find.byKey(const ValueKey('conn_send_error')), findsOneWidget);
+      expect(find.text('相册'), findsNothing,
+          reason: '未确认原生任务已结束：暂存条目隔离，不能再发');
+      expect(find.byKey(const ValueKey('picked_item_0')), findsOneWidget,
+          reason: '普通文件仍可重试');
+      expect(picker.released, isEmpty, reason: '隔离不是释放');
+
+      // No later path hands the copy back.
+      await tester.tap(_clearButton);
+      await tester.pump();
+      await _leavePage(tester);
+      expect(picker.released, isEmpty);
+    });
+  }
+
+  testWidgets('staged_entry detail: an id whose job end is UNCONFIRMED '
+      'stays protected for the page\'s life — listed again or not, it is '
+      'never handed back', (tester) async {
     final picker = FakeFilePickGateway();
-    final fake = _StalledSendService(cancelFailed: false);
+    final fake = _ScriptedSendService();
     await _showDetail(tester,
         picker: picker, service: fake, initialPicked: const [_stagedAlbum]);
 
     await tester.tap(_sendButton);
     await tester.pump();
+    fake.failSendWith(_engineFailedError);
     await pumpEvents(tester);
     await tester.pump();
-
-    expect(find.byKey(const ValueKey('conn_send_error')), findsOneWidget);
-    expect(find.byKey(const ValueKey('picked_item_0')), findsOneWidget,
-        reason: '已确认的取消：引擎已停手，条目仍归页面');
+    expect(find.text('相册'), findsNothing, reason: '前置：已隔离');
     expect(picker.released, isEmpty);
 
+    // A later send of ANOTHER folder settles normally…
+    picker.filesResult = const [_stagedNotes];
+    await _pickFiles(tester);
     await tester.tap(_sendButton);
     await tester.pump();
-    expect(fake.sendRequests.last.$2, [_stagedAlbum.path]);
+    fake.completeSendWith();
+    await pumpEvents(tester);
+    expect(picker.released, [[_stagedNotes]],
+        reason: '新的一次发送成功：只交还它自己的副本');
+
+    // …and a pick that lists the quarantined folder AGAIN changes nothing:
+    // (staging ids never repeat in production — this pins the protection
+    // itself, not a reachable sequence).
+    picker.filesResult = const [_stagedAlbum];
+    await _pickFiles(tester);
+    expect(find.text('相册'), findsOneWidget);
+    await _leavePage(tester);
+
+    expect(_releasedIds(picker), [_stagedNotes.stagingId],
+        reason: '未确认结束的 id 不经任何路径交还');
   });
 
   // -----------------------------------------------------------------------
@@ -354,21 +492,24 @@ void main() {
     ]);
   });
 
-  testWidgets('staged_entry detail: 清空 after a FAILED send releases the '
-      'staged folder it removes', (tester) async {
+  testWidgets('staged_entry detail: 清空 after a CONFIRMED failure '
+      'releases the staged folder it removes (the user gives up on the '
+      'retry)', (tester) async {
     final picker = FakeFilePickGateway();
-    final fake = await _showDetail(tester,
-        picker: picker, initialPicked: const [_stagedAlbum]);
+    final fake = _ScriptedSendService();
+    await _showDetail(tester,
+        picker: picker, service: fake, initialPicked: const [_stagedAlbum]);
 
     await tester.tap(_sendButton);
     await tester.pump();
-    fake.failSend('对方拒绝了接收');
+    fake.failSendWith(
+        const AkFfiException(2, 'stream failed: connection lost'));
     await pumpEvents(tester);
     await tester.pump();
-    expect(picker.released, isEmpty,
-        reason: '前置：失败本身不释放');
+    expect(find.byKey(const ValueKey('picked_item_0')), findsOneWidget,
+        reason: '前置：已确认的失败把条目留给重试');
+    expect(picker.released, isEmpty, reason: '前置：失败本身不释放');
 
-    // The user gives up on the retry.
     await tester.tap(_clearButton);
     await tester.pump();
 
@@ -584,6 +725,32 @@ void main() {
   });
 }
 
+/// Sends stay pending until the test settles them — with a summary, or
+/// with a caller-chosen ERROR OBJECT. The plain fake only fails with a
+/// `StateError`; these tests tell the failure shapes apart.
+class _ScriptedSendService extends LocalSimpleTransferService {
+  final List<Completer<String>> _pending = [];
+
+  /// Fails the OLDEST unfinished send with [error].
+  void failSendWith(Object error) {
+    _pending.removeAt(0).completeError(error);
+  }
+
+  /// Completes the OLDEST unfinished send with [summary].
+  void completeSendWith([String summary = '发送完成']) {
+    _pending.removeAt(0).complete(summary);
+  }
+
+  @override
+  Future<String> sendFiles(String connId, List<String> paths) {
+    sendFilesCalls += 1;
+    sendRequests.add((connId, List.of(paths)));
+    final completer = Completer<String>();
+    _pending.add(completer);
+    return completer.future;
+  }
+}
+
 /// Batch Z double: a MULTI-FILE pick that stays OPEN until the test
 /// answers it, plus a record of every `releaseStaged` call.
 class _HoldingFilesPickGateway implements FilePickGateway {
@@ -616,29 +783,6 @@ class _HoldingFilesPickGateway implements FilePickGateway {
   @override
   Future<void> releaseStaged(Iterable<PickedEntry> entries) async {
     released.add(List.of(entries));
-  }
-}
-
-/// Fails every send the way `SimpleTransferService.sendFiles` reports a
-/// stalled send: a `TimeoutException`. [cancelFailed] picks the text the
-/// service uses when cancelling the native task FAILED (the engine may
-/// still be reading) over the text of a confirmed cancel.
-class _StalledSendService extends LocalSimpleTransferService {
-  _StalledSendService({required this.cancelFailed});
-
-  final bool cancelFailed;
-
-  @override
-  Future<String> sendFiles(String connId, List<String> paths) async {
-    sendFilesCalls += 1;
-    sendRequests.add((connId, List.of(paths)));
-    throw TimeoutException(
-      cancelFailed
-          ? '发送超时（150 秒无进展），且取消原生任务失败（engine busy）'
-              '——传输可能仍在后台进行，请稍后重试或手动断开连接。'
-          : '发送超时（150 秒无进展），已取消原生发送任务并断开该连接。',
-      const Duration(seconds: 150),
-    );
   }
 }
 

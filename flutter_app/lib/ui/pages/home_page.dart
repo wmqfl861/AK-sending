@@ -286,11 +286,24 @@ class _HomePageState extends State<HomePage> {
         final id = connection.id;
         // Batch Z: read here — the callback below may find the page gone.
         final picker = widget.picker;
+        // Batch Z (U3): the handover belongs to THIS flow and to no other.
+        // The callback runs a frame later, and the frame in between can
+        // end the flow — e.g. a 取消配对 whose revoke round-trip lands
+        // after the pairing already succeeded: the controller resets, the
+        // established connection stays, and the old selection must not be
+        // sent over it.
+        final generation = _flow.generation;
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) {
-            // Batch Z: the page left before this frame — the selection was
-            // already detached from `_pendingEntries` above, so nothing
-            // else will ever free its staged folders.
+          // Batch Z (U3): re-check what the handover was scheduled for —
+          // the page (the page left before this frame), the flow
+          // generation (the flow was reset, failed or retried since), and
+          // the connection (the flow's row must still be this one). Any
+          // other case: no push, and the selection the callback holds goes
+          // back — it was detached from `_pendingEntries` above, so nothing
+          // else will ever free it.
+          if (!mounted ||
+              _flow.generation != generation ||
+              _flow.connection?.id != id) {
             _releaseStaged(picker, pending);
             return;
           }

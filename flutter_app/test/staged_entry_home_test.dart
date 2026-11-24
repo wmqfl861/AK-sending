@@ -6,7 +6,9 @@
 /// every point where that ownership ends hands the staged folders back
 /// through `releaseStaged` — exactly once each — and the automatic handover
 /// to the connection detail page is a TRANSFER (nothing is released there).
-/// Each test pins one release point.
+/// The handover runs a frame after it is scheduled and re-checks the flow
+/// it was scheduled for: a flow that ended inside that window gets no
+/// detail page, and the selection goes back. Each test pins one point.
 library;
 
 import 'dart:async' show Completer;
@@ -15,7 +17,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:ak_sending_app/services/simple_transfer_fake.dart';
+import 'package:ak_sending_app/ui/app.dart';
 import 'package:ak_sending_app/ui/service/file_pick_gateway.dart';
+import 'package:ak_sending_app/ui/service/save_dir_store.dart';
 import 'package:ak_sending_app/ui/service/simple_transfer_service.dart';
 
 import 'w28_test_helpers.dart';
@@ -59,6 +63,25 @@ Future<void> _establish(
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 400));
   await pumpEvents(tester);
+}
+
+/// `pumpApp` for a service the test had to build itself (the shared helper
+/// always constructs the plain fake).
+Future<T> _pumpWith<T extends LocalSimpleTransferService>(
+  WidgetTester tester, {
+  required T service,
+  required FilePickGateway picker,
+}) async {
+  await tester.binding.setSurfaceSize(kWideSize);
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+  addTearDown(service.dispose);
+  await tester.pumpWidget(AkSendingApp(
+    service: service,
+    store: InMemorySaveDirStore(),
+    picker: picker,
+  ));
+  await tester.pump();
+  return service;
 }
 
 /// Drives the primary send path to its waiting code with a staged folder
@@ -420,6 +443,147 @@ void main() {
   });
 
   // -----------------------------------------------------------------------
+  // U3: the handover re-checks the flow it was scheduled for.
+  // -----------------------------------------------------------------------
+
+  testWidgets('staged_entry home: a 取消配对 whose reset lands INSIDE the '
+      'handover window (the pairing succeeded during the revoke '
+      'round-trip) pushes no detail page and releases the folder once',
+      (tester) async {
+    final picker = FakeFilePickGateway(filesResult: const [_stagedAlbum]);
+    final fake = _HeldRevokeService();
+    await _pumpWith(tester, service: fake, picker: picker);
+
+    await tester.tap(_sendButton);
+    await pumpEvents(tester);
+    expect(find.textContaining('已选：1 项'), findsOneWidget);
+
+    // 取消配对 while the code still waits: its revoke is on its way to the
+    // engine, so nothing has been reset yet.
+    await tester.tap(find.byKey(const ValueKey('flow_cancel_button')));
+    await pumpEvents(tester);
+    expect(fake.revokeHeld, isTrue,
+        reason: '前置：撤码请求已发出并被扣住，流程尚未复位');
+    expect(find.byKey(const ValueKey('flow_pairing_code')), findsOneWidget);
+
+    // The peer's join lands FIRST: the pairing succeeds and the handover
+    // is scheduled — the selection is detached, nothing is pushed yet.
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(connId);
+    await tester.idle(); // microtasks only — no frame
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: '前置：交接的 post-frame 回调还没跑');
+    expect(picker.released, isEmpty);
+
+    // THEN the cancel's reset lands — inside the window.
+    fake.finishRevoke();
+    await tester.idle();
+
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: 'U3：流程已复位——不得再把旧选择交出去自动发送');
+    expect(fake.sendFilesCalls, 0);
+    expect(find.byKey(ValueKey('conn_card_name_$connId')), findsOneWidget,
+        reason: '已建立的连接仍在，只是不再自动发送');
+    expect(_sendButton, findsOneWidget);
+    expect(picker.released, [[_stagedAlbum]],
+        reason: 'U3：回调持有的暂存文件夹交还一次');
+
+    // Nothing hands it back a second time.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    expect(picker.released, [[_stagedAlbum]]);
+  });
+
+  testWidgets('staged_entry home: the OLD 取消配对 button firing AFTER the '
+      'success was scheduled resets the flow — no detail page, the folder '
+      'released once', (tester) async {
+    final picker = FakeFilePickGateway(filesResult: const [_stagedAlbum]);
+    final fake = await pumpApp(tester, picker: picker);
+    addTearDown(fake.dispose);
+
+    await tester.tap(_sendButton);
+    await pumpEvents(tester);
+    // The 取消配对 button built while the code waits — the callback it
+    // still holds.
+    final staleCancel = tester
+        .widget<TextButton>(
+            find.byKey(const ValueKey('flow_cancel_button')))
+        .onPressed!;
+
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+    fake.completeProbe(connId);
+    await tester.idle(); // microtasks only — no frame
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: '前置：交接的 post-frame 回调还没跑');
+    expect(picker.released, isEmpty);
+
+    // It still fires. The pairing is already made, so the controller only
+    // resets the flow — the established connection stays.
+    staleCancel();
+    await tester.idle();
+
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: 'U3：流程已复位——不得再把旧选择交出去自动发送');
+    expect(fake.sendFilesCalls, 0);
+    expect(find.byKey(ValueKey('conn_card_name_$connId')), findsOneWidget,
+        reason: '已建立的连接仍在');
+    expect(_sendButton, findsOneWidget);
+    expect(picker.released, [[_stagedAlbum]],
+        reason: 'U3：回调持有的暂存文件夹交还一次');
+  });
+
+  testWidgets('staged_entry home: the row going TERMINAL inside the '
+      'handover window (unreachable verdict, then the connection drops) '
+      'pushes no detail page and releases the folder once — only the '
+      'GENERATION check catches it, the flow keeps the same connection',
+      (tester) async {
+    final picker = FakeFilePickGateway(filesResult: const [_stagedAlbum]);
+    final fake = await pumpApp(tester, picker: picker);
+    addTearDown(fake.dispose);
+
+    await tester.tap(_sendButton);
+    await pumpEvents(tester);
+    final connId = fake.simulatePeerJoin();
+    await pumpEvents(tester);
+
+    // The probe fails: paired-but-unreachable still counts as established
+    // for the send, so the handover is scheduled.
+    fake.failProbe(connId);
+    await tester.idle(); // microtasks only — no frame
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: '前置：交接的 post-frame 回调还没跑');
+    expect(picker.released, isEmpty);
+
+    // Inside the window the connection drops. The flow FAILS on the SAME
+    // connection (its row is carried as `disconnected`): the generation
+    // moves, the connection id does not.
+    fake.simulateNetworkChange();
+    await tester.idle();
+
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await pumpEvents(tester);
+
+    expect(find.byKey(const ValueKey('conn_detail_page')), findsNothing,
+        reason: 'U3：流程已换代——不得打开一条已断开的连接的页面');
+    expect(fake.sendFilesCalls, 0);
+    expect(find.textContaining('与对方的连接断开了'), findsOneWidget,
+        reason: '失败卡保持可见');
+    expect(picker.released, [[_stagedAlbum]],
+        reason: 'U3：回调持有的暂存文件夹交还一次');
+  });
+
+  // -----------------------------------------------------------------------
   // NOT a release: the handover to the connection detail page.
   // -----------------------------------------------------------------------
 
@@ -484,5 +648,29 @@ class _HoldingPickGateway implements FilePickGateway {
   @override
   Future<void> releaseStaged(Iterable<PickedEntry> entries) async {
     released.add(List.of(entries));
+  }
+}
+
+/// Batch Z double (U3): holds the code revoke behind 取消配对 until the
+/// test answers it — the engine round-trip during which the peer's join can
+/// still land (whichever side the engine processes first wins).
+class _HeldRevokeService extends LocalSimpleTransferService {
+  final Completer<void> _revoke = Completer<void>();
+  bool _revokeHeld = false;
+
+  /// Whether a code revoke has reached this service and is being held.
+  bool get revokeHeld => _revokeHeld;
+
+  /// Lets the held revoke finish; the controller resets the flow after it.
+  void finishRevoke() => _revoke.complete();
+
+  @override
+  Future<void> disconnect(String connId) async {
+    final code = pendingCode;
+    if (code != null && code.codeId == connId) {
+      _revokeHeld = true;
+      await _revoke.future; // the revoke is on its way to the engine
+    }
+    return super.disconnect(connId);
   }
 }

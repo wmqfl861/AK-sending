@@ -32,8 +32,11 @@
 /// through [FilePickGateway.releaseStaged] wherever its ownership of them
 /// ends: a SUCCESSFUL send (they also leave the review list, so nothing
 /// can send a released path again), 清空, a new pick replacing them, and
-/// `dispose` while no send is in flight. A FAILED send releases nothing
-/// on its own (see `_send`).
+/// `dispose` while no send is in flight. Every release goes through ONE
+/// point (`_releaseOwned`), which never hands back a folder a send in
+/// flight is still reading. A FAILED send releases nothing on its own: its
+/// staged folders stay for a retry only when the failure CONFIRMS the
+/// native job ended, otherwise they are quarantined (see `_send`).
 library;
 
 import 'dart:async' show StreamSubscription, TimeoutException, unawaited;
@@ -125,10 +128,12 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   /// the picked files' sizes when the engine reported none).
   int? _sentBytes;
 
-  /// Batch Z: the staged folders of the send in flight (empty when none) —
-  /// the engine's to read until that send settles. Nothing else hands them
-  /// back meanwhile: a pick that replaces the review list while the send
-  /// still runs leaves them to the send's own completion.
+  /// Batch Z: the staging ids this page must NEVER hand back (empty when
+  /// none): those of the send in flight — the engine's to read until it
+  /// settles — and, after a send that ended UNCONFIRMED, those of that send
+  /// for the rest of the page's life (see `_confirmsJobEnded`). Every
+  /// release of this page goes through `_releaseOwned`, the one place that
+  /// holds them back.
   Set<String> _readingStagedIds = const <String>{};
 
   /// Batch Z: a send is with the engine right now. Set with the sending
@@ -190,16 +195,15 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     _sub?.cancel();
     _progressSub?.cancel();
     _idleExpirySub?.cancel();
-    // Batch Z: the page is gone and hands back the staged folders still in
-    // its review list — unless a send is in flight: that send's own
-    // completion decides (a SUCCESS releases, a failure never does), else
-    // the stale cleanup of a later process owns them. (A pick that landed
-    // during a send has replaced the list and reset the stage: what is
-    // listed then is NOT what the engine reads, so handing it back is
-    // safe — the entries being read are that send's, not the list's.)
-    if (_sendStage != _SendStage.sending) {
-      _releaseStaged(widget.picker, _picked);
-    }
+    // Batch Z: the page is gone and hands back the staged folders it still
+    // lists — through the ONE release point, which holds back what a send
+    // in flight is still reading. So nothing is handed back while a send
+    // runs with this list: that send's own completion decides (a SUCCESS
+    // releases; a failure by `_confirmsJobEnded`), else the stale cleanup
+    // of a later process owns them. What is listed beyond that is not being
+    // read — a pick or 清空 that landed during a send replaced the list —
+    // so handing it back is safe.
+    _releaseOwned(widget.picker, _picked);
     super.dispose();
   }
 
@@ -240,24 +244,54 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
           if (entry.stagingId != null) entry,
       ];
 
-  /// Batch Z: hands the staged folders behind [entries] back to [picker].
-  /// Fire-and-forget — it never delays or reorders the flow — and does
-  /// nothing when [entries] holds no staged folder.
-  static void _releaseStaged(
-      FilePickGateway picker, Iterable<PickedEntry> entries) {
-    final staged = _stagedOf(entries);
-    if (staged.isNotEmpty) {
-      unawaited(picker.releaseStaged(staged));
+  /// Batch Z (U1): THE release point of this page. Every staged folder it
+  /// hands back leaves through here, because no caller can be trusted to
+  /// have kept out what a send in flight is still reading: 「发送」 and a
+  /// callback built in an earlier frame (the old 「清空」, a pick that was
+  /// already open) can run before the first frame shows the sending state.
+  /// An id in [_readingStagedIds] is never passed on. Fire-and-forget — it
+  /// never delays or reorders the flow — and a no-op without staged folders.
+  void _releaseOwned(FilePickGateway picker, Iterable<PickedEntry> entries) {
+    final releasable = [
+      for (final entry in entries)
+        if (entry.stagingId != null &&
+            !_readingStagedIds.contains(entry.stagingId))
+          entry,
+    ];
+    if (releasable.isNotEmpty) {
+      unawaited(picker.releaseStaged(releasable));
     }
   }
 
-  /// Batch Z: a failed send that signals an UNCONFIRMED native cancel —
-  /// the `TimeoutException` `SimpleTransferService.sendFiles` rethrows when
-  /// cancelling the native task fails. The service has no typed error for
-  /// it, so the text of its message is the only signal.
-  static bool _isUnconfirmedNativeCancel(Object error) =>
-      error is TimeoutException &&
-      (error.message ?? '').contains('取消原生任务失败');
+  /// The text `SimpleTransferService.sendFiles` uses when the stall cancel
+  /// of the native send task went through.
+  static const String _nativeSendCancelled = '已取消原生发送任务并断开该连接';
+
+  /// Batch Z (U2): whether a FAILED send PROVES the native job has ended —
+  /// the one condition on which its staged folders stay in the review list
+  /// for a retry. Only two shapes do:
+  ///
+  /// * an engine-reported failure — an `AkFfiException`, read through
+  ///   [errorCodeOf] because this layer does not import the FFI package;
+  /// * the stall timeout whose text says the native send task was
+  ///   cancelled ([_nativeSendCancelled]).
+  ///
+  /// Everything else is UNCONFIRMED, and therefore QUARANTINES: the stall
+  /// timeout whose cancel itself failed (`取消原生任务失败` — the engine may
+  /// still be reading), ANY `StateError` — the engine-failed latch
+  /// (`_latchEngineFailed`, `services/simple_transfer_service.dart`) stops
+  /// the pump and fails the in-flight waiters through `_ensureLive`
+  /// without proving the Rust send exited, and the services signal with
+  /// plain `StateError`s elsewhere too (the 「该请求已失效」 one of
+  /// `services/ffi_simple_transfer_service.dart`) — and any other error
+  /// type. A returned Future does not prove the engine stopped reading.
+  static bool _confirmsJobEnded(Object error) {
+    if (error is StateError) return false;
+    if (error is TimeoutException) {
+      return (error.message ?? '').contains(_nativeSendCancelled);
+    }
+    return errorCodeOf(error) != null;
+  }
 
   Future<void> _pickSource({bool roleHint = false}) async {
     // Batch Z: read before the awaits — the unmounted branch below must
@@ -320,18 +354,14 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       // Batch Z: the page left while the picker was up — the entries it
       // just obtained were never shown, so nothing else owns their staged
       // copies.
-      _releaseStaged(picker, entries);
+      _releaseOwned(picker, entries);
       return;
     }
     // Batch Z: the new selection replaces the old one — the staged folders
-    // of the replaced selection go back with it. EXCEPT the ones a send in
-    // flight is still reading (a pick opened before that send started can
-    // return while it runs): those are the send's own completion to hand
-    // back, never a path that runs while the engine may still be reading.
-    final replaced = [
-      for (final entry in _picked)
-        if (!_readingStagedIds.contains(entry.stagingId)) entry,
-    ];
+    // of the replaced selection go back with it. (A pick opened before a
+    // send started can return while that send still runs; whatever the
+    // engine is reading is held back by the release point itself.)
+    final replaced = List<PickedEntry>.of(_picked);
     setState(() {
       _picked
         ..clear()
@@ -341,7 +371,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       _sendError = null;
       _progress = null;
     });
-    _releaseStaged(picker, replaced);
+    _releaseOwned(picker, replaced);
   }
 
   Future<void> _send() async {
@@ -372,7 +402,9 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     setState(() {
       _sendStage = _SendStage.sending;
       _sendInFlight = true;
-      _readingStagedIds = stagedIds;
+      // Ids of an earlier UNCONFIRMED send stay protected: the set only
+      // ever grows here, and a settle removes no more than its own ids.
+      _readingStagedIds = {..._readingStagedIds, ...stagedIds};
       _sendSummary = null;
       _sendError = null;
       _progress = null;
@@ -393,12 +425,13 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         pathLabel: _pathLabelIn(summary),
       ));
       // Batch Z: the engine is done reading — the staged folders of THIS
-      // send go back, also when the page is gone by now (its dispose
-      // released nothing: the send was in flight, so nothing else owns
-      // them).
-      _releaseStaged(picker, sending);
-      _readingStagedIds = const <String>{}; // the engine is done reading
+      // send stop being protected and go back, also when the page is gone
+      // by now (its dispose handed none of theirs back: they were
+      // protected, so nothing else owns them). Unprotect FIRST: the one
+      // release point holds protected ids back.
+      _readingStagedIds = _readingStagedIds.difference(stagedIds);
       _sendInFlight = false;
+      _releaseOwned(picker, sending);
       if (!mounted) return;
       setState(() {
         // …and they leave the review list: nothing can send a released
@@ -410,11 +443,17 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         _sentBytes = bytes;
       });
     } on Object catch (e) {
-      // Batch Z: the engine has answered — this send is no longer in
-      // flight. (An UNCONFIRMED native cancel may STILL be reading in the
-      // background; its copies are QUARANTINED below: they leave the review
-      // list, so no path that reads it can ever hand them back.)
-      _readingStagedIds = const <String>{};
+      // Batch Z (U2): a failure releases NOTHING on its own — a returned
+      // Future does not prove the engine stopped reading. Whether a later
+      // path (清空, a new pick, dispose) may ever hand the staged folders
+      // of this send back comes down to one question: did the engine
+      // CONFIRM the job ended?
+      final ended = _confirmsJobEnded(e);
+      if (ended) {
+        // Confirmed: this send's ids stop being protected, and its entries
+        // stay listed for a retry.
+        _readingStagedIds = _readingStagedIds.difference(stagedIds);
+      }
       _sendInFlight = false;
       history?.add(TransferRecord(
         role: TaskRole.send,
@@ -431,17 +470,13 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
         // W3: keep the OBJECT — the card maps it; the original text only
         // renders inside the expandable 「详情」.
         _sendError = e;
-        // Batch Z: a failure releases NOTHING on its own — a returned
-        // Future does not prove the engine stopped reading; a mounted page
-        // keeps the entries for a retry, an unmounted one leaves them to
-        // the stale cleanup. One failure shape still changes the list: an
-        // UNCONFIRMED native cancel (the engine may STILL be reading these
-        // files in the background) QUARANTINES the staged folders of this
-        // send — they leave the review list (nothing can resend them) and
-        // are never handed back by any later path: 清空, a new pick and
-        // dispose all read this list. The stale cleanup of a later process
-        // removes the copies.
-        if (_isUnconfirmedNativeCancel(e)) {
+        if (!ended) {
+          // UNCONFIRMED — the engine may STILL be reading these files in
+          // the background. QUARANTINE: the staged folders of this send
+          // leave the review list (nothing can resend them) AND their ids
+          // stay in `_readingStagedIds` for good — so no later path can
+          // ever hand the copies back, not even one that lists them again.
+          // The stale cleanup of a later process removes them.
           _picked
               .removeWhere((entry) => stagedIds.contains(entry.stagingId));
         }
@@ -450,7 +485,10 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   }
 
   /// 清空: the review list goes. Batch Z: with it the page's ownership of
-  /// the staged folders that were in it.
+  /// the staged folders that were in it — except what a send in flight is
+  /// still reading: the 清空 button is gone in the first frame that shows
+  /// the sending state, but the one built before can still fire in the
+  /// same frame as 「发送」 (`_releaseOwned` holds those back).
   void _clearPicked() {
     final removed = List<PickedEntry>.of(_picked);
     setState(() {
@@ -460,7 +498,7 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       _sendError = null;
       _progress = null;
     });
-    _releaseStaged(widget.picker, removed);
+    _releaseOwned(widget.picker, removed);
   }
 
   /// The picked files' total when every entry is a plain file with a

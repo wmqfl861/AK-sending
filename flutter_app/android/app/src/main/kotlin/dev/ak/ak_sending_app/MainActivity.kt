@@ -52,6 +52,8 @@ package dev.ak.ak_sending_app
  *      {status:"selected", treeUri, displayName} | {status:"cancelled"}
  *      与 pickFolder 各用一个 launcher 和一个 pending result，互不影响。
  *      只校验 authority，并借 Activity 的临时授权读出根目录名——不持久化任何授权。
+ *      这几个发送侧方法在主线程上不做任何 ContentResolver 调用：根目录名在工作
+ *      线程上查，应答从那里回主线程。
  *      选择器打不开（ActivityNotFoundException 等）或 launcher 不可用时答 cancelled。
  *
  * 7) stageSafTree(treeUri: String, stageId: String) -> Map
@@ -60,15 +62,22 @@ package dev.ak.ak_sending_app
  *      path 是暂存后的根目录路径（<noBackupFilesDir>/ak-saf-staging/<stageId>/
  *      payload/<displayName>）。失败一律 PlatformException(code, 固定 reason token)，
  *      进度经同一通道的 stagingProgress 事件回传，应答在工作线程完全停下之后。
+ *      读授权：先看该 URI 是否已有持久的 READ 授权（有就原样用、不碰）；没有才
+ *      先记进 ak-saf-staging/.send-grants 再 take(READ)，结束时只放掉自己拿的那份。
+ *      复制完逐个目录复核成员关系（source-changed）、逐个文件核对已知长度
+ *      （size-mismatch），最后才写完成标记。
  *
  * 8) cancelStaging(stageId: String) -> null
- *      只置取消标志；清理由在跑的暂存任务自己完成后再应答。
+ *      置取消标志、取消任务的 CancellationSignal、关掉它打开着的输入流；不删任何
+ *      东西，清理由在跑的暂存任务自己完成后再应答。
  *
- * 9) cleanupStagedSend(stageId: String) -> null
- *      删除已暂存的副本，幂等（已经不在了也答 null）。
+ * 9) cleanupStagedSend(stageId: String) -> Map
+ *      {removed: Boolean}   true = 已经不在了（或刚删掉），false = 有东西删不掉。
+ *      这个 id 的暂存还在跑时答 PlatformException(STAGE_IO_FAILED, busy)，不删任何东西。
  *
  * 10) cleanupStaleStaging() -> Map
- *      {removed: Long}   清掉以前各次运行留下的暂存目录与 READ-only 授权。
+ *      {removed: Long}   清掉以前各次运行留下的暂存目录，以及 .send-grants 里
+ *      记着、不属于任何在跑暂存的 READ-only 授权。
  *
  * ── ActivityResult 路由说明 ─────────────────────────────────────────────
  * FlutterActivity 继承的是 android.app.Activity（非 ComponentActivity），

@@ -27,6 +27,9 @@ package dev.ak.ak_sending_app
  *                              成功选择后本端调用 takePersistableUriPermission(RW)
  *                              持久化授权（失败仅打日志，不改变返回值——
  *                              授权是否真的持久化由 listSafPersisted() 复核）。
+ *                              批次 Z 复审 N9 起这次 take 排在 SafSendStager 的工作
+ *                              线程上执行（本应用的持久授权操作全在那里串行），
+ *                              应答等它做完再回。
  *      重复调用未完成时返回 PlatformException(pick_in_progress)。
  *      选择器经 androidx.activity 的 ActivityResultContracts.OpenDocumentTree
  *      （ACTION_OPEN_DOCUMENT_TREE，EXTRA_INITIAL_URI 尽力定位到主卷 Download；
@@ -408,16 +411,17 @@ class MainActivity : FlutterActivity() {
             pending.success(mapOf("treeUri" to null as String?))
             return
         }
-        try {
-            contentResolver.takePersistableUriPermission(
-                treeUri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            )
-        } catch (t: Throwable) {
-            // 不改变返回值：URI 本身当前可用；持久化是否生效由 listSafPersisted 复核。
-            Log.w(TAG, "takePersistableUriPermission failed for $treeUri: $t")
+        val answer = { pending.success(mapOf("treeUri" to treeUri.toString())) }
+        // 批次 Z 复审 N9：takePersistableUriPermission(READ|WRITE) 经 SafSendStager 的工作线程
+        // 执行——本应用所有持久授权操作在同一线程上串行，与发送侧的 take/release 互不
+        // 交错。应答还是同一个 map，等工作线程做完再回；take 失败只记日志，不改变应答。
+        val stager = sendStager
+        if (stager == null) {
+            // stager 已随 Activity 释放（不会走到这一步）：授权不拿了，照旧应答。
+            answer()
+            return
         }
-        pending.success(mapOf("treeUri" to treeUri.toString()))
+        stager.takeReceiveGrant(treeUri, answer)
     }
 
     /**

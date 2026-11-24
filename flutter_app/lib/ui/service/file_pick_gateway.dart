@@ -16,8 +16,10 @@
 /// (and fully filesystem-pathed — see the provider-URI exclusions below)
 /// file pick with ONE optional app-side offer to add a whole folder:
 ///
-/// * 「添加文件夹」 runs the same single `getDirectoryPath()` as
-///   [PluginFilePickGateway.pickDirectory] and appends that entry;
+/// * 「添加文件夹」 runs the single folder pick — off Android the same
+///   `getDirectoryPath()` as [PluginFilePickGateway.pickDirectory], on
+///   Android the staged tree pick (batch Z, below) — and appends that
+///   entry;
 /// * 「不用了」 — or dismissing the dialog, or cancelling the folder pick —
 ///   keeps the files alone;
 /// * a cancelled FILE pick opens the folder-ONLY offer (round 3): choosing
@@ -36,12 +38,33 @@
 /// paths). If the whole selection is excluded, the folder-only path
 /// behaves like a cancelled folder pick (empty overall result) and the
 /// append path keeps the remaining files.
+///
+/// Batch Z (Android folder SEND): the plugin's Android folder pick can
+/// only hand back what the engine cannot read — a `content://` tree URI
+/// (SAF) or an `msd:` pseudo path — so the two folder paths above go
+/// through [PluginFilePickGateway.pickSendDirectory]. On Android it uses
+/// the `dev.ak/storage` channel: the system tree picker, then a copy of
+/// the folder into app-private storage (the root name, the relative
+/// structure, empty sub-directories and zero-byte files kept), and only
+/// the staged root's FILESYSTEM path leaves the gateway. The read grant
+/// of the picked tree is held only while a staging runs — the platform
+/// takes and releases it per staging call. Off Android
+/// [PluginFilePickGateway.pickSendDirectory] IS
+/// [PluginFilePickGateway.pickDirectory], whose meaning does not change:
+/// the settings page uses it for the RECEIVE save directory.
 library;
 
+import 'dart:async' show unawaited;
 import 'dart:io' show Platform;
+import 'dart:math' show Random;
 
 import 'package:file_picker/file_picker.dart' as fp;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'
+    show MethodCall, MethodChannel, PlatformException;
+
+import 'saf_send_dialogs.dart';
+import 'ui_platform.dart';
 
 /// One user-chosen item: a file (with size when the platform reports it)
 /// or a directory (folder pick). [path] is what goes into
@@ -105,9 +128,10 @@ abstract class FilePickGateway {
 
 /// Production gateway over the `file_picker` plugin.
 ///
-/// The three function members are the test seams — the plugin's static
-/// calls cannot run without a platform, the same function-seam style as
-/// the other services in this repo — and each defaults to the real call.
+/// The function members are the test seams — the plugin's static calls
+/// cannot run without a platform, the same function-seam style as the
+/// other services in this repo — and each defaults to the real call. The
+/// batch Z seams cover the `dev.ak/storage` calls the same way.
 class PluginFilePickGateway implements FilePickGateway {
   /// The seams are optional and default to the real calls: `const
   /// PluginFilePickGateway()` stays the production gateway every page
@@ -118,6 +142,12 @@ class PluginFilePickGateway implements FilePickGateway {
     this._folderOffer,
     this._folderOnlyOffer,
     this._isAndroidPlatform,
+    this._sendFolderPicker,
+    this._safStager,
+    this._stagingCanceller,
+    this._stagedCleaner,
+    this._staleStagingCleaner,
+    this._androidFolderSendEnabled,
   });
 
   /// The platform multi-file pick (`FilePicker.pickFiles`): an empty list
@@ -142,6 +172,36 @@ class PluginFilePickGateway implements FilePickGateway {
   /// branch deterministically). Defaults to `Platform.isAndroid`.
   final bool Function()? _isAndroidPlatform;
 
+  /// Batch Z: the Android tree pick (`pickSendFolder` on
+  /// `dev.ak/storage`) — the answer map: `status` `selected` with
+  /// `treeUri` and `displayName`, or `cancelled`. Defaults to the real
+  /// channel call.
+  final Future<Map<Object?, Object?>?> Function()? _sendFolderPicker;
+
+  /// Batch Z: the staging of a picked tree (`stageSafTree(treeUri,
+  /// stageId)`) — the ok map (`path`, `displayName`, `fileCount`,
+  /// `byteCount`), or the channel's `PlatformException`. It answers only
+  /// once the platform side has stopped for good. Defaults to the real
+  /// channel call.
+  final Future<Map<Object?, Object?>?> Function(String treeUri, String stageId)?
+      _safStager;
+
+  /// Batch Z: asks the staging [stageId] to stop (`cancelStaging`) — a
+  /// flag on the platform side only. Defaults to the real channel call.
+  final Future<void> Function(String stageId)? _stagingCanceller;
+
+  /// Batch Z: removes one staged copy (`cleanupStagedSend(stageId)`,
+  /// idempotent). Defaults to the real channel call.
+  final Future<void> Function(String stageId)? _stagedCleaner;
+
+  /// Batch Z: the stale cleanup the first staging of the process waits
+  /// for. Defaults to [cleanupStaleStaging] — once per process.
+  final Future<void> Function()? _staleStagingCleaner;
+
+  /// Batch Z: the compile-time switch [kAndroidFolderSendEnabled],
+  /// injectable so tests on a desktop host can drive both values.
+  final bool Function()? _androidFolderSendEnabled;
+
   @override
   Future<List<PickedEntry>> pickFiles() async {
     final files = await (_filePicker ?? fp.FilePicker.pickFiles)();
@@ -151,7 +211,8 @@ class PluginFilePickGateway implements FilePickGateway {
       // 「可多选，含文件夹」includes the folder-only case). One offer
       // follows; declining it (or cancelling the folder pick) is the
       // overall cancel, exactly as before.
-      if (await (_folderOnlyOffer ?? _showFolderOnlyOffer)()) {
+      if (_folderSendOffered() &&
+          await (_folderOnlyOffer ?? _showFolderOnlyOffer)()) {
         final folder = await pickSendDirectory();
         if (folder != null) {
           return <PickedEntry>[folder];
@@ -180,8 +241,9 @@ class PluginFilePickGateway implements FilePickGateway {
       return const <PickedEntry>[];
     }
     // X4 P1-2: ONE optional whole folder after a real selection.
-    if (await (_folderOffer ?? _showFolderOffer)()) {
-      final folder = await pickSendDirectory();
+    if (_folderSendOffered() &&
+        await (_folderOffer ?? _showFolderOffer)()) {
+      final folder = await _pickAppendableFolder(entries);
       if (folder != null) {
         entries.add(folder); // a cancelled folder pick keeps the files
       }
@@ -189,21 +251,379 @@ class PluginFilePickGateway implements FilePickGateway {
     return entries;
   }
 
+  bool _isAndroid() => _isAndroidPlatform?.call() ?? Platform.isAndroid;
+
+  bool _folderSendEnabled() =>
+      _androidFolderSendEnabled?.call() ?? kAndroidFolderSendEnabled;
+
+  /// Batch Z: whether the send paths offer a folder at all — everywhere,
+  /// except on Android with [kAndroidFolderSendEnabled] switched off.
+  bool _folderSendOffered() => !_isAndroid() || _folderSendEnabled();
+
+  /// Batch Z: the folder to append to [files] — [pickSendDirectory] until
+  /// one can go with them. A STAGED folder named like a picked file is
+  /// refused: an appended folder's entries reach the receiver under its
+  /// root name, and the engine refuses a run whose root names repeat. The
+  /// copy is released and the refusal dialog offers the choice — 「取消」
+  /// keeps the files alone. A folder that is not staged (the desktop
+  /// pick) passes unchanged.
+  Future<PickedEntry?> _pickAppendableFolder(List<PickedEntry> files) async {
+    while (true) {
+      final folder = await pickSendDirectory();
+      if (folder == null ||
+          folder.stagingId == null ||
+          !_isNamedLikeAFile(folder, files)) {
+        return folder;
+      }
+      // Not awaited: the refusal can be shown while the copy is removed.
+      unawaited(releaseStaged(<PickedEntry>[folder]));
+      if (!await _showStagingError(_nameConflict, 'duplicate-with-picked')) {
+        return null;
+      }
+    }
+  }
+
+  /// Is [folder] named exactly like one of the picked [files]? The
+  /// engine's rule is the plain string comparison, so is this.
+  static bool _isNamedLikeAFile(PickedEntry folder, List<PickedEntry> files) =>
+      files.any((file) => file.name == folder.name);
+
   /// Batch Z: compile-time switch of the Android folder-send entry. Off =
   /// Android shows no folder offer and [pickSendDirectory] only says the
   /// folder is unsupported — it never hands the engine a picker pseudo path.
   static const bool kAndroidFolderSendEnabled = true;
 
-  @override
-  Future<PickedEntry?> pickSendDirectory() => pickDirectory();
+  /// The native half of the Android folder send (batch Z): the channel
+  /// `MainActivity` owns. Const by name — tests intercept it through the
+  /// test binding's mock method-call handler.
+  static const MethodChannel _storageChannel =
+      MethodChannel('dev.ak/storage');
+
+  static const String _stageCancelled = 'STAGE_CANCELLED';
+  static const String _nameConflict = 'STAGE_NAME_CONFLICT';
+  static const String _ioFailed = 'STAGE_IO_FAILED';
+
+  /// Source of the staging ids: 32 lowercase hex digits from 16 random
+  /// bytes each, the format the platform side validates.
+  static final Random _stageIdRandom = Random.secure();
+
+  /// Whether an Android folder pick is open. The Android branch admits one
+  /// at a time — a second caller gets an immediate cancel. Static: the
+  /// production gateway is a `const`, built several times.
+  static bool _sendFolderPickOpen = false;
+
+  /// Whether the `stagingProgress` listener is on the channel — installed
+  /// once per process, BEFORE the first `stageSafTree` call.
+  static bool _stagingProgressListening = false;
+
+  /// The staging in flight (the id whose progress events are accepted)
+  /// and whether its cancel was requested.
+  static String? _stagingStageId;
+  static bool _stagingCancelRequested = false;
+
+  /// The latest event of [_stagingStageId]; null until the first one.
+  static final ValueNotifier<SafSendStagingProgress?> _stagingProgress =
+      ValueNotifier<SafSendStagingProgress?>(null);
+
+  /// The stale cleanup of this process — started by its first caller and
+  /// shared by every later one.
+  static Future<void>? _staleStagingCleanup;
 
   @override
-  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {}
+  Future<PickedEntry?> pickSendDirectory() async {
+    if (!_isAndroid()) {
+      return pickDirectory(); // desktop: unchanged behaviour
+    }
+    if (_sendFolderPickOpen) {
+      return null; // one pick at a time: a second caller gets a cancel
+    }
+    _sendFolderPickOpen = true;
+    try {
+      if (!_folderSendEnabled()) {
+        await _showFolderSendUnsupported();
+        return null;
+      }
+      // Nothing is staged before the leftovers of earlier runs are gone.
+      // The app start already ran the cleanup — this await is satisfied
+      // at once then, and IS the run when it comes first.
+      await (_staleStagingCleaner ?? cleanupStaleStaging)();
+      final folder = await _pickStagedFolder();
+      return folder;
+    } finally {
+      _sendFolderPickOpen = false;
+    }
+  }
+
+  /// The Android loop: pick a tree, stage it. A refusal asks whether to
+  /// start over (「重新选择」); null is the user's cancel at any point.
+  Future<PickedEntry?> _pickStagedFolder() async {
+    while (true) {
+      final (String, String) refusal;
+      try {
+        final folder = await _stageOnce();
+        return folder;
+      } on PlatformException catch (e) {
+        if (e.code == _stageCancelled) {
+          return null; // the user cancelled; the dialog closed with it
+        }
+        refusal = (e.code, e.message ?? '');
+      } on _StagingRefused catch (e) {
+        refusal = (e.code, e.token);
+      }
+      if (!await _showStagingError(refusal.$1, refusal.$2)) {
+        return null;
+      }
+    }
+  }
+
+  /// One attempt: the system tree picker, then the staging under the
+  /// progress dialog. Null = the user backed out of the picker, or
+  /// cancelled the staging.
+  Future<PickedEntry?> _stageOnce() async {
+    // The picker runs OUTSIDE the app and may refuse by itself.
+    final picked = await (_sendFolderPicker ?? _pickSendFolderOnChannel)();
+    if (picked?['status'] == 'cancelled') {
+      return null;
+    }
+    final treeUri = picked?['treeUri'];
+    final displayName = picked?['displayName'];
+    if (picked?['status'] != 'selected' ||
+        treeUri is! String ||
+        treeUri.isEmpty ||
+        displayName is! String ||
+        displayName.isEmpty) {
+      // Not a shape this side can stage.
+      throw const _StagingRefused(_ioFailed, 'io');
+    }
+    return _stageTree(treeUri, displayName);
+  }
+
+  /// Stages [treeUri] (the folder [displayName] names) under the progress
+  /// dialog, with a fresh staging id.
+  Future<PickedEntry?> _stageTree(String treeUri, String displayName) async {
+    final navigator = _rootNavigator();
+    if (navigator == null || !navigator.mounted) {
+      // Nowhere to show progress or to cancel from: nothing is staged
+      // unattended, and no dialog is waited for that cannot be shown.
+      return null;
+    }
+    final stageId = _newStageId();
+    // The listener is on the channel BEFORE the call, so no event of this
+    // staging is missed.
+    _listenForStagingProgress();
+    _stagingStageId = stageId;
+    _stagingCancelRequested = false;
+    _stagingProgress.value = null;
+    final dialog = DialogRoute<void>(
+      context: navigator.context,
+      barrierDismissible: false,
+      builder: (context) => SafSendProgressDialog(
+        progress: _stagingProgress,
+        onCancel: () => _cancelStaging(stageId),
+      ),
+    );
+    unawaited(navigator.push(dialog));
+    try {
+      final staged =
+          await (_safStager ?? _stageSafTreeOnChannel)(treeUri, stageId);
+      final folder = _stagedEntryOf(stageId, staged, displayName);
+      if (folder != null && !_stagingCancelRequested) {
+        return folder;
+      }
+      // A copy the user had cancelled after all, or one this side cannot
+      // hand over. The staging call has answered, so releasing it is safe
+      // (it is never released while the call is still open).
+      await _cleanupStagedSend(stageId);
+      if (folder != null) {
+        return null;
+      }
+      throw const _StagingRefused(_ioFailed, 'io');
+    } finally {
+      _closeProgressDialog(navigator, dialog);
+      _stagingStageId = null;
+    }
+  }
+
+  /// The entry of a staged folder: the staged root — a FILESYSTEM path,
+  /// checked like any other (P1-H: never the tree URI that was picked,
+  /// never an `msd:` pseudo path) — named as the platform staged it, with
+  /// what it copied. Null when the answer is not the ok shape.
+  PickedEntry? _stagedEntryOf(
+    String stageId,
+    Map<Object?, Object?>? staged,
+    String displayName,
+  ) {
+    final path = staged?['path'];
+    final name = staged?['displayName'];
+    if (staged?['status'] != 'ok' ||
+        path is! String ||
+        !_isStagedRootPath(path)) {
+      return null;
+    }
+    return PickedEntry(
+      path: path,
+      name: name is String && name.isNotEmpty ? name : displayName,
+      isDirectory: true,
+      stagingId: stageId,
+      stagedFileCount: _intOf(staged?['fileCount']),
+      stagedByteCount: _intOf(staged?['byteCount']),
+    );
+  }
+
+  /// P1-H for a staged root: the path the platform answers must be a
+  /// filesystem path like any other — never the tree URI that was picked
+  /// nor an `msd:` pseudo path.
+  bool _isStagedRootPath(String path) =>
+      _isFileSystemPath(path) &&
+      !path.contains('content:') &&
+      !path.contains('msd:');
+
+  /// 「取消」: asks the platform to stop [stageId] — once. The staging
+  /// call itself is what keeps the dialog up until it answers.
+  void _cancelStaging(String stageId) {
+    if (_stagingCancelRequested) {
+      return;
+    }
+    _stagingCancelRequested = true;
+    unawaited(_bestEffort(
+      () => (_stagingCanceller ?? _cancelStagingOnChannel)(stageId),
+    ));
+  }
+
+  @override
+  Future<void> releaseStaged(Iterable<PickedEntry> entries) async {
+    final ids = {for (final entry in entries) entry.stagingId}.nonNulls;
+    for (final id in ids) {
+      await _cleanupStagedSend(id);
+    }
+  }
+
+  Future<void> _cleanupStagedSend(String stageId) => _bestEffort(
+        () => (_stagedCleaner ?? _cleanupStagedSendOnChannel)(stageId),
+      );
 
   /// Batch Z: removes staging leftovers of earlier runs (interrupted
   /// copies, expired finished ones) and the read grants they left behind.
   /// Android only; errors are swallowed.
-  static Future<void> cleanupStaleStaging() async {}
+  ///
+  /// Runs ONCE per process: the app start calls it, and the first staging
+  /// waits for the same run instead of starting another.
+  static Future<void> cleanupStaleStaging() =>
+      _staleStagingCleanup ??= _runStaleStagingCleanup();
+
+  static Future<void> _runStaleStagingCleanup() async {
+    try {
+      // A static has no instance seam: the Android fact comes from the
+      // UI's platform seam.
+      if (UiPlatform.isAndroid) {
+        await _storageChannel.invokeMethod<void>('cleanupStaleStaging');
+      }
+    } on Object catch (_) {
+      // Best effort by contract: whatever it left is removed next start.
+    }
+  }
+
+  /// Test seam: puts the per-process statics back to their state at the
+  /// start of a process (the stale-cleanup run, the listener guard, the
+  /// open-pick guard), so a test isolate can observe the FIRST staging of
+  /// a process more than once — and one test's abandoned pick cannot
+  /// cancel the next test's. Tests call it from `setUp`; production never
+  /// does.
+  @visibleForTesting
+  static void resetProcessStateForTest() {
+    _staleStagingCleanup = null;
+    _stagingProgressListening = false;
+    _sendFolderPickOpen = false;
+  }
+
+  /// Runs a best-effort channel call: a failure never reaches the caller.
+  static Future<void> _bestEffort(Future<void> Function() call) async {
+    try {
+      await call();
+    } on Object catch (_) {
+      // Best effort by contract: ignored on purpose.
+    }
+  }
+
+  /// Installs the `stagingProgress` listener — idempotent, since every
+  /// `const PluginFilePickGateway()` shares this one guard.
+  static void _listenForStagingProgress() {
+    if (_stagingProgressListening) {
+      return;
+    }
+    _stagingProgressListening = true;
+    _storageChannel.setMethodCallHandler(_onStorageCall);
+  }
+
+  /// The platform→Dart half of `dev.ak/storage`: the `stagingProgress`
+  /// events of the staging in flight. Anything else is ignored.
+  static Future<Object?> _onStorageCall(MethodCall call) async {
+    if (call.method != 'stagingProgress') {
+      return null;
+    }
+    final args = call.arguments;
+    final foreign = _stagingStageId == null ||
+        args is! Map ||
+        args['stageId'] != _stagingStageId;
+    if (foreign) {
+      return null; // nothing in flight, or a late event of an earlier one
+    }
+    _stagingProgress.value = SafSendStagingProgress(
+      copying: args['phase'] == 'copy',
+      filesCopied: _intOf(args['filesCopied']) ?? 0,
+      bytesCopied: _intOf(args['bytesCopied']) ?? 0,
+      totalBytesEstimate: _intOf(args['totalBytesEstimate']) ?? -1,
+    );
+    return null;
+  }
+
+  /// Closes the progress route THIS staging pushed — and nothing else.
+  /// The route object is the proof of ownership: once it is gone (the
+  /// navigator was rebuilt underneath, the route was removed), nothing is
+  /// popped — a blind `pop()` would close somebody else's page.
+  static void _closeProgressDialog(
+    NavigatorState navigator,
+    Route<void> dialog,
+  ) {
+    if (!dialog.isActive) {
+      return;
+    }
+    if (dialog.isCurrent) {
+      navigator.pop();
+    } else {
+      navigator.removeRoute(dialog); // something was pushed on top of it
+    }
+  }
+
+  static String _newStageId() {
+    final bytes = [
+      for (var i = 0; i < 16; i += 1) _stageIdRandom.nextInt(256),
+    ];
+    return [
+      for (final byte in bytes) byte.toRadixString(16).padLeft(2, '0'),
+    ].join();
+  }
+
+  static int? _intOf(Object? value) => value is int ? value : null;
+
+  static Future<Map<Object?, Object?>?> _pickSendFolderOnChannel() =>
+      _storageChannel.invokeMethod<Map<Object?, Object?>>('pickSendFolder');
+
+  static Future<Map<Object?, Object?>?> _stageSafTreeOnChannel(
+    String treeUri,
+    String stageId,
+  ) =>
+      _storageChannel.invokeMethod<Map<Object?, Object?>>('stageSafTree', {
+        'treeUri': treeUri,
+        'stageId': stageId,
+      });
+
+  static Future<void> _cancelStagingOnChannel(String stageId) =>
+      _storageChannel.invokeMethod<void>('cancelStaging', {'stageId': stageId});
+
+  static Future<void> _cleanupStagedSendOnChannel(String stageId) =>
+      _storageChannel
+          .invokeMethod<void>('cleanupStagedSend', {'stageId': stageId});
 
   @override
   Future<PickedEntry?> pickDirectory() async {
@@ -294,6 +714,51 @@ Future<bool> _showFolderOnlyOffer() async {
     ),
   );
   return pick == true;
+}
+
+/// Batch Z: the refusal dialog of a folder send —「无法发送此文件夹」,
+/// its body chosen by the error [code] and reason [token]. True only for
+/// 「重新选择」; 「取消」, dismissing the dialog, or having no app UI to
+/// ask on all answer false (the pick ends cancelled, never blocks). Same
+/// rules as [_showFolderOffer].
+Future<bool> _showStagingError(String code, String token) async {
+  final navigator = _rootNavigator();
+  if (navigator == null || !navigator.mounted) {
+    return false;
+  }
+  final retry = await navigator.push<bool>(
+    DialogRoute<bool>(
+      context: navigator.context,
+      builder: (context) =>
+          SafSendStagingErrorDialog(code: code, token: token),
+    ),
+  );
+  return retry == true;
+}
+
+/// Batch Z: the info dialog of a build without the Android folder send.
+/// Nothing to answer — it only says why the pick ends cancelled.
+Future<void> _showFolderSendUnsupported() async {
+  final navigator = _rootNavigator();
+  if (navigator == null || !navigator.mounted) {
+    return;
+  }
+  await navigator.push<void>(
+    DialogRoute<void>(
+      context: navigator.context,
+      builder: (context) => const SafSendFolderUnsupportedDialog(),
+    ),
+  );
+}
+
+/// Batch Z: a staging attempt this side refuses — an answer that is not
+/// one of the channel's shapes. Carries what the channel's
+/// `PlatformException` would: the error code and its reason token.
+class _StagingRefused implements Exception {
+  const _StagingRefused(this.code, this.token);
+
+  final String code;
+  final String token;
 }
 
 /// The app's root navigator, wherever it sits in the element tree (the

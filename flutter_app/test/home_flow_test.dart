@@ -1537,6 +1537,13 @@ void main() {
         directoryPicks += 1;
         return '/storage/msd/2184/Documents/相册';
       },
+      // Batch Z: on Android the SEND-side folder pick goes over the SAF
+      // channel and never reaches the plugin's directory picker; the
+      // /storage/msd/ exclusion is asserted on pickDirectory() below, the
+      // one pick that still returns that path shape.
+      sendFolderPicker: () async =>
+          const <String, Object>{'status': 'cancelled'},
+      staleStagingCleaner: () async {},
     );
     final desktopGateway = PluginFilePickGateway(
       isAndroidPlatform: () => false,
@@ -1553,10 +1560,21 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
 
-    expect(directoryPicks, 1);
+    // Batch Z: the Android send-side pick ran over the channel (cancelled
+    // here) and never touched the plugin's directory picker.
+    expect(directoryPicks, 0,
+        reason: '批次 Z：Android 发送侧不再走插件的目录选择');
     expect(picked, isNotNull);
     expect(picked, isEmpty,
+        reason: '批次 Z：系统树形选择器取消——整体空结果');
+
+    // P1-H (round 5) still holds where that path shape can come back: the
+    // plain directory pick (the receive save-dir pick) excludes it.
+    final android = await androidGateway.pickDirectory();
+    expect(android, isNull,
         reason: 'P1-H：Android 上 /storage/msd/ 形态不可发送——按取消处理');
+    expect(directoryPicks, 1,
+        reason: 'P1-H：排除发生在插件的目录选择之后，不是没有去选');
 
     // The desktop branch: the same path shape is a REAL directory the
     // engine can send (round 6: the exclusion is Android-only).

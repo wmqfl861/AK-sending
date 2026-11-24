@@ -1,36 +1,45 @@
-// Z probe (batch Z, 2026-11-24): the ANDROID SEND-SIDE folder path against
-// the REAL platform in a profile build — the system tree picker
-// (ACTION_OPEN_DOCUMENT_TREE), the native staging behind `dev.ak/storage`,
-// the content of the staged copy, its release, and the failure paths of the
-// channel. The Flutter side is driven by this test; the NATIVE picker is
-// driven from the host (adb/uiautomator), for the reasons recorded in the
-// header of the K1 walkthrough (k1_android_saf_test.dart).
+// Z probe (batch Z, 2026-11-24; part D and the hard assertions of revision 3,
+// 2026-11-25): the ANDROID SEND-SIDE folder path against the REAL platform in
+// a profile build — the system tree picker (ACTION_OPEN_DOCUMENT_TREE), the
+// native staging behind `dev.ak/storage`, the content of the staged copy,
+// its release, and the failure paths of the channel. The Flutter side is
+// driven by this test; the NATIVE picker is driven from the host
+// (adb/uiautomator), for the reasons recorded in the header of the K1
+// walkthrough (k1_android_saf_test.dart).
 //
 // Orchestration contract:
 //   * dart-define: AK_SAF_PROBE_SHA_BIG=<64 hex> — the host's SHA-256 of
 //     the 32 MiB `nested/photo.bin` it pushed to /sdcard/Download/akstage.
 //   * every evidence line `ZSAF|<part>|PICKER|tree|awaiting external
 //     DocumentsUI drive` (logcat, tag `flutter`) asks the host to drive
-//     DocumentsUI onto that folder: once for part A, once for part B and
-//     once for part C.
+//     DocumentsUI onto that folder: once each for parts A, B and C.
 //   * the synthetic tree, whose host manifest is the reference:
 //       nested/deep/note.txt   "ak stage probe" + LF
 //       nested/photo.bin       33554432 random bytes
 //       empty.txt              0 bytes
 //       emptydir/              an empty directory
 //       sub/说明 文本.txt       "中文 名字" + LF
+//   * part D needs no drive. The host enlarges nested/photo.bin while the
+//     test waits on the picker of part C (a longer copy phase to land in),
+//     reads the window the baseline staging measures, and changes the tree
+//     at each `ZSAF|D<n>|COPY` line — the device's own "enumeration over,
+//     the copy began". It restores the tree after `ZSAF|D|DONE`.
 //
 // Part A runs the PRODUCTION gateway with no injected seam: pick → stage →
-// verify the staged tree → release. Parts B and C go through the raw
+// verify the staged tree → release. Parts B, C and D go through the raw
 // channel. B is the failure paths — a malformed id, an untrusted authority,
 // a cancel that must land in the copy phase, an idempotent cleanup, and
 // the stale cleanup next to a RUNNING staging. C proves that a send never
-// strips the RECEIVE grant of the same folder.
+// strips the RECEIVE grant of the same folder. D proves the two checks the
+// stager makes before its completion marker: a directory that gained a
+// child while the copy ran (`source-changed`) and a file that did not have
+// its enumerated size any more (`size-mismatch`).
 //
-// Evidence is one `ZSAF|…` line per fact. A staged path, a tree URI and a
-// stage id never print: counts, lengths and booleans stand in. One run is
-// long (three picker drives), so a failed check is COLLECTED under its name
-// and the run goes on; the test fails on the collected list at the end.
+// Evidence is one `ZSAF|…` line per fact. A staged path, a tree URI, a
+// stage id and the content of the grant journal never print: counts,
+// lengths and booleans stand in. Every check is HARD — a failed one is
+// collected under its name, the run goes on to gather the rest, and the
+// test fails on the collected list at the end.
 import 'dart:async' show unawaited;
 import 'dart:convert' show utf8;
 import 'dart:io' as io;
@@ -73,13 +82,25 @@ final int _expectedBytes =
     _sizes.values.fold<int>(0, (sum, size) => sum + size);
 final String _emptySha = crypto.sha256.convert(const <int>[]).toString();
 
+/// The grant journal the send side keeps directly under the staging root
+/// (revision 3, N2), and the scratch file it is rewritten through.
+const String _journalName = '.send-grants';
+const String _journalScratchName = '.send-grants.tmp';
+
 /// How long a pick may stay open. The host has seen the PICKER line by
-/// then, so this only bounds a picker drive that never comes.
+/// then, so this only bounds a picker drive that never comes — and the
+/// tree preparation the host does while the test waits on part C's picker.
 const int _pickSeconds = 240;
 const int _workSeconds = 120;
 
+/// A staging of part D copies the enlarged file: its budget is its own.
+const int _bigWorkSeconds = 180;
+
 final RegExp _idShape = RegExp(r'^[0-9a-f]{32}$');
 final Random _random = Random.secure();
+
+/// One clock for the evidence timings (the copy phase of a staging).
+final Stopwatch _clock = Stopwatch()..start();
 
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -98,17 +119,28 @@ void main() {
 
     final run = _Run(tester);
     addTearDown(() async {
-      // Whatever went wrong, no staged copy of this run stays behind. The
-      // cleanup is idempotent, and the platform queues it behind a staging
-      // that is still in flight.
+      // Whatever went wrong, no staged copy of this run stays behind. For
+      // an id whose staging is still in flight the platform answers `busy`
+      // and deletes nothing; that copy is left to the next start's stale
+      // sweep, exactly as a killed process would leave it.
+      var answered = 0;
+      var busy = 0;
+      var errors = 0;
       for (final id in run.owned) {
-        try {
-          await _storageChannel.invokeMethod<void>(
-              'cleanupStagedSend', <String, Object?>{'stageId': id});
-        } on Object {
-          // Best effort, exactly like the gateway's own release.
+        final answer = _Answer.capture(_storageChannel.invokeMethod<Object?>(
+            'cleanupStagedSend', <String, Object?>{'stageId': id}));
+        await answer.wait(30);
+        final failure = answer.error;
+        if (failure == null) {
+          answered += 1;
+        } else if (failure is PlatformException && answer.token == 'busy') {
+          busy += 1;
+        } else {
+          errors += 1;
         }
       }
+      zSay('TEARDOWN|ids=${run.owned.length}|answered=$answered'
+          '|busy=$busy|errors=$errors');
       _storageChannel.setMethodCallHandler(null);
     });
 
@@ -119,6 +151,7 @@ void main() {
     await _partA(run, shaBig);
     if (!run.pickerStalled) await _partB(run);
     if (!run.pickerStalled) await _partC(run);
+    if (!run.pickerStalled && run.treeUri.isNotEmpty) await _partD(run);
 
     zSay('VERDICT|${run.problems.isEmpty ? 'ok' : 'failed=${run.problems.length}'}');
     expect(run.problems, isEmpty,
@@ -132,14 +165,21 @@ void zSay(String value) {
 }
 
 /// What one run collects: the failed checks under their names, every stage
-/// id this run may leave behind, and whether a picker drive never came —
-/// the parts after that cannot run.
+/// id this run may leave behind, the staging root and the tree URI the
+/// later parts work with, and whether a picker drive never came — the
+/// parts after that cannot run.
 class _Run {
   _Run(this.tester);
 
   final WidgetTester tester;
   final List<String> problems = <String>[];
   final Set<String> owned = <String>{};
+
+  /// The staging root as the platform spelled it in part A's answer.
+  String stagingRoot = '';
+
+  /// The tree URI of part B's pick — never printed.
+  String treeUri = '';
   bool pickerStalled = false;
 
   /// A fresh staging id in the shape the platform validates.
@@ -162,6 +202,9 @@ class _Answer {
   Object? error;
   bool answered = false;
 
+  /// When the call answered, on the test's clock.
+  int? answeredAtMs;
+
   /// `ok`, the PlatformException code, the error type, or `no-answer`.
   String get verdict {
     if (!answered) return 'no-answer';
@@ -172,15 +215,42 @@ class _Answer {
         : 'threw:${failure.runtimeType}';
   }
 
+  /// The reason token of a PlatformException (`leftover`, `source-changed`,
+  /// …). Anything that is not a plain lowercase token reads `?`: a message
+  /// that carries more than the contract's fixed token never prints.
+  String get token {
+    final failure = error;
+    if (failure is! PlatformException) return '';
+    final message = failure.message ?? '';
+    return RegExp(r'^[a-z][a-z0-9-]{0,31}$').hasMatch(message) ? message : '?';
+  }
+
+  /// `<code>/<token>` of a PlatformException, else [verdict].
+  String get codeToken {
+    final failure = error;
+    return failure is PlatformException ? '${failure.code}/$token' : verdict;
+  }
+
+  /// Waits for the answer without pumping — a teardown has no frame to
+  /// wait for.
+  Future<void> wait(int seconds) async {
+    final end = DateTime.now().add(Duration(seconds: seconds));
+    while (!answered && DateTime.now().isBefore(end)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
   static _Answer capture(Future<Object?> call) {
     final answer = _Answer();
     unawaited(call.then((Object? value) {
       answer
         ..value = value
+        ..answeredAtMs = _clock.elapsedMilliseconds
         ..answered = true;
     }, onError: (Object failure) {
       answer
         ..error = failure
+        ..answeredAtMs = _clock.elapsedMilliseconds
         ..answered = true;
     }));
     return answer;
@@ -229,12 +299,228 @@ Future<bool> _pumpUntil(
   return ready();
 }
 
-/// Awaits [call] (pumping meanwhile) and hands its captured answer.
-Future<_Answer> _settled(_Run run, Future<Object?> call) async {
+/// Awaits [call] (pumping meanwhile) and hands its captured answer. A call
+/// that copies the enlarged file gets [seconds].
+Future<_Answer> _settled(_Run run, Future<Object?> call,
+    {int seconds = _workSeconds}) async {
   final answer = _Answer.capture(call);
-  await _pumpUntil(run.tester, () => answer.answered, _workSeconds);
+  await _pumpUntil(run.tester, () => answer.answered, seconds);
   return answer;
 }
+
+/// Whether the call failed with exactly `<code>/<token>`.
+bool _failedWith(_Answer answer, String code, String token) {
+  final failure = answer.error;
+  return failure is PlatformException &&
+      failure.code == code &&
+      answer.token == token;
+}
+
+/// `ok` or the status the answer map carries; a failed or missing call
+/// shows its PlatformException code instead.
+String _statusOf(_Answer answer) {
+  if (!answer.answered) return 'no-answer';
+  if (answer.error != null) return answer.verdict;
+  final map = answer.value;
+  return map is Map ? '${map['status']}' : 'no-map';
+}
+
+// ---------------------------------------------------------------------------
+// The channel calls of parts B–D, and what their answers must look like.
+// ---------------------------------------------------------------------------
+
+Future<Object?> _stageCall(String uri, String stageId) =>
+    _storageChannel.invokeMethod<Object?>('stageSafTree',
+        <String, Object?>{'treeUri': uri, 'stageId': stageId});
+
+/// A direct `cleanupStagedSend`, judged by what the platform is contracted
+/// to answer: a map with the boolean `removed` — `true` also when the stage
+/// directory is already gone, `false` when something is left behind. A
+/// staging that is still running answers `STAGE_IO_FAILED` / `busy`.
+Future<({String text, bool shapeOk, bool? removed})> _cleanup(
+    _Run run, String stageId) async {
+  final answer = await _settled(
+      run,
+      _storageChannel.invokeMethod<Object?>(
+          'cleanupStagedSend', <String, Object?>{'stageId': stageId}));
+  final value = answer.value;
+  final removed = answer.error == null && value is Map && value['removed'] is bool
+      ? value['removed'] as bool?
+      : null;
+  return (
+    text: removed != null ? 'removed=$removed' : answer.codeToken,
+    shapeOk: removed != null,
+    removed: removed,
+  );
+}
+
+/// The `stagingProgress` events of the raw channel while the tap is on it:
+/// per stage id when its copy phase began and ended (ms on the test's
+/// clock) and its last event — and, for the probes that act on a copy
+/// event, a hook that runs on every one of them.
+class _ProgressTap {
+  final Map<String, int> _copyStartedAt = <String, int>{};
+  final Map<String, int> _copyEndedAt = <String, int>{};
+  final Map<String, int> _copyEvents = <String, int>{};
+  final Map<String, Map<Object?, Object?>> _last = <String, Map<Object?, Object?>>{};
+  var _events = 0;
+  String lastPhase = 'none';
+
+  /// Runs on every copy-phase event, with the event as the platform sent it.
+  void Function(Map<Object?, Object?> event)? onCopy;
+
+  int get events => _events;
+  int? copyStartedAt(String id) => _copyStartedAt[id];
+  int? copyEndedAt(String id) => _copyEndedAt[id];
+  int copyEvents(String id) => _copyEvents[id] ?? 0;
+  Map<Object?, Object?>? last(String id) => _last[id];
+
+  /// How long the copy phase of [id] lasted: first copy event to last.
+  int? copyMs(String id) {
+    final started = _copyStartedAt[id];
+    final ended = _copyEndedAt[id];
+    return started == null || ended == null ? null : ended - started;
+  }
+
+  /// From the last copy event of [id] to the moment [answer] came back:
+  /// the membership check, the marker and the grant release.
+  int? afterCopyMs(String id, _Answer answer) {
+    final ended = _copyEndedAt[id];
+    final at = answer.answeredAtMs;
+    return ended == null || at == null ? null : at - ended;
+  }
+
+  /// Puts the tap on the channel — BEFORE the staging call it watches.
+  void install() {
+    _storageChannel.setMethodCallHandler((MethodCall call) async {
+      final args = call.arguments;
+      if (call.method != 'stagingProgress' || args is! Map) return null;
+      final event = Map<Object?, Object?>.from(args);
+      final id = '${event['stageId']}';
+      final now = _clock.elapsedMilliseconds;
+      _events += 1;
+      lastPhase = '${event['phase']}';
+      _last[id] = event;
+      if (event['phase'] == 'copy') {
+        _copyStartedAt.putIfAbsent(id, () => now);
+        _copyEndedAt[id] = now;
+        _copyEvents[id] = copyEvents(id) + 1;
+        onCopy?.call(event);
+      }
+      return null;
+    });
+  }
+
+  void remove() {
+    onCopy = null;
+    _storageChannel.setMethodCallHandler(null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The staging root: what may be in it, and the grant journal.
+// ---------------------------------------------------------------------------
+
+/// What the staging root holds — by KIND and count, never by name. The
+/// send side keeps its grant journal directly under the staging root
+/// (revision 3, N2): a regular file that stays behind EMPTY once every
+/// grant it recorded is released. So "nothing left" means no stage
+/// directory and no other entry; the journal is reported on its own, by
+/// size only — its lines are tree URIs.
+class _RootShape {
+  const _RootShape({
+    required this.exists,
+    required this.children,
+    required this.stageDirs,
+    required this.other,
+    required this.scratch,
+    required this.journal,
+  });
+
+  final bool exists;
+
+  /// Every entry directly under the staging root.
+  final int children;
+
+  /// Real directories — one staged copy each (their names are stage ids).
+  final int stageDirs;
+
+  /// Everything that is neither a stage directory nor the journal.
+  final int other;
+
+  /// The journal's scratch file is still there. It exists only while the
+  /// journal is being rewritten, which is over before a staging answers.
+  final bool scratch;
+
+  /// `absent`, `empty`, `<n> bytes` or `not-a-file`.
+  final String journal;
+
+  /// No stage directory and nothing else: the root holds no copy.
+  bool get holdsNothing => exists && stageDirs == 0 && other == 0;
+
+  /// [holdsNothing], with the journal empty and its scratch file gone.
+  bool get clear =>
+      holdsNothing && !scratch && (journal == 'absent' || journal == 'empty');
+
+  String get describe =>
+      'exists=$exists|children=$children|stageDirs=$stageDirs|other=$other'
+      '|scratch=$scratch|journal=$journal';
+}
+
+_RootShape _rootShape(String root) {
+  final dir = io.Directory(root);
+  if (!dir.existsSync()) {
+    return const _RootShape(
+      exists: false,
+      children: 0,
+      stageDirs: 0,
+      other: 0,
+      scratch: false,
+      journal: 'absent',
+    );
+  }
+  final entries = dir.listSync(followLinks: false);
+  var stageDirs = 0;
+  var other = 0;
+  var scratch = false;
+  for (final entry in entries) {
+    final name = _basename(entry.path);
+    if (entry is io.Directory) {
+      stageDirs += 1;
+    } else if (entry is io.File && name == _journalScratchName) {
+      scratch = true;
+    } else if (name != _journalName) {
+      other += 1;
+    }
+  }
+  return _RootShape(
+    exists: true,
+    children: entries.length,
+    stageDirs: stageDirs,
+    other: other,
+    scratch: scratch,
+    journal: _journalState(root),
+  );
+}
+
+/// The grant journal by SIZE only — a line in it is a tree URI the send
+/// side still holds the read grant of; the line itself never prints.
+String _journalState(String root) {
+  final journal = io.File('$root/$_journalName');
+  switch (io.FileSystemEntity.typeSync(journal.path, followLinks: false)) {
+    case io.FileSystemEntityType.notFound:
+      return 'absent';
+    case io.FileSystemEntityType.file:
+      final bytes = journal.lengthSync();
+      return bytes == 0 ? 'empty' : '$bytes bytes';
+    default:
+      return 'not-a-file';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers.
+// ---------------------------------------------------------------------------
 
 /// The text of the widget under [key] (the key's own text, else its texts
 /// joined with " / "); empty when there is no such widget).
@@ -254,9 +540,6 @@ String _textAt(WidgetTester tester, String key) {
 }
 
 String _basename(String path) => path.substring(path.lastIndexOf('/') + 1);
-
-int _childCount(io.Directory dir) =>
-    dir.existsSync() ? dir.listSync().length : 0;
 
 Future<String> _sha256Of(io.File file) async =>
     (await crypto.sha256.bind(file.openRead()).first).toString();
@@ -280,7 +563,7 @@ Future<Map<String, io.FileSystemEntity>> _walk(String root) async {
 /// exists: Android's `/data/user/0` is a link to `/data/data`, and the
 /// stager answers the resolved form, so the unresolved spelling never
 /// prefixes a staged path. Empty when the platform directory cannot be
-/// resolved — this is a cross-check, never a precondition.
+/// resolved — which the parts that depend on it count as a failure.
 Future<String> _derivedRoot() async {
   try {
     final support = (await getApplicationSupportDirectory()).path;
@@ -322,15 +605,6 @@ Future<String?> _rawPick(_Run run, String part, String method) async {
       '|uriIsTree=${treeUri?.startsWith('content://')}'
       '|threw=${picked.error == null ? 'no' : picked.verdict}');
   return treeUri;
-}
-
-/// `ok` or the status the answer map carries; a failed or missing call
-/// shows its PlatformException code instead.
-String _statusOf(_Answer answer) {
-  if (!answer.answered) return 'no-answer';
-  if (answer.error != null) return answer.verdict;
-  final map = answer.value;
-  return map is Map ? '${map['status']}' : 'no-map';
 }
 
 /// `rw`, `r-`, `-w` or `--` for the persisted grant of exactly [treeUri];
@@ -423,6 +697,7 @@ Future<void> _partA(_Run run, String shaBig) async {
   // root.
   final stageDir = io.Directory(path).parent.parent;
   final stagingRoot = stageDir.parent;
+  run.stagingRoot = stagingRoot.path;
   need(entry.isDirectory, 'entry-is-directory');
   need(entry.name == _rootName, 'entry-name');
   need(
@@ -442,8 +717,17 @@ Future<void> _partA(_Run run, String shaBig) async {
   final rels = entries.keys.toList()..sort();
   for (final rel in rels) {
     final entity = entries[rel]!;
+    // What the tree says must be here: a file, a directory, or nothing.
+    final wanted = _sizes.containsKey(rel)
+        ? 'file'
+        : _directories.contains(rel)
+            ? 'dir'
+            : null;
     if (entity is io.Directory) {
       zSay('A|ENTRY|rel=$rel|kind=dir');
+      // A directory where a file belongs is a wrong copy, not a skip: the
+      // path set alone would still be equal.
+      if (wanted != null && wanted != 'dir') need(false, 'kind:$rel(file)');
       continue;
     }
     if (entity is! io.File) {
@@ -452,6 +736,7 @@ Future<void> _partA(_Run run, String shaBig) async {
       zSay('A|ENTRY|rel=$rel|kind=other');
       continue;
     }
+    if (wanted != null && wanted != 'file') need(false, 'kind:$rel(dir)');
     final size = await entity.length();
     final digest = await _sha256Of(entity);
     zSay('A|ENTRY|rel=$rel|kind=file|size=$size|sha256=$digest');
@@ -480,15 +765,15 @@ Future<void> _partA(_Run run, String shaBig) async {
     zSay('A|RELSET|missing=${missing.join(',')}|extra=${extra.join(',')}');
   }
 
-  final siblings = stagingRoot.existsSync()
-      ? stagingRoot.listSync()
-      : const <io.FileSystemEntity>[];
-  if (siblings.length != 1 || siblings.first.path != stageDir.path) {
-    need(false, 'staging-root-children(${siblings.length})');
+  // Exactly one stage directory — the one just staged — and, besides it,
+  // nothing but the grant journal the send side keeps in the staging root.
+  final staged = _rootShape(stagingRoot.path);
+  if (staged.stageDirs != 1 || staged.other != 0) {
+    need(false, 'staging-root-shape(${staged.describe})');
   }
-  final stageChildren = stageDir.existsSync()
-      ? <String>{for (final e in stageDir.listSync()) _basename(e.path)}
-      : const <String>{};
+  final stageChildren = <String>{
+    for (final e in stageDir.listSync()) _basename(e.path),
+  };
   need(
       stageChildren.length == 2 &&
           stageChildren.contains('payload') &&
@@ -499,16 +784,18 @@ Future<void> _partA(_Run run, String shaBig) async {
 
   await gateway.releaseStaged(<PickedEntry>[entry]);
   final gone = !stageDir.existsSync();
-  final rootChildren = _childCount(stagingRoot);
-  zSay('A|RELEASED|stageDirGone=$gone|stagingRootChildren=$rootChildren');
+  final after = _rootShape(stagingRoot.path);
+  zSay('A|RELEASED|stageDirGone=$gone|${after.describe}');
   if (!gone) need(false, 'release-stage-dir');
-  if (rootChildren != 0) need(false, 'release-staging-root($rootChildren)');
+  if (!after.holdsNothing) need(false, 'release-staging-root(${after.describe})');
 
-  // Cross-check of the derived root the E2E walkthrough lists (it never
-  // sees the staged path): the staged copy must sit under it.
+  // The derived root the E2E walkthrough lists (it never sees the staged
+  // path) must resolve, and the staged copy must lie under it.
   final derived = await _derivedRoot();
-  zSay('A|ROOT|derivedOk='
-      '${derived.isEmpty ? 'error' : path.startsWith('$derived/')}');
+  final under = derived.isNotEmpty && path.startsWith('$derived/');
+  zSay('A|ROOT|derivedOk=$under|resolved=${derived.isNotEmpty}');
+  if (derived.isEmpty) need(false, 'derived-root-unresolved');
+  if (!under) need(false, 'derived-root-not-above-staged-path');
   zSay('A|DONE|failed=${failures.length}');
   collect();
 }
@@ -533,82 +820,83 @@ Future<void> _partB(_Run run) async {
     zSay('B|DONE|failed=${failures.length}');
     return collect();
   }
+  run.treeUri = treeUri;
 
-  Future<_Answer> stage(String uri, String stageId) => _settled(
-      run,
-      _storageChannel.invokeMethod<Object?>('stageSafTree',
-          <String, Object?>{'treeUri': uri, 'stageId': stageId}));
+  Future<_Answer> stage(String uri, String stageId) =>
+      _settled(run, _stageCall(uri, stageId));
 
-  /// `ok` only for an answer that is null: the cleanup returns nothing,
-  /// whether or not the stage directory was still there.
-  Future<String> cleanup(String stageId) async {
-    final answer = await _settled(
-        run,
-        _storageChannel.invokeMethod<Object?>(
-            'cleanupStagedSend', <String, Object?>{'stageId': stageId}));
-    if (!answer.answered) return 'no-answer';
-    if (answer.error != null) return answer.verdict;
-    return answer.value == null ? 'ok' : 'non-null';
-  }
+  // The staging root as the platform spelled it in part A; without part A's
+  // answer it is derived the way Android lays it out.
+  final root = run.stagingRoot.isNotEmpty ? run.stagingRoot : await _derivedRoot();
 
-  // A malformed id is refused before anything is read or written.
-  var code = (await stage(treeUri, 'not-an-id')).verdict;
+  // A malformed id is refused before anything is read or written. The
+  // answer is checked as code/token: both the code and the contract's
+  // reason token must be exactly right.
+  var code = (await stage(treeUri, 'not-an-id')).codeToken;
   zSay('B|BADID|code=$code');
-  if (code != 'STAGE_INVALID_ID') need(false, 'badid-code:$code');
+  if (code != 'STAGE_INVALID_ID/format') need(false, 'badid-code:$code');
 
   // An authority outside the allow-list is refused before any grant.
   code = (await stage(
           'content://com.example.untrusted.documents/tree/x', run.newId()))
-      .verdict;
+      .codeToken;
   zSay('B|UNTRUSTED|code=$code');
-  if (code != 'SAF_PROVIDER_UNTRUSTED') need(false, 'untrusted-code:$code');
-
-  // A cancel must land while the copy is running: the listener is on the
-  // channel BEFORE the staging call starts, and the cancel goes out at the
-  // FIRST event whose phase is `copy`.
-  final idB = run.newId();
-  final phases = <String>[];
-  var copyEvents = 0;
-  var cancelAtEvent = 0;
-  var bytesAtCancel = -1;
-  _storageChannel.setMethodCallHandler((MethodCall call) async {
-    final args = call.arguments;
-    if (call.method != 'stagingProgress' || args is! Map) return null;
-    final phase = '${args['phase']}';
-    phases.add(phase);
-    if (phase == 'copy') copyEvents += 1;
-    if (cancelAtEvent == 0 && phase == 'copy' && args['stageId'] == idB) {
-      cancelAtEvent = phases.length;
-      bytesAtCancel = args['bytesCopied'] as int? ?? -1;
-      _Answer.capture(_storageChannel.invokeMethod<void>(
-          'cancelStaging', <String, Object?>{'stageId': idB}));
-    }
-    return null;
-  });
-  final cancelling = _Answer.capture(_storageChannel.invokeMethod<Object?>(
-      'stageSafTree', <String, Object?>{'treeUri': treeUri, 'stageId': idB}));
-  await _pumpUntil(run.tester, () => cancelling.answered, _workSeconds);
-  zSay('B|CANCEL|code=${cancelling.verdict}|events=${phases.length}'
-      '|lastPhase=${phases.isEmpty ? 'none' : phases.last}'
-      '|copyEvents=$copyEvents|cancelSentAtEvent=$cancelAtEvent'
-      '|bytesAtCancel=$bytesAtCancel');
-  if (cancelAtEvent == 0) need(false, 'cancel-no-copy-event');
-  if (cancelling.verdict != 'STAGE_CANCELLED') {
-    need(false, 'cancel-code:${cancelling.verdict}');
+  if (code != 'SAF_PROVIDER_UNTRUSTED/authority') {
+    need(false, 'untrusted-code:$code');
   }
 
-  // The cleanup answers null for an id that is already gone, every time.
-  final first = await cleanup(idB);
-  final second = await cleanup(idB);
-  zSay('B|IDEMPOTENT|first=$first|second=$second');
-  if (first != 'ok' || second != 'ok') need(false, 'idempotent:$first/$second');
+  // A cancel must land while the copy is running: the tap is on the channel
+  // BEFORE the staging call starts, and the cancel goes out at the FIRST
+  // event whose phase is `copy`.
+  final idB = run.newId();
+  final tap = _ProgressTap();
+  var cancelAtEvent = 0;
+  var bytesAtCancel = -1;
+  tap.onCopy = (event) {
+    if (cancelAtEvent != 0 || event['stageId'] != idB) return;
+    cancelAtEvent = tap.events;
+    bytesAtCancel = event['bytesCopied'] as int? ?? -1;
+    _Answer.capture(_storageChannel.invokeMethod<void>(
+        'cancelStaging', <String, Object?>{'stageId': idB}));
+  };
+  tap.install();
+  final cancelling = _Answer.capture(_stageCall(treeUri, idB));
+  await _pumpUntil(run.tester, () => cancelling.answered, _workSeconds);
+  // Right at the answer — before any explicit cleanup — a cancelled job
+  // must have removed its own stage directory. Null: no staging root is
+  // known, so there is nothing this test can say about the directory.
+  final goneAfterCancel =
+      root.isEmpty ? null : !io.Directory('$root/$idB').existsSync();
+  zSay('B|CANCEL|code=${cancelling.codeToken}'
+      '|stageDirGone=${goneAfterCancel ?? 'unknown'}'
+      '|events=${tap.events}|lastPhase=${tap.lastPhase}'
+      '|copyEvents=${tap.copyEvents(idB)}|cancelSentAtEvent=$cancelAtEvent'
+      '|bytesAtCancel=$bytesAtCancel');
+  if (cancelAtEvent == 0) need(false, 'cancel-no-copy-event');
+  // It answers STAGE_CANCELLED only once its directory is gone; otherwise
+  // the answer says what was left (`STAGE_IO_FAILED` / `leftover`).
+  if (!_failedWith(cancelling, 'STAGE_CANCELLED', 'user')) {
+    need(false, 'cancel-code:${cancelling.codeToken}');
+  }
+  if (root.isEmpty) need(false, 'no-staging-root');
+  if (goneAfterCancel == false) need(false, 'cancel-stage-dir-left');
+
+  // The cleanup answers `{"removed": true}` for an id that is already gone,
+  // every time.
+  final first = await _cleanup(run, idB);
+  final second = await _cleanup(run, idB);
+  zSay('B|IDEMPOTENT|first=${first.text}|second=${second.text}');
+  if (!first.shapeOk || !second.shapeOk) {
+    need(false, 'idempotent-shape:${first.text}/${second.text}');
+  }
+  if (first.removed != true || second.removed != true) {
+    need(false, 'idempotent-value:${first.text}/${second.text}');
+  }
 
   // The stale cleanup next to a RUNNING staging: it must not touch the
-  // running job — its copy and its completion marker are still there once
-  // both calls have answered.
+  // running job, and its answer must be the map the contract names.
   final idC = run.newId();
-  final active = _Answer.capture(_storageChannel.invokeMethod<Object?>(
-      'stageSafTree', <String, Object?>{'treeUri': treeUri, 'stageId': idC}));
+  final active = _Answer.capture(_stageCall(treeUri, idC));
   final stale = _Answer.capture(
       _storageChannel.invokeMethod<Object?>('cleanupStaleStaging'));
   await _pumpUntil(
@@ -621,39 +909,52 @@ Future<void> _partB(_Run run) async {
       ? activeMap['displayName'] as String
       : _rootName;
   final staleMap = stale.value;
+  final staleRemoved =
+      stale.error == null && staleMap is Map && staleMap['removed'] is int
+          ? staleMap['removed'] as int?
+          : null;
   var payloadKept = false;
   var markerKept = false;
   var stageChildren = 0;
   if (activePath != null) {
     final stageDir = io.Directory(activePath).parent.parent;
-    final children = stageDir.existsSync()
-        ? <String>{for (final e in stageDir.listSync()) _basename(e.path)}
-        : const <String>{};
+    final children = <String>{
+      for (final e in stageDir.listSync()) _basename(e.path),
+    };
     stageChildren = children.length;
     markerKept = children.contains('.ak-stage-complete');
     payloadKept =
         io.Directory('${stageDir.path}/payload/$activeName').existsSync();
   }
   zSay('B|ACTIVE'
-      '|staleRemoved=${staleMap is Map ? '${staleMap['removed']}' : stale.verdict}'
+      '|staleRemoved=${staleRemoved ?? stale.codeToken}'
+      '|staleShape=${staleRemoved != null ? 'int' : 'bad'}'
       '|staged=${_statusOf(active)}'
       '|payloadKept=$payloadKept|markerKept=$markerKept'
       '|stageDirChildren=$stageChildren');
-  if (stale.error != null) {
-    need(false, 'active-stale-cleanup:${stale.verdict}');
+  // Judged while the copy and its marker are still there — nothing has
+  // cleaned idC yet.
+  if (staleRemoved == null || staleRemoved < 0) {
+    need(false, 'active-stale-answer:${staleRemoved ?? stale.codeToken}');
   }
   if (_statusOf(active) != 'ok') {
     need(false, 'active-staged:${_statusOf(active)}');
   }
   if (!payloadKept || !markerKept) need(false, 'active-kept-copy-or-marker');
-  final cleanedC = await cleanup(idC);
-  final cGone = activePath != null &&
-      !io.Directory(activePath).parent.parent.existsSync();
-  zSay('B|ACTIVE_CLEANED|code=$cleanedC|stageDirGone=$cGone');
-  if (cleanedC != 'ok' || !cGone) need(false, 'active-cleanup:$cleanedC');
+  final cleanedC = await _cleanup(run, idC);
+  final cGone =
+      activePath != null && !io.Directory(activePath).parent.parent.existsSync();
+  zSay('B|ACTIVE_CLEANED|code=${cleanedC.text}|stageDirGone=$cGone');
+  if (!cleanedC.shapeOk || cleanedC.removed != true || !cGone) {
+    need(false, 'active-cleanup:${cleanedC.text}/gone=$cGone');
+  }
 
-  zSay('B|GRANT|left=${await _readOnlyGrants(run)}');
-  _storageChannel.setMethodCallHandler(null);
+  // Every send-side staging of this part is over: no read-only grant may
+  // be left. The journal is on record by size only.
+  final left = await _readOnlyGrants(run);
+  zSay('B|GRANT|left=$left|journal=${root.isEmpty ? 'na' : _journalState(root)}');
+  if (left != '0') need(false, 'grant-left:$left');
+  tap.remove();
   zSay('B|DONE|failed=${failures.length}');
   collect();
 }
@@ -680,23 +981,137 @@ Future<void> _partC(_Run run) async {
 
   final before = await _grantFlags(run, treeUri);
   final idD = run.newId();
-  final staged = await _settled(
-      run,
-      _storageChannel.invokeMethod<Object?>('stageSafTree',
-          <String, Object?>{'treeUri': treeUri, 'stageId': idD}));
+  // The host may have enlarged nested/photo.bin for part D while this
+  // test waited on the picker: the staging gets the longer budget.
+  final staged = await _settled(run, _stageCall(treeUri, idD),
+      seconds: _bigWorkSeconds);
   final after = await _grantFlags(run, treeUri);
   zSay('C|STAGED|status=${_statusOf(staged)}');
   zSay('C|GRANT|before=$before|after=$after');
   if (before != 'rw') need(false, 'grant-before:$before');
   if (_statusOf(staged) != 'ok') need(false, 'staged:${_statusOf(staged)}');
   if (after != 'rw') need(false, 'grant-after:$after');
-  final cleaned = await _settled(
-          run,
-          _storageChannel.invokeMethod<Object?>(
-              'cleanupStagedSend', <String, Object?>{'stageId': idD}))
-      .then((answer) => answer.verdict);
-  if (cleaned != 'ok') need(false, 'cleanup:$cleaned');
+  final root = run.stagingRoot.isNotEmpty ? run.stagingRoot : await _derivedRoot();
+  final cleaned = await _cleanup(run, idD);
+  final dGone = root.isEmpty ? null : !io.Directory('$root/$idD').existsSync();
+  zSay('C|CLEANED|${cleaned.text}|stageDirGone=${dGone ?? 'unknown'}');
+  if (!cleaned.shapeOk) need(false, 'cleanup-shape:${cleaned.text}');
+  if (root.isEmpty) need(false, 'no-staging-root');
+  if (cleaned.removed != true || dGone == false) {
+    need(false, 'cleanup:${cleaned.text}/gone=${dGone ?? 'unknown'}');
+  }
 
   zSay('C|DONE|failed=${failures.length}');
   run.problems.addAll(<String>[for (final f in failures) 'C:$f']);
 }
+
+// ---------------------------------------------------------------------------
+// Part D — the stager's own checks before the completion marker: the tree
+// must still be the one it enumerated. The tree URI is part B's; the host
+// changes the tree at each `D<n>|COPY` line.
+// ---------------------------------------------------------------------------
+
+/// One staging of part D under the tap. `<step>|START` goes out first;
+/// `<step>|COPY` at the first copy event — the enumeration is over and the
+/// copy began, which is the host's cue; `<step>|RESULT` once the call
+/// answered.
+Future<({_Answer answer, int? copyMs, int? afterCopyMs, int? estimate, int? entries})>
+    _stagedUnderTap(_Run run, _ProgressTap tap, String step, String treeUri,
+        String stageId) async {
+  zSay('$step|START');
+  Map<Object?, Object?>? firstCopy;
+  tap.onCopy = (event) {
+    if (firstCopy != null || event['stageId'] != stageId) return;
+    firstCopy = event;
+    zSay('$step|COPY|entries=${event['entriesSeen']}'
+        '|estimate=${event['totalBytesEstimate']}');
+  };
+  final answer = _Answer.capture(_stageCall(treeUri, stageId));
+  await _pumpUntil(run.tester, () => answer.answered, _bigWorkSeconds);
+  tap.onCopy = null;
+  final copyMs = tap.copyMs(stageId);
+  final afterCopyMs = tap.afterCopyMs(stageId, answer);
+  final last = tap.last(stageId);
+  zSay('$step|RESULT|code=${answer.codeToken}'
+      '|copySeen=${firstCopy != null}'
+      '|copyMs=${copyMs ?? 'na'}|afterCopyMs=${afterCopyMs ?? 'na'}'
+      '|copyEvents=${tap.copyEvents(stageId)}'
+      '|filesCopied=${last?['filesCopied']}|bytesCopied=${last?['bytesCopied']}'
+      '|estimate=${last?['totalBytesEstimate']}');
+  final first = firstCopy;
+  return (
+    answer: answer,
+    copyMs: copyMs,
+    afterCopyMs: afterCopyMs,
+    estimate: first == null ? null : first['totalBytesEstimate'] as int?,
+    entries: first == null ? null : first['entriesSeen'] as int?,
+  );
+}
+
+Future<void> _partD(_Run run) async {
+  final failures = <String>[];
+  void need(bool ok, String what) {
+    if (!ok) failures.add(what);
+  }
+
+  final treeUri = run.treeUri;
+  final root = run.stagingRoot.isNotEmpty ? run.stagingRoot : await _derivedRoot();
+  final tap = _ProgressTap()..install();
+  // Without a staging root the directories below cannot be looked at; that
+  // is a failure of its own, and the directory checks say `unknown`.
+  if (root.isEmpty) need(false, 'no-staging-root');
+
+  // The cleanup after [step]: its answer must be the map with `removed:
+  // true`, and the stage directory of [id] must be gone afterwards.
+  Future<void> release(String step, String id, String what) async {
+    final cleaned = await _cleanup(run, id);
+    final gone = root.isEmpty ? null : !io.Directory('$root/$id').existsSync();
+    zSay('$step|CLEANED|${cleaned.text}|stageDirGone=${gone ?? 'unknown'}');
+    if (!cleaned.shapeOk) need(false, '$what:cleanup-shape:${cleaned.text}');
+    if (cleaned.removed != true || gone == false) {
+      need(false, '$what:cleanup:${cleaned.text}/gone=${gone ?? 'unknown'}');
+    }
+  }
+
+  // D0 — the baseline: the same staging with NO intervention. It proves
+  // the tree still stages, and it measures the copy phase the two
+  // interventions have to land in (the host reads `copyMs`).
+  final idZ = run.newId();
+  final base = await _stagedUnderTap(run, tap, 'D0', treeUri, idZ);
+  zSay('D0|BASELINE|status=${_statusOf(base.answer)}'
+      '|copyMs=${base.copyMs ?? 'na'}|afterCopyMs=${base.afterCopyMs ?? 'na'}'
+      '|estimate=${base.estimate ?? 'na'}|entries=${base.entries ?? 'na'}');
+  if (_statusOf(base.answer) != 'ok') {
+    need(false, 'd0:baseline:${base.answer.codeToken}');
+  }
+  await release('D0', idZ, 'd0');
+
+  // D1 / D2: a staging under intervention.
+  Future<void> judged(String step, String token) async {
+    final what = 'd${step.substring(1)}';
+    final id = run.newId();
+    final result = await _stagedUnderTap(run, tap, step, treeUri, id);
+    final hit = _failedWith(result.answer, 'STAGE_IO_FAILED', token);
+    final gone = root.isEmpty ? null : !io.Directory('$root/$id').existsSync();
+    zSay('$step|VERDICT|triggered=$hit|stageDirGone=${gone ?? 'unknown'}');
+    // An intervention that landed too late lets the staging SUCCEED. That
+    // is `not-triggered` — never a pass.
+    if (!hit) need(false, '$what:not-triggered:${result.answer.codeToken}');
+    // A failed job must have removed its own stage directory (else the
+    // answer would have said `leftover`).
+    if (hit && gone == false) need(false, '$what:stage-dir-left');
+    await release(step, id, what);
+  }
+
+  await judged('D1', 'source-changed');
+  await judged('D2', 'size-mismatch');
+
+  // On record, not judged: with part C's read+write grant on the same tree
+  // the send side takes no grant of its own here.
+  final left = await _readOnlyGrants(run);
+  zSay('D|GRANT|left=$left|journal=${root.isEmpty ? 'na' : _journalState(root)}');
+  tap.remove();
+  zSay('D|DONE|failed=${failures.length}');
+  run.problems.addAll(<String>[for (final f in failures) 'D:$f']);
+}
+

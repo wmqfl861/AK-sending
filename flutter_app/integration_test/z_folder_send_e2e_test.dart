@@ -25,6 +25,13 @@
 // Evidence is one `ZSAF|E2E|…` line per fact. Codes appear as their last
 // four symbols only; no staged path ever prints (the walkthrough never
 // holds one — it derives the staging root the way Android lays it out).
+//
+// The staging root is a HARD check (batch Z, revision 3, T2): it must
+// resolve, hold exactly the one staged copy while the send runs, and hold
+// nothing once the send succeeded — no stage directory, no other entry, an
+// empty grant journal. An unresolvable root or an unexpected layout fails
+// the test; the walkthrough still runs to the end first, so the send's own
+// evidence stays on record.
 import 'dart:io' as io;
 
 import 'package:ak_sending_app/main.dart' as app;
@@ -127,14 +134,13 @@ void main() {
       zSay('E2E|STAGE_ERROR|title=${k1.safTextAt(tester, 'staging_error_title')}'
           '|body=${k1.safTextAt(tester, 'staging_error_body')}');
     }
+    // The staging root the walkthrough never sees a path of: what it holds
+    // right after staging is the layout this send starts from.
     final root = await _derivedRoot();
-    final before = root.isEmpty
-        ? const (children: -1, payloadOk: false, valid: false)
-        : _stagingState(root, 'akstage');
-    final count = before.children < 0 ? 'na' : '${before.children}';
+    final before = root.isEmpty ? null : _rootState(root, 'akstage');
     zSay('E2E|STAGED|picked=${picked && !refused ? 1 : 0}'
         '|name=${k1.safTextAt(tester, 'picked_item_0')}'
-        '|rootChildren=$count|payloadOk=${before.payloadOk}');
+        '|${before?.describe ?? 'root=unresolved'}');
     expect(picked && !refused, isTrue,
         reason: refused
             ? 'the gateway refused the folder'
@@ -165,16 +171,23 @@ void main() {
         reason: ended ? result : 'no result within 7 minutes');
 
     // The page releases the staged copy after a SUCCESSFUL send; give the
-    // cleanup a moment, then count what the staging root still holds.
+    // cleanup a moment, then look at what the staging root holds.
     for (var i = 0; i < 5; i++) {
       await tester.pump(const Duration(seconds: 1));
     }
-    final rootChildren = root.isEmpty ? -1 : _childCount(io.Directory(root));
-    zSay('E2E|STAGING_ROOT|children=${rootChildren < 0 ? 'na' : rootChildren}');
-    if (result.contains('发送完成') && before.valid) {
-      expect(rootChildren, 0,
-          reason: 'the staged copy of a finished send is still there');
-    }
+    final after = root.isEmpty ? null : _rootState(root, 'akstage');
+    final sent = result.contains('发送完成');
+    final rootProblems = <String>[
+      if (root.isEmpty) 'the staging root could not be resolved',
+      if (before != null && !before.oneCopy)
+        'unexpected layout in the staging root before the send: '
+            '${before.describe}',
+      if (sent && after != null && !after.clear)
+        'the staging root still holds something after the send: '
+            '${after.describe}',
+    ];
+    zSay('E2E|STAGING_ROOT|${after?.describe ?? 'root=unresolved'}');
+    expect(rootProblems, isEmpty, reason: rootProblems.join('; '));
     zSay('E2E|DONE');
   }, timeout: const Timeout(Duration(minutes: 12)));
 }
@@ -231,40 +244,132 @@ Future<bool> _pumpUntil(
 
 /// The staging root as Android lays it out: the application-support
 /// directory is `<data dir>/files`, the staging root
-/// `<data dir>/no_backup/ak-saf-staging`. Empty when the platform directory
-/// cannot be resolved — the staging-root lines are then `na` instead of
-/// failing the walkthrough.
+/// `<data dir>/no_backup/ak-saf-staging`. Resolved through symlinks once it
+/// exists: Android's `/data/user/0` is a link to `/data/data`, and the
+/// stager answers the resolved form. Empty when the platform directory
+/// cannot be resolved — which the staging-root check counts as a failure.
 Future<String> _derivedRoot() async {
   try {
     final support = (await getApplicationSupportDirectory()).path;
     final slash = support.lastIndexOf('/');
     final dataDir = slash > 0 ? support.substring(0, slash) : support;
-    return '$dataDir/no_backup/ak-saf-staging';
+    final root = io.Directory('$dataDir/no_backup/ak-saf-staging');
+    return root.existsSync() ? root.resolveSymbolicLinksSync() : root.path;
   } on Object {
     return '';
   }
 }
 
-int _childCount(io.Directory dir) =>
-    dir.existsSync() ? dir.listSync().length : 0;
+/// The grant journal the send side keeps directly under the staging root
+/// (batch Z, revision 3, N2), and the scratch file it is rewritten through.
+const String _journalName = '.send-grants';
+const String _journalScratchName = '.send-grants.tmp';
 
-/// What the staging root holds for this send: its stage directories, and
-/// whether exactly one of them carries the `payload/<name>` copy — then
-/// the count after the send is a statement about THIS send.
-({int children, bool payloadOk, bool valid}) _stagingState(
-    String root, String name) {
-  final children = <io.FileSystemEntity>[
-    if (io.Directory(root).existsSync()) ...io.Directory(root).listSync(),
-  ];
+/// What the staging root holds — by KIND and count, never by name. The
+/// journal is a regular file that stays behind EMPTY once every grant it
+/// recorded is released; so "nothing left" is no stage directory, no other
+/// entry and an empty journal.
+class _RootState {
+  const _RootState({
+    required this.exists,
+    required this.children,
+    required this.stageDirs,
+    required this.other,
+    required this.scratch,
+    required this.journal,
+    required this.payloadOk,
+  });
+
+  final bool exists;
+
+  /// Every entry directly under the staging root.
+  final int children;
+
+  /// Real directories — one staged copy each (their names are stage ids).
+  final int stageDirs;
+
+  /// Everything that is neither a stage directory nor the journal.
+  final int other;
+
+  /// The journal's scratch file is still there (it exists only while the
+  /// journal is rewritten, which is over before a staging answers).
+  final bool scratch;
+
+  /// `absent`, `empty`, `<n> bytes` or `not-a-file` — a size, never a line.
+  final String journal;
+
+  /// A stage directory carries the `payload/<name>` copy of this send.
+  final bool payloadOk;
+
+  /// The layout while a staged copy is waiting for its send: exactly one.
+  bool get oneCopy => exists && stageDirs == 1 && other == 0 && payloadOk;
+
+  /// Nothing is left: no stage directory, nothing else, the journal empty.
+  bool get clear =>
+      exists &&
+      stageDirs == 0 &&
+      other == 0 &&
+      !scratch &&
+      (journal == 'absent' || journal == 'empty');
+
+  String get describe =>
+      'exists=$exists|children=$children|stageDirs=$stageDirs|other=$other'
+      '|scratch=$scratch|journal=$journal|payloadOk=$payloadOk';
+}
+
+_RootState _rootState(String root, String name) {
+  final dir = io.Directory(root);
+  if (!dir.existsSync()) {
+    return const _RootState(
+      exists: false,
+      children: 0,
+      stageDirs: 0,
+      other: 0,
+      scratch: false,
+      journal: 'absent',
+      payloadOk: false,
+    );
+  }
+  final entries = dir.listSync(followLinks: false);
+  var stageDirs = 0;
+  var other = 0;
+  var scratch = false;
   var payloadOk = false;
-  for (final child in children) {
-    if (io.Directory('${child.path}/payload/$name').existsSync()) {
-      payloadOk = true;
+  for (final entry in entries) {
+    final base = entry.path.substring(entry.path.lastIndexOf('/') + 1);
+    if (entry is io.Directory) {
+      stageDirs += 1;
+      if (io.Directory('${entry.path}/payload/$name').existsSync()) {
+        payloadOk = true;
+      }
+    } else if (entry is io.File && base == _journalScratchName) {
+      scratch = true;
+    } else if (base != _journalName) {
+      other += 1;
     }
   }
-  return (
-    children: children.length,
+  return _RootState(
+    exists: true,
+    children: entries.length,
+    stageDirs: stageDirs,
+    other: other,
+    scratch: scratch,
+    journal: _journalState(root),
     payloadOk: payloadOk,
-    valid: children.length == 1 && payloadOk,
   );
+}
+
+/// The grant journal by SIZE only — its lines are tree URIs and never
+/// print.
+String _journalState(String root) {
+  final journal = io.File('$root/$_journalName');
+  switch (io.FileSystemEntity.typeSync(journal.path, followLinks: false)) {
+    case io.FileSystemEntityType.notFound:
+      return 'absent';
+    case io.FileSystemEntityType.file:
+      final bytes = journal.lengthSync();
+      return bytes == 0 ? 'empty' : '$bytes bytes';
+    default:
+      return 'not-a-file';
+  }
 }

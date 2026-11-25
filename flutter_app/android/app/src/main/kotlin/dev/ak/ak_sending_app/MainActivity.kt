@@ -8,7 +8,7 @@ package dev.ak.ak_sending_app
  * 与评审 4.4：默认下载目录 + 用户改选走 SAF；SAF 每次操作经跨进程调用，
  * 十万级小文件会明显变慢，故正文路径的最终选择留给 P0 实测数据）。
  *
- * 批次 Z 起增加发送侧目录暂存（方法 6–10，实现在 SafSendStager.kt）：SAF 目录树先
+ * 批次 Z 起增加发送侧目录暂存（方法 6–11，实现在 SafSendStager.kt）：SAF 目录树先
  * 复制进应用私有存储，引擎仍只读文件系统路径。接收侧的应答形状不变；批次 Z 第 5 修
  * （G15/M）起 pickFolder 的 take 和授权表的读取都经 SafSendStager，主线程不再碰授权表。
  *
@@ -96,6 +96,13 @@ package dev.ak.ak_sending_app
  * 10) cleanupStaleStaging() -> Map
  *      {removed: Long}   清掉以前各次运行留下的暂存目录，以及 .send-grants 里
  *      记着、不属于任何在跑暂存的 READ-only 授权。
+ *
+ * 11) safGrantTrace() -> List<String>                                 （批次 Z 第 5 修，X1；诊断用）
+ *      授权时刻的轨迹快照，按先后排，每项 "<seq>|<event>|u<n>"：进程内的序号、
+ *      六个固定标签之一（pick_result / job_end / settle_refused / settle_begin /
+ *      release / receive_take）、树的别名。只给集成探针核对授权时刻的先后；环至多
+ *      256 项，逐出由读的一方识别。项里没有 URI、路径、名字或 stage id。
+ *      stager 不在时答 PlatformException(unavailable)。
  *
  * ── ActivityResult 路由说明 ─────────────────────────────────────────────
  * FlutterActivity 继承的是 android.app.Activity（非 ComponentActivity），
@@ -328,6 +335,10 @@ class MainActivity : FlutterActivity() {
                 }
                 "cleanupStaleStaging" -> withSendStager(result) {
                     cleanupStaleStaging(result)
+                }
+                // 批次 Z 第 5 修（X1）：给集成探针的诊断读数，见文件头第 11 项。
+                "safGrantTrace" -> withSendStager(result) {
+                    grantTrace(result)
                 }
                 else -> result.notImplemented()
             }

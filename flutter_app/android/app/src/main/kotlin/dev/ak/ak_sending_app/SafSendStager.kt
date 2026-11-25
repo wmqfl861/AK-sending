@@ -34,6 +34,10 @@ package dev.ak.ak_sending_app
  *    之间升成了 READ+WRITE，而我们刚把它的读位剥掉——把 READ 重新 take 回来（给不
  *    排在本工作线程上串行的 take 兜底）。没 take 成，或 take 完复核还不是 READ+WRITE，
  *    这一行留着，下一次过期清理再试；
+ *  - 了结先要获准（J16）：同一个 URI 上还有任何一个已登记的发送任务——在跑的、排队中的、
+ *    已请求取消但还没注销的——或者有接收侧的选择登记着（G15），这一次就不获准，那一行
+ *    留给最后用它的任务。任务收尾和过期清理走的是同一个准入，在锁内逐个 URI 判定，不看
+ *    任何一次快照；已经获准的那一次照做完，之后才登记的任务自己再 take；
  *  - 进程若在 take 与 release 之间被杀，cleanupStaleStaging 对 journal 里不属于任何
  *    在跑暂存的 URI 用同一段逻辑：READ-only 才释放；已经是 READ+WRITE 的不碰授权、
  *    只划掉那一行；不在 journal 里的一概不碰。
@@ -45,6 +49,23 @@ package dev.ak.ak_sending_app
  *  有任何一次了结能获准（行留在 journal 里）；已经获准的那一次先做完，选择器的启
  *  动等它结束再发。判定都是 jobsLock 下很短的状态操作；Binder 调用——主线程上的
  *  launch、工作线程上的 release——都在锁外。
+ *
+ * ── 了结的准入：有任务用着这个 URI，就不放（J16）──────────────────────
+ *  一个 URI 的了结在 jobsLock 之内判定，两处都会走到它：任务收尾时先注销、再去
+ *  了结，两步之间另一个任务可能正好登记进来；过期清理从读出各行到逐行准入之间
+ *  也一样。所以不在外面看一眼“谁在跑”，而是准入时在锁内对着此刻的任务表复核：
+ *  有接收侧的选择登记着（上面那一条），或者任何一个已登记的发送任务用着同一个
+ *  URI，都不获准，行留着。已经获准的那一次照做完——之后才登记的任务不能把它追
+ *  回，它自己再 take。这是说定的边界：旧 READ 已经放掉、此后又没有新的系统授位
+ *  时，Android 7–10 上那次 take 可能以 no-persisted-grant 结束，页面请用户重选。
+ *
+ * ── 授权时刻的轨迹（X1，只给集成探针用）─────────────────────────────────
+ *  伴生对象里有一只至多 256 项的环，记六个时刻：接收侧选择的结果排进了工作线程
+ *  （pick_result）、发送任务的授权收尾开始（job_end）、一次了结被拒绝或获准
+ *  （settle_refused / settle_begin）、release 真的调了（release）、接收侧的 take
+ *  即将去调（receive_take）。每一项只有进程内的序号、标签和这棵树的别名 u<n>：
+ *  URI、路径、名字和 stage id 都不进轨迹。记点都在作出它所记录的那个判定的同一段
+ *  jobsLock 临界区里，中间没有能切换线程的间隙；探针经 safGrantTrace 读一份拷贝。
  *
  * ── 实例之外什么都不留 ─────────────────────────────────────────────────
  * 令牌属于 stager 实例，而不是进程（O16）：每个实例建立时铸一枚登记进伴生对象，
@@ -122,9 +143,9 @@ import java.util.concurrent.Executors
  * 发送侧 SAF 目录暂存器：不碰任何 Android UI，只持有 Context、通道和主线程 Handler。
  * MainActivity 在主线程上调用 [onSendFolderPicked]、[stageSafTree]、[cancelStaging]、
  * [cleanupStagedSend]、[cleanupStaleStaging]、[takeReceiveGrant]、[settleJournal]、
- * [persistedGrants] 与 [shutdown]；接收侧选择的登记（G15）是伴生对象里的
- * [beginReceivePick]、[launchReceivePick]、[endReceivePick]——Activity 还没有 stager
- * 实例时也调得到。
+ * [persistedGrants]、[grantTrace]（X1 的诊断读数）与 [shutdown]；接收侧选择的登记（G15）
+ * 是伴生对象里的 [beginReceivePick]、[launchReceivePick]、[endReceivePick]——Activity
+ * 还没有 stager 实例时也调得到。
  */
 class SafSendStager(
     context: Context,
@@ -226,7 +247,11 @@ class SafSendStager(
          */
         private val jobsLock = Any()
 
-        /** 进行中（运行或排队）的暂存任务，按 stageId 索引。 */
+        /**
+         * 进行中（运行或排队）的暂存任务，按 stageId 索引。它也是了结准入的依据（J16）：表里
+         * 任何一个任务的 treeUri 等于要了结的那个 URI，就不获准——已请求取消、还没注销的任务
+         * 仍在表里。
+         */
         private val activeJobs = HashMap<String, Job>()
 
         /**
@@ -240,6 +265,33 @@ class SafSendStager(
 
         /** 本应用有一次授权了结在“已获准”与“做完”之间（释放、重读、恢复 take、判定都在其中）。 */
         private var settlementRunning = false
+
+        // ── 授权时刻的轨迹（X1）：下面几样只在 jobsLock 之下读写 ──────────────────
+
+        /** 轨迹环的容量：满了以后最旧的一项被逐出。 */
+        private const val GRANT_TRACE_LIMIT = 256
+
+        private const val TRACE_PICK_RESULT = "pick_result"
+        private const val TRACE_JOB_END = "job_end"
+        private const val TRACE_SETTLE_REFUSED = "settle_refused"
+        private const val TRACE_SETTLE_BEGIN = "settle_begin"
+        private const val TRACE_RELEASE = "release"
+        private const val TRACE_RECEIVE_TAKE = "receive_take"
+
+        /** 轨迹环：最旧的一项在头。 */
+        private val grantTraceRing = ArrayDeque<GrantTraceEntry>()
+
+        /** 进程内的序号：每个实例、每个时刻共用一本账，单调递增，从不归零。 */
+        private var grantTraceSeq = 0L
+
+        /** 下一个要发的别名编号：发出去的编号从不复用。 */
+        private var nextGrantTraceAlias = 0
+
+        /** 树 URI → 别名；只留环里仍被引用的 URI。 */
+        private val grantTraceAliases = HashMap<Uri, Int>()
+
+        /** 环里引用着各个 URI 的项数：减到零（引用它的最后一项被逐出）就撤掉它的别名。 */
+        private val grantTraceRefs = HashMap<Uri, Int>()
 
         /** 给被推迟的 launch 用的主线程 Handler：不依赖任何实例，也不持有 Context。 */
         private val MAIN_HANDLER: Handler by lazy { Handler(Looper.getMainLooper()) }
@@ -297,12 +349,17 @@ class SafSendStager(
         // ── 放行闸门，工作线程一侧（只在工作线程调用）───────────────────────────
 
         /**
-         * 一次授权了结的开始：有接收侧选择登记着就不获准——调用方把这一行留着，原路返回；
-         * 否则记下“有一次在跑”。从获准到 [endSettlement] 之间，release、重读、恢复 take 和
-         * 判定都在这一段里。
+         * 一次授权了结的准入（G15、J16、X1）：拒绝与获准都在同一段 jobsLock 临界区里判定，轨迹
+         * 也记在同一处。两种情况不获准——调用方把这一行留着，原路返回：有接收侧选择登记着
+         * （它之后的那次 take 可能正需要这份授权）；或者此刻有任何一个已登记的发送任务用着同
+         * 一个 [treeUri]（在跑的、排队中的、已请求取消但还没注销的都算：它们都还在表里）——
+         * 它的 READ 不能从它底下被放掉。获准了才在同一段临界区里记下“有一次在跑”。从获准到
+         * [endSettlement] 之间，release、重读、恢复 take 和判定都在这一段里；那些都在锁外。
          */
-        private fun beginSettlement(): Boolean = synchronized(jobsLock) {
-            if (receivePick != null) return false
+        private fun beginSettlement(treeUri: Uri): Boolean = synchronized(jobsLock) {
+            val refused = receivePick != null || activeJobs.values.any { it.treeUri == treeUri }
+            traceGrant(if (refused) TRACE_SETTLE_REFUSED else TRACE_SETTLE_BEGIN, treeUri)
+            if (refused) return false
             settlementRunning = true
             true
         }
@@ -332,6 +389,33 @@ class SafSendStager(
                 endReceivePick(pick)
             }
         }
+
+        // ── 授权时刻的轨迹（X1；调用方都拿着 jobsLock，这里不做任何 Binder 调用）──────
+
+        /**
+         * 记一个授权时刻。调用方已经在同一段 jobsLock 临界区里作出了这个时刻所记录的事——
+         * 任务入队成功了、任务注销了、了结被拒绝或获准了、release 调过了、请求还活着——记点
+         * 紧跟在那个判定之后，中间没有能切换线程的间隙。URI 在这里换成别名；环满了逐出最旧
+         * 的一项，引用它的最后一项走了，这棵树的别名就撤掉，发出去的编号不收回再用。
+         */
+        private fun traceGrant(event: String, treeUri: Uri) {
+            val alias = grantTraceAliases.getOrPut(treeUri) { ++nextGrantTraceAlias }
+            grantTraceRefs[treeUri] = (grantTraceRefs[treeUri] ?: 0) + 1
+            grantTraceRing.addLast(GrantTraceEntry(++grantTraceSeq, event, treeUri, alias))
+            while (grantTraceRing.size > GRANT_TRACE_LIMIT) {
+                val evicted = grantTraceRing.removeFirst()
+                val left = (grantTraceRefs[evicted.treeUri] ?: 0) - 1
+                if (left > 0) {
+                    grantTraceRefs[evicted.treeUri] = left
+                } else {
+                    grantTraceRefs.remove(evicted.treeUri)
+                    grantTraceAliases.remove(evicted.treeUri)
+                }
+            }
+        }
+
+        /** 轨迹环的一份拷贝：调用方拿着 jobsLock。 */
+        private fun grantTraceSnapshot(): List<String> = grantTraceRing.map { it.text }
     }
 
     /** 暂存失败：code 是契约里的 PlatformException code，reason 是固定 reason token。 */
@@ -432,6 +516,11 @@ class SafSendStager(
 
     private class CopyResult(val stagedRootPath: String, val bytesCopied: Long)
 
+    /** 轨迹环的一项（X1）：进程内的序号、六个固定标签之一、这棵树记下它时的别名。 */
+    private class GrantTraceEntry(val seq: Long, val event: String, val treeUri: Uri, val alias: Int) {
+        val text: String get() = "$seq|$event|u$alias"
+    }
+
     /**
      * lstat 定型的结果：不存在 / 普通文件 / 真实目录 / 符号链接 / 其它（管道、套接字、字符与块
      * 设备）。lstat 出错（ENOENT 之外）是单独一种结果——[lstatType] 返回 null——从不折进这
@@ -524,8 +613,8 @@ class SafSendStager(
             WORKER.execute { runJob(job, answer) }
         } catch (t: Throwable) {
             // 排不进工作线程（不会发生）：它从没跑过。它若是这个 URI 的最后一个使用者，journal
-            // 里那一行也由它的注销来了结（J15）
-            if (unregisterJob(job)) settleJournal()
+            // 里那一行也由它的注销来了结（J15）；没跑过的任务不记轨迹（X1）
+            if (unregisterJob(job, ran = false)) settleJournal()
             answer.fail(CODE_IO_FAILED, "io")
         }
     }
@@ -602,29 +691,48 @@ class SafSendStager(
      *
      * [onDone] 至多跑一次，而且只在主线程上跑：工作线程排不进去时也是先结束这次选择，再回
      * 主线程，从不在调用线程上直接调。
+     *
+     * 轨迹（X1）记两处。pick_result：这次任务提交给工作线程成功之后——提交与记点在同一段
+     * jobsLock 之下，worker 拿不到锁就记不下任何结束点；排不进去就不记，那是没有入队。
+     * receive_take：worker 在锁内确认它还是这一次存活着的请求之后、调 take 之前。
      */
     fun takeReceiveGrant(pick: ReceivePick, treeUri: Uri, onDone: () -> Unit) {
-        try {
-            WORKER.execute {
-                runCatching {
-                    val live = synchronized(jobsLock) { receivePick === pick && !pick.ended }
-                    if (live) {
-                        try {
-                            appContext.contentResolver.takePersistableUriPermission(
-                                treeUri,
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                            )
-                        } catch (t: Throwable) {
-                            // 不改变返回值：URI 本身当前可用；持久化是否生效由 listSafPersisted 复核。
-                            Log.w(TAG, "takePersistableUriPermission(READ|WRITE) failed: ${t.javaClass.simpleName}")
+        val submitted = synchronized(jobsLock) {
+            // 只有提交本身在 try 里：入队成功之后的记点若被当成“没排进去”，这里结束一次选择、应答一次，排队着的那个任务还会再应答一次
+            val queued = try {
+                WORKER.execute {
+                    runCatching {
+                        // 判定与 receive_take 记点在同一段临界区里（X1）；Binder 调用本身留在锁外
+                        val live = synchronized(jobsLock) {
+                            val same = receivePick === pick && !pick.ended
+                            if (same) traceGrant(TRACE_RECEIVE_TAKE, treeUri)
+                            same
                         }
-                    }
-                    endReceivePick(pick)
-                    releaseJournaledGrants()
-                }.onFailure { Log.w(TAG, "receive take wrap-up threw: ${it.javaClass.simpleName}") }
-                postToMain { onDone() }
+                        if (live) {
+                            try {
+                                appContext.contentResolver.takePersistableUriPermission(
+                                    treeUri,
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                                )
+                            } catch (t: Throwable) {
+                                // 不改变返回值：URI 本身当前可用；持久化是否生效由 listSafPersisted 复核。
+                                Log.w(TAG, "takePersistableUriPermission(READ|WRITE) failed: ${t.javaClass.simpleName}")
+                            }
+                        }
+                        endReceivePick(pick)
+                        releaseJournaledGrants()
+                    }.onFailure { Log.w(TAG, "receive take wrap-up threw: ${it.javaClass.simpleName}") }
+                    postToMain { onDone() }
+                }
+                true
+            } catch (t: Throwable) {
+                false
             }
-        } catch (t: Throwable) {
+            // 入队成功才记 pick_result（X1）：记点与提交在同一段临界区里
+            if (queued) traceGrant(TRACE_PICK_RESULT, treeUri)
+            queued
+        }
+        if (!submitted) {
             // 工作线程排不进去（不会发生）：授权没拿，这次选择就地结束，应答仍然回主线程
             endReceivePick(pick)
             postToMain { onDone() }
@@ -672,6 +780,18 @@ class SafSendStager(
         }
     }
 
+    /**
+     * 授权时刻的轨迹（X1，诊断用；只给集成探针经通道方法 safGrantTrace 调）：环的一份拷贝，
+     * 每一项 "<seq>|<event>|u<n>"，按先后排。拷贝在 jobsLock 之内取；应答在锁外、在调用线程
+     * 上、只答一次。环满了最旧的先走，所以读的一方要认得出被逐出过的段：同一棵树隔了一段再
+     * 出现，顶的是另一个别名，别名的编号从不复用。项里没有 URI、路径、名字或 stage id。
+     */
+    fun grantTrace(result: MethodChannel.Result) {
+        val answer = OneShot(result)
+        val snapshot = synchronized(jobsLock) { grantTraceSnapshot() }
+        answer.success(snapshot)
+    }
+
     // ── 工作线程：一次暂存 ─────────────────────────────────────────────────
 
     private fun runJob(job: Job, answer: OneShot) {
@@ -685,8 +805,9 @@ class SafSendStager(
         }
         val reported = if (outcome is Outcome.Failed) reportableFailure(job, outcome.failure) else outcome
         // 成功时完成标记已经写下，失败时目录已经清掉。先从在跑的表里去掉，再看它是不是这个 URI 的
-        // 最后一个使用者：是，才了结 journal 里那一行（J15）——必须先去掉，了结才认得出“没人用了”
-        val lastUser = unregisterJob(job)
+        // 最后一个使用者：是，才了结 journal 里那一行（J15）——必须先去掉，了结才认得出“没人用了”。
+        // 注销与 job_end 的记点在同一段临界区里（X1）：只记真的跑过的任务
+        val lastUser = unregisterJob(job, ran = true)
         runCatching { releaseOwnedGrant(job, lastUser) }
             .onFailure { Log.w(TAG, "grant release after staging threw: ${it.javaClass.simpleName}") }
         postToMain { deliver(answer, reported) }
@@ -709,7 +830,8 @@ class SafSendStager(
         // 排队期间就已经被取消的任务：什么都不读、什么都不建
         checkCancelled(job)
         val stagingRoot = stagingRoot()
-        // 这个 id 的名字下已经有交付过的副本，或者读不出它是什么：拒绝复用，什么都不删（N6、O16）
+        // 这个 id 的名字下已经有交付过的副本，或者此刻读不出它是什么：拒绝复用，什么都不删
+        // （N6、O16、N18）。这是入口的一次，在取授权之前；删除之前 copyPlan 还再看一次
         refuseReusedId(File(stagingRoot, job.stageId))?.let { throw it }
         acquireReadGrant(job)
         val plan = enumerateTree(job)
@@ -843,7 +965,13 @@ class SafSendStager(
     private fun copyPlan(job: Job, stagingRoot: File, plan: Plan): CopyResult {
         val stageDir = File(stagingRoot, job.stageId)
         val rootCanonical = trustedStagingRoot(stagingRoot)
-        // 同一 id 的残留（没有完成标记的上次中断）必须先删干净：暂存目录只能是从零建起来的
+        // 删除之前再看一次（N18）。入口那一次在取授权、枚举之前；这中间名字下的东西可能变了——
+        // 那时读不出它是什么、此刻读得出了，或者枚举期间有人往这个名字下交付了一份副本。仍是
+        // 已交付、或此刻仍定不了型：拒绝，什么都不删——定不了型的条目可能就是一份正有人读的
+        // 副本。本任务到这里还没建目录（ownsStageDir 仍是 false），收尾也不会去删它。
+        refuseReusedId(stageDir)?.let { throw it }
+        // 走到这里，名字下确认没有东西，或只是可以清理的残留：没有完成标记的半截目录、不是
+        // 目录的条目。把它删干净——暂存目录只能是从零建起来的
         if (!deleteStagedEntry(stageDir)) throw StageFailure(CODE_IO_FAILED, "io")
         // 从这里起，这个名字下的任何东西都是本任务建的：失败时由它负责删掉
         job.ownsStageDir = true
@@ -1021,30 +1149,28 @@ class SafSendStager(
     }
 
     /**
-     * 过期清理对 journal 里记着、却不属于任何在跑暂存的每一个 URI 了结那份授权（批次 Z
-     * 复审 N10）——与发送侧结束时是同一段（见 [releaseJournaledRead]），而且按它此刻的权限位
-     * （每个 URI 现读，不靠早先的快照）：
+     * 过期清理对 journal 里记着的每一个 URI 了结那份授权（批次 Z 复审 N10）——与发送侧结束
+     * 时是同一段（见 [releaseJournaledRead]），而且按它此刻的权限位（每个 URI 现读，不靠早先
+     * 的快照）：
      *  - READ-only（有读位、无写位）→ 释放；放完立刻重读，该把 READ take 回来就 take 回来；
      *    确认之后才划掉这一行；
      *  - 写位在、读位不在 → 上一次放了之后没能把 READ take 回来（那一行因此还留着）：现在再试；
      *  - 已经是 READ+WRITE（接收侧的）→ 授权不碰，只划掉这一行；授权不在了 → 只划掉这一行。
      * 不在 journal 里的授权一概不碰。读不到权限位、或哪一步没得到确认，这一行就留着。
      *
-     * 每一个 URI 走的都是那唯一的一条路（[settleJournalLine]），因此都在放行闸门之内（G15）：
-     * 有接收侧选择登记着就跳过，行留着，等它的 take 跑过之后、或者它没有结果结束时再了结。
-     * journal 不是普通文件时记下类型，里面的行一律不动（T17）。
+     * 每一个不同的 URI 走的都是那唯一的一条路（[settleJournalLine]）。这一段自己不判断“是不是
+     * 还有暂存在用它”，也不取在跑任务的一次快照（J16）：读出各行之后、轮到其中一行准入之前，
+     * 任务表可能已经变了。谁在用，由准入在锁内对着此刻的任务表逐个 URI 判定——有接收侧选择
+     * 登记着（G15），或有已登记的发送任务用着它，这一行就留着，留给最后用它的任务，或下一次
+     * 清理。journal 不是普通文件时记下类型，里面的行一律不动（T17）。
      */
     private fun releaseJournaledGrants() {
         if (lstatType(stagingRoot()) == EntryType.MISSING) return
         val lines = journalLinesOrNull() ?: return
         if (lines.isEmpty()) return
-        val activeUris = synchronized(jobsLock) { activeJobs.values.map { it.treeUri }.toSet() }
 
         for (line in lines.distinct()) {
-            val uri = Uri.parse(line)
-            // 在跑的暂存还用着：行和授权都留给它自己处理
-            if (uri in activeUris) continue
-            settleJournalLine(uri)
+            settleJournalLine(Uri.parse(line))
         }
     }
 
@@ -1101,7 +1227,8 @@ class SafSendStager(
      * 读一个已交付暂存目录的归属（O16；只在工作线程上调用）。先定型：.owner 不在，或者不是
      * 普通文件 → GONE；lstat 出错（ENOENT 之外）→ UNKNOWN。是普通文件才打开，至多读
      * [OWNER_READ_LIMIT] 个字节，再拿字节数和 lstat 时的大小、内容一起判定（[ownershipVerdict]）。
-     * 日志里只有 errno 名或异常类名，不带 id。
+     * 日志里只有 errno 名、异常类名，或者定型时的大小与实际读到的字节数对不上时的一句固定
+     * 短语（不带数值），不带 id。
      */
     private fun readOwnership(stageDir: File): Ownership {
         val owner = File(stageDir, OWNER_NAME)
@@ -1131,13 +1258,19 @@ class SafSendStager(
             Log.w(TAG, "owner file cannot be read (${t.javaClass.simpleName}); stage directory kept")
             return Ownership.UNKNOWN
         }
+        if (read.first.toLong() != stat.st_size) {
+            // 定型时的大小与实际读到的字节数对不上：只记一句固定短语，不带数值。读取有
+            // [OWNER_READ_LIMIT] 的上限，单凭长短不符说不出原因——判定仍是 UNKNOWN，目录留着
+            Log.w(TAG, "owner size/read mismatch; stage directory kept")
+        }
         val live = synchronized(jobsLock) { liveTokens.toSet() }
         return ownershipVerdict(stat.st_size, read.first, read.second, live)
     }
 
     /**
-     * 归属判定（纯判定）。读到的字节数必须正好是 lstat 时文件的大小：少了是短读，多了是文件在
-     * lstat 之后变了——都是 UNKNOWN；读全了才拿完整内容去对活实例的令牌。
+     * 归属判定（纯判定）。读到的字节数必须正好是 lstat 时文件的大小，对不上就是 UNKNOWN：
+     * 读取有上限，单凭长短不符不能断言文件一定在两次操作之间变过，所以不去猜原因。
+     * 读全了才拿完整内容去对活实例的令牌。
      */
     private fun ownershipVerdict(size: Long, read: Int, content: String, live: Set<String>): Ownership {
         if (read.toLong() != size) return Ownership.UNKNOWN
@@ -1439,30 +1572,34 @@ class SafSendStager(
     }
 
     /**
-     * 这个 id 的名字下已经有东西时拒绝复用（N6、O16；只在工作线程上调用）。不是真实目录（不
-     * 存在，或者不是目录的残留）：交给 copyPlan 先删干净再用。是真实目录才要看：交付过（完成
-     * 标记是普通文件）——不管它是谁的副本，和读不出结果的，一律 id-in-use，什么都不删。
+     * 这个 id 的名字下已经有东西时拒绝复用（N6、O16、N18；只在工作线程上调用）。先定型，并留住
+     * 这一次的结果：定不了型（lstat 出错，ENOENT 之外）一律 id-in-use，什么都不删——此刻读不出
+     * 它是什么，它就可能是一份正有人读的已交付副本，之后 lstat 说什么都不算。只有确认是真实
+     * 目录才去看完成标记：交付过（标记是普通文件）——不管它是谁的副本，一律 id-in-use；标记读
+     * 不出来、或者半截目录的归属读不出来，同样拒绝，什么都不删。确认缺失、不是目录的残留、
+     * 允许清理的半截目录，交给 copyPlan 先删干净再用。
      */
     private fun refuseReusedId(stageDir: File): StageFailure? {
-        if (lstatType(stageDir) != EntryType.DIRECTORY) return null
-        val markerType = lstatType(File(stageDir, MARKER_NAME))
-        val ownership = if (markerType == EntryType.FILE) null else readOwnership(stageDir)
-        return when (idReuseDecision(EntryType.DIRECTORY, markerType, ownership)) {
+        val stageDirType = lstatType(stageDir)
+        val markerType = if (stageDirType == EntryType.DIRECTORY) lstatType(File(stageDir, MARKER_NAME)) else null
+        val ownership = if (markerType != null && markerType != EntryType.FILE) readOwnership(stageDir) else null
+        return when (idReuseDecision(stageDirType, markerType, ownership)) {
             IdReuse.PROCEED -> null
             IdReuse.IN_USE -> StageFailure(CODE_IO_FAILED, "id-in-use")
         }
     }
 
     /**
-     * 复用一个 id 的判定（纯判定，O16）：目录不在了（或者名字下不是目录）→ 照常进行；交付
-     * 过 → 拒绝；完成标记读不出来、或者（半截目录的）归属读不出来 → 同样拒绝，什么都不删；
-     * 其余是半截目录 → 先删干净再用。
+     * 复用一个 id 的判定（纯判定，O16、N18）：定型失败（第一个参数为 null）→ 拒绝，什么都不删；
+     * 确认缺失、或者名字下不是目录 → 照常进行；交付过 → 拒绝；完成标记读不出来、或者（半截
+     * 目录的）归属读不出来 → 同样拒绝，什么都不删；其余是半截目录 → 先删干净再用。
      */
     private fun idReuseDecision(
         stageDirType: EntryType?,
         markerType: EntryType?,
         ownership: Ownership?
     ): IdReuse = when {
+        stageDirType == null -> IdReuse.IN_USE
         stageDirType != EntryType.DIRECTORY -> IdReuse.PROCEED
         markerType == EntryType.FILE -> IdReuse.IN_USE
         markerType == null -> IdReuse.IN_USE
@@ -1615,8 +1752,9 @@ class SafSendStager(
      * 暂存任务从在跑的表里去掉之后（J15；[lastUser]：此刻没有别的任务用着同一个 URI）：了结
      * journal 里那一行。不论这一次自己有没有 take 过——上一回留在那里的行也是此时了结，包括
      * 排队之后才被取消的任务。走的是唯一的那条路（[settleJournalLine]），不再直接调
-     * [releaseJournaledRead]。读不到权限位、释放抛了、或要把 READ take 回来却没 take 成，
-     * 这一行就留着，交给下一次了结。
+     * [releaseJournaledRead]；那条路自己还要再准入一次（J16）——[lastUser] 只是这里的一次
+     * 快捷返回，真正说了算的是准入时锁内的任务表。读不到权限位、释放抛了、或要把 READ take
+     * 回来却没 take 成，这一行就留着，交给下一次了结。
      */
     private fun releaseOwnedGrant(job: Job, lastUser: Boolean) {
         if (!lastUser) return
@@ -1626,14 +1764,15 @@ class SafSendStager(
     /**
      * 了结 journal 里 [treeUri] 那一行的唯一一条路：暂存任务结束时（J15）、过期清理、接收侧
      * take 之后和 settleJournal 都走这里。先确认这一行还在 journal 里——不在 journal 里的授权
-     * 一概不碰；再过放行闸门（G15），没获准就把这一行留着，原路返回；获准了，按此刻的权限位
-     * 走 [sweepGrantStep]：READ-only → 放 READ；写位在、读位不在 → 把 READ take 回来；其余 →
-     * 只划掉这一行。读不到权限位，这一行留着。
+     * 一概不碰；再过准入（[beginSettlement]：G15、J16），没获准就把这一行留着，原路返回；
+     * 获准了，按此刻的权限位走 [sweepGrantStep]：READ-only → 放 READ；写位在、读位不在 →
+     * 把 READ take 回来；其余 → 只划掉这一行。读不到权限位，这一行留着。journal 的读写和
+     * Binder 调用都在锁外；获准之后的每一条返回路径都在 finally 里结束这一次了结。
      */
     private fun settleJournalLine(treeUri: Uri) {
         val journaled = journalLinesOrNull()?.contains(treeUri.toString()) ?: false
         if (!journaled) return
-        if (!beginSettlement()) return
+        if (!beginSettlement(treeUri)) return
         try {
             // 读不到权限位就不知道该做什么：这一行留着
             val bits = readBits(treeUri) ?: return
@@ -1653,7 +1792,8 @@ class SafSendStager(
      * 放掉 [treeUri] 的 READ，并把 journal 里那一行了结（只在工作线程上调用）——发送侧暂存
      * 结束时和过期清理走的是同一段。[before] 是刚刚现读的该 URI 权限位。
      *  1. 放之前就不是 READ-only：不放，直接划掉这一行（见 [afterReleaseStep]）。
-     *  2. READ-only：releasePersistableUriPermission(READ)。
+     *  2. READ-only：releasePersistableUriPermission(READ)——调过之后记一次轨迹（X1），没放成
+     *     也记；第 1 步那种根本不放的分支不记。
      *  3. 放完立刻再读权限位：写位在、读位没了——接收侧就在这一瞬之间把授权升成了
      *     READ+WRITE，我们刚把它的读位剥掉——把 READ 重新 take 回来。那个 take 本来都排在
      *     本工作线程上串行，这一条是给不在这里串行的 take 兜底的。
@@ -1665,7 +1805,10 @@ class SafSendStager(
         val readBefore = before?.first ?: return false
         val writeBefore = before.second
         val released = if (mustReleaseRead(readBefore, writeBefore)) {
-            releasePersistableRead(treeUri)
+            val called = releasePersistableRead(treeUri)
+            // release 真的调过了才记一次（X1），没放成也算；下面那种根本不放的分支不记
+            synchronized(jobsLock) { traceGrant(TRACE_RELEASE, treeUri) }
+            called
         } else {
             true
         }
@@ -1708,10 +1851,13 @@ class SafSendStager(
 
     /**
      * 任务结束（或没能排上队）时把它从在跑的表里去掉；只去掉它自己。返回此刻是不是已经没有
-     * 任务用着同一个 treeUri——它是最后一个使用者。
+     * 任务用着同一个 treeUri——它是最后一个使用者。[ran]：这个任务真的跑过——只有这时才记
+     * job_end（X1），记点和注销、lastUser 的计算在同一段临界区里；排不进工作线程、从没跑过
+     * 的任务不记。
      */
-    private fun unregisterJob(job: Job): Boolean = synchronized(jobsLock) {
+    private fun unregisterJob(job: Job, ran: Boolean): Boolean = synchronized(jobsLock) {
         if (activeJobs[job.stageId] === job) activeJobs.remove(job.stageId)
+        if (ran) traceGrant(TRACE_JOB_END, job.treeUri)
         activeJobs.values.none { it.treeUri == job.treeUri }
     }
 

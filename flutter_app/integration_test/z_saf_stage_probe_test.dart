@@ -147,7 +147,7 @@ final String _emptySha = crypto.sha256.convert(const <int>[]).toString();
 /// The fixed names inside the staging root and a stage directory: the grant
 /// journal the send side keeps directly under the staging root (revision 3,
 /// N2) and the scratch file it is rewritten through; the completion marker
-/// of a delivered copy; the owner file every stage directory of a process
+/// of a delivered copy; the owner file every stage directory of a stager instance
 /// carries (revision 4, N11).
 const String _journalName = '.send-grants';
 const String _journalScratchName = '.send-grants.tmp';
@@ -665,10 +665,10 @@ class _ProgressTap {
 
 /// What the staging root holds — by KIND and count, never by name. The
 /// send side keeps its grant journal directly under the staging root
-/// (revision 3, N2): a regular file that stays behind EMPTY once every
-/// grant it recorded is released. So "nothing left" means no stage
-/// directory and no other entry; the journal is reported on its own, by
-/// state only — its lines are tree URIs.
+/// (revision 3, N2): a regular file that is deleted once every grant it
+/// recorded is released. So "nothing left" means no stage directory, no
+/// other entry and no journal; the journal is reported on its own, by state
+/// only — its lines are tree URIs.
 class _RootShape {
   const _RootShape({
     required this.exists,
@@ -1215,7 +1215,7 @@ Future<void> _partA(_Run run, String shaBig) async {
   if (staged.stageDirs != 1 || staged.other != 0) {
     need(false, 'staging-root-shape(${staged.describe})');
   }
-  // payload, the completion marker and the owner file of this process (N11)
+  // payload, the completion marker and the owner file of its stager instance (O16)
   // — nothing else beside them.
   final stageChildren = <String>{
     for (final e in stageDir.listSync()) _basename(e.path),

@@ -22,6 +22,16 @@
 //         activities": on the Android 15 emulator that setting has no
 //         run-time effect, checked 2026-11-25 20:10, and the switch itself
 //         would need the Settings UI). Required: the stage directory is gone.
+//   cold
+//     R1  phase 1, the same.
+//     R2  the host STOPS THE PROCESS (`am force-stop`): nothing retires the
+//         token, so the delivered copy is still there when the app is
+//         started again — a NEW process, whose isolate pumps the real app.
+//         Required: the copy is gone, and the start hook answered
+//         `removed=<n>` with n >= 1: here the production start hook is what
+//         removes the copy. (In `recreate` the retiring instance's own sweep
+//         usually has the copy gone before the new isolate starts, so that
+//         variant proves the end state and the same process, not the hook.)
 //   neighbour
 //     N1  phase 1, the same as R1.
 //     N2  the isolate of a SECOND instance of the Activity, started by the
@@ -129,6 +139,7 @@ void main() {
   // The phase is read off the device (the marker file), so a run decides it.
   switch (_variantName) {
     case 'recreate':
+    case 'cold':
       testWidgets(
           'Z SAF recreation: a delivered copy, and the start hook of the '
           'relaunched app',
@@ -143,7 +154,7 @@ void main() {
     default:
       testWidgets('Z SAF: unknown AK_SAF_RECREATE_VARIANT',
           (_) => fail('AK_SAF_RECREATE_VARIANT=[$_variantName] is not one of: '
-              '(empty), recreate, neighbour'));
+              '(empty), recreate, cold, neighbour'));
   }
 }
 
@@ -283,7 +294,7 @@ Future<void> _recreatePhase2(
   var afterMs = -1;
   final sweep = _SweepTap();
 
-  _say('$tag|MODE|recreate|marker=read|stageDirBefore=${_flag(exists)}');
+  _say('$tag|MODE|$_variantName|marker=read|stageDirBefore=${_flag(exists)}');
   if (await _pumpRealApp(tester, checks, sweep)) {
     final clock = Stopwatch()..start();
     while (exists == true && clock.elapsedMilliseconds < _recreateWaitMs) {
@@ -316,6 +327,11 @@ Future<void> _recreatePhase2(
     _need(checks, shape.other == 0, 'root-other:${shape.other}');
   }
   _say('$tag|SWEEP|$sweepFact');
+  // The start hook must have RUN: the copy is gone because the app's own
+  // clean-up removed it, not because nothing was there to remove.
+  _need(checks, sweep.calls >= 1, 'start-hook-not-called:${sweep.calls}');
+  _need(checks, sweep.removed >= 1,
+      'start-hook-removed-nothing:${sweep.removed}');
   _say('$tag|MARKER|deleted=${_flag(_deletePhaseMarker(root))}');
   _say('$tag|DONE|failed=${checks.count}');
   _failOn(checks);
@@ -404,6 +420,12 @@ String _flag(bool? value) => value == null ? 'unknown' : '$value';
 // The channel, observed or called.
 // ---------------------------------------------------------------------------
 
+/// The `n` of `removed=<n>`, else −1.
+int _removedOf(String answer) {
+  final match = RegExp(r'^removed=([0-9]+)$').firstMatch(answer);
+  return match == null ? -1 : int.parse(match.group(1)!);
+}
+
 /// What the app's own start-up sweep answered — observed, never made. Every
 /// message the app sends on `dev.ak/storage` is handed on to the platform
 /// untouched, and the reply to `cleanupStaleStaging` is read on its way
@@ -412,9 +434,15 @@ String _flag(bool? value) => value == null ? 'unknown' : '$value';
 class _SweepTap {
   TestDefaultBinaryMessenger? _messenger;
   int _calls = 0;
+  int _removed = -1;
   String _answer = 'none';
 
   bool get installed => _messenger != null;
+
+  /// How many sweeps went through the tap, and the `n` of the last
+  /// `removed=<n>` answer (−1 when the last answer was not of that form).
+  int get calls => _calls;
+  int get removed => _removed;
 
   /// One evidence fact: whether the tap is on, how many sweeps went through
   /// it and what the last one answered (`removed=<n>`, a PlatformException
@@ -436,7 +464,10 @@ class _SweepTap {
       }
       if (sweep) _calls += 1;
       final ByteData? reply = await messenger.delegate.send(name, message);
-      if (sweep) _answer = _envelope(codec, reply);
+      if (sweep) {
+        _answer = _envelope(codec, reply);
+        _removed = _removedOf(_answer);
+      }
       return reply;
     });
     _messenger = messenger;

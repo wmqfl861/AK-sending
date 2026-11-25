@@ -9,7 +9,8 @@ package dev.ak.ak_sending_app
  * 十万级小文件会明显变慢，故正文路径的最终选择留给 P0 实测数据）。
  *
  * 批次 Z 起增加发送侧目录暂存（方法 6–10，实现在 SafSendStager.kt）：SAF 目录树先
- * 复制进应用私有存储，引擎仍只读文件系统路径；接收侧与 pickFolder 不变。
+ * 复制进应用私有存储，引擎仍只读文件系统路径。接收侧的应答形状不变；批次 Z 第 5 修
+ * （G15/M）起 pickFolder 的 take 和授权表的读取都经 SafSendStager，主线程不再碰授权表。
  *
  * ── Channel 方法与返回 schema（MethodChannel "dev.ak/storage"）──────────────
  *
@@ -20,7 +21,11 @@ package dev.ak.ak_sending_app
  *                         外部存储不可用时回退 filesDir/Download）
  *      freeBytes      : Long    该目录所在卷的可用字节数（StatFs.availableBytes）；
  *                        取不到时为 -1（不伪造容量，符合存储文档“剩余空间未知时不虚假放行”）
- *      safPersisted   : Boolean contentResolver.persistedUriPermissions 是否非空
+ *      safPersisted   : Boolean 持久授权表（contentResolver.persistedUriPermissions）
+ *                        是否非空。批次 Z 第 5 修（M）起这张表只由 SafSendStager 在工作
+ *                        线程上读、回主线程应答；目录与 freeBytes 仍照旧先算好。
+ *                        stager 不在时答 PlatformException(unavailable)，读表失败答
+ *                        PlatformException(error)。
  *
  * 2) pickFolder() -> Map
  *      treeUri : String|null   用户确认的目录 tree URI；取消/失败为 null。
@@ -30,7 +35,15 @@ package dev.ak.ak_sending_app
  *                              批次 Z 复审 N9 起这次 take 排在 SafSendStager 的工作
  *                              线程上执行（本应用的持久授权操作全在那里串行），
  *                              应答等它做完再回。
- *      重复调用未完成时返回 PlatformException(pick_in_progress)。
+ *                              批次 Z 第 5 修（G15 放行闸门）：请求先在 SafSendStager
+ *                              登记、再打开选择器，登记留到 take 跑完（或没拿到结果就
+ *                              结束）为止；登记期间本应用不放掉任何授权——Android 7–10
+ *                              上落在授权与 take 之间的一次 release 会让 take 失败。
+ *                              正好有放行在收尾时，打开选择器的那一步等它结束再执行。
+ *      launcher 或 stager 不在时返回 PlatformException(unavailable)。一次请求从头到尾
+ *      （打开选择器、等结果、take 排队或执行）还没结束时再调，返回
+ *      PlatformException(pick_in_progress)；Activity 在此期间销毁，返回
+ *      PlatformException(activity_destroyed)。
  *      选择器经 androidx.activity 的 ActivityResultContracts.OpenDocumentTree
  *      （ACTION_OPEN_DOCUMENT_TREE，EXTRA_INITIAL_URI 尽力定位到主卷 Download；
  *       系统说明该初值是 best-effort，提供器可能忽略）。
@@ -45,6 +58,8 @@ package dev.ak.ak_sending_app
  * 4) listSafPersisted() -> List<Map>
  *      每项 { uri: String, read: Bool, write: Bool, tree: Bool, persistedTimeMs: Long }
  *      persistedTimeMs 在 API<30 上为 -1；tree 由 DocumentsContract.isTreeUri 判定。
+ *      批次 Z 第 5 修（M）起授权表只由 SafSendStager 在工作线程上读、回主线程应答；
+ *      stager 不在时答 PlatformException(unavailable)，读表失败答 PlatformException(error)。
  *
  * 5) deviceName() -> String|null
  *      本机自报设备名（X5，批次 X 交接 §4.5：仅展示用，不是身份证明）。
@@ -132,6 +147,7 @@ package dev.ak.ak_sending_app
  */
 
 import android.content.Intent
+import android.content.UriPermission
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -166,8 +182,21 @@ class MainActivity : FlutterActivity() {
         private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
     }
 
-    /** 进行中的 pickFolder 调用的 result；同一时刻至多一个。 */
-    private var pendingPickResult: MethodChannel.Result? = null
+    /** 一次 pickFolder 请求（批次 Z 第 5 修，G15）：登记句柄、要应答的 result、是否已结束。 */
+    private class PickFolderRequest(
+        val pick: SafSendStager.ReceivePick,
+        val result: MethodChannel.Result
+    ) {
+        /** 置上之后谁都不能再拿这个请求应答。 */
+        var finished = false
+    }
+
+    /**
+     * 进行中的 pickFolder 请求；同一时刻至多一个。字段里留着的永远是“已登记、未结束”的
+     * 请求——选择器打开着、打开那一步还在等放行、take 排队或执行中都算，结束时才移出去。
+     * 所以它在，再调 pickFolder 就答 pick_in_progress。
+     */
+    private var pendingPickRequest: PickFolderRequest? = null
 
     private var folderPicker: ActivityResultLauncher<Uri?>? = null
 
@@ -243,6 +272,10 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         engineRef = flutterEngine
         flutterEngine.plugins.add(activityResultRouter)
+        // 接收侧选目录（批次 Z 第 5 修，G15）：这个 launcher 只负责打开系统选择器。请求在
+        // onPickFolder 里先向 SafSendStager 登记、后 launch——正好有授权放行在收尾时，
+        // launch 由 stager 等它结束再执行（晚一些，仍在主线程上）。结果一律回到
+        // onFolderPicked，由它或者 take 跑完后的回调结束请求、应答；迟到的结果只丢弃。
         folderPicker = storageResultRegistry.register(
             PICK_FOLDER_KEY,
             ActivityResultContracts.OpenDocumentTree()
@@ -263,12 +296,20 @@ class MainActivity : FlutterActivity() {
         )
         storageChannel.setMethodCallHandler { call, result ->
             when (call.method) {
-                "getStorageInfo" -> result.success(getStorageInfo())
+                "getStorageInfo" -> withSendStager(result) {
+                    val info = getStorageInfo()
+                    // 批次 Z 第 5 修（M）：授权表在工作线程上读，应答由 stager 回主线程。
+                    persistedGrants(result) { grants ->
+                        info + ("safPersisted" to grants.isNotEmpty())
+                    }
+                }
                 "pickFolder" -> onPickFolder(result)
                 "safWriteTest" -> result.success(
                     safWriteTest(call.argument<String>("treeUri"))
                 )
-                "listSafPersisted" -> result.success(listSafPersisted())
+                "listSafPersisted" -> withSendStager(result) {
+                    persistedGrants(result, ::listSafPersisted)
+                }
                 "deviceName" -> result.success(deviceName())
                 "pickSendFolder" -> onPickSendFolder(result)
                 "stageSafTree" -> withSendStager(result) {
@@ -315,16 +356,14 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        pendingPickResult?.let { pending ->
-            runCatching {
-                pending.error(
-                    "activity_destroyed",
-                    "host activity destroyed before folder pick completed",
-                    null
-                )
+        // 接收侧请求还没结束（选择器未回、launch 还在等放行、take 排队或执行中）：先撤掉
+        // 登记——排队的 take 自己跳过，等着的 launch 不再放行——再答 activity_destroyed。
+        pendingPickRequest?.let { request ->
+            if (finishPickRequest(request)) {
+                SafSendStager.endReceivePick(request.pick)
+                answerActivityDestroyed(request.result)
             }
         }
-        pendingPickResult = null
         pendingSendPickResult?.let { pending ->
             runCatching {
                 pending.error(
@@ -349,18 +388,21 @@ class MainActivity : FlutterActivity() {
 
     // ── getStorageInfo ────────────────────────────────────────────────────
 
+    /**
+     * 目录与 freeBytes 照旧在调用线程上算。safPersisted 不在这里取（批次 Z 第 5 修 M）：
+     * 授权表只能经 SafSendStager.persistedGrants 在工作线程上读，由调用处补上这一个值。
+     */
     private fun getStorageInfo(): Map<String, Any?> {
         val dir = appDownloadDir()
         val freeBytes = try {
             if (dir.exists()) StatFs(dir.absolutePath).availableBytes else -1L
         } catch (t: Throwable) {
-            Log.w(TAG, "StatFs failed for ${dir.absolutePath}: $t")
+            Log.w(TAG, "StatFs failed: ${t.javaClass.simpleName}")
             -1L
         }
         return mapOf(
             "appDownloadDir" to dir.absolutePath,
-            "freeBytes" to freeBytes,
-            "safPersisted" to contentResolver.persistedUriPermissions.isNotEmpty()
+            "freeBytes" to freeBytes
         )
     }
 
@@ -378,50 +420,127 @@ class MainActivity : FlutterActivity() {
 
     // ── pickFolder ────────────────────────────────────────────────────────
 
+    /**
+     * 接收侧选目录（批次 Z 第 5 修，G15 放行闸门）。次序不能变：先向 SafSendStager 登记，
+     * 再经它 launch——正好有授权放行在收尾时，它把 launch 留到收尾结束之后。登记一直留到
+     * take 跑完（或没拿到结果就结束）为止，这期间再调 pickFolder 答 pick_in_progress。
+     */
     private fun onPickFolder(result: MethodChannel.Result) {
         val launcher = folderPicker
         if (launcher == null) {
             result.error("unavailable", "folder picker launcher not initialized", null)
             return
         }
-        if (pendingPickResult != null) {
+        // 字段里有请求就是还在途（选择器打开着、launch 在等放行、take 排队或执行中）。
+        if (pendingPickRequest != null) {
             result.error("pick_in_progress", "a folder pick is already in flight", null)
             return
         }
-        pendingPickResult = result
-        try {
-            launcher.launch(initialDownloadDocumentUri())
+        if (sendStager == null) {
+            result.error("unavailable", "send stager not initialized", null)
+            return
+        }
+        val pick = try {
+            SafSendStager.beginReceivePick()
         } catch (t: Throwable) {
-            // 典型场景：Android TV 等没有文档选择器的环境（ActivityNotFoundException）。
-            // 不当作崩溃：返回 treeUri=null，让 Dart 侧退回默认目录策略。
-            Log.w(TAG, "launch OpenDocumentTree failed: $t")
-            pendingPickResult = null
-            result.success(mapOf("treeUri" to null as String?))
+            // 本文件只在自己的字段空着时登记：登记不上只会是登记处另有一份在（同进程里
+            // 另一个 Activity 实例的请求）。按在途处理，不让异常从通道处理器里抛出来。
+            Log.w(TAG, "beginReceivePick failed: ${t.javaClass.simpleName}")
+            result.error("pick_in_progress", "a folder pick is already in flight", null)
+            return
+        }
+        val request = PickFolderRequest(pick, result)
+        pendingPickRequest = request
+        val launch = {
+            // 请求已经被结束（onDestroy）而 stager 又把这一步送了过来：不再打开选择器。
+            if (!request.finished && pendingPickRequest === request) {
+                try {
+                    launcher.launch(initialDownloadDocumentUri())
+                } catch (t: Throwable) {
+                    // 典型场景：Android TV 等没有文档选择器的环境（ActivityNotFoundException）。
+                    // 不当作崩溃：返回 treeUri=null，让 Dart 侧退回默认目录策略。
+                    Log.w(TAG, "launch OpenDocumentTree failed: ${t.javaClass.simpleName}")
+                    endPickWithoutResult(request)
+                }
+            }
+        }
+        try {
+            SafSendStager.launchReceivePick(pick, launch)
+        } catch (t: Throwable) {
+            // launchReceivePick 自己抛了出来（launcher 那一步的异常在它里面已经收尾过）：
+            // 这里兜住，做同样的收尾，应答仍只有一次。
+            Log.w(TAG, "launchReceivePick failed: ${t.javaClass.simpleName}")
+            endPickWithoutResult(request)
         }
     }
 
+    /**
+     * 没拿到结果的收尾：撤销登记、答 {treeUri: null}（与第 5 修之前一样）。
+     * 只对还没结束的请求做一次。
+     */
+    private fun endPickWithoutResult(request: PickFolderRequest) {
+        if (!finishPickRequest(request)) return
+        SafSendStager.endReceivePick(request.pick)
+        request.result.success(mapOf("treeUri" to null as String?))
+    }
+
+    /**
+     * 结束一个请求并把它移出字段，返回是不是这一处结束的。每个请求只有第一处拿到 true：
+     * take 的 onDone、onDestroy 这些路径之中只能有一处应答。
+     */
+    private fun finishPickRequest(request: PickFolderRequest): Boolean {
+        if (request.finished) return false
+        request.finished = true
+        if (pendingPickRequest === request) pendingPickRequest = null
+        return true
+    }
+
+    /** 请求随 Activity 一起作废时的应答；引擎可能已经不在了，所以包在 runCatching 里。 */
+    private fun answerActivityDestroyed(result: MethodChannel.Result) {
+        runCatching {
+            result.error(
+                "activity_destroyed",
+                "host activity destroyed before folder pick completed",
+                null
+            )
+        }
+    }
+
+    /** OpenDocumentTree 的结果回到 pickFolder 的调用方；只结束字段里那一个请求。 */
     private fun onFolderPicked(treeUri: Uri?) {
-        val pending = pendingPickResult
-        pendingPickResult = null
-        if (pending == null) {
-            Log.w(TAG, "folder picked but no pending result (treeUri=$treeUri)")
+        val request = pendingPickRequest
+        if (request == null) {
+            // 没有在途的请求（已经由别的路径结束）：丢弃，日志里不带 URI。
+            Log.w(TAG, "folder picked but no pending result")
             return
         }
         if (treeUri == null) {
-            pending.success(mapOf("treeUri" to null as String?))
+            // 取消：没有授权可拿。登记撤掉之后让 stager 把登记期间搁下的日志行结算掉。
+            if (finishPickRequest(request)) {
+                SafSendStager.endReceivePick(request.pick)
+                sendStager?.settleJournal()
+                request.result.success(mapOf("treeUri" to null as String?))
+            }
             return
         }
-        val answer = { pending.success(mapOf("treeUri" to treeUri.toString())) }
+        val stager = sendStager
+        if (stager == null) {
+            // stager 已随 Activity 释放（不会走到这一步）：授权不拿了，按 Activity 已销毁应答。
+            if (finishPickRequest(request)) {
+                SafSendStager.endReceivePick(request.pick)
+                answerActivityDestroyed(request.result)
+            }
+            return
+        }
         // 批次 Z 复审 N9：takePersistableUriPermission(READ|WRITE) 经 SafSendStager 的工作线程
         // 执行——本应用所有持久授权操作在同一线程上串行，与发送侧的 take/release 互不
         // 交错。应答还是同一个 map，等工作线程做完再回；take 失败只记日志，不改变应答。
-        val stager = sendStager
-        if (stager == null) {
-            // stager 已随 Activity 释放（不会走到这一步）：授权不拿了，照旧应答。
-            answer()
-            return
+        // 登记由工作线程在 take 之后撤掉（G15）：在那之前请求一直留在字段里。
+        stager.takeReceiveGrant(request.pick, treeUri) {
+            if (finishPickRequest(request)) {
+                request.result.success(mapOf("treeUri" to treeUri.toString()))
+            }
         }
-        stager.takeReceiveGrant(treeUri, answer)
     }
 
     /**
@@ -435,7 +554,7 @@ class MainActivity : FlutterActivity() {
             "primary:" + Environment.DIRECTORY_DOWNLOADS
         )
     } catch (t: Throwable) {
-        Log.w(TAG, "build initial Download URI failed: $t")
+        Log.w(TAG, "build initial Download URI failed: ${t.javaClass.simpleName}")
         null
     }
 
@@ -534,21 +653,26 @@ class MainActivity : FlutterActivity() {
             mapOf("ok" to true, "error" to null as String?)
         } catch (t: Throwable) {
             val message = "${t.javaClass.simpleName}: ${t.message}"
-            Log.w(TAG, "safWriteTest failed: $message")
+            // 回给 Dart 的 map 不变；日志只带异常类名（消息里可能带着探测文件的名字）。
+            Log.w(TAG, "safWriteTest failed: ${t.javaClass.simpleName}")
             mapOf("ok" to false, "error" to message)
         } finally {
             // 无论成败都清理探测文件；清理失败只记日志，不掩盖原始结果。
             createdDocUri?.let { doc ->
                 runCatching { DocumentsContract.deleteDocument(contentResolver, doc) }
-                    .onFailure { Log.w(TAG, "probe cleanup failed for $doc: $it") }
+                    .onFailure { Log.w(TAG, "probe cleanup failed: ${it.javaClass.simpleName}") }
             }
         }
     }
 
     // ── listSafPersisted ──────────────────────────────────────────────────
 
-    private fun listSafPersisted(): List<Map<String, Any?>> =
-        contentResolver.persistedUriPermissions.map { permission ->
+    /**
+     * 批次 Z 第 5 修（M）：授权表由 SafSendStager.persistedGrants 在工作线程上读出来再交给
+     * 这里整理——主线程不碰 contentResolver.persistedUriPermissions。
+     */
+    private fun listSafPersisted(grants: List<UriPermission>): List<Map<String, Any?>> =
+        grants.map { permission ->
             mapOf(
                 "uri" to permission.uri.toString(),
                 "read" to permission.isReadPermission,

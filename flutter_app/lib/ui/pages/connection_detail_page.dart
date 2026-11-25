@@ -33,12 +33,17 @@
 /// ends: a SUCCESSFUL send (they also leave the review list, so nothing
 /// can send a released path again), 清空, a new pick replacing them, and
 /// `dispose` while no send is in flight. Every release goes through ONE
-/// point (`_releaseOwned`), which never hands back a folder a STARTED send
-/// has not succeeded on. A staged folder is released by exactly one thing:
-/// the SUCCESSFUL send that carried it. A FAILED send leaves it listed for
-/// a retry; 清空, a new pick and dispose then drop it unreleased (the next
-/// app start removes the copy) — no error shape proves the engine has
-/// stopped reading (see `_send`).
+/// point (`_releaseOwned`). A FAILED send leaves a staged folder listed
+/// for a retry — no error shape proves the engine has stopped reading
+/// (see `_send`) — and once a send has STARTED on it, 清空, a new pick
+/// and `dispose` never release that copy: they drop it from the list,
+/// UNRELEASED. Such a copy is released by exactly one thing: a
+/// SUCCESSFUL send, a later retry included (the failed send's Rust read
+/// may still be alive then — accepted). An unreleased copy belongs to
+/// the stager instance that created it (one per Flutter engine); the
+/// start-up sweep of a NEW isolate removes the copies of the stager
+/// instances that are no longer live — whether or not Android reused the
+/// process.
 library;
 
 import 'dart:async' show StreamSubscription, unawaited;
@@ -131,14 +136,23 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   int? _sentBytes;
 
   /// Batch Z (U4): the staging ids this page must NEVER hand back (empty
-  /// when none). A send STARTS by adding the ids of its staged entries;
-  /// only that send's SUCCESS takes them out again. While the send runs
-  /// they are the engine's to read, and after a FAILURE they stay in for
-  /// the rest of the page's life: no error shape proves the reading has
-  /// ended (an `AkFfiException` can come from a failed poll, the
+  /// when none). A send STARTS by adding the ids of its staged entries.
+  /// While the send runs they are the engine's to read, and after a
+  /// FAILURE they stay in: no error shape proves the reading has ended
+  /// (an `AkFfiException` can come from a failed poll, the
   /// 「已取消原生发送任务」 text only says the disconnect call succeeded,
   /// and the Rust read runs on a blocking thread). Every release of this
   /// page goes through `_releaseOwned`, the one place that holds them back.
+  ///
+  /// Narrow, though: once a send has STARTED on a copy, 清空, a new pick
+  /// and `dispose` never release it, and only a SUCCESSFUL send takes ids
+  /// out of the set again — those of the entries it sent — so a later
+  /// retry's success releases what a failed send left here (that failed
+  /// send's Rust read may still be alive then: accepted). A copy that no
+  /// successful send releases stays with the stager instance that created
+  /// it (one per Flutter engine); the start-up sweep of a NEW isolate
+  /// removes the copies of the stager instances that are no longer live —
+  /// whether or not Android reused the process.
   Set<String> _readingStagedIds = const <String>{};
 
   /// Batch Z: a send is with the engine right now. Set with the sending
@@ -204,9 +218,12 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
     // lists — through the ONE release point, which holds back every id a
     // started send has not succeeded on: what a send in flight is reading
     // (that send's own completion decides) and what a FAILED send may
-    // still be reading (dropped unreleased; the next app start removes
-    // it). What is listed beyond that was never sent — or replaced the
-    // list during a send — so handing it back is safe.
+    // still be reading (dropped unreleased: such a copy belongs to the
+    // stager instance that created it, one per Flutter engine, and the
+    // start-up sweep of a NEW isolate removes the copies of the stager
+    // instances that are no longer live, whether or not Android reused
+    // the process). What is listed beyond that was never sent — or
+    // replaced the list during a send — so handing it back is safe.
     _releaseOwned(widget.picker, _picked);
     super.dispose();
   }
@@ -254,8 +271,14 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
   /// built in an earlier frame (the old 「清空」, a pick that was already
   /// open) can run before the first frame shows the sending state. An id in
   /// [_readingStagedIds] is never passed on — that is every id a started
-  /// send has not succeeded on. Fire-and-forget — it never delays or
-  /// reorders the flow — and a no-op without staged folders.
+  /// send has not succeeded on, so once a send has STARTED on a copy,
+  /// 清空, a new pick and `dispose` never release it through here; only a
+  /// SUCCESSFUL send takes an id out of the set, a later retry included
+  /// (see [_readingStagedIds]). What does leave here is a best-effort
+  /// hand-back: it does not confirm that the copy is gone from disk — the
+  /// start-up sweep of a new isolate is what reclaims a copy that was not
+  /// released. Fire-and-forget — it never delays or reorders the flow —
+  /// and a no-op without staged folders.
   void _releaseOwned(FilePickGateway picker, Iterable<PickedEntry> entries) {
     final releasable = [
       for (final entry in entries)
@@ -422,9 +445,13 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
       // whatever the error is — no error shape proves the engine has
       // stopped reading. The staged entries of this send stay in the review
       // list for a retry, and their ids stay in `_readingStagedIds`: 清空,
-      // a new pick and dispose drop them WITHOUT handing the copies back
-      // (the next app start removes those). Only a successful send — this
-      // entry's own retry included — un-protects and releases them.
+      // a new pick and dispose drop them WITHOUT handing the copies back.
+      // Each copy belongs to the stager instance that created it (one per
+      // Flutter engine); the start-up sweep of a NEW isolate removes the
+      // copies of the stager instances that are no longer live — whether
+      // or not Android reused the process. Only a successful send — this
+      // entry's own retry included — un-protects and releases them, while
+      // this failed send's Rust read may still be alive (accepted).
       _sendInFlight = false;
       history?.add(TransferRecord(
         role: TaskRole.send,
@@ -447,10 +474,12 @@ class _ConnectionDetailPageState extends State<ConnectionDetailPage> {
 
   /// 清空: the review list goes. Batch Z: with it the page's ownership of
   /// the staged folders that were in it — except those a started send has
-  /// not succeeded on, which `_releaseOwned` holds back (dropped from the
-  /// list, never handed back). The 清空 button is gone in the first frame
-  /// that shows the sending state, but the one built before can still fire
-  /// in the same frame as 「发送」.
+  /// not succeeded on, which `_releaseOwned` holds back: 清空 drops them
+  /// from the list UNRELEASED and never releases such a copy — that is
+  /// left to the start-up sweep of a NEW isolate (see
+  /// [_readingStagedIds]). The 清空 button is gone in the first frame that
+  /// shows the sending state, but the one built before can still fire in
+  /// the same frame as 「发送」.
   void _clearPicked() {
     final removed = List<PickedEntry>.of(_picked);
     setState(() {

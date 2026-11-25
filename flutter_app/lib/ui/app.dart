@@ -74,11 +74,15 @@ class _AkSendingAppState extends State<AkSendingApp> {
   @override
   void initState() {
     super.initState();
-    // Batch Z: remove the staging leftovers of earlier runs (interrupted
-    // copies, expired finished ones) and the read grants they left behind.
-    // Only the PRODUCTION gateway — an injected fake never touches the
-    // channel. Unawaited: the gateway swallows its errors, and the first
-    // staging of the process awaits its own copy of this anyway.
+    // Batch Z: remove the staging leftovers — interrupted copies and the
+    // finished copies of stager instances that are no longer live — and
+    // the read grants they left behind. A copy belongs to the stager
+    // instance that created it (one instance per Flutter engine), so this
+    // sweep of a NEW isolate removes the copies of the instances that are
+    // no longer live, whether or not Android reused the process. Only the
+    // PRODUCTION gateway — an injected fake never touches the channel.
+    // Unawaited: the gateway swallows its errors, and the first staging of
+    // this isolate awaits the same run anyway.
     if (widget.picker is PluginFilePickGateway) {
       unawaited(PluginFilePickGateway.cleanupStaleStaging());
     }

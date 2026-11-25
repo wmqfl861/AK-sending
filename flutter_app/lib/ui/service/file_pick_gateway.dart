@@ -121,8 +121,13 @@ abstract class FilePickGateway {
   Future<PickedEntry?> pickSendDirectory();
 
   /// Batch Z: hands the staged copies behind [entries] back to the
-  /// platform. Entries without a [PickedEntry.stagingId] are ignored; a
-  /// call is idempotent and never throws.
+  /// platform — best effort: the call does not confirm that a copy is gone
+  /// from disk. Entries without a [PickedEntry.stagingId] are ignored; a
+  /// call is idempotent and never throws. A copy that was not released
+  /// belongs to the stager instance that created it (one instance per
+  /// Flutter engine); the start-up sweep of a NEW isolate is what reclaims
+  /// it, whether or not Android reused the process (see
+  /// [PluginFilePickGateway.cleanupStaleStaging]).
   Future<void> releaseStaged(Iterable<PickedEntry> entries);
 }
 
@@ -564,14 +569,17 @@ class PluginFilePickGateway implements FilePickGateway {
         () => (_stagedCleaner ?? _cleanupStagedSendOnChannel)(stageId),
       );
 
-  /// Batch Z: removes staging leftovers of earlier runs (interrupted
-  /// copies, expired finished ones) and the read grants they left behind.
-  /// Android only; errors are swallowed.
+  /// Batch Z: removes staging leftovers — interrupted copies and the
+  /// finished copies of stager instances that are no longer live — and
+  /// the read grants they left behind. Android only; errors are swallowed.
   ///
-  /// Runs ONCE PER DART ISOLATE — not once per Android process: a rebuilt
-  /// engine is a new isolate with fresh statics, and runs it again. Within
-  /// an isolate the app start calls it, and the first staging waits for
-  /// the same run instead of starting another.
+  /// A copy belongs to the stager instance that created it (one instance
+  /// per Flutter engine), and this sweep of a NEW isolate removes the
+  /// copies of the stager instances that are no longer live — whether or
+  /// not Android reused the process. It runs ONCE PER DART ISOLATE: a
+  /// rebuilt engine is a new isolate with fresh statics, and runs it
+  /// again. Within an isolate the app start calls it, and the first
+  /// staging waits for the same run instead of starting another.
   static Future<void> cleanupStaleStaging() =>
       _staleStagingCleanup ??= _runStaleStagingCleanup();
 
@@ -583,7 +591,8 @@ class PluginFilePickGateway implements FilePickGateway {
         await _storageChannel.invokeMethod<void>('cleanupStaleStaging');
       }
     } on Object catch (_) {
-      // Best effort by contract: whatever it left is removed next start.
+      // Best effort by contract: whatever this run did not remove is left
+      // to the start-up sweep of the next NEW isolate.
     }
   }
 

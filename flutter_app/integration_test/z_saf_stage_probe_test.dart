@@ -1,11 +1,13 @@
 // Z probe (batch Z, 2026-11-24; part D and the hard assertions of revision 3
-// and T5–T8 of revision 4, 2026-11-25): the ANDROID SEND-SIDE folder path
-// against the REAL platform in a profile build — the system tree picker
-// (ACTION_OPEN_DOCUMENT_TREE), the native staging behind `dev.ak/storage`,
-// the content of the staged copy, its release, and the failure paths of the
-// channel. The Flutter side is driven by this test; the NATIVE picker is
-// driven from the host (adb/uiautomator), for the reasons recorded in the
-// header of the K1 walkthrough (k1_android_saf_test.dart).
+// and T5–T8 of revision 4; revision 5 — no value in the output, the journal's
+// four answers, T7 as two orders and part B's RETAKE, 2026-11-25): the
+// ANDROID SEND-SIDE folder path against the REAL platform in a profile
+// build — the system tree picker (ACTION_OPEN_DOCUMENT_TREE), the native
+// staging behind `dev.ak/storage`, the content of the staged copy, its
+// release, and the failure paths of the channel. The Flutter side is driven
+// by this test; the NATIVE picker is driven from the host (adb/uiautomator),
+// for the reasons recorded in the header of the K1 walkthrough
+// (k1_android_saf_test.dart).
 //
 // Three builds of this one file, chosen by dart-define AK_SAF_PROBE_MODE:
 //
@@ -14,7 +16,12 @@
 //        verify the staged tree → release.
 //     B  the raw channel's failure paths: a malformed id, an untrusted
 //        authority, a cancel that must land in the copy phase, an idempotent
-//        cleanup, the stale cleanup next to a RUNNING staging.
+//        cleanup. Then the RETAKE of the API 29 round: once the cancelled
+//        job has released its READ, one more staging of the SAME tree URI
+//        and no new pick — `ok` on API 30 and later, SAF_PERMISSION_DENIED
+//        on API 24–29, where that release took READ out of what a later
+//        take may persist. Then a FRESH pick (`B|PICKER2`) and the stale
+//        cleanup next to a RUNNING staging.
 //     C  the receive grant of the akstage tree survives a send staging (the
 //        receive pick leaves READ+WRITE there; it stays for the rest).
 //     D  the stager's own checks before its completion marker — a directory
@@ -22,25 +29,47 @@
 //        that lost its enumerated size (size-mismatch) — and, on the
 //        baseline staging, T6: a cleanup aimed at a RUNNING staging is
 //        refused with busy at call time, and the staging still delivers.
-//     E  T7: the receive side upgrades the grant DURING a send staging, on
-//        a folder that holds no grant yet (nested/deep — a different URI
-//        from akstage; verified first through listSafPersisted).
+//     E1 T7's first order, the one that loses the grant on Android 7–10
+//        unless no release falls between a receive pick's grant and its
+//        take (G15): the receive side upgrades the grant DURING a send
+//        staging, on a folder that holds no grant yet (nested/deep — a
+//        different URI from akstage; verified first through
+//        listSafPersisted).
+//     E2 T7's second order, the one that tells a broken deferral from a
+//        correct one on Android 15: `pickFolder` FIRST, the picker parked by
+//        the host on nested/dip (no grant there either) while a send staging
+//        of that folder ends. The tree with the pick registered and not yet
+//        taken is the part's first observation, the tree after the confirm
+//        its second. nested/dip's READ+WRITE stays for the rest of the round
+//        (no channel method releases it); a fresh install clears it.
 //   leave — z-probe-kill.sh, first launch: pick nested/deep, start a send
 //        staging, print `ZSAF|K|COPY` at its first copy event; the host
 //        force-stops the app mid-copy.
 //   check — z-probe-kill.sh, second launch, same install: what the killed
 //        process left (through dart:io), then cleanupStaleStaging, then
-//        nothing.
+//        nothing — after which no persisted grant exists at all.
 //
 // Orchestration contract:
 //   * dart-define AK_SAF_PROBE_SHA_BIG=<64 hex> (default mode): the host's
 //     SHA-256 of the 32 MiB `nested/photo.bin` it pushed to
 //     /sdcard/Download/akstage.
-//   * every evidence line `ZSAF|…|PICKER…|tree|awaiting external DocumentsUI
-//     drive` (logcat, tag `flutter`) asks the host to drive DocumentsUI:
-//     parts A, B and C onto akstage; part E onto akstage/nested/deep
-//     (twice: `E|PICKER` and `E|PICKER2`); the leave mode onto
-//     akstage/nested/deep.
+//   * dart-define AK_SAF_PROBE_API=<n> (default mode): the SDK level of the
+//     image as the host read it (`getprop ro.build.version.sdk`). It is the
+//     only source of the API level part B's RETAKE expects by: the
+//     platform's version string is not a release string on Android (on the
+//     x86_64 image its first number is 64 — seen on the device), so it names
+//     nothing (see _apiLevelOf). Without this define RETAKE fails by name.
+//   * every evidence line `ZSAF|<part>|<PICKER…>|tree|awaiting external
+//     DocumentsUI drive` (logcat, tag `flutter`) asks the host to drive
+//     DocumentsUI onto the folder the contract names here — never onto one a
+//     line printed — and to confirm it, except where it says to park:
+//     parts A, B and C onto akstage, and B once more for its fresh pick
+//     (`B|PICKER2`); E1 onto akstage/nested/deep (twice: `E1|PICKER` and
+//     `E1|PICKER2`); E2 onto akstage/nested/dip — `E2|PICKER0` is confirmed
+//     like the others, `E2|PICKER` is PARKED on the folder (its row is
+//     tapped, "Use this folder" is not) until `ZSAF|E2|HOLD|…` is in logcat,
+//     and only then confirmed ("Use this folder", then "Allow"); the leave
+//     mode onto akstage/nested/deep.
 //   * the synthetic tree, whose host manifest is the reference for part A:
 //       nested/deep/note.txt   "ak stage probe" + LF
 //       nested/photo.bin       33554432 random bytes
@@ -50,16 +79,29 @@
 //     The host changes it only after part A has verified it. It enlarges
 //     nested/photo.bin while the test waits on part C's picker (a longer
 //     copy phase) and changes the tree at each `ZSAF|D<n>|COPY` line — the
-//     device's own "enumeration over, the copy began". For part E it puts a
+//     device's own "enumeration over, the copy began". For part E1 it puts a
 //     big file and many small ones into nested/deep while the test waits on
-//     `E|PICKER`, so that the send staging outlasts the second picker. It
-//     restores the tree once the drive has ended.
+//     `E1|PICKER`, so that the send staging outlasts the second picker. For
+//     part E2 it builds, while the test waits on `E2|PICKER0`,
+//       nested/dip/note.txt    "dip note" + LF — a few bytes, so that the
+//                              folder's send staging is over almost at once
+//     It restores the tree once the drive has ended (nested/dip goes with
+//     the rest).
 //
-// Evidence is one `ZSAF|…` line per fact. A staged path, a tree URI, a
-// stage id and the content of the grant journal never print: counts,
-// lengths and booleans stand in. Every check is HARD — a failed one is
-// collected under its name, the run goes on to gather the rest, and the
-// test fails on the collected list at the end.
+// Evidence is one `ZSAF|…` line per fact, and no line carries a value read
+// from the device: not a display name, not the relative name of a staged
+// entry, not a tree URI, not a stage id, not journal content. What stands
+// in are preset synthetic labels, match booleans and counts of unknown
+// items; a failing check names the label it expected or the state it saw
+// (a grant's bits, a journal's state) — never what the device answered.
+// Every check is HARD — a failed one is collected under its name, the run
+// goes on to gather the rest, and the test fails on the collected list at
+// the end.
+//
+// No wait that spans the system picker waits for a Flutter frame: while
+// DocumentsUI is in front the app's are paused, and a `pump()` issued then
+// stays open until the picker closes — at the end of a failed round that is
+// what died with `Guarded function conflict` (the round of 09:27).
 import 'dart:async' show unawaited;
 import 'dart:convert' show utf8;
 import 'dart:io' as io;
@@ -112,10 +154,15 @@ const String _journalScratchName = '.send-grants.tmp';
 const String _markerName = '.ak-stage-complete';
 const String _ownerName = '.owner';
 
-/// The folder of part E and of the kill round — nested/deep — and the big
+/// The folder of part E1 and of the kill round — nested/deep — and the big
 /// file the host puts into it to keep a staging busy.
 const String _deepName = 'deep';
 const String _holdName = 'hold.bin';
+
+/// The folder of part E2 — nested/dip, which the host builds: a note of a
+/// few bytes and nothing else, so that its send staging is over almost at
+/// once.
+const String _dipName = 'dip';
 
 /// The mode of this build (dart-define AK_SAF_PROBE_MODE): empty = the
 /// whole probe; `leave` and `check` are the two launches of the kill round.
@@ -123,11 +170,11 @@ const String _mode = String.fromEnvironment('AK_SAF_PROBE_MODE');
 
 /// How long a pick may stay open. The host has seen the PICKER line by
 /// then, so this only bounds a picker drive that never comes — and the
-/// tree preparation the host does while the test waits on part C's picker.
+/// tree preparation the host does while the test waits on a picker.
 const int _pickSeconds = 240;
 
-/// Part E's first pick: the host also builds nested/deep's payload in that
-/// window (a big file, and thousands of small ones).
+/// Part E1's first pick: the host also moves nested/deep's payload in, in
+/// that window (a big file, and thousands of small ones).
 const int _t7PickSeconds = 300;
 
 const int _workSeconds = 120;
@@ -135,10 +182,10 @@ const int _workSeconds = 120;
 /// A staging that copies the enlarged file: its budget is its own.
 const int _bigWorkSeconds = 180;
 
-/// Part E's staging copies the big file AND thousands of small ones.
+/// Part E1's staging copies the big file AND thousands of small ones.
 const int _t7WorkSeconds = 300;
 
-/// For part E's TIMING evidence only: how long after the send staging's
+/// For part E1's ORDER evidence only: how long after the send staging's
 /// answer the receive pick may answer and still read as "confirmed while
 /// the staging ran". The receive take is queued behind the running staging
 /// on the stager's worker, so such a pick answers right behind it.
@@ -177,23 +224,40 @@ void main() {
   }
 }
 
-/// The whole probe: parts A–E, then the verdict on every collected check.
+/// The whole probe: parts A–E2, then the verdict on every collected check.
 Future<void> _defaultRun(WidgetTester tester) async {
   const shaBig = String.fromEnvironment('AK_SAF_PROBE_SHA_BIG');
+  final api = _apiLevel();
   zSay('BOOTSTRAP|android=${io.Platform.isAndroid}|mode=default'
-      '|shaBig=${shaBig.length}hex');
+      '|shaBig=${shaBig.length}hex|api=${api.level ?? 'unreadable'}'
+      '|apiFrom=${api.source}'
+      '${api.source == 'os' ? '' : '|osFirst=${api.osFirst ?? 'none'}'}');
   expect(shaBig, matches(RegExp(r'^[0-9a-f]{64}$')),
       reason: 'AK_SAF_PROBE_SHA_BIG (64 lowercase hex) is required');
   expect(io.Platform.isAndroid, isTrue,
       reason: 'the probe needs the Android channel');
 
-  final run = _Run(tester);
+  final run = _Run(tester)..apiLevel = api.level;
+  // Without an API level part B's RETAKE would expect one of two answers at
+  // random: it fails by name instead. Said here, at the start, so that the
+  // run's verdict carries it whatever the parts find.
+  if (run.apiLevel == null) run.problems.add('BOOTSTRAP:api-level-unreadable');
   addTearDown(() async {
     // Whatever went wrong, no staged copy of this run stays behind. For an
     // id whose staging is still in flight the platform answers `busy` at
     // call time and deletes nothing; that copy is left to the next start's
     // stale sweep, exactly as a killed process would leave it.
     final released = await run.releaseOwned();
+    // A wait that failed by its open pump leaves that pump here. Let it finish
+    // first: the expects below are guarded, and a guarded call beside an open
+    // pump is a "Guarded function conflict" that buries the real failure.
+    final open = _openPump;
+    if (open != null) {
+      await Future.any<void>(<Future<void>>[
+        open,
+        Future<void>.delayed(const Duration(seconds: 60)),
+      ]);
+    }
     _storageChannel.setMethodCallHandler(null);
     zSay('TEARDOWN|ids=${released.ids}|done=${released.done}'
         '|unanswered=${released.unanswered}'
@@ -214,8 +278,24 @@ Future<void> _defaultRun(WidgetTester tester) async {
   if (!run.pickerStalled) await _partB(run);
   if (!run.pickerStalled) await _partC(run);
   if (!run.pickerStalled && run.treeUri.isNotEmpty) await _partD(run);
-  if (!run.pickerStalled && run.treeUri.isNotEmpty) await _partE(run);
+  if (!run.pickerStalled && run.treeUri.isNotEmpty) await _partE1(run);
+  if (!run.pickerStalled && run.treeUri.isNotEmpty) {
+    if (run.pickerLeftOpen) {
+      // A receive pick that never answered leaves its picker in front; a
+      // picker drive of part E2 would land in that one.
+      zSay('E2|SKIPPED|reason=picker-left-open');
+      run.problems.add('E2:skipped-picker-left-open');
+    } else {
+      await _partE2(run);
+    }
+  }
 
+  // Nothing may be left waiting for a frame when the teardown runs. A pump
+  // that is still open holds the test API's guarded scope, and the runner's
+  // own last guarded call then fails with `Guarded function conflict`
+  // instead of the verdict — the 09:27 round. Every wait that spans the
+  // system picker is frame-free for that reason; this only proves it.
+  expect(_openPump, isNull, reason: 'a pump is still open at the end of the run');
   zSay('VERDICT|${run.problems.isEmpty ? 'ok' : 'failed=${run.problems.length}'}');
   expect(run.problems, isEmpty,
       reason: 'failed checks: ${run.problems.join('; ')}');
@@ -227,9 +307,9 @@ void zSay(String value) {
 }
 
 /// What one run collects: the failed checks under their names, every stage
-/// id this run may leave behind, the staging root and the tree URI the
-/// later parts work with, and whether a picker drive never came — the
-/// parts after that cannot run.
+/// id this run may leave behind, the staging root and the tree URIs the
+/// later parts work with, and whether a picker drive never came — the parts
+/// after that cannot run.
 class _Run {
   _Run(this.tester);
 
@@ -243,10 +323,22 @@ class _Run {
   /// The tree URI of part B's pick — never printed.
   String treeUri = '';
 
+  /// The tree URI of part E1's folder — never printed.
+  String deepUri = '';
+
   /// The display name of the last pick, as the platform answered it: which
-  /// folder the host's DocumentsUI drive really ended in.
+  /// folder the host's DocumentsUI drive really ended in. Compared with the
+  /// label the contract names, and never printed.
   String lastPickName = '';
+
+  /// The API level of this image ([_apiLevelOf]); null when no source says.
+  int? apiLevel;
+
+  /// A picker drive never came: the parts that need one cannot run.
   bool pickerStalled = false;
+
+  /// A receive pick never answered, so its picker may still be in front.
+  bool pickerLeftOpen = false;
 
   /// A fresh staging id in the shape the platform validates.
   String newId() {
@@ -313,6 +405,12 @@ class _Answer {
         : 'threw:${failure.runtimeType}';
   }
 
+  /// The PlatformException code; '' for anything else.
+  String get code {
+    final failure = error;
+    return failure is PlatformException ? failure.code : '';
+  }
+
   /// The reason token of a PlatformException (`leftover`, `source-changed`,
   /// …). Anything that is not a plain lowercase token reads `?`: a message
   /// that carries more than the contract's fixed token never prints.
@@ -330,8 +428,9 @@ class _Answer {
   }
 
   /// Waits up to [seconds] for the answer without pumping — a teardown has
-  /// no frame to wait for. Answers whether the call DID answer: a caller
-  /// must not take silence for one.
+  /// no frame to wait for, and neither has a wait that spans the system
+  /// picker. Answers whether the call DID answer: a caller must not take
+  /// silence for one.
   Future<bool> wait(int seconds) async {
     final end = DateTime.now().add(Duration(seconds: seconds));
     while (!answered && DateTime.now().isBefore(end)) {
@@ -368,7 +467,8 @@ Future<void>? _openPump;
 /// bounded that wait at 45 s; here the picker may legally stay open longer
 /// (the host scrolls and dumps), so at most ONE pump is ever outstanding,
 /// the loop keeps polling [ready] around a stalled one, and the next frame
-/// completes it.
+/// completes it. No caller may span the system picker with it: a wait that
+/// does is written on [_Answer.wait], which needs no frame at all.
 Future<bool> _pumpUntil(
     WidgetTester tester, bool Function() ready, int seconds) async {
   final end = DateTime.now().add(Duration(seconds: seconds));
@@ -390,17 +490,26 @@ Future<bool> _pumpUntil(
   if (open != null) {
     await Future.any<void>(<Future<void>>[
       open,
-      Future<void>.delayed(const Duration(seconds: 20)),
+      Future<void>.delayed(_pumpPatience),
     ]);
   }
   if (_openPump != null) {
-    fail('a pump was still stalled 20 s after the wait ended: no frame');
+    fail('a pump was still stalled ${_pumpPatience.inSeconds} s after the '
+        'wait ended: no frame');
   }
   return ready();
 }
 
+/// How long a wait that is satisfied keeps waiting for the one pump it opened.
+/// On a fast image the pump is over in a frame; on the Android 10 (API 29)
+/// emulator in software rendering a frame takes seconds — a wait of the round
+/// of 2026-11-25 21:21 saw none for more than 20 s there. The pump must be
+/// over before the caller goes on: an open one keeps the guarded test API.
+const Duration _pumpPatience = Duration(seconds: 120);
+
 /// Awaits [call] (pumping meanwhile) and hands its captured answer. A call
-/// that copies the enlarged file gets [seconds].
+/// that copies the enlarged file gets [seconds]. Only for a moment at which
+/// the app is in front — never across a pick.
 Future<_Answer> _settled(_Run run, Future<Object?> call,
     {int seconds = _workSeconds}) async {
   final answer = _Answer.capture(call);
@@ -408,9 +517,10 @@ Future<_Answer> _settled(_Run run, Future<Object?> call,
   return answer;
 }
 
-/// A channel call in a mode that pumps nothing (the kill round's `check`
-/// mode): no frame to wait for. Whether it answered is for the caller to
-/// read off the answer — silence is never taken for an answer.
+/// A channel call that pumps nothing — in a mode without frames (the kill
+/// round's `check`), in a teardown, and wherever the system picker may be
+/// in front. Whether it answered is for the caller to read off the answer —
+/// silence is never taken for an answer.
 Future<_Answer> _call(Future<Object?> call) async {
   final answer = _Answer.capture(call);
   await answer.wait(60);
@@ -453,23 +563,37 @@ bool? _removedOf(_Answer answer) {
   return value['removed'] as bool;
 }
 
-/// A direct `cleanupStagedSend`, judged by what the platform is contracted
-/// to answer: a map with the boolean `removed` — `true` also when the stage
-/// directory is already gone, `false` when something is left behind. For an
-/// id whose staging is registered it answers `STAGE_IO_FAILED` / `busy` at
-/// call time.
-Future<({String text, bool shapeOk, bool? removed})> _cleanup(
-    _Run run, String stageId) async {
-  final answer = await _settled(
-      run,
-      _storageChannel.invokeMethod<Object?>(
-          'cleanupStagedSend', <String, Object?>{'stageId': stageId}));
+/// A cleanup answer judged by what the platform is contracted to answer: a
+/// map with the boolean `removed` — `true` also when the stage directory is
+/// already gone, `false` when something is left behind. For an id whose
+/// staging is registered it answers `STAGE_IO_FAILED` / `busy` at call
+/// time.
+({String text, bool shapeOk, bool? removed}) _cleanupAnswer(_Answer answer) {
   final removed = _removedOf(answer);
   return (
     text: removed != null ? 'removed=$removed' : answer.codeToken,
     shapeOk: removed != null,
     removed: removed,
   );
+}
+
+/// A direct `cleanupStagedSend` while the app is in front.
+Future<({String text, bool shapeOk, bool? removed})> _cleanup(
+    _Run run, String stageId) async {
+  final answer = await _settled(
+      run,
+      _storageChannel.invokeMethod<Object?>(
+          'cleanupStagedSend', <String, Object?>{'stageId': stageId}));
+  return _cleanupAnswer(answer);
+}
+
+/// The same call where no frame may be waited for (parts E1 and E2: the
+/// system picker may still be in front when the part ends).
+Future<({String text, bool shapeOk, bool? removed})> _cleanupNoFrame(
+    String stageId) async {
+  final answer = await _call(_storageChannel.invokeMethod<Object?>(
+      'cleanupStagedSend', <String, Object?>{'stageId': stageId}));
+  return _cleanupAnswer(answer);
 }
 
 /// The `stagingProgress` events of the raw channel while the tap is on it:
@@ -544,7 +668,7 @@ class _ProgressTap {
 /// (revision 3, N2): a regular file that stays behind EMPTY once every
 /// grant it recorded is released. So "nothing left" means no stage
 /// directory and no other entry; the journal is reported on its own, by
-/// size only — its lines are tree URIs.
+/// state only — its lines are tree URIs.
 class _RootShape {
   const _RootShape({
     required this.exists,
@@ -570,15 +694,15 @@ class _RootShape {
   /// journal is being rewritten, which is over before a staging answers.
   final bool scratch;
 
-  /// `absent`, `empty`, `<n> bytes` or `not-a-file`.
+  /// `absent`, `empty`, `lines:<n>`, `not-a-file` or `unreadable`.
   final String journal;
 
   /// No stage directory and nothing else: the root holds no copy.
   bool get holdsNothing => exists && stageDirs == 0 && other == 0;
 
-  /// [holdsNothing], with the journal empty and its scratch file gone.
+  /// [holdsNothing], with nothing journaled and the scratch file gone.
   bool get clear =>
-      holdsNothing && !scratch && (journal == 'absent' || journal == 'empty');
+      holdsNothing && !scratch && _journalClear(journal);
 
   String get describe =>
       'exists=$exists|children=$children|stageDirs=$stageDirs|other=$other'
@@ -621,35 +745,91 @@ _RootShape _rootShape(String root) {
   );
 }
 
-/// The grant journal by SIZE only — a line in it is a tree URI the send
-/// side still holds the read grant of; the line itself never prints.
+// pure helpers: start
+//
+// The four below need nothing but dart:io and decide what a state string
+// means. The host's self-test lifts them out of this file between these two
+// marker lines and runs them; keep them free of the test's other members.
+
+/// The lowest API level the app is built for: a smaller number is not one.
+const int _minApi = 24;
+
+/// The API level of this image — what part B's RETAKE expects depends on
+/// it. Only the host's own reading of `ro.build.version.sdk` on the image it
+/// drives names the level ([fromHost], dart-define AK_SAF_PROBE_API).
+/// [osVersion] is `Platform.operatingSystemVersion`; it is NOT a release
+/// string on Android — on the x86_64 image its first number is 64 (seen on
+/// the device) — so only that first number is recorded ([osFirst]) and
+/// nothing is ever taken from it. Without the host's value the level is null
+/// and the RETAKE fails by name: no answer is ever expected at random.
+({int? level, String source, int? osFirst}) _apiLevelOf(
+    String osVersion, int fromHost) {
+  final match = RegExp(r'[0-9]+').firstMatch(osVersion);
+  final first = match == null ? null : int.tryParse(match.group(0)!);
+  if (fromHost >= _minApi && fromHost <= 99) {
+    return (level: fromHost, source: 'host', osFirst: first);
+  }
+  return (level: null, source: 'none', osFirst: first);
+}
+
+/// The folder a tree URI names — for a channel that answers no display name:
+/// the document id is the URI's last segment
+/// (`…/tree/primary%3ADownload%2Fakstage`), and its last component is the
+/// folder. Compared with a preset label, never printed.
+String _folderOfTreeUri(String treeUri) {
+  var decoded = '';
+  try {
+    decoded = Uri.decodeComponent(treeUri.split('/').last);
+  } on Object {
+    return '';
+  }
+  final cut = decoded.lastIndexOf('/');
+  return cut < 0 ? decoded : decoded.substring(cut + 1);
+}
+
+/// The state of the grant journal — by LINE COUNT, never by content (a line
+/// is a tree URI): `absent`, `empty`, `lines:<n>`, and anything else —
+/// `not-a-file`, `unreadable`. Only a regular file is looked into, and
+/// only its bytes are counted.
 String _journalState(String root) {
   final journal = io.File('$root/$_journalName');
   switch (io.FileSystemEntity.typeSync(journal.path, followLinks: false)) {
     case io.FileSystemEntityType.notFound:
       return 'absent';
     case io.FileSystemEntityType.file:
-      final bytes = journal.lengthSync();
-      return bytes == 0 ? 'empty' : '$bytes bytes';
+      break;
     default:
       return 'not-a-file';
   }
+  final List<int> bytes;
+  try {
+    bytes = journal.readAsBytesSync();
+  } on Object {
+    return 'unreadable';
+  }
+  var lines = 0;
+  var inLine = false;
+  for (final byte in bytes) {
+    if (byte == 0x0a) {
+      if (inLine) lines += 1;
+      inLine = false;
+    } else if (byte != 0x0d && byte != 0x09 && byte != 0x20) {
+      inLine = true;
+    }
+  }
+  if (inLine) lines += 1;
+  return lines == 0 ? 'empty' : 'lines:$lines';
 }
 
-/// How many lines the grant journal holds — counted, never read out loud
-/// (a line is a tree URI). -1 when it cannot be read.
-int _journalLines(String root) {
-  final journal = io.File('$root/$_journalName');
-  if (!_isRegularFile(journal.path)) return 0;
-  try {
-    return journal
-        .readAsLinesSync()
-        .where((line) => line.trim().isNotEmpty)
-        .length;
-  } on Object {
-    return -1;
-  }
-}
+/// Whether [state] says the send side journaled a take: `lines:` with at
+/// least one line — never "anything but absent".
+bool _journaled(String state) =>
+    RegExp(r'^lines:([1-9][0-9]*)$').hasMatch(state);
+
+/// Whether [state] says nothing is journaled: absent or empty, and nothing
+/// else — a journal that is not a file, or cannot be read, is not clear.
+bool _journalClear(String state) => state == 'absent' || state == 'empty';
+// pure helpers: end
 
 bool _isRegularFile(String path) =>
     io.FileSystemEntity.typeSync(path, followLinks: false) ==
@@ -725,23 +905,6 @@ _StageDir _stageDirState(String dir, {String root = _deepName}) {
 // Small helpers.
 // ---------------------------------------------------------------------------
 
-/// The text of the widget under [key] (the key's own text, else its texts
-/// joined with " / "); empty when there is no such widget).
-String _textAt(WidgetTester tester, String key) {
-  final finder = find.byKey(ValueKey<String>(key));
-  if (finder.evaluate().isEmpty) return '';
-  final widget = finder.evaluate().first.widget;
-  if (widget is Text) {
-    return widget.data ?? widget.textSpan?.toPlainText() ?? '';
-  }
-  return find
-      .descendant(of: finder, matching: find.byType(Text))
-      .evaluate()
-      .map((e) => e.widget as Text)
-      .map((t) => t.data ?? t.textSpan?.toPlainText() ?? '')
-      .join(' / ');
-}
-
 String _basename(String path) => path.substring(path.lastIndexOf('/') + 1);
 
 Future<String> _sha256Of(io.File file) async =>
@@ -749,6 +912,16 @@ Future<String> _sha256Of(io.File file) async =>
 
 String _sha256OfText(String text) =>
     crypto.sha256.convert(utf8.encode(text)).toString();
+
+/// The digest the preset names for [rel]: the text's, the empty file's, or
+/// — for nested/photo.bin — the host's (AK_SAF_PROBE_SHA_BIG).
+String? _digestOf(String rel, String shaBig) => rel == _bigRel
+    ? shaBig
+    : _texts.containsKey(rel)
+        ? _sha256OfText(_texts[rel]!)
+        : rel == _emptyRel
+            ? _emptySha
+            : null;
 
 /// The staged tree under [root]: every entry by its path relative to it.
 Future<Map<String, io.FileSystemEntity>> _walk(String root) async {
@@ -779,25 +952,38 @@ Future<String> _derivedRoot() async {
   }
 }
 
-/// The refusal dialog of the gateway, when one is up. Its copy is static
-/// UI text and says why the folder was refused.
+/// Whether the gateway's refusal dialog is up. That is all it says: the
+/// dialog's text carries the platform's reason, which may name a folder or
+/// a path, and no value read from the device reaches a line.
 void _refusalDialog(WidgetTester tester, String part) {
   if (find.byKey(const ValueKey('staging_error_dialog')).evaluate().isEmpty) {
     return;
   }
-  zSay('$part|ERROR_DIALOG|title=${_textAt(tester, 'staging_error_title')}'
-      '|body=${_textAt(tester, 'staging_error_body')}');
+  zSay('$part|ERROR_DIALOG|up=true');
 }
 
-/// A pick through the raw channel [method]: asks for the host's drive,
-/// waits for it and hands back the tree URI — which never prints — or
-/// null. No answer within the budget means no drive came.
+/// The API level of THIS image: the platform's version string, and the
+/// host's dart-define.
+({int? level, String source, int? osFirst}) _apiLevel() => _apiLevelOf(
+    io.Platform.operatingSystemVersion,
+    const int.fromEnvironment('AK_SAF_PROBE_API', defaultValue: 0));
+
+/// A pick through the raw channel [method]: asks for the host's drive
+/// (`<part>|<picker>|tree|…`), waits for it WITHOUT a frame — the system
+/// picker is in front until the host has confirmed it — and hands back the
+/// tree URI, which never prints, or null. No answer within the budget means
+/// no drive came. [label] is the folder the contract names for this pick:
+/// the name the platform answers is compared with it — a channel that answers
+/// no name has the folder read off its tree URI — and only whether they match
+/// is printed.
 Future<String?> _rawPick(_Run run, String part, String method,
-    {int seconds = _pickSeconds}) async {
-  zSay('$part|PICKER|tree|awaiting external DocumentsUI drive');
-  final picked = await _settled(
-      run, _storageChannel.invokeMethod<Object?>(method),
-      seconds: seconds);
+    {required String label,
+    int seconds = _pickSeconds,
+    String picker = 'PICKER'}) async {
+  zSay('$part|$picker|tree|awaiting external DocumentsUI drive');
+  final picked =
+      _Answer.capture(_storageChannel.invokeMethod<Object?>(method));
+  await picked.wait(seconds);
   if (!picked.answered) {
     run.pickerStalled = true;
   }
@@ -805,12 +991,16 @@ Future<String?> _rawPick(_Run run, String part, String method,
   final treeUri = map is Map && map['treeUri'] is String
       ? map['treeUri'] as String
       : null;
+  // pickSendFolder answers the folder's display name; pickFolder answers
+  // none — its folder is read off the tree URI's own document id instead.
   final name = map is Map && map['displayName'] is String
       ? map['displayName'] as String
-      : '';
+      : treeUri == null
+          ? ''
+          : _folderOfTreeUri(treeUri);
   run.lastPickName = name;
-  zSay('$part|PICKED|selected=${treeUri != null}'
-      '|name=${map is Map ? map['displayName'] : ''}'
+  zSay('$part|${picker.replaceFirst('PICKER', 'PICKED')}'
+      '|selected=${treeUri != null}|nameIsPreset=${name == label}'
       '|uriIsTree=${treeUri?.startsWith('content://')}'
       '|threw=${picked.error == null ? 'no' : picked.verdict}');
   return treeUri;
@@ -819,8 +1009,9 @@ Future<String?> _rawPick(_Run run, String part, String method,
 Future<_Answer> _listGrants(_Run run) => _settled(
     run, _storageChannel.invokeMethod<Object?>('listSafPersisted'));
 
-/// `rw`, `r-`, `-w` or `--` for the persisted grant of exactly [treeUri];
-/// `absent` without one. The URIs themselves stay on the device.
+/// The persisted grant of exactly [treeUri] as a word: `rw`, `r`, `w`,
+/// `--` — or `absent` without one, `error:<verdict>` when the list itself
+/// did not answer. The URIs themselves stay on the device.
 Future<String> _grantFlags(_Run run, String treeUri) async =>
     _flagsIn(await _listGrants(run), treeUri);
 
@@ -829,8 +1020,12 @@ String _flagsIn(_Answer listed, String treeUri) {
   if (!listed.answered || grants is! List) return 'error:${listed.verdict}';
   for (final grant in grants) {
     if (grant is Map && grant['uri'] == treeUri) {
-      return '${grant['read'] == true ? 'r' : '-'}'
-          '${grant['write'] == true ? 'w' : '-'}';
+      final read = grant['read'] == true;
+      final write = grant['write'] == true;
+      if (read && write) return 'rw';
+      if (read) return 'r';
+      if (write) return 'w';
+      return '--';
     }
   }
   return 'absent';
@@ -851,12 +1046,55 @@ int _readOnlyIn(_Answer listed) {
   return left;
 }
 
-/// The same count as text for the evidence lines; `error:<verdict>` when
-/// the list itself did not answer.
+/// How many persisted grants there are in all; -1 when the list itself did
+/// not answer.
+int _grantsIn(_Answer listed) =>
+    listed.answered && listed.value is List ? (listed.value as List).length : -1;
+
+/// The READ-only count as text for the evidence lines; `error:<verdict>`
+/// when the list itself did not answer.
 Future<String> _readOnlyGrants(_Run run) async {
   final listed = await _listGrants(run);
   final left = _readOnlyIn(listed);
   return left < 0 ? 'error:${listed.verdict}' : '$left';
+}
+
+/// When the app came back in front after a pick was asked for — the moment
+/// the host confirmed the system picker. A lifecycle message, so it needs
+/// no frame (the app's are paused while the picker is in front). The count
+/// it records is the caller's: of its own events, at that moment.
+class _ForegroundTap with WidgetsBindingObserver {
+  int Function()? _events;
+  bool _away = false;
+  int? _resumedAfterEvents;
+
+  /// How many events had passed when the app was back; null if it never was.
+  int? get resumedAfterEvents => _resumedAfterEvents;
+
+  void install(int Function() events) {
+    _events = events;
+    _away = false;
+    _resumedAfterEvents = null;
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  void remove() {
+    WidgetsBinding.instance.removeObserver(this);
+    _events = null;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // The app was away (the picker in front) and is back: that is the confirm.
+      if (_away && _resumedAfterEvents == null) {
+        _resumedAfterEvents = _events?.call() ?? 0;
+      }
+      _away = false;
+    } else {
+      _away = true;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -877,8 +1115,12 @@ Future<void> _partA(_Run run, String shaBig) async {
 
   zSay('A|PICKER|tree|awaiting external DocumentsUI drive');
   final gateway = const PluginFilePickGateway();
+  // No frame is waited for: the system picker is in front from here until
+  // the host has confirmed it. The live binding draws by itself once the
+  // app is back, and the gateway's answer arrives without a pump.
   final pick = _Answer.capture(gateway.pickSendDirectory());
-  if (!await _pumpUntil(tester, () => pick.answered, _pickSeconds)) {
+  await pick.wait(_pickSeconds);
+  if (!pick.answered) {
     // No drive came: free the gateway from a dialog it may be waiting on.
     // The picker is left as it is — the host ends the round.
     run.pickerStalled = true;
@@ -895,9 +1137,9 @@ Future<void> _partA(_Run run, String shaBig) async {
 
   final entry = pick.value as PickedEntry?;
   final id = entry?.stagingId;
-  zSay('A|STAGED|name=${entry?.name}|files=${entry?.stagedFileCount}'
-      '|bytes=${entry?.stagedByteCount}|staged=${id != null}'
-      '|pathIsFs=${entry?.path.startsWith('/')}'
+  zSay('A|STAGED|nameIsPreset=${entry?.name == _rootName}'
+      '|files=${entry?.stagedFileCount}|bytes=${entry?.stagedByteCount}'
+      '|staged=${id != null}|pathIsFs=${entry?.path.startsWith('/')}'
       '|threw=${pick.error == null ? 'no' : pick.verdict}');
   if (id != null) run.owned.add(id);
   if (entry == null || id == null) {
@@ -929,57 +1171,43 @@ Future<void> _partA(_Run run, String shaBig) async {
   need(entry.stagedFileCount == _sizes.length, 'file-count');
   need(entry.stagedByteCount == _expectedBytes, 'byte-count');
 
+  // The staged copy against the preset tree — by PRESET label. One line per
+  // preset entry: whether the copy has it, of the kind, the size and the
+  // digest the preset names; and one count for everything the copy holds
+  // beyond the preset. A relative name read off the device never prints: a
+  // directory where a file belongs — and the other way round — is a wrong
+  // copy, not a skip (the path set alone would still be equal).
   final entries = await _walk(path);
-  final rels = entries.keys.toList()..sort();
-  for (final rel in rels) {
-    final entity = entries[rel]!;
-    // What the tree says must be here: a file, a directory, or nothing.
-    final wanted = _sizes.containsKey(rel)
-        ? 'file'
-        : _directories.contains(rel)
-            ? 'dir'
-            : null;
-    if (entity is io.Directory) {
-      zSay('A|ENTRY|rel=$rel|kind=dir');
-      // A directory where a file belongs is a wrong copy, not a skip: the
-      // path set alone would still be equal.
-      if (wanted != null && wanted != 'dir') need(false, 'kind:$rel(file)');
-      continue;
-    }
-    if (entity is! io.File) {
-      // The stager never writes a link: anything else is a defect to name.
-      need(false, 'kind:$rel');
-      zSay('A|ENTRY|rel=$rel|kind=other');
-      continue;
-    }
-    if (wanted != null && wanted != 'file') need(false, 'kind:$rel(dir)');
-    final size = await entity.length();
-    final digest = await _sha256Of(entity);
-    zSay('A|ENTRY|rel=$rel|kind=file|size=$size|sha256=$digest');
-    if (size != _sizes[rel]) need(false, 'size:$rel');
-    final expectedSha = rel == _bigRel
-        ? shaBig
-        : _texts.containsKey(rel)
-            ? _sha256OfText(_texts[rel]!)
-            : rel == _emptyRel
-                ? _emptySha
-                : null;
-    if (expectedSha != null && digest != expectedSha) need(false, 'sha:$rel');
+  final preset = <String>{..._sizes.keys, ..._directories}.toList()..sort();
+  var extra = 0;
+  for (final rel in entries.keys) {
+    if (!preset.contains(rel)) extra += 1;
   }
-
-  final expected = <String>{..._sizes.keys, ..._directories};
-  final missing = expected
-      .where((rel) => !entries.containsKey(rel))
-      .toList()
-    ..sort();
-  final extra = entries.keys
-      .where((rel) => !expected.contains(rel))
-      .toList()
-    ..sort();
-  if (missing.isNotEmpty || extra.isNotEmpty) {
-    need(false, 'rel-set');
-    zSay('A|RELSET|missing=${missing.join(',')}|extra=${extra.join(',')}');
+  for (final rel in preset) {
+    final entity = entries[rel];
+    final file = _sizes.containsKey(rel);
+    final found = entity != null;
+    var kind = false;
+    var size = false;
+    var sha = false;
+    if (entity is io.File && file) {
+      kind = true;
+      size = await entity.length() == _sizes[rel];
+      sha = await _sha256Of(entity) == _digestOf(rel, shaBig);
+    } else if (entity is io.Directory && !file) {
+      kind = true;
+    }
+    zSay('A|ENTRY|label=$rel|found=$found|kind=$kind'
+        '|size=${file ? size : 'na'}|sha=${file ? sha : 'na'}');
+    need(found, 'missing:$rel');
+    need(kind, 'kind:$rel');
+    if (file) {
+      need(size, 'size:$rel');
+      need(sha, 'sha:$rel');
+    }
   }
+  zSay('A|EXTRA|unknown=$extra');
+  need(extra == 0, 'extra-entries:$extra');
 
   // Exactly one stage directory — the one just staged — and, besides it,
   // nothing but the grant journal the send side keeps in the staging root.
@@ -1024,7 +1252,7 @@ Future<void> _partA(_Run run, String shaBig) async {
 }
 
 // ---------------------------------------------------------------------------
-// Part B — the failure paths through the raw channel.
+// Part B — the failure paths through the raw channel, and the RETAKE.
 // ---------------------------------------------------------------------------
 
 Future<void> _partB(_Run run) async {
@@ -1037,13 +1265,14 @@ Future<void> _partB(_Run run) async {
     run.problems.addAll(<String>[for (final f in failures) 'B:$f']);
   }
 
-  final treeUri = await _rawPick(run, 'B', 'pickSendFolder');
+  final treeUri = await _rawPick(run, 'B', 'pickSendFolder', label: _rootName);
   if (treeUri == null) {
     need(false, 'pick-no-tree');
     zSay('B|DONE|failed=${failures.length}');
     return collect();
   }
   run.treeUri = treeUri;
+  need(run.lastPickName == _rootName, 'pick-wrong-folder');
 
   Future<_Answer> stage(String uri, String stageId) =>
       _settled(run, _stageCall(uri, stageId));
@@ -1116,70 +1345,142 @@ Future<void> _partB(_Run run) async {
     need(false, 'idempotent-value:${first.text}/${second.text}');
   }
 
+  // ---- the RETAKE (the API 29 round) ----
+  // The cancelled job has released the READ it took. Read here, because the
+  // retake's answer means something only when nothing is persisted for the
+  // tree any more: with READ still there a later staging takes nothing, and
+  // succeeds on every API level.
+  final released = await _grantFlags(run, treeUri);
+  final readOnlyReleased = await _readOnlyGrants(run);
+  final journalReleased = root.isEmpty ? 'na' : _journalState(root);
+  zSay('B|RELEASED|flags=$released|readOnly=$readOnlyReleased'
+      '|journal=$journalReleased');
+  if (root.isEmpty) need(false, 'no-staging-root');
+  if (released != 'absent') need(false, 'cancel-grant-not-released:$released');
+  if (readOnlyReleased != '0') {
+    need(false, 'cancel-read-only-left:$readOnlyReleased');
+  }
+  if (!_journalClear(journalReleased)) {
+    need(false, 'cancel-journal:$journalReleased');
+  }
+
+  // One more staging with the SAME tree URI and no new pick. From API 30 on
+  // the platform lets the send side take READ again: ok. On API 24–29 the
+  // release above took READ out of what a later take may persist — the
+  // platform fact behind G15: SAF_PERMISSION_DENIED.
+  final idR = run.newId();
+  final retake = await stage(treeUri, idR);
+  final api = run.apiLevel;
+  zSay('B|RETAKE|code=${retake.codeToken}|api=${api ?? 'unknown'}');
+  if (api == null) {
+    // Never one of the two answers at random: the run fails under this name.
+    need(false, 'retake-api-unknown');
+  } else if (api < 30) {
+    if (retake.code != 'SAF_PERMISSION_DENIED') {
+      need(false, 'retake-code:$api:${retake.codeToken}');
+    }
+  } else if (retake.code != '' || _statusOf(retake) != 'ok') {
+    need(false, 'retake-status:$api:${_statusOf(retake)}');
+  }
+  // A retake that delivered leaves a copy: it goes. (A refused one has
+  // nothing to clean; the answer is on record all the same.)
+  final retakeCleaned = await _cleanup(run, idR);
+  final rGone = root.isEmpty ? null : !io.Directory('$root/$idR').existsSync();
+  zSay('B|RETAKE_CLEANED|code=${retakeCleaned.text}'
+      '|stageDirGone=${rGone ?? 'unknown'}');
+  if (api != null && api >= 30) {
+    if (!retakeCleaned.shapeOk) {
+      need(false, 'retake-cleanup-shape:${retakeCleaned.text}');
+    }
+    if (retakeCleaned.removed != true || rGone == false) {
+      need(false, 'retake-cleanup:${retakeCleaned.text}/gone=${rGone ?? 'unknown'}');
+    }
+  }
+  // Whatever the retake did, no READ-only grant and no journal line stay
+  // behind — read now, before the next staging of the same tree could
+  // settle a line that is not its own.
+  final readOnlyRetook = await _readOnlyGrants(run);
+  final journalRetook = root.isEmpty ? 'na' : _journalState(root);
+  zSay('B|RETAKE_GRANT|left=$readOnlyRetook|journal=$journalRetook');
+  if (readOnlyRetook != '0') need(false, 'retake-grant-left:$readOnlyRetook');
+  if (!_journalClear(journalRetook)) {
+    need(false, 'retake-journal:$journalRetook');
+  }
+
   // The stale cleanup next to a RUNNING staging: it must not touch the
-  // running job, and its answer must be the map the contract names.
-  final idC = run.newId();
-  final active = _Answer.capture(_stageCall(treeUri, idC));
-  final stale = _Answer.capture(
-      _storageChannel.invokeMethod<Object?>('cleanupStaleStaging'));
-  await _pumpUntil(
-      run.tester, () => active.answered && stale.answered, _workSeconds);
-  final activeMap = active.value;
-  final activePath = activeMap is Map && activeMap['path'] is String
-      ? activeMap['path'] as String
-      : null;
-  final activeName = activeMap is Map && activeMap['displayName'] is String
-      ? activeMap['displayName'] as String
-      : _rootName;
-  final staleMap = stale.value;
-  final staleRemoved =
-      stale.error == null && staleMap is Map && staleMap['removed'] is int
-          ? staleMap['removed'] as int?
-          : null;
-  var payloadKept = false;
-  var markerKept = false;
-  var ownerKept = false;
-  var stageChildren = 0;
-  if (activePath != null) {
-    final stageDir = io.Directory(activePath).parent.parent;
-    final children = <String>{
-      for (final e in stageDir.listSync()) _basename(e.path),
-    };
-    stageChildren = children.length;
-    markerKept = children.contains(_markerName);
-    ownerKept = children.contains(_ownerName);
-    payloadKept =
-        io.Directory('${stageDir.path}/payload/$activeName').existsSync();
-  }
-  zSay('B|ACTIVE'
-      '|staleRemoved=${staleRemoved ?? stale.codeToken}'
-      '|staleShape=${staleRemoved != null ? 'int' : 'bad'}'
-      '|staged=${_statusOf(active)}'
-      '|payloadKept=$payloadKept|markerKept=$markerKept'
-      '|ownerKept=$ownerKept|stageDirChildren=$stageChildren');
-  // Judged while the copy and its marker are still there — nothing has
-  // cleaned idC yet. A delivered stage directory is payload, the completion
-  // marker and the owner file: three entries (N11).
-  if (staleRemoved == null || staleRemoved < 0) {
-    need(false, 'active-stale-answer:${staleRemoved ?? stale.codeToken}');
-  }
-  if (_statusOf(active) != 'ok') {
-    need(false, 'active-staged:${_statusOf(active)}');
-  }
-  if (!payloadKept || !markerKept || !ownerKept || stageChildren != 3) {
-    need(false,
-        'active-kept-copy-marker-owner:$payloadKept/$markerKept/$ownerKept/$stageChildren');
-  }
-  final cleanedC = await _cleanup(run, idC);
-  final cGone =
-      activePath != null && !io.Directory(activePath).parent.parent.existsSync();
-  zSay('B|ACTIVE_CLEANED|code=${cleanedC.text}|stageDirGone=$cGone');
-  if (!cleanedC.shapeOk || cleanedC.removed != true || !cGone) {
-    need(false, 'active-cleanup:${cleanedC.text}/gone=$cGone');
+  // running job, and its answer must be the map the contract names. The
+  // tree is picked afresh first, on every API level: that is what a real
+  // flow has, and after the retake the old URI alone would be refused on
+  // API 24–29.
+  final fresh = await _rawPick(run, 'B', 'pickSendFolder',
+      picker: 'PICKER2', label: _rootName);
+  if (fresh == null) {
+    need(false, 'pick2-no-tree');
+  } else {
+    need(run.lastPickName == _rootName, 'pick2-wrong-folder');
+    final idC = run.newId();
+    final active = _Answer.capture(_stageCall(fresh, idC));
+    final stale = _Answer.capture(
+        _storageChannel.invokeMethod<Object?>('cleanupStaleStaging'));
+    await _pumpUntil(
+        run.tester, () => active.answered && stale.answered, _workSeconds);
+    final activeMap = active.value;
+    final activePath = activeMap is Map && activeMap['path'] is String
+        ? activeMap['path'] as String
+        : null;
+    final activeName = activeMap is Map && activeMap['displayName'] is String
+        ? activeMap['displayName'] as String
+        : _rootName;
+    final staleMap = stale.value;
+    final staleRemoved =
+        stale.error == null && staleMap is Map && staleMap['removed'] is int
+            ? staleMap['removed'] as int?
+            : null;
+    var payloadKept = false;
+    var markerKept = false;
+    var ownerKept = false;
+    var stageChildren = 0;
+    if (activePath != null) {
+      final stageDir = io.Directory(activePath).parent.parent;
+      final children = <String>{
+        for (final e in stageDir.listSync()) _basename(e.path),
+      };
+      stageChildren = children.length;
+      markerKept = children.contains(_markerName);
+      ownerKept = children.contains(_ownerName);
+      payloadKept =
+          io.Directory('${stageDir.path}/payload/$activeName').existsSync();
+    }
+    zSay('B|ACTIVE'
+        '|staleRemoved=${staleRemoved ?? stale.codeToken}'
+        '|staleShape=${staleRemoved != null ? 'int' : 'bad'}'
+        '|staged=${_statusOf(active)}'
+        '|payloadKept=$payloadKept|markerKept=$markerKept'
+        '|ownerKept=$ownerKept|stageDirChildren=$stageChildren');
+    // Judged while the copy and its marker are still there — nothing has
+    // cleaned idC yet. A delivered stage directory is payload, the completion
+    // marker and the owner file: three entries (N11).
+    if (staleRemoved == null || staleRemoved < 0) {
+      need(false, 'active-stale-answer:${staleRemoved ?? stale.codeToken}');
+    }
+    if (_statusOf(active) != 'ok') {
+      need(false, 'active-staged:${_statusOf(active)}');
+    }
+    if (!payloadKept || !markerKept || !ownerKept || stageChildren != 3) {
+      need(false,
+          'active-kept-copy-marker-owner:$payloadKept/$markerKept/$ownerKept/$stageChildren');
+    }
+    final cleanedC = await _cleanup(run, idC);
+    final cGone = activePath != null &&
+        !io.Directory(activePath).parent.parent.existsSync();
+    zSay('B|ACTIVE_CLEANED|code=${cleanedC.text}|stageDirGone=$cGone');
+    if (!cleanedC.shapeOk || cleanedC.removed != true || !cGone) {
+      need(false, 'active-cleanup:${cleanedC.text}/gone=$cGone');
+    }
   }
 
   // Every send-side staging of this part is over: no read-only grant may
-  // be left. The journal is on record by size only.
+  // be left. The journal is on record by state only.
   final left = await _readOnlyGrants(run);
   zSay('B|GRANT|left=$left|journal=${root.isEmpty ? 'na' : _journalState(root)}');
   if (left != '0') need(false, 'grant-left:$left');
@@ -1200,13 +1501,14 @@ Future<void> _partC(_Run run) async {
 
   // The RECEIVE save-dir pick of the existing channel: it persists
   // READ+WRITE for the very same tree.
-  final treeUri = await _rawPick(run, 'C', 'pickFolder');
+  final treeUri = await _rawPick(run, 'C', 'pickFolder', label: _rootName);
   if (treeUri == null) {
     need(false, 'pick-no-tree');
     zSay('C|DONE|failed=${failures.length}');
     run.problems.addAll(<String>[for (final f in failures) 'C:$f']);
     return;
   }
+  need(run.lastPickName == _rootName, 'pick-wrong-folder');
 
   final before = await _grantFlags(run, treeUri);
   final idD = run.newId();
@@ -1385,82 +1687,99 @@ Future<void> _partD(_Run run) async {
 }
 
 // ---------------------------------------------------------------------------
-// Part E — T7: the receive side upgrades the grant DURING a send staging.
-// The folder is nested/deep: a different persisted-grant URI from akstage
-// (part C leaves READ+WRITE there) and one that holds no grant yet — both
-// read through listSafPersisted before anything is staged.
+// Part E1 — T7's first order: the receive side upgrades the grant while a
+// send staging of the SAME folder is still copying. The folder is
+// nested/deep: a different persisted-grant URI from akstage (part C leaves
+// READ+WRITE there) and one that holds no grant yet — both read through
+// listSafPersisted before anything is staged.
 //
-// What is asserted is the END state: both calls succeeded, the URI holds
-// read AND write, no READ-only grant is left anywhere, the journal line is
-// gone. The receive take is serialized behind the running staging on the
-// stager's worker, so the platform's order is "send release first, then
-// receive take" — but no interleaving is asserted here, only the end state.
-// That the pick was confirmed while the staging still copied is reported as
-// timing evidence (E|TIMING).
+// The order is the host's: it confirms the receive picker while the send
+// staging copies its big hold file. The result reaches the Activity, the
+// take queues behind the running staging, the staging enters its wrap-up,
+// the take runs — on Android 7–10 the order that loses the grant unless no
+// release falls between a receive pick's grant and its take (G15). What is
+// asserted is the END state: the staging answered ok, the pick selected the
+// same URI, the URI holds read AND write, no READ-only grant is left
+// anywhere, the journal is absent or empty. Whether the order really
+// happened is on record, not judged — by three order markers without
+// values: the host logs at which copy event it confirmed (its own clock);
+// this test logs at which copy event the app came back in front, and that
+// the pick answered within the slack behind the staging's answer (a take
+// queued behind a staging answers right behind it).
+//
+// From `E1|PICKER2` on no frame is waited for: while DocumentsUI is in
+// front the app's are paused, and a pump issued then stays open until the
+// picker closes.
 // ---------------------------------------------------------------------------
 
-Future<void> _partE(_Run run) async {
+Future<void> _partE1(_Run run) async {
   final failures = <String>[];
   void need(bool ok, String what) {
     if (!ok) failures.add(what);
   }
 
   void collect() {
-    run.problems.addAll(<String>[for (final f in failures) 'E:$f']);
+    run.problems.addAll(<String>[for (final f in failures) 'E1:$f']);
   }
 
   final root = run.stagingRoot.isNotEmpty ? run.stagingRoot : await _derivedRoot();
   final journal = root.isEmpty ? 'na' : _journalState(root);
 
-  // The send-side pick of nested/deep — one more drive. The host builds the
-  // folder's payload while this waits.
-  final deep =
-      await _rawPick(run, 'E', 'pickSendFolder', seconds: _t7PickSeconds);
+  // The send-side pick of nested/deep — one more drive. The host moves the
+  // folder's payload in while this waits.
+  final deep = await _rawPick(run, 'E1', 'pickSendFolder',
+      label: _deepName, seconds: _t7PickSeconds);
   if (deep == null) {
     need(false, 'pick-no-tree');
-    zSay('E|DONE|failed=${failures.length}');
+    zSay('E1|DONE|failed=${failures.length}');
     return collect();
   }
+  run.deepUri = deep;
 
   // What this part relies on, read first. A persisted grant belongs to one
   // exact URI: akstage's READ+WRITE (part C) is not a grant on nested/deep,
   // so the send staging of nested/deep will take READ of its own.
   final akstage = run.treeUri;
-  need(run.lastPickName == _deepName, 'pick-wrong-folder:${run.lastPickName}');
   final akstageFlags =
       akstage == deep ? 'same-uri' : await _grantFlags(run, akstage);
   final deepBefore = await _grantFlags(run, deep);
   final readOnlyBefore = await _readOnlyGrants(run);
-  zSay('E|PRE|deep=$deepBefore|akstage=$akstageFlags'
+  zSay('E1|PRE|flags=$deepBefore|akstage=$akstageFlags'
       '|readOnly=$readOnlyBefore|journal=$journal');
+  need(run.lastPickName == _deepName, 'pick-wrong-folder');
   need(deep != akstage, 'same-uri-as-akstage');
   need(deepBefore == 'absent', 'deep-holds-a-grant:$deepBefore');
   need(akstageFlags == 'rw', 'akstage-not-rw:$akstageFlags');
   need(readOnlyBefore == '0', 'read-only-before:$readOnlyBefore');
+  if (root.isEmpty) need(false, 'no-staging-root');
 
   // The send staging takes READ and journals it. While it copies, the
   // receive side picks the SAME folder: its take is a task queued behind
   // the running staging on the stager's worker.
   final idE = run.newId();
   final tap = _ProgressTap()..install();
-  String? journalDuring;
+  var journalDuring = root.isEmpty ? 'na' : '';
   tap.onCopy = (event) {
-    if (journalDuring != null || event['stageId'] != idE) return;
-    // The take happened before the enumeration: by the first copy event
-    // the journal carries the folder's line.
-    journalDuring = root.isEmpty ? 'na' : _journalState(root);
-    zSay('E|COPY|entries=${event['entriesSeen']}'
+    if (event['stageId'] != idE) return;
+    if (journalDuring == '') journalDuring = _journalState(root);
+    // One line per copy event: the host counts them when it confirms.
+    zSay('E1|COPY|n=${tap.copyEvents(idE)}|entries=${event['entriesSeen']}'
         '|estimate=${event['totalBytesEstimate']}|journal=$journalDuring');
   };
-  zSay('E|START');
+  final front = _ForegroundTap()..install(() => tap.copyEvents(idE));
+  zSay('E1|START');
   final startedAt = _clock.elapsedMilliseconds;
   final staging = _Answer.capture(_stageCall(deep, idE));
-  zSay('E|PICKER2|tree|awaiting external DocumentsUI drive');
+  zSay('E1|PICKER2|tree|awaiting external DocumentsUI drive');
   final pick = _Answer.capture(
       _storageChannel.invokeMethod<Object?>('pickFolder'));
-  await _pumpUntil(
-      run.tester, () => staging.answered && pick.answered, _t7WorkSeconds);
+  await staging.wait(_t7WorkSeconds);
+  await pick.wait(_pickSeconds);
   tap.onCopy = null;
+  front.remove();
+  tap.remove();
+  if (!pick.answered) run.pickerLeftOpen = true;
+
   final pickMap = pick.value;
   final pickedUri = pickMap is Map && pickMap['treeUri'] is String
       ? pickMap['treeUri'] as String
@@ -1469,58 +1788,184 @@ Future<void> _partE(_Run run) async {
   final pickAt = pick.answeredAtMs;
   final pickAfterStagingMs =
       stagingAt != null && pickAt != null ? pickAt - stagingAt : null;
-  // Evidence, not a check: the receive take is queued behind the running
-  // staging on the stager's worker, so a pick that was confirmed while the
-  // copy ran answers right behind the staging — not seconds later.
+  // Order marker, not a check: the receive take is queued behind the
+  // running staging on the stager's worker, so a pick that was confirmed
+  // while the copy ran answers right behind the staging — not seconds
+  // later.
   final answeredRightBehind = pickAfterStagingMs != null &&
       pickAfterStagingMs >= 0 &&
       pickAfterStagingMs <= _behindSlackMs;
   final copyMs = tap.copyMs(idE);
-  zSay('E|PICKED2|selected=${pickedUri != null}|sameUri=${pickedUri == deep}'
+  zSay('E1|PICKED2|selected=${pickedUri != null}|sameUri=${pickedUri == deep}'
       '|threw=${pick.error == null ? 'no' : pick.verdict}');
-  zSay('E|STAGED|status=${_statusOf(staging)}|copyMs=${copyMs ?? 'na'}'
+  zSay('E1|STAGED|status=${_statusOf(staging)}|copyMs=${copyMs ?? 'na'}'
       '|stagingMs=${stagingAt != null ? stagingAt - startedAt : 'na'}'
       '|pickMs=${pickAt != null ? pickAt - startedAt : 'na'}'
       '|pickAfterStagingMs=${pickAfterStagingMs ?? 'na'}');
-  zSay('E|TIMING|pickAnsweredRightBehindStaging=$answeredRightBehind'
-      '|pickAfterStagingMs=${pickAfterStagingMs ?? 'na'}');
+  zSay('E1|ORDER|confirmSeenAfterCopyEvents=${front.resumedAfterEvents ?? 'na'}'
+      '|copyEventsTotal=${tap.copyEvents(idE)}'
+      '|pickAnsweredAfterStagingMs=${pickAfterStagingMs ?? 'na'}'
+      '|pickAnsweredRightBehind=$answeredRightBehind');
 
   // Both succeeded, and the grant is the receive side's now.
-  final listedAfter = await _listGrants(run);
+  final listedAfter = await _call(
+      _storageChannel.invokeMethod<Object?>('listSafPersisted'));
   final deepAfter = _flagsIn(listedAfter, deep);
   final readOnlyAfter = _readOnlyIn(listedAfter);
   final journalAfter = root.isEmpty ? 'na' : _journalState(root);
-  zSay('E|AFTER|deep=$deepAfter|readOnly=$readOnlyAfter'
-      '|journal=$journalAfter');
-  tap.remove();
+  zSay('E1|AFTER|selected=${pickedUri != null}|sameUri=${pickedUri == deep}'
+      '|flags=$deepAfter|readOnly=$readOnlyAfter|journal=$journalAfter');
 
   need(_statusOf(staging) == 'ok', 'staged:${_statusOf(staging)}');
-  final took = journalDuring != null &&
-      journalDuring != 'absent' &&
-      journalDuring != 'empty' &&
-      journalDuring != 'na';
-  if (!took) need(false, 'send-take-not-journalled:$journalDuring');
+  // The take happened before the enumeration: by the first copy event the
+  // journal carries the folder's line — `lines:` with a line in it, never
+  // "anything but absent".
+  if (!_journaled(journalDuring)) {
+    need(false, 'send-take-not-journalled:$journalDuring');
+  }
   if (pickedUri == null) need(false, 'pick-no-folder');
   if (pickedUri != deep) need(false, 'pick-other-folder');
   // The END state is what this part asserts: with the receive take
   // serialized behind the running staging, the platform's order is "send
   // release first, then receive take", and no interleaving is asserted.
-  if (deepAfter != 'rw') need(false, 'deep-after:$deepAfter');
-  if (readOnlyAfter != 0) need(false, 'read-only-after:$readOnlyAfter');
-  if (journalAfter != 'absent' && journalAfter != 'empty') {
-    need(false, 'journal-after:$journalAfter');
-  }
+  if (deepAfter != 'rw') need(false, 'after-flags:$deepAfter');
+  if (readOnlyAfter != 0) need(false, 'after-read-only:$readOnlyAfter');
+  if (!_journalClear(journalAfter)) need(false, 'after-journal:$journalAfter');
 
-  final cleaned = await _cleanup(run, idE);
+  final cleaned = await _cleanupNoFrame(idE);
   final gone = root.isEmpty ? null : !io.Directory('$root/$idE').existsSync();
-  zSay('E|CLEANED|${cleaned.text}|stageDirGone=${gone ?? 'unknown'}');
+  zSay('E1|CLEANED|${cleaned.text}|stageDirGone=${gone ?? 'unknown'}');
   if (!cleaned.shapeOk) need(false, 'cleanup-shape:${cleaned.text}');
   if (root.isEmpty) need(false, 'no-staging-root');
   if (cleaned.removed != true || gone == false) {
     need(false, 'cleanup:${cleaned.text}/gone=${gone ?? 'unknown'}');
   }
 
-  zSay('E|DONE|failed=${failures.length}');
+  zSay('E1|DONE|failed=${failures.length}');
+  collect();
+}
+
+// ---------------------------------------------------------------------------
+// Part E2 — T7's second order: the receive pick FIRST. It is the order that
+// tells a broken deferral from a correct one on Android 15.
+//
+// The folder is nested/dip (built by the host, note.txt only — a few bytes),
+// and it holds no persisted grant, read through listSafPersisted first; the
+// part's tree URI comes from a send-side pick of it, which takes no grant.
+//
+// `pickFolder` is called FIRST: the platform thread registers the pick while
+// it handles that message, before the staging message that follows — both
+// leave back to back. The host parks the picker on the folder WITHOUT
+// confirming; the send staging runs to its end meanwhile. Observation 1,
+// with the picker still parked (the line `E2|HOLD`, the host's cue to
+// confirm): the staging answered ok, the URI is READ-only, exactly one
+// READ-only grant exists, the journal holds exactly one line. Observation 2,
+// after the pick answered: the URI is READ+WRITE, no READ-only grant, the
+// journal absent or empty.
+//
+// No frame is waited for anywhere in this part: the system picker is in
+// front from `E2|PICKER` until the host has confirmed it.
+// ---------------------------------------------------------------------------
+
+Future<void> _partE2(_Run run) async {
+  final failures = <String>[];
+  void need(bool ok, String what) {
+    if (!ok) failures.add(what);
+  }
+
+  void collect() {
+    run.problems.addAll(<String>[for (final f in failures) 'E2:$f']);
+  }
+
+  final root = run.stagingRoot.isNotEmpty ? run.stagingRoot : await _derivedRoot();
+
+  // The part's tree URI, from a send-side pick: a pick takes no grant —
+  // read below, before anything is staged.
+  final dip = await _rawPick(run, 'E2', 'pickSendFolder',
+      picker: 'PICKER0', label: _dipName);
+  if (dip == null) {
+    need(false, 'pick-no-tree');
+    zSay('E2|DONE|failed=${failures.length}');
+    return collect();
+  }
+
+  final dipBefore = await _grantFlags(run, dip);
+  final readOnlyBefore = await _readOnlyGrants(run);
+  final journalBefore = root.isEmpty ? 'na' : _journalState(root);
+  zSay('E2|PRE|flags=$dipBefore|readOnly=$readOnlyBefore|journal=$journalBefore');
+  need(run.lastPickName == _dipName, 'pick-wrong-folder');
+  need(dip != run.treeUri && dip != run.deepUri, 'same-uri-as-another-part');
+  need(dipBefore == 'absent', 'dip-holds-a-grant:$dipBefore');
+  need(readOnlyBefore == '0', 'read-only-before:$readOnlyBefore');
+  if (root.isEmpty) need(false, 'no-staging-root');
+
+  // The receive pick FIRST, the staging message right behind it.
+  final idQ = run.newId();
+  final tap = _ProgressTap()..install();
+  tap.onCopy = (event) {
+    if (event['stageId'] != idQ) return;
+    zSay('E2|COPY|n=${tap.copyEvents(idQ)}|entries=${event['entriesSeen']}'
+        '|estimate=${event['totalBytesEstimate']}');
+  };
+  zSay('E2|PICKER|tree|awaiting external DocumentsUI drive');
+  final pick = _Answer.capture(
+      _storageChannel.invokeMethod<Object?>('pickFolder'));
+  final staging = _Answer.capture(_stageCall(dip, idQ));
+  await staging.wait(_workSeconds);
+  tap.onCopy = null;
+  tap.remove();
+
+  // Observation 1 — the picker is still parked: the send side took READ and
+  // journaled it, and nothing has released it. This line is the host's cue.
+  final held = await _call(
+      _storageChannel.invokeMethod<Object?>('listSafPersisted'));
+  final heldFlags = _flagsIn(held, dip);
+  final heldReadOnly = _readOnlyIn(held);
+  final heldJournal = root.isEmpty ? 'na' : _journalState(root);
+  zSay('E2|HOLD|staged=${_statusOf(staging)}|flags=$heldFlags'
+      '|readOnly=$heldReadOnly|journal=$heldJournal');
+  need(_statusOf(staging) == 'ok', 'hold-staged:${_statusOf(staging)}');
+  need(heldFlags == 'r', 'hold-flags:$heldFlags');
+  need(heldReadOnly == 1, 'hold-read-only:$heldReadOnly');
+  need(heldJournal == 'lines:1', 'hold-journal:$heldJournal');
+
+  // The host confirms on that line: the take runs, and the journal is
+  // settled behind it.
+  await pick.wait(_pickSeconds);
+  if (!pick.answered) run.pickerLeftOpen = true;
+
+  // Observation 2 — after the pick answered.
+  final pickMap = pick.value;
+  final pickedUri = pickMap is Map && pickMap['treeUri'] is String
+      ? pickMap['treeUri'] as String
+      : null;
+  final after = await _call(
+      _storageChannel.invokeMethod<Object?>('listSafPersisted'));
+  final dipAfter = _flagsIn(after, dip);
+  final readOnlyAfter = _readOnlyIn(after);
+  final journalAfter = root.isEmpty ? 'na' : _journalState(root);
+  zSay('E2|AFTER|selected=${pickedUri != null}|sameUri=${pickedUri == dip}'
+      '|flags=$dipAfter|readOnly=$readOnlyAfter|journal=$journalAfter'
+      '|threw=${pick.error == null ? 'no' : pick.verdict}');
+  if (!pick.answered) need(false, 'pick-no-answer');
+  if (pickedUri == null) need(false, 'pick-no-folder');
+  if (pickedUri != dip) need(false, 'pick-other-folder');
+  if (dipAfter != 'rw') need(false, 'after-flags:$dipAfter');
+  if (readOnlyAfter != 0) need(false, 'after-read-only:$readOnlyAfter');
+  if (!_journalClear(journalAfter)) need(false, 'after-journal:$journalAfter');
+
+  // The copy of this part goes. The tree's READ+WRITE stays: it is the
+  // receive side's now, and no channel method releases it.
+  final cleaned = await _cleanupNoFrame(idQ);
+  final gone = root.isEmpty ? null : !io.Directory('$root/$idQ').existsSync();
+  zSay('E2|CLEANED|${cleaned.text}|stageDirGone=${gone ?? 'unknown'}');
+  if (!cleaned.shapeOk) need(false, 'cleanup-shape:${cleaned.text}');
+  if (root.isEmpty) need(false, 'no-staging-root');
+  if (cleaned.removed != true || gone == false) {
+    need(false, 'cleanup:${cleaned.text}/gone=${gone ?? 'unknown'}');
+  }
+
+  zSay('E2|DONE|failed=${failures.length}');
   collect();
 }
 
@@ -1531,7 +1976,8 @@ Future<void> _partE(_Run run) async {
 // ---------------------------------------------------------------------------
 
 Future<void> _leaveRun(WidgetTester tester) async {
-  zSay('K|MODE|leave|android=${io.Platform.isAndroid}');
+  zSay('K|MODE|leave|android=${io.Platform.isAndroid}'
+      '|api=${_apiLevel().level ?? 'unreadable'}');
   expect(io.Platform.isAndroid, isTrue,
       reason: 'the kill round needs the Android channel');
 
@@ -1541,7 +1987,7 @@ Future<void> _leaveRun(WidgetTester tester) async {
   final root = await _derivedRoot();
   final tap = _ProgressTap()..install();
 
-  final deep = await _rawPick(run, 'K', 'pickSendFolder');
+  final deep = await _rawPick(run, 'K', 'pickSendFolder', label: _deepName);
   if (deep == null) {
     // Nothing is started; the host reads this and ends the launch.
     zSay('K|ABORT|pick-returned-nothing');
@@ -1554,12 +2000,12 @@ Future<void> _leaveRun(WidgetTester tester) async {
   final listed = await _listGrants(run);
   final deepBefore = _flagsIn(listed, deep);
   final readOnlyBefore = _readOnlyIn(listed);
-  zSay('K|START|deep=$deepBefore|readOnly=$readOnlyBefore'
+  zSay('K|START|flags=$deepBefore|readOnly=$readOnlyBefore'
       '|journal=${root.isEmpty ? 'na' : _journalState(root)}');
-  expect(run.lastPickName, _deepName,
-      reason: 'the picker did not end in nested/deep (${run.lastPickName})');
+  expect(run.lastPickName == _deepName, isTrue,
+      reason: 'the picker did not end in nested/deep');
   expect(deepBefore, 'absent',
-      reason: 'nested/deep already holds a persisted grant ($deepBefore) — '
+      reason: 'nested/deep already holds a persisted grant — '
           'the kill round needs a fresh install');
   expect(readOnlyBefore, 0,
       reason: 'a READ-only grant exists before the staging — not a fresh install');
@@ -1577,7 +2023,7 @@ Future<void> _leaveRun(WidgetTester tester) async {
     final state = root.isEmpty ? null : _stageDirState('$root/$id');
     zSay('K|HOLD|marker=${state?.marker}|owner=${state?.ownerWritten}'
         '|payload=${state?.payload}|holdBytes=${state?.holdBytes}'
-        '|journalLines=${root.isEmpty ? 'na' : _journalLines(root)}');
+        '|journal=${root.isEmpty ? 'na' : _journalState(root)}');
   };
   final staging = _Answer.capture(_stageCall(deep, id));
   // The app is stopped while this waits: the call normally never answers.
@@ -1608,7 +2054,8 @@ Future<void> _checkRun(WidgetTester tester) async {
     if (!ok) failures.add(what);
   }
 
-  zSay('K|MODE|check|android=${io.Platform.isAndroid}|holdFull=$holdFull');
+  zSay('K|MODE|check|android=${io.Platform.isAndroid}|holdFull=$holdFull'
+      '|api=${_apiLevel().level ?? 'unreadable'}');
   expect(io.Platform.isAndroid, isTrue,
       reason: 'the kill round needs the Android channel');
 
@@ -1630,9 +2077,8 @@ Future<void> _checkRun(WidgetTester tester) async {
     final listedBefore = await _call(
         _storageChannel.invokeMethod<Object?>('listSafPersisted'));
     final readOnlyBefore = _readOnlyIn(listedBefore);
-    final grantsBefore =
-        listedBefore.value is List ? (listedBefore.value as List).length : -1;
-    zSay('K|BEFORE|${before.describe}|journalLines=${_journalLines(root)}'
+    final grantsBefore = _grantsIn(listedBefore);
+    zSay('K|BEFORE|${before.describe}'
         '|marker=${one?.marker}|owner=${one == null ? 'absent' : one.ownerWritten}'
         '|ownerBytes=${one?.ownerBytes}|payload=${one?.payload}'
         '|holdBytes=${one?.holdBytes}|grants=$grantsBefore'
@@ -1658,9 +2104,8 @@ Future<void> _checkRun(WidgetTester tester) async {
         }
       }
     }
-    if (_journalLines(root) != 1) {
-      need(false, 'before-journal-lines:${_journalLines(root)}');
-    }
+    // Exactly one line — the stopped process's take — and nothing else.
+    if (before.journal != 'lines:1') need(false, 'before-journal:${before.journal}');
     if (readOnlyBefore != 1) need(false, 'before-read-only:$readOnlyBefore');
   }
 
@@ -1679,21 +2124,24 @@ Future<void> _checkRun(WidgetTester tester) async {
     need(false, 'sweep-removed:$removed');
   }
 
-  // AFTER: the staging root holds nothing, and no READ-only grant remains.
+  // AFTER: the staging root holds nothing — and on a fresh install no
+  // persisted grant of any kind remains, READ-only or not.
   final listedAfter = await _call(
       _storageChannel.invokeMethod<Object?>('listSafPersisted'));
   final readOnlyAfter = _readOnlyIn(listedAfter);
+  final grantsAfter = _grantsIn(listedAfter);
   if (root.isEmpty) {
-    zSay('K|AFTER|root=unresolved|readOnly=$readOnlyAfter');
+    zSay('K|AFTER|root=unresolved|readOnly=$readOnlyAfter'
+        '|grantsAfter=$grantsAfter');
   } else {
     final after = _rootShape(root);
-    zSay('K|AFTER|${after.describe}|journalLines=${_journalLines(root)}'
-        '|readOnly=$readOnlyAfter');
+    zSay('K|AFTER|${after.describe}|readOnly=$readOnlyAfter'
+        '|grantsAfter=$grantsAfter');
     if (!after.clear) need(false, 'after-not-clear:${after.describe}');
   }
   if (readOnlyAfter != 0) need(false, 'after-read-only:$readOnlyAfter');
+  if (grantsAfter != 0) need(false, 'after-grants:$grantsAfter');
 
   zSay('K|DONE|failed=${failures.length}');
   expect(failures, isEmpty, reason: 'failed checks: ${failures.join('; ')}');
 }
-

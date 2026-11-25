@@ -244,7 +244,8 @@ class SafSendStager(
         /** 给被推迟的 launch 用的主线程 Handler：不依赖任何实例，也不持有 Context。 */
         private val MAIN_HANDLER: Handler by lazy { Handler(Looper.getMainLooper()) }
 
-        // ── 接收侧选择的登记（G15；一律在主线程调用，这里不做任何 Binder 调用）──────────
+        // ── 接收侧选择的登记（G15；beginReceivePick 与 launchReceivePick 只在主线程调用，
+        //    endReceivePick 主线程与工作线程都会调；这里不做任何 Binder 调用）────────────
 
         /** 铸一枚实例令牌：16 个随机字节，写成 32 位十六进制。 */
         private fun mintToken(): String {
@@ -849,7 +850,7 @@ class SafSendStager(
         val stageCanonical = realDirectory(
             stageDir, rootCanonical + File.separator + job.stageId
         )
-        // 目录一建起来、别的什么都还没放进去，先写下本进程的实例令牌
+        // 目录一建起来、别的什么都还没放进去，先写下本实例的令牌
         writeOwnerFile(stageCanonical)
         val payloadCanonical = realDirectory(
             File(stageCanonical, PAYLOAD_DIR_NAME),

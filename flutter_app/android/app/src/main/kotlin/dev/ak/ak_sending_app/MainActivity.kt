@@ -476,11 +476,13 @@ class MainActivity : FlutterActivity() {
 
     /**
      * 没拿到结果的收尾：撤销登记、答 {treeUri: null}（与第 5 修之前一样）。
-     * 只对还没结束的请求做一次。
+     * 只对还没结束的请求做一次。登记期间被搁下的日志行在这里结算——启动选择器
+     * 抛了，同样是一次没有结果的选择，与结果为 null 的那条路一样。
      */
     private fun endPickWithoutResult(request: PickFolderRequest) {
         if (!finishPickRequest(request)) return
         SafSendStager.endReceivePick(request.pick)
+        sendStager?.settleJournal()
         request.result.success(mapOf("treeUri" to null as String?))
     }
 

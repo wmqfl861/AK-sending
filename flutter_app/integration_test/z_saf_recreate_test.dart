@@ -291,12 +291,22 @@ Future<void> _recreatePhase2(
   final stageDir = root.isEmpty ? '' : '$root/$id';
   // null: nothing to watch.
   bool? exists = stageDir.isEmpty ? null : _stageDirExists(stageDir);
+  // What the staging root held before the app was pumped.
+  final bool? before = exists;
   var afterMs = -1;
   final sweep = _SweepTap();
 
   _say('$tag|MODE|$_variantName|marker=read|stageDirBefore=${_flag(exists)}');
   if (await _pumpRealApp(tester, checks, sweep)) {
     final clock = Stopwatch()..start();
+    // The start hook's own answer first. The copy may be gone already (the
+    // retiring instance's sweep in `recreate`), and then there is nothing to
+    // wait for but the answer — the proof that the hook ran. In `cold` the
+    // copy is there, and the hook's sweep is what removes it.
+    while (clock.elapsedMilliseconds < _recreateWaitMs &&
+        (sweep.calls < 1 || sweep.answer == 'none')) {
+      await Future<void>.delayed(const Duration(milliseconds: _pollMs));
+    }
     while (exists == true && clock.elapsedMilliseconds < _recreateWaitMs) {
       await Future<void>.delayed(const Duration(milliseconds: _pollMs));
       exists = _stageDirExists(stageDir);
@@ -327,11 +337,19 @@ Future<void> _recreatePhase2(
     _need(checks, shape.other == 0, 'root-other:${shape.other}');
   }
   _say('$tag|SWEEP|$sweepFact');
-  // The start hook must have RUN: the copy is gone because the app's own
-  // clean-up removed it, not because nothing was there to remove.
+  // The start hook must have RUN in either variant.
   _need(checks, sweep.calls >= 1, 'start-hook-not-called:${sweep.calls}');
-  _need(checks, sweep.removed >= 1,
-      'start-hook-removed-nothing:${sweep.removed}');
+  // In `cold` the start hook is the only thing that could remove the copy:
+  // it must have been there when the new process started, and the hook must
+  // have answered removed=<n>, n >= 1. In `recreate` the retiring instance's
+  // own sweep usually has the copy gone first (stageDirBefore=false), so the
+  // hook's answer may be removed=0 there.
+  if (_variantName == 'cold') {
+    _need(checks, before == true,
+        'cold-copy-not-there-before-the-start:${_flag(before)}');
+    _need(checks, sweep.removed >= 1,
+        'start-hook-removed-nothing:${sweep.removed}');
+  }
   _say('$tag|MARKER|deleted=${_flag(_deletePhaseMarker(root))}');
   _say('$tag|DONE|failed=${checks.count}');
   _failOn(checks);
@@ -443,6 +461,9 @@ class _SweepTap {
   /// `removed=<n>` answer (−1 when the last answer was not of that form).
   int get calls => _calls;
   int get removed => _removed;
+
+  /// The last answer the tap read (`none` until one came back).
+  String get answer => _answer;
 
   /// One evidence fact: whether the tap is on, how many sweeps went through
   /// it and what the last one answered (`removed=<n>`, a PlatformException

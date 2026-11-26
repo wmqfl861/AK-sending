@@ -226,10 +226,15 @@ void main() {
 
   switch (_mode) {
     case '':
+      // The whole default run: 11 to 14 minutes on the emulators these rounds
+      // were written on. The emulator can be much slower (it is itself a
+      // guest of a cloud machine whose speed varies): on 2026-11-27 a run
+      // whose every part answered was cut at 20 minutes. Each part's waits
+      // have their own budgets; this cap only catches a run that hangs.
       testWidgets(
           'Z SAF: tree pick, native staging, staged-tree verification, release and failure paths',
           _defaultRun,
-          timeout: const Timeout(Duration(minutes: 20)));
+          timeout: const Timeout(Duration(minutes: 45)));
     case 'leave':
       testWidgets('Z SAF kill: a send staging, stopped by the host mid-copy',
           _leaveRun,

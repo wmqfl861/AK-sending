@@ -7,6 +7,8 @@
 > - 每项状态只写在[审核状态表 §7](REVIEW_2026-11-11.zh-CN.md#7-状态表执行-agent-每完成一项就更新)；
 > - 执行方从本文 §8 证据表开始记录本批的运行编号与计数。
 >
+> **2026-11-27（复核方加注）：接手请从 [Z 接手交接](HANDOFF-BATCH-Z-2026-11-27.zh-CN.md) 开始；它与本文 §9.2 不一致的地方，以接手交接为准。复核结论见 [Z 复核](REVIEW_2026-11-27-batchZ.zh-CN.md)，复核方证据见 [§10](#10-复核方证据2026-11-27)。**
+>
 > **2026-11-27：按所有者指示停下并移交。** 第五轮修复已提交，但最终提交上的设备证据、本机门槛与安装包都没有重做——接手的人先读 [§9](#9-移交第五轮停在哪里还差什么2026-11-27)。
 
 ## 0. 一句话现状
@@ -286,3 +288,24 @@ cd flutter_app && flutter build apk --profile --target-platform android-arm64 \
 | 所有者的安装包备份与样例文件夹 | `ak-y/owner-apk-final2.apk`、`ak-y/owner-kit/` |
 
 红线不变：不加 relay；不碰生产服务器；不生成签名密钥；不加第三方依赖（测试依赖也不加）；不改清单权限；密钥、码、真实路径、截图不入库；154 测试服务器的地址不入库。154 测试服务器上的两个测试服务单元还在运行，所有者真机测试之后要撤掉。
+
+## 10. 复核方证据（2026-11-27）
+
+由复核方（Claude）填写。复核方的环境只有 Python 3、git 与 gh，没有 Rust、Flutter、Dart、Android SDK，也没有设备或模拟器。下表逐行标明依据；凡涉及 Android 平台行为的结论都是推断。本轮复核方只改文档，没有改上面的 §1 至 §9，只在文首加了一行指向接手交接的说明。
+
+| 证据 | 提交 / 运行 | 结果与边界 |
+|---|---|---|
+| 复核对象 | `dev/batch-z-20261124`，`5b6ae31` 之后的 28 个提交，头 `22f5bd9` | 只读。`git diff --stat 5b6ae31 22f5bd9`：25 个文件，新增 12446 行；`SafSendStager.kt` 2311 行（去掉注释与空行后 1452 行） |
+| 分支各次推送的 CI（用接口核对） | `af71048` run [45450345458](https://github.com/wmqfl861/AK-sending/actions/runs/45450345458)、`29f735b` run [45488700838](https://github.com/wmqfl861/AK-sending/actions/runs/45488700838)、`ebc80df` run [45561759000](https://github.com/wmqfl861/AK-sending/actions/runs/45561759000)、`4eb074a` run [45674847764](https://github.com/wmqfl861/AK-sending/actions/runs/45674847764)、`1eadb2f` run [45688067005](https://github.com/wmqfl861/AK-sending/actions/runs/45688067005)、`22f5bd9` run [45908511092](https://github.com/wmqfl861/AK-sending/actions/runs/45908511092) | 第三、第五次 failure，其余四次 success；分支头 `22f5bd9` 的那次是 14 个任务里 12 个 success、2 个手动深测 skipped |
+| 第三次推送失败的用例（读任务日志） | run 45561759000，任务 Rust 1.99.1（windows-latest），步骤 Tests (workspace) | `sender_stun_and_probe_round_share_the_adopted_dial_socket` 失败，位置 `crates/ak-itests/tests/t03_ipv6_loopback.rs`。日志原文的关键行：加入方 `Error: registry task pairing failed: transcript verification failed: pairing proof deadline has passed`；注册服务器 `06:41:55 … online`（两台设备）与 `06:42:06 … disconnected`（加入方）。同一个测试二进制里其余 11 条通过 |
+| 第五次推送失败的用例（读任务日志） | run 45688067005，任务 Rust 1.99.1（ubuntu-latest），步骤 Tests (workspace) | `cancelled_single_receive_port_rebinds_immediately` 失败，位置 `crates/ak-ffi/tests/ffi.rs`。日志原文：`no listening event for job …0002 within 20s; saw []`（任务号以 2 结尾，即取消之后重新接收的那一个）。同一个测试二进制里其余 28 条通过；同一次运行里 aarch64-apple-darwin 的可移植性检查是 cancelled |
+| 代码阅读：持久读授权没有带来功能（Z-N1） | 分支头，阅读源码 | `MainActivity.onDestroy` 调 `sendStager?.shutdown()`；`SafSendStager.shutdown()` 把本实例的令牌从活跃集合里去掉、对本实例在跑的每个任务调 `cancelJob`、再排一次过期清理。`file_pick_gateway.dart` 的 `pickSendDirectory()` 先调通道方法 `pickSendFolder`，随后调 `stageSafTree`。发送路径在 `SafSendStager.acquireReadGrant` 里取持久读授权（了结时另有 `restoreRead` 可能把读位取回）；`pickSendFolder` 不持久化任何授权。授权操作、清理与目录名查询都经同一个 `WORKER`（全进程唯一的单线程执行器）。临时授权的寿命属于平台行为，没有验证 |
+| 代码阅读：接收侧（Z-N5） | `5b6ae31` 与分支头对比 | 批次 Z 之前 `MainActivity.kt` 428 行，`pickFolder` 的结果处理里直接取读写持久授权；批次 Z 之后 717 行，改为先向暂存器登记、经工作线程取授权。`flutter_app/lib` 里没有任何地方调用 `getStorageInfo` 或 `listSafPersisted` |
+| 代码阅读：配对计时（Z-N7、Z-N8） | 分支头，阅读源码；这些文件批次 X、Z 都没有改 | `crates/ak-session/src/pairing/task_net.rs`：`TASK_REDEEM_WINDOW_MS` 为 10 秒。`crates/ak-session/src/pairing/orchestrator.rs`：`redeem_to_commit_on` 以“本地当前时间加窗口”为截止时间，等提交帧的上限是截止时间加 10 秒，随后 `verify_commit_full(…, now_unix_ms())`；创建方的实时路径同样；恢复路径用 `now_unix_ms().min(transcript.deadline_ms)`。`crates/ak-signal/src/server_v2/engine/pairing.rs`：截止时间不晚于服务器当前时间、或晚于当前时间加 120 秒，都拒绝；创建方的质询只在截止之前有效。没有任何一处对时钟偏差做补偿。复核方没有运行 Rust |
+| 代码阅读：取消与端口（Z-N6 第二条） | 分支头，阅读源码 | `crates/ak-ffi/src/core.rs` 的 `job_cancel`：中止任务后以 500 毫秒为上限等待其句柄；`ffi.rs` 的 `wait_for_event` 超时时只打印收到的事件，不打印该任务的结果。“端口尚未释放导致重新绑定失败”是推断 |
+| 契约检查（复核方本机） | 本节所在提交的工作区 | `python3 scripts/check_contracts.py`：`RESULT: 5/5 checks PASS`，退出码 0 |
+| 仓库检查（复核方本机） | 同上 | `python3 scripts/check_repository.py`：写完本节之后再跑的一次 `errors: []` |
+| Python 全套单元测试（复核方本机） | 与 CI 相同的 discover 命令，目录 scripts/tests | `Ran 382 tests in 121.171s`，`OK`，退出码 0 |
+| 标为“推断”的结论 | — | 临时授权足以覆盖暂存全程（Z-N1 的前提）；`probe-20261127-0015` 是“界面没了、进程还在”（Z-N4，没有原始日志）；取消后端口未释放（Z-N6 第二条）。三者都要由接手方在设备上或测试里确认 |
+| 复核方没有做的事 | — | 没有逐行审完暂存器，也没有审三个设备探针的全部代码；没有运行 Kotlin、Dart、Rust；没有设备或模拟器；仓库外的宿主脚本、JVM 检查与原始设备日志复核方看不到 |
+| 本轮改了什么 | 本节所在提交 | 只有 `docs/` 下的文档：Z 复核、Z 接手交接、状态表、STATUS、X 交接 §9、本节与文首的一行说明。没有改代码、脚本、契约 |

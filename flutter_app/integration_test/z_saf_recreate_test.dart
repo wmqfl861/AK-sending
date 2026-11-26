@@ -8,7 +8,7 @@
 // second isolate pumps the REAL app (AkSendingApp → cleanupStaleStaging())
 // and never calls the channel method itself.
 //
-// Two variants, chosen by dart-define AK_SAF_RECREATE_VARIANT, and two
+// Three variants, chosen by dart-define AK_SAF_RECREATE_VARIANT, and two
 // phases each:
 //
 //   recreate (the default when the define is empty)
@@ -29,9 +29,7 @@
 //         started again — a NEW process, whose isolate pumps the real app.
 //         Required: the copy is gone, and the start hook answered
 //         `removed=<n>` with n >= 1: here the production start hook is what
-//         removes the copy. (In `recreate` the retiring instance's own sweep
-//         usually has the copy gone before the new isolate starts, so that
-//         variant proves the end state and the same process, not the hook.)
+//         removes the copy.
 //   neighbour
 //     N1  phase 1, the same as R1.
 //     N2  the isolate of a SECOND instance of the Activity, started by the
@@ -41,6 +39,26 @@
 //         instance's delivered copy is still there while its stager lives,
 //         and gone after the host destroyed that instance — the first task
 //         to the front, BACK — which retires its token and queues a sweep.
+//
+// WHO REMOVES THE COPY in each variant (revision 6, T10):
+//   recreate  usually the retiring instance's own sweep — the new isolate's
+//             start hook then answers `removed=0`; (it answers `removed=1`
+//             in the rarer case where that sweep has not run yet: any legal
+//             `removed=<n>` passes this variant, the end state is its point);
+//   cold      the production start hook — `removed=<n>` with n >= 1;
+//   neighbour the second instance's hook leaves the live copy alone
+//             (`removed=0`); the copy goes when the first instance retires.
+//
+// The hook's answer is READ OFF THE TAP and is REQUIRED (it used to be on
+// record only): a tap that was not installed before the app was pumped, a
+// hook that never ran or never answered, and an answer that is not a legal
+// `removed=<n>` are failed checks by name. In `neighbour` the line
+// `N2|NEIGHBOUR` — the host's cue to destroy the first instance — is said
+// ONLY after the hook answered `removed=0` AND the first instance's copy
+// was re-read intact: its completion marker and owner file regular files,
+// its payload there, and the note of the size phase 1 established still
+// holding the preset text. Without all of that no cue goes out and the host
+// fails the round by itself.
 //
 // A MARKER FILE tells the phases apart: `ak-probe-recreate.txt` in the
 // PARENT of the staging root (`<data dir>/no_backup/`), holding the stage
@@ -67,10 +85,15 @@
 //
 // Evidence is one `ZSAF|…` line per fact. A staged path, a tree URI, a
 // display name, a stage id and the content of the grant journal never
-// print: counts, lengths and booleans stand in. Every check is HARD — a
-// failed one is collected under its name, the run goes on to gather the
-// rest, and the test fails on the collected list.
+// print: counts, lengths and booleans stand in. Nor does an exception: a
+// call on dart:io that throws — a look, a listing, a length, a read, a
+// delete — is caught where it is made and turns into a fixed check name,
+// and a failed read is never taken for a copy that is gone. The tap's own
+// handler never throws either. Every check is HARD — a failed one is
+// collected under its name, the run goes on to gather the rest, and the
+// test fails on the collected list.
 import 'dart:async' show unawaited;
+import 'dart:convert' show utf8;
 import 'dart:io' as io;
 import 'dart:math' show Random;
 
@@ -88,6 +111,12 @@ const MethodChannel _storageChannel = MethodChannel('dev.ak/storage');
 /// one file the host puts into it.
 const String _deepName = 'deep';
 const String _noteText = 'ak stage probe\n';
+
+/// The note's size in bytes: the KNOWN SAMPLE. Phase 1 establishes it (the
+/// note is a regular file holding exactly the preset text) and phase 2 of
+/// `neighbour` requires the first instance's copy to hold a note of exactly
+/// this size, with exactly this text, still.
+final int _noteBytes = utf8.encode(_noteText).length;
 
 /// The fixed names inside a stage directory and the staging root: the
 /// completion marker of a delivered copy, the owner file, the grant journal
@@ -119,6 +148,11 @@ const int _workSeconds = 120;
 
 /// Phase 2 of `recreate`: how long the start-up cleanup may take.
 const int _recreateWaitMs = 20000;
+
+/// Phase 2 of `neighbour`: how long the second instance's start hook may
+/// take to take its call and answer it. The host waits 60 s for the cue
+/// that only a legal `removed=0` lets out, so this stays well inside that.
+const int _hookWaitMs = 30000;
 
 /// Phase 2 of `neighbour`: the copy must be gone while the host destroys
 /// the first instance — seconds after N2|NEIGHBOUR. This bounds a
@@ -168,14 +202,22 @@ Future<void> _recreateRun(WidgetTester tester) => _round(tester, 'R1', _recreate
 Future<void> _neighbourRun(WidgetTester tester) =>
     _round(tester, 'N1', _neighbourPhase2);
 
-/// Phase 1 without a marker, phase 2 (`<first letter>2`) with one.
+/// Phase 1 without a marker, phase 2 (`<first letter>2`) with one. A marker
+/// that cannot be looked at names neither: the round fails under a fixed
+/// name instead of staging a second copy over one that may be there.
 Future<void> _round(WidgetTester tester, String phaseTag, _Phase2 phase2) async {
   final stagingRoot = await _derivedRoot();
-  final id = _phaseMarkerId(stagingRoot);
-  if (id.isEmpty) {
+  final marker = _phaseMarkerState(stagingRoot);
+  if (!marker.readable) {
+    _say('$phaseTag|MODE|$_variantName|android=${io.Platform.isAndroid}'
+        '|marker=unreadable');
+    _say('$phaseTag|DONE|failed=1');
+    fail('the phase marker could not be looked at: marker-unreadable');
+  }
+  if (marker.id.isEmpty) {
     await _deliver(tester, phaseTag, stagingRoot);
   } else {
-    await phase2(tester, '${phaseTag[0]}2', id, stagingRoot);
+    await phase2(tester, '${phaseTag[0]}2', marker.id, stagingRoot);
   }
 }
 
@@ -211,10 +253,15 @@ Future<void> _deliver(WidgetTester tester, String tag, String root) async {
     _need(checks, status == 'ok', 'staged-not-ok:$status');
     if (staged.error == null) copy = _copyState('$root/$id');
   }
-  _need(checks, copy.present, 'no-stage-directory');
+  // A read that failed is none of the facts below: it is named first.
+  _need(checks, copy.read == 'ok', 'stage-dir-read:${copy.read}');
+  _need(checks, copy.present == true, 'no-stage-directory');
   _need(checks, copy.marker, 'no-completion-marker');
   _need(checks, copy.owner, 'no-owner-file');
   _need(checks, copy.payload, 'no-payload');
+  // The note is the KNOWN SAMPLE: a regular file holding exactly the preset
+  // text — so of exactly its size, which this phase ESTABLISHES (the
+  // `noteBytes` of the line below) and phase 2 of `neighbour` compares.
   _need(checks, copy.note, 'no-note-in-payload');
 
   // The marker goes to the parent of the staging root, never into it.
@@ -224,15 +271,18 @@ Future<void> _deliver(WidgetTester tester, String tag, String root) async {
       final marker = _phaseMarker(root);
       marker.parent.createSync(recursive: true);
       marker.writeAsStringSync(id, flush: true);
-      markerFile = _phaseMarkerId(root) == id ? 'written' : 'not-read-back';
+      final readBack = _phaseMarkerState(root);
+      markerFile =
+          readBack.readable && readBack.id == id ? 'written' : 'not-read-back';
     } on Object {
       markerFile = 'not-written';
     }
   }
   _need(checks, markerFile == 'written', 'marker-file:$markerFile');
 
-  _say('$tag|DELIVERED|staged=$status|stageDir=${copy.present}'
+  _say('$tag|DELIVERED|staged=$status|stageDir=${copy.present ?? 'unknown'}'
       '|marker=${copy.marker}|owner=${copy.owner}|payload=${copy.payload}'
+      '|note=${copy.note}|noteBytes=${copy.noteBytes}|read=${copy.read}'
       '|markerFile=$markerFile');
   _say('$tag|DONE|failed=${checks.count}');
   _failOn(checks);
@@ -284,13 +334,19 @@ bool _endpointsAreLocal() =>
 
 /// Phase 2 of `recreate`: the start-up cleanup of a relaunched isolate in a
 /// process whose Activity was destroyed. Waits on timers only — no frame.
+/// The start hook's answer is read off the tap and is REQUIRED: the tap on
+/// the channel before the pump, at least one call, a legal `removed=<n>`
+/// (zero allowed — in `recreate` the retiring instance's own sweep usually
+/// has the copy gone first).
 Future<void> _recreatePhase2(
     WidgetTester tester, String tag, String id, String root) async {
   final checks = _Checks();
   _need(checks, root.isNotEmpty, 'root-unresolved');
   final stageDir = root.isEmpty ? '' : '$root/$id';
-  // null: nothing to watch.
-  bool? exists = stageDir.isEmpty ? null : _stageDirExists(stageDir);
+  // Whether there is a directory to watch at all.
+  final watching = stageDir.isNotEmpty;
+  // null: the look itself failed — never "gone".
+  bool? exists = watching ? _stageDirExists(stageDir) : null;
   // What the staging root held before the app was pumped.
   final bool? before = exists;
   var afterMs = -1;
@@ -304,10 +360,12 @@ Future<void> _recreatePhase2(
     // wait for but the answer — the proof that the hook ran. In `cold` the
     // copy is there, and the hook's sweep is what removes it.
     while (clock.elapsedMilliseconds < _recreateWaitMs &&
-        (sweep.calls < 1 || sweep.answer == 'none')) {
+        (sweep.calls < 1 || sweep.removed == null)) {
       await Future<void>.delayed(const Duration(milliseconds: _pollMs));
     }
-    while (exists == true && clock.elapsedMilliseconds < _recreateWaitMs) {
+    // While the look says the directory is there — or says nothing: a look
+    // that failed is not "gone".
+    while (exists != false && clock.elapsedMilliseconds < _recreateWaitMs) {
       await Future<void>.delayed(const Duration(milliseconds: _pollMs));
       exists = _stageDirExists(stageDir);
     }
@@ -319,12 +377,14 @@ Future<void> _recreatePhase2(
 
   _say('$tag|STAGEDIR|exists=${_flag(exists)}'
       '|afterMs=${afterMs < 0 ? 'na' : afterMs}');
-  _need(
-      checks,
-      exists == false,
-      exists == null
-          ? 'no-stage-directory-to-watch'
-          : 'stage-directory-still-there');
+  if (!watching) {
+    _need(checks, false, 'no-stage-directory-to-watch');
+  } else if (exists == null) {
+    // A look that failed is not "gone".
+    _need(checks, false, 'stage-dir-look-failed');
+  } else if (exists != false) {
+    _need(checks, false, 'stage-directory-still-there');
+  }
 
   final shape = root.isEmpty ? null : _rootShape(root);
   _say('$tag|ROOT|stageDirs=${shape?.stageDirs ?? 'na'}'
@@ -337,18 +397,22 @@ Future<void> _recreatePhase2(
     _need(checks, shape.other == 0, 'root-other:${shape.other}');
   }
   _say('$tag|SWEEP|$sweepFact');
-  // The start hook must have RUN in either variant.
+  // The start hook must have RUN, and ANSWERED, in either variant: the tap
+  // on the channel before the app was pumped, at least one sweep through
+  // it, and a legal `removed=<n>` back — anything else (no answer, another
+  // shape, an error) is a failed check, never a pass.
+  _need(checks, sweep.installed, 'sweep-tap-not-installed');
   _need(checks, sweep.calls >= 1, 'start-hook-not-called:${sweep.calls}');
+  _need(checks, sweep.removed != null,
+      'start-hook-illegal-answer:${sweep.answer}');
   // In `cold` the start hook is the only thing that could remove the copy:
   // it must have been there when the new process started, and the hook must
-  // have answered removed=<n>, n >= 1. In `recreate` the retiring instance's
-  // own sweep usually has the copy gone first (stageDirBefore=false), so the
-  // hook's answer may be removed=0 there.
+  // have answered removed=<n>, n >= 1.
   if (_variantName == 'cold') {
     _need(checks, before == true,
         'cold-copy-not-there-before-the-start:${_flag(before)}');
-    _need(checks, sweep.removed >= 1,
-        'start-hook-removed-nothing:${sweep.removed}');
+    _need(checks, (sweep.removed ?? 0) >= 1,
+        'start-hook-removed-nothing:${sweep.removed ?? 'none'}');
   }
   _say('$tag|MARKER|deleted=${_flag(_deletePhaseMarker(root))}');
   _say('$tag|DONE|failed=${checks.count}');
@@ -360,30 +424,86 @@ Future<void> _recreatePhase2(
 /// instance is alive; then the host destroys the first instance, and the
 /// copy must go. Waits on timers only — this instance is in the background
 /// from the moment the first task comes to the front.
+///
+/// The cue `N2|NEIGHBOUR` — the host's signal to destroy the first instance
+/// — goes out ONLY when all of this holds (revision 6, T10): the tap was on
+/// the channel before the app was pumped; the start hook took at least one
+/// call and answered a LEGAL `removed=<n>`; that answer is `removed=0` (a
+/// hook that reports a removal touched something it must leave alone); and
+/// the first instance's copy, re-read after that answer, is there and
+/// INTACT — its completion marker and owner file regular files, its payload
+/// there, and the note of the size phase 1 established still holding the
+/// preset text. Otherwise no cue is said: a fixed failure name is collected,
+/// the AFTER / SWEEP / DONE lines go out, and the host fails the round.
 Future<void> _neighbourPhase2(
     WidgetTester tester, String tag, String id, String root) async {
   final checks = _Checks();
   _need(checks, root.isNotEmpty, 'root-unresolved');
   final stageDir = root.isEmpty ? '' : '$root/$id';
-  // null: nothing to watch.
-  bool? first = stageDir.isEmpty ? null : _copyState(stageDir).delivered;
-  var afterMs = -1;
   final sweep = _SweepTap();
+  // What the first instance's copy is when this phase ends: false = gone,
+  // true = still there, null = it could not be looked at.
+  bool? first;
+  var afterMs = -1;
+  // Whether the cue went out.
+  var cued = false;
 
   _say('$tag|MODE|neighbour|marker=read');
   if (await _pumpRealApp(tester, checks, sweep)) {
-    await Future<void>.delayed(const Duration(seconds: 5));
-    first = stageDir.isEmpty ? null : _copyState(stageDir).delivered;
-    _say('$tag|NEIGHBOUR|firstCopy=${_flag(first)}');
-    _need(checks, first == true, 'first-copy-not-there-while-its-stager-is-alive');
+    // Why the cue cannot go out; null while everything it needs still holds.
+    String? notCued;
     final clock = Stopwatch()..start();
-    while (first == true && clock.elapsedMilliseconds < _neighbourWaitMs) {
-      await Future<void>.delayed(const Duration(milliseconds: _pollMs));
-      first = _copyState(stageDir).delivered;
+    if (!sweep.installed) {
+      notCued = 'neighbour-hook-not-installed';
+    } else {
+      // Bounded, on timers only: the hook has taken at least one call AND
+      // its answer is a legal `removed=<n>`.
+      while (clock.elapsedMilliseconds < _hookWaitMs &&
+          (sweep.calls < 1 || sweep.removed == null)) {
+        await Future<void>.delayed(const Duration(milliseconds: _pollMs));
+      }
+      final removed = sweep.removed;
+      if (sweep.calls < 1 || sweep.answer == 'none') {
+        notCued = 'neighbour-hook-no-answer';
+      } else if (removed == null) {
+        notCued = 'neighbour-hook-illegal-answer:${sweep.answer}';
+      } else if (removed > 0) {
+        notCued = 'neighbour-hook-removed-something:${sweep.answer}';
+      }
     }
-    afterMs = clock.elapsedMilliseconds;
+    // The first instance's copy, re-read once the hook has answered.
+    var copy = _copyState(stageDir);
+    if (notCued == null) {
+      if (copy.read != 'ok') {
+        notCued = 'neighbour-first-copy-unreadable-while-its-stager-is-alive';
+      } else if (copy.present != true) {
+        notCued = 'neighbour-first-copy-not-there-while-its-stager-is-alive';
+      } else if (!copy.intact) {
+        notCued = 'neighbour-first-copy-changed-while-its-stager-is-alive';
+      }
+    }
+    if (notCued != null) {
+      // No cue goes out: the host ends the round by itself.
+      _need(checks, false, notCued);
+      first = copy.present;
+    } else {
+      cued = true;
+      _say('$tag|NEIGHBOUR|firstCopy=true|hook=${sweep.answer}'
+          '|copyIntact=true');
+      // The cue is out: the host brings the first task to the front and
+      // presses BACK, and the retiring instance's sweep must take the copy.
+      final wait = Stopwatch()..start();
+      while (!copy.gone && wait.elapsedMilliseconds < _neighbourWaitMs) {
+        await Future<void>.delayed(const Duration(milliseconds: _pollMs));
+        copy = _copyState(stageDir);
+      }
+      afterMs = wait.elapsedMilliseconds;
+      first = copy.present;
+    }
   } else {
-    _say('$tag|NEIGHBOUR|firstCopy=unknown');
+    // The app was not pumped (`endpoints-not-local` is collected): nothing
+    // was looked at again.
+    first = null;
   }
   // As in the recreate variant: the tap's facts, read before it goes.
   final sweepFact = sweep.fact;
@@ -391,13 +511,22 @@ Future<void> _neighbourPhase2(
 
   _say('$tag|AFTER|firstCopy=${_flag(first)}'
       '|afterMs=${afterMs < 0 ? 'na' : afterMs}');
-  _need(
-      checks,
-      first == false,
-      first == null
-          ? 'no-copy-to-watch'
-          : 'first-copy-still-there-after-its-stager-retired');
+  if (cued) {
+    _need(
+        checks,
+        first == false,
+        first == null
+            ? 'first-copy-unreadable-after-its-stager-retired'
+            : 'first-copy-still-there-after-its-stager-retired');
+  }
   _say('$tag|SWEEP|$sweepFact');
+  if (!cued) {
+    // Nothing is deleted while no cue was said: the copy, if any, and the
+    // marker are what the host's own look needs.
+    _say('$tag|DONE|failed=${checks.count}');
+    _failOn(checks);
+    return;
+  }
   // The marker goes only once the copy is gone: while the copy is there it
   // is what a later look needs. The uninstall at the end takes both anyway.
   final bool? deleted = first == false ? _deletePhaseMarker(root) : false;
@@ -438,10 +567,27 @@ String _flag(bool? value) => value == null ? 'unknown' : '$value';
 // The channel, observed or called.
 // ---------------------------------------------------------------------------
 
-/// The `n` of `removed=<n>`, else −1.
-int _removedOf(String answer) {
+/// The `n` of a LEGAL answer — `removed=<n>` with n a non-negative integer
+/// — else null: no answer yet, or one of any other form.
+int? _removedOf(String answer) {
   final match = RegExp(r'^removed=([0-9]+)$').firstMatch(answer);
-  return match == null ? -1 : int.parse(match.group(1)!);
+  return match == null ? null : int.tryParse(match.group(1)!);
+}
+
+/// A PlatformException's code as it may print: only when it is a plain
+/// token; `other` for anything else. Never a message.
+final RegExp _codeShape = RegExp(r'^[A-Za-z0-9_]{1,47}$');
+
+String _codeOf(String? code) =>
+    code != null && _codeShape.hasMatch(code) ? code : 'other';
+
+/// Whether the message is the app's own start-up sweep (`cleanupStaleStaging`).
+bool _isSweep(StandardMethodCodec codec, ByteData? message) {
+  try {
+    return codec.decodeMethodCall(message).method == 'cleanupStaleStaging';
+  } on Object {
+    return false;
+  }
 }
 
 /// What the app's own start-up sweep answered — observed, never made. Every
@@ -449,25 +595,31 @@ int _removedOf(String answer) {
 /// untouched, and the reply to `cleanupStaleStaging` is read on its way
 /// back. Product code is not changed for it; a binding without the test
 /// messenger leaves the channel alone (`tap=off`).
+///
+/// The answer is one fixed token: `none` until one came back, `removed=<n>`
+/// for the contract's map, `other` for a map of another shape, `unreadable`
+/// for no envelope, `no-reply` when the platform's reply never came back
+/// through the tap, `error:<code>` for a PlatformException. The handler
+/// never throws: an exception here would be printed in full.
 class _SweepTap {
   TestDefaultBinaryMessenger? _messenger;
   int _calls = 0;
-  int _removed = -1;
   String _answer = 'none';
 
   bool get installed => _messenger != null;
 
-  /// How many sweeps went through the tap, and the `n` of the last
-  /// `removed=<n>` answer (−1 when the last answer was not of that form).
+  /// How many sweeps went through the tap.
   int get calls => _calls;
-  int get removed => _removed;
 
   /// The last answer the tap read (`none` until one came back).
   String get answer => _answer;
 
+  /// The `n` of the last answer when it is a legal `removed=<n>`; null while
+  /// no answer came back, or one of any other form did.
+  int? get removed => _removedOf(_answer);
+
   /// One evidence fact: whether the tap is on, how many sweeps went through
-  /// it and what the last one answered (`removed=<n>`, a PlatformException
-  /// code, `other` or `unreadable`).
+  /// it and what the last one answered.
   String get fact =>
       'tap=${installed ? 'installed' : 'off'}|calls=$_calls|answer=$_answer';
 
@@ -477,18 +629,20 @@ class _SweepTap {
     const codec = StandardMethodCodec();
     final name = _storageChannel.name;
     messenger.setMockMessageHandler(name, (ByteData? message) async {
-      var sweep = false;
-      try {
-        sweep = codec.decodeMethodCall(message).method == 'cleanupStaleStaging';
-      } on Object {
-        sweep = false;
-      }
+      final sweep = _isSweep(codec, message);
       if (sweep) _calls += 1;
-      final ByteData? reply = await messenger.delegate.send(name, message);
-      if (sweep) {
-        _answer = _envelope(codec, reply);
-        _removed = _removedOf(_answer);
+      ByteData? reply;
+      try {
+        reply = await messenger.delegate.send(name, message);
+      } on Object {
+        // The platform's reply did not come back through the tap. The app
+        // gets a fixed failure in its place — never the exception — and the
+        // sweep's answer is a named fact.
+        reply = codec.encodeErrorEnvelope(
+            code: 'error', message: 'tap-send-failed');
+        if (sweep) _answer = 'no-reply';
       }
+      if (sweep && _answer == 'none') _answer = _envelope(codec, reply);
       return reply;
     });
     _messenger = messenger;
@@ -500,8 +654,8 @@ class _SweepTap {
   }
 }
 
-/// `<code>/<token>` of a PlatformException, else `ok`, `no-answer` or the
-/// error type: never a message, which could carry more than a token.
+/// The reply's envelope as one fixed token — never a message, which could
+/// carry more than a code.
 String _envelope(StandardMethodCodec codec, ByteData? reply) {
   try {
     // A null reply is no envelope.
@@ -511,7 +665,7 @@ String _envelope(StandardMethodCodec codec, ByteData? reply) {
         ? 'removed=${value['removed']}'
         : 'other';
   } on PlatformException catch (failure) {
-    return 'error:${failure.code}';
+    return 'error:${_codeOf(failure.code)}';
   } on Object {
     return 'unreadable';
   }
@@ -630,13 +784,33 @@ class _Copy {
     required this.owner,
     required this.payload,
     required this.note,
+    required this.noteBytes,
+    required this.read,
   });
 
+  /// Nothing is at the path — or nothing was staged: every fact false, and
+  /// that was read.
   static const _Copy none = _Copy(
-      present: false, marker: false, owner: false, payload: false, note: false);
+      present: false,
+      marker: false,
+      owner: false,
+      payload: false,
+      note: false,
+      noteBytes: -1,
+      read: 'ok');
 
-  /// The directory exists.
-  final bool present;
+  /// The path could not be looked at at all: no fact here is one.
+  static const _Copy unreadable = _Copy(
+      present: null,
+      marker: false,
+      owner: false,
+      payload: false,
+      note: false,
+      noteBytes: -1,
+      read: 'look-failed');
+
+  /// The directory is there: null when the look itself failed — never "gone".
+  final bool? present;
 
   /// `.ak-stage-complete` is a regular file: the copy was delivered.
   final bool marker;
@@ -650,37 +824,98 @@ class _Copy {
   /// `payload/<folder>/note.txt` is a regular file holding the host's note.
   final bool note;
 
-  bool get delivered => present && marker && owner && payload;
+  /// The note's size in bytes; -1 without such a regular file, or when it
+  /// could not be measured.
+  final int noteBytes;
+
+  /// Whether all of this could be read: `ok`; `look-failed` — the directory
+  /// itself could not be looked at; `list-failed` — it could not be listed;
+  /// `read-failed` — an entry inside could not be looked at or measured.
+  /// Every look is caught where it is made, and one that failed leaves its
+  /// fact false: a false is "not there" only when this says `ok`.
+  final String read;
+
+  /// The look says nothing is at the path any more.
+  bool get gone => read == 'ok' && present == false;
+
+  /// Delivered: payload, the completion marker and the owner file.
+  bool get delivered =>
+      read == 'ok' && present == true && marker && owner && payload;
+
+  /// Delivered, and the note is the one phase 1 established: of its size,
+  /// holding its text.
+  bool get intact => delivered && note && noteBytes == _noteBytes;
 }
 
+/// Never throws: a look that failed is [read], and its facts stay false.
 _Copy _copyState(String dir) {
-  if (!_isDirectory(dir)) return _Copy.none;
+  final type = _typeOf(dir);
+  if (type == null) return _Copy.unreadable;
+  if (type != io.FileSystemEntityType.directory) return _Copy.none;
+  final List<io.FileSystemEntity> entries;
   try {
-    final payload = io.Directory(dir)
-        .listSync(followLinks: false)
-        .any((e) => e is io.Directory && _basename(e.path) == 'payload');
-    return _Copy(
-      present: true,
-      marker: _isRegularFile('$dir/$_markerName'),
-      owner: _isRegularFile('$dir/$_ownerName'),
-      payload: payload,
-      note: _noteHeld('$dir/payload/$_deepName/note.txt'),
-    );
+    entries = io.Directory(dir).listSync(followLinks: false);
   } on Object {
     return const _Copy(
-        present: true, marker: false, owner: false, payload: false, note: false);
+        present: true,
+        marker: false,
+        owner: false,
+        payload: false,
+        note: false,
+        noteBytes: -1,
+        read: 'list-failed');
+  }
+  var failed = false;
+  bool regular(String path) {
+    final type = _typeOf(path);
+    if (type == null) failed = true;
+    return type == io.FileSystemEntityType.file;
+  }
+
+  final note = _noteState('$dir/payload/$_deepName/note.txt');
+  return _Copy(
+    present: true,
+    marker: regular('$dir/$_markerName'),
+    owner: regular('$dir/$_ownerName'),
+    payload: entries.any(
+        (e) => e is io.Directory && _basename(e.path) == 'payload'),
+    note: note.held,
+    noteBytes: note.bytes,
+    read: failed || !note.read ? 'read-failed' : 'ok',
+  );
+}
+
+/// The known sample — the note inside a payload. [bytes]: its size, -1 when
+/// it is no regular file or could not be measured; [held]: whether its
+/// content is exactly the preset note; [read]: whether every look at it
+/// succeeded (a content that could not be read is not held).
+({int bytes, bool held, bool read}) _noteState(String path) {
+  final type = _typeOf(path);
+  if (type == null) return (bytes: -1, held: false, read: false);
+  if (type != io.FileSystemEntityType.file) {
+    return (bytes: -1, held: false, read: true);
+  }
+  final file = io.File(path);
+  int bytes;
+  try {
+    bytes = file.lengthSync();
+  } on Object {
+    return (bytes: -1, held: false, read: false);
+  }
+  try {
+    final held = file.readAsStringSync() == _noteText;
+    return (bytes: bytes, held: held, read: true);
+  } on Object {
+    return (bytes: bytes, held: false, read: false);
   }
 }
 
-bool _stageDirExists(String dir) => _isDirectory(dir);
-
-bool _noteHeld(String path) {
-  if (!_isRegularFile(path)) return false;
-  try {
-    return io.File(path).readAsStringSync() == _noteText;
-  } on Object {
-    return false;
-  }
+/// Whether the stage directory [dir] is there; null when the look itself
+/// failed — never "gone" (the caller names it).
+bool? _stageDirExists(String dir) {
+  final type = _typeOf(dir);
+  if (type == null) return null;
+  return type == io.FileSystemEntityType.directory;
 }
 
 /// What the staging root holds — by KIND and count, never by name. The
@@ -699,33 +934,42 @@ class _Root {
   final String journal;
 }
 
+/// Null when a look or a listing failed — never a root that holds nothing
+/// (the caller names it `root-unreadable`).
 _Root? _rootShape(String root) {
+  final type = _typeOf(root);
+  if (type == null) return null;
+  if (type != io.FileSystemEntityType.directory) {
+    return const _Root(stageDirs: 0, other: 0, journal: 'absent');
+  }
+  final List<io.FileSystemEntity> entries;
   try {
-    final dir = io.Directory(root);
-    if (!_isDirectory(dir.path)) {
-      return const _Root(stageDirs: 0, other: 0, journal: 'absent');
-    }
-    var stageDirs = 0;
-    var other = 0;
-    for (final entry in dir.listSync(followLinks: false)) {
-      final name = _basename(entry.path);
-      if (entry is io.Directory) {
-        stageDirs += 1;
-      } else if (name != _journalName && name != _journalScratchName) {
-        other += 1;
-      }
-    }
-    return _Root(stageDirs: stageDirs, other: other, journal: _journalState(root));
+    entries = io.Directory(root).listSync(followLinks: false);
   } on Object {
     return null;
   }
+  var stageDirs = 0;
+  var other = 0;
+  for (final entry in entries) {
+    final name = _basename(entry.path);
+    if (entry is io.Directory) {
+      stageDirs += 1;
+    } else if (name != _journalName && name != _journalScratchName) {
+      other += 1;
+    }
+  }
+  return _Root(
+      stageDirs: stageDirs, other: other, journal: _journalState(root));
 }
 
 /// The grant journal by LINE COUNT only — a line in it is a tree URI the
 /// send side still holds the read grant of; the line itself never prints.
+/// Never throws: a look or a read that failed is `unreadable`.
 String _journalState(String root) {
   final journal = io.File('$root/$_journalName');
-  switch (io.FileSystemEntity.typeSync(journal.path, followLinks: false)) {
+  final type = _typeOf(journal.path);
+  if (type == null) return 'unreadable';
+  switch (type) {
     case io.FileSystemEntityType.notFound:
       return 'absent';
     case io.FileSystemEntityType.file:
@@ -748,21 +992,25 @@ String _journalState(String root) {
 // The phase marker.
 // ---------------------------------------------------------------------------
 
-/// The stage id the phase marker holds — never printed; '' without a marker
-/// or when it holds nothing usable.
-String _phaseMarkerId(String stagingRoot) {
-  if (stagingRoot.isEmpty) return '';
+/// The phase marker as a round starts: the stage id it holds — never
+/// printed; '' without a marker or when it holds nothing usable — and
+/// whether it could be looked at at all. Nothing here throws.
+({String id, bool readable}) _phaseMarkerState(String stagingRoot) {
+  // Without a staging root there is nothing to look at: phase 1 names that.
+  if (stagingRoot.isEmpty) return (id: '', readable: true);
   try {
     final marker = _phaseMarker(stagingRoot);
-    if (!marker.existsSync()) return '';
+    if (!marker.existsSync()) return (id: '', readable: true);
     final id = marker.readAsStringSync().trim();
-    return _idShape.hasMatch(id) ? id : '';
+    return (id: _idShape.hasMatch(id) ? id : '', readable: true);
   } on Object {
-    return '';
+    return (id: '', readable: false);
   }
 }
 
 /// Removes the marker; null when the staging root could not be derived.
+/// Never throws: false when the delete or the look after it failed — which
+/// is not "deleted".
 bool? _deletePhaseMarker(String stagingRoot) {
   if (stagingRoot.isEmpty) return null;
   try {
@@ -807,12 +1055,15 @@ String _newId() => [
         _random.nextInt(256).toRadixString(16).padLeft(2, '0'),
     ].join();
 
-bool _isRegularFile(String path) =>
-    io.FileSystemEntity.typeSync(path, followLinks: false) ==
-    io.FileSystemEntityType.file;
-
-bool _isDirectory(String path) =>
-    io.FileSystemEntity.typeSync(path, followLinks: false) ==
-    io.FileSystemEntityType.directory;
+/// The type of what is at [path], no link followed — or null when the look
+/// itself failed, which is no type at all: every caller names it, and none
+/// reads a failed look as "gone".
+io.FileSystemEntityType? _typeOf(String path) {
+  try {
+    return io.FileSystemEntity.typeSync(path, followLinks: false);
+  } on Object {
+    return null;
+  }
+}
 
 String _basename(String path) => path.substring(path.lastIndexOf('/') + 1);

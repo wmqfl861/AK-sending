@@ -95,7 +95,7 @@ V-N3（回前台黑屏）待验证；W-N11 的长等待场景待在更稳的设�
 2. **入库**。把宿主脚本（四个入口、`z-common.sh`、`z-common-recreate.sh`、`_selftest.sh`）、执行方的运行器、宿主 JVM 检查（`harness/` 与 `run5.sh`）、契约文本（`CONTRACT.md`）放进仓库，建议放在 `scripts/android_probe/`。入库之前去掉服务器地址、任务码、真实路径与设备名；配一份说明：依赖什么、怎么运行、每个入口对应证据表里的哪一类行。路线 A 之后要删的部分可以先原样入库，到 Z12 再删，这样历史可查。确实不能入库的，写明原因与存放位置。
 3. **分支**。确认 `git merge-base --is-ancestor origin/dev/batch-x-20261122 origin/main` 成立后，删除远端的 `dev/batch-x-20261122`，清理本地旧分支与 worktree。继续使用 `dev/batch-z-20261124`，不另开分支。
 4. **154 测试服务器**（Z-N9）。开发已经停下，两个对公网开放的测试服务先停掉：`systemctl --user disable --now ak-test-registry ak-test-stun`；单元文件留着，做手机测试时再启用。地址不入库。
-5. 在 §8 回填本文所在提交在分支上的 CI 运行编号与结论。
+5. 在 §8 回填两次 CI 的运行编号与结论，都用接口自己核实：本文所在提交在分支上的那一次，以及 `5b6ae31` 在 main 上的那一次（批次 X 合入时触发）。
 
 ### 4.2 Z9：请 codex 出计划
 

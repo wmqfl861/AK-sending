@@ -217,16 +217,30 @@ struct ClientInner {
     info_query: AsyncMutex<()>,
     unmatched: AtomicU64,
     state_tx: watch::Sender<ClientState>,
+    /// Test-only: a test's hold on decoded `PairCommit` frames between the
+    /// reader and the dispatch (`test_gate::CommitGate`).
+    #[cfg(test)]
+    commit_gate: test_gate::CommitGate,
 }
 
 impl ClientInner {
     /// Route one inbound frame (single-reader context, no await inside).
+    fn route(&self, frame: CtrlFrame) {
+        // Test-only: a test may park a `PairCommit` here and dispatch it later.
+        #[cfg(test)]
+        if self.park_commit(&frame) {
+            return;
+        }
+        self.dispatch_frame(frame);
+    }
+
+    /// Fan one decoded frame out to the inboxes.
     /// Wave-28: the extension section is peeled off first — an endpoint
     /// blob on `InviteRedeemOffered` / `PairCommit` lands in the dispatch
     /// side-map keyed by the frame's pairing id BEFORE the carrier message
     /// fans out, so the flow that consumes the frame can take the blob
     /// with no ordering race.
-    fn route(&self, frame: CtrlFrame) {
+    fn dispatch_frame(&self, frame: CtrlFrame) {
         let message = frame.message;
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
         if let Some(EndpointBlob(blob)) = frame.endpoint {
@@ -511,6 +525,8 @@ impl RegistryClient {
             info_query: AsyncMutex::new(()),
             unmatched: AtomicU64::new(0),
             state_tx,
+            #[cfg(test)]
+            commit_gate: test_gate::CommitGate::default(),
         });
         check_display_name(&inner.name)?;
         open_connection(&inner).await?;
@@ -520,6 +536,17 @@ impl RegistryClient {
     /// This device's id (the key's public bytes).
     pub fn device_id(&self) -> DeviceId {
         self.inner.key.public_key()
+    }
+
+    /// The wall clock a live pairing flow uses when it takes a `PairCommit`
+    /// off the wire: the moment this endpoint processes the frame, not the
+    /// moment it left the registry. A test may pin it on its own instance.
+    pub(crate) fn frame_taken_at_unix_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(pinned) = self.inner.pinned_delivery_now() {
+            return pinned;
+        }
+        now_unix_ms()
     }
 
     /// The wire-legal display name this client Hello'd with (wave 28:
@@ -1743,6 +1770,135 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
         }
     }
     let _ = write.shutdown().await;
+}
+
+/// Test-only hold on decoded `PairCommit` frames and a per-instance
+/// delivery clock (`#[cfg(test)]`).
+///
+/// A live flow must accept a `PairCommit` the registry committed before
+/// the deadline even when the frame is processed after it. A test
+/// reproduces that ordering on its own two instances: it parks the frame
+/// between the reader and the dispatch, observes that the registry has
+/// committed while the wall clock is still before the deadline, pins the
+/// moment the flow takes the frame to just after the deadline, and
+/// releases the frame. The parked frame is routed whole (extension
+/// included), so the endpoint blob and the carrier message keep their
+/// order. Nothing here is shared between instances.
+#[cfg(test)]
+mod test_gate {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::{
+        transcript_pairing_id, ClientInner, CtrlFrame, CtrlMessage, PairingId, RegistryClient,
+    };
+
+    #[derive(Default)]
+    pub(super) struct CommitGate {
+        armed: AtomicBool,
+        held: StdMutex<Vec<CtrlFrame>>,
+        parked: Notify,
+        /// The wall clock a flow on THIS instance reads when it takes a
+        /// frame; `None` means the real clock.
+        delivery_now: StdMutex<Option<u64>>,
+    }
+
+    impl ClientInner {
+        /// Park `frame` when armed and it is a `PairCommit`; `true` once parked.
+        pub(super) fn park_commit(&self, frame: &CtrlFrame) -> bool {
+            if !self.commit_gate.armed.load(Ordering::SeqCst)
+                || !matches!(frame.message, CtrlMessage::PairCommit { .. })
+            {
+                return false;
+            }
+            self.commit_gate
+                .held
+                .lock()
+                .expect("commit gate lock")
+                .push(frame.clone());
+            self.commit_gate.parked.notify_one();
+            true
+        }
+
+        /// The pinned delivery clock of this instance, when a test set one.
+        pub(super) fn pinned_delivery_now(&self) -> Option<u64> {
+            *self
+                .commit_gate
+                .delivery_now
+                .lock()
+                .expect("commit gate lock")
+        }
+    }
+
+    impl RegistryClient {
+        /// Hold every decoded `PairCommit` back until [`Self::release_commits`].
+        pub(crate) fn arm_commit_gate(&self) {
+            self.inner.commit_gate.armed.store(true, Ordering::SeqCst);
+        }
+
+        /// Resolve once a `PairCommit` is parked, or after `limit` (`false`).
+        pub(crate) async fn commit_parked_within(&self, limit: Duration) -> bool {
+            if !self
+                .inner
+                .commit_gate
+                .held
+                .lock()
+                .expect("commit gate lock")
+                .is_empty()
+            {
+                return true;
+            }
+            tokio::time::timeout(limit, self.inner.commit_gate.parked.notified())
+                .await
+                .is_ok()
+        }
+
+        /// The pairing ids of the `PairCommit` frames parked so far, in order.
+        pub(crate) fn parked_commits(&self) -> Vec<PairingId> {
+            self.inner
+                .commit_gate
+                .held
+                .lock()
+                .expect("commit gate lock")
+                .iter()
+                .map(|frame| match &frame.message {
+                    CtrlMessage::PairCommit { transcript, .. } => transcript_pairing_id(transcript),
+                    _ => unreachable!("only PairCommit frames are parked"),
+                })
+                .collect()
+        }
+
+        /// Make flows on this instance take their next frames at `now_unix_ms`
+        /// as far as the deadline rule is concerned.
+        pub(crate) fn pin_delivery_now(&self, now_unix_ms: u64) {
+            *self
+                .inner
+                .commit_gate
+                .delivery_now
+                .lock()
+                .expect("commit gate lock") = Some(now_unix_ms);
+        }
+
+        /// Route every parked frame now; the gate stays armed. Returns how many.
+        pub(crate) fn release_commits(&self) -> usize {
+            let frames: Vec<CtrlFrame> = self
+                .inner
+                .commit_gate
+                .held
+                .lock()
+                .expect("commit gate lock")
+                .drain(..)
+                .collect();
+            let released = frames.len();
+            for frame in frames {
+                self.inner.dispatch_frame(frame);
+            }
+            released
+        }
+    }
 }
 
 #[cfg(test)]

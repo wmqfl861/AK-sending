@@ -569,6 +569,72 @@ fn roundtrip_pair_commit() {
     });
 }
 
+/// Z-N7 pins the frame its endpoint rule reasons about: a `PairCommit`
+/// without an extension is exactly the frozen 588-byte frame — the 4-byte
+/// header, then the 584-byte payload field by field — so a codec change
+/// cannot hide behind a round-trip that still agrees with itself. Every
+/// field carries its own byte pattern: equal neighbours or an all-`FF`
+/// integer would let a swapped field or a reversed byte order pass.
+#[test]
+fn pair_commit_wire_layout_byte_exact() {
+    // One byte value per field, none shared with a neighbour.
+    let transcript = [0xA1u8; v2::message::TRANSCRIPT_BYTES];
+    let owner_proof = PairProof {
+        mac: [0xB2; 32],
+        signature: [0xC3; 64],
+    };
+    let redeemer_proof = PairProof {
+        mac: [0xD4; 32],
+        signature: [0xE5; 64],
+    };
+    let owner_prepared_signature = [0xF6; 64];
+    let redeemer_prepared_signature = [0x17; 64];
+    let commit_revision = 0x0102_0304_0506_0708u64;
+    let original = CtrlFrame::new(CtrlMessage::PairCommit {
+        transcript,
+        owner_proof: owner_proof.clone(),
+        redeemer_proof: redeemer_proof.clone(),
+        owner_prepared_signature,
+        redeemer_prepared_signature,
+        commit_revision,
+    });
+
+    let mut bytes = Vec::new();
+    original.try_encode_as(Role::Server, &mut bytes).unwrap();
+
+    let mut expected = vec![
+        // version 2, type 0x16 (`PairCommit`), payload length 584,
+        // big-endian.
+        0x02, 0x16, 0x02, 0x48,
+    ];
+    expected.extend_from_slice(&transcript);
+    expected.extend_from_slice(&owner_proof.mac);
+    expected.extend_from_slice(&owner_proof.signature);
+    expected.extend_from_slice(&redeemer_proof.mac);
+    expected.extend_from_slice(&redeemer_proof.signature);
+    expected.extend_from_slice(&owner_prepared_signature);
+    expected.extend_from_slice(&redeemer_prepared_signature);
+    // `commit_revision`, 0x0102030405060708, most significant byte first.
+    expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.len() - HEADER_LEN, 584);
+    assert!(bytes.len() - HEADER_LEN <= v2::message::PAIR_COMMIT_PAYLOAD);
+    assert_eq!(CtrlFrame::decode(&expected).unwrap(), original);
+
+    // The sample really tells those apart: the revision with its byte
+    // order reversed, and the two Prepared signatures swapped, each decode
+    // to something other than the original frame.
+    let tail = expected.len() - 8;
+    let mut reversed = expected.clone();
+    reversed[tail..].reverse();
+    assert_ne!(CtrlFrame::decode(&reversed).unwrap(), original);
+    let mut swapped = expected.clone();
+    let first = tail - 128;
+    swapped[first..tail].rotate_left(64);
+    assert_ne!(CtrlFrame::decode(&swapped).unwrap(), original);
+}
+
 #[test]
 fn roundtrip_pair_status_and_abort_all_enum_values() {
     for state in [

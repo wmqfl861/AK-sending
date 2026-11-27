@@ -173,7 +173,7 @@ sequenceDiagram
 2. `PairChallenge`：owner 发送 `PairChallenge(transcript, owner_proof)`，服务端转发给 redeemer；redeemer 验 owner MAC/签名，由公钥计算指纹。
 3. `PairProof`：redeemer 发送 `PairProof(pairing_id, transcript_digest, redeemer_proof)`，服务端转发，owner 验 redeemer MAC/签名。
 4. `PairPrepared`：两侧各自持久写 pending journal 后分别发送 `PairPrepared(pairing_id, transcript_digest, signature)`。
-5. `PairCommit`：服务端重查码状态、与撤销串行化、持久写 Commit（`commit_revision`），向双方下发 `PairCommit`。重发规则：已 Commit 的事务在 `PairStatusReply` 后由服务端重发固定 `PairCommit`。
+5. `PairCommit`：服务端重查码状态、与撤销串行化、持久写 Commit（`commit_revision`），向双方下发 `PairCommit`。重发规则：已 Commit 的事务在 `PairStatusReply` 后由服务端重发固定 `PairCommit`。服务端按**受理采样时刻**裁决 `PairPrepared`：采样不晚于 `deadline_ms` 才受理，提交成功之后才发帧，而帧可能晚于截止时间才到；线上帧本身不带提交时刻。端点在实时流程里按同一条投递宽限接收（2026-11-27，Z-N7）：等待上限和允许的最晚取帧时刻都是 `deadline_ms` 加 10 秒（取帧可以更早）；取到时已过宽限，一律按超时处理，不看帧的内容；宽限之内到达的帧必须与本端本轮已认证的 transcript 逐字节一致；证明校验按“取帧时刻与截止时间取小”进行（与崩溃恢复一致），两份 MAC 与两份签名照常核对。线上帧的形状不变。
 6. `PairApplied`：双方各自加锁合并并原子保存 `peers.book` 后发送 `PairApplied(pairing_id, transcript_digest, commit_revision, signature)`。
 7. `PairReady`：服务端收到双方 Applied 后下发 `PairReady`（含双方 Applied 签名）；两侧激活 pairing 关系。已 Ready 的事务在状态回复后由服务端重发固定 `PairReady`。
 
@@ -243,6 +243,8 @@ S-->>A: PairCommit(+owner_endpoint)                     ; 同一固定帧，owne
 | 已持久 Commit 的事务 | 必须恢复到完成或明确人工处理，不能按普通 TTL 丢弃 |
 | 候选协调 session | 保持现有默认 120 秒 |
 | 已建立的数据直连 | 不依赖邀请码 TTL 或协调 session 存活 |
+
+实时流程里端点接收已提交 `PairCommit` 的宽限是 `deadline_ms` 加 10 秒（第 6 节第 5 项）：超过宽限的实时接收按超时处理；单凭这个超时，端点并不知道服务端是否已经持久 Commit，要经状态查询才能确定，已持久 Commit 的事务仍按上表走恢复；崩溃恢复不受这条宽限约束。
 
 过期判断在每次 redeem 与 Commit 事务内执行，不能只依赖定时清扫。已经进入 expired/revoked 的状态不可因时钟回拨恢复 active。服务器检测到异常时钟回退或数据库恢复缺口时，应停止发行和新的配对提交，先完成状态核对。
 

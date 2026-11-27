@@ -661,7 +661,7 @@ impl PairingOrchestrator {
             &self.client,
             plane,
             pairing_id,
-            deadline.saturating_add(10_000),
+            deadline.saturating_add(COMMIT_DELIVERY_GRACE_MS),
             |frame| pair_commit_of(frame, pairing_id),
         )
         .await?
@@ -669,7 +669,12 @@ impl PairingOrchestrator {
             Some(commit) => commit,
             None => return Err(PairFlowError::Timeout),
         };
-        let verified = verify_commit_full(&commit, &auth_key, now_unix_ms())?;
+        let verified = verify_live_commit(
+            &commit,
+            &transcript,
+            &auth_key,
+            self.client.frame_taken_at_unix_ms(),
+        )?;
         Ok(CommittedPairing {
             pairing_id,
             peer_fingerprint: Fingerprint::from_public_key(&transcript.owner_device_id),
@@ -1010,7 +1015,7 @@ impl PairingOrchestrator {
             &self.client,
             &mut plane,
             pairing_id,
-            redeem.deadline_ms.saturating_add(10_000),
+            redeem.deadline_ms.saturating_add(COMMIT_DELIVERY_GRACE_MS),
             |frame| pair_commit_of(frame, pairing_id),
         )
         .await?
@@ -1018,7 +1023,12 @@ impl PairingOrchestrator {
             Some(commit) => commit,
             None => return Err(PairFlowError::Timeout),
         };
-        let verified = verify_commit_full(&commit, &auth_key, now_unix_ms())?;
+        let verified = verify_live_commit(
+            &commit,
+            &transcript,
+            &auth_key,
+            self.client.frame_taken_at_unix_ms(),
+        )?;
         let committed = CommittedPairing {
             pairing_id,
             peer_fingerprint: Fingerprint::from_public_key(&redeemer_device_id),
@@ -1111,8 +1121,11 @@ impl PairingOrchestrator {
                     match hint_by_lookup.get(&record.lookup_digest) {
                         Some(code) => {
                             // Full MAC verification; the expiry bound is the
-                            // transcript's own deadline (the commit happened
-                            // before it, which the server enforced).
+                            // transcript's own deadline. The registry accepted
+                            // the `PairPrepared` on an acceptance sample at or
+                            // before that deadline and sent the frame only
+                            // after its commit succeeded; a wire frame carries
+                            // no commit time of its own.
                             let now = now_unix_ms().min(transcript.deadline_ms);
                             let _ = verify_commit_full(&commit, &code.auth_key(), now)?;
                         }
@@ -1279,6 +1292,57 @@ struct CommitView {
     owner_proof: WireProof,
     redeemer_proof: WireProof,
     commit_revision: u64,
+}
+
+/// How long after the deadline a live flow still waits for, and still
+/// takes, the `PairCommit` of its own round (Z-N7). The registry takes a
+/// `PairPrepared` only while its own acceptance sample reads at or before
+/// the deadline, commits, and sends the frame after that; the frame can
+/// reach an endpoint later. The bound is one and the same for the wait and
+/// for the delivery, so a frame taken off the wire past it is a timeout,
+/// never a proof failure.
+const COMMIT_DELIVERY_GRACE_MS: u64 = 10_000;
+
+/// Verification of a `PairCommit` taken off the wire by a live flow
+/// (`redeem_to_commit_on` and `owner_answer_offer`).
+///
+/// `taken_at_unix_ms` is when this endpoint took the frame, not when it
+/// left the registry. Checked in this order:
+///
+/// 1. Past `COMMIT_DELIVERY_GRACE_MS` after THIS round's deadline (the
+///    deadline of the transcript the flow holds) the flow reports
+///    `Timeout`, whatever the frame carries. The wait has the same bound,
+///    but a frame queued before the timer fired can still be taken after it.
+/// 2. The frame must carry THIS round's transcript: the 256 canonical
+///    bytes the flow authenticated before it sent its `PairPrepared`.
+///    `pair_commit_of` only matches the pairing id, and the proof check
+///    takes its digest and nonces from the frame itself, so a commit of
+///    another round under the same pairing id passes the bare check — it
+///    must not pass here.
+/// 3. Inside the grace the proof check runs at `min(taken at, deadline)`.
+///    What the registry guarantees of a frame of this round: it accepted
+///    this round's `PairPrepared` on an acceptance sample at or before the
+///    deadline, and it sent the frame only after the commit of that
+///    acceptance succeeded. The nonces bind the frame to this attempt. A
+///    wire frame carries no commit time, and the registry does not sample
+///    again before it commits, so the endpoint cannot place the commit
+///    itself before the deadline — this is as much as it can establish.
+fn verify_live_commit(
+    commit: &CommitView,
+    round_transcript: &PairTranscript,
+    auth_key: &[u8; 32],
+    taken_at_unix_ms: u64,
+) -> Result<VerifiedPairing, PairFlowError> {
+    let deadline = round_transcript.deadline_ms;
+    if taken_at_unix_ms > deadline.saturating_add(COMMIT_DELIVERY_GRACE_MS) {
+        return Err(PairFlowError::Timeout);
+    }
+    if commit.transcript != round_transcript.to_bytes() {
+        return Err(PairFlowError::Verify(
+            ak_identity::pairing_txn::PairingVerifyError::TranscriptDigestMismatch,
+        ));
+    }
+    verify_commit_full(commit, auth_key, taken_at_unix_ms.min(deadline))
 }
 
 /// Full verification of a `PairCommit` against the invite auth key.
@@ -1833,6 +1897,347 @@ mod tests {
         // The authentic commit against the WRONG pin is refused too: the
         // pin is the authority, not the commit's own structure.
         assert!(verify_commit_pinned(&authentic, &[0xEE; 32]).is_err());
+    }
+
+    // ---- Z-N7: a committed PairCommit processed after the deadline ----
+
+    fn round_transcript(
+        code: &InviteCode,
+        owner: &DeviceKeyPair,
+        redeemer: &DeviceKeyPair,
+        deadline_ms: u64,
+    ) -> PairTranscript {
+        PairTranscript {
+            registry_id: [0x11; 32],
+            code_id: [0x22; 16],
+            code_revision: 1,
+            pairing_id: [0x33; 16],
+            request_id: [0x44; 16],
+            lookup_digest: code.lookup_digest(),
+            owner_device_id: owner.public_key(),
+            redeemer_device_id: redeemer.public_key(),
+            owner_nonce: [0x55; 32],
+            redeemer_nonce: [0x66; 32],
+            deadline_ms,
+        }
+    }
+
+    /// The grace bound is the same for waiting and for taking the frame,
+    /// and the frame is bound to this round's transcript.
+    #[test]
+    fn live_commit_enforces_grace_and_expected_transcript() {
+        // The contract's bound, written out here on purpose: the test must
+        // fail if the product's grace moves, not move with it.
+        const GRACE_MS: i64 = 10_000;
+        let owner = DeviceKeyPair::generate();
+        let redeemer = DeviceKeyPair::generate();
+        let code = InviteCode::generate();
+        let auth_key = code.auth_key();
+        let deadline: i64 = 4_102_444_800_000; // 2100-01-01T00:00:00Z
+        let transcript = round_transcript(&code, &owner, &redeemer, deadline as u64);
+        let record = PairingRecord::build(transcript, &auth_key, &owner, &redeemer);
+        let commit = commit_view_of(&transcript, &record);
+
+        // This round's frame, taken anywhere inside the grace: the proof
+        // check runs at the deadline, not at the (later) take time. Taken
+        // past the grace: a timeout, not a proof failure.
+        for (offset, outcome) in [
+            (-1i64, "ok"),
+            (0, "ok"),
+            (1, "ok"),
+            (GRACE_MS, "ok"),
+            (GRACE_MS + 1, "timeout"),
+        ] {
+            let taken_at = (deadline + offset) as u64;
+            let result = verify_live_commit(&commit, &transcript, &auth_key, taken_at).map(|_| ());
+            match outcome {
+                "ok" => assert!(result.is_ok(), "taken at D{offset:+} ms: {result:?}"),
+                _ => assert!(
+                    matches!(result, Err(PairFlowError::Timeout)),
+                    "taken at D{offset:+} ms: {result:?}"
+                ),
+            }
+        }
+
+        // Another round of the same pairing id: validly signed under the
+        // same keys and code, so the bare proof check accepts it on its own
+        // terms. The live check refuses it inside the grace because it is
+        // not this round's transcript, and past the grace as a timeout:
+        // the bound is judged by this round's own deadline.
+        let other = PairTranscript {
+            owner_nonce: [0x77; 32],
+            ..transcript
+        };
+        let other_record = PairingRecord::build(other, &auth_key, &owner, &redeemer);
+        let other_commit = commit_view_of(&other, &other_record);
+        assert!(
+            verify_commit_full(&other_commit, &auth_key, (deadline - 1) as u64).is_ok(),
+            "fixture: the bare proof check is self-consistent"
+        );
+        for offset in [-1i64, 0, 1, GRACE_MS] {
+            let result = verify_live_commit(
+                &other_commit,
+                &transcript,
+                &auth_key,
+                (deadline + offset) as u64,
+            )
+            .map(|_| ());
+            assert!(
+                matches!(
+                    result,
+                    Err(PairFlowError::Verify(
+                        PairingVerifyError::TranscriptDigestMismatch
+                    ))
+                ),
+                "another round's transcript taken at D{offset:+} ms: {result:?}"
+            );
+        }
+        let result = verify_live_commit(
+            &other_commit,
+            &transcript,
+            &auth_key,
+            (deadline + GRACE_MS + 1) as u64,
+        )
+        .map(|_| ());
+        assert!(
+            matches!(result, Err(PairFlowError::Timeout)),
+            "past the grace the timeout comes before the transcript check: {result:?}"
+        );
+
+        // Inside the grace a broken MAC or signature is still refused.
+        let mut bad_mac = commit_view_of(&transcript, &record);
+        bad_mac.owner_proof.mac = [0xEE; 32];
+        assert!(matches!(
+            verify_live_commit(&bad_mac, &transcript, &auth_key, (deadline + 1) as u64).map(|_| ()),
+            Err(PairFlowError::Verify(
+                PairingVerifyError::InviteCodeMismatch
+            ))
+        ));
+        let mut bad_signature = commit_view_of(&transcript, &record);
+        bad_signature.redeemer_proof.signature = [0; 64];
+        assert!(matches!(
+            verify_live_commit(
+                &bad_signature,
+                &transcript,
+                &auth_key,
+                (deadline + 1) as u64
+            )
+            .map(|_| ()),
+            Err(PairFlowError::Verify(PairingVerifyError::PublicKeyMismatch))
+        ));
+    }
+
+    type RedeemOutcome = Result<TaskRedeem, PairFlowError>;
+
+    /// What the joiner is doing, without waiting for it: how its task ended
+    /// when it already finished (a panic or a cancellation included, so the
+    /// caller's own reason is never lost), else that it is still running.
+    async fn joiner_state(redeeming: &mut tokio::task::JoinHandle<RedeemOutcome>) -> String {
+        if !redeeming.is_finished() {
+            return "the joiner is still running".to_string();
+        }
+        let joined = redeeming.await.map(|inner| inner.map(|_| ()));
+        format!("the joiner task ended with {joined:?}")
+    }
+
+    /// The one `InviteRedeemOffered` the owner loop would answer, or a
+    /// failure that names why it never came and what the joiner was doing:
+    /// it gave up first, the plane closed, or `limit` ran out.
+    async fn offered_redeem(
+        plane: &mut mpsc::Receiver<CtrlMessage>,
+        redeeming: &mut tokio::task::JoinHandle<RedeemOutcome>,
+        limit: Duration,
+    ) -> (
+        [u8; 16],
+        u64,
+        [u8; 16],
+        [u8; 32],
+        ak_signal::protocol_v2::RedeemRequest,
+    ) {
+        let give_up_at = tokio::time::Instant::now() + limit;
+        loop {
+            tokio::select! {
+                joined = &mut *redeeming => {
+                    let joined = joined.map(|inner| inner.map(|_| ()));
+                    panic!("the joiner finished before the owner was offered anything: {joined:?}")
+                }
+                frame = plane.recv() => match frame {
+                    Some(CtrlMessage::InviteRedeemOffered {
+                        code_id,
+                        code_revision,
+                        pairing_id,
+                        redeemer_device_id,
+                        redeem,
+                    }) => {
+                        return (code_id, code_revision, pairing_id, redeemer_device_id, redeem);
+                    }
+                    Some(_) => continue,
+                    None => panic!(
+                        "owner pairing plane closed before the offer; {}",
+                        joiner_state(redeeming).await
+                    ),
+                },
+                _ = tokio::time::sleep_until(give_up_at) => {
+                    panic!(
+                        "no InviteRedeemOffered within {limit:?}; {}",
+                        joiner_state(redeeming).await
+                    );
+                }
+            }
+        }
+    }
+
+    async fn orchestrator_on(
+        registry: &registry::TestRegistry,
+        name: &str,
+        key: &DeviceKeyPair,
+        dir: &Path,
+        config: OrchestratorConfig,
+    ) -> PairingOrchestrator {
+        let client = RegistryClient::connect(registry.addr, registry.registry_id, key, name)
+            .await
+            .expect("connect to the registry");
+        PairingOrchestrator::open(client, key.clone(), dir, config).expect("open")
+    }
+
+    /// The registry commits at or before the deadline; both endpoints take
+    /// the `PairCommit` after it, inside the delivery grace, and both must
+    /// still end at `Applied` with the other device booked (Z-N7).
+    ///
+    /// The ordering does not depend on how fast the machine is. The real
+    /// registry runs with a generous window; the two flows park their
+    /// frames; the test checks that they arrived while the wall clock was
+    /// still before the deadline; and only the moment each flow takes its
+    /// frame is then pinned, on these two instances alone.
+    #[tokio::test]
+    async fn live_commit_delivered_after_deadline_applies_on_both_sides() {
+        const LIMIT: Duration = Duration::from_secs(20);
+        // The contract's delivery grace, written out on purpose (see the
+        // table test).
+        const GRACE_MS: u64 = 10_000;
+        const TAKEN_PAST_DEADLINE_MS: u64 = 1;
+        let registry = registry::spawn().await;
+
+        let owner_endpoint_bytes = br#"{"addrs":["127.0.0.1:7100"]}"#.to_vec();
+        let joiner_endpoint =
+            ak_signal::protocol_v2::EndpointBlob(br#"{"addrs":["127.0.0.1:7101"]}"#.to_vec());
+
+        let a_key = DeviceKeyPair::generate();
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = orchestrator_on(&registry, "alice", &a_key, a_dir.path(), test_config()).await;
+        a.client().arm_commit_gate();
+        let mut a_plane = a.client().subscribe_plane();
+        // A one-shot task code, as in the flow that failed on CI.
+        let invite = a
+            .create_task_invite(
+                [0x51; 16],
+                0,
+                ak_signal::protocol_v2::EndpointBlob(owner_endpoint_bytes.clone()),
+            )
+            .await
+            .expect("claim the one-shot task code");
+
+        let b_key = DeviceKeyPair::generate();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = orchestrator_on(&registry, "bob", &b_key, b_dir.path(), test_config()).await;
+        b.client().arm_commit_gate();
+
+        let code_display = invite.display.clone();
+        let mut redeeming = {
+            let b = b.clone();
+            tokio::spawn(async move { b.redeem_task(&code_display, joiner_endpoint).await })
+        };
+        let (code_id, code_revision, pairing_id, redeemer_device_id, redeem) =
+            offered_redeem(&mut a_plane, &mut redeeming, LIMIT).await;
+        let deadline = redeem.deadline_ms;
+        let answering = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                a.owner_answer_offer(
+                    code_id,
+                    code_revision,
+                    pairing_id,
+                    redeemer_device_id,
+                    redeem,
+                )
+                .await
+            })
+        };
+
+        // Both frames parked, one per side, both of this pairing. The
+        // registry sends a `PairCommit` only once its commit succeeded, and
+        // both arrived while the wall clock was still before the deadline:
+        // in this run the registry had committed by then. (This is an
+        // observation about this run, not something an endpoint can tell
+        // from a frame that arrives late.)
+        let parked = tokio::time::timeout(LIMIT, async {
+            a.client().commit_parked_within(LIMIT).await
+                && b.client().commit_parked_within(LIMIT).await
+        })
+        .await;
+        assert_eq!(
+            parked,
+            Ok(true),
+            "both sides take the registry's PairCommit"
+        );
+        assert_eq!(a.client().parked_commits(), vec![pairing_id]);
+        assert_eq!(b.client().parked_commits(), vec![pairing_id]);
+        let parked_at = now_unix_ms();
+        assert!(
+            parked_at < deadline,
+            "fixture: both frames arrived at {parked_at}, before the deadline {deadline}"
+        );
+        assert!(!a_dir.path().join(BOOK_NAME).exists());
+        assert!(!b_dir.path().join(BOOK_NAME).exists());
+
+        // Each flow now takes its frame 1 ms past the deadline, well inside
+        // the grace.
+        let taken_at = deadline + TAKEN_PAST_DEADLINE_MS;
+        assert!(taken_at <= deadline + GRACE_MS);
+        a.client().pin_delivery_now(taken_at);
+        b.client().pin_delivery_now(taken_at);
+        assert_eq!(a.client().frame_taken_at_unix_ms(), taken_at);
+        assert_eq!(b.client().frame_taken_at_unix_ms(), taken_at);
+        assert_eq!(a.client().release_commits(), 1);
+        assert_eq!(b.client().release_commits(), 1);
+
+        let (owner, redeemer) =
+            tokio::time::timeout(LIMIT, async { tokio::join!(answering, redeeming) })
+                .await
+                .expect("both flows finish after the late commit");
+        let owner = owner
+            .expect("owner task")
+            .expect("owner accepts the commit the registry made before the deadline");
+        let redeemer = redeemer
+            .expect("redeemer task")
+            .expect("redeemer accepts the commit the registry made before the deadline");
+        assert_eq!(owner.record().transcript.pairing_id, pairing_id);
+        assert_eq!(redeemer.verified.record().transcript.pairing_id, pairing_id);
+        assert_eq!(
+            owner.record().transcript.transcript_digest(),
+            redeemer.verified.record().transcript.transcript_digest()
+        );
+        // The joiner also got the owner's endpoint off the late frame.
+        assert_eq!(redeemer.owner_endpoint, Some(owner_endpoint_bytes));
+
+        // Each side booked the other, and both journals end at Applied.
+        let a_book = fs::read_to_string(a_dir.path().join(BOOK_NAME)).expect("owner trust book");
+        let b_book = fs::read_to_string(b_dir.path().join(BOOK_NAME)).expect("redeemer trust book");
+        assert!(a_book.contains(&Fingerprint::from_public_key(&b_key.public_key()).to_hex()));
+        assert!(b_book.contains(&Fingerprint::from_public_key(&a_key.public_key()).to_hex()));
+        for dir in [a_dir.path(), b_dir.path()] {
+            let records = PairingJournal::open(&dir.join(JOURNAL_SUBDIR))
+                .unwrap()
+                .load_all()
+                .unwrap();
+            assert!(
+                records.iter().any(|record| {
+                    record.pairing_id == pairing_id && record.phase == PairingPhase::Applied
+                }),
+                "journal of {} is Applied for this pairing",
+                dir.display()
+            );
+        }
     }
 
     // ---- P1-1: pin sidecar persistence ------------------------------------

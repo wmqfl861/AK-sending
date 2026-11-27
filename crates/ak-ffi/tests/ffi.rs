@@ -1008,6 +1008,84 @@ fn wait_for_event(
     panic!("no {event} event for job {job_hex} within {timeout:?}; saw {others:?}");
 }
 
+/// [`wait_for_event`] for a receive's `listening`, returning the address
+/// the job reported itself listening on and also reporting the job's own
+/// outcome (Z-N6): when the job ends before it listens, or does not listen
+/// within `timeout`, the panic carries the `ak_job_result` code — with
+/// `ak_engine_last_error` when that code is an ABI error — the result body
+/// and every event seen, so a bind failure is visible instead of a bare
+/// event timeout.
+///
+/// The worker queues `listening` first and its terminal outcome later, so
+/// both can land between a poll that saw an empty queue and the result
+/// read. The order is therefore always: drain the queue, read the outcome,
+/// and — when the outcome is terminal or the time is up — drain once more
+/// before believing it. By the time the outcome reads terminal the worker
+/// has queued whatever it had to queue.
+fn wait_for_listening_or_result(
+    engine: *mut AkEngine,
+    job: &[u8; 16],
+    timeout: Duration,
+) -> std::net::SocketAddr {
+    let job_hex = hex16(job);
+    let mut others = Vec::new();
+    // Take every event queued now; `Some` once this job's `listening` shows.
+    let drain = |others: &mut Vec<String>| -> Option<std::net::SocketAddr> {
+        loop {
+            let (code, line) = poll_big(engine);
+            if code == AK_EVENT {
+                if line_job(&line) == job_hex && event_name(&line) == "listening" {
+                    return Some(
+                        field_str(&line, "addr")
+                            .parse()
+                            .expect("listening addr parses"),
+                    );
+                }
+                others.push(line);
+                continue;
+            }
+            assert_eq!(code, AK_PENDING, "poll: {}", last_error_text(engine));
+            return None;
+        }
+    };
+    // One `ak_job_result` read as a report-ready line: `AK_DONE` and
+    // `AK_FAILED` keep their body; a negative code is an ABI error whose
+    // text is taken right here, because `ak_poll_progress` (inside the
+    // drain) clears the engine's last-error text on entry.
+    let read_outcome = || -> (bool, String) {
+        let (result, json) = result_big(engine, job);
+        if result < 0 {
+            (
+                true,
+                format!("ABI error {result}: {}", last_error_text(engine)),
+            )
+        } else {
+            (result != AK_PENDING, format!("{result}: {json}"))
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(addr) = drain(&mut others) {
+            return addr;
+        }
+        let (terminal, outcome) = read_outcome();
+        if !terminal && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        // The queue may have changed since the drain above; look once more.
+        if let Some(addr) = drain(&mut others) {
+            return addr;
+        }
+        if terminal {
+            panic!("job {job_hex} ended without listening; result {outcome}; saw {others:?}");
+        }
+        panic!(
+            "no listening event for job {job_hex} within {timeout:?}; result {outcome}; saw {others:?}"
+        );
+    }
+}
+
 #[test]
 fn null_job_out_is_refused_before_any_task_starts() {
     let engine = ak_engine_new();
@@ -1215,7 +1293,12 @@ fn cancelled_single_receive_port_rebinds_immediately() {
         "immediate rebind on port {port}: {}",
         last_error_text(engine)
     );
-    wait_for_event(engine, &job2, "listening", Duration::from_secs(20));
+    let listening = wait_for_listening_or_result(engine, &job2, Duration::from_secs(20));
+    assert_eq!(
+        listening.port(),
+        port,
+        "the rebound receive listens on the port that was just cancelled"
+    );
     assert_eq!(unsafe { ak_job_cancel(engine, job2.as_ptr()) }, AK_OK);
 
     unsafe { ak_engine_free(engine) };

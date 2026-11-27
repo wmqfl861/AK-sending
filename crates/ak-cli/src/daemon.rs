@@ -550,6 +550,9 @@ async fn watch_wired_task(
 /// event output). See the module docs; Ctrl-C withdraws the announcement
 /// and exits 0.
 pub(crate) async fn daemon_command(id: &Path, opts: DaemonOptions) -> Result<()> {
+    // The integration tests' pairing trace (Q-N3) turns on the same way as
+    // for `ak-cli task`: only with a non-empty `AK_PAIR_DIAG`.
+    crate::task_cli::init_pair_diag_logger();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         // Ctrl-C flips the shared shutdown flag; the core loop observes it

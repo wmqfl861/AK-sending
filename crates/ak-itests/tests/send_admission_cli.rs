@@ -32,16 +32,26 @@
 //! `ak-cli` binary built from this workspace.
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ak_engine::{AdmissionDecision, AdmissionRequest, ReceiveSpec};
 use ak_identity::{DeviceKeyPair, Fingerprint};
 use ak_net::DirectEndpoint as EngineEndpoint;
+
+mod common;
+
+// The chain plumbing is the one the T03 test checks (plan of 2026-11-28,
+// section F): both pipes and the exit status of every process, frozen
+// once for a report, and the registry database sampled next to it.
+use common::report::{
+    argv_summary, live_report, mark_decision_cursor, redact, registry_snapshot_about, Proc,
+    RegistryProc, Stream,
+};
 
 // ---- CLI binary location / build -------------------------------------------
 
@@ -102,141 +112,6 @@ fn cli_exe() -> PathBuf {
 
 // ---- process plumbing -------------------------------------------------------
 
-/// Lines a piped stream has produced so far (fed by a reader thread so
-/// the child can never block on a full pipe). A stdout log also holds its
-/// process's stderr so a timed-out wait reports both (2026-11-19 review).
-#[derive(Clone, Default)]
-struct LineLog {
-    lines: Arc<Mutex<Vec<String>>>,
-    stderr: Option<Arc<Mutex<Vec<String>>>>,
-}
-
-impl LineLog {
-    fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
-        let log = LineLog::default();
-        let sink = Arc::clone(&log.lines);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines() {
-                match line {
-                    Ok(text) => {
-                        let mut lines =
-                            sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        lines.push(text);
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        log
-    }
-
-    /// Report `stderr` (the same process's other stream) on a timeout.
-    fn with_stderr(mut self, stderr: &LineLog) -> Self {
-        self.stderr = Some(Arc::clone(&stderr.lines));
-        self
-    }
-
-    fn snapshot(&self) -> Vec<String> {
-        self.lines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// This stream so far, plus the process's stderr when attached.
-    fn report(&self) -> String {
-        let mut text = self.snapshot().join("\n");
-        if let Some(stderr) = &self.stderr {
-            let stderr = stderr
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .join("\n");
-            text.push_str("\nstderr so far:\n");
-            text.push_str(&stderr);
-        }
-        text
-    }
-
-    /// First line containing `needle`, polling until it appears.
-    fn wait_for(&self, needle: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
-        loop {
-            for line in self.snapshot() {
-                if line.contains(needle) {
-                    return line;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
-                self.report()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Wait until at least `count` lines contain `needle`.
-    fn wait_count(&self, needle: &str, count: usize, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let have = self
-                .snapshot()
-                .iter()
-                .filter(|line| line.contains(needle))
-                .count();
-            if have >= count {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {have}/{count} lines containing {needle:?} within {timeout:?}; output so far:
-{}",
-                self.report()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-/// A resident CLI child process with captured stdout/stderr.
-struct Proc {
-    child: Child,
-    stdout: LineLog,
-    #[allow(dead_code)]
-    stderr: LineLog,
-}
-
-impl Proc {
-    fn spawn(tag: &str, args: &[&str]) -> Proc {
-        let cli = cli_exe();
-        let mut child = Command::new(&cli)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| panic!("spawn {tag} ({:?} {:?}): {err}", cli, args));
-        let stderr = LineLog::spawn_reader(child.stderr.take().expect("stderr piped"));
-        let stdout =
-            LineLog::spawn_reader(child.stdout.take().expect("stdout piped")).with_stderr(&stderr);
-        Proc {
-            child,
-            stdout,
-            stderr,
-        }
-    }
-
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 /// Result of one one-shot CLI run.
 struct RunOutcome {
     success: bool,
@@ -252,7 +127,10 @@ fn run_cli(args: &[&str], timeout: Duration) -> RunOutcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|err| panic!("spawn ({:?} {:?}): {err}", cli, args));
+        .unwrap_or_else(|err| {
+            let owned: Vec<String> = args.iter().map(|text| text.to_string()).collect();
+            panic!("spawn ({}): {err}", argv_summary(&owned))
+        });
     let stdout_handle = {
         let pipe = child.stdout.take().expect("stdout piped");
         std::thread::spawn(move || read_all(pipe))
@@ -280,24 +158,18 @@ fn run_cli(args: &[&str], timeout: Duration) -> RunOutcome {
     }
 }
 
+/// One CLI child of this file's chains, with the pairing trace on (the
+/// shared `Proc::spawn` does that for every child). It is registered for
+/// the reports of this thread from its first moment.
+fn spawn_proc(tag: &str, args: &[&str]) -> Proc {
+    let owned: Vec<String> = args.iter().map(|text| text.to_string()).collect();
+    Proc::spawn(tag, &owned)
+}
+
 fn read_all(mut pipe: impl Read) -> String {
     let mut buf = Vec::new();
     let _ = pipe.read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// The port a `registry-server --port 0` bound, from its `v2 pairing
-/// registry on tls <addr> (db …)` line. The server prints that line only
-/// once it listens (2026-11-19 review), so no port is picked here and
-/// bound later by another process, and no client starts too early.
-fn announced_registry_port(line: &str) -> u16 {
-    line.split("v2 pairing registry on tls ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|token| token.parse::<SocketAddr>().ok())
-        .map(|addr| addr.port())
-        .filter(|port| *port != 0)
-        .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
 }
 
 /// Extract `"field":"value"` or `"field":number` from a JSON line (the
@@ -464,7 +336,7 @@ async fn cli_send_with_ready_relation_falls_back_to_legacy_receiver() {
 
     let daemon_dir_text = daemon_dir.to_string_lossy().into_owned();
     let out_text = out.to_string_lossy().into_owned();
-    let mut daemon = Proc::spawn(
+    let mut daemon = spawn_proc(
         "legacy-daemon",
         &[
             "daemon",
@@ -705,52 +577,6 @@ async fn cli_send_admission_denied_reports_busy_without_silent_retry() {
 
 // ---- daemon-matrix tests (wave-27 daemon-side admission dependency) ---------
 
-/// The registry-server subprocess (real v2 TLS registry + SQLite): reused
-/// verbatim from `invite_pairing_cli_e2e.rs` so the chains here speak the
-/// same real control plane.
-struct RegistryProc {
-    #[allow(dead_code)]
-    proc: Proc,
-    addr: SocketAddr,
-    fp_hex: String,
-}
-
-impl RegistryProc {
-    fn spawn(tag: &str, server_dir: &Path, db: &Path) -> RegistryProc {
-        let db_text = db.to_string_lossy().into_owned();
-        let id_text = server_dir.to_string_lossy().into_owned();
-        let args = [
-            "registry-server",
-            "--port",
-            "0",
-            "--db-path",
-            &db_text,
-            "--id-dir",
-            &id_text,
-        ];
-        let proc = Proc::spawn(tag, &args);
-        let listening = proc
-            .stdout
-            .wait_for("v2 pairing registry on tls ", Duration::from_secs(30));
-        let port = announced_registry_port(&listening);
-        let line = proc.stdout.wait_for(
-            "registry id (pin with --registry-fp): ",
-            Duration::from_secs(30),
-        );
-        let fp_hex = line
-            .rsplit(' ')
-            .next()
-            .expect("hex id is the last token")
-            .to_ascii_lowercase();
-        assert_eq!(fp_hex.len(), 64, "registry id line: {line}");
-        RegistryProc {
-            proc,
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
-            fp_hex,
-        }
-    }
-}
-
 /// One code created by the owner identity (`invite create` subprocess):
 /// its bearer display form (the redeem input).
 struct CreatedCode {
@@ -762,8 +588,373 @@ fn parse_created_code(stdout: &str) -> CreatedCode {
         .lines()
         .find_map(|line| line.trim().strip_prefix("AKI1-"))
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("no AKI1- code line in:\n{stdout}"));
+        .unwrap_or_else(|| panic!("no AKI1- code line in:\n{}", redact(stdout)));
     CreatedCode { display }
+}
+
+// ---- calibration of the capture (plan of 2026-11-28, section F) -----------
+
+/// The pairing the calibration asks the registry about: synthetic, not
+/// zero, and in no database.
+const CALIBRATION_PAIRING: [u8; 16] = [0xA5; 16];
+
+/// What the calibration collected on one registry instance.
+#[derive(Clone)]
+struct Calibration {
+    /// The registry's stderr when the calibration ended.
+    registry_err: Vec<String>,
+    /// What the calibration client took off the wire for the synthetic
+    /// pairing, if it took anything.
+    taken: Option<ak_signal::protocol_v2::CtrlMessage>,
+    /// The calibration device's first four bytes, as the notice line names
+    /// the device.
+    device: [u8; 4],
+    /// The snapshot's look at the control pairing.
+    transactions: String,
+    /// Why the calibration identity could not reach the registry, when it
+    /// could not: then nothing else was collected. Carried back instead of
+    /// a panic, so the verdict and the report come from the test's own
+    /// thread, which holds the registry.
+    unreached: Option<String>,
+}
+
+/// Which of the registry's two calibration lines are on its stderr: the
+/// decision for the synthetic pairing, and the notice queued to the
+/// calibration device.
+fn calibration_lines(registry_err: &[String], device: &[u8; 4]) -> (bool, bool) {
+    let prefix = hex_of(&CALIBRATION_PAIRING[..4]);
+    let device = hex_of(device);
+    let decision = registry_err.iter().any(|line| {
+        line.contains(&format!(
+            "answered unavailable: no transaction to prepare (pairing {prefix})"
+        ))
+    });
+    let notice = registry_err.iter().any(|line| {
+        line.contains(&format!("pairing {prefix} notice "))
+            && line.contains(&format!(" to the requester {device}: "))
+            && line.contains("; enqueued")
+    });
+    (decision, notice)
+}
+
+/// Whether the calibration proves that this registry's decisions are being
+/// captured. Four things must be there: the registry's decision line for
+/// the synthetic pairing, the notice queued to the calibration device,
+/// the `unavailable` the calibration client took for that pairing, and
+/// no row for it in the snapshot. Anything missing is red — also the lines
+/// of another registry instance, which hold none of this one's.
+fn calibration_verdict(calibration: &Calibration) -> Result<(), String> {
+    use ak_signal::protocol_v2::{CtrlMessage, ErrorScope, PAIR_UNAVAILABLE};
+    if let Some(reason) = &calibration.unreached {
+        return Err(format!(
+            "the calibration identity could not reach the registry: {reason}"
+        ));
+    }
+    let (decision, notice) = calibration_lines(&calibration.registry_err, &calibration.device);
+    let taken = matches!(
+        calibration.taken,
+        Some(CtrlMessage::PairError {
+            scope: ErrorScope::Pairing,
+            object_id,
+            code: PAIR_UNAVAILABLE,
+            ..
+        }) if object_id == CALIBRATION_PAIRING
+    );
+    let no_row = calibration
+        .transactions
+        .contains("\"alias\": \"calibration\", \"matches\": 0, \"row\": null");
+    let mut missing = Vec::new();
+    if !decision {
+        missing.push("the registry's decision line for the pairing");
+    }
+    if !notice {
+        missing.push("the notice queued to the calibration device");
+    }
+    if !taken {
+        missing.push("the `unavailable` the calibration client took");
+    }
+    if !no_row {
+        missing.push("zero rows for the control pairing in the snapshot");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the calibration on this registry is missing: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Run the calibration on `registry`. A calibration identity subscribes to
+/// the plane and sends a Prepared for a pairing that does not exist — the
+/// registry's one certain exit for that — then the registry's stderr, the
+/// client's answer and the snapshot are collected within one bounded
+/// window. It proves only that this registry instance and this capture
+/// path work; a natural attempt is aligned on its own lines.
+async fn collect_calibration(registry: &RegistryProc) -> Calibration {
+    let key = DeviceKeyPair::generate();
+    let mut registry_id = [0u8; 32];
+    for (index, slot) in registry_id.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&registry.fp_hex[index * 2..index * 2 + 2], 16)
+            .expect("the registry's pin is hex");
+    }
+    let client = match ak_session::pairing::RegistryClient::connect(
+        registry.addr,
+        registry_id,
+        &key,
+        "calibration",
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => {
+            // No panic here: this is the calibration's own thread, which
+            // holds no process. The registry's lines are read through the
+            // shared log, and the verdict is given on the test's thread.
+            return Calibration {
+                registry_err: registry
+                    .proc
+                    .stdout
+                    .lines_of(Stream::Stderr)
+                    .into_iter()
+                    .map(|line| line.text)
+                    .collect(),
+                taken: None,
+                device: key.public_key()[..4].try_into().expect("four bytes"),
+                transactions: String::new(),
+                unreached: Some(redact(&error.to_string())),
+            };
+        }
+    };
+    let mut plane = client.subscribe_plane();
+    client
+        .send_pair_prepared(CALIBRATION_PAIRING, [0x5A; 32], [0u8; 64])
+        .await
+        .expect("the calibration client sends its Prepared");
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut taken = None;
+    let registry_err = loop {
+        if taken.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Some(message)) = tokio::time::timeout(left, plane.recv()).await {
+                taken = Some(message);
+            }
+        }
+        let registry_err = registry
+            .proc
+            .stdout
+            .lines_of(Stream::Stderr)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        // With all three parts in, the registry's stderr is read once more
+        // after a short grace, so a line written right behind the notice
+        // is not cut off.
+        let (decision, notice) = calibration_lines(
+            &registry_err,
+            &key.public_key()[..4].try_into().expect("four bytes"),
+        );
+        if taken.is_some() && decision && notice {
+            std::thread::sleep(Duration::from_millis(150));
+            break registry
+                .proc
+                .stdout
+                .lines_of(Stream::Stderr)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>();
+        }
+        if Instant::now() >= deadline {
+            break registry_err;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let answered_ms = started.elapsed().as_millis();
+    let transactions = registry_snapshot_about(
+        &registry.db,
+        &[(
+            "calibration",
+            CALIBRATION_PAIRING[..4].try_into().expect("four bytes"),
+        )],
+    );
+    let looked_up_ms = started.elapsed().as_millis();
+    client.close().await;
+    // How long each part took, for the handoff's timings.
+    eprintln!(
+        "t03 calibration: the answer, the decision line and the notice were in after {answered_ms} ms; \
+         the snapshot lookup ended at {looked_up_ms} ms; the calibration connection closed at {} ms",
+        started.elapsed().as_millis()
+    );
+    let device: [u8; 4] = key.public_key()[..4].try_into().expect("four bytes");
+    Calibration {
+        registry_err,
+        taken,
+        device,
+        transactions,
+        unreached: None,
+    }
+}
+
+/// Run the calibration on a thread of its own (the chain fixture is
+/// synchronous) and demand that it passes.
+fn calibrate(registry: &RegistryProc) {
+    let calibration = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Runtime::new()
+                    .expect("a runtime for the calibration")
+                    .block_on(collect_calibration(registry))
+            })
+            .join()
+            .expect("the calibration thread")
+    });
+    if let Err(missing) = calibration_verdict(&calibration) {
+        panic!("{missing}\n{}", live_report());
+    }
+}
+
+/// Plan of 2026-11-28, section F: the verdict is red whenever one of its
+/// four parts is missing — among others with the lines of another registry
+/// instance, which have none of this one's.
+#[test]
+fn the_calibration_is_red_without_any_of_its_four_parts() {
+    use ak_signal::protocol_v2::{CtrlMessage, ErrorScope, PAIR_UNAVAILABLE};
+    let prefix = hex_of(&CALIBRATION_PAIRING[..4]);
+    let device = [0x11u8; 4];
+    let decision = format!(
+        "[.. DEBUG ak_signal::server_v2::engine::pairing] prepared from 1a2b3c4d \
+         answered unavailable: no transaction to prepare (pairing {prefix})"
+    );
+    let notice = format!(
+        "[.. DEBUG ak_signal::server_v2::engine] pairing {prefix} notice 1 to the requester {}: \
+         prepared answered unavailable: no transaction on record; enqueued",
+        hex_of(&device)
+    );
+    let taken = || {
+        Some(CtrlMessage::PairError {
+            request_id: [0u8; 16],
+            scope: ErrorScope::Pairing,
+            object_id: CALIBRATION_PAIRING,
+            code: PAIR_UNAVAILABLE,
+            retry_after_ms: 0,
+        })
+    };
+    let whole = Calibration {
+        registry_err: vec![decision.clone(), notice.clone()],
+        taken: taken(),
+        device,
+        transactions: "{\"about\": [{\"alias\": \"calibration\", \"matches\": 0, \"row\": null}]}"
+            .to_string(),
+        unreached: None,
+    };
+    assert_eq!(calibration_verdict(&whole), Ok(()));
+    let other_device = Calibration {
+        device: [0x22u8; 4],
+        ..whole.clone()
+    };
+    let mut other_pairing = whole.clone();
+    other_pairing.taken = Some(CtrlMessage::PairError {
+        request_id: [0u8; 16],
+        scope: ErrorScope::Pairing,
+        object_id: [0x5A; 16],
+        code: PAIR_UNAVAILABLE,
+        retry_after_ms: 0,
+    });
+    let broken = [
+        (
+            "no decision line",
+            Calibration {
+                registry_err: vec![notice.clone()],
+                ..whole.clone()
+            },
+        ),
+        (
+            "no notice",
+            Calibration {
+                registry_err: vec![decision.clone()],
+                ..whole.clone()
+            },
+        ),
+        (
+            "another instance's log",
+            Calibration {
+                registry_err: vec!["v2 registry server listening on tls 127.0.0.1:9".to_string()],
+                ..whole.clone()
+            },
+        ),
+        ("a notice to another device", other_device),
+        (
+            "the client took nothing",
+            Calibration {
+                taken: None,
+                ..whole.clone()
+            },
+        ),
+        ("the client took another pairing's answer", other_pairing),
+        (
+            "a dropped notice",
+            Calibration {
+                registry_err: vec![
+                    decision,
+                    notice.replace("enqueued", "dropped: the outbound queue is full"),
+                ],
+                ..whole.clone()
+            },
+        ),
+        (
+            "a row exists for the control pairing",
+            Calibration {
+                transactions:
+                    "{\"about\": [{\"alias\": \"calibration\", \"matches\": 1, \"row\": {}}]}"
+                        .to_string(),
+                ..whole.clone()
+            },
+        ),
+    ];
+    for (name, calibration) in broken {
+        assert!(
+            calibration_verdict(&calibration).is_err(),
+            "{name}: {:?}",
+            calibration_verdict(&calibration)
+        );
+    }
+    // An identity that could not reach the registry names that, and not
+    // the three parts it never got to look for.
+    let unreachable = calibration_verdict(&Calibration {
+        unreached: Some("pinned TLS dial failed".to_string()),
+        ..whole.clone()
+    });
+    assert_eq!(
+        unreachable,
+        Err(
+            "the calibration identity could not reach the registry: pinned TLS dial failed"
+                .to_string()
+        )
+    );
+}
+
+/// …and on a real registry whose DEBUG lines are not written: the decision
+/// and the notice are two of those lines.
+#[tokio::test]
+async fn the_calibration_on_a_real_registry_is_red_without_its_debug_lines() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let server_dir = tmp.path().join("server");
+    std::fs::create_dir_all(&server_dir).expect("server dir");
+    let registry = RegistryProc::spawn_with_log(
+        "quiet-registry",
+        &server_dir,
+        &tmp.path().join("registry.db"),
+        "info",
+    );
+    let calibration = collect_calibration(&registry).await;
+    let verdict = calibration_verdict(&calibration);
+    assert!(
+        verdict.is_err(),
+        "without the registry's DEBUG lines the calibration must be red; the registry said:\n{}",
+        redact(&calibration.registry_err.join("\n"))
+    );
 }
 
 /// One owner daemon plus N redeemer daemons, every device a real
@@ -798,6 +989,11 @@ impl DaemonChain {
         std::fs::create_dir_all(&server_dir).expect("server dir");
         std::fs::create_dir_all(&owner_dir).expect("owner dir");
         let registry = RegistryProc::spawn(tag, &server_dir, &tmp.path().join("registry.db"));
+        // Before any natural redeem: from here on, every report of this
+        // thread shows what this registry decided, without the
+        // calibration's own lines.
+        calibrate(&registry);
+        mark_decision_cursor();
         let addr = registry.addr.to_string();
         let fp = registry.fp_hex.clone();
 
@@ -822,11 +1018,16 @@ impl DaemonChain {
                 ],
                 Duration::from_secs(30),
             );
-            assert!(run.success, "invite create failed:\n{}", run.stderr);
+            assert!(
+                run.success,
+                "invite create failed:\n{}\n{}",
+                redact(&run.stderr),
+                live_report()
+            );
             created.push(parse_created_code(&run.stdout));
         }
 
-        let owner = Proc::spawn(
+        let owner = spawn_proc(
             &format!("{tag}-owner"),
             &[
                 "daemon",
@@ -850,9 +1051,11 @@ impl DaemonChain {
                 &fp,
             ],
         );
-        owner.stderr.wait_for(
+        owner.wait_for_line(
+            Stream::Stderr,
             "pairing service: answering redeems",
             Duration::from_secs(30),
+            &[],
         );
         let listening = owner
             .stdout
@@ -877,7 +1080,7 @@ impl DaemonChain {
             let dir_text = dir.to_string_lossy().into_owned();
             let out_text = out.to_string_lossy().into_owned();
             let name = format!("redeemer-{tag}-{index}");
-            let proc = Proc::spawn(
+            let proc = spawn_proc(
                 &format!("{tag}-redeemer-{index}"),
                 &[
                     "daemon",
@@ -1009,8 +1212,10 @@ async fn same_code_serial_two_redeemers_never_overlap() {
         let sent = outcome.join().expect("send thread");
         assert!(
             sent.success,
-            "{label} send failed:\n{}\n{}",
-            sent.stdout, sent.stderr
+            "{label} send failed:\n{}\n{}\n{}",
+            redact(&sent.stdout),
+            redact(&sent.stderr),
+            live_report()
         );
     }
 
@@ -1046,8 +1251,10 @@ async fn cross_code_parallel_two_redeemers_overlap() {
         let sent = outcome.join().expect("send thread");
         assert!(
             sent.success,
-            "{label} send failed:\n{}\n{}",
-            sent.stdout, sent.stderr
+            "{label} send failed:\n{}\n{}\n{}",
+            redact(&sent.stdout),
+            redact(&sent.stderr),
+            live_report()
         );
     }
 
@@ -1091,8 +1298,10 @@ async fn dual_policy_intersection_serializes_same_code_sends() {
         let sent = outcome.join().expect("send thread");
         assert!(
             sent.success,
-            "{label} failed:\n{}\n{}",
-            sent.stdout, sent.stderr
+            "{label} failed:\n{}\n{}\n{}",
+            redact(&sent.stdout),
+            redact(&sent.stderr),
+            live_report()
         );
     }
 

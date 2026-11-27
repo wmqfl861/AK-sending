@@ -263,16 +263,17 @@ impl std::fmt::Display for TaskCancelled {
 impl std::error::Error for TaskCancelled {}
 
 /// `AK_PAIR_DIAG` set to a non-empty value: the pairing trace is on (the
-/// T03 integration test does that; no other run of the CLI sets it).
+/// T03 and admission integration tests do that; no other run of the CLI
+/// sets it).
 fn pair_diag_on() -> bool {
     std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty())
 }
 
-/// The pairing trace of the T03 integration test (Q-N3 recurrence,
+/// The pairing trace of the integration tests (Q-N3 recurrence,
 /// 2026-11-27) reaches stderr only when `AK_PAIR_DIAG` is set to a
-/// non-empty value; no other run of `ak-cli task` installs a logger here,
-/// and the levels come from `RUST_LOG`.
-fn init_pair_diag_logger() {
+/// non-empty value; no other run of `ak-cli task` or `ak-cli daemon`
+/// installs a logger here, and the levels come from `RUST_LOG`.
+pub(crate) fn init_pair_diag_logger() {
     if !pair_diag_on() {
         return;
     }

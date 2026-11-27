@@ -104,6 +104,7 @@ pub(super) fn process_hello(
                     close: state.close.clone(),
                     candidates: Vec::new(),
                     peer_ip: state.peer_ip,
+                    notices: 0,
                 },
             );
             true

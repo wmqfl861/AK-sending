@@ -51,6 +51,37 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+/// One line of the pairing trace the T03 integration test asks for (Q-N3
+/// recurrence, 2026-11-27). `AK_PAIR_DIAG` on the process turns it on, and
+/// it goes to the `ak_pair_diag` log target, so nothing is written unless a
+/// logger with that target enabled is installed as well — only that test
+/// does both. A line names the side and the step and counts milliseconds
+/// from the redeem deadline (negative is before it); it never carries a
+/// code, a key or an id beyond the first four bytes of a pairing id, which
+/// only tell one round from another.
+macro_rules! pair_diag {
+    ($($arg:tt)*) => {
+        if $crate::pairing::pair_diag_enabled() {
+            log::info!(target: "ak_pair_diag", $($arg)*);
+        }
+    };
+}
+pub(crate) use pair_diag;
+
+pub(crate) fn pair_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()))
+}
+
+/// The first four bytes of an id as hex, for the pairing trace (review 20:
+/// the registry's lines carry the same prefix).
+pub(crate) fn id_prefix(id: &[u8]) -> String {
+    id.iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The per-identity registry control-connection lock shared by the CLI
 /// task commands, the daemon and the FFI task runtime (R36-P2-04, batch
 /// G6 — see the module docs).

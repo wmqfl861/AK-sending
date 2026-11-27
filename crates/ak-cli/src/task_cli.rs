@@ -1078,21 +1078,33 @@ async fn run_task_receiver(
                     );
                     // Q-N3 (2026-11-27): with the pairing trace on, say what
                     // the loop actually did once it ends — "no packet sent"
-                    // and "sent, but nothing arrived" look the same from the
-                    // target's side. Loopback ports only, never an address.
+                    // and "sent, but nothing arrived" look the same from
+                    // the target's side. Review 20: per selected target,
+                    // so one particular target's first send is on record
+                    // (`port@first tick/packets`, `@0/0` when no send to
+                    // it succeeded). Ports only, never an address.
                     let diag = pair_diag_on();
                     punch_candidates(punch_socket, &candidates, &punch_stop_loop, |report| {
                         if !diag {
                             return;
                         }
-                        let loopback_ports: Vec<u16> = candidates
+                        let targets: Vec<String> = report
+                            .targets
                             .iter()
-                            .filter(|candidate| candidate.ip().is_loopback())
-                            .map(|candidate| candidate.port())
+                            .map(|target| {
+                                format!(
+                                    "{}@{}/{}",
+                                    target.address.port(),
+                                    target.first_sent_tick,
+                                    target.packets_sent
+                                )
+                            })
                             .collect();
                         eprintln!(
-                            "[pair-diag] receiver punch loop ended: {} candidate(s), loopback candidate ports {loopback_ports:?}; {} packet(s) sent ({} low-TTL), {} tick(s), stopped early: {}, start delayed: {}",
+                            "[pair-diag] receiver punch loop ended: {} candidate(s), {} considered, selected [{}]; {} packet(s) sent ({} low-TTL), {} tick(s), stopped early: {}, start delayed: {}",
                             candidates.len(),
+                            report.considered,
+                            targets.join(", "),
                             report.packets_sent,
                             report.low_ttl_packets,
                             report.ticks,

@@ -5,23 +5,6 @@
 
 use super::*;
 
-/// One decision line of the pairing handlers: a DEBUG log in every
-/// build and, in this crate's own tests, a line in the tests' sink, so a
-/// test can check that the diagnostics name the branch it drove (Q-N3).
-fn decision(args: std::fmt::Arguments<'_>) {
-    log::debug!("{args}");
-    #[cfg(test)]
-    super::tests::DECISIONS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(args.to_string());
-}
-macro_rules! decision {
-    ($($arg:tt)*) => {
-        decision(format_args!($($arg)*))
-    };
-}
-
 // ---- redeem -------------------------------------------------------------------
 
 pub(super) fn handle_redeem(
@@ -528,6 +511,15 @@ fn prepared_outcome<Error>(decision: &Result<PreparedDecision, Error>) -> &'stat
     }
 }
 
+/// The role a participant's line names it by (Q-N3, review 20).
+fn role_in(snapshot: &PairingSnapshot, device: &DeviceId) -> &'static str {
+    if snapshot.owner == *device {
+        "owner"
+    } else {
+        "redeemer"
+    }
+}
+
 pub(super) fn handle_prepared(
     shared: &Shared,
     out: &mpsc::Sender<CtrlFrame>,
@@ -540,6 +532,9 @@ pub(super) fn handle_prepared(
     // Q-N3 recurrence (2026-11-27): every exit below answers the sender
     // with `unavailable` and had no line of its own; each now says why, and
     // counts signed milliseconds from the deadline (negative: before it).
+    // Review 20: the answer is delivered with a line of its own too, so a
+    // sweep's notification and a late Prepared's answer — the same frame to
+    // the same participant — can be told apart and ordered.
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
@@ -548,7 +543,14 @@ pub(super) fn handle_prepared(
                 util::hex_prefix(&me, 4),
                 util::hex_prefix(&pairing_id, 4)
             );
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                "requester",
+                pairing_id,
+                "prepared answered unavailable: no transaction on record",
+                unavailable([0u8; 16], pairing_id),
+            );
             return;
         }
         Err(error) => {
@@ -556,21 +558,43 @@ pub(super) fn handle_prepared(
                 "prepared from {} answered unavailable: the transaction lookup failed ({error}) (pairing {})",
                 util::hex_prefix(&me, 4)
             , util::hex_prefix(&pairing_id, 4));
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                "requester",
+                pairing_id,
+                "prepared answered unavailable: the transaction lookup failed",
+                unavailable([0u8; 16], pairing_id),
+            );
             return;
         }
     };
-    if (snapshot.owner != me && snapshot.redeemer != me)
-        || snapshot.transcript_digest != Some(transcript_digest)
-        || now > snapshot.deadline_ms
-    {
+    let role = role_in(&snapshot, &me);
+    let outsider = snapshot.owner != me && snapshot.redeemer != me;
+    let digest_differs = snapshot.transcript_digest != Some(transcript_digest);
+    let past_deadline = now > snapshot.deadline_ms;
+    if outsider || digest_differs || past_deadline {
         decision!("prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms from the deadline (pairing {})",
             util::hex_prefix(&me, 4),
-            snapshot.owner != me && snapshot.redeemer != me,
-            snapshot.transcript_digest != Some(transcript_digest),
+            outsider,
+            digest_differs,
             now as i64 - snapshot.deadline_ms as i64
         , util::hex_prefix(&pairing_id, 4));
-        deliver_msg(out, unavailable([0u8; 16], pairing_id));
+        // A participant with the right transcript that is merely late is
+        // the case that races the sweep; everything else is a refusal.
+        let note = if !outsider && !digest_differs {
+            "prepared past the deadline"
+        } else {
+            "prepared refused: not a participant, or a different transcript"
+        };
+        shared.answer_noted(
+            out,
+            &me,
+            role,
+            pairing_id,
+            note,
+            unavailable([0u8; 16], pairing_id),
+        );
         return;
     }
     let signed = hello2::prepared_message(&pairing_id, &transcript_digest);
@@ -579,7 +603,14 @@ pub(super) fn handle_prepared(
             "prepared from {} rejected: signature",
             util::hex_prefix(&me, 4)
         );
-        deliver_msg(out, unavailable([0u8; 16], pairing_id));
+        shared.answer_noted(
+            out,
+            &me,
+            role,
+            pairing_id,
+            "prepared rejected: signature",
+            unavailable([0u8; 16], pairing_id),
+        );
         return;
     }
     let decision = shared.store.store_prepared_and_try_commit(
@@ -619,7 +650,14 @@ pub(super) fn handle_prepared(
         Ok(PreparedDecision::Unavailable) => {
             // The aborting path (revoke, sweep, explicit abort) already
             // notified both participants; tell only the sender.
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                role,
+                pairing_id,
+                "prepared answered unavailable: the pairing was already aborted",
+                unavailable([0u8; 16], pairing_id),
+            );
         }
         Ok(PreparedDecision::RedeemExhausted) => {
             // P1-03: the cap bound at the commit linearization point — a
@@ -660,7 +698,14 @@ pub(super) fn handle_prepared(
             }
         }
         Ok(PreparedDecision::NotFound) => {
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                role,
+                pairing_id,
+                "prepared answered unavailable: the store no longer has the transaction",
+                unavailable([0u8; 16], pairing_id),
+            );
         }
         Err(e) => {
             log::error!("prepared storage failure: {e}");
@@ -690,16 +735,25 @@ pub(super) fn handle_applied(
     let now = now_ms();
     // Q-N3 recurrence (2026-11-27): the exits that only answer
     // `unavailable` now say why (the signature exit already had a line).
+    // Review 20: the answer is delivered with a numbered line of its own.
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
             decision!("applied from {} answered unavailable: no transaction to apply, or the lookup failed (pairing {})",
                 util::hex_prefix(&me, 4)
             , util::hex_prefix(&pairing_id, 4));
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                "requester",
+                pairing_id,
+                "applied answered unavailable: no transaction to apply, or the lookup failed",
+                unavailable([0u8; 16], pairing_id),
+            );
             return;
         }
     };
+    let role = role_in(&snapshot, &me);
     if (snapshot.owner != me && snapshot.redeemer != me)
         || snapshot.transcript_digest != Some(transcript_digest)
         || !matches!(
@@ -716,7 +770,12 @@ pub(super) fn handle_applied(
                 PairingState::Committed | PairingState::Applied | PairingState::Ready
             )
         , util::hex_prefix(&pairing_id, 4));
-        deliver_msg(out, unavailable([0u8; 16], pairing_id));
+        shared.answer_noted(out, &me,
+            role,
+            pairing_id,
+            "applied refused: not a participant, a different transcript, or a state past committing",
+            unavailable([0u8; 16], pairing_id),
+        );
         return;
     }
     let signed = hello2::applied_message(&pairing_id, &transcript_digest, commit_revision);
@@ -725,7 +784,14 @@ pub(super) fn handle_applied(
             "applied from {} rejected: signature",
             util::hex_prefix(&me, 4)
         );
-        deliver_msg(out, unavailable([0u8; 16], pairing_id));
+        shared.answer_noted(
+            out,
+            &me,
+            role,
+            pairing_id,
+            "applied rejected: signature",
+            unavailable([0u8; 16], pairing_id),
+        );
         return;
     }
     let decision = shared.store.store_applied(
@@ -763,7 +829,14 @@ pub(super) fn handle_applied(
                 "applied from {} answered unavailable: the store no longer has the transaction (pairing {})",
                 util::hex_prefix(&me, 4)
             , util::hex_prefix(&pairing_id, 4));
-            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            shared.answer_noted(
+                out,
+                &me,
+                role,
+                pairing_id,
+                "applied answered unavailable: the store no longer has the transaction",
+                unavailable([0u8; 16], pairing_id),
+            );
         }
         Err(e) => {
             log::error!("applied storage failure: {e}");
@@ -877,8 +950,8 @@ pub(super) fn handle_abort(
         Ok(AbortDecision::Aborted(aborted)) => {
             // Q-N3 recurrence (2026-11-27): a participant giving up is
             // otherwise visible only as the other side's `unavailable`.
-            // This line is the decision; whether the notification below
-            // reached the other participant is logged by the delivery.
+            // This line is the decision; the notification below carries a
+            // numbered line of its own (review 20).
             decision!(
                 "pairing {} aborted by an explicit request from {}",
                 util::hex_prefix(&pairing_id, 4),
@@ -886,12 +959,18 @@ pub(super) fn handle_abort(
             );
             // The other participant learns the pairing is gone; the
             // aborter gets silence (idempotent success).
-            let other = if aborted.owner == me {
-                aborted.redeemer
+            let (other, role) = if aborted.owner == me {
+                (aborted.redeemer, "redeemer")
             } else {
-                aborted.owner
+                (aborted.owner, "owner")
             };
-            shared.deliver(&other, unavailable([0u8; 16], pairing_id));
+            shared.deliver_noted(
+                &other,
+                role,
+                pairing_id,
+                "explicit abort by the other participant",
+                unavailable([0u8; 16], pairing_id),
+            );
         }
         Ok(AbortDecision::NotAbortable) => {
             // Committed transactions must be recovered, not dropped.

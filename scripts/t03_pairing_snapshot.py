@@ -19,6 +19,10 @@ states, ages and "is this column set" flags:
   the proof / Prepared / Commit / Applied columns are set;
 - pairing_relations: the row count.
 
+The two per-row tables are read oldest first and cut at MAX_ROWS rows: what
+they print describes the rows shown only, and their `truncated` flag says
+whether more were left out. pairing_relations is counted in full.
+
 Nothing else leaves the database: no ids, digests, signatures, endpoints or
 paths are printed. The database is opened with `mode=ro` and every read runs
 inside one deferred transaction, so the picture is consistent and no byte is
@@ -60,10 +64,16 @@ TRANSACTION_FLAGS = (
 def _read_only_uri(path: str) -> str:
     """`file:` URI that opens an existing database without creating it.
 
-    `pathname2url` already percent-encodes the path once; encoding it again
-    would turn a legal `%` into `%25` and make SQLite look for another file.
+    `pathname2url` percent-encodes the path once: a literal `%` becomes
+    `%25`. Encoding its result again would turn that into `%2525` (and a
+    space's `%20` into `%2520`) and make SQLite look for another file.
     """
     return "file:" + urllib.request.pathname2url(path) + "?mode=ro"
+
+
+def _cut_at_max(rows: list) -> tuple[list, bool]:
+    """The first MAX_ROWS rows, and whether the query returned more."""
+    return rows[:MAX_ROWS], len(rows) > MAX_ROWS
 
 
 def _by_state(rows: list) -> dict:
@@ -79,8 +89,9 @@ def _invite_codes(conn: sqlite3.Connection, now_ms: int) -> dict:
         "SELECT state, created_unix_ms, expires_unix_ms, max_redeems,"
         " owner_endpoint IS NOT NULL"
         " FROM invite_codes ORDER BY created_unix_ms LIMIT ?",
-        (MAX_ROWS,),
+        (MAX_ROWS + 1,),
     ).fetchall()
+    rows, truncated = _cut_at_max(rows)
     detail = []
     for state, created, expires, max_redeems, endpoint in rows:
         detail.append(
@@ -99,6 +110,7 @@ def _invite_codes(conn: sqlite3.Connection, now_ms: int) -> dict:
     )
     return {
         "rows": len(rows),
+        "truncated": truncated,
         "by_state": _by_state(rows),
         "active_unexpired": active_unexpired,
         "row_detail": detail,
@@ -114,8 +126,9 @@ def _pairing_transactions(conn: sqlite3.Connection, now_ms: int) -> dict:
         " owner_applied_signature IS NOT NULL, redeemer_applied_signature IS NOT NULL,"
         " owner_endpoint IS NOT NULL, redeemer_endpoint IS NOT NULL"
         " FROM pairing_transactions ORDER BY created_unix_ms LIMIT ?",
-        (MAX_ROWS,),
+        (MAX_ROWS + 1,),
     ).fetchall()
+    rows, truncated = _cut_at_max(rows)
     detail = []
     for row in rows:
         item = {
@@ -128,7 +141,12 @@ def _pairing_transactions(conn: sqlite3.Connection, now_ms: int) -> dict:
         for name, value in zip(TRANSACTION_FLAGS, row[5:]):
             item[name] = bool(value)
         detail.append(item)
-    return {"rows": len(rows), "by_state": _by_state(rows), "row_detail": detail}
+    return {
+        "rows": len(rows),
+        "truncated": truncated,
+        "by_state": _by_state(rows),
+        "row_detail": detail,
+    }
 
 
 def _read_all(conn: sqlite3.Connection, now_ms: int) -> dict:

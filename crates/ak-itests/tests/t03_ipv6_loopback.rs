@@ -18,7 +18,7 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use ak_core::handle::ConflictPolicy;
 use ak_core::policy::PathKind;
@@ -254,7 +254,7 @@ fn announced_registry_port(line: &str) -> u16 {
         .and_then(|token| token.parse::<SocketAddr>().ok())
         .map(|addr| addr.port())
         .filter(|port| *port != 0)
-        .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
+        .unwrap_or_else(|| panic!("bound address in the registry line: {}", redact(line)))
 }
 
 /// Lines a piped stream produced so far, each stamped with the moment the
@@ -275,8 +275,18 @@ struct LineLog {
     stderr: Option<Arc<Mutex<LogState>>>,
     /// The process tag, for a report's heading.
     name: Option<String>,
-    /// The process's exit status once the watcher thread saw it.
-    exit: Option<Arc<Mutex<Option<std::process::ExitStatus>>>>,
+    /// What the watcher thread concluded about the process's end.
+    exit: Option<Arc<Mutex<Watched>>>,
+}
+
+/// What the watcher of a child process knows about how it ended.
+#[derive(Clone)]
+enum Watched {
+    /// Still running (or not watched at all).
+    Running,
+    Exited(std::process::ExitStatus),
+    /// The watcher could not keep polling the child: its end is unknown.
+    Unwatched(String),
 }
 
 /// One line read off a pipe and the moment it was read.
@@ -301,174 +311,445 @@ fn since_origin_ms() -> u128 {
     ORIGIN.get_or_init(Instant::now).elapsed().as_millis()
 }
 
-/// `true` for a token that is a filesystem path: a drive letter, a UNC
-/// root, or a `/` root with a separator in it.
-fn looks_like_path(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.len() >= 3
+/// Punctuation that may sit in front of a secret inside one token; it is
+/// kept in front of what replaces the secret.
+const OPENERS: [char; 8] = ['"', '\'', '(', '[', '{', '<', '（', '“'];
+
+/// What ends a path or a name inside one token: what follows it there is
+/// other text.
+const CLAUSE_CLOSERS: [char; 8] = [',', ';', ')', ']', '}', '=', '）', '＝'];
+
+/// Punctuation after a secret, kept so the line still reads.
+const TRAILING: [char; 11] = ['"', '\'', ',', ';', ')', ']', '}', ':', '.', '!', '?'];
+
+/// The words after which a bare file name (`in device.key`) or a quoted
+/// name (`under "photos"`) is a name on disk, not a word of the message.
+const INTRODUCES_A_NAME: [&str; 15] = [
+    "in", "at", "into", "under", "dir", "path", "file", "db", "key", "open", "read", "write",
+    "save", "load", "create",
+];
+
+/// `true` for text that is a filesystem path: absolute (a drive letter,
+/// a UNC root, a `/` root), or relative with a separator (`..\x`,
+/// `src/main.rs`, a URL; not prose such as `Y/n`).
+fn looks_like_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let absolute = (bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return true;
-    }
-    if token.starts_with(r"\\") {
-        return true;
-    }
-    token.len() > 1 && token.starts_with('/') && token[1..].contains('/')
+        && matches!(bytes[2], b'\\' | b'/'))
+        || text.starts_with(r"\\")
+        || (text.starts_with('/') && text[1..].contains('/'));
+    let from_here = ["./", "../", ".\\", "..\\"]
+        .iter()
+        .any(|start| text.starts_with(start));
+    let last = text.rsplit(['\\', '/']).next().unwrap_or(text);
+    absolute
+        || from_here
+        || text.contains('\\')
+        || text.contains("://")
+        || (text.contains('/') && is_bare_file_name(last))
 }
 
-/// An address that is not loopback, as text: `None` for anything else
-/// (and for loopback, which stays). `ip:port` keeps its port.
-fn non_loopback_address(stem: &str) -> Option<String> {
-    // `[v6]:port` has its port after the bracket; a bare v6 has none.
-    let (host, port) = if let Some(rest) = stem.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((host, tail)) => (host, tail.strip_prefix(':')),
-            None => (stem, None),
+/// A file name with no separator in it (`device.key`): a dot and a short
+/// extension that is not all digits (`256.00` is a number).
+fn is_bare_file_name(text: &str) -> bool {
+    let Some((base, extension)) = text.rsplit_once('.') else {
+        return false;
+    };
+    let short = !extension.is_empty()
+        && extension.len() <= 4
+        && extension.bytes().all(|b| b.is_ascii_alphanumeric());
+    let numbered = extension.bytes().all(|b| b.is_ascii_digit());
+    !base.is_empty() && short && !numbered
+}
+
+/// An address as text; a zone id (`fe80::1%12`) is left out of the parse.
+fn parse_host(text: &str) -> Option<IpAddr> {
+    let bare = text.split('%').next()?;
+    if let Ok(v6) = bare.parse::<Ipv6Addr>() {
+        return Some(IpAddr::V6(v6));
+    }
+    bare.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
+}
+
+/// Loopback and unspecified addresses, and loopback in its v4-mapped
+/// form, stay in a report.
+fn address_stays(address: IpAddr) -> bool {
+    let local = |v4: Ipv4Addr| v4.is_loopback() || v4.is_unspecified();
+    match address {
+        IpAddr::V4(v4) => local(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(local)
         }
-    } else {
-        match stem.rsplit_once(':') {
-            Some((host, port))
-                if !host.is_empty()
-                    && !host.contains(':')
-                    && !port.is_empty()
-                    && port.chars().all(|c| c.is_ascii_digit()) =>
-            {
-                (host, Some(port))
+    }
+}
+
+/// What replaces an address that is not kept: `<addr>`, with its port
+/// when the text has one (`[v6]:port`, `v4:port`; a bare v6 has none).
+fn hidden_address(address: &str) -> String {
+    let port = match address.strip_prefix('[') {
+        Some(after) => after
+            .split_once(']')
+            .and_then(|(_, tail)| tail.strip_prefix(':')),
+        None => address
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.contains(':'))
+            .map(|(_, port)| port),
+    };
+    match port {
+        Some(port) => format!("<addr>:{port}"),
+        None => "<addr>".to_string(),
+    }
+}
+
+/// An IP address at the start of `text`: how many bytes it takes, and
+/// whether it is hidden. `None` when `text` does not start with one.
+fn address_prefix(text: &str) -> Option<(usize, bool)> {
+    // `[v6]:port`: the bracket belongs to the address.
+    if let Some(after) = text.strip_prefix('[') {
+        let end = after.find(']')?;
+        let address = parse_host(&after[..end])?;
+        if !address.is_ipv6() {
+            return None;
+        }
+        let digits = after[end + 1..].strip_prefix(':').unwrap_or("");
+        let port = digits.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let len = 2 + end + if port > 0 { 1 + port } else { 0 };
+        return Some((len, !address_stays(address)));
+    }
+    let len = text
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '%'))
+        .count();
+    let candidate = text.get(..len)?;
+    let (host, port) = match candidate.rsplit_once(':') {
+        Some((host, port))
+            if !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (host, Some(port))
+        }
+        _ => (candidate, None),
+    };
+    let address = parse_host(host)?;
+    if port.is_some() && !address.is_ipv4() {
+        return None;
+    }
+    Some((len, !address_stays(address)))
+}
+
+/// A task code in every form the parser takes (any case, grouped or
+/// not), from `AKI1` on: how many bytes it takes.
+fn task_code_len(text: &str) -> Option<usize> {
+    let body = text.get(4..)?;
+    let run = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .count();
+    let code = body
+        .get(..run)
+        .is_some_and(|code| match code.strip_prefix('-') {
+            Some(groups) => {
+                groups.split('-').count() == 8 && groups.split('-').all(|group| group.len() == 4)
             }
-            _ => (stem, None),
-        }
-    };
-    let address: IpAddr = host.parse().ok()?;
-    let is_loopback = match address {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
-    };
-    if is_loopback {
-        None
-    } else {
-        Some(match port {
-            Some(port) => format!("<addr>:{port}"),
-            None => "<addr>".to_string(),
-        })
-    }
+            None => code.len() == 32 && code.chars().all(|c| c.is_ascii_alphanumeric()),
+        });
+    code.then_some(4 + run)
 }
 
-/// The reportable form of a captured line. The callers that parse a line
-/// (the code, the bound port, the candidates) keep the raw text; this is
-/// only for what a failure prints. Hidden: the task code; hex runs of 32
-/// or more (the registry fingerprint, a pairing id); paths, quoted or not,
-/// spaces included; addresses that are not loopback (their ports stay).
-fn redact(text: &str) -> String {
-    const PREFIX: &str = "AKI1-";
-    const CLOSERS: [char; 3] = [',', ';', ')'];
-    let mut out = String::with_capacity(text.len());
+/// One stretch of text that is neither a path nor an address, with the
+/// task code and hex runs of 32 or more (a registry fingerprint, a
+/// pairing id) hidden wherever they start.
+fn redact_plain(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find(PREFIX) {
-        let (head, tail) = rest.split_at(at);
-        let groups = tail[PREFIX.len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
-            .count();
-        out.push_str(head);
-        // A code is eight groups of four; a shorter run is something else.
-        if groups >= 24 {
-            out.push_str("AKI1-<code>");
-            rest = &tail[PREFIX.len() + groups..];
-        } else {
-            out.push_str(PREFIX);
-            rest = &tail[PREFIX.len()..];
-        }
-    }
-    out.push_str(rest);
-    let mut shown = String::with_capacity(out.len());
-    // How the current path runs on over the next words: a quoted one (a
-    // `Debug` argv) up to its closing quote, an unquoted one for at most
-    // three words.
-    let mut open_quoted_path = false;
-    let mut unquoted_words_left = 0usize;
-    for token in out.split_whitespace() {
-        let (lead, stem, tail) = split_edges(token);
-        let closes = token.ends_with('"') || token.ends_with('\'');
-        let ends_a_clause = CLOSERS.iter().any(|c| tail.contains(*c));
-        let starts_something_new = token.starts_with('-') || token.starts_with('[');
-        if open_quoted_path {
-            // The rest of a quoted path: absorbed up to its closing quote.
-            if closes {
-                open_quoted_path = false;
-                shown.push('"');
+    while !rest.is_empty() {
+        let code_at = (0..rest.len().saturating_sub(3))
+            .find(|&at| rest.as_bytes()[at..at + 4].eq_ignore_ascii_case(b"AKI1"));
+        let hex_at = rest.find(|c: char| c.is_ascii_hexdigit());
+        let code_at = match (code_at, hex_at) {
+            (Some(at), None) => Some(at),
+            (Some(at), Some(hex)) if at <= hex => Some(at),
+            _ => None,
+        };
+        match (code_at, hex_at) {
+            (Some(at), _) => {
+                if let Some(len) = task_code_len(&rest[at..]) {
+                    shown.push_str(&rest[..at]);
+                    shown.push_str("AKI1-<code>");
+                    rest = &rest[at + len..];
+                } else {
+                    // Not a code: this `AKI1` stays; look further on.
+                    shown.push_str(&rest[..at + 4]);
+                    rest = &rest[at + 4..];
+                }
             }
-            continue;
-        }
-        if unquoted_words_left > 0 && !starts_something_new {
-            // A word of an unquoted path with spaces.
-            unquoted_words_left -= 1;
-            if ends_a_clause || closes {
-                unquoted_words_left = 0;
+            (_, Some(at)) => {
+                shown.push_str(&rest[..at]);
+                let run = rest[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                if run >= 32 {
+                    shown.push_str("<hex>");
+                } else {
+                    shown.push_str(&rest[at..at + run]);
+                }
+                rest = &rest[at + run..];
             }
-            continue;
-        }
-        unquoted_words_left = 0;
-        if !shown.is_empty() {
-            shown.push(' ');
-        }
-        shown.push_str(lead);
-        if looks_like_path(stem) {
-            shown.push_str("<path>");
-            let quoted = lead.contains('"') || lead.contains('\'');
-            if quoted && !closes {
-                open_quoted_path = true;
-            } else if !quoted && !ends_a_clause {
-                unquoted_words_left = 3;
+            (None, None) => {
+                shown.push_str(rest);
+                rest = "";
             }
-        } else {
-            shown.push_str(&redact_token(stem));
         }
-        shown.push_str(tail);
     }
     shown
 }
 
-/// One token split three ways: the punctuation that opens it (quotes and
-/// brackets, kept in front of whatever replaces the secret), the part that
-/// may carry a secret, and the punctuation at its end, which is kept so the
-/// line still reads.
-fn split_edges(token: &str) -> (&str, &str, &str) {
-    let start = token.len() - token.trim_start_matches(['"', '\'', '(', '[', '{']).len();
-    let stem_len = token[start..]
-        .trim_end_matches(|c: char| ",;):]}\"".contains(c))
-        .len();
-    (
-        &token[..start],
-        &token[start..start + stem_len],
-        &token[start + stem_len..],
-    )
+fn strip_trailing(text: &str) -> (&str, &str) {
+    let stem_len = text.trim_end_matches(|c: char| TRAILING.contains(&c)).len();
+    text.split_at(stem_len)
 }
 
-/// One whitespace-delimited token with its secrets replaced.
-fn redact_token(stem: &str) -> String {
-    if let Some(address) = non_loopback_address(stem) {
-        return address;
+fn clause_end(text: &str) -> Option<usize> {
+    text.char_indices()
+        .find(|(_, c)| CLAUSE_CLOSERS.contains(c))
+        .map(|(at, _)| at)
+}
+
+/// How a secret runs on over the words that follow it in the line.
+#[derive(Clone, Copy)]
+enum RunOn {
+    /// A quoted path or name: the words up to its closing quote.
+    Quoted(char),
+    /// An unquoted path with spaces: the words up to one that ends a
+    /// clause, starts a flag or a bracket, or has an `=`.
+    Unquoted,
+}
+
+enum TokenPiece {
+    Text(String),
+    RunsOn { shown: String, run_on: RunOn },
+}
+
+impl TokenPiece {
+    fn into_parts(self) -> (String, Option<RunOn>) {
+        match self {
+            TokenPiece::Text(text) => (text, None),
+            TokenPiece::RunsOn { shown, run_on } => (shown, Some(run_on)),
+        }
     }
-    let hex_run = stem.chars().take_while(|c| c.is_ascii_hexdigit()).count();
-    if hex_run >= 32 {
-        let mut shown = String::from("<hex>");
-        shown.push_str(&stem[hex_run..]);
-        shown
+}
+
+/// The secret that starts at `rest`: a token, or what follows an
+/// opening quote or bracket inside one; `before` is what precedes it
+/// there, and `previous` the word shown before the token. `None` when
+/// `rest` does not start with one.
+fn secret_at(rest: &str, before: &str, previous: &str) -> Option<TokenPiece> {
+    // An address, first with its own bracket.
+    if let Some((len, hidden)) = address_prefix(rest) {
+        let head = &rest[..len];
+        let shown = if hidden {
+            hidden_address(head)
+        } else {
+            head.to_string()
+        };
+        return Some(TokenPiece::Text(format!(
+            "{before}{shown}{}",
+            redact_plain(&rest[len..])
+        )));
+    }
+    let lead_len = rest.chars().take_while(|c| OPENERS.contains(c)).count();
+    let (lead, body) = rest.split_at(lead_len);
+    if !lead.is_empty() {
+        if let Some((len, hidden)) = address_prefix(body) {
+            let head = &body[..len];
+            let shown = if hidden {
+                hidden_address(head)
+            } else {
+                head.to_string()
+            };
+            return Some(TokenPiece::Text(format!(
+                "{before}{lead}{shown}{}",
+                redact_plain(&body[len..])
+            )));
+        }
+    }
+    // `key=value` and `--flag=value`: the value is where a secret can be.
+    if let Some((key, value)) = body.split_once('=') {
+        if let Some(piece) = secret_at(value, &format!("{before}{lead}{key}="), "") {
+            return Some(piece);
+        }
+    }
+    let quote = lead.chars().rev().find(|c| *c == '"' || *c == '\'');
+    let (stem, tail) = strip_trailing(body);
+    let (stem, after) = match clause_end(stem) {
+        Some(at) => (&stem[..at], &stem[at..]),
+        None => (stem, ""),
+    };
+    let placeholder = if looks_like_path(stem) {
+        "<path>"
+    } else if INTRODUCES_A_NAME.contains(&previous) && is_bare_file_name(stem) {
+        return Some(TokenPiece::Text(format!(
+            "{before}{lead}<path>{after}{tail}"
+        )));
+    } else if INTRODUCES_A_NAME.contains(&previous) && quote.is_some() {
+        "<name>"
     } else {
-        stem.to_string()
+        return None;
+    };
+    let mut shown = format!("{before}{lead}{placeholder}");
+    if let Some(quote) = quote {
+        // Quoted: the same word may already close it.
+        if !after.is_empty() || tail.starts_with(quote) {
+            shown.push_str(after);
+            shown.push_str(tail);
+            return Some(TokenPiece::Text(shown));
+        }
+        return Some(TokenPiece::RunsOn {
+            shown,
+            run_on: RunOn::Quoted(quote),
+        });
+    }
+    shown.push_str(after);
+    // Unquoted: a path whose last part has no extension may have spaces
+    // after it (`C:\Users\John Doe`); one that ends in a file name, or is
+    // followed by punctuation, does not.
+    let complete = is_bare_file_name(stem.rsplit(['\\', '/']).next().unwrap_or(stem));
+    if complete || !tail.is_empty() {
+        shown.push_str(tail);
+        return Some(TokenPiece::Text(shown));
+    }
+    Some(TokenPiece::RunsOn {
+        shown,
+        run_on: RunOn::Unquoted,
+    })
+}
+
+/// What replaces a token: a secret starts at its first character or
+/// right after an opening quote or bracket in it; anything else is text
+/// with codes and hex runs hidden.
+fn open_token(token: &str, previous: &str) -> TokenPiece {
+    let after_openers = token
+        .char_indices()
+        .filter(|(_, c)| OPENERS.contains(c))
+        .map(|(at, c)| at + c.len_utf8());
+    for at in std::iter::once(0usize).chain(after_openers) {
+        if let Some(piece) = secret_at(&token[at..], &token[..at], previous) {
+            return piece;
+        }
+    }
+    TokenPiece::Text(redact_plain(token))
+}
+
+/// Where an unquoted path's run on ends inside `token`: at a word that
+/// starts a flag or a bracket (unless the word still carries a path
+/// separator, as `C:\Program Files (x86)\x` does), or at a clause closer
+/// or an `=` in it.
+fn run_on_end(token: &str) -> Option<usize> {
+    if let Some(first) = token.chars().next() {
+        if (first == '-' || OPENERS.contains(&first)) && !token.contains(['\\', '/']) {
+            return Some(0);
+        }
+    }
+    let (at, closer) = token
+        .char_indices()
+        .find(|(_, c)| CLAUSE_CLOSERS.contains(c))?;
+    let after = &token[at + closer.len_utf8()..];
+    // `(x86)\Common`: a closer inside a word that still carries the path.
+    if after.contains(['\\', '/']) {
+        None
+    } else {
+        Some(at)
     }
 }
 
-/// What a spawn failure may say about a child's arguments: flags and plain
-/// words (the subcommand names) as they are, every other value hidden.
+fn redact_line(line: &str) -> String {
+    let mut shown = String::with_capacity(line.len());
+    let mut run_on: Option<RunOn> = None;
+    let mut previous = String::new();
+    for token in line.split_whitespace() {
+        let in_run_on = run_on.is_some();
+        let (piece, runs_on) = match run_on {
+            // The rest of a quoted path or name: absorbed up to its
+            // closing quote.
+            Some(RunOn::Quoted(quote)) => match token.find(quote) {
+                Some(at) => {
+                    let after = at + quote.len_utf8();
+                    (format!("{quote}{}", redact_plain(&token[after..])), None)
+                }
+                None => continue,
+            },
+            // A word of an unquoted path with spaces.
+            Some(RunOn::Unquoted) => match run_on_end(token) {
+                Some(0) => open_token(token, &previous).into_parts(),
+                Some(at) => (redact_plain(&token[at..]), None),
+                // `path: cause`: the path ends with the word before the colon.
+                None if token.ends_with(':') => (":".to_string(), None),
+                None => continue,
+            },
+            None => open_token(token, &previous).into_parts(),
+        };
+        run_on = runs_on;
+        // The word that ends a path: its closing quote, clause closer or
+        // colon belongs to the placeholder, without a space before it.
+        let closes =
+            in_run_on && piece.starts_with(['"', '\'', ',', ';', ')', ']', '}', ':', '）']);
+        if !shown.is_empty() && !closes {
+            shown.push(' ');
+        }
+        shown.push_str(&piece);
+        previous = piece
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_ascii_lowercase();
+    }
+    shown
+}
+
+/// The reportable form of captured text. The callers that parse a line
+/// (the code, the bound port, the candidates) keep the raw text; this is
+/// only for what a failure prints. Hidden: the task code in every form
+/// the parser takes; hex runs of 32 or more (the registry fingerprint, a
+/// pairing id); paths and file names, quoted or not, spaces included;
+/// the source root name the receiver prints; addresses that are not
+/// loopback (their ports stay). A path never runs on over the words that
+/// follow it into the next line, and a clause closer, a colon or a
+/// closing quote after it ends it, so the cause after it stays.
+fn redact(text: &str) -> String {
+    text.split('\n')
+        .map(redact_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The subcommand words a spawn failure may name.
+const SUBCOMMANDS: [&str; 6] = [
+    "task",
+    "code-recv",
+    "code-send",
+    "join-send",
+    "join-recv",
+    "registry-server",
+];
+
+/// What a spawn failure may say about a child's arguments: long flags by
+/// name (`--key=value` as `--key=<value>`) and the subcommand words as
+/// they are; every other value hidden.
 fn argv_summary(args: &[String]) -> String {
     args.iter()
         .map(|arg| {
-            let plain = arg.len() <= 24 && arg.chars().all(|c| c.is_ascii_alphabetic() || c == '-');
-            if arg.starts_with("--") || plain {
-                arg.clone()
+            let name = match arg.split_once('=') {
+                Some((flag, _)) => flag,
+                None => arg.as_str(),
+            };
+            if name.starts_with("--") || SUBCOMMANDS.contains(&name) {
+                if name.len() == arg.len() {
+                    arg.clone()
+                } else {
+                    format!("{name}=<value>")
+                }
             } else {
                 "<value>".to_string()
             }
@@ -477,15 +758,27 @@ fn argv_summary(args: &[String]) -> String {
         .join(" ")
 }
 
-/// Q-N3 (review 19): what a report may show, on synthetic lines.
+/// Q-N3 (reviews 19 and 20): what a report may show, on synthetic
+/// lines — the secrets vanish and the cause of a fault stays.
 #[test]
 fn report_redaction_hides_codes_fingerprints_ids_paths_and_foreign_addresses() {
-    // The task code.
+    // The task code: grouped, lowercase, ungrouped, inside `key=value`.
     assert_eq!(
         redact("join with 'AKI1-RXBM-2ZJG-GPSV-VAXH-NJ9P-CHGK-DSFZ-4V05' now"),
         "join with 'AKI1-<code>' now"
     );
-    // The registry fingerprint and a pairing id, quotes and parentheses kept.
+    assert_eq!(
+        redact("join with aki1-rxbm-2zjg-gpsv-vaxh-nj9p-chgk-dsfz-4v05 now"),
+        "join with AKI1-<code> now"
+    );
+    assert_eq!(
+        redact("code=AKI1RXBM2ZJGGPSVVAXHNJ9PCHGKDSFZ4V05;"),
+        "code=AKI1-<code>;"
+    );
+    // A shorter run after the prefix is something else and stays.
+    assert_eq!(redact("prefix AKI1-XXXX stays"), "prefix AKI1-XXXX stays");
+
+    // The registry fingerprint, a pairing id, quotes and parentheses kept.
     assert_eq!(
         redact("fp \"3553befe995cc81c0557d05e1b99cc785810538eddd27d80b3a4be5f81768efc\""),
         "fp \"<hex>\""
@@ -494,27 +787,113 @@ fn report_redaction_hides_codes_fingerprints_ids_paths_and_foreign_addresses() {
         redact("owner pairing flow failed (9053fa41d556827c7bc97bc2cfe93505): x"),
         "owner pairing flow failed (<hex>): x"
     );
+    // The receiver's paired line: the peer stays when it is loopback, the
+    // pairing id after it does not.
+    assert_eq!(
+        redact("[task] paired; peer 127.0.0.1:53421 (task 9053fa41d556827c7bc97bc2cfe93505)"),
+        "[task] paired; peer 127.0.0.1:53421 (task <hex>)"
+    );
+    assert_eq!(
+        redact("pairing=9053fa41d556827c7bc97bc2cfe93505"),
+        "pairing=<hex>"
+    );
     // A short device prefix, times and small numbers stay.
     assert_eq!(
         redact("v2 device c805e392 online 14:40:23 0.29 s"),
         "v2 device c805e392 online 14:40:23 0.29 s"
     );
-    // Paths: quoted with spaces (a `Debug` argv), unquoted with spaces, and
-    // one that closes a clause.
     assert_eq!(
-        redact("\"--id-dir\" \"C:\\Users\\John Doe\\t03 x\\device.key\""),
-        "\"--id-dir\" \"<path>\""
+        redact("version 0.1.0 (256.00 KiB) at 14:40:23.5"),
+        "version 0.1.0 (256.00 KiB) at 14:40:23.5"
     );
-    let unquoted = redact("created new device key in C:\\Users\\John Doe\\device.key");
-    assert_eq!(unquoted, "created new device key in <path>");
+
+    // A quoted path with spaces (a `Debug` argv): the closing quote may
+    // carry the punctuation after it.
+    assert_eq!(
+        redact("\"--id-dir\" \"C:\\Users\\John Doe\\t03 x\\device.key\", \"task\" \"code-recv\""),
+        "\"--id-dir\" \"<path>\", \"task\" \"code-recv\""
+    );
+    assert_eq!(
+        redact("open \"C:\\lab\\a b\", cause=timeout"),
+        "open \"<path>\", cause=timeout"
+    );
+    assert_eq!(
+        redact("open \"C:\\lab\\a b\": cause=timeout"),
+        "open \"<path>\": cause=timeout"
+    );
+    // An unquoted path with spaces, a longer one, and a relative one.
+    assert_eq!(
+        redact("created new device key in C:\\Users\\John Doe\\device.key"),
+        "created new device key in <path>"
+    );
+    assert_eq!(
+        redact("created new device key in C:\\Users\\A B C D E F G H\\device.key"),
+        "created new device key in <path>"
+    );
+    assert_eq!(
+        redact("created new device key in ..\\id dir two\\device.key"),
+        "created new device key in <path>"
+    );
+    assert_eq!(
+        redact("cannot read C:\\Program Files (x86)\\Common Files\\x\\device.key: missing"),
+        "cannot read <path>: missing"
+    );
+    // The path may end inside its word or right before a flag.
     assert_eq!(
         redact("on tls 10.1.0.43:54091 (db C:\\Users\\RUNNER~1\\AppData\\registry.db); no file routes exist"),
         "on tls <addr>:54091 (db <path>); no file routes exist"
     );
-    // Addresses: loopback stays with its port; others keep only the port.
+    assert_eq!(
+        redact("--id-dir=C:\\x y\\id --registry-fp=3553befe995cc81c0557d05e1b99cc785810538eddd27d80b3a4be5f81768efc --server 10.1.0.43:54091"),
+        "--id-dir=<path> --registry-fp=<hex> --server <addr>:54091"
+    );
+    assert_eq!(
+        redact("wrote the journal to src/main.rs and continued"),
+        "wrote the journal to <path> and continued"
+    );
+    // A bare file name and a quoted name after a word that introduces one.
+    assert_eq!(
+        redact("cannot load device key in device.key: missing"),
+        "cannot load device key in <path>: missing"
+    );
+    assert_eq!(
+        redact("[task] the peer wants to send 1 file(s) (256.00 KiB under \"zz-diag-send-src\") into C:\\Users\\RUNNER~1\\AppData\\Local\\Temp"),
+        "[task] the peer wants to send 1 file(s) (256.00 KiB under \"<name>\") into <path>"
+    );
+    assert_eq!(
+        redact("(256.00 KiB under \"My Photos 2024\") into C:\\x"),
+        "(256.00 KiB under \"<name>\") into <path>"
+    );
+    // Prose with a slash or a dot is not a path.
+    assert_eq!(
+        redact("accept? [Y/n] read/write and/or target/debug 0.29 s"),
+        "accept? [Y/n] read/write and/or target/debug 0.29 s"
+    );
+
+    // The cause stays: a path never runs on into the next line.
+    assert_eq!(
+        redact("Error: cannot load device key in C:\\lab\\a b\\id\n\nCaused by:\n    No such file or directory (os error 2)"),
+        "Error: cannot load device key in <path>\n\nCaused by:\nNo such file or directory (os error 2)"
+    );
+    assert_eq!(
+        redact("in C:\\lab\\a b: The system cannot find the file specified. (os error 2)"),
+        "in <path>: The system cannot find the file specified. (os error 2)"
+    );
+    assert_eq!(
+        redact("in C:\\lab\\a b (os error 2)"),
+        "in <path> (os error 2)"
+    );
+
+    // Addresses: loopback and unspecified stay with their port; others
+    // keep only the port — v4, v6, bracketed with a port, with a zone id,
+    // quoted, and inside `key=value`.
     assert_eq!(
         redact("bound [::1]:63049 via 127.0.0.9:51845"),
         "bound [::1]:63049 via 127.0.0.9:51845"
+    );
+    assert_eq!(
+        redact("receiver bound [::]:53421 on 0.0.0.0:53421 via ::ffff:127.0.0.1"),
+        "receiver bound [::]:53421 on 0.0.0.0:53421 via ::ffff:127.0.0.1"
     );
     assert_eq!(
         redact("stun reflexive 172.206.23.55:33858 (queried)"),
@@ -524,7 +903,17 @@ fn report_redaction_hides_codes_fingerprints_ids_paths_and_foreign_addresses() {
         redact("candidate fe80::1 and 10.1.0.62:62070"),
         "candidate <addr> and <addr>:62070"
     );
-    // A spawn failure names flags and subcommands, never values.
+    assert_eq!(
+        redact("via [2001:db8::7]:443 and [2001:db8::7]"),
+        "via <addr>:443 and <addr>"
+    );
+    assert_eq!(
+        redact("on fe80::1%12 (link-local) from '10.1.0.43:54091' peer=10.1.0.43:54091"),
+        "on <addr> (link-local) from '<addr>:54091' peer=<addr>:54091"
+    );
+
+    // A spawn failure names flags and subcommands, never values: a flag
+    // with a value shows the flag's name only.
     assert_eq!(
         argv_summary(&[
             "--id-dir".to_string(),
@@ -533,8 +922,12 @@ fn report_redaction_hides_codes_fingerprints_ids_paths_and_foreign_addresses() {
             "join-send".to_string(),
             "AKI1-RXBM-2ZJG-GPSV-VAXH-NJ9P-CHGK-DSFZ-4V05".to_string(),
             "C:\\p".to_string(),
+            "--registry-fp=3553befe995cc81c0557d05e1b99cc785810538eddd27d80b3a4be5f81768efc"
+                .to_string(),
+            "-v".to_string(),
+            "photos".to_string(),
         ]),
-        "--id-dir <value> task join-send <value> <value>"
+        "--id-dir <value> task join-send <value> <value> --registry-fp=<value> <value> <value>"
     );
 }
 
@@ -575,9 +968,17 @@ impl LineLog {
         self
     }
 
-    fn watched_by(mut self, exit: &Arc<Mutex<Option<std::process::ExitStatus>>>) -> Self {
+    fn watched_by(mut self, exit: &Arc<Mutex<Watched>>) -> Self {
         self.exit = Some(Arc::clone(exit));
         self
+    }
+
+    /// What the watcher concluded so far.
+    fn watched(&self) -> Watched {
+        self.exit
+            .as_ref()
+            .map(|watched| watched.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            .unwrap_or(Watched::Running)
     }
 
     /// The raw lines so far, for the callers that parse them.
@@ -593,9 +994,10 @@ impl LineLog {
 
     /// The process's exit status once the watcher saw it.
     fn exit(&self) -> Option<std::process::ExitStatus> {
-        self.exit
-            .as_ref()
-            .and_then(|exit| *exit.lock().unwrap_or_else(|p| p.into_inner()))
+        match self.watched() {
+            Watched::Exited(status) => Some(status),
+            _ => None,
+        }
     }
 
     /// When the first line of this log or its stderr was read.
@@ -645,12 +1047,14 @@ impl LineLog {
     }
 
     /// The process is over and did not end well: a non-zero exit, or its
-    /// pipes closed after an error line. It cannot produce the line a wait
-    /// is looking for, so the wait stops and reports now.
+    /// pipes closed after an error line — whichever the watcher and the
+    /// reader threads happen to report first, the same ending decides the
+    /// same way. It cannot produce the line a wait is looking for, so the
+    /// wait stops and reports now.
     fn ended_with_error(&self) -> bool {
-        match self.exit() {
-            Some(status) => !status.success(),
-            None => self.pipes_ended() && self.has_error_line(),
+        match self.watched() {
+            Watched::Exited(status) => !status.success(),
+            Watched::Running | Watched::Unwatched(_) => self.pipes_ended() && self.has_error_line(),
         }
     }
 
@@ -704,12 +1108,16 @@ impl LineLog {
                 None => rows.push((u128::MAX, format!("[+      ? ms] {tag}: <pipe still open>"))),
             }
         }
-        match self.exit() {
-            Some(status) if status.success() => {
+        match self.watched() {
+            Watched::Exited(status) if status.success() => {
                 rows.push((u128::MAX, format!("exit status: {status}")))
             }
-            Some(status) => rows.push((u128::MAX - 1, format!("exit status: {status}"))),
-            None => rows.push((
+            Watched::Exited(status) => rows.push((u128::MAX - 1, format!("exit status: {status}"))),
+            Watched::Unwatched(error) => rows.push((
+                u128::MAX - 1,
+                format!("exit status: unknown; the watcher could not poll the child: {error}"),
+            )),
+            Watched::Running => rows.push((
                 u128::MAX,
                 "exit status: <process still running>".to_string(),
             )),
@@ -719,8 +1127,10 @@ impl LineLog {
     }
 
     /// This stream so far plus the process's stderr when attached, as one
-    /// timeline counted from the earliest line.
+    /// timeline counted from the earliest line. The last lines of a
+    /// process that already exited are waited for (see [`settle`]).
     fn report(&self) -> String {
+        settle(&[self]);
         let origin = self.earliest_ms().unwrap_or_else(since_origin_ms);
         self.timeline(origin).join("\n")
     }
@@ -784,10 +1194,33 @@ impl LineLog {
     }
 }
 
+/// How long a report waits for the last lines of a process that already
+/// exited: they can still be in the pipes when its exit is first seen
+/// (review 20), and the first error is often the last line.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Wait, at most [`SETTLE`], until every process here that already exited
+/// has nothing left coming out of its pipes. A process still running is
+/// not waited for.
+fn settle(logs: &[&LineLog]) {
+    let until = Instant::now() + SETTLE;
+    while Instant::now() < until {
+        let pending = logs
+            .iter()
+            .any(|log| log.exit().is_some() && !log.pipes_ended());
+        if !pending {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// One failure report for every process of the chain: a timeline counted
 /// from the first line any of them wrote, then the registry database as it
 /// is right now (when a registry was started on this thread).
 fn failure_report(logs: &[(&str, &LineLog)]) -> String {
+    let watched: Vec<&LineLog> = logs.iter().map(|(_, log)| *log).collect();
+    settle(&watched);
     let origin = logs
         .iter()
         .filter_map(|(_, log)| log.earliest_ms())
@@ -901,7 +1334,7 @@ impl Proc {
                 .take()
                 .expect("stderr piped"),
         );
-        let exit: Arc<Mutex<Option<std::process::ExitStatus>>> = Arc::default();
+        let exit: Arc<Mutex<Watched>> = Arc::new(Mutex::new(Watched::Running));
         let stdout = LineLog::spawn_reader(
             child
                 .lock()
@@ -923,12 +1356,15 @@ impl Proc {
             };
             match status {
                 Ok(Some(status)) => {
-                    *exit.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+                    *exit.lock().unwrap_or_else(|p| p.into_inner()) = Watched::Exited(status);
                     break;
                 }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
                 Err(error) => {
                     eprintln!("t03: cannot poll the child {tag}: {error}");
+                    // The report says the end is unknown, not "still running".
+                    *exit.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Watched::Unwatched(error.to_string());
                     break;
                 }
             }
@@ -1059,7 +1495,12 @@ impl RegistryProc {
             .next()
             .expect("hex id is the last token")
             .to_ascii_lowercase();
-        assert_eq!(fp_hex.len(), 64, "registry id line: {line}");
+        assert_eq!(
+            fp_hex.len(),
+            64,
+            "registry id line: {}",
+            redact(line.as_ref())
+        );
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         RegistryProc { proc, addr, fp_hex }
     }
@@ -1128,7 +1569,7 @@ fn run_task_code_chain(
         .trim()
         .strip_prefix("AKI1-")
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+        .unwrap_or_else(|| panic!("not the display line: {}", redact(code_line.as_ref())));
 
     let send_args: Vec<String> = [
         "--id-dir".to_string(),
@@ -1176,6 +1617,11 @@ fn run_task_code_chain(
     let landed = std::fs::read(out.join("payload.bin")).expect("received payload");
     let expected = std::fs::read(src.join("payload.bin")).expect("source payload");
     assert_eq!(landed, expected, "payload bytes differ ({tag})");
+    // For a single-case run of a test on this chain (`--exact --nocapture`).
+    eprintln!(
+        "t03 chain {tag}: both children exited 0; payload {} bytes identical",
+        landed.len()
+    );
     (bound, advertised, recv_lines, sender_lines)
 }
 
@@ -1220,19 +1666,23 @@ fn v1_task_code_path_transfers_over_dual_stack_receiver_with_ipv6_candidates() {
     );
     assert!(
         bound.contains("[::]"),
-        "the receiver must report the dual-stack wildcard bind: {bound}"
+        "the receiver must report the dual-stack wildcard bind: {}",
+        redact(bound.as_ref())
     );
     assert!(
         bound.contains("dual-stack"),
-        "the receiver must name the bind dual-stack: {bound}"
+        "the receiver must name the bind dual-stack: {}",
+        redact(bound.as_ref())
     );
     assert!(
         advertised.contains("[::1]") && advertised.contains("127.0.0.1"),
-        "the derived candidates must carry both loopback families: {advertised}"
+        "the derived candidates must carry both loopback families: {}",
+        redact(advertised.as_ref())
     );
     assert!(
         !advertised.contains("fe80"),
-        "link-local IPv6 must never ride the candidate list: {advertised}"
+        "link-local IPv6 must never ride the candidate list: {}",
+        redact(advertised.as_ref())
     );
     assert!(
         sender_log.contains("[task] done:"),
@@ -1483,26 +1933,34 @@ fn stun_reflexive_rides_the_cli_receiver_socket() {
         .split("[task] stun reflexive ")
         .nth(1)
         .and_then(|rest| rest.split(' ').next())
-        .unwrap_or_else(|| panic!("reflexive address in the line: {reflexive_line}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "reflexive address in the line: {}",
+                redact(reflexive_line.as_ref())
+            )
+        });
     let reflexive: SocketAddr = reflexive_addr_text
         .parse()
-        .unwrap_or_else(|_| panic!("reflexive ip:port: {reflexive_addr_text}"));
+        .unwrap_or_else(|_| panic!("reflexive ip:port: {}", redact(reflexive_addr_text)));
     let bound_port = bound
         .split("receiver bound ")
         .nth(1)
         .and_then(|rest| rest.split(' ').next())
         .and_then(|token| token.parse::<SocketAddr>().ok())
         .map(|addr| addr.port())
-        .unwrap_or_else(|| panic!("bound addr token in the line: {bound}"));
+        .unwrap_or_else(|| panic!("bound addr token in the line: {}", redact(bound.as_ref())));
     assert_eq!(
         reflexive.port(),
         bound_port,
-        "the STUN query must run on the socket QUIC adopts: {reflexive_line} vs {bound}"
+        "the STUN query must run on the socket QUIC adopts: {} vs {}",
+        redact(reflexive_line.as_ref()),
+        redact(bound.as_ref())
     );
     assert_eq!(
         reflexive.ip(),
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        "the truthful loopback responder reflects the local source: {reflexive_line}"
+        "the truthful loopback responder reflects the local source: {}",
+        redact(reflexive_line.as_ref())
     );
 
     // (2) Wire shape: the reflexive address rides the advertisement, and
@@ -1519,8 +1977,10 @@ fn stun_reflexive_rides_the_cli_receiver_socket() {
         .filter(|token| *token == reflexive_text)
         .count();
     assert_eq!(
-        occurrences, 1,
-        "the loopback reflection is the derived loopback candidate — deduped to one entry: {advertised}"
+        occurrences,
+        1,
+        "the loopback reflection is the derived loopback candidate — deduped to one entry: {}",
+        redact(advertised.as_ref())
     );
 
     // (3) A full task-code transfer through the STUN-configured receiver.
@@ -1533,7 +1993,7 @@ fn stun_reflexive_rides_the_cli_receiver_socket() {
         .trim()
         .strip_prefix("AKI1-")
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+        .unwrap_or_else(|| panic!("not the display line: {}", redact(code_line.as_ref())));
     let src = tmp.path().join("t03-stun-src");
     std::fs::create_dir_all(&src).expect("src dir");
     write_file(
@@ -1602,15 +2062,22 @@ fn distinct_stun_reflection_leads_the_non_lan_candidates() {
     let advertised = recv
         .stdout
         .wait_for("[task] advertising", std::time::Duration::from_secs(15));
-    let reflexive_at = advertised
-        .find("198.51.100.9:55555")
-        .unwrap_or_else(|| panic!("the distinct reflection must ride the blob: {advertised}"));
+    let reflexive_at = advertised.find("198.51.100.9:55555").unwrap_or_else(|| {
+        panic!(
+            "the distinct reflection must ride the blob: {}",
+            redact(advertised.as_ref())
+        )
+    });
     let loopback_at = advertised.find("127.0.0.1:").unwrap_or_else(|| {
-        panic!("the derived loopback candidate must ride the blob: {advertised}")
+        panic!(
+            "the derived loopback candidate must ride the blob: {}",
+            redact(advertised.as_ref())
+        )
     });
     assert!(
         reflexive_at < loopback_at,
-        "the reflexive candidate inserts BEFORE the loopback tail: {advertised}"
+        "the reflexive candidate inserts BEFORE the loopback tail: {}",
+        redact(advertised.as_ref())
     );
 }
 
@@ -1647,21 +2114,24 @@ fn dead_stun_server_fails_open_within_the_budget() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(8),
-        "fail-open must stay inside the budget (query budget 2 s): {elapsed:?}; {bound}"
+        "fail-open must stay inside the budget (query budget 2 s): {elapsed:?}; {}",
+        redact(bound.as_ref())
     );
     let advertised = recv
         .stdout
         .wait_for("[task] advertising", std::time::Duration::from_secs(10));
     assert!(
         advertised.contains("127.0.0.1:"),
-        "local candidates still advertise on STUN failure: {advertised}"
+        "local candidates still advertise on STUN failure: {}",
+        redact(advertised.as_ref())
     );
     let failure = recv
         .stdout
         .wait_for("stun query failed", std::time::Duration::from_secs(5));
     assert!(
         !failure.contains("panicked"),
-        "the failure line is bounded diagnostics, not a crash: {failure}"
+        "the failure line is bounded diagnostics, not a crash: {}",
+        redact(&failure)
     );
 }
 
@@ -1760,7 +2230,7 @@ fn connected_via_addr(sender_log: &str) -> SocketAddr {
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|token| token.parse().ok())
-        .unwrap_or_else(|| panic!("connected-via address in the line: {line}"))
+        .unwrap_or_else(|| panic!("connected-via address in the line: {}", redact(line)))
 }
 
 /// The port the receiver's "receiver bound [::]:<port>" line reports.
@@ -1771,7 +2241,7 @@ fn receiver_bound_port(bound_line: &str) -> u16 {
         .and_then(|rest| rest.split(' ').next())
         .and_then(|token| token.parse::<SocketAddr>().ok())
         .map(|addr| addr.port())
-        .unwrap_or_else(|| panic!("bound addr token in the line: {bound_line}"))
+        .unwrap_or_else(|| panic!("bound addr token in the line: {}", redact(bound_line)))
 }
 
 /// The address the sender's probe-round line observed (the observed head
@@ -1790,7 +2260,7 @@ fn probe_observed_addr(sender_log: &str) -> SocketAddr {
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|token| token.parse().ok())
-        .unwrap_or_else(|| panic!("observed address in the line: {line}"))
+        .unwrap_or_else(|| panic!("observed address in the line: {}", redact(line)))
 }
 
 /// Fallback layer: the advertised list carries a probe-answering fake
@@ -1832,7 +2302,8 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
     let fake_text = fake.addr.to_string();
     assert!(
         advertised.contains(&fake_text),
-        "the probe-echo fake must ride the advertised candidates: {advertised}"
+        "the probe-echo fake must ride the advertised candidates: {}",
+        redact(advertised.as_ref())
     );
 
     // The real transfer chain against that receiver.
@@ -1845,7 +2316,7 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
         .trim()
         .strip_prefix("AKI1-")
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+        .unwrap_or_else(|| panic!("not the display line: {}", redact(code_line.as_ref())));
     let src = tmp.path().join("t03-punch-src");
     std::fs::create_dir_all(&src).expect("src dir");
     write_file(
@@ -1896,8 +2367,12 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
     let observed = probe_observed_addr(&sender_log);
     let observed_text = observed.to_string();
     assert!(
-        advertised.split_whitespace().any(|token| token == observed_text),
-        "the observed head must be a genuinely advertised candidate: {observed_text} not in {advertised}"
+        advertised
+            .split_whitespace()
+            .any(|token| token == observed_text),
+        "the observed head must be a genuinely advertised candidate: {} not in {}",
+        redact(observed_text.as_ref()),
+        redact(advertised.as_ref())
     );
     assert!(
         observed == fake.addr || observed.port() == real_port,
@@ -1973,7 +2448,9 @@ fn probe_round_observes_the_real_advertised_candidates() {
         advertised
             .split_whitespace()
             .any(|token| token == observed_text),
-        "the probe round must observe a genuinely advertised candidate: {observed_text} not in {advertised}"
+        "the probe round must observe a genuinely advertised candidate: {} not in {}",
+        redact(observed_text.as_ref()),
+        redact(advertised.as_ref())
     );
 
     // The observed-first attempt fails over to the real receiver.
@@ -1988,6 +2465,19 @@ fn probe_round_observes_the_real_advertised_candidates() {
         sender_log.contains("[task] done:"),
         "the plain chain still completes: {}",
         redact(&sender_log)
+    );
+    // What the run proved, for a single-case run of this test (`--exact
+    // --nocapture`): loopback ports only.
+    eprintln!(
+        "t03 probe round: the observed head {} is one of the {} advertised candidates; the \
+         transfer rode the receiver's bound port {real_port}; the sender printed its done line; \
+         payload bytes are checked by the chain",
+        redact(observed_text.as_ref()),
+        advertised
+            .split("[task] advertising ")
+            .nth(1)
+            .and_then(|rest| rest.split(" candidate").next())
+            .unwrap_or("?")
     );
 }
 
@@ -2026,7 +2516,7 @@ fn sender_stun_reflexive_addr(sender_log: &str) -> SocketAddr {
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|token| token.parse().ok())
-        .unwrap_or_else(|| panic!("reflexive address in the line: {line}"))
+        .unwrap_or_else(|| panic!("reflexive address in the line: {}", redact(line)))
 }
 
 /// One `task code-recv` child with STUN disabled (the receiver side is a
@@ -2126,7 +2616,7 @@ fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
         .trim()
         .strip_prefix("AKI1-")
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+        .unwrap_or_else(|| panic!("not the display line: {}", redact(code_line.as_ref())));
 
     let (mut sender, src) = spawn_join_send_with_stun(
         "t03-cr5a-send",
@@ -2142,7 +2632,8 @@ fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
     assert_eq!(
         reflexive.ip(),
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        "the truthful responder reflects the sender's own source: {reflexive_line}"
+        "the truthful responder reflects the sender's own source: {}",
+        redact(reflexive_line.as_ref())
     );
 
     // Drive the transfer to completion (offer + consent + done).
@@ -2180,11 +2671,13 @@ fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|token| token.parse::<SocketAddr>().ok())
         .map(|addr| addr.port())
-        .unwrap_or_else(|| panic!("peer endpoint token in the line: {paired_line}"));
+        .unwrap_or_else(|| panic!("peer endpoint token in the line: {}", redact(paired_line)));
     assert_eq!(
         reflexive.port(),
         advertised_port,
-        "the STUN query must run on the socket the blob advertises (and the dial adopts): {reflexive_line} vs {paired_line}"
+        "the STUN query must run on the socket the blob advertises (and the dial adopts): {} vs {}",
+        redact(reflexive_line.as_ref()),
+        redact(paired_line)
     );
     let sender_log = sender.stdout.snapshot().join("\n");
     assert!(
@@ -2242,7 +2735,7 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         .trim()
         .strip_prefix("AKI1-")
         .map(|rest| format!("AKI1-{rest}"))
-        .unwrap_or_else(|| panic!("not the display line: {code_line}"));
+        .unwrap_or_else(|| panic!("not the display line: {}", redact(code_line.as_ref())));
 
     let (mut sender, src) = spawn_join_send_with_stun(
         "t03-cr5b-send",
@@ -2252,10 +2745,16 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         &responder.addr.to_string(),
     );
     // The distinct reflection rides the sender's own reflexive line (and
-    // with it, the advertised blob).
-    sender.stdout.wait_for(
+    // with it, the advertised blob). The receiver and the registry go into
+    // the report too: review 20 found a run that stopped here with only
+    // the joiner's side.
+    sender.stdout.wait_for_reporting(
         &format!("stun reflexive {punch_addr}"),
         std::time::Duration::from_secs(10),
+        &[
+            ("receiver", &recv.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
     );
 
     // THE punch observable: a probe-shaped packet from the receiver's
@@ -2269,56 +2768,46 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
     let punch_deadline = Instant::now() + std::time::Duration::from_secs(30);
     // Q-N3 (2026-11-27): the first CI failure of this test said only that
     // no matching packet arrived. The report now also says what the 30 s
-    // did see, on the same clock as the three processes' timelines.
-    let origin = [&recv.stdout, &sender.stdout, &registry.proc.stdout]
-        .iter()
-        .filter_map(|log| log.earliest_ms())
-        .min()
-        .unwrap_or_else(since_origin_ms);
-    let watching_from_ms = since_origin_ms().saturating_sub(origin);
-    let mut punch_from_quic_port = false;
-    let mut packets = 0usize;
-    let mut other_source_port = 0usize;
-    let mut first_packet_ms: Option<u128> = None;
-    let mut last_packet_ms: Option<u128> = None;
-    let mut read_timeouts = 0usize;
-    let mut os_error: Option<std::io::Error> = None;
-    // The joiner's exit status when it ended before a matching packet.
-    let mut sender_exit: Option<String> = None;
-    // A packet that is not what this socket is for: its length and whether
-    // it was probe-shaped. The report is built before the assertions so a
-    // bad packet also shows the three processes.
-    let mut bad_packet: Option<(usize, bool)> = None;
+    // did see, on the same clock as the three processes' timelines, and
+    // (review 20) what the receiver's own punch loop says it sent to the
+    // watched target.
     let chain = [
         ("receiver", &recv.stdout),
         ("sender", &sender.stdout),
         ("registry", &registry.proc.stdout),
     ];
+    let origin = chain
+        .iter()
+        .filter_map(|(_, log)| log.earliest_ms())
+        .min()
+        .unwrap_or_else(since_origin_ms);
+    let watching_from_ms = since_origin_ms().saturating_sub(origin);
+    let mut watch = PunchWatch::default();
+    // The joiner's exit status when it ended before a matching packet, and
+    // when that was seen.
+    let mut sender_exit: Option<String> = None;
+    let mut joiner_gone: Option<Instant> = None;
     let mut buffer = [0u8; 1500];
-    while Instant::now() < punch_deadline && !punch_from_quic_port {
-        // The joiner ending (any status) means no punch follows.
-        if let Some(status) = sender.exit_status() {
-            sender_exit = Some(status.to_string());
+    while Instant::now() < punch_deadline && !watch.from_quic_port {
+        // The joiner ending (any status) means the transfer is over. The
+        // receiver's punch loop, started at pairing, may still be inside
+        // its window: read what is already queued first (review 20: a
+        // matching packet can sit in the queue when the exit is first
+        // seen), then keep reading only for as long as that window lasts.
+        if sender_exit.is_none() {
+            if let Some(status) = sender.exit_status() {
+                sender_exit = Some(status.to_string());
+                watch.drain(&punch_target, quic_port, origin);
+                joiner_gone = Some(Instant::now());
+            }
+        }
+        if joiner_gone.is_some_and(|seen| seen.elapsed() >= punch_grace()) {
             break;
         }
         match punch_target.recv_from(&mut buffer) {
             Ok((len, from)) => {
-                let probe = ak_net::holepunch::is_probe_packet(&buffer[..len]);
-                if !probe || len > 64 {
-                    bad_packet = Some((len, probe));
+                if watch.saw(&buffer[..len], from, quic_port, origin) {
                     break;
-                }
-                packets += 1;
-                let at = since_origin_ms().saturating_sub(origin);
-                first_packet_ms.get_or_insert(at);
-                last_packet_ms = Some(at);
-                if from.port() == quic_port {
-                    punch_from_quic_port = true;
-                } else {
-                    // The pairing-time probe (ak-session's throwaway
-                    // socket) also lands here; keep reading until the
-                    // QUIC-socket punch shows up.
-                    other_source_port += 1;
                 }
             }
             // Interrupted (e.g. on Unix): the read is retried inside the
@@ -2330,15 +2819,15 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                read_timeouts += 1;
+                watch.read_timeouts += 1;
             }
             Err(error) => {
-                os_error = Some(error);
+                watch.read_error = Some(error.to_string());
                 break;
             }
         }
     }
-    if let Some((len, probe)) = bad_packet {
+    if let Some((len, probe)) = watch.bad_packet {
         assert!(
             probe,
             "the punch packet is probe-shaped: {len} bytes{}",
@@ -2350,13 +2839,22 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
             failure_report(&chain)
         );
     }
+    let receiver_log = recv.stdout.snapshot().join("\n");
     assert!(
-        punch_from_quic_port,
+        watch.from_quic_port,
         "the receiver's punch must arrive from its bound QUIC port {quic_port}: \
-         watching from +{watching_from_ms} ms, probe-shaped packets seen {packets} \
-         (from other source ports {other_source_port}), first at +{first_packet_ms:?} ms, \
-         last at +{last_packet_ms:?} ms, read timeouts {read_timeouts}, \
-         sender exit status {sender_exit:?}, read error {os_error:?}{}",
+         watching from +{watching_from_ms} ms, probe-shaped packets seen {} \
+         (from other source ports {}), first at +{:?} ms, last at +{:?} ms, \
+         read timeouts {}, sender exit status {sender_exit:?}, read error {:?}; \
+         receiver pairing line seen: {}; receiver punch loop: {}{}",
+        watch.packets,
+        watch.other_source_port,
+        watch.first_packet_ms,
+        watch.last_packet_ms,
+        watch.read_timeouts,
+        watch.read_error,
+        receiver_log.contains("[task] paired; peer "),
+        punch_loop_record(&recv.stderr.snapshot().join("\n"), punch_addr.port()),
         failure_report(&chain)
     );
 
@@ -2382,11 +2880,150 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         "the receiver must report its punch loop: {}",
         redact(&recv_log)
     );
+    // The receiver's own record agrees with the socket: the watched port
+    // was one of its selected targets, and it sent to that target.
+    let record = punch_loop_record(&recv.stderr.snapshot().join("\n"), punch_addr.port());
+    assert!(
+        record.contains("first sent on tick "),
+        "the receiver's punch loop must record a send to the watched port: {record}"
+    );
     let landed = std::fs::read(tmp.path().join("t03-cr5b-recv-out").join("payload.bin"))
         .expect("received payload");
+    let expected = std::fs::read(src.join("payload.bin")).expect("source payload");
     assert_eq!(
-        landed,
-        std::fs::read(src.join("payload.bin")).expect("source payload"),
+        landed, expected,
         "payload bytes differ through the punched path"
     );
+    // What the run proved, for a single-case run of this test (`--exact
+    // --nocapture`): a skipped run prints `skipping:` and none of this.
+    eprintln!(
+        "t03 punch: a probe-shaped packet from the receiver's QUIC port {quic_port} reached the \
+         watched target at +{} ms ({} probe-shaped packets seen, {} from other source ports); \
+         receiver punch loop: {record}; both children exited 0; payload {} bytes identical",
+        watch
+            .first_packet_ms
+            .map_or("?".to_string(), |ms| ms.to_string()),
+        watch.packets,
+        watch.other_source_port,
+        landed.len()
+    );
+}
+
+/// How long after the joiner is gone the watched socket is still read: the
+/// receiver's punch window, plus the delayed start of a host with no
+/// low-TTL send. All of it inside the test's own 30 s.
+fn punch_grace() -> std::time::Duration {
+    ak_session::pairing::task_net::PUNCH_WINDOW + ak_session::pairing::task_net::PUNCH_LOW_TTL_PHASE
+}
+
+/// What the watched socket of the punch test saw (Q-N3, review 20): the
+/// numbers a failure needs, kept apart from the processes' logs.
+#[derive(Default)]
+struct PunchWatch {
+    /// A probe-shaped packet from the receiver's bound QUIC port arrived.
+    from_quic_port: bool,
+    packets: usize,
+    other_source_port: usize,
+    first_packet_ms: Option<u128>,
+    last_packet_ms: Option<u128>,
+    read_timeouts: usize,
+    read_error: Option<String>,
+    /// A packet that is not what this socket is for: its length and
+    /// whether it was probe-shaped.
+    bad_packet: Option<(usize, bool)>,
+}
+
+impl PunchWatch {
+    /// Account for one datagram read off the watched socket. `true` when
+    /// it is not a punch packet: the caller stops and reports.
+    fn saw(&mut self, payload: &[u8], from: SocketAddr, quic_port: u16, origin: u128) -> bool {
+        let probe = ak_net::holepunch::is_probe_packet(payload);
+        if !probe || payload.len() > 64 {
+            self.bad_packet = Some((payload.len(), probe));
+            return true;
+        }
+        self.packets += 1;
+        let at = since_origin_ms().saturating_sub(origin);
+        self.first_packet_ms.get_or_insert(at);
+        self.last_packet_ms = Some(at);
+        if from.port() == quic_port {
+            self.from_quic_port = true;
+        } else {
+            // The pairing-time probe (ak-session's throwaway socket) also
+            // lands here.
+            self.other_source_port += 1;
+        }
+        false
+    }
+
+    /// Read and account for every datagram already queued on `socket`,
+    /// without blocking; the socket's read timeout is set back after.
+    fn drain(&mut self, socket: &std::net::UdpSocket, quic_port: u16, origin: u128) {
+        let timeout = socket.read_timeout().ok().flatten();
+        let _ = socket.set_read_timeout(Some(std::time::Duration::ZERO));
+        let mut buffer = [0u8; 1500];
+        while !self.from_quic_port && self.bad_packet.is_none() {
+            match socket.recv_from(&mut buffer) {
+                Ok((len, from)) => {
+                    if self.saw(&buffer[..len], from, quic_port, origin) {
+                        break;
+                    }
+                }
+                // Nothing more is queued (or the socket is done): the
+                // errors of a non-blocking read carry no information.
+                Err(_) => break,
+            }
+        }
+        let _ = socket.set_read_timeout(timeout);
+    }
+}
+
+/// What the receiver's `[pair-diag] receiver punch loop ended:` line says
+/// about the port the test watches (review 20): whether that target was
+/// selected at all, and on which tick the loop first sent to it — a total
+/// over all targets cannot tell. The line carries ports and counts only.
+fn punch_loop_record(receiver_log: &str, watched_port: u16) -> String {
+    let Some(line) = receiver_log
+        .lines()
+        .find(|line| line.contains("[pair-diag] receiver punch loop ended: "))
+    else {
+        return "no end line yet (the loop starts once pairing completes and ends \
+                with its window or the first connection)"
+            .to_string();
+    };
+    let said = line
+        .split("[pair-diag] receiver punch loop ended: ")
+        .nth(1)
+        .unwrap_or("");
+    let selected = said
+        .split("selected [")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .unwrap_or("");
+    let entries: Vec<&str> = selected
+        .split(", ")
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let watched_port = watched_port.to_string();
+    let target = match entries
+        .iter()
+        .position(|entry| entry.split('@').next() == Some(watched_port.as_str()))
+    {
+        Some(index) => {
+            let (tick, packets) = entries[index]
+                .rsplit_once('@')
+                .and_then(|(_, counts)| counts.split_once('/'))
+                .unwrap_or(("?", "?"));
+            format!(
+                "the watched port is target {} of {}, first sent on tick {tick}, {packets} packet(s)",
+                index + 1,
+                entries.len()
+            )
+        }
+        None => format!(
+            "the watched port is not among the selected target(s) [{}]",
+            selected
+        ),
+    };
+    format!("{said}; for the watched port: {target}")
 }

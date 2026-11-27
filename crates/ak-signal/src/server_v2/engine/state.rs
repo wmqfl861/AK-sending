@@ -18,6 +18,10 @@ pub(super) struct ConnEntry {
     pub(super) close: Arc<watch::Sender<bool>>,
     pub(super) candidates: Vec<SocketAddr>,
     pub(super) peer_ip: IpAddr,
+    /// The pairing notices queued to this connection so far (Q-N3, review
+    /// 20): their numbers are the order in which the connection's outbox
+    /// took them. Restarts with a replacement connection, as the outbox does.
+    pub(super) notices: u64,
 }
 
 /// Resolve once the close watch fires (true) or its sender is gone
@@ -466,6 +470,10 @@ pub(super) struct Shared {
     /// [`MAX_REJECT_TASKS`], so a flood past the serving cap can never
     /// stack unbounded handshake work (R36-P1-03).
     pub(super) reject_count: AtomicUsize,
+    /// Test-only: the serve loop skips `sweep` while it is set, so a test
+    /// can run the sweep itself and choose its order against a handler.
+    #[cfg(test)]
+    pub(super) sweep_held: std::sync::atomic::AtomicBool,
 }
 
 /// Which admission counter a [`ConnSlotGuard`] releases on drop.
@@ -964,6 +972,95 @@ impl Shared {
         }
     }
 
+    /// A pairing notification to one participant's current connection, with
+    /// the branch that produced it (Q-N3, review 20). The notices a
+    /// connection receives are numbered in the order its outbox takes them,
+    /// decided under the engine lock: whichever tasks produce them, the
+    /// first error a participant can have read is the lowest number it was
+    /// sent. The line also says whether the frame was queued at all.
+    pub(super) fn deliver_noted(
+        &self,
+        device: &DeviceId,
+        role: &str,
+        pairing_id: PairingId,
+        note: &str,
+        frame: impl Into<CtrlFrame>,
+    ) {
+        let line = {
+            let mut inner = self.lock();
+            match inner.conns.get_mut(device) {
+                None => format!(
+                    "pairing {} notice to the {role} {}: {note}; dropped: the device is offline",
+                    util::hex_prefix(&pairing_id, 4),
+                    util::hex_prefix(device, 4)
+                ),
+                Some(entry) => {
+                    entry.notices += 1;
+                    let outcome = queue_notice(&entry.out, frame.into());
+                    format!(
+                        "pairing {} notice {} to the {role} {}: {note}; {outcome}",
+                        util::hex_prefix(&pairing_id, 4),
+                        entry.notices,
+                        util::hex_prefix(device, 4)
+                    )
+                }
+            }
+        };
+        decision!("{line}");
+    }
+
+    /// A handler's answer to the sender of a request, on the connection the
+    /// request came in on (`out`) — where it went before this line existed.
+    /// Numbered as above while that connection is still the device's
+    /// current one; once a newer Hello has replaced it, the answer is
+    /// queued on `out` all the same and the line says so.
+    pub(super) fn answer_noted(
+        &self,
+        out: &mpsc::Sender<CtrlFrame>,
+        device: &DeviceId,
+        role: &str,
+        pairing_id: PairingId,
+        note: &str,
+        frame: impl Into<CtrlFrame>,
+    ) {
+        let line = {
+            let mut inner = self.lock();
+            match inner.conns.get_mut(device) {
+                Some(entry) if entry.out.same_channel(out) => {
+                    entry.notices += 1;
+                    let outcome = queue_notice(out, frame.into());
+                    format!(
+                        "pairing {} notice {} to the {role} {}: {note}; {outcome}",
+                        util::hex_prefix(&pairing_id, 4),
+                        entry.notices,
+                        util::hex_prefix(device, 4)
+                    )
+                }
+                _ => {
+                    let outcome = queue_notice(out, frame.into());
+                    format!(
+                        "pairing {} notice to the {role} {}: {note}; {outcome} (on a connection that a newer one replaced)",
+                        util::hex_prefix(&pairing_id, 4),
+                        util::hex_prefix(device, 4)
+                    )
+                }
+            }
+        };
+        decision!("{line}");
+    }
+
+    /// Whether the serve loop leaves the sweep to a test.
+    pub(super) fn sweep_held(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.sweep_held.load(Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     /// CR-P1-03: the shared redeem budget layers (per source, per
     /// identity, global breaker) under one lock acquisition.
     pub(super) fn redeem_allows(
@@ -980,6 +1077,16 @@ impl Shared {
 pub(super) fn deliver<F: Into<CtrlFrame>>(tx: &mpsc::Sender<CtrlFrame>, frame: F) {
     if let Err(e) = tx.try_send(frame.into()) {
         log::debug!("outbound queue full or closed; message dropped: {e}");
+    }
+}
+
+/// Queue one pairing notice on a connection's outbox and say what became
+/// of it (Q-N3, review 20).
+fn queue_notice(tx: &mpsc::Sender<CtrlFrame>, frame: CtrlFrame) -> &'static str {
+    match tx.try_send(frame) {
+        Ok(()) => "enqueued",
+        Err(mpsc::error::TrySendError::Full(_)) => "dropped: the outbound queue is full",
+        Err(mpsc::error::TrySendError::Closed(_)) => "dropped: the outbound queue is closed",
     }
 }
 

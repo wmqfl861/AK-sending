@@ -70,6 +70,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
 use crate::pairing::error::ClientError;
+use crate::pairing::{id_prefix, pair_diag};
 
 /// Wall-clock Unix milliseconds (the coordination plane's time domain).
 pub(crate) fn now_unix_ms() -> u64 {
@@ -88,6 +89,48 @@ pub(crate) fn transcript_pairing_id(transcript: &Transcript256) -> PairingId {
     let mut id = [0u8; 16];
     id.copy_from_slice(&transcript[TRANSCRIPT_PAIRING_OFFSET..TRANSCRIPT_PAIRING_OFFSET + 16]);
     id
+}
+
+/// What the pairing trace calls an inbound frame of the pairing flow, and
+/// which round it names (Q-N3, review 20: the registry numbers the notices
+/// it queues to a connection; this names what arrived, in arrival order).
+/// `None` for every other frame.
+fn pairing_frame_trace(message: &CtrlMessage) -> Option<String> {
+    let round = |id: &[u8; 16]| format!("pairing {}", id_prefix(id));
+    Some(match message {
+        CtrlMessage::PairError {
+            scope,
+            object_id,
+            code,
+            ..
+        } => match scope {
+            ErrorScope::Pairing => format!(
+                "pairing error 0x{code:04x}, correlation {}",
+                if *object_id == [0u8; 16] {
+                    "all-zero".to_string()
+                } else {
+                    round(object_id)
+                }
+            ),
+            ErrorScope::Code => format!("code-scoped error 0x{code:04x}"),
+            _ => return None,
+        },
+        CtrlMessage::InviteRedeemPending { pairing_id, .. } => {
+            format!("redeem acknowledged ({})", round(pairing_id))
+        }
+        CtrlMessage::InviteRedeemOffered { pairing_id, .. } => {
+            format!("offer ({})", round(pairing_id))
+        }
+        CtrlMessage::PairChallenge { transcript, .. } => {
+            format!("challenge ({})", round(&transcript_pairing_id(transcript)))
+        }
+        CtrlMessage::PairProof { pairing_id, .. } => format!("proof ({})", round(pairing_id)),
+        CtrlMessage::PairCommit { transcript, .. } => {
+            format!("commit ({})", round(&transcript_pairing_id(transcript)))
+        }
+        CtrlMessage::PairReady { pairing_id, .. } => format!("ready ({})", round(pairing_id)),
+        _ => return None,
+    })
 }
 
 /// Tunables of [`RegistryClient`]; defaults mirror the frozen client_v2
@@ -216,6 +259,10 @@ struct ClientInner {
     /// request id; at most one query is in flight per client).
     info_query: AsyncMutex<()>,
     unmatched: AtomicU64,
+    /// Q-N3 (review 20): the pairing frames this connection delivered, in
+    /// order; restarts with every connection, as the registry's own count
+    /// of the notices it queues to a connection does.
+    pairing_frames: AtomicU64,
     state_tx: watch::Sender<ClientState>,
     /// Test-only: a test's hold on decoded `PairCommit` frames between the
     /// reader and the dispatch (`test_gate::CommitGate`).
@@ -242,6 +289,7 @@ impl ClientInner {
     /// with no ordering race.
     fn dispatch_frame(&self, frame: CtrlFrame) {
         let message = frame.message;
+        let traced = pairing_frame_trace(&message);
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
         if let Some(EndpointBlob(blob)) = frame.endpoint {
             let pairing_id = match &message {
@@ -385,6 +433,17 @@ impl ClientInner {
             inboxes.retain(|tx| !tx.is_closed());
         }
         drop(dispatch);
+        if let Some(what) = traced {
+            let n = self.pairing_frames.fetch_add(1, Ordering::AcqRel) + 1;
+            pair_diag!(
+                "registry frame #{n}: {what}; {}",
+                if delivered {
+                    "queued to a subscribed flow"
+                } else {
+                    "no subscribed flow took it"
+                }
+            );
+        }
         if !delivered {
             let n = self.unmatched.fetch_add(1, Ordering::AcqRel) + 1;
             log::debug!("pairing client: dropped unmatched frame (total {n})");
@@ -524,6 +583,7 @@ impl RegistryClient {
             server_info_cache: StdMutex::new(None),
             info_query: AsyncMutex::new(()),
             unmatched: AtomicU64::new(0),
+            pairing_frames: AtomicU64::new(0),
             state_tx,
             #[cfg(test)]
             commit_gate: test_gate::CommitGate::default(),
@@ -1683,6 +1743,7 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
 
     // ---- Hand over to the long-lived tasks ----
     let epoch = inner.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    inner.pairing_frames.store(0, Ordering::Release);
     let (read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel(inner.config.outbox_capacity);
     *inner.outbox.lock().expect("client outbox lock") = tx;

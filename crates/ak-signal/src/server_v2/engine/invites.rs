@@ -199,9 +199,23 @@ pub(super) fn handle_revoke(
                     revoked_ms,
                 },
             );
+            // Q-N3 (review 20): each notification carries its own numbered
+            // line, as the sweep's and the explicit abort's do.
             for pairing in aborted {
-                notify_pairing_unavailable(shared, &pairing.owner, pairing.pairing_id);
-                notify_pairing_unavailable(shared, &pairing.redeemer, pairing.pairing_id);
+                shared.deliver_noted(
+                    &pairing.owner,
+                    "owner",
+                    pairing.pairing_id,
+                    "revoke of the code: the pairing was aborted",
+                    unavailable([0u8; 16], pairing.pairing_id),
+                );
+                shared.deliver_noted(
+                    &pairing.redeemer,
+                    "redeemer",
+                    pairing.pairing_id,
+                    "revoke of the code: the pairing was aborted",
+                    unavailable([0u8; 16], pairing.pairing_id),
+                );
             }
         }
         Ok(RevokeOutcome::Replay(bytes)) => deliver_msg(out, decode_stored(&bytes)),
@@ -240,12 +254,4 @@ pub(super) fn handle_revoke(
             );
         }
     }
-}
-
-pub(super) fn notify_pairing_unavailable(
-    shared: &Shared,
-    device: &DeviceId,
-    pairing_id: PairingId,
-) {
-    shared.deliver(device, unavailable([0u8; 16], pairing_id));
 }

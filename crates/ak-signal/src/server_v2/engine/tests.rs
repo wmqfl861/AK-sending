@@ -2473,11 +2473,17 @@ struct PendingRedeem {
     /// The redeem's request id and nonce: the transcript must bind both.
     request_id: RequestId,
     redeemer_nonce: [u8; 32],
+    /// The deadline the redeem was signed with.
+    deadline_ms: u64,
 }
 
 /// A live code of an owner and a pending redeem of a joiner under it: the
 /// registry has begun the pairing and pushed the offer to the owner.
-async fn pending_redeem(server: &TestServer, deadline: u64) -> PendingRedeem {
+/// `deadline` is evaluated when the redeem is about to go out — after the
+/// two connections and the claim — so that a slow machine does not use up
+/// the window before the request exists (the registry answers a redeem
+/// whose deadline has passed with `PROTOCOL_UNSUPPORTED`).
+async fn pending_redeem(server: &TestServer, deadline: impl FnOnce() -> u64) -> PendingRedeem {
     let registry_id = server.registry_id();
     let mut owner =
         TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
@@ -2498,6 +2504,7 @@ async fn pending_redeem(server: &TestServer, deadline: u64) -> PendingRedeem {
         CtrlMessage::InviteClaimed { code_id, .. } => code_id,
         other => panic!("expected InviteClaimed, got {other:?}"),
     };
+    let deadline = deadline();
     let redeem = signed_redeem(&joiner.key, &registry_id, lookup, random_id16(), deadline);
     joiner
         .send(&CtrlMessage::InviteRedeem(redeem.clone()))
@@ -2514,6 +2521,7 @@ async fn pending_redeem(server: &TestServer, deadline: u64) -> PendingRedeem {
         code_id,
         request_id: redeem.request_id,
         redeemer_nonce: redeem.redeemer_nonce,
+        deadline_ms: deadline,
     }
 }
 
@@ -2662,7 +2670,7 @@ async fn diagnostics_name_a_ghost_redeem_expiring_at_its_deadline() {
 async fn diagnostics_name_a_pending_pairing_swept_past_its_deadline() {
     let server = spawn_server().await;
     let since = sink_len();
-    let pending = pending_redeem(&server, now_ms() + 300).await;
+    let pending = pending_redeem(&server, || now_ms() + 300).await;
     let PendingRedeem {
         mut owner,
         mut joiner,
@@ -2670,6 +2678,7 @@ async fn diagnostics_name_a_pending_pairing_swept_past_its_deadline() {
         code_id: _,
         request_id: _,
         redeemer_nonce: _,
+        deadline_ms: _,
     } = pending;
     expect_unavailable(&mut joiner, pairing_id).await;
     expect_unavailable(&mut owner, pairing_id).await;
@@ -2696,7 +2705,7 @@ async fn diagnostics_name_a_pending_pairing_swept_past_its_deadline() {
 async fn diagnostics_name_an_owner_aborting_before_the_deadline() {
     let server = spawn_server().await;
     let since = sink_len();
-    let pending = pending_redeem(&server, now_ms() + 8_000).await;
+    let pending = pending_redeem(&server, || now_ms() + 8_000).await;
     let PendingRedeem {
         mut owner,
         mut joiner,
@@ -2704,6 +2713,7 @@ async fn diagnostics_name_an_owner_aborting_before_the_deadline() {
         code_id: _,
         request_id: _,
         redeemer_nonce: _,
+        deadline_ms: _,
     } = pending;
     owner
         .send(&CtrlMessage::PairAbort {
@@ -2739,8 +2749,7 @@ async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
     let server = spawn_server().await;
     let registry_id = server.registry_id();
     let since = sink_len();
-    let deadline = now_ms() + 700;
-    let pending = pending_redeem(&server, deadline).await;
+    let pending = pending_redeem(&server, || now_ms() + 700).await;
     let PendingRedeem {
         mut owner,
         mut joiner,
@@ -2748,6 +2757,7 @@ async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
         code_id,
         request_id,
         redeemer_nonce,
+        deadline_ms: deadline,
     } = pending;
     let digest = challenge_and_proof(
         &mut owner,
@@ -2795,6 +2805,285 @@ async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
     );
     // The joiner's `unavailable` comes from the sweep in either order.
     expect_unavailable(&mut joiner, pairing_id).await;
+    // Review 20: both notices are on record for the owner — the sweep's
+    // and the late Prepared's answer — numbered in the order its
+    // connection took them; that order is the one the frames arrived in.
+    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
+    assert_eq!(to_owner.len(), 2, "{to_owner:?}");
+    let late_first = to_owner[0].contains("prepared past the deadline");
+    let sweep_first = to_owner[0].contains("sweep:");
+    assert!(late_first || sweep_first, "{to_owner:?}");
+    assert!(
+        to_owner[0].contains("notice 1 ") && to_owner[1].contains("notice 2 "),
+        "{to_owner:?}"
+    );
+    assert!(
+        to_owner[1].contains(if late_first {
+            "sweep:"
+        } else {
+            "prepared past the deadline"
+        }),
+        "{to_owner:?}"
+    );
+    server.stop().await;
+}
+
+// ---- review 20: the order of two identical errors -----------------------------
+
+/// Every engine this process serves, by registry id, weakly (a stopped
+/// server is not kept alive). `serve_v2_with_revision` registers its engine
+/// here in test builds.
+static SHARED: Mutex<Vec<(RegistryId, std::sync::Weak<Shared>)>> = Mutex::new(Vec::new());
+
+pub(super) fn register_shared(shared: &Arc<Shared>) {
+    SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((shared.registry_id, Arc::downgrade(shared)));
+}
+
+/// Stop the serve loop from sweeping `server`'s engine and hand back the
+/// state to run `sweep` from: the test then decides whether the sweep or a
+/// handler comes first, instead of racing the 200 ms tick. The engine
+/// registers itself when its serve task starts, which can be after the
+/// test gets here: that is waited for.
+async fn hold_the_sweeper(server: &TestServer) -> Arc<Shared> {
+    let registry_id = server.registry_id();
+    let shared = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let found = SHARED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|(registered, _)| *registered == registry_id)
+                .and_then(|(_, shared)| shared.upgrade());
+            match found {
+                Some(shared) => break shared,
+                None => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("the engine registers its shared state when it starts serving");
+    shared
+        .sweep_held
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    shared
+}
+
+fn sweep_now(shared: &Shared) {
+    super::sweep(shared);
+}
+
+/// A pairing with both proofs that is now past its deadline, on an engine
+/// whose sweeper is held.
+struct HeldPairing {
+    shared: Arc<Shared>,
+    owner: TestClient,
+    joiner: TestClient,
+    pairing_id: PairingId,
+    digest: Digest32,
+}
+
+async fn held_pairing_past_its_deadline(server: &TestServer) -> HeldPairing {
+    let shared = hold_the_sweeper(server).await;
+    let registry_id = server.registry_id();
+    let PendingRedeem {
+        mut owner,
+        mut joiner,
+        pairing_id,
+        code_id,
+        request_id,
+        redeemer_nonce,
+        deadline_ms: deadline,
+    } = pending_redeem(server, || now_ms() + 700).await;
+    let digest = challenge_and_proof(
+        &mut owner,
+        &mut joiner,
+        &registry_id,
+        code_id,
+        [0x5A; 32],
+        pairing_id,
+        request_id,
+        redeemer_nonce,
+        deadline,
+    )
+    .await;
+    sleep_until_after(deadline).await;
+    HeldPairing {
+        shared,
+        owner,
+        joiner,
+        pairing_id,
+        digest,
+    }
+}
+
+async fn send_prepared(client: &mut TestClient, pairing_id: PairingId, digest: Digest32) {
+    client
+        .send(&CtrlMessage::PairPrepared {
+            pairing_id,
+            transcript_digest: digest,
+            signature: client
+                .key
+                .sign(&hello2::prepared_message(&pairing_id, &digest)),
+        })
+        .await;
+}
+
+/// The registry's notice lines to one participant of a pairing, in the
+/// sink's order.
+fn notices(since: usize, pairing_id: &PairingId, role: &str, device: &DeviceId) -> Vec<String> {
+    let to = format!("to the {role} {}", prefix(device));
+    DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .skip(since)
+        .filter(|line| line.contains(&prefix(pairing_id)) && line.contains(&to))
+        .cloned()
+        .collect()
+}
+
+/// The sweep and a late Prepared answer the redeemer with the same frame.
+/// Sweep first: the redeemer's first `unavailable` is the sweep's, notice 1
+/// on its connection; the late Prepared's answer is notice 2.
+#[tokio::test]
+async fn diagnostics_order_a_sweep_before_a_late_prepared() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let HeldPairing {
+        shared,
+        mut owner,
+        mut joiner,
+        pairing_id,
+        digest,
+    } = held_pairing_past_its_deadline(&server).await;
+    sweep_now(&shared);
+    expect_unavailable(&mut joiner, pairing_id).await;
+    expect_unavailable(&mut owner, pairing_id).await;
+    send_prepared(&mut joiner, pairing_id, digest).await;
+    expect_unavailable(&mut joiner, pairing_id).await;
+
+    let to_redeemer = notices(since, &pairing_id, "redeemer", &joiner.key.public_key());
+    assert_eq!(to_redeemer.len(), 2, "{to_redeemer:?}");
+    assert!(
+        to_redeemer[0].contains("notice 1 to the redeemer")
+            && to_redeemer[0].contains("sweep:")
+            && to_redeemer[0].ends_with("enqueued"),
+        "{to_redeemer:?}"
+    );
+    assert!(
+        to_redeemer[1].contains("notice 2 to the redeemer")
+            && to_redeemer[1].contains("prepared past the deadline")
+            && to_redeemer[1].ends_with("enqueued"),
+        "{to_redeemer:?}"
+    );
+    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
+    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
+    assert!(
+        to_owner[0].contains("notice 1 to the owner")
+            && to_owner[0].contains("sweep:")
+            && to_owner[0].ends_with("enqueued"),
+        "{to_owner:?}"
+    );
+    // Nothing follows the two.
+    match tokio::time::timeout(Duration::from_millis(300), joiner.recv()).await {
+        Err(_elapsed) => {}
+        Ok(other) => panic!("a third frame for the pairing: {other:?}"),
+    }
+    server.stop().await;
+}
+
+/// The other order: the late Prepared's answer is notice 1 and the
+/// redeemer's first `unavailable`; the sweep's is notice 2.
+#[tokio::test]
+async fn diagnostics_order_a_late_prepared_before_the_sweep() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let HeldPairing {
+        shared,
+        mut owner,
+        mut joiner,
+        pairing_id,
+        digest,
+    } = held_pairing_past_its_deadline(&server).await;
+    send_prepared(&mut joiner, pairing_id, digest).await;
+    expect_unavailable(&mut joiner, pairing_id).await;
+    sweep_now(&shared);
+    expect_unavailable(&mut joiner, pairing_id).await;
+    expect_unavailable(&mut owner, pairing_id).await;
+
+    let to_redeemer = notices(since, &pairing_id, "redeemer", &joiner.key.public_key());
+    assert_eq!(to_redeemer.len(), 2, "{to_redeemer:?}");
+    assert!(
+        to_redeemer[0].contains("notice 1 to the redeemer")
+            && to_redeemer[0].contains("prepared past the deadline")
+            && to_redeemer[0].ends_with("enqueued"),
+        "{to_redeemer:?}"
+    );
+    assert!(
+        to_redeemer[1].contains("notice 2 to the redeemer")
+            && to_redeemer[1].contains("sweep:")
+            && to_redeemer[1].ends_with("enqueued"),
+        "{to_redeemer:?}"
+    );
+    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
+    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
+    assert!(
+        to_owner[0].contains("notice 1 to the owner")
+            && to_owner[0].contains("sweep:")
+            && to_owner[0].ends_with("enqueued"),
+        "{to_owner:?}"
+    );
+    match tokio::time::timeout(Duration::from_millis(300), joiner.recv()).await {
+        Err(_elapsed) => {}
+        Ok(other) => panic!("a third frame for the pairing: {other:?}"),
+    }
+    server.stop().await;
+}
+
+/// A participant that went offline before the sweep: nothing is queued for
+/// it and its line says so; the owner's notice is number 1 as usual.
+#[tokio::test]
+async fn diagnostics_name_a_notice_dropped_for_an_offline_participant() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let HeldPairing {
+        shared,
+        mut owner,
+        joiner,
+        pairing_id,
+        ..
+    } = held_pairing_past_its_deadline(&server).await;
+    let redeemer_id = joiner.key.public_key();
+    drop(joiner);
+    // The registry forgets the connection once its reader saw the EOF.
+    let forgotten = tokio::time::timeout(Duration::from_secs(5), async {
+        while shared.lock().conns.contains_key(&redeemer_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(forgotten.is_ok(), "the registry still lists the redeemer");
+    sweep_now(&shared);
+    expect_unavailable(&mut owner, pairing_id).await;
+
+    let to_redeemer = notices(since, &pairing_id, "redeemer", &redeemer_id);
+    assert_eq!(to_redeemer.len(), 1, "{to_redeemer:?}");
+    assert!(
+        to_redeemer[0].contains("sweep:")
+            && to_redeemer[0].ends_with("dropped: the device is offline"),
+        "{to_redeemer:?}"
+    );
+    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
+    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
+    assert!(
+        to_owner[0].contains("notice 1 to the owner")
+            && to_owner[0].contains("sweep:")
+            && to_owner[0].ends_with("enqueued"),
+        "{to_owner:?}"
+    );
     server.stop().await;
 }
 
@@ -2805,8 +3094,7 @@ async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
 async fn diagnostics_say_which_of_a_sweep_and_a_late_abort_came_first() {
     let server = spawn_server().await;
     let since = sink_len();
-    let deadline = now_ms() + 300;
-    let pending = pending_redeem(&server, deadline).await;
+    let pending = pending_redeem(&server, || now_ms() + 300).await;
     let PendingRedeem {
         mut owner,
         mut joiner,
@@ -2814,6 +3102,7 @@ async fn diagnostics_say_which_of_a_sweep_and_a_late_abort_came_first() {
         code_id: _,
         request_id: _,
         redeemer_nonce: _,
+        deadline_ms: deadline,
     } = pending;
     sleep_until_after(deadline).await;
     owner

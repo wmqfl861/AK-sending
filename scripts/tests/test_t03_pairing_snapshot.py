@@ -173,12 +173,52 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue()), {"ok": False, "error_kind": "usage"})
 
     def test_the_uri_is_encoded_exactly_once(self):
-        # A second encoding would turn a legal `%` into `%25` (and `%20` into `%2520`).
+        # One encoding turns a literal `%` into `%25` and a space into `%20`;
+        # a second would turn those into `%2525` and `%2520`.
         uri = snapshot._read_only_uri("/tmp/a b/100%#x/registry.db")
         self.assertIn("a%20b/100%25%23x/registry.db", uri)
         self.assertNotIn("%2520", uri)
+        self.assertNotIn("%2525", uri)
         self.assertTrue(uri.startswith("file:"))
         self.assertTrue(uri.endswith("?mode=ro"))
+
+    def test_tables_are_cut_at_max_rows_and_say_so(self):
+        limit = snapshot.MAX_ROWS
+        self._create()
+        conn = sqlite3.connect(str(self.db))
+        for index in range(limit + 3):
+            # Later than the two rows of `_create`, so they are cut first.
+            created = NOW - 1_000 + index
+            conn.execute(
+                "INSERT INTO pairing_transactions (pairing_id, state, created_unix_ms,"
+                " updated_unix_ms, deadline_unix_ms, code_revision)"
+                " VALUES (?,?,?,?,?,?)",
+                (bytes([0x40 + index // 256, index % 256]) + b"\x0e" * 14, "ready",
+                 created, created, NOW + 6_000, 1),
+            )
+        conn.commit()
+        conn.close()
+        out = snapshot.read_snapshot(str(self.db), NOW)
+        transactions = out["pairing_transactions"]
+        self.assertTrue(transactions["truncated"])
+        self.assertEqual(transactions["rows"], limit)
+        self.assertEqual(len(transactions["row_detail"]), limit)
+        # The oldest rows are kept; the counts describe the rows shown only.
+        self.assertEqual(sorted(row["state"] for row in transactions["row_detail"])[:2],
+                         ["aborted", "committed"])
+        self.assertEqual(transactions["by_state"], {"aborted": 1, "committed": 1, "ready": limit - 2})
+        self.assertFalse(out["invite_codes"]["truncated"])
+        self.assertEqual(out["invite_codes"]["rows"], 1)
+        self.assertEqual(out["pairing_relations"], {"rows": 1})  # counted in full, never cut
+
+        # A table under the limit is not marked.
+        fresh = Path(self._tmp.name) / "fresh"
+        fresh.mkdir()
+        self.db = fresh / "registry.db"
+        self._create()
+        out = snapshot.read_snapshot(str(self.db), NOW)
+        for table in ("invite_codes", "pairing_transactions"):
+            self.assertFalse(out[table]["truncated"], table)
 
     def test_paths_with_spaces_percent_hash_and_non_ascii_are_read(self):
         for name in ("temp dir", "100% done", "hash#dir", "缓存", "a%20b"):

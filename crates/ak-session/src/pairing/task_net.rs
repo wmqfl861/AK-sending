@@ -1229,10 +1229,26 @@ pub fn observed_first_order(
 // 条's receiver half: the QUIC socket itself must SEND to the sender).
 // ---------------------------------------------------------------------------
 
+/// What one [`punch_candidates`] run did to one of the targets it
+/// selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchTarget {
+    /// The target as the loop sent to it (the family bridge of
+    /// [`punch_targets`] applied).
+    pub address: SocketAddr,
+    /// The 1-based tick of the first packet actually sent to it, and
+    /// whether that packet left with the low TTL of the first phase;
+    /// `0` / `false` when no send to it succeeded.
+    pub first_sent_tick: usize,
+    pub first_sent_low_ttl: bool,
+    /// Packets actually sent to it (failed sends do not count).
+    pub packets_sent: usize,
+}
+
 /// The outcome snapshot of one [`punch_candidates`] run — a bounded
 /// report for the adapters' diagnostics (event line / stdout line) and
 /// the unit pins of cadence, window and early stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PunchReport {
     /// Probe-shaped punch packets actually sent (sum over all targets and
     /// ticks; per-datagram send errors do not count).
@@ -1265,6 +1281,13 @@ pub struct PunchReport {
     /// elapsed (the early-stop path — set by the accept side on the
     /// first successful data-plane connection, or by task teardown).
     pub stopped_early: bool,
+    /// Q-N3 (2026-11-28): how many advertised candidates the loop looked
+    /// at (the first [`PUNCH_MAX_TARGETS`]; the rest were never
+    /// considered), and what it did to each target [`punch_targets`]
+    /// selected from them, in selection order. A total over all targets
+    /// cannot say whether one particular target was ever sent to.
+    pub considered: usize,
+    pub targets: Vec<PunchTarget>,
 }
 
 /// The RECEIVER-side hole punch (CR-P1-05): from `socket` — a
@@ -1356,11 +1379,25 @@ pub async fn punch_candidates<F>(
                 start_delayed: false,
                 ticks: 0,
                 stopped_early: false,
+                considered: 0,
+                targets: Vec::new(),
             });
             return;
         }
     };
     let targets = punch_targets(local, candidates);
+    let considered = candidates.len().min(PUNCH_MAX_TARGETS);
+    // Q-N3 (2026-11-28): per target, the first successful send and the
+    // count, for the adapters' diagnostics.
+    let mut per_target: Vec<PunchTarget> = targets
+        .iter()
+        .map(|&address| PunchTarget {
+            address,
+            first_sent_tick: 0,
+            first_sent_low_ttl: false,
+            packets_sent: 0,
+        })
+        .collect();
     // One packet for the whole run: same time-derived nonce (the reply,
     // if any, lands in quinn's queue and is discarded — the loop never
     // reads it back).
@@ -1406,6 +1443,8 @@ pub async fn punch_candidates<F>(
             start_delayed,
             ticks,
             stopped_early: true,
+            considered,
+            targets: per_target,
         });
         return;
     }
@@ -1430,39 +1469,38 @@ pub async fn punch_candidates<F>(
             // retries once more, so the armed window is always bounded).
             let _ = socket_ttl.restore();
         }
-        for target in &targets {
+        for (index, target) in targets.iter().enumerate() {
             // Per-datagram TTL decision (pure, unit-pinned below): low
             // TTL only for IPv4 targets inside the first phase on hosts
             // that can send it per-packet; everything else normal (the
             // socket-level fallback's low TTL rides the plain send
             // below while its guard is armed).
-            let sent = match punch_send_ttl(*target, low_phase, per_packet) {
+            let (sent, sent_low) = match punch_send_ttl(*target, low_phase, per_packet) {
                 // A refused/failed cmsg send is skipped, never retried
                 // at normal TTL inside the low phase (see the function
                 // doc — a normal-TTL fallback would re-create the very
                 // conntrack record the phase exists to avoid).
-                Some(ttl) => {
-                    if send_low_ttl_punch(&socket, &packet, *target, ttl) {
-                        low_ttl_packets += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
+                Some(ttl) => (send_low_ttl_punch(&socket, &packet, *target, ttl), true),
                 // Non-blocking UDP send_to: success is best-effort
                 // delivery; per-datagram errors (unreachable,
                 // WSAECONNRESET-shaped) cost nothing and never end the
                 // loop.
                 None => {
-                    let ok = socket.send_to(&packet, target).is_ok();
-                    if ok && socket_ttl.armed() && low_phase {
-                        low_ttl_packets += 1;
-                    }
-                    ok
+                    let sent = socket.send_to(&packet, target).is_ok();
+                    (sent, sent && socket_ttl.armed() && low_phase)
                 }
             };
             if sent {
                 packets_sent += 1;
+                if sent_low {
+                    low_ttl_packets += 1;
+                }
+                let entry = &mut per_target[index];
+                if entry.first_sent_tick == 0 {
+                    entry.first_sent_tick = ticks;
+                    entry.first_sent_low_ttl = sent_low;
+                }
+                entry.packets_sent += 1;
             }
         }
         let now = tokio::time::Instant::now();
@@ -1480,6 +1518,10 @@ pub async fn punch_candidates<F>(
         }
     }
     let stopped_early = stop.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline;
+    // Q-N3 (review 20): the socket's TTL is back to normal before the
+    // adapter's callback runs — the callback may write to a pipe, and
+    // with the socket-level fallback an early stop can land mid-phase.
+    let _ = socket_ttl.restore();
     report(PunchReport {
         packets_sent,
         low_ttl_packets,
@@ -1487,6 +1529,8 @@ pub async fn punch_candidates<F>(
         start_delayed,
         ticks,
         stopped_early,
+        considered,
+        targets: per_target,
     });
 }
 
@@ -3393,6 +3437,30 @@ mod tests {
             punch_candidates(puncher, &candidates, &stop, |r| *report_slot = Some(r)).await;
         }
         let report = report.expect("the report fires at loop end");
+        // Q-N3 (review 20): the record is per target — three candidates
+        // were considered, the two undialable ones dropped out, and the
+        // one selected got its first packet on the first tick.
+        assert_eq!(report.considered, 3, "{report:?}");
+        assert_eq!(
+            report.targets.len(),
+            1,
+            "only the dialable candidate is a target: {report:?}"
+        );
+        let only = report.targets[0];
+        assert_eq!(only.address, target_addr);
+        assert_eq!(
+            only.first_sent_tick, 1,
+            "the first tick already sends to it: {report:?}"
+        );
+        assert_eq!(
+            only.packets_sent, report.packets_sent,
+            "the one target carries the whole count: {report:?}"
+        );
+        assert_eq!(
+            only.first_sent_low_ttl,
+            report.low_ttl_packets > 0,
+            "the first tick lies in the low phase on a host with a low-TTL send: {report:?}"
+        );
         target
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("target timeout");
@@ -3528,6 +3596,12 @@ mod tests {
             started.elapsed() < PUNCH_WINDOW,
             "the early stop beat the window"
         );
+        // Q-N3 (review 20): the target that received the first packet is
+        // on record with its first tick.
+        assert_eq!(report.considered, 1, "{report:?}");
+        assert_eq!(report.targets.len(), 1, "{report:?}");
+        assert_eq!(report.targets[0].address, target_addr, "{report:?}");
+        assert_eq!(report.targets[0].first_sent_tick, 1, "{report:?}");
     }
 
     /// The punch target selection rule, pure: undialable entries (port 0

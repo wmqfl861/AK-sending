@@ -64,6 +64,23 @@ use crate::server_v2::tls;
 use crate::server_v2::{hello2, CAPABILITIES};
 use crate::util;
 
+/// One decision line of the pairing engine (Q-N3): a DEBUG log in every
+/// build and, in this crate's own tests, a line in the tests' sink, so a
+/// test can check that the diagnostics name the branch it drove.
+pub(super) fn decision(args: std::fmt::Arguments<'_>) {
+    log::debug!("{args}");
+    #[cfg(test)]
+    tests::DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(args.to_string());
+}
+macro_rules! decision {
+    ($($arg:tt)*) => {
+        decision(format_args!($($arg)*))
+    };
+}
+
 mod conn;
 mod hello;
 mod invites;
@@ -245,7 +262,11 @@ pub async fn serve_v2_with_revision(
         inner: Mutex::new(Inner::default()),
         conn_count: AtomicUsize::new(0),
         reject_count: AtomicUsize::new(0),
+        #[cfg(test)]
+        sweep_held: std::sync::atomic::AtomicBool::new(false),
     });
+    #[cfg(test)]
+    tests::register_shared(&shared);
     log::info!(
         "v2 registry server listening on tls {} (registry {})",
         listener.local_addr()?,
@@ -273,7 +294,11 @@ pub async fn serve_v2_with_revision(
                 }
                 return Ok(());
             }
-            _ = tick.tick() => sweep(&shared),
+            _ = tick.tick() => {
+                if !shared.sweep_held() {
+                    sweep(&shared);
+                }
+            }
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     let _ = tcp.set_nodelay(true);
@@ -526,24 +551,29 @@ fn sweep(shared: &Shared) {
         }
     };
     // Q-N3 recurrence (2026-11-27): one decision line per pairing — it
-    // names the pairing the participants' `unavailable` will carry. Whether
-    // each notification below reached its participant is logged by the
-    // delivery itself (a dropped message has its own DEBUG line).
+    // names the pairing the participants' `unavailable` will carry. Review
+    // 20: each notification is then delivered with its own line, numbered
+    // per connection in the order the outbox took it, and saying whether
+    // it was queued at all.
     for aborted in report.aborted {
-        log::debug!(
+        decision!(
             "sweep: pairing {} is past its deadline and is aborted; notifying its owner and its redeemer",
             util::hex_prefix(&aborted.pairing_id, 4)
         );
-        #[cfg(test)]
-        tests::DECISIONS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(format!(
-                "sweep: pairing {} is past its deadline and is aborted; notifying its owner and its redeemer",
-                util::hex_prefix(&aborted.pairing_id, 4)
-            ));
-        notify_pairing_unavailable(shared, &aborted.owner, aborted.pairing_id);
-        notify_pairing_unavailable(shared, &aborted.redeemer, aborted.pairing_id);
+        shared.deliver_noted(
+            &aborted.owner,
+            "owner",
+            aborted.pairing_id,
+            "sweep: the pairing is past its deadline and was aborted",
+            unavailable([0u8; 16], aborted.pairing_id),
+        );
+        shared.deliver_noted(
+            &aborted.redeemer,
+            "redeemer",
+            aborted.pairing_id,
+            "sweep: the pairing is past its deadline and was aborted",
+            unavailable([0u8; 16], aborted.pairing_id),
+        );
     }
 }
 

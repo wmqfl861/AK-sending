@@ -84,6 +84,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use crate::pairing::id_prefix;
+
 use ak_identity::invite::InviteCode;
 use ak_identity::pairing_txn::PairingVerifyError::{InviteCodeMismatch, PublicKeyMismatch};
 use ak_identity::pairing_txn::{
@@ -1394,27 +1396,6 @@ struct CommitView {
 /// never a proof failure.
 const COMMIT_DELIVERY_GRACE_MS: u64 = 10_000;
 
-/// One line of the pairing trace the T03 integration test asks for (Q-N3
-/// recurrence, 2026-11-27). `AK_PAIR_DIAG` on the process turns it on, and
-/// it goes to the `ak_pair_diag` log target, so nothing is written unless a
-/// logger with that target enabled is installed as well — only that test
-/// does both. A line names the side and the step and counts milliseconds
-/// from the redeem deadline (negative is before it); it never carries a
-/// code, a key or an id.
-macro_rules! pair_diag {
-    ($($arg:tt)*) => {
-        if $crate::pairing::orchestrator::pair_diag_enabled() {
-            log::info!(target: "ak_pair_diag", $($arg)*);
-        }
-    };
-}
-use pair_diag;
-
-fn pair_diag_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()))
-}
-
 /// Milliseconds between now and the redeem deadline: negative is before it.
 fn from_deadline_ms(deadline_ms: u64) -> i64 {
     now_unix_ms() as i64 - deadline_ms as i64
@@ -1784,7 +1765,11 @@ where
                 // and for which round (the all-zero id is any round's).
                 pair_diag!(
                     "pairing error frame taken: code 0x{code:04x}, correlation {}, at {} ms on the clock",
-                    if *object_id == pairing_id { "this round" } else { "all-zero" },
+                    if *object_id == pairing_id {
+                        format!("this round (pairing {})", id_prefix(&pairing_id))
+                    } else {
+                        "all-zero".to_string()
+                    },
                     now_unix_ms()
                 );
                 return Err(PairFlowError::from_pair_code(*code));

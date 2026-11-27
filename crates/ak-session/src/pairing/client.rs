@@ -70,7 +70,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
 use crate::pairing::error::ClientError;
-use crate::pairing::{id_prefix, pair_diag};
+use crate::pairing::{id_prefix, pair_diag, pair_diag_enabled};
 
 /// Wall-clock Unix milliseconds (the coordination plane's time domain).
 pub(crate) fn now_unix_ms() -> u64 {
@@ -91,6 +91,36 @@ pub(crate) fn transcript_pairing_id(transcript: &Transcript256) -> PairingId {
     id
 }
 
+/// Test-only: how many frame descriptions the trace built (the switch tests
+/// prove that none is built while the trace is off).
+#[cfg(test)]
+pub(crate) static DESCRIPTIONS_BUILT: AtomicU64 = AtomicU64::new(0);
+
+/// Which round a pairing-scoped error names: the first four bytes of its
+/// object id, or `all-zero` (the ghost path names no pairing).
+fn correlation(object_id: &[u8; 16]) -> String {
+    if *object_id == [0u8; 16] {
+        "all-zero".to_string()
+    } else {
+        format!("pairing {}", id_prefix(object_id))
+    }
+}
+
+/// An error frame as the pairing trace names it: the code, and for a
+/// pairing-scoped error which round it names. A request- or session-scoped
+/// error names an object a reader of the trace cannot place, so only its
+/// scope is said.
+fn error_description(scope: &ErrorScope, object_id: &[u8; 16], code: u16) -> String {
+    match scope {
+        ErrorScope::Pairing => format!(
+            "pairing error 0x{code:04x}, correlation {}",
+            correlation(object_id)
+        ),
+        ErrorScope::Code => format!("code-scoped error 0x{code:04x}"),
+        other => format!("error 0x{code:04x} ({other:?}-scoped)"),
+    }
+}
+
 /// What the pairing trace calls an inbound frame of the pairing flow, and
 /// which round it names (Q-N3, review 20: the registry numbers the notices
 /// it queues to a connection; this names what arrived, in arrival order).
@@ -104,15 +134,7 @@ fn pairing_frame_trace(message: &CtrlMessage) -> Option<String> {
             code,
             ..
         } => match scope {
-            ErrorScope::Pairing => format!(
-                "pairing error 0x{code:04x}, correlation {}",
-                if *object_id == [0u8; 16] {
-                    "all-zero".to_string()
-                } else {
-                    round(object_id)
-                }
-            ),
-            ErrorScope::Code => format!("code-scoped error 0x{code:04x}"),
+            ErrorScope::Pairing | ErrorScope::Code => error_description(scope, object_id, *code),
             _ => return None,
         },
         CtrlMessage::InviteRedeemPending { pairing_id, .. } => {
@@ -130,6 +152,40 @@ fn pairing_frame_trace(message: &CtrlMessage) -> Option<String> {
         }
         CtrlMessage::PairReady { pairing_id, .. } => format!("ready ({})", round(pairing_id)),
         _ => return None,
+    })
+}
+
+/// One inbound frame of the pairing flow as it arrived: the connection
+/// epoch of the reader that took it, that reader's own count (from 1, per
+/// connection — as the registry counts the notices it queues to one
+/// connection), and what the frame is. The reader makes it when the frame
+/// comes off the wire and it travels with the frame to the dispatch, so a
+/// frame that is dispatched late is still reported under the connection
+/// that received it, never under whatever connection is current by then
+/// (Q-N3, review 21). Built only while the trace is on.
+#[derive(Debug, Clone)]
+struct FrameTrace {
+    epoch: u64,
+    n: u64,
+    what: String,
+}
+
+/// The stamp of a frame the reader of connection `epoch` just took: `None`
+/// when the trace is off (nothing is described or counted) or the frame is
+/// not one of the pairing flow. This is the only place a reader's count
+/// moves.
+fn traced(message: &CtrlMessage, epoch: u64, pairing_frames: &mut u64) -> Option<FrameTrace> {
+    if !pair_diag_enabled() {
+        return None;
+    }
+    let what = pairing_frame_trace(message)?;
+    *pairing_frames += 1;
+    #[cfg(test)]
+    DESCRIPTIONS_BUILT.fetch_add(1, Ordering::Relaxed);
+    Some(FrameTrace {
+        epoch,
+        n: *pairing_frames,
+        what,
     })
 }
 
@@ -215,14 +271,54 @@ const MAX_ENDPOINT_BLOBS: usize = 256;
 
 impl Dispatch {
     /// Bounded fan-out to one sender list; full inboxes drop and count.
-    fn fan_out(senders: &[mpsc::Sender<CtrlMessage>], message: &CtrlMessage) -> bool {
-        let mut delivered = false;
+    /// How many of the senders took the frame, of how many there are.
+    fn fan_out(senders: &[mpsc::Sender<CtrlMessage>], message: &CtrlMessage) -> [usize; 2] {
+        let mut queued = 0;
         for tx in senders {
             if tx.try_send(message.clone()).is_ok() {
-                delivered = true;
+                queued += 1;
             }
         }
-        delivered
+        [queued, senders.len()]
+    }
+}
+
+/// Where one dispatched frame went, destination by destination (Q-N3,
+/// review 21). One "delivered" flag said a frame was queued somewhere; with
+/// several subscribers that is not the same as the flow the frame was meant
+/// for having it, so the pairing trace reports each destination on its own.
+/// Queued is all the dispatch can know: whether a flow took the frame is
+/// said where the flow takes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Delivery {
+    /// The one-shot request waiter of the frame's id: `None` when nobody
+    /// waits for it, else whether the frame was queued to it.
+    waiter: Option<bool>,
+    /// Pairing inboxes that took the frame, of those subscribed to it.
+    inbox: [usize; 2],
+    /// Pairing-plane subscribers that took the frame, of those subscribed.
+    plane: [usize; 2],
+}
+
+impl Delivery {
+    /// Whether any destination took the frame. The `unmatched` rule is
+    /// unchanged: a frame nobody took.
+    fn any(self) -> bool {
+        self.waiter == Some(true) || self.inbox[0] > 0 || self.plane[0] > 0
+    }
+
+    /// `request waiter queued|gone|none, pairing inbox <took> of <subscribed>,
+    /// plane <took> of <subscribed>`.
+    fn describe(self) -> String {
+        let waiter = match self.waiter {
+            Some(true) => "queued",
+            Some(false) => "gone",
+            None => "none",
+        };
+        format!(
+            "request waiter {waiter}, pairing inbox {} of {}, plane {} of {}",
+            self.inbox[0], self.inbox[1], self.plane[0], self.plane[1]
+        )
     }
 }
 
@@ -259,10 +355,6 @@ struct ClientInner {
     /// request id; at most one query is in flight per client).
     info_query: AsyncMutex<()>,
     unmatched: AtomicU64,
-    /// Q-N3 (review 20): the pairing frames this connection delivered, in
-    /// order; restarts with every connection, as the registry's own count
-    /// of the notices it queues to a connection does.
-    pairing_frames: AtomicU64,
     state_tx: watch::Sender<ClientState>,
     /// Test-only: a test's hold on decoded `PairCommit` frames between the
     /// reader and the dispatch (`test_gate::CommitGate`).
@@ -271,14 +363,49 @@ struct ClientInner {
 }
 
 impl ClientInner {
+    /// A client before its first connection: nothing dispatched, sent or
+    /// counted yet.
+    fn new(
+        addr: SocketAddr,
+        registry_id: RegistryId,
+        key: DeviceKeyPair,
+        name: String,
+        config: ClientConfig,
+        state_tx: watch::Sender<ClientState>,
+    ) -> Self {
+        ClientInner {
+            addr,
+            registry_id,
+            key,
+            name,
+            config,
+            dispatch: StdMutex::new(Dispatch::default()),
+            outbox: StdMutex::new(mpsc::channel(1).0),
+            lifecycle: AsyncMutex::new(()),
+            epoch: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            replaced: AtomicBool::new(false),
+            replace_closed: AtomicBool::new(false),
+            welcome_caps: AtomicU32::new(0),
+            server_info_cache: StdMutex::new(None),
+            info_query: AsyncMutex::new(()),
+            unmatched: AtomicU64::new(0),
+            state_tx,
+            #[cfg(test)]
+            commit_gate: test_gate::CommitGate::default(),
+        }
+    }
+
     /// Route one inbound frame (single-reader context, no await inside).
-    fn route(&self, frame: CtrlFrame) {
+    /// `trace` is the stamp its reader gave it; only a reader gives one.
+    fn route(&self, frame: CtrlFrame, trace: Option<FrameTrace>) {
         // Test-only: a test may park a `PairCommit` here and dispatch it later.
         #[cfg(test)]
-        if self.park_commit(&frame) {
+        if self.park_commit(&frame, trace.clone()) {
             return;
         }
-        self.dispatch_frame(frame);
+        self.dispatch_frame(frame, trace);
     }
 
     /// Fan one decoded frame out to the inboxes.
@@ -287,9 +414,8 @@ impl ClientInner {
     /// side-map keyed by the frame's pairing id BEFORE the carrier message
     /// fans out, so the flow that consumes the frame can take the blob
     /// with no ordering race.
-    fn dispatch_frame(&self, frame: CtrlFrame) {
+    fn dispatch_frame(&self, frame: CtrlFrame, trace: Option<FrameTrace>) {
         let message = frame.message;
-        let traced = pairing_frame_trace(&message);
         let mut dispatch = self.dispatch.lock().expect("client dispatch lock");
         if let Some(EndpointBlob(blob)) = frame.endpoint {
             let pairing_id = match &message {
@@ -332,7 +458,7 @@ impl ClientInner {
                 }
             }
         }
-        let mut delivered = false;
+        let mut delivery = Delivery::default();
         match &message {
             CtrlMessage::InviteClaimed { request_id, .. }
             | CtrlMessage::InviteListPage { request_id, .. }
@@ -340,12 +466,12 @@ impl ClientInner {
             | CtrlMessage::InviteRedeemPending { request_id, .. }
             | CtrlMessage::PairStatusReply { request_id, .. } => {
                 if let Some(tx) = dispatch.waiters.remove(request_id) {
-                    delivered = tx.send(message).is_ok() || delivered;
+                    delivery.waiter = Some(tx.send(message).is_ok());
                 }
             }
             CtrlMessage::Pong { nonce } => {
                 if let Some(tx) = dispatch.waiters.remove(nonce) {
-                    delivered = tx.send(message).is_ok() || delivered;
+                    delivery.waiter = Some(tx.send(message).is_ok());
                 }
             }
             CtrlMessage::PairError {
@@ -355,15 +481,15 @@ impl ClientInner {
                 ..
             } => {
                 if let Some(tx) = dispatch.waiters.remove(request_id) {
-                    delivered = tx.send(message.clone()).is_ok() || delivered;
+                    delivery.waiter = Some(tx.send(message.clone()).is_ok());
                 }
                 if *scope == ErrorScope::Pairing {
                     // Pairing-scoped failures are also pairing-plane events
                     // (deadline ghosts, revoke aborts, sweep aborts).
                     if let Some(inboxes) = dispatch.pairing.get(object_id) {
-                        delivered |= Dispatch::fan_out(inboxes, &message);
+                        delivery.inbox = Dispatch::fan_out(inboxes, &message);
                     }
-                    delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                    delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
                 }
                 if *scope == ErrorScope::Code {
                     // Code-scoped failures name no pairing and carry no
@@ -375,32 +501,32 @@ impl ClientInner {
                     // attribute the error to their own pairing (see the
                     // orchestrator's `wait_frame`) instead of waiting out
                     // their commit deadline.
-                    delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                    delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
                 }
             }
             CtrlMessage::InviteRedeemOffered { pairing_id, .. }
             | CtrlMessage::PairProof { pairing_id, .. }
             | CtrlMessage::PairReady { pairing_id, .. } => {
                 if let Some(inboxes) = dispatch.pairing.get(pairing_id) {
-                    delivered |= Dispatch::fan_out(inboxes, &message);
+                    delivery.inbox = Dispatch::fan_out(inboxes, &message);
                 }
-                delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
             }
             CtrlMessage::PairCommit { transcript, .. } => {
                 let pid = transcript_pairing_id(transcript);
                 if let Some(inboxes) = dispatch.pairing.get(&pid) {
-                    delivered |= Dispatch::fan_out(inboxes, &message);
+                    delivery.inbox = Dispatch::fan_out(inboxes, &message);
                 }
-                delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
             }
             CtrlMessage::PairChallenge { transcript, .. } => {
                 // No envelope id; the embedded pairing id still routes it to
                 // a redeemer that subscribed to its own pairing.
                 let pid = transcript_pairing_id(transcript);
                 if let Some(inboxes) = dispatch.pairing.get(&pid) {
-                    delivered |= Dispatch::fan_out(inboxes, &message);
+                    delivery.inbox = Dispatch::fan_out(inboxes, &message);
                 }
-                delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
             }
             CtrlMessage::ServerError { code, .. } => {
                 if *code == ak_signal::client_v2::ERR_DEVICE_REPLACED {
@@ -411,9 +537,9 @@ impl ClientInner {
                 // answer): hand the frame to the waiter — it maps any
                 // non-ServerInfo reply to None — and keep the plane copy.
                 if let Some(tx) = dispatch.server_info_waiter.take() {
-                    delivered |= tx.send(message.clone()).is_ok();
+                    delivery.waiter = Some(tx.send(message.clone()).is_ok());
                 }
-                delivered |= Dispatch::fan_out(&dispatch.plane, &message);
+                delivery.plane = Dispatch::fan_out(&dispatch.plane, &message);
             }
             CtrlMessage::ServerInfo { .. } => {
                 // G6: the revision answer has no request id — the single
@@ -421,7 +547,7 @@ impl ClientInner {
                 // an unsolicited push (the server never does this) and
                 // counts as unmatched like every other undeliverable.
                 if let Some(tx) = dispatch.server_info_waiter.take() {
-                    delivered |= tx.send(message).is_ok();
+                    delivery.waiter = Some(tx.send(message).is_ok());
                 }
             }
             // Client-authored and handshake frames never arrive here (the
@@ -433,15 +559,18 @@ impl ClientInner {
             inboxes.retain(|tx| !tx.is_closed());
         }
         drop(dispatch);
-        if let Some(what) = traced {
-            let n = self.pairing_frames.fetch_add(1, Ordering::AcqRel) + 1;
+        let delivered = delivery.any();
+        // Q-N3 (review 20): what arrived, in arrival order, numbered by the
+        // reader that took it under its own connection. Review 21: where it
+        // went, destination by destination. Built only while the trace is
+        // on — the stamp is `None` otherwise.
+        if let Some(trace) = trace {
             pair_diag!(
-                "registry frame #{n}: {what}; {}",
-                if delivered {
-                    "queued to a subscribed flow"
-                } else {
-                    "no subscribed flow took it"
-                }
+                "registry frame #{}: {}; delivery: {}; connection: {}",
+                trace.n,
+                trace.what,
+                delivery.describe(),
+                trace.epoch
             );
         }
         if !delivered {
@@ -565,29 +694,14 @@ impl RegistryClient {
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
         let (state_tx, _) = watch::channel(ClientState::Connecting);
-        let inner = Arc::new(ClientInner {
+        let inner = Arc::new(ClientInner::new(
             addr,
             registry_id,
-            key: key.clone(),
-            name: name.to_string(),
+            key.clone(),
+            name.to_string(),
             config,
-            dispatch: StdMutex::new(Dispatch::default()),
-            outbox: StdMutex::new(mpsc::channel(1).0),
-            lifecycle: AsyncMutex::new(()),
-            epoch: AtomicU64::new(0),
-            connected: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
-            replaced: AtomicBool::new(false),
-            replace_closed: AtomicBool::new(false),
-            welcome_caps: AtomicU32::new(0),
-            server_info_cache: StdMutex::new(None),
-            info_query: AsyncMutex::new(()),
-            unmatched: AtomicU64::new(0),
-            pairing_frames: AtomicU64::new(0),
             state_tx,
-            #[cfg(test)]
-            commit_gate: test_gate::CommitGate::default(),
-        });
+        ));
         check_display_name(&inner.name)?;
         open_connection(&inner).await?;
         Ok(RegistryClient { inner })
@@ -1300,7 +1414,7 @@ impl RegistryClient {
             code: ak_signal::client_v2::ERR_DEVICE_REPLACED,
             message: "replaced (simulated)".to_owned(),
         };
-        self.inner.route(frame.into());
+        self.inner.route(frame.into(), None);
         self.simulate_connection_loss().await;
     }
 
@@ -1378,8 +1492,12 @@ impl RegistryClient {
             self.inner.send_frame_with(frame.clone())?;
             match tokio::time::timeout(timeout, rx).await {
                 Err(_elapsed) => continue, // same id, same bytes, again
-                Ok(Ok(response)) => return Ok(response),
+                Ok(Ok(response)) => {
+                    note_taken_answer(&frame.message, &response);
+                    return Ok(response);
+                }
                 Ok(Err(_dropped)) => {
+                    note_dropped_waiter(&frame.message);
                     return Err(if self.is_replaced() {
                         ClientError::Replaced
                     } else {
@@ -1621,6 +1739,51 @@ fn pair_error(scope: ErrorScope, code: u16, retry_after_ms: u32) -> ClientError 
     }
 }
 
+/// What a request is, for the pairing trace: the name of its wire message,
+/// never a field.
+fn request_name(message: &CtrlMessage) -> &'static str {
+    match message {
+        CtrlMessage::InviteClaim { .. } => "InviteClaim",
+        CtrlMessage::InviteList { .. } => "InviteList",
+        CtrlMessage::InviteRevoke { .. } => "InviteRevoke",
+        CtrlMessage::InviteRedeem(_) => "InviteRedeem",
+        CtrlMessage::PairStatusQuery { .. } => "PairStatusQuery",
+        CtrlMessage::ConnectRequest { .. } => "ConnectRequest",
+        CtrlMessage::Ping { .. } => "Ping",
+        _ => "request",
+    }
+}
+
+/// Q-N3 (review 21): the evidence of a request that is refused while it
+/// waits for its answer, written where the request's oneshot is taken. A
+/// redeem refused before its acknowledgment never reaches the
+/// orchestrator's `wait_frame`, so no "taken" line of the plane would name
+/// the answer; the dispatch line only says a waiter was queued.
+fn note_taken_answer(request: &CtrlMessage, answer: &CtrlMessage) {
+    if let CtrlMessage::PairError {
+        scope,
+        object_id,
+        code,
+        ..
+    } = answer
+    {
+        pair_diag!(
+            "request answer taken: {} answered with {}",
+            request_name(request),
+            error_description(scope, object_id, *code)
+        );
+    }
+}
+
+/// Q-N3 (review 21): the waiter of a request was dropped before an answer
+/// came — the connection changed or the client closed while it waited.
+fn note_dropped_waiter(request: &CtrlMessage) {
+    pair_diag!(
+        "request waiter dropped before an answer: {}",
+        request_name(request)
+    );
+}
+
 /// Validate the Hello device name against the wire rules (≤64 bytes, no
 /// C0/DEL/C1 controls) before anything is signed or sent.
 fn check_display_name(name: &str) -> Result<(), ClientError> {
@@ -1743,7 +1906,6 @@ async fn open_connection(inner: &Arc<ClientInner>) -> Result<(), ClientError> {
 
     // ---- Hand over to the long-lived tasks ----
     let epoch = inner.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    inner.pairing_frames.store(0, Ordering::Release);
     let (read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel(inner.config.outbox_capacity);
     *inner.outbox.lock().expect("client outbox lock") = tx;
@@ -1790,11 +1952,21 @@ fn decode_server(bytes: &[u8]) -> Result<CtrlMessage, ClientError> {
 
 /// The single reader: consumes every frame and routes it to the bounded
 /// inboxes; exits (and fails waiters) on EOF/decode error.
+///
+/// The `epoch` is the connection this reader was spawned for, captured
+/// then. Each reader counts the pairing frames it delivers from 1 on its
+/// own — there is no shared count to reset or to read late — so the stamp
+/// a frame carries never names a connection other than the one that
+/// received it (Q-N3, review 21).
 async fn reader_loop<R: AsyncRead + Unpin>(inner: Arc<ClientInner>, mut read: R, epoch: u64) {
+    let mut pairing_frames = 0u64;
     loop {
         match read_frame(&mut read).await {
             Ok(Some(bytes)) => match decode_server_frame(&bytes) {
-                Ok(frame) => inner.route(frame),
+                Ok(frame) => {
+                    let trace = traced(&frame.message, epoch, &mut pairing_frames);
+                    inner.route(frame, trace);
+                }
                 Err(e) => {
                     log::debug!("pairing client: decode error, dropping connection: {e}");
                     inner.on_disconnect(epoch);
@@ -1848,19 +2020,31 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod test_gate {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
+    use tokio::io::{AsyncWriteExt, DuplexStream};
     use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
 
     use super::{
-        transcript_pairing_id, ClientInner, CtrlFrame, CtrlMessage, PairingId, RegistryClient,
+        reader_loop, transcript_pairing_id, watch, write_frame, ClientConfig, ClientInner,
+        ClientState, CtrlFrame, CtrlMessage, DeviceKeyPair, FrameTrace, PairingId, RegistryClient,
+        Role,
     };
+
+    /// A parked `PairCommit` with the stamp its reader gave it: dispatched
+    /// later, it is still reported as the frame of the connection that
+    /// received it.
+    struct Parked {
+        frame: CtrlFrame,
+        trace: Option<FrameTrace>,
+    }
 
     #[derive(Default)]
     pub(super) struct CommitGate {
         armed: AtomicBool,
-        held: StdMutex<Vec<CtrlFrame>>,
+        held: StdMutex<Vec<Parked>>,
         parked: Notify,
         /// The wall clock a flow on THIS instance reads when it takes a
         /// frame; `None` means the real clock.
@@ -1869,7 +2053,7 @@ mod test_gate {
 
     impl ClientInner {
         /// Park `frame` when armed and it is a `PairCommit`; `true` once parked.
-        pub(super) fn park_commit(&self, frame: &CtrlFrame) -> bool {
+        pub(super) fn park_commit(&self, frame: &CtrlFrame, trace: Option<FrameTrace>) -> bool {
             if !self.commit_gate.armed.load(Ordering::SeqCst)
                 || !matches!(frame.message, CtrlMessage::PairCommit { .. })
             {
@@ -1879,7 +2063,10 @@ mod test_gate {
                 .held
                 .lock()
                 .expect("commit gate lock")
-                .push(frame.clone());
+                .push(Parked {
+                    frame: frame.clone(),
+                    trace,
+                });
             self.commit_gate.parked.notify_one();
             true
         }
@@ -1894,7 +2081,57 @@ mod test_gate {
         }
     }
 
+    /// The real reader of one connection, over a stream the test writes to.
+    pub(crate) struct TestReader {
+        wire: DuplexStream,
+        task: JoinHandle<()>,
+    }
+
     impl RegistryClient {
+        /// A client that was never connected. Nothing reaches it unless a
+        /// test hands it over, so a dispatch test depends on no TLS
+        /// handshake.
+        pub(crate) fn offline(config: ClientConfig) -> Self {
+            let key = DeviceKeyPair::generate();
+            let (state_tx, _) = watch::channel(ClientState::Connecting);
+            RegistryClient {
+                inner: Arc::new(ClientInner::new(
+                    "127.0.0.1:1".parse().expect("a socket address"),
+                    key.public_key(),
+                    key,
+                    "diag-probe".to_string(),
+                    config,
+                    state_tx,
+                )),
+            }
+        }
+
+        /// Hand one frame to the real routing path as no reader's: it
+        /// reaches the inboxes like any other, and the trace has no line
+        /// for it.
+        pub(crate) fn inject(&self, message: CtrlMessage) {
+            self.inner.route(CtrlFrame::new(message), None);
+        }
+
+        /// Start the real reader loop for connection `epoch` over an
+        /// in-memory stream.
+        pub(crate) fn test_reader(&self, epoch: u64) -> TestReader {
+            let (wire, read) = tokio::io::duplex(256 * 1024);
+            let inner = Arc::clone(&self.inner);
+            let task = tokio::spawn(async move {
+                reader_loop(inner, read, epoch).await;
+            });
+            TestReader { wire, task }
+        }
+
+        /// Hand `frames` to a reader of connection `epoch`, in order, and
+        /// wait until it has dispatched the last and exited.
+        pub(crate) async fn deliver_as_reader(&self, epoch: u64, frames: Vec<CtrlFrame>) {
+            let mut reader = self.test_reader(epoch);
+            reader.send(&frames).await;
+            reader.finish().await;
+        }
+
         /// Hold every decoded `PairCommit` back until [`Self::release_commits`].
         pub(crate) fn arm_commit_gate(&self) {
             self.inner.commit_gate.armed.store(true, Ordering::SeqCst);
@@ -1925,7 +2162,7 @@ mod test_gate {
                 .lock()
                 .expect("commit gate lock")
                 .iter()
-                .map(|frame| match &frame.message {
+                .map(|parked| match &parked.frame.message {
                     CtrlMessage::PairCommit { transcript, .. } => transcript_pairing_id(transcript),
                     _ => unreachable!("only PairCommit frames are parked"),
                 })
@@ -1943,9 +2180,10 @@ mod test_gate {
                 .expect("commit gate lock") = Some(now_unix_ms);
         }
 
-        /// Route every parked frame now; the gate stays armed. Returns how many.
+        /// Route every parked frame now, each with the stamp its reader
+        /// gave it; the gate stays armed. Returns how many.
         pub(crate) fn release_commits(&self) -> usize {
-            let frames: Vec<CtrlFrame> = self
+            let parked: Vec<Parked> = self
                 .inner
                 .commit_gate
                 .held
@@ -1953,11 +2191,33 @@ mod test_gate {
                 .expect("commit gate lock")
                 .drain(..)
                 .collect();
-            let released = frames.len();
-            for frame in frames {
-                self.inner.dispatch_frame(frame);
+            let released = parked.len();
+            for Parked { frame, trace } in parked {
+                self.inner.dispatch_frame(frame, trace);
             }
             released
+        }
+    }
+
+    impl TestReader {
+        /// Write `frames` as the registry would send them.
+        pub(crate) async fn send(&mut self, frames: &[CtrlFrame]) {
+            for frame in frames {
+                write_frame(&mut self.wire, frame, Role::Server)
+                    .await
+                    .expect("write a server frame");
+            }
+        }
+
+        /// Close the stream and wait until the reader has dispatched
+        /// everything it was given and exited.
+        pub(crate) async fn finish(self) {
+            let Self { mut wire, task } = self;
+            wire.shutdown().await.expect("close the stream");
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the reader exits at EOF")
+                .expect("the reader task");
         }
     }
 }
@@ -2371,5 +2631,347 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), keeper).await;
         a.close().await;
         drop(registry);
+    }
+
+    // ---- Q-N3, review 21: the pairing trace of the dispatch ----------------
+    //
+    // A trace line is only worth reading next to what the dispatch did, so
+    // each of these tests drives the REAL reader (`reader_loop`) over an
+    // in-memory stream of an offline client: no handshake, no timing but the
+    // test's own barriers. The trace's switch is process-wide (the
+    // environment read once, one logger per process), so each test runs its
+    // body in a child copy of this executable.
+
+    /// What a reader hands the dispatch in these tests.
+    mod diag {
+        use super::super::*;
+        use crate::pairing::diag_test::{self, Switch};
+        use crate::pairing::ID_PREFIXES_BUILT;
+        use ak_signal::protocol_v2::PAIR_UNAVAILABLE;
+
+        const SWITCH_TEST: &str =
+            "pairing::client::tests::diag::the_switch_gates_lines_counts_and_descriptions_together";
+        const EPOCH_TEST: &str = "pairing::client::tests::diag::a_late_frame_of_a_replaced_reader_stays_in_its_own_connection";
+        const DESTINATIONS_TEST: &str =
+            "pairing::client::tests::diag::each_destination_is_reported_on_its_own";
+        const DROPPED_TEST: &str =
+            "pairing::client::tests::diag::a_request_whose_waiter_is_dropped_says_so";
+
+        fn pong() -> CtrlFrame {
+            CtrlFrame::new(CtrlMessage::Pong { nonce: [0xEE; 16] })
+        }
+
+        fn ready(pairing_id: PairingId) -> CtrlFrame {
+            CtrlFrame::new(CtrlMessage::PairReady {
+                pairing_id,
+                transcript_digest: [0x50; 32],
+                commit_revision: 1,
+                owner_applied_signature: [0; 64],
+                redeemer_applied_signature: [0; 64],
+            })
+        }
+
+        fn unavailable(request_id: [u8; 16], object_id: [u8; 16]) -> CtrlFrame {
+            CtrlFrame::new(CtrlMessage::PairError {
+                request_id,
+                scope: ErrorScope::Pairing,
+                object_id,
+                code: PAIR_UNAVAILABLE,
+                retry_after_ms: 0,
+            })
+        }
+
+        /// The same input in every position of the switch, read to the end:
+        /// a `Pong` and an unanswered `InviteRedeemPending` with nobody
+        /// subscribed, then — with one plane subscriber — a `PairReady`, a
+        /// `PairChallenge`, another `Pong` and an all-zero `PairError`. The
+        /// two `Pong`s and the unanswered pending reach nobody (three
+        /// unmatched frames). Returns what the trace built meanwhile.
+        async fn switch_input(client: &RegistryClient) -> (u64, u64) {
+            client
+                .deliver_as_reader(
+                    1,
+                    vec![
+                        pong(),
+                        CtrlFrame::new(CtrlMessage::InviteRedeemPending {
+                            request_id: [0x01; 16],
+                            pairing_id: [0x01; 16],
+                            deadline_ms: 0,
+                        }),
+                    ],
+                )
+                .await;
+            let mut plane = client.subscribe_plane();
+            let mut transcript = [0u8; 256];
+            transcript[TRANSCRIPT_PAIRING_OFFSET..TRANSCRIPT_PAIRING_OFFSET + 16]
+                .copy_from_slice(&[0x0A; 16]);
+            client
+                .deliver_as_reader(
+                    2,
+                    vec![
+                        ready([0x0A; 16]),
+                        CtrlFrame::new(CtrlMessage::PairChallenge {
+                            transcript,
+                            owner_proof: ak_signal::protocol_v2::PairProof {
+                                mac: [0; 32],
+                                signature: [0; 64],
+                            },
+                        }),
+                        pong(),
+                        unavailable([0; 16], [0; 16]),
+                    ],
+                )
+                .await;
+            assert!(
+                matches!(
+                    plane.recv().await,
+                    Some(CtrlMessage::PairReady { pairing_id, .. }) if pairing_id == [0x0A; 16]
+                ),
+                "the ready frame reached the plane"
+            );
+            assert!(
+                matches!(plane.recv().await, Some(CtrlMessage::PairChallenge { .. })),
+                "the challenge reached the plane"
+            );
+            assert!(
+                matches!(
+                    plane.recv().await,
+                    Some(CtrlMessage::PairError { code, .. }) if code == PAIR_UNAVAILABLE
+                ),
+                "the error frame reached the plane"
+            );
+            (
+                DESCRIPTIONS_BUILT.load(Ordering::Relaxed),
+                ID_PREFIXES_BUILT.load(Ordering::Relaxed),
+            )
+        }
+
+        /// Review 21: the trace is on only when `AK_PAIR_DIAG` is non-empty
+        /// AND the logger lets `ak_pair_diag` through. In both off positions
+        /// nothing is written, counted or built; on, the lines and the
+        /// counts agree (four frames of the pairing flow, three of them
+        /// naming a round). `unmatched` counts in every position: it was
+        /// never part of the trace.
+        ///
+        /// Goes red when a description or a prefix is built, or a reader's
+        /// count moves, while the switch is off; when a line is written
+        /// there; or when the lines on do not number the frames of one
+        /// reader 1, 2, 3 … under their own connection.
+        #[tokio::test]
+        async fn the_switch_gates_lines_counts_and_descriptions_together() {
+            let Some(traced) = diag_test::every_switch(SWITCH_TEST) else {
+                return;
+            };
+            let client = RegistryClient::offline(ClientConfig::default());
+            let (descriptions, prefixes) = switch_input(&client).await;
+            assert_eq!(
+                client.dropped_unmatched_frames(),
+                3,
+                "unmatched counts with or without the trace"
+            );
+            let lines = traced.lines();
+            match traced.switch {
+                Switch::On => {
+                    assert_eq!(
+                        descriptions, 4,
+                        "one description per frame of the pairing flow"
+                    );
+                    assert_eq!(prefixes, 3, "the all-zero error names no round");
+                    assert_eq!(
+                        lines,
+                        [
+                            "registry frame #1: redeem acknowledged (pairing 01010101); delivery: request waiter none, pairing inbox 0 of 0, plane 0 of 0; connection: 1",
+                            "registry frame #1: ready (pairing 0a0a0a0a); delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 2",
+                            "registry frame #2: challenge (pairing 0a0a0a0a); delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 2",
+                            "registry frame #3: pairing error 0x2101, correlation all-zero; delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 2",
+                        ]
+                    );
+                }
+                switch => {
+                    assert!(lines.is_empty(), "{switch:?}: the trace wrote {lines:?}");
+                    assert_eq!(descriptions, 0, "{switch:?}: a frame description was built");
+                    assert_eq!(prefixes, 0, "{switch:?}: an id prefix was built");
+                }
+            }
+        }
+
+        /// Review 21: the number and the connection a frame is reported
+        /// under are those of the reader that took it. The reader of
+        /// connection 1 delivers a frame, the reader of connection 2 —
+        /// current by then — delivers its first, and only then does the old
+        /// reader deliver a frame it was late with. The new connection's
+        /// first frame is still `#1`; the late frame is counted in
+        /// connection 1, never relabelled with the connection current at
+        /// dispatch. Whether such a frame should be dropped is not decided
+        /// here: it is delivered as before.
+        ///
+        /// Goes red when the late frame is reported under connection 2 (the
+        /// current epoch read at dispatch), or numbered in the new
+        /// reader's count (a count shared between readers).
+        #[tokio::test]
+        async fn a_late_frame_of_a_replaced_reader_stays_in_its_own_connection() {
+            let Some(traced) = diag_test::traced_process(EPOCH_TEST, Switch::On) else {
+                return;
+            };
+            let client = RegistryClient::offline(ClientConfig::default());
+            // Connection 2 is the current one, as after a reconnect.
+            client.inner.epoch.store(2, Ordering::SeqCst);
+            let mut plane = client.subscribe_plane();
+            let (old, new, late) = (ready([0x01; 16]), ready([0x02; 16]), ready([0x03; 16]));
+
+            // Connection 1 delivered a frame while it was current.
+            let mut first = client.test_reader(1);
+            first.send(std::slice::from_ref(&old)).await;
+            assert_eq!(plane.recv().await, Some(old.message));
+
+            // Connection 2 took over and delivers its first frame.
+            let mut second = client.test_reader(2);
+            second.send(std::slice::from_ref(&new)).await;
+            assert_eq!(plane.recv().await, Some(new.message));
+
+            // Only now does the old reader deliver a frame it was late with.
+            first.send(std::slice::from_ref(&late)).await;
+            assert_eq!(plane.recv().await, Some(late.message));
+            first.finish().await;
+            second.finish().await;
+
+            assert_eq!(
+                traced.lines(),
+                [
+                    "registry frame #1: ready (pairing 01010101); delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 1",
+                    "registry frame #1: ready (pairing 02020202); delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 2",
+                    "registry frame #2: ready (pairing 03030303); delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 1; connection: 1",
+                ]
+            );
+        }
+
+        /// Review 21: the dispatch line says where a frame went,
+        /// destination by destination — a request waiter queued, a request
+        /// waiter whose requester was gone, so many pairing inboxes of so
+        /// many, so many plane subscribers of so many — instead of one flag
+        /// for "queued somewhere". Every inbox here holds one frame.
+        ///
+        /// Goes red when destinations are summed into one flag again, when
+        /// a full inbox counts as having taken the frame, or when a waiter
+        /// whose receiver is gone is reported as queued.
+        #[tokio::test]
+        async fn each_destination_is_reported_on_its_own() {
+            let Some(traced) = diag_test::traced_process(DESTINATIONS_TEST, Switch::On) else {
+                return;
+            };
+            let client = RegistryClient::offline(ClientConfig {
+                inbox_capacity: 1,
+                plane_capacity: 1,
+                ..ClientConfig::default()
+            });
+            let pairing = [0x0B; 16];
+            let inbox_kept = client.subscribe_pairing(pairing); // read never
+            let mut inbox_drained = client.subscribe_pairing(pairing);
+            let mut plane_drained = client.subscribe_plane();
+            let plane_kept = client.subscribe_plane(); // read never
+            let mut reader = client.test_reader(1);
+
+            // All four take the first frame. The two read here are the
+            // barrier: the reader finishes a whole dispatch before it
+            // yields, so once they have the frame the dispatch line is
+            // written. The other two are never read — full from here on.
+            let first = ready(pairing);
+            reader.send(std::slice::from_ref(&first)).await;
+            assert_eq!(inbox_drained.recv().await, Some(first.message.clone()));
+            assert_eq!(plane_drained.recv().await, Some(first.message));
+
+            // One waiter whose requester still waits, one whose requester
+            // is gone.
+            let (queued_tx, queued_rx) = oneshot::channel();
+            let (gone_tx, gone_rx) = oneshot::channel();
+            drop(gone_rx);
+            {
+                let mut dispatch = client.inner.dispatch.lock().expect("client dispatch lock");
+                assert!(dispatch.waiters.insert([0x11; 16], queued_tx).is_none());
+                assert!(dispatch.waiters.insert([0x12; 16], gone_tx).is_none());
+            }
+
+            // The error of this round: the waiter takes it, and of each
+            // pair of subscribers only the one with room.
+            let second = unavailable([0x11; 16], pairing);
+            reader.send(std::slice::from_ref(&second)).await;
+            assert_eq!(queued_rx.await, Ok(second.message.clone()));
+
+            // Room again in the drained two, then the same error answered
+            // to a waiter that no longer exists.
+            assert_eq!(inbox_drained.recv().await, Some(second.message.clone()));
+            assert_eq!(plane_drained.recv().await, Some(second.message));
+            let third = unavailable([0x12; 16], pairing);
+            reader.send(std::slice::from_ref(&third)).await;
+            assert_eq!(inbox_drained.recv().await, Some(third.message));
+            reader.finish().await;
+            drop((inbox_kept, plane_kept));
+
+            assert_eq!(
+                traced.lines(),
+                [
+                    "registry frame #1: ready (pairing 0b0b0b0b); delivery: request waiter none, pairing inbox 2 of 2, plane 2 of 2; connection: 1",
+                    "registry frame #2: pairing error 0x2101, correlation pairing 0b0b0b0b; delivery: request waiter queued, pairing inbox 1 of 2, plane 1 of 2; connection: 1",
+                    "registry frame #3: pairing error 0x2101, correlation pairing 0b0b0b0b; delivery: request waiter gone, pairing inbox 1 of 2, plane 1 of 2; connection: 1",
+                ]
+            );
+        }
+
+        /// Review 21: the other way a request ends while it waits for its
+        /// answer — its waiter is dropped, which is what a disconnect does —
+        /// is named where the oneshot is taken as well. The request here is
+        /// queued to a writer that never writes, so nothing answers it.
+        ///
+        /// Goes red when the request's end is not written at the take (a
+        /// line inferred somewhere else, or none), or when the request does
+        /// not still return its own error.
+        #[tokio::test]
+        async fn a_request_whose_waiter_is_dropped_says_so() {
+            let Some(traced) = diag_test::traced_process(DROPPED_TEST, Switch::On) else {
+                return;
+            };
+            let client = RegistryClient::offline(ClientConfig::default());
+            let (outbox, never_written) = mpsc::channel(4);
+            *client.inner.outbox.lock().expect("client outbox lock") = outbox;
+            client.inner.connected.store(true, Ordering::SeqCst);
+            let key = [0x77; 16];
+            let asking = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .roundtrip(key, CtrlMessage::Ping { nonce: key })
+                        .await
+                })
+            };
+            // The request waits: its waiter is registered.
+            let give_up_at = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !client
+                .inner
+                .dispatch
+                .lock()
+                .expect("client dispatch lock")
+                .waiters
+                .contains_key(&key)
+            {
+                assert!(
+                    tokio::time::Instant::now() < give_up_at,
+                    "the request never registered its waiter"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            // What a disconnect does to every one-shot waiter.
+            client.inner.clear_waiters();
+            let answer = asking.await.expect("the request task");
+            drop(never_written);
+            assert!(
+                matches!(answer, Err(ClientError::ConnectionLost)),
+                "the request keeps its own error: {answer:?}"
+            );
+            assert_eq!(
+                traced.lines(),
+                ["request waiter dropped before an answer: Ping"]
+            );
+        }
     }
 }

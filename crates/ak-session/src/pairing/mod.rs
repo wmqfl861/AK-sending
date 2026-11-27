@@ -58,7 +58,8 @@ pub mod client;
 /// does both. A line names the side and the step and counts milliseconds
 /// from the redeem deadline (negative is before it); it never carries a
 /// code, a key or an id beyond the first four bytes of a pairing id, which
-/// only tell one round from another.
+/// only tell one round from another. A failed flow is named by the class of
+/// its failure, never by a message that could carry a path or a full id.
 macro_rules! pair_diag {
     ($($arg:tt)*) => {
         if $crate::pairing::pair_diag_enabled() {
@@ -68,18 +69,247 @@ macro_rules! pair_diag {
 }
 pub(crate) use pair_diag;
 
+/// Whether the pairing trace is on: `AK_PAIR_DIAG` non-empty on the process
+/// (read once) AND a logger that lets `ak_pair_diag` through at `info`.
+/// Whatever a line would cost — a frame description, an id prefix, a place
+/// in a reader's count — is built only behind this (review 21), so a
+/// process without the trace neither writes nor builds any of it. The
+/// logger is asked every time, not cached: one may be installed after the
+/// first frame.
 pub(crate) fn pair_diag_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()))
+        && log::log_enabled!(target: "ak_pair_diag", log::Level::Info)
 }
+
+/// Test-only: how many id prefixes the trace built (the switch tests prove
+/// that none is built while the trace is off).
+#[cfg(test)]
+pub(crate) static ID_PREFIXES_BUILT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The first four bytes of an id as hex, for the pairing trace (review 20:
 /// the registry's lines carry the same prefix).
 pub(crate) fn id_prefix(id: &[u8]) -> String {
+    #[cfg(test)]
+    ID_PREFIXES_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     id.iter()
         .take(4)
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Test support of the pairing trace (`#[cfg(test)]`): a logger that keeps
+/// the `ak_pair_diag` lines in memory, and the re-exec that gives one test
+/// a process of its own. The trace's switch has process-wide state — the
+/// environment read once, the one logger per process — so a test that
+/// changes either runs its body in a child copy of this test executable.
+#[cfg(test)]
+pub(crate) mod diag_test {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// The positions the switch has.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Switch {
+        /// `AK_PAIR_DIAG` unset, under a logger that would show the trace.
+        Off,
+        /// `AK_PAIR_DIAG=1`, under a logger that shows `info` but keeps
+        /// `ak_pair_diag` out (the strict half: the log crate's own level
+        /// check lets the line through, only the target refuses it).
+        LevelOff,
+        /// `AK_PAIR_DIAG=1`, under a logger that shows `ak_pair_diag`.
+        On,
+    }
+
+    /// The switch a child process runs under, and the lines it captured.
+    pub(crate) struct Traced {
+        pub(crate) switch: Switch,
+        lines: Arc<StdMutex<Vec<String>>>,
+        others: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl Traced {
+        /// Every `ak_pair_diag` line written so far, in order.
+        pub(crate) fn lines(&self) -> Vec<String> {
+            self.lines.lock().expect("captured lines lock").clone()
+        }
+
+        /// What the registry and the clients themselves said at `info`, in
+        /// order: when a pairing stops on its way, their decision is here.
+        pub(crate) fn others(&self) -> Vec<String> {
+            self.others.lock().expect("captured lines lock").clone()
+        }
+
+        /// How many lines contain `text`.
+        pub(crate) fn count(&self, text: &str) -> usize {
+            self.lines()
+                .iter()
+                .filter(|line| line.contains(text))
+                .count()
+        }
+
+        /// The one line that contains `text` (panics unless exactly one).
+        pub(crate) fn the_one(&self, text: &str) -> String {
+            let found: Vec<String> = self
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(text))
+                .collect();
+            assert!(
+                found.len() == 1,
+                "expected exactly one line with {text:?}, found {}:\n{}",
+                found.len(),
+                self.lines().join("\n")
+            );
+            found[0].clone()
+        }
+
+        /// Whether a line containing `first` comes before a line containing
+        /// `second`.
+        pub(crate) fn before(&self, first: &str, second: &str) -> bool {
+            let lines = self.lines();
+            let at = |text: &str| {
+                lines
+                    .iter()
+                    .position(|line| line.contains(text))
+                    .unwrap_or_else(|| {
+                        panic!("no line with {text:?}; lines:\n{}", lines.join("\n"))
+                    })
+            };
+            at(first) < at(second)
+        }
+    }
+
+    /// Names the child run of a test and the switch it was started under.
+    const CHILD_VAR: &str = "AK_SESSION_PAIR_DIAG_CHILD";
+
+    /// Keeps what it is shown: the lines of `ak_pair_diag` apart from what
+    /// every other target says at `info` (the registry server's decisions,
+    /// the client's warnings).
+    #[derive(Clone)]
+    struct Capturing {
+        lines: Arc<StdMutex<Vec<String>>>,
+        others: Arc<StdMutex<Vec<String>>>,
+        show_trace: bool,
+    }
+
+    impl log::Log for Capturing {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+                && (metadata.target() != "ak_pair_diag" || self.show_trace)
+        }
+
+        fn log(&self, record: &log::Record) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let kept = if record.target() == "ak_pair_diag" {
+                &self.lines
+            } else {
+                &self.others
+            };
+            kept.lock()
+                .expect("captured lines lock")
+                .push(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// In the parent (no child variable): run this very test again in a
+    /// child process under `switch` and require that exactly that one test
+    /// passed there; `None`. In the child: install the logger of `switch`
+    /// and hand back the lines it captures; `Some`.
+    ///
+    /// A wrong `test` name cannot pass by running nothing: the child's own
+    /// summary must say `1 passed`.
+    pub(crate) fn traced_process(test: &str, switch: Switch) -> Option<Traced> {
+        let name = match switch {
+            Switch::Off => "off",
+            Switch::LevelOff => "level-off",
+            Switch::On => "on",
+        };
+        let Some(child) = std::env::var_os(CHILD_VAR) else {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("this test executable"));
+            command.args(["--exact", test, "--nocapture", "--test-threads=1"]);
+            command.env(CHILD_VAR, name);
+            match switch {
+                Switch::Off => {
+                    command.env_remove("AK_PAIR_DIAG");
+                }
+                _ => {
+                    command.env("AK_PAIR_DIAG", "1");
+                }
+            }
+            let output = command.output().expect("start the child test process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the child run of `{test}` under `{name}` did not pass ({})\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+                output.status
+            );
+            return None;
+        };
+        assert_eq!(
+            child,
+            std::ffi::OsString::from(name),
+            "the child was started under another switch"
+        );
+        let lines = Arc::new(StdMutex::new(Vec::new()));
+        let others = Arc::new(StdMutex::new(Vec::new()));
+        // Whatever fails in this process fails with its evidence: after the
+        // panic message, what the registry and the clients said. A pairing
+        // that stops on its way shows the registry's decision right there
+        // (it refuses a signature by disconnecting, or by answering
+        // nothing), which the assertion alone does not.
+        let (trace, said) = (Arc::clone(&lines), Arc::clone(&others));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            previous(info);
+            let show = |kept: &StdMutex<Vec<String>>, what: &str| {
+                let kept = kept.lock().expect("captured lines lock").join("\n");
+                eprintln!("--- {what} ---\n{kept}");
+            };
+            show(&trace, "the pairing trace so far");
+            show(&said, "what the registry and the clients said at info");
+        }));
+        log::set_boxed_logger(Box::new(Capturing {
+            lines: Arc::clone(&lines),
+            others: Arc::clone(&others),
+            show_trace: switch != Switch::LevelOff,
+        }))
+        .expect("no logger is installed in a child process before its test");
+        // The level the crate checks first: at `info` even for `LevelOff`,
+        // so that case is refused by the target alone.
+        log::set_max_level(log::LevelFilter::Info);
+        Some(Traced {
+            switch,
+            lines,
+            others,
+        })
+    }
+
+    /// [`traced_process`] for each position of the switch in turn. In the
+    /// parent it runs the three children and returns `None`; in a child it
+    /// returns that child's switch and lines.
+    pub(crate) fn every_switch(test: &str) -> Option<Traced> {
+        let child = std::env::var_os(CHILD_VAR);
+        if child.is_none() {
+            for switch in [Switch::Off, Switch::LevelOff, Switch::On] {
+                assert!(traced_process(test, switch).is_none());
+            }
+            return None;
+        }
+        let switch = match child.as_deref().and_then(|value| value.to_str()) {
+            Some("off") => Switch::Off,
+            Some("level-off") => Switch::LevelOff,
+            Some("on") => Switch::On,
+            _ => panic!("unknown child switch {child:?}"),
+        };
+        traced_process(test, switch)
+    }
 }
 
 /// The per-identity registry control-connection lock shared by the CLI

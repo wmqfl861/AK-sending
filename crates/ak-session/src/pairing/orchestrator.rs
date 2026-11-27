@@ -82,7 +82,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::pairing::id_prefix;
 
@@ -469,8 +469,11 @@ impl PairingOrchestrator {
     /// `PairReady` (see the module docs for the sequence).
     pub async fn redeem(&self, code_str: &str) -> Result<VerifiedPairing, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
-        let committed = self.redeem_to_commit_on(code_str, &mut plane, None).await?;
-        self.finish_committed(committed, &mut plane).await
+        let started = Instant::now();
+        let committed = self
+            .redeem_to_commit_on(code_str, &mut plane, None, started)
+            .await?;
+        self.finish_as_joiner(committed, &mut plane, started).await
     }
 
     /// Wave-28 task-code redeem: the v1 minimal pairing model. Identical
@@ -485,11 +488,14 @@ impl PairingOrchestrator {
         endpoint: ak_signal::protocol_v2::EndpointBlob,
     ) -> Result<TaskRedeem, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
+        let started = Instant::now();
         let committed = self
-            .redeem_to_commit_on(code_str, &mut plane, Some(endpoint))
+            .redeem_to_commit_on(code_str, &mut plane, Some(endpoint), started)
             .await?;
         let owner_endpoint = self.client.take_endpoint_blob(committed.pairing_id);
-        let verified = self.finish_committed(committed, &mut plane).await?;
+        let verified = self
+            .finish_as_joiner(committed, &mut plane, started)
+            .await?;
         Ok(TaskRedeem {
             verified,
             owner_endpoint,
@@ -503,7 +509,8 @@ impl PairingOrchestrator {
         code_str: &str,
     ) -> Result<CommittedPairing, PairFlowError> {
         let mut plane = self.client.subscribe_plane();
-        self.redeem_to_commit_on(code_str, &mut plane, None).await
+        self.redeem_to_commit_on(code_str, &mut plane, None, Instant::now())
+            .await
     }
 
     /// Finish a committed pairing: trust-book apply, journal marks, the
@@ -512,6 +519,59 @@ impl PairingOrchestrator {
         &self,
         committed: CommittedPairing,
         plane: &mut mpsc::Receiver<CtrlMessage>,
+    ) -> Result<VerifiedPairing, PairFlowError> {
+        let mut last_started = FinishStep::CommitPeer;
+        self.finish_committed_from(committed, plane, &mut last_started)
+            .await
+    }
+
+    /// The joiner's finish of a committed pairing — the half both joiner
+    /// entry points ([`Self::redeem`] and [`Self::redeem_task`]) share —
+    /// with its closing trace line. The registry has committed by now, so
+    /// a stop here is a pairing that stands server-side but not on this
+    /// device; the line says which step stopped, with which failure, and
+    /// returns the failure unchanged. Written here and nowhere else: the
+    /// half before the commit has its own line
+    /// ([`Self::redeem_to_commit_on`]), and the owner's outer wrapper
+    /// writes the owner's.
+    async fn finish_as_joiner(
+        &self,
+        committed: CommittedPairing,
+        plane: &mut mpsc::Receiver<CtrlMessage>,
+        started: Instant,
+    ) -> Result<VerifiedPairing, PairFlowError> {
+        let pairing_id = committed.pairing_id;
+        let mut last_started = FinishStep::CommitPeer;
+        let result = self
+            .finish_committed_from(committed, plane, &mut last_started)
+            .await;
+        if let Err(error) = &result {
+            // Q-N3 (review 21): the joiner's flow can stop after the
+            // registry committed; that stretch was outside every closing
+            // line.
+            pair_diag!(
+                "redeemer: flow stopped with `{}` {} ms after it began, at {} ms on the clock; \
+                 after the commit, last stage started: {}, pairing {}",
+                error_category(error),
+                started.elapsed().as_millis(),
+                now_unix_ms(),
+                last_started.name(),
+                id_prefix(&pairing_id)
+            );
+        }
+        result
+    }
+
+    /// [`Self::finish_committed`] step by step, naming in `last_started`
+    /// the step that started last — so a stop is placed after the step
+    /// that ran, not before the one that did not. `PairReady` received and
+    /// the local `applied` mark are two steps: the first can stand without
+    /// the second.
+    async fn finish_committed_from(
+        &self,
+        committed: CommittedPairing,
+        plane: &mut mpsc::Receiver<CtrlMessage>,
+        last_started: &mut FinishStep,
     ) -> Result<VerifiedPairing, PairFlowError> {
         let transcript = committed.verified.record().transcript;
         let pairing_id = committed.pairing_id;
@@ -522,29 +582,44 @@ impl PairingOrchestrator {
         } else {
             transcript.owner_device_id
         };
+        // Which side of the transcript this device is names its flow in the
+        // trace; the owner finishes through here too.
+        let flow = if transcript.owner_device_id == me {
+            "owner"
+        } else {
+            "redeemer"
+        };
+        *last_started = FinishStep::CommitPeer;
         self.commit_peer(&pairing_id, peer_pub)?;
+        *last_started = FinishStep::MarkCommitted;
         self.journal.mark_committed(&pairing_id)?;
         let signature = self.key.sign(&hello2::applied_message(
             &pairing_id,
             &digest,
             committed.commit_revision,
         ));
+        *last_started = FinishStep::SendApplied;
         self.client
             .send_pair_applied(pairing_id, digest, committed.commit_revision, signature)
             .await
             .map_err(map_client)?;
+        *last_started = FinishStep::WaitReady;
         wait_ready(
             &self.client,
             plane,
             pairing_id,
             digest,
             self.config.ready_wait_ms,
+            flow,
         )
         .await?;
         pair_diag!(
-            "applied sent and ready received, {} ms from the deadline",
-            from_deadline_ms(transcript.deadline_ms)
+            "applied sent and ready received, {} ms from the deadline; flow: {}, pairing {}",
+            from_deadline_ms(transcript.deadline_ms),
+            flow,
+            id_prefix(&pairing_id)
         );
+        *last_started = FinishStep::MarkApplied;
         self.journal.mark_applied(&pairing_id)?;
         Ok(committed.verified)
     }
@@ -554,8 +629,8 @@ impl PairingOrchestrator {
         code_str: &str,
         plane: &mut mpsc::Receiver<CtrlMessage>,
         endpoint: Option<ak_signal::protocol_v2::EndpointBlob>,
+        started: Instant,
     ) -> Result<CommittedPairing, PairFlowError> {
-        let started = std::time::Instant::now();
         let result = self
             .redeem_to_commit_on_inner(code_str, plane, endpoint)
             .await;
@@ -563,7 +638,8 @@ impl PairingOrchestrator {
             // Q-N3: the last step is in the lines above; this is where the
             // joiner's flow stopped and how long it took.
             pair_diag!(
-                "redeemer: flow stopped with `{error}` {} ms after it began, at {} ms on the clock",
+                "redeemer: flow stopped with `{}` {} ms after it began, at {} ms on the clock",
+                error_category(error),
                 started.elapsed().as_millis(),
                 now_unix_ms()
             );
@@ -628,6 +704,10 @@ impl PairingOrchestrator {
             plane,
             pairing_id,
             deadline.saturating_add(5_000),
+            Waiting {
+                flow: "redeemer",
+                frame: "PairChallenge",
+            },
             |frame| pairing_challenge_of(frame, pairing_id),
         )
         .await?
@@ -706,6 +786,10 @@ impl PairingOrchestrator {
             plane,
             pairing_id,
             deadline.saturating_add(COMMIT_DELIVERY_GRACE_MS),
+            Waiting {
+                flow: "redeemer",
+                frame: "PairCommit",
+            },
             |frame| pair_commit_of(frame, pairing_id),
         )
         .await?
@@ -933,7 +1017,8 @@ impl PairingOrchestrator {
         if let Err(error) = &result {
             // Q-N3: where the owner's flow stopped and how long it took.
             pair_diag!(
-                "owner: flow stopped with `{error}` {} ms after the offer, at {} ms on the clock",
+                "owner: flow stopped with `{}` {} ms after the offer, at {} ms on the clock",
+                error_category(error),
                 started.elapsed().as_millis(),
                 now_unix_ms()
             );
@@ -1069,6 +1154,10 @@ impl PairingOrchestrator {
             &mut plane,
             pairing_id,
             redeem.deadline_ms.saturating_add(5_000),
+            Waiting {
+                flow: "owner",
+                frame: "PairProof",
+            },
             |frame| pair_proof_of(frame, pairing_id, digest),
         )
         .await?
@@ -1105,6 +1194,10 @@ impl PairingOrchestrator {
             &mut plane,
             pairing_id,
             redeem.deadline_ms.saturating_add(COMMIT_DELIVERY_GRACE_MS),
+            Waiting {
+                flow: "owner",
+                frame: "PairCommit",
+            },
             |frame| pair_commit_of(frame, pairing_id),
         )
         .await?
@@ -1186,9 +1279,16 @@ impl PairingOrchestrator {
                     {
                         return Err(recover_unverifiable());
                     }
-                    if wait_ready(&self.client, &mut plane, pairing_id, [0u8; 32], 10_000)
-                        .await
-                        .is_ok()
+                    if wait_ready(
+                        &self.client,
+                        &mut plane,
+                        pairing_id,
+                        [0u8; 32],
+                        10_000,
+                        "recovery",
+                    )
+                    .await
+                    .is_ok()
                     {
                         self.journal.mark_applied(&pairing_id)?;
                         applied.push(pairing_id);
@@ -1202,6 +1302,10 @@ impl PairingOrchestrator {
                         &mut plane,
                         pairing_id,
                         now_unix_ms().saturating_add(10_000),
+                        Waiting {
+                            flow: "recovery",
+                            frame: "PairCommit",
+                        },
                         |frame| pair_commit_of(frame, pairing_id),
                     )
                     .await?
@@ -1253,6 +1357,7 @@ impl PairingOrchestrator {
                         pairing_id,
                         digest,
                         self.config.ready_wait_ms,
+                        "recovery",
                     )
                     .await
                     .is_ok()
@@ -1718,14 +1823,25 @@ fn hex(id: &[u8; 16]) -> String {
 
 // ---- plane waiting -----------------------------------------------------------
 
+/// What a flow is taking frames off the plane for. The pairing trace names
+/// both when the flow takes an error frame (Q-N3, review 21): a line that
+/// says only which frame arrived does not place it in a flow.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    /// `owner`, `redeemer` or `recovery`.
+    flow: &'static str,
+    /// The frame the flow was waiting for.
+    frame: &'static str,
+}
+
 /// Wait until `extract` returns `Some` for a frame of `pairing_id`'s flow.
 /// `Ok(None)` = timeout. Pairing-scoped `PairError` frames (deadline
 /// ghosts, revoke/sweep aborts — including the all-zero object id the
 /// ghost path uses) surface as unified flow errors.
 ///
 /// Wave 30 (review 2026-11-07, R29-P2-01): the commit-time
-/// `REDEEM_EXHAUSTED` refusal is CODE-scoped — it names the code, not
-/// the losing pairing, and carries the all-zero request id — so it
+/// `REDEEM_EXHAUSTED` refusal is CODE-scoped — it names the code, not the
+/// losing pairing, and carries the all-zero request id — so it
 /// cannot be matched the way pairing-scoped errors are. It is attributed
 /// by asking the registry about OUR pairing: the server aborted the
 /// losing transaction when it refused the commit, so a pairing that no
@@ -1737,6 +1853,7 @@ async fn wait_frame<T, F>(
     plane: &mut mpsc::Receiver<CtrlMessage>,
     pairing_id: [u8; 16],
     until_ms: u64,
+    waiting: Waiting,
     extract: F,
 ) -> Result<Option<T>, PairFlowError>
 where
@@ -1761,16 +1878,22 @@ where
                 && (*object_id == pairing_id || *object_id == [0u8; 16])
             {
                 // Q-N3: the error frame that ends this flow — the registry
-                // logs its own decision; this line says when it was taken
-                // and for which round (the all-zero id is any round's).
+                // logs its own decision; this line says when it was taken.
+                // Review 21: by which flow, waiting for which frame, and
+                // for which round. The all-zero id is any round's, so the
+                // round waited for is named apart from it.
                 pair_diag!(
-                    "pairing error frame taken: code 0x{code:04x}, correlation {}, at {} ms on the clock",
+                    "pairing error frame taken: code 0x{code:04x}, correlation {}, at {} ms on the clock; \
+                     flow: {}, waiting for: {}, pairing {}",
                     if *object_id == pairing_id {
                         format!("this round (pairing {})", id_prefix(&pairing_id))
                     } else {
                         "all-zero".to_string()
                     },
-                    now_unix_ms()
+                    now_unix_ms(),
+                    waiting.flow,
+                    waiting.frame,
+                    id_prefix(&pairing_id)
                 );
                 return Err(PairFlowError::from_pair_code(*code));
             }
@@ -1778,6 +1901,16 @@ where
                 && *code == ak_signal::protocol_v2::message::REDEEM_EXHAUSTED
                 && code_scoped_refusal_is_ours(client, pairing_id).await
             {
+                // The frame names no pairing of its own; the status round
+                // trip just above placed it in this one.
+                pair_diag!(
+                    "code-scoped error frame taken: code 0x{code:04x}, our pairing gone server-side, \
+                     at {} ms on the clock; flow: {}, waiting for: {}, pairing {}",
+                    now_unix_ms(),
+                    waiting.flow,
+                    waiting.frame,
+                    id_prefix(&pairing_id)
+                );
                 return Err(PairFlowError::from_pair_code(*code));
             }
         }
@@ -1856,22 +1989,79 @@ async fn wait_ready(
     pairing_id: [u8; 16],
     digest: [u8; 32],
     wait_ms: u64,
+    flow: &'static str,
 ) -> Result<(), PairFlowError> {
     let until = now_unix_ms().saturating_add(wait_ms);
-    match wait_frame(client, plane, pairing_id, until, |frame| match frame {
-        CtrlMessage::PairReady {
-            pairing_id: pid,
-            transcript_digest,
-            ..
-        } if *pid == pairing_id && (digest == [0u8; 32] || *transcript_digest == digest) => {
-            Some(())
-        }
-        _ => None,
-    })
+    match wait_frame(
+        client,
+        plane,
+        pairing_id,
+        until,
+        Waiting {
+            flow,
+            frame: "PairReady",
+        },
+        |frame| match frame {
+            CtrlMessage::PairReady {
+                pairing_id: pid,
+                transcript_digest,
+                ..
+            } if *pid == pairing_id && (digest == [0u8; 32] || *transcript_digest == digest) => {
+                Some(())
+            }
+            _ => None,
+        },
+    )
     .await?
     {
         Some(()) => Ok(()),
         None => Err(PairFlowError::Timeout),
+    }
+}
+
+/// The steps of the finish after a verified commit, in the order they run.
+/// The pairing trace names the last one that started when the finish stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishStep {
+    CommitPeer,
+    MarkCommitted,
+    SendApplied,
+    WaitReady,
+    MarkApplied,
+}
+
+impl FinishStep {
+    fn name(self) -> &'static str {
+        match self {
+            FinishStep::CommitPeer => "commit_peer",
+            FinishStep::MarkCommitted => "journal.mark_committed",
+            FinishStep::SendApplied => "send PairApplied",
+            FinishStep::WaitReady => "wait PairReady",
+            FinishStep::MarkApplied => "journal.mark_applied",
+        }
+    }
+}
+
+/// The class of a flow failure for the pairing trace. Where the failure's
+/// own text is fixed — a numeric code, a verification verdict, a transport
+/// state — that text is the class. Where the text carries a free payload
+/// only the class is given: a protocol message, a local-state message or an
+/// I/O error can name a local path or a full pairing id, and a rejected
+/// code names a symbol of what the user typed.
+fn error_category(error: &PairFlowError) -> String {
+    match error {
+        PairFlowError::Client(ClientError::Protocol(_)) => "protocol violation".to_string(),
+        PairFlowError::Client(inner) => inner.to_string(),
+        PairFlowError::BadCode(_) => "invite code rejected".to_string(),
+        PairFlowError::Unavailable { .. }
+        | PairFlowError::Rejected { .. }
+        | PairFlowError::Verify(_)
+        | PairFlowError::Timeout => error.to_string(),
+        PairFlowError::Local(_) => "local pairing state error".to_string(),
+        PairFlowError::Io(inner) => match inner.raw_os_error() {
+            Some(raw) => format!("local pairing store io error (os error {raw})"),
+            None => format!("local pairing store io error ({:?})", inner.kind()),
+        },
     }
 }
 
@@ -2137,12 +2327,12 @@ mod tests {
         ));
     }
 
-    type RedeemOutcome = Result<TaskRedeem, PairFlowError>;
-
     /// What the joiner is doing, without waiting for it: how its task ended
     /// when it already finished (a panic or a cancellation included, so the
     /// caller's own reason is never lost), else that it is still running.
-    async fn joiner_state(redeeming: &mut tokio::task::JoinHandle<RedeemOutcome>) -> String {
+    async fn joiner_state<T>(
+        redeeming: &mut tokio::task::JoinHandle<Result<T, PairFlowError>>,
+    ) -> String {
         if !redeeming.is_finished() {
             return "the joiner is still running".to_string();
         }
@@ -2153,9 +2343,9 @@ mod tests {
     /// The one `InviteRedeemOffered` the owner loop would answer, or a
     /// failure that names why it never came and what the joiner was doing:
     /// it gave up first, the plane closed, or `limit` ran out.
-    async fn offered_redeem(
+    async fn offered_redeem<T>(
         plane: &mut mpsc::Receiver<CtrlMessage>,
-        redeeming: &mut tokio::task::JoinHandle<RedeemOutcome>,
+        redeeming: &mut tokio::task::JoinHandle<Result<T, PairFlowError>>,
         limit: Duration,
     ) -> (
         [u8; 16],
@@ -2572,5 +2762,1128 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].phase, PairingPhase::Pending);
         assert!(!b_dir.path().join(BOOK_NAME).exists());
+    }
+
+    // ---- Q-N3, review 21: the pairing trace of the flows --------------------
+    //
+    // Each test here runs its body in a child copy of this executable with
+    // the trace on (the switch is process-wide — see `pairing::diag_test`)
+    // and against the real registry: the lines are only worth reading next
+    // to real frames. Every scenario ends on what stands locally — the
+    // journal, the trust book, the error returned — as well as on the lines.
+    mod diag {
+        use super::super::*;
+        use super::{offered_redeem, orchestrator_on, registry, test_config};
+        use crate::pairing::client::{ClientConfig, RegistryClient};
+        use crate::pairing::diag_test::{self, Switch, Traced};
+        use ak_signal::protocol_v2::message::REDEEM_EXHAUSTED;
+        use ak_signal::protocol_v2::{CtrlFrame, ErrorScope, PAIR_UNAVAILABLE};
+
+        const LIMIT: Duration = Duration::from_secs(20);
+
+        const TWO_SUBSCRIBERS: &str = "pairing::orchestrator::tests::diag::a_frame_only_another_subscriber_took_is_not_reported_as_taken";
+        const TASK_READY_ERROR: &str = "pairing::orchestrator::tests::diag::a_task_join_stops_waiting_for_ready_on_this_round_s_error";
+        const PLAIN_READY_ERROR: &str = "pairing::orchestrator::tests::diag::a_plain_redeem_stops_waiting_for_ready_on_this_round_s_error";
+        const APPLIED_OFFLINE: &str = "pairing::orchestrator::tests::diag::a_joiner_stops_sending_pair_applied_without_a_connection";
+        const BOOK_UNWRITABLE: &str = "pairing::orchestrator::tests::diag::a_joiner_stops_at_commit_peer_when_the_book_cannot_be_written";
+        const STALE_ENTRY: &str = "pairing::orchestrator::tests::diag::a_joiner_stops_at_mark_committed_on_an_entry_already_applied";
+        const ENTRY_BLOCKED: &str = "pairing::orchestrator::tests::diag::a_joiner_stops_at_mark_applied_when_the_entry_cannot_be_replaced";
+        const SUCCESS: &str =
+            "pairing::orchestrator::tests::diag::a_paired_flow_writes_no_stop_line";
+        const BEFORE_COMMIT: &str = "pairing::orchestrator::tests::diag::a_stop_before_the_commit_writes_one_line_without_a_stage";
+        const OWNER_STOP: &str = "pairing::orchestrator::tests::diag::an_owner_stop_after_the_commit_writes_one_owner_line";
+        const ONESHOT: &str =
+            "pairing::orchestrator::tests::diag::a_redeem_refused_at_its_answer_is_taken_on_the_oneshot";
+
+        /// Which joiner entry point a scenario drives.
+        #[derive(Clone, Copy, Debug)]
+        enum Entry {
+            /// `redeem`: the daemon of the admission case joins this way.
+            Plain,
+            /// `redeem_task`: the task layer joins this way.
+            Task,
+        }
+
+        /// Both flows of one one-shot task code where the Commit fixture of
+        /// `live_commit_delivered_after_deadline_applies_on_both_sides`
+        /// stands: the registry has committed, each side's `PairCommit` is
+        /// parked before its dispatch, and so nothing local has run after
+        /// the commit on either side.
+        struct Parked {
+            owner: PairingOrchestrator,
+            owner_key: DeviceKeyPair,
+            owner_dir: tempfile::TempDir,
+            joiner: PairingOrchestrator,
+            joiner_dir: tempfile::TempDir,
+            /// The code the joiner typed — it must never reach a line.
+            code: String,
+            /// Still waiting for its commit.
+            redeeming: tokio::task::JoinHandle<Result<VerifiedPairing, PairFlowError>>,
+            /// Still waiting for its commit.
+            answering: tokio::task::JoinHandle<Result<VerifiedPairing, PairFlowError>>,
+            pairing_id: [u8; 16],
+        }
+
+        /// Brings both flows of one one-shot task code to where [`Parked`]
+        /// says. `traced` is the trace the child captured: a pairing that
+        /// stops on its way to the commit says in it where.
+        async fn parked_at_the_commit(
+            registry: &registry::TestRegistry,
+            entry: Entry,
+            joiner_config: OrchestratorConfig,
+            traced: &Traced,
+        ) -> Parked {
+            let owner_endpoint =
+                ak_signal::protocol_v2::EndpointBlob(br#"{"addrs":["127.0.0.1:7100"]}"#.to_vec());
+            let joiner_endpoint =
+                ak_signal::protocol_v2::EndpointBlob(br#"{"addrs":["127.0.0.1:7101"]}"#.to_vec());
+            let owner_key = DeviceKeyPair::generate();
+            let owner_dir = tempfile::tempdir().unwrap();
+            let owner = orchestrator_on(
+                registry,
+                "alice",
+                &owner_key,
+                owner_dir.path(),
+                test_config(),
+            )
+            .await;
+            owner.client().arm_commit_gate();
+            let mut owner_plane = owner.client().subscribe_plane();
+            let invite = owner
+                .create_task_invite([0x51; 16], 0, owner_endpoint)
+                .await
+                .expect("claim the one-shot task code");
+
+            let joiner_key = DeviceKeyPair::generate();
+            let joiner_dir = tempfile::tempdir().unwrap();
+            let joiner = orchestrator_on(
+                registry,
+                "bob",
+                &joiner_key,
+                joiner_dir.path(),
+                joiner_config,
+            )
+            .await;
+            joiner.client().arm_commit_gate();
+
+            let code = invite.display.clone();
+            let mut redeeming = {
+                let joiner = joiner.clone();
+                tokio::spawn(async move {
+                    match entry {
+                        Entry::Plain => joiner.redeem(&code).await,
+                        Entry::Task => joiner
+                            .redeem_task(&code, joiner_endpoint)
+                            .await
+                            .map(|task| task.verified),
+                    }
+                })
+            };
+            let (code_id, code_revision, pairing_id, redeemer_device_id, redeem) =
+                offered_redeem(&mut owner_plane, &mut redeeming, LIMIT).await;
+            let deadline = redeem.deadline_ms;
+            let answering = {
+                let owner = owner.clone();
+                tokio::spawn(async move {
+                    owner
+                        .owner_answer_offer(
+                            code_id,
+                            code_revision,
+                            pairing_id,
+                            redeemer_device_id,
+                            redeem,
+                        )
+                        .await
+                })
+            };
+
+            let parked = tokio::time::timeout(LIMIT, async {
+                owner.client().commit_parked_within(LIMIT).await
+                    && joiner.client().commit_parked_within(LIMIT).await
+            })
+            .await;
+            assert!(
+                parked == Ok(true),
+                "both sides parked the registry's PairCommit ({parked:?}); the trace so far:\n{}\n\
+                 what the registry and the clients said:\n{}",
+                traced.lines().join("\n"),
+                traced.others().join("\n")
+            );
+            assert_eq!(owner.client().parked_commits(), vec![pairing_id]);
+            assert_eq!(joiner.client().parked_commits(), vec![pairing_id]);
+            assert!(
+                now_unix_ms() < deadline,
+                "fixture: both frames arrived before the deadline {deadline}"
+            );
+            Parked {
+                owner,
+                owner_key,
+                owner_dir,
+                joiner,
+                joiner_dir,
+                code: invite.display,
+                redeeming,
+                answering,
+                pairing_id,
+            }
+        }
+
+        fn ready(pairing_id: [u8; 16]) -> CtrlMessage {
+            CtrlMessage::PairReady {
+                pairing_id,
+                transcript_digest: [0x50; 32],
+                commit_revision: 1,
+                owner_applied_signature: [0; 64],
+                redeemer_applied_signature: [0; 64],
+            }
+        }
+
+        /// A pairing-scoped `unavailable` naming `object_id`, as the
+        /// registry answers an applied confirmation it refuses.
+        fn unavailable(object_id: [u8; 16]) -> CtrlMessage {
+            CtrlMessage::PairError {
+                request_id: [0; 16],
+                scope: ErrorScope::Pairing,
+                object_id,
+                code: PAIR_UNAVAILABLE,
+                retry_after_ms: 0,
+            }
+        }
+
+        fn entry_of(dir: &Path, pairing_id: &[u8; 16]) -> PathBuf {
+            dir.join(JOURNAL_SUBDIR)
+                .join(format!("{}.akpair", hex(pairing_id)))
+        }
+
+        /// Every journal entry of an identity directory with its phase.
+        fn phases(dir: &Path) -> Vec<([u8; 16], PairingPhase)> {
+            PairingJournal::open(&dir.join(JOURNAL_SUBDIR))
+                .expect("open the journal")
+                .load_all()
+                .expect("load the journal")
+                .into_iter()
+                .map(|record| (record.pairing_id, record.phase))
+                .collect()
+        }
+
+        /// Whether the journal already shows `pairing_id` at `phase`. An
+        /// entry that is being replaced just now reads as not there yet.
+        fn journal_has(dir: &Path, pairing_id: [u8; 16], phase: PairingPhase) -> bool {
+            PairingJournal::open(&dir.join(JOURNAL_SUBDIR))
+                .and_then(|journal| journal.load_all())
+                .map(|records| {
+                    records
+                        .iter()
+                        .any(|record| record.pairing_id == pairing_id && record.phase == phase)
+                })
+                .unwrap_or(false)
+        }
+
+        async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+            let give_up_at = Instant::now() + LIMIT;
+            while !cond() {
+                assert!(
+                    Instant::now() < give_up_at,
+                    "{what} did not happen within {LIMIT:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// The plane wait of one redeemer flow for this round's commit,
+        /// bounded to `ms`; `Ok(true)` once it took the commit.
+        async fn wait_for_the_commit(
+            client: &RegistryClient,
+            flow: &mut mpsc::Receiver<CtrlMessage>,
+            pairing_id: [u8; 16],
+            ms: u64,
+        ) -> Result<bool, PairFlowError> {
+            wait_frame(
+                client,
+                flow,
+                pairing_id,
+                now_unix_ms().saturating_add(ms),
+                Waiting {
+                    flow: "redeemer",
+                    frame: "PairCommit",
+                },
+                |frame| pair_commit_of(frame, pairing_id),
+            )
+            .await
+            .map(|commit| commit.is_some())
+        }
+
+        /// A closing line reads `{head}{elapsed}{middle}{now} ms on the clock{tail}`:
+        /// both readings are whole milliseconds, nothing else stands between.
+        fn closing_line(line: &str, head: &str, middle: &str, tail: &str) {
+            let Some(rest) = line.strip_prefix(head) else {
+                panic!("the line does not start with {head:?}: {line}")
+            };
+            let Some(rest) = rest.strip_suffix(tail) else {
+                panic!("the line does not end with {tail:?}: {line}")
+            };
+            let Some((elapsed, now)) = rest.split_once(middle) else {
+                panic!("no {middle:?} in {line}")
+            };
+            let Some(now) = now.strip_suffix(" ms on the clock") else {
+                panic!("no clock reading in {line}")
+            };
+            let milliseconds =
+                |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+            assert!(
+                milliseconds(elapsed) && milliseconds(now),
+                "two millisecond readings, got {elapsed:?} and {now:?}: {line}"
+            );
+        }
+
+        /// The joiner's one closing line: this failure after the commit,
+        /// stopped at this stage, for this round.
+        fn one_joiner_stop(traced: &Traced, category: &str, stage: &str, prefix: &str) {
+            let stopped = traced.the_one("redeemer: flow stopped with");
+            closing_line(
+                &stopped,
+                &format!("redeemer: flow stopped with `{category}` "),
+                " ms after it began, at ",
+                &format!("; after the commit, last stage started: {stage}, pairing {prefix}"),
+            );
+        }
+
+        /// No line carries the full pairing id or the code a device typed.
+        fn nothing_private(traced: &Traced, pairing_id: &[u8; 16], code: &str) {
+            for line in traced.lines() {
+                assert!(
+                    !line.contains(&hex(pairing_id)),
+                    "a full pairing id: {line}"
+                );
+                assert!(!line.contains(code), "the invite code: {line}");
+            }
+        }
+
+        /// The controlled local write failure of the `applied` mark.
+        /// Windows refuses to replace a file that is open without
+        /// share-delete: the flow still loads the committed entry, the
+        /// write of `applied` fails, and the committed entry stays.
+        #[cfg(windows)]
+        fn hold_entry_against_replacement(entry: &Path) -> std::fs::File {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(entry)
+                .expect("hold the entry open")
+        }
+
+        /// The joiner takes its commit and runs its half up to `PairApplied`.
+        /// The registry's applied handler answers `unavailable` on several
+        /// of its exits (nothing to apply, a state past committing, a
+        /// signature it refuses), pairing-scoped and naming this round; the
+        /// joiner takes that frame while it waits for `PairReady`.
+        async fn stops_waiting_for_ready(entry: Entry, traced: &Traced) {
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, entry, test_config(), traced).await;
+            let Parked {
+                owner,
+                owner_key,
+                joiner,
+                redeeming,
+                answering,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            // The commit goes into the joiner's stream first, the error
+            // right behind it.
+            assert_eq!(joiner.client().release_commits(), 1);
+            joiner.client().inject(unavailable(pairing_id));
+
+            let error = redeeming
+                .await
+                .expect("the joiner task")
+                .expect_err("the joiner stops on this round's error");
+            assert!(
+                matches!(error, PairFlowError::Unavailable { code } if code == PAIR_UNAVAILABLE),
+                "the original error comes back, got `{}`",
+                error_category(&error)
+            );
+
+            // Taken by the flow, where it waited; then the one closing line.
+            let taken = traced.the_one("pairing error frame taken");
+            assert!(
+                taken.starts_with(&format!(
+                    "pairing error frame taken: code 0x2101, correlation this round (pairing {prefix}), at "
+                )),
+                "{taken}"
+            );
+            assert!(
+                taken.ends_with(&format!(
+                    "; flow: redeemer, waiting for: PairReady, pairing {prefix}"
+                )),
+                "{taken}"
+            );
+            one_joiner_stop(
+                traced,
+                "pairing target unavailable (0x2101)",
+                "wait PairReady",
+                &prefix,
+            );
+            assert_eq!(
+                traced.count("flow stopped with"),
+                1,
+                "one line for this flow"
+            );
+            assert!(traced.before("pairing error frame taken", "redeemer: flow stopped with"));
+
+            // What stands locally: the owner is booked and the journal says
+            // committed. No `PairReady` came, so nothing marked it applied.
+            let book = fs::read_to_string(joiner_dir.path().join(BOOK_NAME))
+                .expect("the joiner booked the owner");
+            assert!(
+                book.contains(&Fingerprint::from_public_key(&owner_key.public_key()).to_hex()),
+                "the owner's fingerprint is in the joiner's book"
+            );
+            assert_eq!(
+                phases(joiner_dir.path()),
+                vec![(pairing_id, PairingPhase::Committed)]
+            );
+
+            // The owner is still parked on its commit. Closing its plane
+            // ends its flow BEFORE the commit: one owner line, of the shape
+            // without a stage — and the joiner's line is not written again.
+            owner.client().close().await;
+            let owner_error = answering
+                .await
+                .expect("the owner task")
+                .expect_err("the owner's plane closed");
+            assert!(
+                matches!(
+                    owner_error,
+                    PairFlowError::Client(ClientError::ConnectionLost)
+                ),
+                "the owner's own error, got `{}`",
+                error_category(&owner_error)
+            );
+            closing_line(
+                &traced.the_one("owner: flow stopped with"),
+                "owner: flow stopped with `connection lost while waiting for the reply` ",
+                " ms after the offer, at ",
+                "",
+            );
+            assert_eq!(
+                traced.count("flow stopped with"),
+                2,
+                "one line per flow, none twice"
+            );
+            nothing_private(traced, &pairing_id, &code);
+        }
+
+        /// Review 21: "at least one delivery succeeded" is not "the flow the
+        /// frame was meant for took it". Two plane subscribers; the flow's
+        /// own stream is full, another flow's has room. This round's error
+        /// is queued to one of the two, the flow waits its bound out and
+        /// takes nothing — and the trace says exactly that, with no "taken"
+        /// line. The control repeats it with room in the flow's stream: two
+        /// of two queued, and only then a line says the flow took the frame.
+        ///
+        /// Goes red when the dispatch line sums the destinations up again
+        /// (one flag for "queued"), when a merely queued frame is reported
+        /// as taken, or — in the control — when a frame the flow did take
+        /// is not reported as taken, with its flow, step and round.
+        #[tokio::test]
+        async fn a_frame_only_another_subscriber_took_is_not_reported_as_taken() {
+            let Some(traced) = diag_test::traced_process(TWO_SUBSCRIBERS, Switch::On) else {
+                return;
+            };
+            let pairing = [0x21; 16];
+
+            // Both subscribers hold a frame of another round; only the
+            // other flow's is read, so only it has room again.
+            let client = RegistryClient::offline(ClientConfig {
+                plane_capacity: 1,
+                ..ClientConfig::default()
+            });
+            let mut flow = client.subscribe_plane();
+            let mut other = client.subscribe_plane();
+            client
+                .deliver_as_reader(1, vec![CtrlFrame::new(ready([0x31; 16]))])
+                .await;
+            assert!(
+                matches!(other.recv().await, Some(CtrlMessage::PairReady { pairing_id, .. }) if pairing_id == [0x31; 16]),
+                "the other flow took the earlier frame"
+            );
+            client
+                .deliver_as_reader(2, vec![CtrlFrame::new(unavailable(pairing))])
+                .await;
+            let taken = wait_for_the_commit(&client, &mut flow, pairing, 300).await;
+            assert!(
+                matches!(taken, Ok(false)),
+                "the flow waited out its bound and took nothing: {taken:?}"
+            );
+            assert!(
+                matches!(other.recv().await, Some(CtrlMessage::PairError { object_id, code, .. }) if object_id == pairing && code == PAIR_UNAVAILABLE),
+                "the other flow did take the error"
+            );
+            assert_eq!(traced.lines().len(), 2, "{}", traced.lines().join("\n"));
+            assert_eq!(
+                traced.count("taken"),
+                0,
+                "queued to another flow is not taken by this one"
+            );
+            assert_eq!(
+                traced.the_one("registry frame #1: pairing error 0x2101"),
+                "registry frame #1: pairing error 0x2101, correlation pairing 21212121; \
+                 delivery: request waiter none, pairing inbox 0 of 0, plane 1 of 2; connection: 2"
+            );
+
+            // The control: room in the flow's own stream.
+            let client = RegistryClient::offline(ClientConfig {
+                plane_capacity: 1,
+                ..ClientConfig::default()
+            });
+            let mut flow = client.subscribe_plane();
+            let other = client.subscribe_plane(); // takes its copy, never read
+            client
+                .deliver_as_reader(1, vec![CtrlFrame::new(unavailable(pairing))])
+                .await;
+            let taken = wait_for_the_commit(&client, &mut flow, pairing, 300).await;
+            drop(other);
+            assert!(
+                matches!(taken, Err(PairFlowError::Unavailable { code }) if code == PAIR_UNAVAILABLE),
+                "now the flow takes the frame: {taken:?}"
+            );
+            assert_eq!(
+                traced.the_one("registry frame #1: pairing error 0x2101, correlation pairing 21212121; delivery: request waiter none, pairing inbox 0 of 0, plane 2 of 2"),
+                "registry frame #1: pairing error 0x2101, correlation pairing 21212121; \
+                 delivery: request waiter none, pairing inbox 0 of 0, plane 2 of 2; connection: 1"
+            );
+            let taken_line = traced.the_one("pairing error frame taken");
+            assert!(
+                taken_line.ends_with("; flow: redeemer, waiting for: PairCommit, pairing 21212121"),
+                "{taken_line}"
+            );
+        }
+
+        /// Review 21: the task join stops after the commit on this round's
+        /// error while it waits for `PairReady` — one closing line naming
+        /// the stage, the failure and the round, the original error
+        /// returned, and the journal left at `committed`.
+        ///
+        /// Goes red when no line, or more than one, closes the joiner's
+        /// flow after the commit; when the stage, the round or the failure
+        /// is not the one that stopped it; when the taken frame is not
+        /// placed in the flow; or when the flow returns another error.
+        #[tokio::test]
+        async fn a_task_join_stops_waiting_for_ready_on_this_round_s_error() {
+            let Some(traced) = diag_test::traced_process(TASK_READY_ERROR, Switch::On) else {
+                return;
+            };
+            stops_waiting_for_ready(Entry::Task, &traced).await;
+        }
+
+        /// The same through the other joiner entry point, `redeem`: the
+        /// daemon of the admission case joins that way, and its stop after
+        /// the commit must close the same. Goes red with the first test's
+        /// reasons, for `redeem` alone.
+        #[tokio::test]
+        async fn a_plain_redeem_stops_waiting_for_ready_on_this_round_s_error() {
+            let Some(traced) = diag_test::traced_process(PLAIN_READY_ERROR, Switch::On) else {
+                return;
+            };
+            stops_waiting_for_ready(Entry::Plain, &traced).await;
+        }
+
+        /// Review 21: the joiner's control connection is gone by the time
+        /// it takes its commit, so `PairApplied` cannot be sent. Goes red
+        /// when the stop is not placed at `send PairApplied`, when the
+        /// line is missing or doubled, or when the journal moved past
+        /// `committed` although the registry never heard this side.
+        #[tokio::test]
+        async fn a_joiner_stops_sending_pair_applied_without_a_connection() {
+            let Some(traced) = diag_test::traced_process(APPLIED_OFFLINE, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, Entry::Task, test_config(), &traced).await;
+            let Parked {
+                owner_key,
+                joiner,
+                redeeming,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            // The plane outlives the connection, so the parked frame still
+            // reaches the flow.
+            joiner.client().simulate_connection_loss().await;
+            assert_eq!(joiner.client().release_commits(), 1);
+            let error = redeeming
+                .await
+                .expect("the joiner task")
+                .expect_err("the joiner cannot confirm its apply");
+            assert!(
+                matches!(error, PairFlowError::Client(ClientError::Offline)),
+                "the original error comes back, got `{}`",
+                error_category(&error)
+            );
+            one_joiner_stop(
+                &traced,
+                "control connection is down",
+                "send PairApplied",
+                &prefix,
+            );
+            assert_eq!(traced.count("flow stopped with"), 1);
+
+            let book = fs::read_to_string(joiner_dir.path().join(BOOK_NAME)).expect("the book");
+            assert!(book.contains(&Fingerprint::from_public_key(&owner_key.public_key()).to_hex()));
+            assert_eq!(
+                phases(joiner_dir.path()),
+                vec![(pairing_id, PairingPhase::Committed)]
+            );
+            nothing_private(&traced, &pairing_id, &code);
+        }
+
+        /// Review 21: the trust book cannot be written (a directory sits
+        /// where the file goes). Goes red when the stop is not placed at
+        /// `commit_peer`, when the journal moved on, or when the failure's
+        /// own message — it names the book's directory — reaches the line.
+        #[tokio::test]
+        async fn a_joiner_stops_at_commit_peer_when_the_book_cannot_be_written() {
+            let Some(traced) = diag_test::traced_process(BOOK_UNWRITABLE, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, Entry::Task, test_config(), &traced).await;
+            let Parked {
+                joiner,
+                redeeming,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            fs::create_dir(joiner_dir.path().join(BOOK_NAME)).expect("block the trust book");
+            assert_eq!(joiner.client().release_commits(), 1);
+            let error = redeeming
+                .await
+                .expect("the joiner task")
+                .expect_err("the trust book cannot be written");
+            assert!(
+                matches!(error, PairFlowError::Local(_)),
+                "the failure is the local one, got `{}`",
+                error_category(&error)
+            );
+            one_joiner_stop(&traced, "local pairing state error", "commit_peer", &prefix);
+            assert_eq!(traced.count("flow stopped with"), 1);
+            assert_eq!(
+                phases(joiner_dir.path()),
+                vec![(pairing_id, PairingPhase::Pending)],
+                "the commit was never marked"
+            );
+            assert!(!joiner_dir.path().join(BOOK_NAME).is_file());
+            nothing_private(&traced, &pairing_id, &code);
+            let directory = joiner_dir.path().file_name().expect("the directory's name");
+            assert!(
+                traced
+                    .lines()
+                    .iter()
+                    .all(|line| !line.contains(&*directory.to_string_lossy())),
+                "no line names the identity directory"
+            );
+        }
+
+        /// Review 21: the journal entry on disk already says `applied` — a
+        /// stale replay, as when another run recovered this pairing in the
+        /// meantime — so the commit cannot be marked; the mark fails closed
+        /// with the pairing's full id in its message. Goes red when the
+        /// stop is not placed at `journal.mark_committed`, when the flow
+        /// rewrote the entry anyway, or when that id reaches the line.
+        #[tokio::test]
+        async fn a_joiner_stops_at_mark_committed_on_an_entry_already_applied() {
+            let Some(traced) = diag_test::traced_process(STALE_ENTRY, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, Entry::Task, test_config(), &traced).await;
+            let Parked {
+                owner_key,
+                joiner,
+                redeeming,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            let entry = entry_of(joiner_dir.path(), &pairing_id);
+            let pending = fs::read_to_string(&entry).expect("the joiner's pending entry");
+            let stale = pending.replace("\nphase pending\n", "\nphase applied\n");
+            assert_ne!(stale, pending, "the entry was pending");
+            fs::write(&entry, &stale).expect("age the entry");
+
+            assert_eq!(joiner.client().release_commits(), 1);
+            let error = redeeming
+                .await
+                .expect("the joiner task")
+                .expect_err("the stale entry refuses the mark");
+            assert!(
+                matches!(&error, PairFlowError::Io(error) if error.kind() == io::ErrorKind::InvalidData),
+                "the journal's own refusal comes back"
+            );
+            one_joiner_stop(
+                &traced,
+                "local pairing store io error (InvalidData)",
+                "journal.mark_committed",
+                &prefix,
+            );
+            assert_eq!(traced.count("flow stopped with"), 1);
+
+            // The book was written before the mark; the entry is as aged,
+            // not marked by this flow.
+            let book = fs::read_to_string(joiner_dir.path().join(BOOK_NAME)).expect("the book");
+            assert!(book.contains(&Fingerprint::from_public_key(&owner_key.public_key()).to_hex()));
+            assert_eq!(fs::read_to_string(&entry).expect("the entry"), stale);
+            nothing_private(&traced, &pairing_id, &code);
+        }
+
+        /// Review 21: `PairReady` received and the local `applied` mark are
+        /// two steps. The registry sends the real `PairReady` (the owner
+        /// finished its half), and only then does the joiner's mark fail on
+        /// a controlled local write failure. Goes red when the stop is not
+        /// placed at `journal.mark_applied`, when the Ready-received line
+        /// is missing or comes after the stop, when the journal shows
+        /// `applied`, or when the line is missing or doubled.
+        #[tokio::test]
+        async fn a_joiner_stops_at_mark_applied_when_the_entry_cannot_be_replaced() {
+            let Some(traced) = diag_test::traced_process(ENTRY_BLOCKED, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, Entry::Task, test_config(), &traced).await;
+            let Parked {
+                owner,
+                owner_key,
+                joiner,
+                redeeming,
+                answering,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            assert_eq!(joiner.client().release_commits(), 1);
+            // The joiner books the owner, marks the commit, sends
+            // `PairApplied`, and waits.
+            wait_until("the joiner marks its commit", || {
+                journal_has(joiner_dir.path(), pairing_id, PairingPhase::Committed)
+            })
+            .await;
+            let entry = entry_of(joiner_dir.path(), &pairing_id);
+            // The controlled local write failure. Elsewhere than Windows
+            // the entry is removed under the flow instead, and the mark
+            // refuses to invent it.
+            #[cfg(windows)]
+            let held = hold_entry_against_replacement(&entry);
+            #[cfg(not(windows))]
+            std::fs::remove_file(&entry).expect("remove the entry under the flow");
+
+            // The owner finishes its half; the registry has both applies
+            // and sends the real `PairReady`.
+            assert_eq!(owner.client().release_commits(), 1);
+            answering
+                .await
+                .expect("the owner task")
+                .expect("the owner applies its side");
+            let error = redeeming
+                .await
+                .expect("the joiner task")
+                .expect_err("the joiner's local mark fails");
+            match &error {
+                PairFlowError::Io(error) => {
+                    #[cfg(windows)]
+                    assert_eq!(error.raw_os_error(), Some(32), "a sharing violation");
+                    #[cfg(not(windows))]
+                    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+                }
+                other => panic!("the journal's own failure comes back, got {other:?}"),
+            }
+
+            // Ready was received — on record under the joiner's flow, before
+            // the stop — and it is the local mark that failed.
+            let ready_line = traced.the_one("; flow: redeemer, pairing ");
+            assert!(
+                ready_line.starts_with("applied sent and ready received, "),
+                "{ready_line}"
+            );
+            assert!(traced.before(
+                "applied sent and ready received",
+                "redeemer: flow stopped with"
+            ));
+            #[cfg(windows)]
+            let category = "local pairing store io error (os error 32)";
+            #[cfg(not(windows))]
+            let category = "local pairing store io error (NotFound)";
+            one_joiner_stop(&traced, category, "journal.mark_applied", &prefix);
+            assert_eq!(
+                traced.count("flow stopped with"),
+                1,
+                "the owner's flow did not stop"
+            );
+            #[cfg(windows)]
+            drop(held);
+
+            let book = fs::read_to_string(joiner_dir.path().join(BOOK_NAME)).expect("the book");
+            assert!(book.contains(&Fingerprint::from_public_key(&owner_key.public_key()).to_hex()));
+            let phases = phases(joiner_dir.path());
+            #[cfg(windows)]
+            assert_eq!(
+                phases,
+                vec![(pairing_id, PairingPhase::Committed)],
+                "the committed entry is still what the journal holds"
+            );
+            #[cfg(not(windows))]
+            assert!(
+                phases
+                    .iter()
+                    .all(|record| record.1 != PairingPhase::Applied),
+                "nothing says applied: {phases:?}"
+            );
+            nothing_private(&traced, &pairing_id, &code);
+        }
+
+        /// The control: a pairing that completes writes no closing line on
+        /// either side. Goes red when a successful flow closes with a
+        /// stop line, or when `PairReady` received is not on record for
+        /// each side under its own flow.
+        #[tokio::test]
+        async fn a_paired_flow_writes_no_stop_line() {
+            let Some(traced) = diag_test::traced_process(SUCCESS, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(&registry, Entry::Task, test_config(), &traced).await;
+            let Parked {
+                owner,
+                joiner,
+                redeeming,
+                answering,
+                owner_dir,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            assert_eq!(joiner.client().release_commits(), 1);
+            assert_eq!(owner.client().release_commits(), 1);
+            let (owner_outcome, joiner_outcome) =
+                tokio::time::timeout(LIMIT, async { tokio::join!(answering, redeeming) })
+                    .await
+                    .expect("both flows finish");
+            owner_outcome
+                .expect("the owner task")
+                .expect("the owner applies its side");
+            joiner_outcome
+                .expect("the joiner task")
+                .expect("the joiner applies its side");
+
+            assert_eq!(
+                traced.count("flow stopped with"),
+                0,
+                "{}",
+                traced.lines().join("\n")
+            );
+            assert_eq!(
+                traced.count("applied sent and ready received"),
+                2,
+                "one line per side"
+            );
+            assert!(
+                traced
+                    .the_one("; flow: redeemer, pairing ")
+                    .ends_with(&format!("; flow: redeemer, pairing {prefix}")),
+                "{}",
+                traced.lines().join("\n")
+            );
+            assert!(traced
+                .the_one("; flow: owner, pairing ")
+                .ends_with(&format!("; flow: owner, pairing {prefix}")));
+            for dir in [owner_dir.path(), joiner_dir.path()] {
+                assert!(
+                    phases(dir).contains(&(pairing_id, PairingPhase::Applied)),
+                    "applied in {}",
+                    dir.display()
+                );
+            }
+            nothing_private(&traced, &pairing_id, &code);
+        }
+
+        /// The control for the half before the commit: its closing line is
+        /// the one that already existed — no stage, written once — and the
+        /// all-zero error frame keeps the round the flow waited for. Goes
+        /// red when that line changes shape or count, or when an all-zero
+        /// error is taken without saying which flow and round took it.
+        #[tokio::test]
+        async fn a_stop_before_the_commit_writes_one_line_without_a_stage() {
+            let Some(traced) = diag_test::traced_process(BEFORE_COMMIT, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let joiner_dir = tempfile::tempdir().unwrap();
+            let joiner = orchestrator_on(
+                &registry,
+                "bob",
+                &DeviceKeyPair::generate(),
+                joiner_dir.path(),
+                OrchestratorConfig {
+                    redeem_window_ms: 1_500,
+                    ..test_config()
+                },
+            )
+            .await;
+            // A parse-valid code nobody registered: the registry answers
+            // the unified failure at the deadline, naming no round.
+            let ghost = InviteCode::generate().to_display();
+            let error = joiner.redeem(&ghost).await.expect_err("a ghost code fails");
+            assert!(
+                matches!(error, PairFlowError::Unavailable { code } if code == PAIR_UNAVAILABLE),
+                "the original error comes back, got `{}`",
+                error_category(&error)
+            );
+
+            // Which round the ghost was is on record with its acknowledgment.
+            let acknowledged = traced.the_one("redeem acknowledged (pairing ");
+            let prefix = acknowledged
+                .split("redeem acknowledged (pairing ")
+                .nth(1)
+                .and_then(|rest| rest.get(..8))
+                .expect("a pairing prefix in the line")
+                .to_string();
+            let taken = traced.the_one("pairing error frame taken");
+            assert!(
+                taken.starts_with(
+                    "pairing error frame taken: code 0x2101, correlation all-zero, at "
+                ),
+                "{taken}"
+            );
+            assert!(
+                taken.ends_with(&format!(
+                    "; flow: redeemer, waiting for: PairChallenge, pairing {prefix}"
+                )),
+                "the all-zero error keeps the round waited for: {taken}"
+            );
+            closing_line(
+                &traced.the_one("redeemer: flow stopped with"),
+                "redeemer: flow stopped with `pairing target unavailable (0x2101)` ",
+                " ms after it began, at ",
+                "",
+            );
+            assert_eq!(traced.count("flow stopped with"), 1);
+            assert_eq!(traced.count("after the commit"), 0);
+            assert_eq!(phases(joiner_dir.path()), [], "nothing was journaled");
+            assert!(!joiner_dir.path().join(BOOK_NAME).exists());
+            nothing_private(&traced, &[0; 16], &ghost);
+        }
+
+        /// The control for the owner: its flow stops after the commit (its
+        /// trust book cannot be written) and the joiner, never told Ready,
+        /// gives up. One line per flow and none twice — the owner's finish
+        /// is closed by its one outer line. Goes red when the owner's stop
+        /// is written twice or not at all, when the joiner's stop is not
+        /// the one of its own wait, or when the owner's failure message —
+        /// it names the book's directory — reaches a line.
+        #[tokio::test]
+        async fn an_owner_stop_after_the_commit_writes_one_owner_line() {
+            let Some(traced) = diag_test::traced_process(OWNER_STOP, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let parked = parked_at_the_commit(
+                &registry,
+                Entry::Task,
+                OrchestratorConfig {
+                    ready_wait_ms: 1_500,
+                    ..test_config()
+                },
+                &traced,
+            )
+            .await;
+            let Parked {
+                owner,
+                joiner,
+                redeeming,
+                answering,
+                owner_dir,
+                joiner_dir,
+                code,
+                pairing_id,
+                ..
+            } = parked;
+            let prefix = id_prefix(&pairing_id);
+
+            fs::create_dir(owner_dir.path().join(BOOK_NAME)).expect("block the owner's book");
+            assert_eq!(joiner.client().release_commits(), 1);
+            assert_eq!(owner.client().release_commits(), 1);
+            let (owner_outcome, joiner_outcome) =
+                tokio::time::timeout(LIMIT, async { tokio::join!(answering, redeeming) })
+                    .await
+                    .expect("both flows end");
+            let owner_error = owner_outcome
+                .expect("the owner task")
+                .expect_err("the owner's book cannot be written");
+            assert!(
+                matches!(owner_error, PairFlowError::Local(_)),
+                "the owner's own error, got `{}`",
+                error_category(&owner_error)
+            );
+            let joiner_error = joiner_outcome
+                .expect("the joiner task")
+                .expect_err("no Ready ever comes");
+            assert!(
+                matches!(joiner_error, PairFlowError::Timeout),
+                "the joiner's own error, got `{}`",
+                error_category(&joiner_error)
+            );
+
+            assert_eq!(
+                traced.count("flow stopped with"),
+                2,
+                "one line per flow, none twice"
+            );
+            closing_line(
+                &traced.the_one("owner: flow stopped with"),
+                "owner: flow stopped with `local pairing state error` ",
+                " ms after the offer, at ",
+                "",
+            );
+            one_joiner_stop(
+                &traced,
+                "timed out waiting for the pairing flow",
+                "wait PairReady",
+                &prefix,
+            );
+            assert_eq!(
+                phases(owner_dir.path()),
+                vec![(pairing_id, PairingPhase::Pending)],
+                "the owner never marked its commit"
+            );
+            assert_eq!(
+                phases(joiner_dir.path()),
+                vec![(pairing_id, PairingPhase::Committed)]
+            );
+            let directory = owner_dir.path().file_name().expect("the directory's name");
+            assert!(
+                traced
+                    .lines()
+                    .iter()
+                    .all(|line| !line.contains(&*directory.to_string_lossy())),
+                "no line names the identity directory"
+            );
+            nothing_private(&traced, &pairing_id, &code);
+        }
+
+        /// Review 21: a redeem refused while it still waits for its answer
+        /// never reaches a flow's `wait_frame`. The evidence is written
+        /// where its oneshot is taken, right after the dispatch line says
+        /// the frame went to the request waiter, and right before the one
+        /// closing line. Goes red when the answer is not named at the take,
+        /// when the dispatch line does not tell the waiter apart from the
+        /// inboxes, or when the order of the three lines is another.
+        #[tokio::test]
+        async fn a_redeem_refused_at_its_answer_is_taken_on_the_oneshot() {
+            let Some(traced) = diag_test::traced_process(ONESHOT, Switch::On) else {
+                return;
+            };
+            let registry = registry::spawn().await;
+            let endpoint = |port: u16| {
+                ak_signal::protocol_v2::EndpointBlob(
+                    format!(r#"{{"addrs":["127.0.0.1:{port}"]}}"#).into_bytes(),
+                )
+            };
+            let owner_dir = tempfile::tempdir().unwrap();
+            let owner = orchestrator_on(
+                &registry,
+                "alice",
+                &DeviceKeyPair::generate(),
+                owner_dir.path(),
+                test_config(),
+            )
+            .await;
+            owner.spawn_owner_loop();
+            let invite = owner
+                .create_task_invite([0x61; 16], 0, endpoint(7200))
+                .await
+                .expect("claim the one-shot task code");
+
+            let first_dir = tempfile::tempdir().unwrap();
+            let first = orchestrator_on(
+                &registry,
+                "bob",
+                &DeviceKeyPair::generate(),
+                first_dir.path(),
+                test_config(),
+            )
+            .await;
+            first
+                .redeem_task(&invite.display, endpoint(7201))
+                .await
+                .expect("the single join pairs");
+
+            // The code's one redeem is spent: the registry refuses the
+            // second one in the answer to `InviteRedeem` itself.
+            let second_dir = tempfile::tempdir().unwrap();
+            let second = orchestrator_on(
+                &registry,
+                "carol",
+                &DeviceKeyPair::generate(),
+                second_dir.path(),
+                test_config(),
+            )
+            .await;
+            let refused = second
+                .redeem_task(&invite.display, endpoint(7202))
+                .await
+                .expect_err("the second join is refused");
+            assert!(
+                matches!(refused, PairFlowError::Rejected { code } | PairFlowError::Unavailable { code } if code == REDEEM_EXHAUSTED),
+                "the original error comes back, got `{}`",
+                error_category(&refused)
+            );
+
+            let dispatched = "registry frame #1: code-scoped error 0x2109; delivery: request waiter queued, pairing inbox 0 of 0, plane 1 of 1; connection: 1";
+            assert_eq!(
+                traced.the_one("code-scoped error 0x2109; delivery: "),
+                dispatched
+            );
+            assert_eq!(
+                traced.the_one("request answer taken: "),
+                "request answer taken: InviteRedeem answered with code-scoped error 0x2109"
+            );
+            closing_line(
+                &traced.the_one("redeemer: flow stopped with"),
+                "redeemer: flow stopped with `pairing rejected: 0x2109` ",
+                " ms after it began, at ",
+                "",
+            );
+            assert_eq!(
+                traced.count("flow stopped with"),
+                1,
+                "the first join and the owner paired"
+            );
+            assert!(traced.before(dispatched, "request answer taken: "));
+            assert!(traced.before("request answer taken: ", "redeemer: flow stopped with"));
+            assert_eq!(phases(second_dir.path()), [], "nothing was journaled");
+            nothing_private(&traced, &[0; 16], &invite.display);
+        }
     }
 }

@@ -328,7 +328,7 @@ fn redact(text: &str) -> String {
             .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
             .count();
         out.push_str(head);
-        // A code is five groups of four; a shorter run is something else.
+        // A code is eight groups of four; a shorter run is something else.
         if groups >= 24 {
             out.push_str("AKI1-<code>");
             rest = &tail[PREFIX.len() + groups..];

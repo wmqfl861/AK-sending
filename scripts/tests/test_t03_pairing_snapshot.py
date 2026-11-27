@@ -172,6 +172,26 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(snapshot.main(["t03_pairing_snapshot.py"]), 0)
         self.assertEqual(json.loads(stdout.getvalue()), {"ok": False, "error_kind": "usage"})
 
+    def test_the_uri_is_encoded_exactly_once(self):
+        # A second encoding would turn a legal `%` into `%25` (and `%20` into `%2520`).
+        uri = snapshot._read_only_uri("/tmp/a b/100%#x/registry.db")
+        self.assertIn("a%20b/100%25%23x/registry.db", uri)
+        self.assertNotIn("%2520", uri)
+        self.assertTrue(uri.startswith("file:"))
+        self.assertTrue(uri.endswith("?mode=ro"))
+
+    def test_paths_with_spaces_percent_hash_and_non_ascii_are_read(self):
+        for name in ("temp dir", "100% done", "hash#dir", "缓存", "a%20b"):
+            with self.subTest(name=name):
+                base = Path(self._tmp.name) / name
+                base.mkdir()
+                self.db = base / "registry.db"
+                self._create()
+                out = snapshot.read_snapshot(str(self.db), NOW)
+                self.assertTrue(out["ok"], out)
+                self.assertEqual(out["invite_codes"]["active_unexpired"], 1)
+                self.assertEqual(out["pairing_transactions"]["rows"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

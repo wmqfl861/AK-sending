@@ -41,7 +41,6 @@ import os
 import sqlite3
 import sys
 import time
-import urllib.parse
 import urllib.request
 
 MAX_ROWS = 64
@@ -59,8 +58,12 @@ TRANSACTION_FLAGS = (
 
 
 def _read_only_uri(path: str) -> str:
-    """`file:` URI that opens an existing database without creating it."""
-    return "file:" + urllib.parse.quote(urllib.request.pathname2url(path), safe="/:") + "?mode=ro"
+    """`file:` URI that opens an existing database without creating it.
+
+    `pathname2url` already percent-encodes the path once; encoding it again
+    would turn a legal `%` into `%25` and make SQLite look for another file.
+    """
+    return "file:" + urllib.request.pathname2url(path) + "?mode=ro"
 
 
 def _by_state(rows: list) -> dict:

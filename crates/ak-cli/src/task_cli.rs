@@ -267,7 +267,8 @@ impl std::error::Error for TaskCancelled {}
 /// process; no other run of `ak-cli task` installs a logger here, and the
 /// levels come from `RUST_LOG`.
 fn init_pair_diag_logger() {
-    if std::env::var_os("AK_PAIR_DIAG").is_none() {
+    // The same rule as the trace itself: a non-empty `AK_PAIR_DIAG`.
+    if !std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()) {
         return;
     }
     let _ = env_logger::builder()

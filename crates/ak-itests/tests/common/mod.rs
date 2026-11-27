@@ -24,6 +24,9 @@ use ak_core::handle::{default_chunk_size, ConflictPolicy};
 use ak_engine::{receive_with_addr, send, Progress, ReceiveSpec, Report, SendSpec};
 use ak_identity::{DeviceKeyPair, Fingerprint};
 
+/// What a failure report may show of captured text.
+pub mod report;
+
 /// Part suffix used by ak-storage for in-progress receive files.
 pub const PART_SUFFIX: &str = ".akpart";
 

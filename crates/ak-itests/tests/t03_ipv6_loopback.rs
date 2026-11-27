@@ -18,7 +18,9 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use common::report::{argv_summary, redact};
+
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use ak_core::handle::ConflictPolicy;
 use ak_core::policy::PathKind;
@@ -280,16 +282,25 @@ struct LineLog {
 }
 
 /// What the watcher of a child process knows about how it ended.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 enum Watched {
     /// Still running (or not watched at all).
+    #[default]
     Running,
     Exited(std::process::ExitStatus),
     /// The watcher could not keep polling the child: its end is unknown.
     Unwatched(String),
 }
 
+/// One of a process's two pipes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
 /// One line read off a pipe and the moment it was read.
+#[derive(Clone)]
 struct TimedLine {
     at_ms: u128,
     text: String,
@@ -309,453 +320,6 @@ struct LogState {
 fn since_origin_ms() -> u128 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     ORIGIN.get_or_init(Instant::now).elapsed().as_millis()
-}
-
-/// Punctuation that may sit in front of a secret inside one token; it is
-/// kept in front of what replaces the secret.
-const OPENERS: [char; 8] = ['"', '\'', '(', '[', '{', '<', '（', '“'];
-
-/// What ends a path or a name inside one token: what follows it there is
-/// other text.
-const CLAUSE_CLOSERS: [char; 8] = [',', ';', ')', ']', '}', '=', '）', '＝'];
-
-/// Punctuation after a secret, kept so the line still reads.
-const TRAILING: [char; 11] = ['"', '\'', ',', ';', ')', ']', '}', ':', '.', '!', '?'];
-
-/// The words after which a bare file name (`in device.key`) or a quoted
-/// name (`under "photos"`) is a name on disk, not a word of the message.
-const INTRODUCES_A_NAME: [&str; 15] = [
-    "in", "at", "into", "under", "dir", "path", "file", "db", "key", "open", "read", "write",
-    "save", "load", "create",
-];
-
-/// `true` for text that is a filesystem path: absolute (a drive letter,
-/// a UNC root, a `/` root), or relative with a separator (`..\x`,
-/// `src/main.rs`, a URL; not prose such as `Y/n`).
-fn looks_like_path(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let absolute = (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || text.starts_with(r"\\")
-        || (text.starts_with('/') && text[1..].contains('/'));
-    let from_here = ["./", "../", ".\\", "..\\"]
-        .iter()
-        .any(|start| text.starts_with(start));
-    let last = text.rsplit(['\\', '/']).next().unwrap_or(text);
-    absolute
-        || from_here
-        || text.contains('\\')
-        || text.contains("://")
-        || (text.contains('/') && is_bare_file_name(last))
-}
-
-/// A file name with no separator in it (`device.key`): a dot and a short
-/// extension that is not all digits (`256.00` is a number).
-fn is_bare_file_name(text: &str) -> bool {
-    let Some((base, extension)) = text.rsplit_once('.') else {
-        return false;
-    };
-    let short = !extension.is_empty()
-        && extension.len() <= 4
-        && extension.bytes().all(|b| b.is_ascii_alphanumeric());
-    let numbered = extension.bytes().all(|b| b.is_ascii_digit());
-    !base.is_empty() && short && !numbered
-}
-
-/// An address as text; a zone id (`fe80::1%12`) is left out of the parse.
-fn parse_host(text: &str) -> Option<IpAddr> {
-    let bare = text.split('%').next()?;
-    if let Ok(v6) = bare.parse::<Ipv6Addr>() {
-        return Some(IpAddr::V6(v6));
-    }
-    bare.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
-}
-
-/// Loopback and unspecified addresses, and loopback in its v4-mapped
-/// form, stay in a report.
-fn address_stays(address: IpAddr) -> bool {
-    let local = |v4: Ipv4Addr| v4.is_loopback() || v4.is_unspecified();
-    match address {
-        IpAddr::V4(v4) => local(v4),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(local)
-        }
-    }
-}
-
-/// What replaces an address that is not kept: `<addr>`, with its port
-/// when the text has one (`[v6]:port`, `v4:port`; a bare v6 has none).
-fn hidden_address(address: &str) -> String {
-    let port = match address.strip_prefix('[') {
-        Some(after) => after
-            .split_once(']')
-            .and_then(|(_, tail)| tail.strip_prefix(':')),
-        None => address
-            .rsplit_once(':')
-            .filter(|(host, _)| !host.contains(':'))
-            .map(|(_, port)| port),
-    };
-    match port {
-        Some(port) => format!("<addr>:{port}"),
-        None => "<addr>".to_string(),
-    }
-}
-
-/// An IP address at the start of `text`: how many bytes it takes, and
-/// whether it is hidden. `None` when `text` does not start with one.
-fn address_prefix(text: &str) -> Option<(usize, bool)> {
-    // `[v6]:port`: the bracket belongs to the address.
-    if let Some(after) = text.strip_prefix('[') {
-        let end = after.find(']')?;
-        let address = parse_host(&after[..end])?;
-        if !address.is_ipv6() {
-            return None;
-        }
-        let digits = after[end + 1..].strip_prefix(':').unwrap_or("");
-        let port = digits.bytes().take_while(|b| b.is_ascii_digit()).count();
-        let len = 2 + end + if port > 0 { 1 + port } else { 0 };
-        return Some((len, !address_stays(address)));
-    }
-    let len = text
-        .chars()
-        .take_while(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '%'))
-        .count();
-    let candidate = text.get(..len)?;
-    let (host, port) = match candidate.rsplit_once(':') {
-        Some((host, port))
-            if !host.contains(':')
-                && !port.is_empty()
-                && port.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            (host, Some(port))
-        }
-        _ => (candidate, None),
-    };
-    let address = parse_host(host)?;
-    if port.is_some() && !address.is_ipv4() {
-        return None;
-    }
-    Some((len, !address_stays(address)))
-}
-
-/// A task code in every form the parser takes (any case, grouped or
-/// not), from `AKI1` on: how many bytes it takes.
-fn task_code_len(text: &str) -> Option<usize> {
-    let body = text.get(4..)?;
-    let run = body
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .count();
-    let code = body
-        .get(..run)
-        .is_some_and(|code| match code.strip_prefix('-') {
-            Some(groups) => {
-                groups.split('-').count() == 8 && groups.split('-').all(|group| group.len() == 4)
-            }
-            None => code.len() == 32 && code.chars().all(|c| c.is_ascii_alphanumeric()),
-        });
-    code.then_some(4 + run)
-}
-
-/// One stretch of text that is neither a path nor an address, with the
-/// task code and hex runs of 32 or more (a registry fingerprint, a
-/// pairing id) hidden wherever they start.
-fn redact_plain(text: &str) -> String {
-    let mut shown = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let code_at = (0..rest.len().saturating_sub(3))
-            .find(|&at| rest.as_bytes()[at..at + 4].eq_ignore_ascii_case(b"AKI1"));
-        let hex_at = rest.find(|c: char| c.is_ascii_hexdigit());
-        let code_at = match (code_at, hex_at) {
-            (Some(at), None) => Some(at),
-            (Some(at), Some(hex)) if at <= hex => Some(at),
-            _ => None,
-        };
-        match (code_at, hex_at) {
-            (Some(at), _) => {
-                if let Some(len) = task_code_len(&rest[at..]) {
-                    shown.push_str(&rest[..at]);
-                    shown.push_str("AKI1-<code>");
-                    rest = &rest[at + len..];
-                } else {
-                    // Not a code: this `AKI1` stays; look further on.
-                    shown.push_str(&rest[..at + 4]);
-                    rest = &rest[at + 4..];
-                }
-            }
-            (_, Some(at)) => {
-                shown.push_str(&rest[..at]);
-                let run = rest[at..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_hexdigit())
-                    .count();
-                if run >= 32 {
-                    shown.push_str("<hex>");
-                } else {
-                    shown.push_str(&rest[at..at + run]);
-                }
-                rest = &rest[at + run..];
-            }
-            (None, None) => {
-                shown.push_str(rest);
-                rest = "";
-            }
-        }
-    }
-    shown
-}
-
-fn strip_trailing(text: &str) -> (&str, &str) {
-    let stem_len = text.trim_end_matches(|c: char| TRAILING.contains(&c)).len();
-    text.split_at(stem_len)
-}
-
-fn clause_end(text: &str) -> Option<usize> {
-    text.char_indices()
-        .find(|(_, c)| CLAUSE_CLOSERS.contains(c))
-        .map(|(at, _)| at)
-}
-
-/// How a secret runs on over the words that follow it in the line.
-#[derive(Clone, Copy)]
-enum RunOn {
-    /// A quoted path or name: the words up to its closing quote.
-    Quoted(char),
-    /// An unquoted path with spaces: the words up to one that ends a
-    /// clause, starts a flag or a bracket, or has an `=`.
-    Unquoted,
-}
-
-enum TokenPiece {
-    Text(String),
-    RunsOn { shown: String, run_on: RunOn },
-}
-
-impl TokenPiece {
-    fn into_parts(self) -> (String, Option<RunOn>) {
-        match self {
-            TokenPiece::Text(text) => (text, None),
-            TokenPiece::RunsOn { shown, run_on } => (shown, Some(run_on)),
-        }
-    }
-}
-
-/// The secret that starts at `rest`: a token, or what follows an
-/// opening quote or bracket inside one; `before` is what precedes it
-/// there, and `previous` the word shown before the token. `None` when
-/// `rest` does not start with one.
-fn secret_at(rest: &str, before: &str, previous: &str) -> Option<TokenPiece> {
-    // An address, first with its own bracket.
-    if let Some((len, hidden)) = address_prefix(rest) {
-        let head = &rest[..len];
-        let shown = if hidden {
-            hidden_address(head)
-        } else {
-            head.to_string()
-        };
-        return Some(TokenPiece::Text(format!(
-            "{before}{shown}{}",
-            redact_plain(&rest[len..])
-        )));
-    }
-    let lead_len = rest.chars().take_while(|c| OPENERS.contains(c)).count();
-    let (lead, body) = rest.split_at(lead_len);
-    if !lead.is_empty() {
-        if let Some((len, hidden)) = address_prefix(body) {
-            let head = &body[..len];
-            let shown = if hidden {
-                hidden_address(head)
-            } else {
-                head.to_string()
-            };
-            return Some(TokenPiece::Text(format!(
-                "{before}{lead}{shown}{}",
-                redact_plain(&body[len..])
-            )));
-        }
-    }
-    // `key=value` and `--flag=value`: the value is where a secret can be.
-    if let Some((key, value)) = body.split_once('=') {
-        if let Some(piece) = secret_at(value, &format!("{before}{lead}{key}="), "") {
-            return Some(piece);
-        }
-    }
-    let quote = lead.chars().rev().find(|c| *c == '"' || *c == '\'');
-    let (stem, tail) = strip_trailing(body);
-    let (stem, after) = match clause_end(stem) {
-        Some(at) => (&stem[..at], &stem[at..]),
-        None => (stem, ""),
-    };
-    let placeholder = if looks_like_path(stem) {
-        "<path>"
-    } else if INTRODUCES_A_NAME.contains(&previous) && is_bare_file_name(stem) {
-        return Some(TokenPiece::Text(format!(
-            "{before}{lead}<path>{after}{tail}"
-        )));
-    } else if INTRODUCES_A_NAME.contains(&previous) && quote.is_some() {
-        "<name>"
-    } else {
-        return None;
-    };
-    let mut shown = format!("{before}{lead}{placeholder}");
-    if let Some(quote) = quote {
-        // Quoted: the same word may already close it.
-        if !after.is_empty() || tail.starts_with(quote) {
-            shown.push_str(after);
-            shown.push_str(tail);
-            return Some(TokenPiece::Text(shown));
-        }
-        return Some(TokenPiece::RunsOn {
-            shown,
-            run_on: RunOn::Quoted(quote),
-        });
-    }
-    shown.push_str(after);
-    // Unquoted: a path whose last part has no extension may have spaces
-    // after it (`C:\Users\John Doe`); one that ends in a file name, or is
-    // followed by punctuation, does not.
-    let complete = is_bare_file_name(stem.rsplit(['\\', '/']).next().unwrap_or(stem));
-    if complete || !tail.is_empty() {
-        shown.push_str(tail);
-        return Some(TokenPiece::Text(shown));
-    }
-    Some(TokenPiece::RunsOn {
-        shown,
-        run_on: RunOn::Unquoted,
-    })
-}
-
-/// What replaces a token: a secret starts at its first character or
-/// right after an opening quote or bracket in it; anything else is text
-/// with codes and hex runs hidden.
-fn open_token(token: &str, previous: &str) -> TokenPiece {
-    let after_openers = token
-        .char_indices()
-        .filter(|(_, c)| OPENERS.contains(c))
-        .map(|(at, c)| at + c.len_utf8());
-    for at in std::iter::once(0usize).chain(after_openers) {
-        if let Some(piece) = secret_at(&token[at..], &token[..at], previous) {
-            return piece;
-        }
-    }
-    TokenPiece::Text(redact_plain(token))
-}
-
-/// Where an unquoted path's run on ends inside `token`: at a word that
-/// starts a flag or a bracket (unless the word still carries a path
-/// separator, as `C:\Program Files (x86)\x` does), or at a clause closer
-/// or an `=` in it.
-fn run_on_end(token: &str) -> Option<usize> {
-    if let Some(first) = token.chars().next() {
-        if (first == '-' || OPENERS.contains(&first)) && !token.contains(['\\', '/']) {
-            return Some(0);
-        }
-    }
-    let (at, closer) = token
-        .char_indices()
-        .find(|(_, c)| CLAUSE_CLOSERS.contains(c))?;
-    let after = &token[at + closer.len_utf8()..];
-    // `(x86)\Common`: a closer inside a word that still carries the path.
-    if after.contains(['\\', '/']) {
-        None
-    } else {
-        Some(at)
-    }
-}
-
-fn redact_line(line: &str) -> String {
-    let mut shown = String::with_capacity(line.len());
-    let mut run_on: Option<RunOn> = None;
-    let mut previous = String::new();
-    for token in line.split_whitespace() {
-        let in_run_on = run_on.is_some();
-        let (piece, runs_on) = match run_on {
-            // The rest of a quoted path or name: absorbed up to its
-            // closing quote.
-            Some(RunOn::Quoted(quote)) => match token.find(quote) {
-                Some(at) => {
-                    let after = at + quote.len_utf8();
-                    (format!("{quote}{}", redact_plain(&token[after..])), None)
-                }
-                None => continue,
-            },
-            // A word of an unquoted path with spaces.
-            Some(RunOn::Unquoted) => match run_on_end(token) {
-                Some(0) => open_token(token, &previous).into_parts(),
-                Some(at) => (redact_plain(&token[at..]), None),
-                // `path: cause`: the path ends with the word before the colon.
-                None if token.ends_with(':') => (":".to_string(), None),
-                None => continue,
-            },
-            None => open_token(token, &previous).into_parts(),
-        };
-        run_on = runs_on;
-        // The word that ends a path: its closing quote, clause closer or
-        // colon belongs to the placeholder, without a space before it.
-        let closes =
-            in_run_on && piece.starts_with(['"', '\'', ',', ';', ')', ']', '}', ':', '）']);
-        if !shown.is_empty() && !closes {
-            shown.push(' ');
-        }
-        shown.push_str(&piece);
-        previous = piece
-            .trim_matches(|c: char| !c.is_alphanumeric())
-            .to_ascii_lowercase();
-    }
-    shown
-}
-
-/// The reportable form of captured text. The callers that parse a line
-/// (the code, the bound port, the candidates) keep the raw text; this is
-/// only for what a failure prints. Hidden: the task code in every form
-/// the parser takes; hex runs of 32 or more (the registry fingerprint, a
-/// pairing id); paths and file names, quoted or not, spaces included;
-/// the source root name the receiver prints; addresses that are not
-/// loopback (their ports stay). A path never runs on over the words that
-/// follow it into the next line, and a clause closer, a colon or a
-/// closing quote after it ends it, so the cause after it stays.
-fn redact(text: &str) -> String {
-    text.split('\n')
-        .map(redact_line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The subcommand words a spawn failure may name.
-const SUBCOMMANDS: [&str; 6] = [
-    "task",
-    "code-recv",
-    "code-send",
-    "join-send",
-    "join-recv",
-    "registry-server",
-];
-
-/// What a spawn failure may say about a child's arguments: long flags by
-/// name (`--key=value` as `--key=<value>`) and the subcommand words as
-/// they are; every other value hidden.
-fn argv_summary(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| {
-            let name = match arg.split_once('=') {
-                Some((flag, _)) => flag,
-                None => arg.as_str(),
-            };
-            if name.starts_with("--") || SUBCOMMANDS.contains(&name) {
-                if name.len() == arg.len() {
-                    arg.clone()
-                } else {
-                    format!("{name}=<value>")
-                }
-            } else {
-                "<value>".to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Q-N3 (reviews 19 and 20): what a report may show, on synthetic
@@ -931,6 +495,416 @@ fn report_redaction_hides_codes_fingerprints_ids_paths_and_foreign_addresses() {
     );
 }
 
+/// A synthetic task code in both forms the parser takes (the symbols are
+/// from the Crockford alphabet, as a real one's are).
+fn synthetic_code() -> (&'static str, &'static str) {
+    (
+        "AKI1-0Z9Y-0Z9Y-0Z9Y-0Z9Y-0Z9Y-0Z9Y-0Z9Y-0Z9Y",
+        "AKI10Z9Y0Z9Y0Z9Y0Z9Y0Z9Y0Z9Y0Z9Y0Z9Y",
+    )
+}
+
+/// The text a closure panicked with.
+fn panic_text(run: impl FnOnce()) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .expect_err("the assertion must fail");
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    panic!("the panic carried neither a String nor a &str");
+}
+
+/// Plan of 2026-11-28 (after review 21), section A: the word shapes the
+/// redaction missed. One table, and every input is redacted on its own, so
+/// one run reports every leak, swallowed cause or second panic.
+#[test]
+fn redaction_covers_the_word_shapes_review_21_found() {
+    let (code, ungrouped) = synthetic_code();
+    let long_hex = "f".repeat(32);
+    let cases: Vec<(String, String)> = vec![
+        ("（说明）".into(), "（说明）".into()),
+        ("（192.0.2.7:41）".into(), "（<addr>:41）".into()),
+        ("under “Alpha,Beta”".into(), "under “<name>”".into()),
+        (
+            "no candidate accepted the connection (192.0.2.7:41: permission denied)".into(),
+            "no candidate accepted the connection (<addr>:41: permission denied)".into(),
+        ),
+        (format!("{code}q"), "AKI1-<code>q".into()),
+        (format!("{ungrouped}-suffix"), "AKI1-<code>-suffix".into()),
+        (
+            format!("{}abc", code.to_ascii_lowercase()),
+            "AKI1-<code>abc".into(),
+        ),
+        (format!("face{code}"), "faceAKI1-<code>".into()),
+        (format!("{long_hex}{code}"), "<hex>AKI1-<code>".into()),
+        ("under \"Alpha,Beta\"".into(), "under \"<name>\"".into()),
+        (
+            "under \"Alpha, Beta\", failed".into(),
+            "under \"<name>\", failed".into(),
+        ),
+        ("open \"/lab/Alpha,Beta\"".into(), "open \"<path>\"".into()),
+        ("in /private".into(), "in <path>".into()),
+        (
+            "in /var/cache/x permission denied".into(),
+            "in <path> permission denied".into(),
+        ),
+        (
+            "in /lab/a b Permission denied (os error 13)".into(),
+            "in <path> Permission denied (os error 13)".into(),
+        ),
+        (
+            "in /lab/a permission denied/leaf".into(),
+            "in <path>".into(),
+        ),
+        ("in /lab/a unclassified words".into(), "in <path>".into()),
+    ];
+    let mut wrong = Vec::new();
+    for (input, expected) in &cases {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| redact(input))) {
+            Ok(actual) if actual == *expected => {}
+            Ok(actual) => wrong.push(format!("{input:?}: expected {expected:?}, got {actual:?}")),
+            Err(_) => wrong.push(format!("{input:?}: panicked")),
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// Plan of 2026-11-28, section A: a failing assertion on an external
+/// address shows the reason and nothing raw — neither the address nor the
+/// `left` / `right` an `assert_eq!` adds by itself.
+#[test]
+fn a_failing_assertion_on_an_external_address_shows_nothing_raw() {
+    let external_v4: SocketAddr = "192.0.2.7:41".parse().unwrap();
+    let external_v6: SocketAddr = "[2001:db8::7]:41".parse().unwrap();
+    let fake: SocketAddr = "127.0.0.9:53422".parse().unwrap();
+    let advertised = "[task] advertising 2 candidate(s): 127.0.0.1:53421 [::1]:53421";
+    let sender_log = "[send] trying 1/2: 192.0.2.7:41...\n[send] connected; peer 127.0.0.1:53421";
+    let reflexive_line = "[task] stun reflexive 192.0.2.7:41 (queried on the sender socket)";
+    let texts = [
+        panic_text(|| assert_observed_head_is_advertised(advertised, external_v4)),
+        panic_text(|| assert_observed_head_is_advertised(advertised, external_v6)),
+        panic_text(|| assert_observed_head_is_fake_or_real(external_v4, fake, 53421, sender_log)),
+        panic_text(|| {
+            assert_reflexive_is_loopback(external_v4, reflexive_line, "the reflexive address")
+        }),
+        panic_text(|| {
+            assert_reflexive_is_loopback(external_v6, reflexive_line, "the reflexive address")
+        }),
+    ];
+    for text in &texts {
+        for raw in ["192.0.2.7", "2001:db8::7", "left:", "right:"] {
+            assert!(!text.contains(raw), "the panic text shows {raw:?}:\n{text}");
+        }
+    }
+    assert!(texts[0].contains("genuinely advertised"), "{}", texts[0]);
+    assert!(
+        texts[2].contains("fake or the punch-revealed"),
+        "{}",
+        texts[2]
+    );
+    assert!(texts[3].contains("the reflexive address"), "{}", texts[3]);
+}
+
+/// Plan of 2026-11-28, section A: the whole panic text of test 1's UDP
+/// failure on a synthetic report — the secrets are gone, the cause stays,
+/// and the report itself survives the wide punctuation the CLI prints.
+#[test]
+fn the_udp_failure_report_hides_secrets_and_keeps_the_cause() {
+    let (code, _) = synthetic_code();
+    let fingerprint = "9f".repeat(32);
+    let receiver = LineLog::synthetic(
+        "receiver",
+        &[
+            format!("[task] paired; peer 192.0.2.7:53421 (task {fingerprint})"),
+            format!("the peer joins with: ak-cli task join-send '{code}' <PATHS...>"),
+        ],
+        &[
+            "created new device key in C:\\Users\\Public User\\t03 x\\device.key".to_string(),
+            "无法加载/新建 device.key（C:\\Users\\Public User\\t03 x\\device.key）：系统找不到指定的文件。 (os error 2)".to_string(),
+        ],
+        false,
+        Watched::Running,
+    );
+    let sender = LineLog::synthetic(
+        "sender",
+        &[],
+        &["[task] joining the task code at the registry...".to_string()],
+        false,
+        Watched::Running,
+    );
+    let registry = LineLog::synthetic(
+        "registry",
+        &[],
+        &[
+            format!("v2 registry server listening on tls 192.0.2.7:54364 (registry {fingerprint})"),
+            "（192.0.2.7:41）".to_string(),
+        ],
+        false,
+        Watched::Running,
+    );
+    let chain = [
+        ("receiver", &receiver),
+        ("sender", &sender),
+        ("registry", &registry),
+    ];
+    let joiner_exit = JoinerExit {
+        at_ms: since_origin_ms(),
+        status: "exit code: 1".to_string(),
+    };
+    let text = panic_text(|| {
+        assert_punch_arrived(
+            &PunchWatch::default(),
+            53421,
+            317,
+            since_origin_ms() + 30_000,
+            Some(&joiner_exit),
+            64169,
+            "receiver",
+            &chain,
+        )
+    });
+    for raw in [
+        code,
+        fingerprint.as_str(),
+        "Public User",
+        "192.0.2.7",
+        "char boundary",
+    ] {
+        assert!(!text.contains(raw), "the report shows {raw:?}:\n{text}");
+    }
+    for kept in [
+        "系统找不到指定的文件",
+        "(os error 2)",
+        "watching from +317 ms",
+        "no end line yet",
+    ] {
+        assert!(text.contains(kept), "the report lost {kept:?}:\n{text}");
+    }
+    for placeholder in ["<addr>:53421", "<path>", "AKI1-<code>", "<hex>"] {
+        assert!(
+            text.contains(placeholder),
+            "the report lacks {placeholder:?}:\n{text}"
+        );
+    }
+    // Each process once.
+    for heading in ["--- receiver (", "--- sender (", "--- registry ("] {
+        assert_eq!(text.matches(heading).count(), 1, "{heading} in:\n{text}");
+    }
+}
+
+/// How long a report waits for the last lines of a process that already
+/// exited: they can still be in the pipes when its exit is first seen
+/// (review 20), and the first error is often the last line.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Wait, at most [`SETTLE`], until every process here that already exited
+/// has nothing left coming out of its pipes. A process still running is
+/// not waited for.
+fn settle(logs: &[&LineLog]) {
+    let until = Instant::now() + SETTLE;
+    while Instant::now() < until {
+        let pending = logs
+            .iter()
+            .any(|log| log.exit().is_some() && !log.pipes_ended());
+        if !pending {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `logs` with every process once: a log is left out when one of its
+/// pipes is a pipe of a log already kept (the bare stderr log of a process
+/// whose stdout log is listed). A report shows each process once, however
+/// the wait that produced it was phrased.
+fn unique_processes<'a>(logs: &[(&'a str, &'a LineLog)]) -> Vec<(&'a str, &'a LineLog)> {
+    fn pipes(log: &LineLog) -> impl Iterator<Item = &Arc<Mutex<LogState>>> {
+        std::iter::once(&log.state).chain(log.stderr.as_ref())
+    }
+    let mut kept: Vec<(&str, &LineLog)> = Vec::new();
+    for &(name, log) in logs {
+        let same = |state: &Arc<Mutex<LogState>>| {
+            kept.iter()
+                .any(|(_, seen)| pipes(seen).any(|pipe| Arc::ptr_eq(pipe, state)))
+        };
+        if !pipes(log).any(same) {
+            kept.push((name, log));
+        }
+    }
+    kept
+}
+
+/// One process as a report froze it.
+struct FrozenProcess {
+    name: String,
+    out: Vec<TimedLine>,
+    err: Vec<TimedLine>,
+    /// How each pipe ended and when: the error is `None` when the writer
+    /// closed the pipe, the whole field `None` while it is still open.
+    out_end: Option<(u128, Option<String>)>,
+    err_end: Option<(u128, Option<String>)>,
+    exit: Watched,
+}
+
+/// Every process of a chain, taken once for one report (plan of 2026-11-28,
+/// after review 21): the last lines of processes that already exited are
+/// waited for, then every pipe, every exit status and the common origin
+/// are frozen, and the registry database is sampled once. A summary, the
+/// details and whatever a test decides all read this one copy, so they
+/// cannot disagree. Lines that only arrived during the wait explain a
+/// failure; they never turn it into a success.
+struct Frozen {
+    origin: u128,
+    processes: Vec<FrozenProcess>,
+    snapshot: String,
+    snapshot_at_ms: u128,
+}
+
+fn freeze(logs: &[(&str, &LineLog)]) -> Frozen {
+    let processes = unique_processes(logs);
+    settle(&processes.iter().map(|(_, log)| *log).collect::<Vec<_>>());
+    let frozen: Vec<FrozenProcess> = processes
+        .iter()
+        .map(|(name, log)| {
+            let out = log
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let err = log.stderr.as_ref().map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            FrozenProcess {
+                name: name.to_string(),
+                out: out.lines.clone(),
+                err: err
+                    .as_ref()
+                    .map(|err| err.lines.clone())
+                    .unwrap_or_default(),
+                out_end: out.end.clone(),
+                err_end: err.as_ref().and_then(|err| err.end.clone()),
+                exit: log.watched(),
+            }
+        })
+        .collect();
+    let origin = frozen
+        .iter()
+        .flat_map(|process| [&process.out, &process.err])
+        .filter_map(|lines| lines.first())
+        .map(|line| line.at_ms)
+        .min()
+        .unwrap_or_else(since_origin_ms);
+    Frozen {
+        origin,
+        processes: frozen,
+        snapshot: registry_snapshot(),
+        snapshot_at_ms: since_origin_ms(),
+    }
+}
+
+impl Frozen {
+    fn process(&self, name: &str) -> Option<&FrozenProcess> {
+        self.processes.iter().find(|process| process.name == name)
+    }
+
+    /// The report's text: each process once, as a timeline of both pipes
+    /// counted from the first line any of them wrote, then the registry
+    /// database with the moment it was sampled.
+    fn render(&self) -> String {
+        let mut report = String::new();
+        for process in &self.processes {
+            report.push_str(&format!(
+                "\n--- {} (milliseconds since the first line of this report):\n",
+                process.name
+            ));
+            report.push_str(&process.timeline(self.origin).join("\n"));
+        }
+        report.push_str(&format!(
+            "\n--- registry database, read-only snapshot at +{} ms:\n{}",
+            self.snapshot_at_ms.saturating_sub(self.origin),
+            self.snapshot
+        ));
+        report
+    }
+}
+
+impl FrozenProcess {
+    /// The lines of both pipes, redacted, each with milliseconds since
+    /// `origin` and the stream it came from; then how each pipe ended and
+    /// the exit status (still-open pipes last).
+    fn timeline(&self, origin: u128) -> Vec<String> {
+        let mut rows: Vec<(u128, String)> = Vec::new();
+        for (state, ended, tag) in [
+            (&self.out, &self.out_end, "out"),
+            (&self.err, &self.err_end, "err"),
+        ] {
+            for line in state {
+                rows.push((
+                    line.at_ms,
+                    format!(
+                        "[+{:>7} ms] {tag}: {}",
+                        line.at_ms.saturating_sub(origin),
+                        redact(&line.text)
+                    ),
+                ));
+            }
+            match ended {
+                Some((at, None)) => rows.push((
+                    *at,
+                    format!(
+                        "[+{:>7} ms] {tag}: <pipe closed by the writer>",
+                        at.saturating_sub(origin)
+                    ),
+                )),
+                Some((at, Some(error))) => rows.push((
+                    *at,
+                    format!(
+                        "[+{:>7} ms] {tag}: <pipe lost on a read error: {error}>",
+                        at.saturating_sub(origin)
+                    ),
+                )),
+                None => rows.push((u128::MAX, format!("[+      ? ms] {tag}: <pipe still open>"))),
+            }
+        }
+        match &self.exit {
+            Watched::Exited(status) if status.success() => {
+                rows.push((u128::MAX, format!("exit status: {status}")))
+            }
+            Watched::Exited(status) => rows.push((u128::MAX - 1, format!("exit status: {status}"))),
+            Watched::Unwatched(error) => rows.push((
+                u128::MAX - 1,
+                format!("exit status: unknown; the watcher could not poll the child: {error}"),
+            )),
+            Watched::Running => rows.push((
+                u128::MAX,
+                "exit status: <process still running>".to_string(),
+            )),
+        }
+        rows.sort_by_key(|(at, _)| *at);
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    fn out_text(&self) -> String {
+        Self::text_of(&self.out)
+    }
+
+    fn err_text(&self) -> String {
+        Self::text_of(&self.err)
+    }
+
+    fn text_of(lines: &[TimedLine]) -> String {
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 impl LineLog {
     fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
         let log = LineLog::default();
@@ -973,6 +947,36 @@ impl LineLog {
         self
     }
 
+    /// A log that no pipe feeds: the caller states its lines, whether its
+    /// pipes ended, and what the watcher concluded — for synthetic reports.
+    fn synthetic(
+        name: &str,
+        out: &[String],
+        err: &[String],
+        ended: bool,
+        exit: Watched,
+    ) -> LineLog {
+        let now = since_origin_ms();
+        let state = |lines: &[String]| -> Arc<Mutex<LogState>> {
+            Arc::new(Mutex::new(LogState {
+                lines: lines
+                    .iter()
+                    .map(|text| TimedLine {
+                        at_ms: now,
+                        text: text.clone(),
+                    })
+                    .collect(),
+                end: ended.then_some((now, None)),
+            }))
+        };
+        LineLog {
+            state: state(out),
+            stderr: Some(state(err)),
+            name: Some(name.to_string()),
+            exit: Some(Arc::new(Mutex::new(exit))),
+        }
+    }
+
     /// What the watcher concluded so far.
     fn watched(&self) -> Watched {
         self.exit
@@ -981,14 +985,24 @@ impl LineLog {
             .unwrap_or(Watched::Running)
     }
 
-    /// The raw lines so far, for the callers that parse them.
-    fn snapshot(&self) -> Vec<String> {
-        self.state
+    /// The lines of `stream` so far, for the callers that parse them.
+    fn lines_of(&self, stream: Stream) -> Vec<TimedLine> {
+        let state = match stream {
+            Stream::Stdout => &self.state,
+            Stream::Stderr => self.stderr.as_ref().unwrap_or(&self.state),
+        };
+        state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .lines
-            .iter()
-            .map(|line| line.text.clone())
+            .clone()
+    }
+
+    /// This stream's raw lines so far.
+    fn snapshot(&self) -> Vec<String> {
+        self.lines_of(Stream::Stdout)
+            .into_iter()
+            .map(|line| line.text)
             .collect()
     }
 
@@ -1002,171 +1016,108 @@ impl LineLog {
 
     /// When the first line of this log or its stderr was read.
     fn earliest_ms(&self) -> Option<u128> {
-        let own = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .lines
-            .first()
-            .map(|line| line.at_ms);
-        let err = self.stderr.as_ref().and_then(|state| {
-            state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .lines
-                .first()
-                .map(|line| line.at_ms)
-        });
-        match (own, err) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
+        [Stream::Stdout, Stream::Stderr]
+            .into_iter()
+            .filter_map(|stream| self.lines_of(stream).first().map(|line| line.at_ms))
+            .min()
     }
 
     /// Both pipes ended (closed or on a read error).
     fn pipes_ended(&self) -> bool {
-        let own = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .end
-            .is_some();
-        let err = self
-            .stderr
-            .as_ref()
-            .map(|state| {
-                state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .end
-                    .is_some()
-            })
-            .unwrap_or(true);
-        own && err
+        let ended = |state: &Arc<Mutex<LogState>>| {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .end
+                .is_some()
+        };
+        let err = self.stderr.as_ref().map(ended).unwrap_or(true);
+        ended(&self.state) && err
     }
 
-    /// The process is over and did not end well: a non-zero exit, or its
-    /// pipes closed after an error line — whichever the watcher and the
-    /// reader threads happen to report first, the same ending decides the
-    /// same way. It cannot produce the line a wait is looking for, so the
-    /// wait stops and reports now.
+    /// The process is over and did not end well: it exited unsuccessfully,
+    /// or both its pipes ended after an error line — one condition or the
+    /// other, whichever the watcher and the reader threads report first.
+    /// An exit status of 0 does not settle it by itself: a process can
+    /// print its error and exit 0. It cannot produce the line a wait is
+    /// looking for, so the wait stops and reports now.
     fn ended_with_error(&self) -> bool {
-        match self.watched() {
-            Watched::Exited(status) => !status.success(),
-            Watched::Running | Watched::Unwatched(_) => self.pipes_ended() && self.has_error_line(),
-        }
+        let exited_badly = matches!(self.watched(), Watched::Exited(status) if !status.success());
+        exited_badly || (self.pipes_ended() && self.has_error_line())
     }
 
     /// `Error:` or a panic somewhere in this log or its stderr.
     fn has_error_line(&self) -> bool {
-        let owns = |state: &Arc<Mutex<LogState>>| {
+        let has = |state: &Arc<Mutex<LogState>>| {
             state
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .lines
                 .iter()
                 .any(|line| line.text.contains("Error:") || line.text.contains("panicked at"))
         };
-        owns(&self.state) || self.stderr.as_ref().map(owns).unwrap_or(false)
+        has(&self.state) || self.stderr.as_ref().is_some_and(has)
     }
 
-    /// The lines of this log and of its stderr, redacted, each with
-    /// milliseconds since `origin` and the stream it came from; then how
-    /// each pipe ended and the exit status (still-open pipes last).
-    fn timeline(&self, origin: u128) -> Vec<String> {
-        let mut rows: Vec<(u128, String)> = Vec::new();
-        let streams = [(Some(&self.state), "out"), (self.stderr.as_ref(), "err")];
-        for (state, tag) in streams {
-            let Some(state) = state else { continue };
-            let state = state.lock().unwrap_or_else(|p| p.into_inner());
-            for line in &state.lines {
-                rows.push((
-                    line.at_ms,
-                    format!(
-                        "[+{:>7} ms] {tag}: {}",
-                        line.at_ms.saturating_sub(origin),
-                        redact(&line.text)
-                    ),
-                ));
-            }
-            match &state.end {
-                Some((at, None)) => rows.push((
-                    *at,
-                    format!(
-                        "[+{:>7} ms] {tag}: <pipe closed by the writer>",
-                        at.saturating_sub(origin)
-                    ),
-                )),
-                Some((at, Some(error))) => rows.push((
-                    *at,
-                    format!(
-                        "[+{:>7} ms] {tag}: <pipe lost on a read error: {error}>",
-                        at.saturating_sub(origin)
-                    ),
-                )),
-                None => rows.push((u128::MAX, format!("[+      ? ms] {tag}: <pipe still open>"))),
-            }
-        }
-        match self.watched() {
-            Watched::Exited(status) if status.success() => {
-                rows.push((u128::MAX, format!("exit status: {status}")))
-            }
-            Watched::Exited(status) => rows.push((u128::MAX - 1, format!("exit status: {status}"))),
-            Watched::Unwatched(error) => rows.push((
-                u128::MAX - 1,
-                format!("exit status: unknown; the watcher could not poll the child: {error}"),
-            )),
-            Watched::Running => rows.push((
-                u128::MAX,
-                "exit status: <process still running>".to_string(),
-            )),
-        }
-        rows.sort_by_key(|(at, _)| *at);
-        rows.into_iter().map(|(_, text)| text).collect()
-    }
-
-    /// This stream so far plus the process's stderr when attached, as one
-    /// timeline counted from the earliest line. The last lines of a
-    /// process that already exited are waited for (see [`settle`]).
+    /// This process as one timeline counted from its earliest line. The
+    /// last lines of a process that already exited are waited for (see
+    /// [`settle`]).
     fn report(&self) -> String {
-        settle(&[self]);
-        let origin = self.earliest_ms().unwrap_or_else(since_origin_ms);
-        self.timeline(origin).join("\n")
+        freeze(&[(self.name.as_deref().unwrap_or("this process"), self)]).render()
     }
 
     /// First line containing `needle`, polling until it appears.
     fn wait_for(&self, needle: &str, timeout: std::time::Duration) -> String {
-        self.wait_for_reporting(needle, timeout, &[])
+        self.wait_for_stream(Stream::Stdout, needle, timeout, &[])
     }
 
     /// [`Self::wait_for`], with `others`' output (stderr included) in the
     /// timeout report too: a wait on one process often runs out because
     /// of another (2026-11-20 review of batch Q: a Windows CI run timed
     /// out waiting for the receiver's offer line, and the report held only
-    /// the receiver's side). Q-N3 (2026-11-27): the wait also stops as soon
-    /// as this process or one of `others` is over and did not end well —
-    /// the registry is still alive then, so its log and a read-only
-    /// snapshot of its database go into the same report.
+    /// the receiver's side).
     fn wait_for_reporting(
         &self,
         needle: &str,
         timeout: std::time::Duration,
         others: &[(&str, &LineLog)],
     ) -> String {
+        self.wait_for_stream(Stream::Stdout, needle, timeout, others)
+    }
+
+    /// [`Self::wait_for`] on one stream of this process. The stream only
+    /// decides where the line is looked for; the report, when the wait
+    /// gives up, always comes from this process — both pipes, one exit
+    /// status — and from `others`, each process once. The wait stops as
+    /// soon as this process or one of `others` is over and did not end
+    /// well (Q-N3, 2026-11-27): the registry is still alive then, so its
+    /// log and a read-only snapshot of its database go into the report.
+    /// A line that was read after the deadline shows in that report and
+    /// does not count as the line having come in time.
+    fn wait_for_stream(
+        &self,
+        stream: Stream,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
         let deadline = Instant::now() + timeout;
+        let deadline_ms = since_origin_ms() + timeout.as_millis();
         loop {
-            for line in self.snapshot() {
-                if line.contains(needle) {
-                    return line;
-                }
+            if let Some(line) = self
+                .lines_of(stream)
+                .into_iter()
+                .find(|line| line.at_ms <= deadline_ms && line.text.contains(needle))
+            {
+                return line.text;
             }
             let self_ended = self.ended_with_error();
             let other_ended = others
                 .iter()
                 .find(|(_, other)| other.ended_with_error())
                 .map(|(name, _)| *name);
-            if Instant::now() >= deadline || self_ended || other_ended.is_some() {
+            let now = Instant::now();
+            if now >= deadline || self_ended || other_ended.is_some() {
                 let mut who: Vec<String> = Vec::new();
                 if self_ended {
                     who.push(self.name.as_deref().unwrap_or("this process").to_string());
@@ -1182,63 +1133,21 @@ impl LineLog {
                         who.join(" and ")
                     )
                 };
-                let mut report = format!("no line containing {needle:?} ({why})");
+                let stream = match stream {
+                    Stream::Stdout => "stdout",
+                    Stream::Stderr => "stderr",
+                };
                 let mut logs: Vec<(&str, &LineLog)> =
                     vec![(self.name.as_deref().unwrap_or("this process"), self)];
                 logs.extend_from_slice(others);
-                report.push_str(&failure_report(&logs));
-                panic!("{report}");
+                panic!(
+                    "no line of the {stream} containing {needle:?} ({why}){}",
+                    freeze(&logs).render()
+                );
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
         }
     }
-}
-
-/// How long a report waits for the last lines of a process that already
-/// exited: they can still be in the pipes when its exit is first seen
-/// (review 20), and the first error is often the last line.
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
-
-/// Wait, at most [`SETTLE`], until every process here that already exited
-/// has nothing left coming out of its pipes. A process still running is
-/// not waited for.
-fn settle(logs: &[&LineLog]) {
-    let until = Instant::now() + SETTLE;
-    while Instant::now() < until {
-        let pending = logs
-            .iter()
-            .any(|log| log.exit().is_some() && !log.pipes_ended());
-        if !pending {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-/// One failure report for every process of the chain: a timeline counted
-/// from the first line any of them wrote, then the registry database as it
-/// is right now (when a registry was started on this thread).
-fn failure_report(logs: &[(&str, &LineLog)]) -> String {
-    let watched: Vec<&LineLog> = logs.iter().map(|(_, log)| *log).collect();
-    settle(&watched);
-    let origin = logs
-        .iter()
-        .filter_map(|(_, log)| log.earliest_ms())
-        .min()
-        .unwrap_or_else(since_origin_ms);
-    let mut report = String::new();
-    for (name, log) in logs {
-        report.push_str(&format!(
-            "\n--- {name} (milliseconds since the first line of this report):\n"
-        ));
-        report.push_str(&log.timeline(origin).join("\n"));
-    }
-    report.push_str(&format!(
-        "\n--- registry database, read-only snapshot at +{} ms:\n{}",
-        since_origin_ms().saturating_sub(origin),
-        registry_snapshot()
-    ));
-    report
 }
 
 thread_local! {
@@ -1381,6 +1290,19 @@ impl Proc {
     /// The exit status once the watcher saw it.
     fn exit_status(&self) -> Option<std::process::ExitStatus> {
         self.stdout.exit()
+    }
+
+    /// Wait for a line of one stream of this process; the report, when
+    /// the wait gives up, is this process's (both pipes, one exit status)
+    /// and `others`'. See [`LineLog::wait_for_stream`].
+    fn wait_for_line(
+        &self,
+        stream: Stream,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
+        self.stdout.wait_for_stream(stream, needle, timeout, others)
     }
 
     /// This process's stdout and stderr as one timeline.
@@ -1961,11 +1883,10 @@ fn stun_reflexive_rides_the_cli_receiver_socket() {
         redact(reflexive_line.as_ref()),
         redact(bound.as_ref())
     );
-    assert_eq!(
-        reflexive.ip(),
-        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        "the truthful loopback responder reflects the local source: {}",
-        redact(reflexive_line.as_ref())
+    assert_reflexive_is_loopback(
+        reflexive,
+        &reflexive_line,
+        "the truthful loopback responder reflects the local source",
     );
 
     // (2) Wire shape: the reflexive address rides the advertisement, and
@@ -2370,20 +2291,8 @@ fn probe_answered_non_quic_candidate_falls_back_to_the_real_receiver() {
     // legal (the pre-punch shape, or a punch that missed the window);
     // both must be ADVERTISED addresses.
     let observed = probe_observed_addr(&sender_log);
-    let observed_text = observed.to_string();
-    assert!(
-        advertised
-            .split_whitespace()
-            .any(|token| token == observed_text),
-        "the observed head must be a genuinely advertised candidate: {} not in {}",
-        redact(observed_text.as_ref()),
-        redact(advertised.as_ref())
-    );
-    assert!(
-        observed == fake.addr || observed.port() == real_port,
-        "the head is the probe-answering fake or the punch-revealed QUIC candidate: {observed} (fake {}, real port {real_port}): {}",
-        fake.addr
-    , redact(&sender_log));
+    assert_observed_head_is_advertised(&advertised, observed);
+    assert_observed_head_is_fake_or_real(observed, fake.addr, real_port, &sender_log);
 
     // (2) The observed-first attempt cannot carry QUIC; the fallback
     // completes the transfer via the REAL receiver's bound port.
@@ -2504,6 +2413,154 @@ fn probe_round_observes_the_real_advertised_candidates() {
 //    is not a NAT traversal claim (no NAT sits on the path); these tests
 //    pin the wiring, not the traversal.
 // ---------------------------------------------------------------------------
+
+/// An address for an assertion's text: loopback as it is, anything else
+/// with only its port.
+fn shown_address(address: SocketAddr) -> String {
+    redact(&address.to_string())
+}
+
+/// The reflexive address a truthful (same-host) responder reports is
+/// loopback. An assertion as a function, so that a synthetic failing input
+/// can show its whole panic text (review 21): a boolean comparison, since
+/// an `assert_eq!` on the address would print both sides by itself.
+fn assert_reflexive_is_loopback(reflexive: SocketAddr, line: &str, what: &str) {
+    assert!(
+        reflexive.ip() == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "{what}: the reflexive address is not loopback: {}",
+        redact(line)
+    );
+}
+
+/// The probe round's observed head is one of the advertised candidates
+/// (an assertion as a function, see [`assert_reflexive_is_loopback`]).
+fn assert_observed_head_is_advertised(advertised: &str, observed: SocketAddr) {
+    let observed_text = observed.to_string();
+    assert!(
+        advertised
+            .split_whitespace()
+            .any(|token| token == observed_text),
+        "the observed head must be a genuinely advertised candidate: {} not in {}",
+        shown_address(observed),
+        redact(advertised)
+    );
+}
+
+/// The observed head is the probe-answering fake or the receiver's real
+/// QUIC port (an assertion as a function, see [`assert_reflexive_is_loopback`]).
+fn assert_observed_head_is_fake_or_real(
+    observed: SocketAddr,
+    fake_addr: SocketAddr,
+    real_port: u16,
+    sender_log: &str,
+) {
+    assert!(
+        observed == fake_addr || observed.port() == real_port,
+        "the head is the probe-answering fake or the punch-revealed QUIC candidate: {} (fake {}, real port {real_port}): {}",
+        shown_address(observed),
+        shown_address(fake_addr),
+        redact(sender_log)
+    );
+}
+
+/// Test 1's assertion that the receiver's punch arrived inside its budget,
+/// as a function: its failure text comes from [`punch_failure`].
+#[allow(clippy::too_many_arguments)] // what the failure text names
+fn assert_punch_arrived(
+    watch: &PunchWatch,
+    quic_port: u16,
+    watching_from_ms: u128,
+    deadline_ms: u128,
+    joiner_exit: Option<&JoinerExit>,
+    watched_port: u16,
+    receiver: &str,
+    chain: &[(&str, &LineLog)],
+) {
+    assert!(
+        watch.matched(),
+        "{}",
+        punch_failure(
+            watch,
+            quic_port,
+            watching_from_ms,
+            deadline_ms,
+            joiner_exit,
+            watched_port,
+            receiver,
+            chain
+        )
+    );
+}
+
+/// How long `at_ms` is after the report's origin, as text.
+fn since_origin(origin: u128, at_ms: Option<u128>) -> String {
+    at_ms.map_or("?".to_string(), |at| at.saturating_sub(origin).to_string())
+}
+
+#[allow(clippy::too_many_arguments)] // what the failure text names
+fn punch_failure(
+    watch: &PunchWatch,
+    quic_port: u16,
+    watching_from_ms: u128,
+    deadline_ms: u128,
+    joiner_exit: Option<&JoinerExit>,
+    watched_port: u16,
+    receiver: &str,
+    chain: &[(&str, &LineLog)],
+) -> String {
+    // Frozen once: the summary and the details read the same copy (plan of
+    // 2026-11-28, section B).
+    let frozen = freeze(chain);
+    let (receiver_out, receiver_err, receiver_exit) = frozen
+        .process(receiver)
+        .map(|process| (process.out_text(), process.err_text(), process.exit.clone()))
+        .unwrap_or_default();
+    let record = punch_loop_record(&receiver_err, watched_port);
+    let receiver_exit = match receiver_exit {
+        Watched::Exited(status) => format!("exited with {status}"),
+        Watched::Running => "still running".to_string(),
+        Watched::Unwatched(_) => "unknown".to_string(),
+    };
+    let joiner = joiner_exit
+        .map(|exit| {
+            format!(
+                "{} at +{} ms",
+                exit.status,
+                exit.at_ms.saturating_sub(frozen.origin)
+            )
+        })
+        .unwrap_or_else(|| "not seen while watching".to_string());
+    format!(
+        "the receiver's punch must arrive from its bound QUIC port {quic_port} before +{} ms \
+         (watching from +{watching_from_ms} ms): probe-shaped packets seen {} \
+         ({} from other source ports), the first from any source at +{} ms, \
+         the first from the QUIC port at +{} ms, the last at +{} ms{}; \
+         {} read(s) found nothing queued, {} interrupted, \
+         {} datagram(s) that were not a probe packet, read error {:?}; \
+         joiner exit status {joiner}; receiver punch loop start line seen: {}, \
+         receiver {receiver_exit}; receiver punch loop: {}{}",
+        deadline_ms.saturating_sub(frozen.origin),
+        watch.probes,
+        watch.other_source_probes,
+        since_origin(frozen.origin, watch.first_probe_ms),
+        since_origin(frozen.origin, watch.first_match_ms),
+        since_origin(frozen.origin, watch.last_probe_ms),
+        watch
+            .late_match_ms
+            .map(|at| format!(
+                ", a matching packet first read at +{} ms, after the deadline",
+                at.saturating_sub(frozen.origin)
+            ))
+            .unwrap_or_default(),
+        watch.empty_reads,
+        watch.interrupted,
+        watch.bad_packets.len(),
+        watch.read_error,
+        receiver_out.contains("[task] punching"),
+        record.describe(),
+        frozen.render()
+    )
+}
 
 /// Extract the address of the sender's "stun reflexive …" line (the
 /// join-sender's own reflection).
@@ -2634,11 +2691,10 @@ fn sender_stun_and_probe_round_share_the_adopted_dial_socket() {
         .stdout
         .wait_for("stun reflexive", std::time::Duration::from_secs(10));
     let reflexive = sender_stun_reflexive_addr(&reflexive_line);
-    assert_eq!(
-        reflexive.ip(),
-        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        "the truthful responder reflects the sender's own source: {}",
-        redact(reflexive_line.as_ref())
+    assert_reflexive_is_loopback(
+        reflexive,
+        &reflexive_line,
+        "the truthful responder reflects the sender's own source",
     );
 
     // Drive the transfer to completion (offer + consent + done).
@@ -2708,7 +2764,7 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
     // The test-owned socket at a LOOPBACK address no interface enumerates
     // (127.0.0.9 is not 127.0.0.1, so the reflection never dedups away) —
     // the stand-in for the sender's NAT-mapped public endpoint.
-    let punch_target = match std::net::UdpSocket::bind("127.0.0.9:0") {
+    let mut punch_target = match std::net::UdpSocket::bind("127.0.0.9:0") {
         Ok(socket) => socket,
         Err(error) => {
             eprintln!("skipping: 127.0.0.9 UDP bind unavailable: {error}");
@@ -2765,114 +2821,61 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
     // THE punch observable: a probe-shaped packet from the receiver's
     // bound QUIC port arrives at the advertised address within the punch
     // window (the loop fires at pairing completion, concurrently with the
-    // sender's dial — read while the transfer runs).
-    punch_target
-        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-        .expect("punch target timeout");
-    // Pairing + punch window + transfer slack.
-    let punch_deadline = Instant::now() + std::time::Duration::from_secs(30);
-    // Q-N3 (2026-11-27): the first CI failure of this test said only that
-    // no matching packet arrived. The report now also says what the 30 s
-    // did see, on the same clock as the three processes' timelines, and
-    // (review 20) what the receiver's own punch loop says it sent to the
-    // watched target.
-    let chain = [
-        ("receiver", &recv.stdout),
-        ("sender", &sender.stdout),
-        ("registry", &registry.proc.stdout),
-    ];
-    let origin = chain
-        .iter()
-        .filter_map(|(_, log)| log.earliest_ms())
-        .min()
-        .unwrap_or_else(since_origin_ms);
-    let watching_from_ms = since_origin_ms().saturating_sub(origin);
-    let mut watch = PunchWatch::default();
-    // The joiner's exit status when it ended before a matching packet, and
-    // when that was seen.
-    let mut sender_exit: Option<String> = None;
-    let mut joiner_gone: Option<Instant> = None;
-    let mut buffer = [0u8; 1500];
-    while Instant::now() < punch_deadline && !watch.from_quic_port {
-        // The joiner ending (any status) means the transfer is over. The
-        // receiver's punch loop, started at pairing, may still be inside
-        // its window: read what is already queued first (review 20: a
-        // matching packet can sit in the queue when the exit is first
-        // seen), then keep reading only for as long as that window lasts.
-        if sender_exit.is_none() {
-            if let Some(status) = sender.exit_status() {
-                sender_exit = Some(status.to_string());
-                watch.drain(&punch_target, quic_port, origin);
-                joiner_gone = Some(Instant::now());
-            }
-        }
-        if joiner_gone.is_some_and(|seen| seen.elapsed() >= punch_grace()) {
-            break;
-        }
-        match punch_target.recv_from(&mut buffer) {
-            Ok((len, from)) => {
-                if watch.saw(&buffer[..len], from, quic_port, origin) {
-                    break;
-                }
-            }
-            // Interrupted (e.g. on Unix): the read is retried inside the
-            // same 30 s budget, not counted and not a failure.
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                watch.read_timeouts += 1;
-            }
-            Err(error) => {
-                watch.read_error = Some(error.to_string());
-                break;
-            }
-        }
-    }
-    if let Some((len, probe)) = watch.bad_packet {
-        assert!(
-            probe,
-            "the punch packet is probe-shaped: {len} bytes{}",
-            failure_report(&chain)
+    // sender's dial — read while the transfer runs). The 30 s start here,
+    // right after the sender's STUN line was read (plan of 2026-11-28,
+    // section C): what they saw, the receiver's own record and the three
+    // processes come from one frozen copy.
+    let watch = {
+        let chain = [
+            ("receiver", &recv.stdout),
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ];
+        let origin = chain
+            .iter()
+            .filter_map(|(_, log)| log.earliest_ms())
+            .min()
+            .unwrap_or_else(since_origin_ms);
+        let watching_from_ms = since_origin_ms().saturating_sub(origin);
+        let deadline_ms = since_origin_ms() + 30_000;
+        let mut watch = PunchWatch::default();
+        let joiner = &mut || sender.exit_status().map(|status| status.to_string());
+        let (ended, joiner_exit) = watch_punch(
+            &mut punch_target,
+            quic_port,
+            deadline_ms,
+            punch_grace().as_millis(),
+            joiner,
+            &mut watch,
         );
-        assert!(
-            len <= 64,
-            "the punch packet is small: {len} bytes{}",
-            failure_report(&chain)
-        );
-    }
-    let receiver_log = recv.stdout.snapshot().join("\n");
-    assert!(
-        watch.from_quic_port,
-        "the receiver's punch must arrive from its bound QUIC port {quic_port}: \
-         watching from +{watching_from_ms} ms, probe-shaped packets seen {} \
-         (from other source ports {}), first at +{:?} ms, last at +{:?} ms, \
-         read timeouts {}, sender exit status {sender_exit:?}, read error {:?}; \
-         receiver pairing line seen: {}; receiver punch loop: {}{}",
-        watch.packets,
-        watch.other_source_port,
-        watch.first_packet_ms,
-        watch.last_packet_ms,
-        watch.read_timeouts,
-        watch.read_error,
-        receiver_log.contains("[task] paired; peer "),
-        punch_loop_record(&recv.stderr.snapshot().join("\n"), punch_addr.port()),
-        failure_report(&chain)
-    );
+        if ended != WatchEnd::Matched {
+            assert_punch_arrived(
+                &watch,
+                quic_port,
+                watching_from_ms,
+                deadline_ms,
+                joiner_exit.as_ref(),
+                punch_addr.port(),
+                "receiver",
+                &chain,
+            );
+        }
+        watch
+    };
 
     // The receiver's punch loop ends with the first connection or with its
     // window, whichever comes first; its line is taken before the transfer
-    // goes on. On a fast machine the receiver can otherwise finish and exit
-    // inside one tick of the loop, and the detached loop's report is never
-    // written (CI run 46054926242 failed exactly there, on both platforms).
-    recv.stderr.wait_for_reporting(
+    // goes on. What CI run 46054926242 (head b0ea728) showed is that, at
+    // the assertion back then, the parent had not read that line yet. Two
+    // explanations fit — the receiver finished and exited before the
+    // loop's next tick wrote it, or the line was written and the parent
+    // had not drained the pipe yet — and the change covers both, so the
+    // green runs since do not tell which it was.
+    recv.wait_for_line(
+        Stream::Stderr,
         "[pair-diag] receiver punch loop ended: ",
         std::time::Duration::from_secs(10),
         &[
-            ("receiver", &recv.stdout),
             ("sender", &sender.stdout),
             ("registry", &registry.proc.stdout),
         ],
@@ -2894,19 +2897,35 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
     );
     sender.wait_exit_ok(std::time::Duration::from_secs(180));
     recv.wait_exit_ok(std::time::Duration::from_secs(60));
-    let recv_log = recv.stdout.snapshot().join("\n");
+    // The receiver's own record agrees with the socket: the watched port
+    // was one of its selected targets, and it sent to that target.
+    let chain = [
+        ("receiver", &recv.stdout),
+        ("sender", &sender.stdout),
+        ("registry", &registry.proc.stdout),
+    ];
+    let frozen = freeze(&chain);
+    let receiver = frozen
+        .process("receiver")
+        .expect("the receiver is one of the chain");
+    let recv_log = receiver.out_text();
     assert!(
         recv_log.contains("[task] punching"),
         "the receiver must report its punch loop: {}",
         redact(&recv_log)
     );
-    // The receiver's own record agrees with the socket: the watched port
-    // was one of its selected targets, and it sent to that target (the
-    // line was waited for above, so it is on hand).
-    let record = punch_loop_record(&recv.stderr.snapshot().join("\n"), punch_addr.port());
+    let record = punch_loop_record(&receiver.err_text(), punch_addr.port());
     assert!(
-        record.contains("first sent on tick "),
-        "the receiver's punch loop must record a send to the watched port: {record}"
+        matches!(
+            record,
+            PunchRecord::Sent {
+                tick: 1..,
+                packets: 1..,
+                ..
+            }
+        ),
+        "the receiver's punch loop must record a send to the watched port: {}",
+        record.describe()
     );
     let landed = std::fs::read(tmp.path().join("t03-cr5b-recv-out").join("payload.bin"))
         .expect("received payload");
@@ -2917,15 +2936,18 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
     );
     // What the run proved, for a single-case run of this test (`--exact
     // --nocapture`): a skipped run prints `skipping:` and none of this.
+    // The time is that of the first packet from the QUIC port, not of the
+    // first packet from anywhere.
     eprintln!(
         "t03 punch: a probe-shaped packet from the receiver's QUIC port {quic_port} reached the \
-         watched target at +{} ms ({} probe-shaped packets seen, {} from other source ports); \
-         receiver punch loop: {record}; both children exited 0; payload {} bytes identical",
-        watch
-            .first_packet_ms
-            .map_or("?".to_string(), |ms| ms.to_string()),
-        watch.packets,
-        watch.other_source_port,
+         watched target at +{} ms (the first probe-shaped packet from any source at +{} ms; \
+         {} seen, {} from other source ports); receiver punch loop: {}; both children exited 0; \
+         payload {} bytes identical",
+        since_origin(frozen.origin, watch.first_match_ms),
+        since_origin(frozen.origin, watch.first_probe_ms),
+        watch.probes,
+        watch.other_source_probes,
+        record.describe(),
         landed.len()
     );
 }
@@ -2937,114 +2959,836 @@ fn punch_grace() -> std::time::Duration {
     ak_session::pairing::task_net::PUNCH_WINDOW + ak_session::pairing::task_net::PUNCH_LOW_TTL_PHASE
 }
 
-/// What the watched socket of the punch test saw (Q-N3, review 20): the
-/// numbers a failure needs, kept apart from the processes' logs.
+/// How often the watched socket is asked again when nothing was queued.
+const PUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The largest datagram the punch test reads.
+const PUNCH_BUFFER: usize = 1500;
+
+/// What the punch test reads datagrams with: the real socket, or a
+/// scripted one with a clock of its own in the unit tests below.
+trait DatagramSource {
+    fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()>;
+    fn recv_from(&mut self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+    /// The test's monotonic clock, in milliseconds.
+    fn now_ms(&self) -> u128;
+    /// How long the socket is left alone before it is asked again.
+    fn wait_a_little(&mut self, at_most: std::time::Duration);
+}
+
+impl DatagramSource for std::net::UdpSocket {
+    fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> {
+        std::net::UdpSocket::set_nonblocking(self, on)
+    }
+
+    fn recv_from(&mut self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        std::net::UdpSocket::recv_from(self, buffer)
+    }
+
+    fn now_ms(&self) -> u128 {
+        since_origin_ms()
+    }
+
+    fn wait_a_little(&mut self, at_most: std::time::Duration) {
+        std::thread::sleep(at_most);
+    }
+}
+
+/// What the watched socket saw of the receiver's punch. Times are the
+/// moments the parent read the datagrams, on the report's clock.
 #[derive(Default)]
 struct PunchWatch {
-    /// A probe-shaped packet from the receiver's bound QUIC port arrived.
-    from_quic_port: bool,
-    packets: usize,
-    other_source_port: usize,
-    first_packet_ms: Option<u128>,
-    last_packet_ms: Option<u128>,
-    read_timeouts: usize,
+    /// The first probe-shaped packet from any source.
+    first_probe_ms: Option<u128>,
+    /// The first probe-shaped packet from the receiver's bound QUIC port,
+    /// read before the deadline.
+    first_match_ms: Option<u128>,
+    /// A matching packet first read at or after the deadline: seen, but no
+    /// hit inside the budget.
+    late_match_ms: Option<u128>,
+    /// The last probe-shaped packet from any source.
+    last_probe_ms: Option<u128>,
+    /// Probe-shaped packets from any source.
+    probes: usize,
+    /// …of them from a source port other than the QUIC port.
+    other_source_probes: usize,
+    /// Datagrams that are not what this socket is for (not probe-shaped,
+    /// or longer than 64 bytes): length and whether probe-shaped.
+    bad_packets: Vec<(usize, bool)>,
+    /// Reads that found nothing queued.
+    empty_reads: usize,
+    /// Reads interrupted and retried inside the same budget.
+    interrupted: usize,
+    /// The first read error that is neither of those, as text.
     read_error: Option<String>,
-    /// A packet that is not what this socket is for: its length and
-    /// whether it was probe-shaped.
-    bad_packet: Option<(usize, bool)>,
 }
 
 impl PunchWatch {
-    /// Account for one datagram read off the watched socket. `true` when
-    /// it is not a punch packet: the caller stops and reports.
-    fn saw(&mut self, payload: &[u8], from: SocketAddr, quic_port: u16, origin: u128) -> bool {
-        let probe = ak_net::holepunch::is_probe_packet(payload);
-        if !probe || payload.len() > 64 {
-            self.bad_packet = Some((payload.len(), probe));
-            return true;
-        }
-        self.packets += 1;
-        let at = since_origin_ms().saturating_sub(origin);
-        self.first_packet_ms.get_or_insert(at);
-        self.last_packet_ms = Some(at);
-        if from.port() == quic_port {
-            self.from_quic_port = true;
-        } else {
-            // The pairing-time probe (ak-session's throwaway socket) also
-            // lands here.
-            self.other_source_port += 1;
-        }
-        false
+    fn matched(&self) -> bool {
+        self.first_match_ms.is_some()
     }
 
-    /// Read and account for every datagram already queued on `socket`,
-    /// without blocking; the socket's read timeout is set back after.
-    fn drain(&mut self, socket: &std::net::UdpSocket, quic_port: u16, origin: u128) {
-        let timeout = socket.read_timeout().ok().flatten();
-        let _ = socket.set_read_timeout(Some(std::time::Duration::ZERO));
-        let mut buffer = [0u8; 1500];
-        while !self.from_quic_port && self.bad_packet.is_none() {
-            match socket.recv_from(&mut buffer) {
-                Ok((len, from)) => {
-                    if self.saw(&buffer[..len], from, quic_port, origin) {
-                        break;
-                    }
-                }
-                // Nothing more is queued (or the socket is done): the
-                // errors of a non-blocking read carry no information.
-                Err(_) => break,
+    /// Account for one datagram read at `at_ms`. `true` when the reading
+    /// stops: a match, or a datagram that is not what this socket is for.
+    fn saw(&mut self, payload: &[u8], from: SocketAddr, quic_port: u16, at_ms: u128) -> bool {
+        let probe = ak_net::holepunch::is_probe_packet(payload);
+        if !probe || payload.len() > 64 {
+            self.bad_packets.push((payload.len(), probe));
+            return true;
+        }
+        self.probes += 1;
+        self.first_probe_ms.get_or_insert(at_ms);
+        self.last_probe_ms = Some(at_ms);
+        if from.port() == quic_port {
+            self.first_match_ms.get_or_insert(at_ms);
+            true
+        } else {
+            self.other_source_probes += 1;
+            false
+        }
+    }
+}
+
+/// How the watching ended.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchEnd {
+    /// A probe-shaped packet from the receiver's bound QUIC port, read
+    /// before the deadline.
+    Matched,
+    /// A datagram that is not what this socket is for.
+    BadPacket,
+    /// The deadline passed: 30 s after the sender's STUN line, or the
+    /// punch grace after the joiner's exit, whichever came first.
+    Deadline,
+    /// The socket could not be switched to non-blocking reads.
+    Source(String),
+    /// A read failed for a reason other than "nothing queued".
+    ReadError,
+}
+
+/// The joiner's exit, as the loop first saw it.
+struct JoinerExit {
+    at_ms: u128,
+    status: String,
+}
+
+/// Read the watched socket until a probe-shaped packet from `quic_port`
+/// arrives, a datagram is not what the socket is for, a read fails, or the
+/// deadline passes — `deadline_ms`, shortened to `grace_ms` after the
+/// joiner's exit (`joiner_exit`, asked before every read) is first seen.
+/// The socket is switched to non-blocking reads once, and that is checked.
+/// Before every read the remaining budget is checked, so a packet that is
+/// only read at or after the deadline is never a hit; a match, a bad
+/// datagram or a hard read error ends the reading at once (plan of
+/// 2026-11-28, section C).
+fn watch_punch(
+    source: &mut impl DatagramSource,
+    quic_port: u16,
+    deadline_ms: u128,
+    grace_ms: u128,
+    joiner_exit: &mut dyn FnMut() -> Option<String>,
+    watch: &mut PunchWatch,
+) -> (WatchEnd, Option<JoinerExit>) {
+    if let Err(error) = source.set_nonblocking(true) {
+        return (WatchEnd::Source(error.to_string()), None);
+    }
+    let mut deadline_ms = deadline_ms;
+    let mut exit: Option<JoinerExit> = None;
+    let mut buffer = [0u8; PUNCH_BUFFER];
+    loop {
+        let now = source.now_ms();
+        if now >= deadline_ms {
+            return (WatchEnd::Deadline, exit);
+        }
+        if exit.is_none() {
+            if let Some(status) = joiner_exit() {
+                // The joiner ending (any status) means the transfer is
+                // over. The receiver's punch loop, started at pairing, may
+                // still be inside its window: the socket keeps being read
+                // for that long, and no longer.
+                deadline_ms = deadline_ms.min(now + grace_ms);
+                exit = Some(JoinerExit { at_ms: now, status });
             }
         }
-        let _ = socket.set_read_timeout(timeout);
+        match source.recv_from(&mut buffer) {
+            Ok((len, from)) => {
+                let at_ms = source.now_ms();
+                if watch.saw(&buffer[..len], from, quic_port, at_ms) {
+                    if let Some(at) = watch.first_match_ms {
+                        if at >= deadline_ms {
+                            // Read only after the deadline: not a hit.
+                            watch.first_match_ms = None;
+                            watch.late_match_ms = Some(at);
+                            return (WatchEnd::Deadline, exit);
+                        }
+                    }
+                    let ended = if watch.matched() {
+                        WatchEnd::Matched
+                    } else {
+                        WatchEnd::BadPacket
+                    };
+                    return (ended, exit);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => watch.interrupted += 1,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                watch.empty_reads += 1;
+                let left = std::time::Duration::from_millis((deadline_ms - now) as u64);
+                source.wait_a_little(PUNCH_POLL.min(left));
+            }
+            Err(error) => {
+                watch.read_error = Some(error.to_string());
+                return (WatchEnd::ReadError, exit);
+            }
+        }
     }
 }
 
 /// What the receiver's `[pair-diag] receiver punch loop ended:` line says
-/// about the port the test watches (review 20): whether that target was
-/// selected at all, and on which tick the loop first sent to it — a total
-/// over all targets cannot tell. The line carries ports and counts only.
-fn punch_loop_record(receiver_log: &str, watched_port: u16) -> String {
-    let Some(line) = receiver_log
+/// about the watched port. Only `Sent` proves that the loop sent to that
+/// port; everything else names what is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PunchRecord {
+    /// The loop has not ended yet, or never ran: no end line.
+    NoEndLine,
+    /// The line is there; the watched port is not among the selected
+    /// targets (the list may be empty).
+    NotSelected,
+    /// Selected, and no send to it succeeded (`@0/0`).
+    NeverSent,
+    /// Selected, but the evidence does not decide: the port is that of
+    /// several targets, or a count is missing, zero on one side only, not
+    /// a number, or out of range.
+    Undecided(String),
+    /// Selected alone: target `index` of `of`, first sent on tick `tick`
+    /// (1-based), `packets` sent in all.
+    Sent {
+        index: usize,
+        of: usize,
+        tick: u32,
+        packets: u32,
+    },
+}
+
+impl PunchRecord {
+    fn describe(&self) -> String {
+        match self {
+            PunchRecord::NoEndLine => "no end line yet (the loop starts once pairing completes \
+                 and ends with its window or the first connection)"
+                .to_string(),
+            PunchRecord::NotSelected => {
+                "the watched port is not among the selected target(s)".to_string()
+            }
+            PunchRecord::NeverSent => {
+                "the watched port is a selected target, but no send to it succeeded (@0/0)"
+                    .to_string()
+            }
+            PunchRecord::Undecided(why) => {
+                format!("the evidence does not decide: {why}")
+            }
+            PunchRecord::Sent {
+                index,
+                of,
+                tick,
+                packets,
+            } => format!(
+                "the watched port is target {index} of {of}, first sent on tick {tick}, \
+                 {packets} packet(s)"
+            ),
+        }
+    }
+}
+
+/// The part of the receiver's end line after `selected [` and before `];`.
+fn punch_loop_record(receiver_err: &str, watched_port: u16) -> PunchRecord {
+    const HEAD: &str = "[pair-diag] receiver punch loop ended: ";
+    let Some(said) = receiver_err
         .lines()
-        .find(|line| line.contains("[pair-diag] receiver punch loop ended: "))
+        .filter_map(|line| line.split_once(HEAD).map(|(_, said)| said))
+        .next_back()
     else {
-        return "no end line yet (the loop starts once pairing completes and ends \
-                with its window or the first connection)"
-            .to_string();
+        return PunchRecord::NoEndLine;
     };
-    let said = line
-        .split("[pair-diag] receiver punch loop ended: ")
-        .nth(1)
-        .unwrap_or("");
     let selected = said
         .split("selected [")
         .nth(1)
         .and_then(|rest| rest.split("];").next())
-        .unwrap_or("");
+        .unwrap_or_default();
     let entries: Vec<&str> = selected
         .split(", ")
         .filter(|entry| !entry.is_empty())
         .collect();
     let watched_port = watched_port.to_string();
-    let target = match entries
+    let watched: Vec<&str> = entries
         .iter()
-        .position(|entry| entry.split('@').next() == Some(watched_port.as_str()))
-    {
-        Some(index) => {
-            let (tick, packets) = entries[index]
-                .rsplit_once('@')
-                .and_then(|(_, counts)| counts.split_once('/'))
-                .unwrap_or(("?", "?"));
-            format!(
-                "the watched port is target {} of {}, first sent on tick {tick}, {packets} packet(s)",
-                index + 1,
-                entries.len()
-            )
-        }
-        None => format!(
-            "the watched port is not among the selected target(s) [{}]",
-            selected
-        ),
+        .copied()
+        .filter(|entry| entry.split('@').next() == Some(watched_port.as_str()))
+        .collect();
+    if watched.is_empty() {
+        return PunchRecord::NotSelected;
+    }
+    if watched.len() > 1 {
+        return PunchRecord::Undecided(format!(
+            "the watched port is the port of {} of the {} selected target(s) \
+             [{selected}], so one target cannot be named",
+            watched.len(),
+            entries.len()
+        ));
+    }
+    let entry = watched[0];
+    let undecided = |why: &str| {
+        PunchRecord::Undecided(format!("the watched port is selected [{entry}], but {why}"))
     };
-    format!("{said}; for the watched port: {target}")
+    let Some((tick, packets)) = entry
+        .split_once('@')
+        .and_then(|(_, counts)| counts.split_once('/'))
+    else {
+        return undecided("a count is missing");
+    };
+    let (Ok(tick), Ok(packets)) = (tick.parse::<u32>(), packets.parse::<u32>()) else {
+        return undecided("a count is not a number or is out of range");
+    };
+    match (tick, packets) {
+        (0, 0) => PunchRecord::NeverSent,
+        (tick, packets) if tick > 0 && packets > 0 => PunchRecord::Sent {
+            index: entries
+                .iter()
+                .position(|other| *other == entry)
+                .unwrap_or(0)
+                + 1,
+            of: entries.len(),
+            tick,
+            packets,
+        },
+        _ => undecided("one count is zero and the other is not"),
+    }
+}
+
+/// An exit status as a real child produced it, for synthetic logs.
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    let mut command = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+    if cfg!(windows) {
+        command.args(["/C", "exit", &code.to_string()]);
+    } else {
+        command.args(["-c", &format!("exit {code}")]);
+    }
+    command
+        .status()
+        .expect("run a child that exits with the code")
+}
+
+/// Plan of 2026-11-28 (after review 21), section B: the same ending
+/// decides the same way, whichever thread reports first.
+#[test]
+fn ending_with_error_does_not_depend_on_which_thread_reports_first() {
+    const ERROR: &str = "Error: something failed";
+    // The exit status 0 first, then the error line and the pipes' end.
+    let a = LineLog::synthetic("p", &[], &[], false, Watched::Exited(exit_status(0)));
+    assert!(!a.ended_with_error());
+    a.state.lock().unwrap().end = Some((since_origin_ms(), None));
+    a.stderr
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .lines
+        .push(TimedLine {
+            at_ms: since_origin_ms(),
+            text: ERROR.to_string(),
+        });
+    // One pipe still open while the status says 0: not enough.
+    assert!(!a.ended_with_error());
+    a.stderr.as_ref().unwrap().lock().unwrap().end = Some((since_origin_ms(), None));
+    assert!(a.ended_with_error());
+    // The error line and both pipes' end first, then the exit status 0.
+    let b = LineLog::synthetic("p", &[], &[ERROR.to_string()], true, Watched::Running);
+    assert!(b.ended_with_error());
+    *b.exit.as_ref().unwrap().lock().unwrap() = Watched::Exited(exit_status(0));
+    assert!(b.ended_with_error());
+    // An unsuccessful exit needs no error line.
+    let c = LineLog::synthetic("p", &[], &[], false, Watched::Exited(exit_status(3)));
+    assert!(c.ended_with_error());
+    // A clean exit is not an error.
+    let d = LineLog::synthetic(
+        "p",
+        &["all good".to_string()],
+        &[],
+        true,
+        Watched::Exited(exit_status(0)),
+    );
+    assert!(!d.ended_with_error());
+    // An error line with one pipe still open, while the process runs, is
+    // not enough.
+    let e = LineLog::synthetic("p", &[], &[ERROR.to_string()], false, Watched::Running);
+    assert!(!e.ended_with_error());
+    // An unknown end goes by the pipes and the error line alone.
+    let f = LineLog::synthetic(
+        "p",
+        &[],
+        &[ERROR.to_string()],
+        true,
+        Watched::Unwatched("x".to_string()),
+    );
+    assert!(f.ended_with_error());
+    let g = LineLog::synthetic("p", &[], &[], true, Watched::Unwatched("x".to_string()));
+    assert!(!g.ended_with_error());
+}
+
+/// Plan of 2026-11-28, section B: a wait on one stream reports every
+/// process once — both pipes, one exit status — and a line read after the
+/// deadline explains the failure without ending it.
+#[test]
+fn a_wait_on_one_stream_reports_each_process_once() {
+    let receiver = LineLog::synthetic(
+        "receiver",
+        &["the same needle on stdout".to_string()],
+        &[],
+        false,
+        Watched::Running,
+    );
+    let sender = LineLog::synthetic("sender", &[], &[], false, Watched::Running);
+    let registry = LineLog::synthetic("registry", &[], &[], false, Watched::Running);
+    let others = [
+        ("sender", &sender),
+        ("registry", &registry),
+        // The same process a second time, and its bare stderr log: neither
+        // gets a second heading.
+        ("receiver", &receiver),
+        (
+            "receiver again",
+            &LineLog {
+                state: Arc::clone(receiver.stderr.as_ref().unwrap()),
+                stderr: None,
+                name: None,
+                exit: None,
+            },
+        ),
+    ];
+    let text = panic_text(|| {
+        receiver.wait_for_stream(
+            Stream::Stderr,
+            "the same needle",
+            std::time::Duration::from_millis(40),
+            &others,
+        );
+    });
+    for heading in ["--- receiver (", "--- sender (", "--- registry ("] {
+        assert_eq!(text.matches(heading).count(), 1, "{heading} in:\n{text}");
+    }
+    assert_eq!(text.matches("exit status:").count(), 3, "{text}");
+    assert!(text.contains("out: the same needle on stdout"), "{text}");
+    assert!(!text.contains("err: the same needle"), "{text}");
+
+    // Read after the deadline: shown in the report, not returned.
+    let late = LineLog::synthetic(
+        "p",
+        &["came late".to_string()],
+        &[],
+        false,
+        Watched::Running,
+    );
+    late.state.lock().unwrap().lines[0].at_ms = since_origin_ms() + 60_000;
+    let text = panic_text(|| {
+        late.wait_for_stream(
+            Stream::Stdout,
+            "came late",
+            std::time::Duration::from_millis(40),
+            &[],
+        );
+    });
+    assert!(
+        text.contains("no line of the stdout containing \"came late\""),
+        "{text}"
+    );
+    assert!(text.contains("came late"), "{text}");
+}
+
+/// Plan of 2026-11-28, section B: a report waits for the last lines of a
+/// process that already exited, and everything it says reads that one
+/// copy. A line that arrives after the copy was taken is in nothing.
+#[test]
+fn a_report_reads_the_last_lines_of_an_exited_process_once() {
+    const END_LINE: &str = "[pair-diag] receiver punch loop ended: 2 candidate(s), 2 considered, \
+         selected [41@2/3]; 6 packet(s) sent (0 low-TTL), 3 tick(s), stopped early: false, \
+         start delayed: false";
+    let receiver = LineLog::synthetic(
+        "receiver",
+        &["[task] punching".to_string()],
+        &[],
+        false,
+        Watched::Exited(exit_status(1)),
+    );
+    receiver.state.lock().unwrap().end = Some((since_origin_ms(), None));
+    let stderr = Arc::clone(receiver.stderr.as_ref().unwrap());
+    // The last line is still in the pipe: it arrives 150 ms after the exit
+    // was seen, and with it the pipe's end.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut state = stderr.lock().unwrap();
+        state.lines.push(TimedLine {
+            at_ms: since_origin_ms(),
+            text: END_LINE.to_string(),
+        });
+        state.end = Some((since_origin_ms(), None));
+    });
+    let sender = LineLog::synthetic("sender", &[], &[], true, Watched::Exited(exit_status(1)));
+    let chain = [("receiver", &receiver), ("sender", &sender)];
+    let watch = PunchWatch::default();
+    let text = panic_text(|| {
+        assert_punch_arrived(&watch, 53421, 300, 30_300, None, 41, "receiver", &chain)
+    });
+    // In the summary …
+    assert!(text.contains("first sent on tick 2, 3 packet(s)"), "{text}");
+    // … and in the details, once.
+    assert_eq!(text.matches(END_LINE).count(), 1, "{text}");
+    // A line that arrives after the copy was taken is in neither.
+    let frozen = freeze(&chain);
+    let taken = frozen.process("receiver").expect("the receiver is frozen");
+    assert!(taken.err_text().contains(END_LINE));
+    assert_eq!(
+        punch_loop_record(&taken.err_text(), 41).describe(),
+        "the watched port is target 1 of 1, first sent on tick 2, 3 packet(s)"
+    );
+    let before = frozen.render();
+    receiver
+        .stderr
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .lines
+        .push(TimedLine {
+            at_ms: since_origin_ms(),
+            text: "written after the copy".to_string(),
+        });
+    assert!(!frozen.render().contains("written after the copy"));
+    assert!(!before.contains("written after the copy"));
+}
+
+/// One read of a scripted watched socket.
+enum Step {
+    /// A datagram from `from_port`, read `after_ms` later: probe-shaped or
+    /// not.
+    Packet {
+        after_ms: u128,
+        from_port: u16,
+        probe: bool,
+    },
+    Interrupted,
+    /// A read error of this kind, other than "nothing queued".
+    Error(std::io::ErrorKind),
+}
+
+/// A watched socket that answers from a script: each read returns the next
+/// step and moves the clock by the step's delay; an empty script answers
+/// `WouldBlock`, and waiting moves the clock too.
+struct ScriptedSocket {
+    steps: std::collections::VecDeque<Step>,
+    clock_ms: u128,
+    reads: usize,
+    refuses_nonblocking: bool,
+}
+
+impl ScriptedSocket {
+    fn new(steps: Vec<Step>) -> Self {
+        ScriptedSocket {
+            steps: steps.into(),
+            clock_ms: 0,
+            reads: 0,
+            refuses_nonblocking: false,
+        }
+    }
+}
+
+impl DatagramSource for ScriptedSocket {
+    fn set_nonblocking(&mut self, _on: bool) -> std::io::Result<()> {
+        if self.refuses_nonblocking {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn recv_from(&mut self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.reads += 1;
+        match self.steps.pop_front() {
+            Some(Step::Packet {
+                after_ms,
+                from_port,
+                probe,
+            }) => {
+                self.clock_ms += after_ms;
+                let packet = if probe {
+                    ak_net::holepunch::probe_packet(&[0x5A; 16])
+                } else {
+                    vec![0u8; 200]
+                };
+                buffer[..packet.len()].copy_from_slice(&packet);
+                Ok((
+                    packet.len(),
+                    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), from_port),
+                ))
+            }
+            Some(Step::Interrupted) => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            Some(Step::Error(kind)) => Err(std::io::Error::from(kind)),
+            None => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        }
+    }
+
+    fn now_ms(&self) -> u128 {
+        self.clock_ms
+    }
+
+    fn wait_a_little(&mut self, at_most: std::time::Duration) {
+        self.clock_ms += at_most.as_millis();
+    }
+}
+
+fn probe(after_ms: u128, from_port: u16) -> Step {
+    Step::Packet {
+        after_ms,
+        from_port,
+        probe: true,
+    }
+}
+
+/// Plan of 2026-11-28, section C: how many reads the loop makes on a
+/// scripted socket with a clock of its own. `run` returns how it ended,
+/// the joiner's exit status as the loop saw it, the number of reads, the
+/// clock when the loop returned, and what was seen.
+#[test]
+fn the_punch_loop_reads_only_what_its_budget_allows() {
+    const QUIC: u16 = 53421;
+    let run = |steps: Vec<Step>, deadline_ms: u128, grace_ms: u128, joiner: Option<&str>| {
+        let mut socket = ScriptedSocket::new(steps);
+        let mut watch = PunchWatch::default();
+        let mut exit_status = || joiner.map(str::to_string);
+        let (ended, exit) = watch_punch(
+            &mut socket,
+            QUIC,
+            deadline_ms,
+            grace_ms,
+            &mut exit_status,
+            &mut watch,
+        );
+        (
+            ended,
+            exit.map(|exit| exit.status),
+            socket.reads,
+            socket.clock_ms,
+            watch,
+        )
+    };
+    // Another source at +3 ms, the match at +9 ms: two reads; the times
+    // are those of the first packet from anywhere and of the match.
+    let (ended, exit, reads, _, watch) =
+        run(vec![probe(3, 54000), probe(6, QUIC)], 30_000, 5_000, None);
+    assert_eq!((ended, exit, reads), (WatchEnd::Matched, None, 2));
+    assert_eq!(
+        (
+            watch.first_probe_ms,
+            watch.first_match_ms,
+            watch.last_probe_ms,
+            watch.other_source_probes
+        ),
+        (Some(3), Some(9), Some(9), 1)
+    );
+    // A datagram that is not a probe packet: one read, no match.
+    let (ended, _, reads, _, watch) = run(
+        vec![
+            Step::Packet {
+                after_ms: 3,
+                from_port: QUIC,
+                probe: false,
+            },
+            probe(6, QUIC),
+        ],
+        30_000,
+        5_000,
+        None,
+    );
+    assert_eq!((ended, reads), (WatchEnd::BadPacket, 1));
+    assert!(!watch.matched());
+    assert_eq!(watch.bad_packets, vec![(200, false)]);
+    // The deadline already passed: not one read.
+    let (ended, _, reads, _, _) = run(vec![probe(1, QUIC)], 0, 5_000, None);
+    assert_eq!((ended, reads), (WatchEnd::Deadline, 0));
+    // A match already queued when the joiner's exit is seen: read.
+    let (ended, exit, reads, _, watch) =
+        run(vec![probe(0, QUIC)], 30_000, 5_000, Some("exit code: 0"));
+    assert_eq!(
+        (ended, exit, reads, watch.matched()),
+        (WatchEnd::Matched, Some("exit code: 0".to_string()), 1, true)
+    );
+    // An empty queue: asked every 10 ms until the deadline, never matched.
+    let (ended, _, reads, clock, watch) = run(vec![], 100, 5_000, None);
+    assert_eq!((ended, reads, clock), (WatchEnd::Deadline, 10, 100));
+    assert_eq!(watch.empty_reads, 10);
+    assert!(!watch.matched());
+    // Near the deadline: another source every millisecond does not keep
+    // the loop reading past it.
+    let near: Vec<Step> = (0..20).map(|_| probe(1, 54000)).collect();
+    let (ended, _, reads, _, watch) = run(near, 10, 5_000, None);
+    assert_eq!((ended, reads), (WatchEnd::Deadline, 10));
+    assert_eq!(watch.other_source_probes, 10);
+    // Interrupted reads are retried inside the same budget.
+    let (ended, _, reads, _, watch) = run(
+        vec![Step::Interrupted, Step::Interrupted, probe(1, QUIC)],
+        30_000,
+        5_000,
+        None,
+    );
+    assert_eq!(ended, WatchEnd::Matched);
+    assert_eq!(
+        (reads, watch.interrupted, watch.first_match_ms),
+        (3, 2, Some(1))
+    );
+    // The joiner's exit shortens the deadline to the grace.
+    let (ended, exit, reads, clock, _) = run(
+        vec![
+            probe(1_000, 54000),
+            probe(1_000, 54000),
+            probe(1_000, 54000),
+            probe(1_000, QUIC),
+        ],
+        30_000,
+        3_000,
+        Some("exit code: 1"),
+    );
+    assert_eq!(ended, WatchEnd::Deadline);
+    assert_eq!(exit.as_deref(), Some("exit code: 1"));
+    assert_eq!((reads, clock), (3, 3_000));
+    // A match read at or after the deadline is not a hit.
+    let (ended, _, reads, _, watch) = run(
+        vec![probe(5_000, 54000), probe(2_000, QUIC)],
+        6_000,
+        5_000,
+        None,
+    );
+    assert_eq!(ended, WatchEnd::Deadline);
+    assert_eq!(
+        (reads, watch.matched(), watch.late_match_ms),
+        (2, false, Some(7_000))
+    );
+    // The socket cannot be switched: nothing is read.
+    let mut socket = ScriptedSocket::new(vec![probe(1, QUIC)]);
+    socket.refuses_nonblocking = true;
+    let mut watch = PunchWatch::default();
+    let mut never = || None;
+    let (ended, _) = watch_punch(&mut socket, QUIC, 30_000, 5_000, &mut never, &mut watch);
+    assert!(matches!(ended, WatchEnd::Source(_)));
+    assert_eq!(socket.reads, 0);
+    // A hard read error ends the reading at once.
+    let (ended, _, reads, _, watch) = run(
+        vec![
+            Step::Error(std::io::ErrorKind::ConnectionReset),
+            probe(1, QUIC),
+        ],
+        30_000,
+        5_000,
+        None,
+    );
+    assert_eq!((ended, reads), (WatchEnd::ReadError, 1));
+    assert!(watch.read_error.is_some());
+}
+
+/// Plan of 2026-11-28, section C: the real API — a datagram queued before
+/// the loop starts is read by the first non-blocking read.
+#[test]
+fn a_queued_probe_is_read_from_the_real_socket() {
+    let mut watched = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the watched socket");
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the sending socket");
+    sender
+        .send_to(
+            &ak_net::holepunch::probe_packet(&[0x07; 16]),
+            watched.local_addr().expect("watched address"),
+        )
+        .expect("queue the datagram");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut watch = PunchWatch::default();
+    let mut never = || None;
+    let (ended, _) = watch_punch(
+        &mut watched,
+        sender.local_addr().expect("sender address").port(),
+        since_origin_ms() + 2_000,
+        100,
+        &mut never,
+        &mut watch,
+    );
+    assert_eq!(ended, WatchEnd::Matched);
+    assert_eq!((watch.probes, watch.empty_reads), (1, 0));
+}
+
+/// Plan of 2026-11-28, section C: the receiver's record decides only for a
+/// target that is the only one with the watched port, and only with both
+/// counts positive.
+#[test]
+fn the_punch_record_decides_only_on_a_unique_target_with_positive_counts() {
+    let said = |selected: &str| {
+        format!(
+            "[pair-diag] receiver punch loop ended: 9 candidate(s), 8 considered, \
+             selected [{selected}]; 80 packet(s) sent (48 low-TTL), 10 tick(s), \
+             stopped early: true, start delayed: false"
+        )
+    };
+    assert_eq!(punch_loop_record("", 41), PunchRecord::NoEndLine);
+    assert_eq!(
+        punch_loop_record("some other line\nmore", 41),
+        PunchRecord::NoEndLine
+    );
+    assert_eq!(punch_loop_record(&said(""), 41), PunchRecord::NotSelected);
+    assert_eq!(
+        punch_loop_record(&said("40@1/2, 42@1/2"), 41),
+        PunchRecord::NotSelected
+    );
+    let sent = punch_loop_record(&said("40@1/2, 41@2/3, 42@1/1"), 41);
+    assert_eq!(
+        sent,
+        PunchRecord::Sent {
+            index: 2,
+            of: 3,
+            tick: 2,
+            packets: 3
+        }
+    );
+    assert_eq!(
+        sent.describe(),
+        "the watched port is target 2 of 3, first sent on tick 2, 3 packet(s)"
+    );
+    // The last end line is the one that counts.
+    assert_eq!(
+        punch_loop_record(&format!("{}\n{}", said("40@1/2"), said("41@2/3")), 41),
+        PunchRecord::Sent {
+            index: 1,
+            of: 1,
+            tick: 2,
+            packets: 3
+        }
+    );
+    assert_eq!(
+        punch_loop_record(&said("41@0/0"), 41),
+        PunchRecord::NeverSent
+    );
+    for undecidable in [
+        "41@0/3",
+        "41@2/0",
+        "41@2",
+        "41@x/3",
+        "41@2/x",
+        "41@2/4294967296",
+        "41@4294967296/1",
+        "41@-1/1",
+        "41@1/1, 41@2/3",
+    ] {
+        let record = punch_loop_record(&said(undecidable), 41);
+        assert!(
+            matches!(record, PunchRecord::Undecided(_)),
+            "{undecidable:?} gave {record:?}"
+        );
+    }
 }

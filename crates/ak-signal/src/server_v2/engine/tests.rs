@@ -2412,3 +2412,440 @@ async fn two_pending_redeems_racing_commit_yield_exactly_one() {
     }
     server.stop().await;
 }
+
+// ---- Q-N3 recurrence (2026-11-27): the diagnostics name each exit --------
+//
+// A Windows CI run saw task-code joins fail with the joiner's
+// `pairing target unavailable (0x2101)` and no line saying why. The
+// registry now logs one decision line per exit (DEBUG, target
+// `ak_signal::server_v2`); in these tests the same lines land in a sink, so
+// each test drives one exit over the real engine and checks that the line
+// for its own pairing names that exit and no other. Every assertion
+// filters by the test's own pairing or device prefix: the sink is
+// process-wide and the tests run in parallel.
+
+/// Every decision line the handlers produced, in order.
+pub(super) static DECISIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn sink_len() -> usize {
+    DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+/// The decision lines written since `since` that mention `about`.
+fn decisions_since(since: usize, about: &str) -> Vec<String> {
+    DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .skip(since)
+        .filter(|line| line.contains(about))
+        .cloned()
+        .collect()
+}
+
+fn prefix(bytes: &[u8]) -> String {
+    util::hex_prefix(bytes, 4)
+}
+
+/// The pairing-scope `unavailable` for `object_id` (the pairing id, or the
+/// all-zero id of a ghost's answer), and nothing else before it.
+async fn expect_unavailable(client: &mut TestClient, object_id: [u8; 16]) {
+    match client.recv().await {
+        CtrlMessage::PairError {
+            scope: crate::protocol_v2::ErrorScope::Pairing,
+            object_id: seen,
+            code: crate::protocol_v2::PAIR_UNAVAILABLE,
+            ..
+        } if seen == object_id => {}
+        other => panic!("expected the pairing's `unavailable`, got {other:?}"),
+    }
+}
+
+/// What `pending_redeem` hands back.
+struct PendingRedeem {
+    owner: TestClient,
+    joiner: TestClient,
+    pairing_id: PairingId,
+    code_id: CodeId,
+    /// The redeem's request id and nonce: the transcript must bind both.
+    request_id: RequestId,
+    redeemer_nonce: [u8; 32],
+}
+
+/// A live code of an owner and a pending redeem of a joiner under it: the
+/// registry has begun the pairing and pushed the offer to the owner.
+async fn pending_redeem(server: &TestServer, deadline: u64) -> PendingRedeem {
+    let registry_id = server.registry_id();
+    let mut owner =
+        TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "o").await;
+    let mut joiner =
+        TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "j").await;
+    let lookup: Digest32 = [0x5A; 32];
+    owner
+        .send_frame(
+            &CtrlFrame::new(CtrlMessage::InviteClaim {
+                request_id: random_id16(),
+                lookup_digest: lookup,
+                ttl_secs: 0,
+            })
+            .with_max_redeems(1),
+        )
+        .await;
+    let code_id = match owner.recv_frame().await.message {
+        CtrlMessage::InviteClaimed { code_id, .. } => code_id,
+        other => panic!("expected InviteClaimed, got {other:?}"),
+    };
+    let redeem = signed_redeem(&joiner.key, &registry_id, lookup, random_id16(), deadline);
+    joiner
+        .send(&CtrlMessage::InviteRedeem(redeem.clone()))
+        .await;
+    let pairing_id = match joiner.recv().await {
+        CtrlMessage::InviteRedeemPending { pairing_id, .. } => pairing_id,
+        other => panic!("expected the redeem to begin, got {other:?}"),
+    };
+    let _offer = owner.recv_frame().await;
+    PendingRedeem {
+        owner,
+        joiner,
+        pairing_id,
+        code_id,
+        request_id: redeem.request_id,
+        redeemer_nonce: redeem.redeemer_nonce,
+    }
+}
+
+/// The owner's challenge and the joiner's proof, both in time: after this
+/// the registry holds the transcript and both proofs, and the pairing
+/// waits for the two Prepared.
+#[allow(clippy::too_many_arguments)] // the transcript's own fields, as in `drive_to_commit`
+async fn challenge_and_proof(
+    owner: &mut TestClient,
+    joiner: &mut TestClient,
+    registry_id: &RegistryId,
+    code_id: CodeId,
+    lookup: Digest32,
+    pairing_id: PairingId,
+    request_id: RequestId,
+    redeemer_nonce: [u8; 32],
+    deadline: u64,
+) -> Digest32 {
+    let transcript = PairTranscript {
+        registry_id: *registry_id,
+        code_id,
+        code_revision: 1,
+        pairing_id,
+        request_id,
+        lookup_digest: lookup,
+        owner_device_id: owner.key.public_key(),
+        redeemer_device_id: joiner.key.public_key(),
+        owner_nonce: [0x0D; 32],
+        redeemer_nonce,
+        deadline_ms: deadline,
+    };
+    let bytes = transcript.to_bytes();
+    owner
+        .send(&CtrlMessage::PairChallenge {
+            transcript: bytes,
+            owner_proof: PairProof {
+                mac: [0x11; 32],
+                signature: owner.key.sign(&hello2::proof_signed_message(
+                    OWNER_PROOF_DOMAIN,
+                    &bytes,
+                    &[0x11; 32],
+                )),
+            },
+        })
+        .await;
+    match joiner.recv().await {
+        CtrlMessage::PairChallenge { transcript, .. } => assert_eq!(transcript, bytes),
+        other => panic!("expected the relayed PairChallenge, got {other:?}"),
+    }
+    let digest = hello2::transcript_digest(&bytes);
+    joiner
+        .send(&CtrlMessage::PairProof {
+            pairing_id,
+            transcript_digest: digest,
+            redeemer_proof: PairProof {
+                mac: [0x22; 32],
+                signature: joiner.key.sign(&hello2::proof_signed_message(
+                    REDEEMER_PROOF_DOMAIN,
+                    &bytes,
+                    &[0x22; 32],
+                )),
+            },
+        })
+        .await;
+    match owner.recv().await {
+        CtrlMessage::PairProof {
+            transcript_digest, ..
+        } => assert_eq!(transcript_digest, digest),
+        other => panic!("expected the relayed PairProof, got {other:?}"),
+    }
+    digest
+}
+
+async fn sleep_until_after(deadline: u64) {
+    while now_ms() <= deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A redeem for a code the registry does not have is a ghost: the joiner's
+/// `unavailable` comes at the deadline and is named as a ghost expiry —
+/// not as a sweep, and not as an abort.
+#[tokio::test]
+async fn diagnostics_name_a_ghost_redeem_expiring_at_its_deadline() {
+    let server = spawn_server().await;
+    let registry_id = server.registry_id();
+    let mut joiner =
+        TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "j").await;
+    let since = sink_len();
+    let deadline = now_ms() + 300;
+    let redeem = signed_redeem(
+        &joiner.key,
+        &registry_id,
+        [0x9E; 32],
+        random_id16(),
+        deadline,
+    );
+    joiner
+        .send(&CtrlMessage::InviteRedeem(redeem.clone()))
+        .await;
+    match joiner.recv().await {
+        CtrlMessage::InviteRedeemPending { .. } => {}
+        other => panic!("expected the ghost's pending shape, got {other:?}"),
+    }
+    // The unified answer carries the all-zero object id and the request id.
+    match joiner.recv().await {
+        CtrlMessage::PairError {
+            request_id,
+            scope: crate::protocol_v2::ErrorScope::Pairing,
+            object_id,
+            code: crate::protocol_v2::PAIR_UNAVAILABLE,
+            ..
+        } => {
+            assert_eq!(request_id, redeem.request_id);
+            assert_eq!(object_id, [0u8; 16]);
+        }
+        other => panic!("expected the ghost's `unavailable`, got {other:?}"),
+    }
+    let about_joiner = decisions_since(since, &prefix(&joiner.key.public_key()));
+    assert!(
+        about_joiner
+            .iter()
+            .any(|line| line.contains("recorded as a ghost")
+                && line.contains("self-redeem: false")),
+        "{about_joiner:?}"
+    );
+    assert!(
+        about_joiner
+            .iter()
+            .all(|line| !line.contains("begun under code revision")),
+        "{about_joiner:?}"
+    );
+    let expired = decisions_since(since, "ghost redeem expired");
+    assert!(
+        expired
+            .iter()
+            .any(|line| line.contains(&format!("at its {deadline} ms deadline"))),
+        "{expired:?}"
+    );
+    server.stop().await;
+}
+
+/// A begun pairing nobody completes is swept at its deadline, and both
+/// participants' `unavailable` is named as that sweep — not as an abort.
+#[tokio::test]
+async fn diagnostics_name_a_pending_pairing_swept_past_its_deadline() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let pending = pending_redeem(&server, now_ms() + 300).await;
+    let PendingRedeem {
+        mut owner,
+        mut joiner,
+        pairing_id,
+        code_id: _,
+        request_id: _,
+        redeemer_nonce: _,
+    } = pending;
+    expect_unavailable(&mut joiner, pairing_id).await;
+    expect_unavailable(&mut owner, pairing_id).await;
+    let about = decisions_since(since, &prefix(&pairing_id));
+    assert!(
+        about
+            .iter()
+            .any(|line| line.contains("is past its deadline and is aborted")),
+        "{about:?}"
+    );
+    assert!(
+        about
+            .iter()
+            .all(|line| !line.contains("aborted by an explicit request")),
+        "{about:?}"
+    );
+    server.stop().await;
+}
+
+/// An owner that gives up before the deadline: the joiner's `unavailable`
+/// is named as that explicit abort — and no sweep line exists for the
+/// pairing.
+#[tokio::test]
+async fn diagnostics_name_an_owner_aborting_before_the_deadline() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let pending = pending_redeem(&server, now_ms() + 8_000).await;
+    let PendingRedeem {
+        mut owner,
+        mut joiner,
+        pairing_id,
+        code_id: _,
+        request_id: _,
+        redeemer_nonce: _,
+    } = pending;
+    owner
+        .send(&CtrlMessage::PairAbort {
+            request_id: random_id16(),
+            pairing_id,
+            reason: crate::protocol_v2::AbortReason::User,
+        })
+        .await;
+    expect_unavailable(&mut joiner, pairing_id).await;
+    let about = decisions_since(since, &prefix(&pairing_id));
+    assert!(
+        about
+            .iter()
+            .any(|line| line.contains("aborted by an explicit request from")
+                && line.contains(&prefix(&owner.key.public_key()))),
+        "{about:?}"
+    );
+    assert!(
+        about
+            .iter()
+            .all(|line| !line.contains("is past its deadline and is aborted")),
+        "{about:?}"
+    );
+    server.stop().await;
+}
+
+/// A Prepared that reaches the registry after the deadline is answered
+/// `unavailable`, and the line says which of the two exits took it: the
+/// late-Prepared check itself, or the sweep that got there first (the
+/// sweeper runs every 200 ms, so both orders happen).
+#[tokio::test]
+async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
+    let server = spawn_server().await;
+    let registry_id = server.registry_id();
+    let since = sink_len();
+    let deadline = now_ms() + 700;
+    let pending = pending_redeem(&server, deadline).await;
+    let PendingRedeem {
+        mut owner,
+        mut joiner,
+        pairing_id,
+        code_id,
+        request_id,
+        redeemer_nonce,
+    } = pending;
+    let digest = challenge_and_proof(
+        &mut owner,
+        &mut joiner,
+        &registry_id,
+        code_id,
+        [0x5A; 32],
+        pairing_id,
+        request_id,
+        redeemer_nonce,
+        deadline,
+    )
+    .await;
+    sleep_until_after(deadline).await;
+    owner
+        .send(&CtrlMessage::PairPrepared {
+            pairing_id,
+            transcript_digest: digest,
+            signature: owner
+                .key
+                .sign(&hello2::prepared_message(&pairing_id, &digest)),
+        })
+        .await;
+    // The owner's first error is its own answer (the all-zero object id)
+    // or, when the sweep got there first, the sweep's notification.
+    match owner.recv().await {
+        CtrlMessage::PairError {
+            code: crate::protocol_v2::PAIR_UNAVAILABLE,
+            ..
+        } => {}
+        other => panic!("expected the registry's `unavailable`, got {other:?}"),
+    }
+    let about = decisions_since(since, &prefix(&pairing_id));
+    let late_check = about.iter().any(|line| {
+        line.contains(
+            "answered unavailable: not a participant: false, transcript digest differs: false, ",
+        )
+    });
+    let swept_first = about
+        .iter()
+        .any(|line| line.contains("is past its deadline and is aborted"));
+    assert!(
+        late_check || swept_first,
+        "neither exit is named for the late Prepared: {about:?}"
+    );
+    // The joiner's `unavailable` comes from the sweep in either order.
+    expect_unavailable(&mut joiner, pairing_id).await;
+    server.stop().await;
+}
+
+/// The owner aborts right after the deadline, where the sweep may already
+/// have run: the joiner gets exactly one `unavailable`, and the lines say
+/// which exit produced it.
+#[tokio::test]
+async fn diagnostics_say_which_of_a_sweep_and_a_late_abort_came_first() {
+    let server = spawn_server().await;
+    let since = sink_len();
+    let deadline = now_ms() + 300;
+    let pending = pending_redeem(&server, deadline).await;
+    let PendingRedeem {
+        mut owner,
+        mut joiner,
+        pairing_id,
+        code_id: _,
+        request_id: _,
+        redeemer_nonce: _,
+    } = pending;
+    sleep_until_after(deadline).await;
+    owner
+        .send(&CtrlMessage::PairAbort {
+            request_id: random_id16(),
+            pairing_id,
+            reason: crate::protocol_v2::AbortReason::User,
+        })
+        .await;
+    expect_unavailable(&mut joiner, pairing_id).await;
+    // A second sweep tick (200 ms) has had time to record its part.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let about = decisions_since(since, &prefix(&pairing_id));
+    let aborted = about
+        .iter()
+        .position(|line| line.contains("aborted by an explicit request from"));
+    let swept = about
+        .iter()
+        .position(|line| line.contains("is past its deadline and is aborted"));
+    let first = match (swept, aborted) {
+        (None, None) => panic!("neither exit is named for the joiner's `unavailable`: {about:?}"),
+        (Some(s), Some(a)) if s < a => "sweep",
+        (Some(_), _) => "sweep",
+        (None, Some(_)) => "abort",
+    };
+    // No second `unavailable` for the pairing: whichever exit won ended it.
+    match tokio::time::timeout(Duration::from_millis(400), joiner.recv()).await {
+        Err(_elapsed) => {}
+        Ok(CtrlMessage::PairError { object_id, .. }) if object_id == pairing_id => {
+            panic!("a second `unavailable` for the pairing after the {first}")
+        }
+        Ok(other) => panic!("unexpected frame after the {first}: {other:?}"),
+    }
+    server.stop().await;
+}

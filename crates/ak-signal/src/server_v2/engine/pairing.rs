@@ -5,6 +5,23 @@
 
 use super::*;
 
+/// One decision line of the pairing handlers: a DEBUG log in every
+/// build and, in this crate's own tests, a line in the tests' sink, so a
+/// test can check that the diagnostics name the branch it drove (Q-N3).
+fn decision(args: std::fmt::Arguments<'_>) {
+    log::debug!("{args}");
+    #[cfg(test)]
+    super::tests::DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(args.to_string());
+}
+macro_rules! decision {
+    ($($arg:tt)*) => {
+        decision(format_args!($($arg)*))
+    };
+}
+
 // ---- redeem -------------------------------------------------------------------
 
 pub(super) fn handle_redeem(
@@ -165,12 +182,12 @@ pub(super) fn handle_redeem(
                     );
                     // Q-N3 recurrence (2026-11-27): which branch took a
                     // redeem, and how much of its window was left.
-                    log::debug!(
-                        "redeem from {} begun under code revision {}, {} ms before its deadline",
+                    decision!(
+                        "redeem from {} begun under code revision {}, {} ms before its deadline (pairing {})",
                         util::hex_prefix(&me, 4),
                         code.revision,
                         redeem.deadline_ms.saturating_sub(now)
-                    );
+                    , util::hex_prefix(&pairing_id, 4));
                     deliver_msg(
                         out,
                         CtrlMessage::InviteRedeemPending {
@@ -246,12 +263,12 @@ pub(super) fn handle_redeem(
             // Q-N3 recurrence (2026-11-27): the lookup found no active code
             // (or the owner is the redeemer); the unified answer follows at
             // the deadline (see `sweep`).
-            log::debug!(
-                "redeem from {} recorded as a ghost, {} ms before its deadline (self-redeem: {})",
+            decision!(
+                "redeem from {} recorded as a ghost, {} ms before its deadline (self-redeem: {}) (pairing {})",
                 util::hex_prefix(&me, 4),
                 redeem.deadline_ms.saturating_sub(now),
                 code.as_ref().map(|code| code.owner == me).unwrap_or(false)
-            );
+            , util::hex_prefix(&pairing_id, 4));
             {
                 let mut inner = shared.lock();
                 inner.ghosts.insert(
@@ -526,18 +543,19 @@ pub(super) fn handle_prepared(
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
-            log::debug!(
-                "prepared from {} answered unavailable: no transaction to prepare",
-                util::hex_prefix(&me, 4)
+            decision!(
+                "prepared from {} answered unavailable: no transaction to prepare (pairing {})",
+                util::hex_prefix(&me, 4),
+                util::hex_prefix(&pairing_id, 4)
             );
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
         Err(error) => {
-            log::debug!(
-                "prepared from {} answered unavailable: the transaction lookup failed ({error})",
+            decision!(
+                "prepared from {} answered unavailable: the transaction lookup failed ({error}) (pairing {})",
                 util::hex_prefix(&me, 4)
-            );
+            , util::hex_prefix(&pairing_id, 4));
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
@@ -546,13 +564,12 @@ pub(super) fn handle_prepared(
         || snapshot.transcript_digest != Some(transcript_digest)
         || now > snapshot.deadline_ms
     {
-        log::debug!(
-            "prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms from the deadline",
+        decision!("prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms from the deadline (pairing {})",
             util::hex_prefix(&me, 4),
             snapshot.owner != me && snapshot.redeemer != me,
             snapshot.transcript_digest != Some(transcript_digest),
             now as i64 - snapshot.deadline_ms as i64
-        );
+        , util::hex_prefix(&pairing_id, 4));
         deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
@@ -573,11 +590,12 @@ pub(super) fn handle_prepared(
         now,
     );
     // Q-N3 recurrence (2026-11-27): how this Prepared landed.
-    log::debug!(
-        "prepared from {} at {} ms from the deadline: {}",
+    decision!(
+        "prepared from {} at {} ms from the deadline: {} (pairing {})",
         util::hex_prefix(&me, 4),
         now as i64 - snapshot.deadline_ms as i64,
-        prepared_outcome(&decision)
+        prepared_outcome(&decision),
+        util::hex_prefix(&pairing_id, 4)
     );
     match decision {
         Ok(PreparedDecision::WaitingOther) => {}
@@ -675,10 +693,9 @@ pub(super) fn handle_applied(
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
-            log::debug!(
-                "applied from {} answered unavailable: no transaction to apply, or the lookup failed",
+            decision!("applied from {} answered unavailable: no transaction to apply, or the lookup failed (pairing {})",
                 util::hex_prefix(&me, 4)
-            );
+            , util::hex_prefix(&pairing_id, 4));
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
@@ -690,8 +707,7 @@ pub(super) fn handle_applied(
             PairingState::Committed | PairingState::Applied | PairingState::Ready
         )
     {
-        log::debug!(
-            "applied from {} answered unavailable: not a participant: {}, transcript digest differs: {}, state not committed/applied/ready: {}",
+        decision!("applied from {} answered unavailable: not a participant: {}, transcript digest differs: {}, state not committed/applied/ready: {} (pairing {})",
             util::hex_prefix(&me, 4),
             snapshot.owner != me && snapshot.redeemer != me,
             snapshot.transcript_digest != Some(transcript_digest),
@@ -699,7 +715,7 @@ pub(super) fn handle_applied(
                 snapshot.state,
                 PairingState::Committed | PairingState::Applied | PairingState::Ready
             )
-        );
+        , util::hex_prefix(&pairing_id, 4));
         deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
@@ -743,10 +759,10 @@ pub(super) fn handle_applied(
             );
         }
         Ok(AppliedDecision::NotFound) => {
-            log::debug!(
-                "applied from {} answered unavailable: the store no longer has the transaction",
+            decision!(
+                "applied from {} answered unavailable: the store no longer has the transaction (pairing {})",
                 util::hex_prefix(&me, 4)
-            );
+            , util::hex_prefix(&pairing_id, 4));
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
         Err(e) => {
@@ -863,7 +879,7 @@ pub(super) fn handle_abort(
             // otherwise visible only as the other side's `unavailable`.
             // This line is the decision; whether the notification below
             // reached the other participant is logged by the delivery.
-            log::debug!(
+            decision!(
                 "pairing {} aborted by an explicit request from {}",
                 util::hex_prefix(&pairing_id, 4),
                 util::hex_prefix(&me, 4)

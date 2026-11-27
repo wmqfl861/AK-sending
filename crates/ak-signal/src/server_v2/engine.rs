@@ -499,6 +499,14 @@ fn sweep(shared: &Shared) {
             "ghost redeem expired at its {} ms deadline",
             ghost.deadline_ms
         );
+        #[cfg(test)]
+        tests::DECISIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!(
+                "ghost redeem expired at its {} ms deadline",
+                ghost.deadline_ms
+            ));
         shared.deliver(
             &ghost.requester,
             pair_error(
@@ -517,16 +525,23 @@ fn sweep(shared: &Shared) {
             return;
         }
     };
-    // Q-N3 recurrence (2026-11-27): the decision comes first; whether each
-    // notification below reached its participant is logged by the delivery
-    // itself (a dropped message has its own DEBUG line).
-    if !report.aborted.is_empty() {
-        log::debug!(
-            "sweep: {} pending pairing(s) are past their deadline and are now aborted; notifying both sides of each",
-            report.aborted.len()
-        );
-    }
+    // Q-N3 recurrence (2026-11-27): one decision line per pairing — it
+    // names the pairing the participants' `unavailable` will carry. Whether
+    // each notification below reached its participant is logged by the
+    // delivery itself (a dropped message has its own DEBUG line).
     for aborted in report.aborted {
+        log::debug!(
+            "sweep: pairing {} is past its deadline and is aborted; notifying its owner and its redeemer",
+            util::hex_prefix(&aborted.pairing_id, 4)
+        );
+        #[cfg(test)]
+        tests::DECISIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!(
+                "sweep: pairing {} is past its deadline and is aborted; notifying its owner and its redeemer",
+                util::hex_prefix(&aborted.pairing_id, 4)
+            ));
         notify_pairing_unavailable(shared, &aborted.owner, aborted.pairing_id);
         notify_pairing_unavailable(shared, &aborted.redeemer, aborted.pairing_id);
     }

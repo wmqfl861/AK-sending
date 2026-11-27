@@ -539,6 +539,10 @@ impl PairingOrchestrator {
             self.config.ready_wait_ms,
         )
         .await?;
+        pair_diag!(
+            "applied sent and ready received, {} ms from the deadline",
+            from_deadline_ms(transcript.deadline_ms)
+        );
         self.journal.mark_applied(&pairing_id)?;
         Ok(committed.verified)
     }
@@ -589,6 +593,10 @@ impl PairingOrchestrator {
         }
         .map_err(map_client)?;
         let pairing_id = ack.pairing_id;
+        pair_diag!(
+            "redeemer: redeem acknowledged, {} ms from the deadline",
+            from_deadline_ms(deadline)
+        );
 
         // ← PairChallenge (relayed owner transcript + owner proof).
         let (transcript, owner_proof) = match wait_frame(
@@ -622,6 +630,10 @@ impl PairingOrchestrator {
             &owner_proof,
             &transcript.owner_device_id,
         )?;
+        pair_diag!(
+            "redeemer: challenge received and the owner proof verified, {} ms from the deadline",
+            from_deadline_ms(deadline)
+        );
 
         // Pin the authenticated transcript locally BEFORE the journal
         // entry (P1-1): the no-code recovery path later compares the
@@ -640,6 +652,10 @@ impl PairingOrchestrator {
             secret_ref,
             peer_public_key: Some(transcript.owner_device_id),
         })?;
+        pair_diag!(
+            "redeemer: pin and journal written, {} ms from the deadline",
+            from_deadline_ms(deadline)
+        );
 
         // → PairProof + PairPrepared.
         let digest = transcript.transcript_digest();
@@ -655,6 +671,10 @@ impl PairingOrchestrator {
             .send_pair_prepared(pairing_id, digest, prepared)
             .await
             .map_err(map_client)?;
+        pair_diag!(
+            "redeemer: proof and prepared sent, {} ms from the deadline",
+            from_deadline_ms(deadline)
+        );
 
         // ← PairCommit (authoritative).
         let commit = match wait_frame(
@@ -675,6 +695,10 @@ impl PairingOrchestrator {
             &auth_key,
             self.client.frame_taken_at_unix_ms(),
         )?;
+        pair_diag!(
+            "redeemer: commit received and verified, {} ms from the deadline",
+            from_deadline_ms(deadline)
+        );
         Ok(CommittedPairing {
             pairing_id,
             peer_fingerprint: Fingerprint::from_public_key(&transcript.owner_device_id),
@@ -981,6 +1005,10 @@ impl PairingOrchestrator {
             .send_pair_challenge(bytes, wire_proof(record.owner_proof))
             .await
             .map_err(map_client)?;
+        pair_diag!(
+            "owner: challenge sent, {} ms from the deadline",
+            from_deadline_ms(redeem.deadline_ms)
+        );
 
         // ← PairProof (redeemer's half).
         let redeemer_proof = match wait_frame(
@@ -1002,6 +1030,10 @@ impl PairingOrchestrator {
             &redeemer_proof,
             &transcript.redeemer_device_id,
         )?;
+        pair_diag!(
+            "owner: redeemer proof received and verified, {} ms from the deadline",
+            from_deadline_ms(redeem.deadline_ms)
+        );
 
         // → PairPrepared, then ← PairCommit.
         let prepared = self
@@ -1011,6 +1043,10 @@ impl PairingOrchestrator {
             .send_pair_prepared(pairing_id, digest, prepared)
             .await
             .map_err(map_client)?;
+        pair_diag!(
+            "owner: prepared sent, {} ms from the deadline",
+            from_deadline_ms(redeem.deadline_ms)
+        );
         let commit = match wait_frame(
             &self.client,
             &mut plane,
@@ -1029,6 +1065,10 @@ impl PairingOrchestrator {
             &auth_key,
             self.client.frame_taken_at_unix_ms(),
         )?;
+        pair_diag!(
+            "owner: commit received and verified, {} ms from the deadline",
+            from_deadline_ms(redeem.deadline_ms)
+        );
         let committed = CommittedPairing {
             pairing_id,
             peer_fingerprint: Fingerprint::from_public_key(&redeemer_device_id),
@@ -1302,6 +1342,32 @@ struct CommitView {
 /// for the delivery, so a frame taken off the wire past it is a timeout,
 /// never a proof failure.
 const COMMIT_DELIVERY_GRACE_MS: u64 = 10_000;
+
+/// One line of the pairing trace the T03 integration test asks for (Q-N3
+/// recurrence, 2026-11-27). `AK_PAIR_DIAG` on the process turns it on, and
+/// it goes to the `ak_pair_diag` log target, so nothing is written unless a
+/// logger with that target enabled is installed as well — only that test
+/// does both. A line names the side and the step and counts milliseconds
+/// from the redeem deadline (negative is before it); it never carries a
+/// code, a key or an id.
+macro_rules! pair_diag {
+    ($($arg:tt)*) => {
+        if $crate::pairing::orchestrator::pair_diag_enabled() {
+            log::info!(target: "ak_pair_diag", $($arg)*);
+        }
+    };
+}
+use pair_diag;
+
+fn pair_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()))
+}
+
+/// Milliseconds between now and the redeem deadline: negative is before it.
+fn from_deadline_ms(deadline_ms: u64) -> i64 {
+    now_unix_ms() as i64 - deadline_ms as i64
+}
 
 /// Verification of a `PairCommit` taken off the wire by a live flow
 /// (`redeem_to_commit_on` and `owner_answer_offer`).

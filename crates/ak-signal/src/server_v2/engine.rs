@@ -517,6 +517,14 @@ fn sweep(shared: &Shared) {
             return;
         }
     };
+    // Q-N3 recurrence (2026-11-27): a deadline sweep is otherwise visible
+    // only as the `unavailable` both participants receive.
+    if !report.aborted.is_empty() {
+        log::debug!(
+            "sweep aborted {} pending pairing(s) past their deadline and told both sides",
+            report.aborted.len()
+        );
+    }
     for aborted in report.aborted {
         notify_pairing_unavailable(shared, &aborted.owner, aborted.pairing_id);
         notify_pairing_unavailable(shared, &aborted.redeemer, aborted.pairing_id);

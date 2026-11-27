@@ -262,9 +262,24 @@ impl std::fmt::Display for TaskCancelled {
 
 impl std::error::Error for TaskCancelled {}
 
+/// The pairing trace of the T03 integration test (Q-N3 recurrence,
+/// 2026-11-27) reaches stderr only when `AK_PAIR_DIAG` is set on the
+/// process; no other run of `ak-cli task` installs a logger here, and the
+/// levels come from `RUST_LOG`.
+fn init_pair_diag_logger() {
+    if std::env::var_os("AK_PAIR_DIAG").is_none() {
+        return;
+    }
+    let _ = env_logger::builder()
+        .format_timestamp_millis()
+        .parse_env("RUST_LOG")
+        .try_init();
+}
+
 /// `ak-cli task ...`: resolve shared settings, spawn the Ctrl-C watcher,
 /// drive the one-shot task, print the summary.
 pub(crate) async fn task_command(id: &Path, cmd: TaskCommand) -> Result<()> {
+    init_pair_diag_logger();
     match cmd {
         TaskCommand::CodeSend {
             paths,

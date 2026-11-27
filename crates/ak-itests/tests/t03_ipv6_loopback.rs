@@ -257,59 +257,265 @@ fn announced_registry_port(line: &str) -> u16 {
         .unwrap_or_else(|| panic!("bound address in the registry line: {line}"))
 }
 
-/// Lines a piped stream produced so far (fed by a reader thread so a full
-/// pipe can never block the child). A stdout log also holds its process's
-/// stderr so a timed-out wait reports both (2026-11-19 review: a CLI that
-/// fails before its first stdout line says why only on stderr).
+/// Lines a piped stream produced so far, each stamped with the moment the
+/// reader thread read it, fed by a reader thread so a full pipe can never
+/// block the child. A stdout log also holds its process's stderr so a
+/// timed-out wait reports both (2026-11-19 review: a CLI that fails before
+/// its first stdout line says why only on stderr).
+///
+/// Q-N3 recurrence (2026-11-27): a report shows every line of every process
+/// of the chain in one order with milliseconds since the first of those
+/// lines, marks when each pipe closed, and never prints a task code, a
+/// registry fingerprint or a filesystem path.
 #[derive(Clone, Default)]
 struct LineLog {
-    lines: Arc<Mutex<Vec<String>>>,
-    stderr: Option<Arc<Mutex<Vec<String>>>>,
+    state: Arc<Mutex<LogState>>,
+    stderr: Option<Arc<Mutex<LogState>>>,
+    /// The process tag, for a report's heading.
+    name: Option<String>,
+}
+
+/// One line read off a pipe and the moment it was read.
+struct TimedLine {
+    at_ms: u128,
+    text: String,
+}
+
+#[derive(Default)]
+struct LogState {
+    lines: Vec<TimedLine>,
+    /// When the pipe closed (the process ended); `None` while it is open.
+    eof_ms: Option<u128>,
+}
+
+/// The test binary's monotonic clock: every captured line is stamped with
+/// milliseconds since the first process was spawned (tests in one binary
+/// share it; each report then counts from its own first line).
+fn since_origin_ms() -> u128 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// `true` for a token that is a filesystem path: a drive letter, a UNC
+/// root, or a `/` root with a separator in it.
+fn looks_like_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    if token.starts_with(r"\\") {
+        return true;
+    }
+    token.len() > 1 && token.starts_with('/') && token[1..].contains('/')
+}
+
+/// The reportable form of a captured line: the task code, the registry
+/// fingerprint and every path are replaced by fixed words. The callers that
+/// parse a line (the code, the bound port, the candidates) keep the raw
+/// text; this is only for what a failure prints.
+fn redact(text: &str) -> String {
+    const PREFIX: &str = "AKI1-";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(PREFIX) {
+        let (head, tail) = rest.split_at(at);
+        let groups = tail[PREFIX.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
+            .count();
+        out.push_str(head);
+        // A code is five groups of four; a shorter run is something else.
+        if groups >= 24 {
+            out.push_str("AKI1-<code>");
+            rest = &tail[PREFIX.len() + groups..];
+        } else {
+            out.push_str(PREFIX);
+            rest = &tail[PREFIX.len()..];
+        }
+    }
+    out.push_str(rest);
+    let mut shown = String::with_capacity(out.len());
+    for (index, token) in out.split_whitespace().enumerate() {
+        if index > 0 {
+            shown.push(' ');
+        }
+        shown.push_str(&redact_token(token));
+    }
+    shown
+}
+
+/// One whitespace-delimited token with its secrets replaced; the
+/// punctuation at its end is kept so the line still reads.
+fn redact_token(token: &str) -> String {
+    let stem_len = token.trim_end_matches(|c: char| ",;):\"".contains(c)).len();
+    let (stem, tail) = token.split_at(stem_len);
+    let mut shown = String::new();
+    if looks_like_path(stem) {
+        shown.push_str("<path>");
+    } else {
+        let hex_run = stem.chars().take_while(|c| c.is_ascii_hexdigit()).count();
+        if hex_run >= 64 {
+            shown.push_str("<fp>");
+            shown.push_str(&stem[hex_run..]);
+        } else {
+            shown.push_str(stem);
+        }
+    }
+    shown.push_str(tail);
+    shown
 }
 
 impl LineLog {
     fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
         let log = LineLog::default();
-        let sink = Arc::clone(&log.lines);
+        let sink = Arc::clone(&log.state);
         std::thread::spawn(move || {
             for line in BufReader::new(stream).lines() {
                 match line {
                     Ok(text) => {
-                        let mut lines = sink.lock().unwrap_or_else(|p| p.into_inner());
-                        lines.push(text);
+                        let at_ms = since_origin_ms();
+                        let mut state = sink.lock().unwrap_or_else(|p| p.into_inner());
+                        state.lines.push(TimedLine { at_ms, text });
                     }
                     Err(_) => break,
                 }
             }
+            let mut state = sink.lock().unwrap_or_else(|p| p.into_inner());
+            state.eof_ms = Some(since_origin_ms());
         });
         log
     }
 
     /// Report `stderr` (the same process's other stream) on a timeout.
     fn with_stderr(mut self, stderr: &LineLog) -> Self {
-        self.stderr = Some(Arc::clone(&stderr.lines));
+        self.stderr = Some(Arc::clone(&stderr.state));
         self
     }
 
-    fn snapshot(&self) -> Vec<String> {
-        self.lines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    fn named(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
     }
 
-    /// This stream so far, plus the process's stderr when attached.
-    fn report(&self) -> String {
-        let mut text = self.snapshot().join("\n");
-        if let Some(stderr) = &self.stderr {
-            let stderr = stderr
+    /// The raw lines so far, for the callers that parse them.
+    fn snapshot(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    /// When the first line of this log or its stderr was read.
+    fn earliest_ms(&self) -> Option<u128> {
+        let own = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lines
+            .first()
+            .map(|line| line.at_ms);
+        let err = self.stderr.as_ref().and_then(|state| {
+            state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .join("\n");
-            text.push_str("\nstderr so far:\n");
-            text.push_str(&stderr);
+                .unwrap_or_else(|p| p.into_inner())
+                .lines
+                .first()
+                .map(|line| line.at_ms)
+        });
+        match (own, err) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
         }
-        text
+    }
+
+    /// Both pipes closed: the process has ended (or at least closed them).
+    fn ended(&self) -> bool {
+        let own = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .eof_ms
+            .is_some();
+        let err = self
+            .stderr
+            .as_ref()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .eof_ms
+                    .is_some()
+            })
+            .unwrap_or(true);
+        own && err
+    }
+
+    /// The process ended after writing an error: it cannot produce the
+    /// line a wait is looking for, so the wait stops and reports now.
+    fn ended_with_error(&self) -> bool {
+        self.ended() && self.has_error_line()
+    }
+
+    /// `Error:` or a panic somewhere in this log or its stderr.
+    fn has_error_line(&self) -> bool {
+        let owns = |state: &Arc<Mutex<LogState>>| {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Error:") || line.text.contains("panicked at"))
+        };
+        owns(&self.state) || self.stderr.as_ref().map(owns).unwrap_or(false)
+    }
+
+    /// The lines of this log and of its stderr, redacted, each with
+    /// milliseconds since `origin` and the stream it came from; a pipe
+    /// that is still open is named last.
+    fn timeline(&self, origin: u128) -> Vec<String> {
+        let mut rows: Vec<(u128, String)> = Vec::new();
+        let streams = [(Some(&self.state), "out"), (self.stderr.as_ref(), "err")];
+        for (state, tag) in streams {
+            let Some(state) = state else { continue };
+            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            for line in &state.lines {
+                rows.push((
+                    line.at_ms,
+                    format!(
+                        "[+{:>7} ms] {tag}: {}",
+                        line.at_ms.saturating_sub(origin),
+                        redact(&line.text)
+                    ),
+                ));
+            }
+            match state.eof_ms {
+                Some(at) => rows.push((
+                    at,
+                    format!(
+                        "[+{:>7} ms] {tag}: <pipe closed>",
+                        at.saturating_sub(origin)
+                    ),
+                )),
+                None => rows.push((u128::MAX, format!("[+      ? ms] {tag}: <pipe still open>"))),
+            }
+        }
+        rows.sort_by_key(|(at, _)| *at);
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// This stream so far plus the process's stderr when attached, as one
+    /// timeline counted from the earliest line.
+    fn report(&self) -> String {
+        let origin = self.earliest_ms().unwrap_or_else(since_origin_ms);
+        self.timeline(origin).join("\n")
     }
 
     /// First line containing `needle`, polling until it appears.
@@ -321,7 +527,10 @@ impl LineLog {
     /// timeout report too: a wait on one process often runs out because
     /// of another (2026-11-20 review of batch Q: a Windows CI run timed
     /// out waiting for the receiver's offer line, and the report held only
-    /// the receiver's side).
+    /// the receiver's side). Q-N3 (2026-11-27): the wait also stops as soon
+    /// as this process or one of `others` has ended after writing an error
+    /// — the registry is still alive then, so its log and a read-only
+    /// snapshot of its database go into the same report.
     fn wait_for_reporting(
         &self,
         needle: &str,
@@ -335,14 +544,32 @@ impl LineLog {
                     return line;
                 }
             }
-            if Instant::now() >= deadline {
-                let mut report = format!(
-                    "no line containing {needle:?} within {timeout:?}; output so far:\n{}",
-                    self.report()
-                );
-                for (name, other) in others {
-                    report.push_str(&format!("\n--- {name}, output so far:\n{}", other.report()));
+            let self_ended = self.ended_with_error();
+            let other_ended = others
+                .iter()
+                .find(|(_, other)| other.ended_with_error())
+                .map(|(name, _)| *name);
+            if Instant::now() >= deadline || self_ended || other_ended.is_some() {
+                let mut who: Vec<&str> = Vec::new();
+                if self_ended {
+                    who.push(self.name.as_deref().unwrap_or("this process"));
                 }
+                if let Some(name) = other_ended {
+                    who.push(name);
+                }
+                let why = if who.is_empty() {
+                    format!("waited the full {timeout:?}")
+                } else {
+                    format!(
+                        "stopped early: {} had already ended after writing an error",
+                        who.join(" and ")
+                    )
+                };
+                let mut report = format!("no line containing {needle:?} ({why})");
+                let mut logs: Vec<(&str, &LineLog)> =
+                    vec![(self.name.as_deref().unwrap_or("this process"), self)];
+                logs.extend_from_slice(others);
+                report.push_str(&failure_report(&logs));
                 panic!("{report}");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -350,28 +577,118 @@ impl LineLog {
     }
 }
 
+/// One failure report for every process of the chain: a timeline counted
+/// from the first line any of them wrote, then the registry database as it
+/// is right now (when a registry was started on this thread).
+fn failure_report(logs: &[(&str, &LineLog)]) -> String {
+    let origin = logs
+        .iter()
+        .filter_map(|(_, log)| log.earliest_ms())
+        .min()
+        .unwrap_or_else(since_origin_ms);
+    let mut report = String::new();
+    for (name, log) in logs {
+        report.push_str(&format!(
+            "\n--- {name} (milliseconds since the first line of this report):\n"
+        ));
+        report.push_str(&log.timeline(origin).join("\n"));
+    }
+    report.push_str(&format!(
+        "\n--- registry database, read-only snapshot at +{} ms:\n{}",
+        since_origin_ms().saturating_sub(origin),
+        registry_snapshot()
+    ));
+    report
+}
+
+thread_local! {
+    /// The database of the registry this test thread started last, for the
+    /// snapshot in a failure report.
+    static REGISTRY_DB: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `scripts/t03_pairing_snapshot.py` on the registry database, or the reason
+/// it was not taken. The interpreter is `AK_T03_PYTHON` when set, else
+/// `python` / `python3` from the PATH.
+fn registry_snapshot() -> String {
+    let Some(db) = REGISTRY_DB.with(|slot| slot.borrow().clone()) else {
+        return "not taken: no registry database was registered on this thread".into();
+    };
+    let python: std::ffi::OsString = std::env::var_os("AK_T03_PYTHON").unwrap_or_else(|| {
+        if cfg!(windows) {
+            "python".into()
+        } else {
+            "python3".into()
+        }
+    });
+    let script = workspace_root()
+        .join("scripts")
+        .join("t03_pairing_snapshot.py");
+    let started = Instant::now();
+    match Command::new(&python)
+        .arg("-I")
+        .arg(&script)
+        .arg(&db)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => format!(
+            "not taken: exit status {} after {:?}; stderr: {}",
+            output.status,
+            started.elapsed(),
+            redact(&String::from_utf8_lossy(&output.stderr))
+        ),
+        Err(error) => format!("not taken: cannot start the interpreter ({error})"),
+    }
+}
+
+/// What every CLI child of a chain runs with (Q-N3, 2026-11-27): the
+/// endpoints' pairing trace on stderr (`AK_PAIR_DIAG` turns it on inside
+/// `ak-cli task`; `RUST_LOG` keeps everything else at warnings).
+const PAIR_DIAG_ENV: &[(&str, &str)] = &[
+    ("AK_PAIR_DIAG", "1"),
+    ("RUST_LOG", "warn,ak_pair_diag=info"),
+];
+
 /// A resident CLI child with captured stdout/stderr and a WRITABLE stdin
 /// (the receive consent prompt reads real terminal input).
 struct Proc {
     child: Child,
     stdout: LineLog,
+    #[allow(dead_code)]
     stderr: LineLog,
     stdin: Option<ChildStdin>,
 }
 
 impl Proc {
     fn spawn(tag: &str, args: &[String]) -> Proc {
+        Proc::spawn_with_env(tag, args, PAIR_DIAG_ENV)
+    }
+
+    /// [`Self::spawn`] with extra environment variables for the child.
+    fn spawn_with_env(tag: &str, args: &[String], env: &[(&str, &str)]) -> Proc {
         let cli = cli_exe();
-        let mut child = Command::new(&cli)
+        let mut command = Command::new(&cli);
+        command
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| panic!("spawn {tag} ({:?} {:?}): {err}", cli, args));
+            .stdin(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap_or_else(|err| {
+            panic!(
+                "spawn {tag} ({}): {err}",
+                redact(&format!("{cli:?} {args:?}"))
+            )
+        });
         let stderr = LineLog::spawn_reader(child.stderr.take().expect("stderr piped"));
-        let stdout =
-            LineLog::spawn_reader(child.stdout.take().expect("stdout piped")).with_stderr(&stderr);
+        let stdout = LineLog::spawn_reader(child.stdout.take().expect("stdout piped"))
+            .with_stderr(&stderr)
+            .named(tag);
         let stdin = child.stdin.take();
         Proc {
             child,
@@ -381,12 +698,19 @@ impl Proc {
         }
     }
 
+    /// The exit status once the process has ended.
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("try wait on cli child")
+    }
+
+    /// This process's stdout and stderr as one timeline.
     fn report(&self) -> String {
-        format!(
-            "stdout:\n{}\nstderr:\n{}",
-            self.stdout.snapshot().join("\n"),
-            self.stderr.snapshot().join("\n")
-        )
+        let mut text = format!("{}:", self.stdout.name.as_deref().unwrap_or("process"));
+        for line in self.stdout.report().split('\n') {
+            text.push('\n');
+            text.push_str(line);
+        }
+        text
     }
 
     /// Answer the consent prompt. The prompt itself is a `print!` without
@@ -472,7 +796,15 @@ impl RegistryProc {
         .iter()
         .map(|text| text.to_string())
         .collect();
-        let proc = Proc::spawn(tag, &args);
+        // Q-N3 (2026-11-27): the registry's DEBUG lines say which branch
+        // did what (a ghost redeem expiring, a delivery that went
+        // nowhere); everything else stays at INFO.
+        let proc = Proc::spawn_with_env(
+            tag,
+            &args,
+            &[("RUST_LOG", "info,ak_signal::server_v2=debug")],
+        );
+        REGISTRY_DB.with(|slot| *slot.borrow_mut() = Some(db.to_path_buf()));
         let listening = proc.stdout.wait_for(
             "v2 pairing registry on tls ",
             std::time::Duration::from_secs(60),
@@ -1645,9 +1977,26 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         .expect("punch target timeout");
     // Pairing + punch window + transfer slack.
     let punch_deadline = Instant::now() + std::time::Duration::from_secs(30);
+    // Q-N3 (2026-11-27): the first CI failure of this test said only that
+    // no matching packet arrived. The report now also says what the 30 s
+    // did see, on the same clock as the three processes' timelines.
+    let origin = [&recv.stdout, &sender.stdout, &registry.proc.stdout]
+        .iter()
+        .filter_map(|log| log.earliest_ms())
+        .min()
+        .unwrap_or_else(since_origin_ms);
+    let watching_from_ms = since_origin_ms().saturating_sub(origin);
     let mut punch_from_quic_port = false;
+    let mut packets = 0usize;
+    let mut other_source_port = 0usize;
+    let mut first_packet_ms: Option<u128> = None;
+    let mut last_packet_ms: Option<u128> = None;
+    let mut read_timeouts = 0usize;
+    let mut os_error: Option<std::io::Error> = None;
+    // The joiner's exit status when it ended before a matching packet.
+    let mut sender_exit: Option<String> = None;
     let mut buffer = [0u8; 1500];
-    while Instant::now() < punch_deadline {
+    while Instant::now() < punch_deadline && !punch_from_quic_port {
         match punch_target.recv_from(&mut buffer) {
             Ok((len, from)) => {
                 assert!(
@@ -1655,20 +2004,52 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
                     "the punch packet is probe-shaped: {len} bytes"
                 );
                 assert!(len <= 64, "the punch packet is small: {len} bytes");
+                packets += 1;
+                let at = since_origin_ms().saturating_sub(origin);
+                first_packet_ms.get_or_insert(at);
+                last_packet_ms = Some(at);
                 if from.port() == quic_port {
                     punch_from_quic_port = true;
+                } else {
+                    // The pairing-time probe (ak-session's throwaway
+                    // socket) also lands here; keep reading until the
+                    // QUIC-socket punch shows up.
+                    other_source_port += 1;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Timeout tick: re-check the deadline, and whether the
+                // joiner already gave up (no punch follows a failed
+                // pairing).
+                read_timeouts += 1;
+                if let Some(status) = sender.exit_status() {
+                    sender_exit = Some(status.to_string());
                     break;
                 }
-                // The pairing-time probe (ak-session's throwaway socket)
-                // also lands here; keep reading until the QUIC-socket
-                // punch shows up.
             }
-            Err(_) => continue, // timeout tick: re-check the deadline
+            Err(error) => {
+                os_error = Some(error);
+                break;
+            }
         }
     }
     assert!(
         punch_from_quic_port,
-        "the receiver's punch must arrive from its bound QUIC port {quic_port}"
+        "the receiver's punch must arrive from its bound QUIC port {quic_port}: \
+         watching from +{watching_from_ms} ms, probe-shaped packets seen {packets} \
+         (from other source ports {other_source_port}), first at +{first_packet_ms:?} ms, \
+         last at +{last_packet_ms:?} ms, read timeouts {read_timeouts}, \
+         sender exit status {sender_exit:?}, read error {os_error:?}{}",
+        failure_report(&[
+            ("receiver", &recv.stdout),
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ])
     );
 
     // The transfer still completes (the junk candidate costs the sender

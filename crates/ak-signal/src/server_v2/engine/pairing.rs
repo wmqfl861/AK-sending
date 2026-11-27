@@ -163,6 +163,14 @@ pub(super) fn handle_redeem(
                         pairing_id,
                         expires_at + REDEEM_REPLAY_GRACE,
                     );
+                    // Q-N3 recurrence (2026-11-27): which branch took a
+                    // redeem, and how much of its window was left.
+                    log::debug!(
+                        "redeem from {} begun under code revision {}, {} ms before its deadline",
+                        util::hex_prefix(&me, 4),
+                        code.revision,
+                        redeem.deadline_ms.saturating_sub(now)
+                    );
                     deliver_msg(
                         out,
                         CtrlMessage::InviteRedeemPending {
@@ -235,6 +243,15 @@ pub(super) fn handle_redeem(
         _ => {
             let expires_at =
                 now_instant + Duration::from_millis(redeem.deadline_ms.saturating_sub(now));
+            // Q-N3 recurrence (2026-11-27): the lookup found no active code
+            // (or the owner is the redeemer); the unified answer follows at
+            // the deadline (see `sweep`).
+            log::debug!(
+                "redeem from {} recorded as a ghost, {} ms before its deadline (self-redeem: {})",
+                util::hex_prefix(&me, 4),
+                redeem.deadline_ms.saturating_sub(now),
+                code.as_ref().map(|code| code.owner == me).unwrap_or(false)
+            );
             {
                 let mut inner = shared.lock();
                 inner.ghosts.insert(
@@ -480,6 +497,20 @@ fn ready_message(snapshot: &PairingSnapshot) -> Option<CtrlMessage> {
     })
 }
 
+/// The name a DEBUG trace gives a Prepared decision.
+fn prepared_outcome<Error>(decision: &Result<PreparedDecision, Error>) -> &'static str {
+    match decision {
+        Ok(PreparedDecision::WaitingOther) => "stored, waiting for the other side",
+        Ok(PreparedDecision::Committed { .. }) => "committed",
+        Ok(PreparedDecision::AlreadyFinal(_)) => "already final",
+        Ok(PreparedDecision::Unavailable) => "unavailable (the pairing was aborted)",
+        Ok(PreparedDecision::RedeemExhausted) => "redeem exhausted",
+        Ok(PreparedDecision::ResourceLimit) => "resource limit",
+        Ok(PreparedDecision::NotFound) => "not found",
+        Err(_) => "storage failure",
+    }
+}
+
 pub(super) fn handle_prepared(
     shared: &Shared,
     out: &mpsc::Sender<CtrlFrame>,
@@ -492,6 +523,11 @@ pub(super) fn handle_prepared(
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
+            // Q-N3 recurrence (2026-11-27): a silent `unavailable`; say why.
+            log::debug!(
+                "prepared from {} answered unavailable: no transaction to prepare",
+                util::hex_prefix(&me, 4)
+            );
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
@@ -500,6 +536,15 @@ pub(super) fn handle_prepared(
         || snapshot.transcript_digest != Some(transcript_digest)
         || now > snapshot.deadline_ms
     {
+        // Q-N3 recurrence (2026-11-27): a silent `unavailable`; say which
+        // condition ruled the Prepared out (a late one has no INFO line).
+        log::debug!(
+            "prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms past the deadline",
+            util::hex_prefix(&me, 4),
+            snapshot.owner != me && snapshot.redeemer != me,
+            snapshot.transcript_digest != Some(transcript_digest),
+            now.saturating_sub(snapshot.deadline_ms)
+        );
         deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
@@ -518,6 +563,13 @@ pub(super) fn handle_prepared(
         &signature,
         &transcript_digest,
         now,
+    );
+    // Q-N3 recurrence (2026-11-27): how this Prepared landed.
+    log::debug!(
+        "prepared from {} at {} ms past the deadline: {}",
+        util::hex_prefix(&me, 4),
+        now.saturating_sub(snapshot.deadline_ms),
+        prepared_outcome(&decision)
     );
     match decision {
         Ok(PreparedDecision::WaitingOther) => {}
@@ -779,6 +831,13 @@ pub(super) fn handle_abort(
     }
     match shared.store.abort_pairing(&pairing_id, now_ms()) {
         Ok(AbortDecision::Aborted(aborted)) => {
+            // Q-N3 recurrence (2026-11-27): an owner or redeemer giving up
+            // is otherwise visible only as the other side's `unavailable`.
+            log::debug!(
+                "pairing {} aborted by an explicit request from {}; the other participant is told it is unavailable",
+                util::hex_prefix(&pairing_id, 4),
+                util::hex_prefix(&me, 4)
+            );
             // The other participant learns the pairing is gone; the
             // aborter gets silence (idempotent success).
             let other = if aborted.owner == me {

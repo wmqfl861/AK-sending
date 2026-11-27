@@ -148,7 +148,99 @@ class SnapshotTests(unittest.TestCase):
         for row in out["pairing_transactions"]["row_detail"]:
             self.assertTrue(set(row) <= TRANSACTION_DETAIL_KEYS)
         self.assertEqual(set(out) <= {"ok", "now_unix_ms", "journal_mode", "invite_codes",
-                                      "pairing_transactions", "pairing_relations"}, True)
+                                      "pairing_transactions", "pairing_relations", "about"}, True)
+
+    def test_a_transaction_is_looked_up_by_its_first_four_bytes_under_an_alias(self):
+        self._create()
+        # Two transactions created in the same millisecond (the fixture's).
+        lookup = [("attempt-1", bytes.fromhex("05050505")), ("attempt-2", bytes.fromhex("07070707"))]
+        out = snapshot.read_snapshot(str(self.db), NOW, about=lookup)
+        about = {item["alias"]: item for item in out["about"]}
+        self.assertEqual(about["attempt-1"]["matches"], 1)
+        row = about["attempt-1"]["row"]
+        self.assertEqual(row["state"], "aborted")
+        self.assertTrue(row["owner_proof"])
+        for key in ("redeemer_proof", "owner_prepared", "redeemer_prepared", "committed", "owner_applied"):
+            self.assertFalse(row[key], key)
+        self.assertEqual(about["attempt-2"]["matches"], 1)
+        self.assertEqual(about["attempt-2"]["row"]["state"], "committed")
+        self.assertTrue(about["attempt-2"]["row"]["committed"])
+        self.assertFalse(about["attempt-2"]["row"]["owner_applied"])
+        # No transaction starts with these bytes.
+        self.assertEqual(about.get("attempt-3"), None)
+        missing = snapshot.read_snapshot(str(self.db), NOW, about=[("attempt-3", bytes.fromhex("ffffffff"))])
+        self.assertEqual(missing["about"], [{"alias": "attempt-3", "matches": 0, "row": None}])
+        # Only the alias is printed, never the bytes looked up.
+        text = json.dumps(out, sort_keys=True)
+        self.assertNotIn("attempt", text.replace('"attempt-1"', "").replace('"attempt-2"', ""))
+        self.assertNotRegex(text, r"05050505|07070707")
+
+    def test_a_prefix_shared_by_two_transactions_names_neither(self):
+        self._create()
+        conn = sqlite3.connect(str(self.db))
+        for tail in (b"\x01" * 12, b"\x02" * 12):
+            conn.execute(
+                "INSERT INTO pairing_transactions (pairing_id, state, created_unix_ms,"
+                " updated_unix_ms, deadline_unix_ms, code_revision) VALUES (?,?,?,?,?,?)",
+                (bytes.fromhex("0b0b0b0b") + tail, "pending", NOW - 1_000, NOW - 900, NOW + 5_000, 1),
+            )
+        conn.commit()
+        conn.close()
+        out = snapshot.read_snapshot(str(self.db), NOW, about=[("attempt", bytes.fromhex("0b0b0b0b"))])
+        self.assertEqual(out["about"], [{"alias": "attempt", "matches": 2, "row": None}])
+
+    def test_a_transaction_beyond_the_detail_rows_is_still_looked_up(self):
+        self._create()
+        conn = sqlite3.connect(str(self.db))
+        # 70 rows newer than the fixture's: the 64-row detail cuts the newest.
+        for index in range(70):
+            created = NOW - 500 + index
+            conn.execute(
+                "INSERT INTO pairing_transactions (pairing_id, state, created_unix_ms,"
+                " updated_unix_ms, deadline_unix_ms, code_revision) VALUES (?,?,?,?,?,?)",
+                (bytes([0xC0, index >> 8, index & 255, 0xEE]) + b"\x0e" * 12, "ready", created, created, NOW + 6_000, 1),
+            )
+        conn.commit()
+        conn.close()
+        out = snapshot.read_snapshot(str(self.db), NOW, about=[("newest", bytes([0xC0, 0x00, 69, 0xEE]))])
+        self.assertTrue(out["pairing_transactions"]["truncated"])
+        self.assertEqual(out["pairing_transactions"]["rows"], 64)
+        shown = [row for row in out["pairing_transactions"]["row_detail"] if row["state"] == "ready"]
+        self.assertEqual(len(shown), 64 - 2)  # the fixture's two rows are the oldest
+        self.assertEqual(out["about"][0]["matches"], 1)
+        self.assertEqual(out["about"][0]["row"]["state"], "ready")
+        self.assertEqual(out["about"][0]["row"]["age_ms"], 500 - 69)
+
+    def test_a_lookup_changes_nothing_and_needs_a_readable_database(self):
+        self._create()
+        before = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        snapshot.read_snapshot(str(self.db), NOW, about=[("attempt", bytes.fromhex("05050505"))])
+        self.assertEqual(hashlib.sha256(self.db.read_bytes()).hexdigest(), before)
+        missing = Path(self._tmp.name) / "nowhere" / "registry.db"
+        out = snapshot.read_snapshot(str(missing), NOW, about=[("attempt", bytes.fromhex("05050505"))])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error_kind"], "missing")
+        self.assertNotIn("about", out)
+
+    def test_the_command_line_takes_lookups_as_alias_equals_prefix(self):
+        self._create()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = snapshot.main([
+                "t03_pairing_snapshot.py", str(self.db),
+                "--about", "attempt-1=05050505", "--about", "attempt-2=07070707",
+            ])
+        self.assertEqual(code, 0)
+        out = json.loads(stdout.getvalue())
+        self.assertEqual([item["alias"] for item in out["about"]], ["attempt-1", "attempt-2"])
+        self.assertEqual([item["matches"] for item in out["about"]], [1, 1])
+        for bad in (["--about"], ["--about", "05050505"], ["--about", "a=xyz"], ["--about", "a=0505"], ["extra"]):
+            with self.subTest(bad=bad):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = snapshot.main(["t03_pairing_snapshot.py", str(self.db), *bad])
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(stdout.getvalue()), {"ok": False, "error_kind": "usage"})
 
     def test_the_read_changes_nothing_and_leaves_no_lock(self):
         self._create()

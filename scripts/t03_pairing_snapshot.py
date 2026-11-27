@@ -23,6 +23,14 @@ The two per-row tables are read oldest first and cut at MAX_ROWS rows: what
 they print describes the rows shown only, and their `truncated` flag says
 whether more were left out. pairing_relations is counted in full.
 
+A looked-up transaction is found over the WHOLE pairing_transactions table,
+whatever the cut above: `--about ALIAS=PREFIX` (repeatable) takes the alias
+a report uses for one pairing attempt and the first four bytes of its
+pairing id as eight hex digits. Under `about` the snapshot then says how
+many transactions start with those bytes (0, 1 or more) and prints the row
+— state, ages, and which proof / Prepared / Commit / Applied columns are
+set — only when exactly one does. The bytes looked up are never printed.
+
 Nothing else leaves the database: no ids, digests, signatures, endpoints or
 paths are printed. The database is opened with `mode=ro` and every read runs
 inside one deferred transaction, so the picture is consistent and no byte is
@@ -30,7 +38,7 @@ changed.
 
 Usage
 -----
-    python -I scripts/t03_pairing_snapshot.py <db-path>
+    python -I scripts/t03_pairing_snapshot.py <db-path> [--about ALIAS=PREFIX ...]
 
 One JSON object goes to stdout. `ok` is false with an `error_kind` when the
 database cannot be read (missing file, locked, schema not created yet); the
@@ -117,40 +125,70 @@ def _invite_codes(conn: sqlite3.Connection, now_ms: int) -> dict:
     }
 
 
+_TRANSACTION_COLUMNS = (
+    "state, created_unix_ms, updated_unix_ms, deadline_unix_ms, code_revision,"
+    " owner_proof_mac IS NOT NULL, redeemer_proof_mac IS NOT NULL,"
+    " owner_prepared_signature IS NOT NULL, redeemer_prepared_signature IS NOT NULL,"
+    " commit_revision IS NOT NULL,"
+    " owner_applied_signature IS NOT NULL, redeemer_applied_signature IS NOT NULL,"
+    " owner_endpoint IS NOT NULL, redeemer_endpoint IS NOT NULL"
+)
+
+
+def _transaction_row(row, now_ms: int) -> dict:
+    item = {
+        "state": row[0],
+        "age_ms": now_ms - row[1],
+        "updated_age_ms": now_ms - row[2],
+        "deadline_in_ms": row[3] - now_ms,
+        "code_revision": row[4],
+    }
+    for name, value in zip(TRANSACTION_FLAGS, row[5:]):
+        item[name] = bool(value)
+    return item
+
+
 def _pairing_transactions(conn: sqlite3.Connection, now_ms: int) -> dict:
     rows = conn.execute(
-        "SELECT state, created_unix_ms, updated_unix_ms, deadline_unix_ms, code_revision,"
-        " owner_proof_mac IS NOT NULL, redeemer_proof_mac IS NOT NULL,"
-        " owner_prepared_signature IS NOT NULL, redeemer_prepared_signature IS NOT NULL,"
-        " commit_revision IS NOT NULL,"
-        " owner_applied_signature IS NOT NULL, redeemer_applied_signature IS NOT NULL,"
-        " owner_endpoint IS NOT NULL, redeemer_endpoint IS NOT NULL"
-        " FROM pairing_transactions ORDER BY created_unix_ms LIMIT ?",
+        "SELECT " + _TRANSACTION_COLUMNS + " FROM pairing_transactions ORDER BY created_unix_ms LIMIT ?",
         (MAX_ROWS + 1,),
     ).fetchall()
     rows, truncated = _cut_at_max(rows)
-    detail = []
-    for row in rows:
-        item = {
-            "state": row[0],
-            "age_ms": now_ms - row[1],
-            "updated_age_ms": now_ms - row[2],
-            "deadline_in_ms": row[3] - now_ms,
-            "code_revision": row[4],
-        }
-        for name, value in zip(TRANSACTION_FLAGS, row[5:]):
-            item[name] = bool(value)
-        detail.append(item)
     return {
         "rows": len(rows),
         "truncated": truncated,
         "by_state": _by_state(rows),
-        "row_detail": detail,
+        "row_detail": [_transaction_row(row, now_ms) for row in rows],
     }
 
 
-def _read_all(conn: sqlite3.Connection, now_ms: int) -> dict:
-    """Every read inside one deferred transaction (one consistent picture)."""
+def _about(conn: sqlite3.Connection, now_ms: int, alias: str, prefix: bytes) -> dict:
+    # The first four bytes of a pairing id are what the registry's decision
+    # lines print; they are never printed here, only the alias is.
+    rows = conn.execute(
+        "SELECT " + _TRANSACTION_COLUMNS + " FROM pairing_transactions"
+        " WHERE substr(pairing_id, 1, 4) = ?",
+        (prefix,),
+    ).fetchall()
+    found = {
+        "alias": alias,
+        # 0: no such transaction; 1: this row; more: the prefix names no single one.
+        "matches": len(rows),
+        "row": None,
+    }
+    if len(rows) == 1:
+        found["row"] = _transaction_row(rows[0], now_ms)
+    return found
+
+
+def _read_all(conn: sqlite3.Connection, now_ms: int, about: list = ()) -> dict:
+    """Every read inside one deferred transaction (one consistent picture).
+
+    `about` lists `(alias, prefix)` pairs: for each, the whole
+    `pairing_transactions` table is searched for pairing ids that start with
+    those bytes, and the row is printed under its alias only when exactly
+    one matches.
+    """
     conn.execute("BEGIN DEFERRED")
     try:
         tables = {
@@ -166,6 +204,10 @@ def _read_all(conn: sqlite3.Connection, now_ms: int) -> dict:
             ("pairing_transactions", _pairing_transactions),
         ):
             out[name] = reader(conn, now_ms) if name in tables else {"present": False}
+        if "pairing_transactions" in tables:
+            # Looked-up transactions are searched over the WHOLE table, not
+            # the 64 rows above: the one a failure is about can be older.
+            out["about"] = [_about(conn, now_ms, alias, prefix) for alias, prefix in about]
         if "pairing_relations" in tables:
             count = conn.execute("SELECT COUNT(*) FROM pairing_relations").fetchone()[0]
             out["pairing_relations"] = {"rows": count}
@@ -179,12 +221,13 @@ def _read_all(conn: sqlite3.Connection, now_ms: int) -> dict:
     return out
 
 
-def read_snapshot(path: str, now_ms: int | None = None) -> dict:
+def read_snapshot(path: str, now_ms: int | None = None, about: list = ()) -> dict:
     """The JSON-able snapshot of the database at `path` (see the module doc).
 
     `now_ms` is the wall-clock millisecond the ages are measured against;
     it defaults to the current time and is recorded in the result so a
-    caller can line the ages up with its own timeline.
+    caller can line the ages up with its own timeline. `about` lists
+    `(alias, prefix)` pairs (see `_read_all`).
     """
     if now_ms is None:
         now_ms = int(time.time() * 1000)
@@ -197,7 +240,7 @@ def read_snapshot(path: str, now_ms: int | None = None) -> dict:
         try:
             conn.execute("PRAGMA query_only = ON")
             out["journal_mode"] = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
-            out.update(_read_all(conn, now_ms))
+            out.update(_read_all(conn, now_ms, about))
         finally:
             conn.close()
         out["ok"] = True
@@ -207,11 +250,35 @@ def read_snapshot(path: str, now_ms: int | None = None) -> dict:
     return out
 
 
+def _parse_about(argv: list) -> tuple:
+    """Split the arguments into the database path and the `(alias, prefix)` pairs.
+
+    A pair is written `--about ALIAS=PREFIX`, the prefix being the first
+    four bytes of a pairing id as eight hex digits.
+    """
+    about = []
+    rest = list(argv)
+    while "--about" in rest:
+        at = rest.index("--about")
+        spec = rest[at + 1] if at + 1 < len(rest) else ""
+        del rest[at : at + 2]
+        alias, separator, prefix = spec.partition("=")
+        prefix = prefix.lower()
+        if not separator or not alias or len(prefix) != 8 or any(c not in "0123456789abcdef" for c in prefix):
+            raise ValueError("usage")
+        about.append((alias, bytes.fromhex(prefix)))
+    if len(rest) != 1:
+        raise ValueError("usage")
+    return rest[0], about
+
+
 def main(argv: list) -> int:
-    if len(argv) != 2:
-        print(json.dumps({"ok": False, "error_kind": "usage"}, sort_keys=True))
+    try:
+        path, about = _parse_about(argv[1:])
+    except ValueError as error:
+        print(json.dumps({"ok": False, "error_kind": str(error)}, sort_keys=True))
         return 0
-    print(json.dumps(read_snapshot(argv[1]), sort_keys=True))
+    print(json.dumps(read_snapshot(path, about=about), sort_keys=True))
     return 0
 
 

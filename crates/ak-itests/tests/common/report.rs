@@ -800,6 +800,10 @@ pub struct FrozenProcess {
 pub struct Frozen {
     pub origin: u128,
     pub processes: Vec<FrozenProcess>,
+    /// The registry's stderr since the cursor, redacted.
+    pub decisions: Vec<String>,
+    /// The snapshot's look at the transactions the decisions name.
+    pub transactions: String,
     pub snapshot: String,
     pub snapshot_at_ms: u128,
 }
@@ -839,9 +843,31 @@ pub fn freeze(logs: &[(&str, &LineLog)]) -> Frozen {
         .map(|line| line.at_ms)
         .min()
         .unwrap_or_else(since_origin_ms);
+    let cursor = DECISIONS_FROM.with(|from| from.get());
+    let decisions: Vec<String> = registry_err_lines()
+        .into_iter()
+        .skip(cursor)
+        .map(|line| redact(&line.text))
+        .collect();
+    let prefixes = pairing_prefixes_in(&decisions);
+    let aliases: Vec<String> = (1..=prefixes.len())
+        .map(|index| format!("pairing-attempt-{index}"))
+        .collect();
+    let about: Vec<(&str, [u8; 4])> = aliases
+        .iter()
+        .zip(&prefixes)
+        .map(|(alias, prefix)| (alias.as_str(), *prefix))
+        .collect();
+    let transactions = REGISTRY_DB
+        .with(|slot| slot.borrow().clone())
+        .filter(|_| !about.is_empty())
+        .map(|db| registry_snapshot_about(&db, &about))
+        .unwrap_or_default();
     Frozen {
         origin,
         processes: frozen,
+        decisions,
+        transactions,
         snapshot: registry_snapshot(),
         snapshot_at_ms: since_origin_ms(),
     }
@@ -863,6 +889,19 @@ impl Frozen {
                 process.name
             ));
             report.push_str(&process.timeline(self.origin).join("\n"));
+        }
+        if !self.decisions.is_empty() {
+            report.push_str(&format!(
+                "\n--- registry decisions and notices since the cursor ({} line(s)):\n{}",
+                self.decisions.len(),
+                self.decisions.join("\n")
+            ));
+        }
+        if !self.transactions.is_empty() {
+            report.push_str(&format!(
+                "\n--- the transactions those decisions name, looked up by their pairing's first four bytes:\n{}",
+                self.transactions
+            ));
         }
         report.push_str(&format!(
             "\n--- registry database, read-only snapshot at +{} ms:\n{}",
@@ -1129,12 +1168,13 @@ impl LineLog {
     /// [`Self::wait_for`] on one stream of this process. The stream only
     /// decides where the line is looked for; the report, when the wait
     /// gives up, always comes from this process — both pipes, one exit
-    /// status — and from `others`, each process once. The wait stops as
-    /// soon as this process or one of `others` is over and did not end
-    /// well (Q-N3, 2026-11-27): the registry is still alive then, so its
-    /// log and a read-only snapshot of its database go into the report.
-    /// A line that was read after the deadline shows in that report and
-    /// does not count as the line having come in time.
+    /// status — and from every other process this test thread still
+    /// holds, those named in `others` and those not, each once. The wait
+    /// stops as soon as this process or one of `others` is over and did
+    /// not end well (Q-N3, 2026-11-27): the registry is still alive then,
+    /// so its log and a read-only snapshot of its database go into the
+    /// report. A line that was read after the deadline shows in that
+    /// report and does not count as the line having come in time.
     pub fn wait_for_stream(
         &self,
         stream: Stream,
@@ -1152,42 +1192,94 @@ impl LineLog {
             {
                 return line.text;
             }
-            let self_ended = self.ended_with_error();
-            let other_ended = others
-                .iter()
-                .find(|(_, other)| other.ended_with_error())
-                .map(|(name, _)| *name);
             let now = Instant::now();
-            if now >= deadline || self_ended || other_ended.is_some() {
-                let mut who: Vec<String> = Vec::new();
-                if self_ended {
-                    who.push(self.name.as_deref().unwrap_or("this process").to_string());
-                }
-                if let Some(name) = other_ended {
-                    who.push(name.to_string());
-                }
-                let why = if who.is_empty() {
-                    format!("waited the full {timeout:?}")
-                } else {
-                    format!(
-                        "stopped early: {} had already ended without success",
-                        who.join(" and ")
-                    )
-                };
-                let stream = match stream {
-                    Stream::Stdout => "stdout",
-                    Stream::Stderr => "stderr",
-                };
-                let mut logs: Vec<(&str, &LineLog)> =
-                    vec![(self.name.as_deref().unwrap_or("this process"), self)];
-                logs.extend_from_slice(others);
-                panic!(
-                    "no line of the {stream} containing {needle:?} ({why}){}",
-                    freeze(&logs).render()
+            if self.giving_up(deadline, now, others) {
+                self.give_up(stream, &format!("containing {needle:?}"), timeout, others);
+            }
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+        }
+    }
+
+    /// Wait until at least `count` lines of stdout contain `needle`; a wait
+    /// that gives up reports as [`Self::wait_for_stream`] does.
+    pub fn wait_count(&self, needle: &str, count: usize, timeout: std::time::Duration) {
+        let deadline = Instant::now() + timeout;
+        let deadline_ms = since_origin_ms() + timeout.as_millis();
+        loop {
+            let have = self
+                .lines_of(Stream::Stdout)
+                .into_iter()
+                .filter(|line| line.at_ms <= deadline_ms && line.text.contains(needle))
+                .count();
+            if have >= count {
+                return;
+            }
+            let now = Instant::now();
+            if self.giving_up(deadline, now, &[]) {
+                self.give_up(
+                    Stream::Stdout,
+                    &format!("with at least {count} line(s) containing {needle:?}"),
+                    timeout,
+                    &[],
                 );
             }
             std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
         }
+    }
+
+    /// Whether a wait has run out: its deadline, or this process or one of
+    /// `others` over and not ended well.
+    fn giving_up(&self, deadline: Instant, now: Instant, others: &[(&str, &LineLog)]) -> bool {
+        let ended =
+            self.ended_with_error() || others.iter().any(|(_, other)| other.ended_with_error());
+        now >= deadline || ended
+    }
+
+    /// Panic with the report of every process for a wait that ran out.
+    fn give_up(
+        &self,
+        stream: Stream,
+        what: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> ! {
+        let mut who: Vec<String> = Vec::new();
+        if self.ended_with_error() {
+            who.push(self.name.as_deref().unwrap_or("this process").to_string());
+        }
+        who.extend(
+            others
+                .iter()
+                .filter(|(_, other)| other.ended_with_error())
+                .map(|(name, _)| name.to_string()),
+        );
+        let why = if who.is_empty() {
+            format!("waited the full {timeout:?}")
+        } else {
+            format!(
+                "stopped early: {} had already ended without success",
+                who.join(" and ")
+            )
+        };
+        let stream = match stream {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
+        };
+        let mut logs: Vec<(&str, &LineLog)> =
+            vec![(self.name.as_deref().unwrap_or("this process"), self)];
+        logs.extend_from_slice(others);
+        // Every other process this test thread still holds goes in too: a
+        // wait on one process often runs out because of another, whichever
+        // was named.
+        let live = live_processes();
+        logs.extend(
+            live.iter()
+                .map(|log| (log.name.as_deref().unwrap_or("process"), log)),
+        );
+        panic!(
+            "no line of the {stream} {what} ({why}){}",
+            freeze(&logs).render()
+        );
     }
 }
 
@@ -1195,13 +1287,111 @@ thread_local! {
     /// The database of the registry this test thread started last, for the
     /// snapshot in a failure report.
     static REGISTRY_DB: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+
+    /// Every process this test thread spawned and has not dropped, in spawn
+    /// order. A report names them all — also the one a wait gave up on
+    /// before its first line (plan of 2026-11-28, section F).
+    static LIVE: std::cell::RefCell<Vec<LineLog>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The registry this test thread started, and where its decision lines
+    /// are to be read from: a report frozen after [`mark_decision_cursor`]
+    /// shows what the registry decided since, and the transactions named
+    /// there (plan of 2026-11-28, section F).
+    static REGISTRY_LOG: std::cell::RefCell<Option<LineLog>> = const { std::cell::RefCell::new(None) };
+    static DECISIONS_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Every process this test thread spawned and still holds.
+fn live_processes() -> Vec<LineLog> {
+    LIVE.with(|live| live.borrow().clone())
+}
+
+/// The registry's stderr, decision and notice lines among it.
+fn registry_err_lines() -> Vec<TimedLine> {
+    REGISTRY_LOG.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|log| log.lines_of(Stream::Stderr))
+            .unwrap_or_default()
+    })
+}
+
+/// From here on, every report of this test thread shows what the registry
+/// decided after this moment, and the transactions it names by the first
+/// four bytes of their pairing id. Taken once a calibration has shown that
+/// this registry's lines are being captured, so the natural attempts are
+/// read without the calibration's own lines.
+pub fn mark_decision_cursor() {
+    DECISIONS_FROM.with(|from| from.set(registry_err_lines().len()));
+}
+
+/// The report for every process this test thread spawned and still holds,
+/// each once, with the registry database of this thread: what a chain test
+/// panics with when one of its waits fails.
+pub fn live_report() -> String {
+    let live = live_processes();
+    let logs: Vec<(&str, &LineLog)> = live
+        .iter()
+        .map(|log| (log.name.as_deref().unwrap_or("process"), log))
+        .collect();
+    freeze(&logs).render()
 }
 
 /// `scripts/t03_pairing_snapshot.py` on the registry database, or the reason
 /// it was not taken. The interpreter is `AK_T03_PYTHON` when set, else
 /// `python` / `python3` from the PATH.
 pub fn registry_snapshot() -> String {
-    let Some(db) = REGISTRY_DB.with(|slot| slot.borrow().clone()) else {
+    run_snapshot(REGISTRY_DB.with(|slot| slot.borrow().clone()), &[])
+}
+
+/// The same snapshot with the transactions whose pairing ids start with
+/// given four bytes printed under an alias — one `(alias, prefix)` per
+/// pairing a failure is about. A row is printed only when exactly one
+/// transaction matches (plan of 2026-11-28, section F); the bytes looked up
+/// are never printed.
+pub fn registry_snapshot_about(db: &std::path::Path, about: &[(&str, [u8; 4])]) -> String {
+    let specs: Vec<String> = about
+        .iter()
+        .map(|(alias, prefix)| {
+            let prefix: String = prefix.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("{alias}={prefix}")
+        })
+        .collect();
+    let mut extra: Vec<&str> = Vec::new();
+    for spec in &specs {
+        extra.extend(["--about", spec.as_str()]);
+    }
+    run_snapshot(Some(db.to_path_buf()), &extra)
+}
+
+/// The first four bytes of every pairing id that `lines` name as
+/// `(pairing XXXXXXXX)`, in order of first appearance. They are what the
+/// registry's decision lines print and what a lookup takes.
+pub fn pairing_prefixes_in<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Vec<[u8; 4]> {
+    let mut prefixes: Vec<[u8; 4]> = Vec::new();
+    for line in lines {
+        let mut rest = line.as_ref();
+        while let Some(at) = rest.find("(pairing ") {
+            rest = &rest[at + "(pairing ".len()..];
+            let Some(prefix) = rest.get(..8).and_then(|text| {
+                let mut bytes = [0u8; 4];
+                for (index, slot) in bytes.iter_mut().enumerate() {
+                    *slot = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+                }
+                Some(bytes)
+            }) else {
+                continue;
+            };
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    prefixes
+}
+
+fn run_snapshot(db: Option<PathBuf>, extra: &[&str]) -> String {
+    let Some(db) = db else {
         return "not taken: no registry database was registered on this thread".into();
     };
     let python: std::ffi::OsString = std::env::var_os("AK_T03_PYTHON").unwrap_or_else(|| {
@@ -1215,12 +1405,9 @@ pub fn registry_snapshot() -> String {
         .join("scripts")
         .join("t03_pairing_snapshot.py");
     let started = Instant::now();
-    match Command::new(&python)
-        .arg("-I")
-        .arg(&script)
-        .arg(&db)
-        .output()
-    {
+    let mut command = Command::new(&python);
+    command.arg("-I").arg(&script).arg(&db).args(extra);
+    match command.output() {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
@@ -1297,6 +1484,8 @@ impl Proc {
         .with_stderr(&stderr)
         .named(tag)
         .watched_by(&exit);
+        // Registered from its first moment, before any line of it exists.
+        LIVE.with(|live| live.borrow_mut().push(stdout.clone()));
         let stdin = child.lock().unwrap_or_else(|p| p.into_inner()).stdin.take();
         let watched = Arc::clone(&child);
         let tag = tag.to_string();
@@ -1412,6 +1601,10 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
+        LIVE.with(|live| {
+            live.borrow_mut()
+                .retain(|log| !Arc::ptr_eq(&log.state, &self.stdout.state))
+        });
         self.kill();
     }
 }
@@ -1424,10 +1617,25 @@ pub struct RegistryProc {
     pub proc: Proc,
     pub addr: SocketAddr,
     pub fp_hex: String,
+    /// The database this registry writes. A lookup from another thread
+    /// takes it explicitly: the thread-local one is its own thread's.
+    pub db: PathBuf,
 }
 
 impl RegistryProc {
     pub fn spawn(tag: &str, server_dir: &std::path::Path, db: &std::path::Path) -> RegistryProc {
+        RegistryProc::spawn_with_log(tag, server_dir, db, "info,ak_signal::server_v2=debug")
+    }
+
+    /// [`Self::spawn`] with the registry's `RUST_LOG` given: the tests of
+    /// the calibration (plan of 2026-11-28, section F) show that it is red
+    /// when the decision lines are not written.
+    pub fn spawn_with_log(
+        tag: &str,
+        server_dir: &std::path::Path,
+        db: &std::path::Path,
+        rust_log: &str,
+    ) -> RegistryProc {
         let args: Vec<String> = [
             "registry-server",
             "--port",
@@ -1443,12 +1651,9 @@ impl RegistryProc {
         // Q-N3 (2026-11-27): the registry's DEBUG lines say which branch
         // did what (a ghost redeem expiring, a delivery that went
         // nowhere); everything else stays at INFO.
-        let proc = Proc::spawn_with_env(
-            tag,
-            &args,
-            &[("RUST_LOG", "info,ak_signal::server_v2=debug")],
-        );
+        let proc = Proc::spawn_with_env(tag, &args, &[("RUST_LOG", rust_log)]);
         REGISTRY_DB.with(|slot| *slot.borrow_mut() = Some(db.to_path_buf()));
+        REGISTRY_LOG.with(|slot| *slot.borrow_mut() = Some(proc.stdout.clone()));
         let listening = proc.stdout.wait_for(
             "v2 pairing registry on tls ",
             std::time::Duration::from_secs(60),
@@ -1470,6 +1675,11 @@ impl RegistryProc {
             redact(line.as_ref())
         );
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        RegistryProc { proc, addr, fp_hex }
+        RegistryProc {
+            proc,
+            addr,
+            fp_hex,
+            db: db.to_path_buf(),
+        }
     }
 }

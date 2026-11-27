@@ -18,8 +18,14 @@
 //! system error phrase that reaches the end of the line, so that the cause
 //! after such a path is kept.
 
+use std::io::{BufRead, BufReader, Read, Write as IoWrite};
+use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// The reportable form of captured text, line by line.
 pub fn redact(text: &str) -> String {
@@ -595,4 +601,875 @@ pub fn argv_summary(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ---- the chain: processes, logs and one frozen report --------------------
+
+pub fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/ak-itests has a workspace root two levels up")
+        .to_path_buf()
+}
+
+pub fn cargo_bin() -> PathBuf {
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        return PathBuf::from(cargo);
+    }
+    std::env::var_os("USERPROFILE")
+        .map(|home| {
+            PathBuf::from(home).join(".cargo").join(if cfg!(windows) {
+                "bin\\cargo.exe"
+            } else {
+                "bin/cargo"
+            })
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("cargo"))
+}
+
+/// Path of the `ak-cli` executable (which also provides the
+/// `registry-server` subcommand), building it once if needed.
+pub fn cli_exe() -> PathBuf {
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    EXE.get_or_init(|| {
+        let root = workspace_root();
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
+        let exe = target_dir.join("debug").join(if cfg!(windows) {
+            "ak-cli.exe"
+        } else {
+            "ak-cli"
+        });
+        let output = Command::new(cargo_bin())
+            .args(["build", "-p", "ak-cli"])
+            .current_dir(&root)
+            .output()
+            .unwrap_or_else(|err| panic!("cannot run cargo build -p ak-cli: {err}"));
+        assert!(
+            output.status.success(),
+            "cargo build -p ak-cli failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(exe.exists(), "cargo build produced no {}", exe.display());
+        exe
+    })
+    .clone()
+}
+
+/// The port a `registry-server --port 0` bound, from its `v2 pairing
+/// registry on tls <addr> (db …)` line. The server prints that line only
+/// once it listens (2026-11-19 review), so no port is picked here and
+/// bound later by another process, and no client starts too early.
+pub fn announced_registry_port(line: &str) -> u16 {
+    line.split("v2 pairing registry on tls ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|token| token.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| panic!("bound address in the registry line: {}", redact(line)))
+}
+
+/// Lines a piped stream produced so far, each stamped with the moment the
+/// reader thread read it, fed by a reader thread so a full pipe can never
+/// block the child. A stdout log also holds its process's stderr and its
+/// exit status (from a watcher thread), so a timed-out wait reports all
+/// three (2026-11-19 review: a CLI that fails before its first stdout line
+/// says why only on stderr).
+///
+/// Q-N3 recurrence (2026-11-27): a report shows every line of every process
+/// of the chain with milliseconds since the first of those lines, how each
+/// pipe ended (closed by the writer, or a read error) and each process's
+/// exit status, and never prints a task code, a registry fingerprint, a
+/// pairing id, a filesystem path or an address that is not loopback.
+#[derive(Clone, Default)]
+pub struct LineLog {
+    pub state: Arc<Mutex<LogState>>,
+    pub stderr: Option<Arc<Mutex<LogState>>>,
+    /// The process tag, for a report's heading.
+    pub name: Option<String>,
+    /// What the watcher thread concluded about the process's end.
+    pub exit: Option<Arc<Mutex<Watched>>>,
+}
+
+/// What the watcher of a child process knows about how it ended.
+#[derive(Clone, Default)]
+pub enum Watched {
+    /// Still running (or not watched at all).
+    #[default]
+    Running,
+    Exited(std::process::ExitStatus),
+    /// The watcher could not keep polling the child: its end is unknown.
+    Unwatched(String),
+}
+
+/// One of a process's two pipes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// One line read off a pipe and the moment it was read.
+#[derive(Clone)]
+pub struct TimedLine {
+    pub at_ms: u128,
+    pub text: String,
+}
+
+#[derive(Default)]
+pub struct LogState {
+    pub lines: Vec<TimedLine>,
+    /// How the pipe ended and when: `None` for the error means the writer
+    /// closed it; `None` for the whole field means it is still open.
+    pub end: Option<(u128, Option<String>)>,
+}
+
+/// The test binary's monotonic clock: every captured line is stamped with
+/// milliseconds since the first process was spawned (tests in one binary
+/// share it; each report then counts from its own first line).
+pub fn since_origin_ms() -> u128 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// How long a report waits for the last lines of a process that already
+/// exited: they can still be in the pipes when its exit is first seen
+/// (review 20), and the first error is often the last line.
+pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Wait, at most [`SETTLE`], until every process here that already exited
+/// has nothing left coming out of its pipes. A process still running is
+/// not waited for.
+pub fn settle(logs: &[&LineLog]) {
+    let until = Instant::now() + SETTLE;
+    while Instant::now() < until {
+        let pending = logs
+            .iter()
+            .any(|log| log.exit().is_some() && !log.pipes_ended());
+        if !pending {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `logs` with every process once: a log is left out when one of its
+/// pipes is a pipe of a log already kept (the bare stderr log of a process
+/// whose stdout log is listed). A report shows each process once, however
+/// the wait that produced it was phrased.
+pub fn unique_processes<'a>(logs: &[(&'a str, &'a LineLog)]) -> Vec<(&'a str, &'a LineLog)> {
+    pub fn pipes(log: &LineLog) -> impl Iterator<Item = &Arc<Mutex<LogState>>> {
+        std::iter::once(&log.state).chain(log.stderr.as_ref())
+    }
+    let mut kept: Vec<(&str, &LineLog)> = Vec::new();
+    for &(name, log) in logs {
+        let same = |state: &Arc<Mutex<LogState>>| {
+            kept.iter()
+                .any(|(_, seen)| pipes(seen).any(|pipe| Arc::ptr_eq(pipe, state)))
+        };
+        if !pipes(log).any(same) {
+            kept.push((name, log));
+        }
+    }
+    kept
+}
+
+/// One process as a report froze it.
+pub struct FrozenProcess {
+    pub name: String,
+    pub out: Vec<TimedLine>,
+    pub err: Vec<TimedLine>,
+    /// How each pipe ended and when: the error is `None` when the writer
+    /// closed the pipe, the whole field `None` while it is still open.
+    pub out_end: Option<(u128, Option<String>)>,
+    pub err_end: Option<(u128, Option<String>)>,
+    pub exit: Watched,
+}
+
+/// Every process of a chain, taken once for one report (plan of 2026-11-28,
+/// after review 21): the last lines of processes that already exited are
+/// waited for, then every pipe, every exit status and the common origin
+/// are frozen, and the registry database is sampled once. A summary, the
+/// details and whatever a test decides all read this one copy, so they
+/// cannot disagree. Lines that only arrived during the wait explain a
+/// failure; they never turn it into a success.
+pub struct Frozen {
+    pub origin: u128,
+    pub processes: Vec<FrozenProcess>,
+    pub snapshot: String,
+    pub snapshot_at_ms: u128,
+}
+
+pub fn freeze(logs: &[(&str, &LineLog)]) -> Frozen {
+    let processes = unique_processes(logs);
+    settle(&processes.iter().map(|(_, log)| *log).collect::<Vec<_>>());
+    let frozen: Vec<FrozenProcess> = processes
+        .iter()
+        .map(|(name, log)| {
+            let out = log
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let err = log.stderr.as_ref().map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            FrozenProcess {
+                name: name.to_string(),
+                out: out.lines.clone(),
+                err: err
+                    .as_ref()
+                    .map(|err| err.lines.clone())
+                    .unwrap_or_default(),
+                out_end: out.end.clone(),
+                err_end: err.as_ref().and_then(|err| err.end.clone()),
+                exit: log.watched(),
+            }
+        })
+        .collect();
+    let origin = frozen
+        .iter()
+        .flat_map(|process| [&process.out, &process.err])
+        .filter_map(|lines| lines.first())
+        .map(|line| line.at_ms)
+        .min()
+        .unwrap_or_else(since_origin_ms);
+    Frozen {
+        origin,
+        processes: frozen,
+        snapshot: registry_snapshot(),
+        snapshot_at_ms: since_origin_ms(),
+    }
+}
+
+impl Frozen {
+    pub fn process(&self, name: &str) -> Option<&FrozenProcess> {
+        self.processes.iter().find(|process| process.name == name)
+    }
+
+    /// The report's text: each process once, as a timeline of both pipes
+    /// counted from the first line any of them wrote, then the registry
+    /// database with the moment it was sampled.
+    pub fn render(&self) -> String {
+        let mut report = String::new();
+        for process in &self.processes {
+            report.push_str(&format!(
+                "\n--- {} (milliseconds since the first line of this report):\n",
+                process.name
+            ));
+            report.push_str(&process.timeline(self.origin).join("\n"));
+        }
+        report.push_str(&format!(
+            "\n--- registry database, read-only snapshot at +{} ms:\n{}",
+            self.snapshot_at_ms.saturating_sub(self.origin),
+            self.snapshot
+        ));
+        report
+    }
+}
+
+impl FrozenProcess {
+    /// The lines of both pipes, redacted, each with milliseconds since
+    /// `origin` and the stream it came from; then how each pipe ended and
+    /// the exit status (still-open pipes last).
+    pub fn timeline(&self, origin: u128) -> Vec<String> {
+        let mut rows: Vec<(u128, String)> = Vec::new();
+        for (state, ended, tag) in [
+            (&self.out, &self.out_end, "out"),
+            (&self.err, &self.err_end, "err"),
+        ] {
+            for line in state {
+                rows.push((
+                    line.at_ms,
+                    format!(
+                        "[+{:>7} ms] {tag}: {}",
+                        line.at_ms.saturating_sub(origin),
+                        redact(&line.text)
+                    ),
+                ));
+            }
+            match ended {
+                Some((at, None)) => rows.push((
+                    *at,
+                    format!(
+                        "[+{:>7} ms] {tag}: <pipe closed by the writer>",
+                        at.saturating_sub(origin)
+                    ),
+                )),
+                Some((at, Some(error))) => rows.push((
+                    *at,
+                    format!(
+                        "[+{:>7} ms] {tag}: <pipe lost on a read error: {error}>",
+                        at.saturating_sub(origin)
+                    ),
+                )),
+                None => rows.push((u128::MAX, format!("[+      ? ms] {tag}: <pipe still open>"))),
+            }
+        }
+        match &self.exit {
+            Watched::Exited(status) if status.success() => {
+                rows.push((u128::MAX, format!("exit status: {status}")))
+            }
+            Watched::Exited(status) => rows.push((u128::MAX - 1, format!("exit status: {status}"))),
+            Watched::Unwatched(error) => rows.push((
+                u128::MAX - 1,
+                format!("exit status: unknown; the watcher could not poll the child: {error}"),
+            )),
+            Watched::Running => rows.push((
+                u128::MAX,
+                "exit status: <process still running>".to_string(),
+            )),
+        }
+        rows.sort_by_key(|(at, _)| *at);
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    pub fn out_text(&self) -> String {
+        Self::text_of(&self.out)
+    }
+
+    pub fn err_text(&self) -> String {
+        Self::text_of(&self.err)
+    }
+
+    pub fn text_of(lines: &[TimedLine]) -> String {
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl LineLog {
+    pub fn spawn_reader(stream: impl Read + Send + 'static) -> Self {
+        let log = LineLog::default();
+        let sink = Arc::clone(&log.state);
+        std::thread::spawn(move || {
+            let mut read_error = None;
+            for line in BufReader::new(stream).lines() {
+                match line {
+                    Ok(text) => {
+                        let at_ms = since_origin_ms();
+                        let mut state = sink.lock().unwrap_or_else(|p| p.into_inner());
+                        state.lines.push(TimedLine { at_ms, text });
+                    }
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            // The pipe ended: closed by the writer, or on a read error.
+            let mut state = sink.lock().unwrap_or_else(|p| p.into_inner());
+            state.end = Some((since_origin_ms(), read_error));
+        });
+        log
+    }
+
+    /// Report `stderr` (the same process's other stream) on a timeout.
+    pub fn with_stderr(mut self, stderr: &LineLog) -> Self {
+        self.stderr = Some(Arc::clone(&stderr.state));
+        self
+    }
+
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    pub fn watched_by(mut self, exit: &Arc<Mutex<Watched>>) -> Self {
+        self.exit = Some(Arc::clone(exit));
+        self
+    }
+
+    /// A log that no pipe feeds: the caller states its lines, whether its
+    /// pipes ended, and what the watcher concluded — for synthetic reports.
+    pub fn synthetic(
+        name: &str,
+        out: &[String],
+        err: &[String],
+        ended: bool,
+        exit: Watched,
+    ) -> LineLog {
+        let now = since_origin_ms();
+        let state = |lines: &[String]| -> Arc<Mutex<LogState>> {
+            Arc::new(Mutex::new(LogState {
+                lines: lines
+                    .iter()
+                    .map(|text| TimedLine {
+                        at_ms: now,
+                        text: text.clone(),
+                    })
+                    .collect(),
+                end: ended.then_some((now, None)),
+            }))
+        };
+        LineLog {
+            state: state(out),
+            stderr: Some(state(err)),
+            name: Some(name.to_string()),
+            exit: Some(Arc::new(Mutex::new(exit))),
+        }
+    }
+
+    /// What the watcher concluded so far.
+    pub fn watched(&self) -> Watched {
+        self.exit
+            .as_ref()
+            .map(|watched| watched.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            .unwrap_or(Watched::Running)
+    }
+
+    /// The lines of `stream` so far, for the callers that parse them.
+    pub fn lines_of(&self, stream: Stream) -> Vec<TimedLine> {
+        let state = match stream {
+            Stream::Stdout => &self.state,
+            Stream::Stderr => self.stderr.as_ref().unwrap_or(&self.state),
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lines
+            .clone()
+    }
+
+    /// This stream's raw lines so far.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.lines_of(Stream::Stdout)
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// The process's exit status once the watcher saw it.
+    pub fn exit(&self) -> Option<std::process::ExitStatus> {
+        match self.watched() {
+            Watched::Exited(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// When the first line of this log or its stderr was read.
+    pub fn earliest_ms(&self) -> Option<u128> {
+        [Stream::Stdout, Stream::Stderr]
+            .into_iter()
+            .filter_map(|stream| self.lines_of(stream).first().map(|line| line.at_ms))
+            .min()
+    }
+
+    /// Both pipes ended (closed or on a read error).
+    pub fn pipes_ended(&self) -> bool {
+        let ended = |state: &Arc<Mutex<LogState>>| {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .end
+                .is_some()
+        };
+        let err = self.stderr.as_ref().map(ended).unwrap_or(true);
+        ended(&self.state) && err
+    }
+
+    /// The process is over and did not end well: it exited unsuccessfully,
+    /// or both its pipes ended after an error line — one condition or the
+    /// other, whichever the watcher and the reader threads report first.
+    /// An exit status of 0 does not settle it by itself: a process can
+    /// print its error and exit 0. It cannot produce the line a wait is
+    /// looking for, so the wait stops and reports now.
+    pub fn ended_with_error(&self) -> bool {
+        let exited_badly = matches!(self.watched(), Watched::Exited(status) if !status.success());
+        exited_badly || (self.pipes_ended() && self.has_error_line())
+    }
+
+    /// `Error:` or a panic somewhere in this log or its stderr.
+    pub fn has_error_line(&self) -> bool {
+        let has = |state: &Arc<Mutex<LogState>>| {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .lines
+                .iter()
+                .any(|line| line.text.contains("Error:") || line.text.contains("panicked at"))
+        };
+        has(&self.state) || self.stderr.as_ref().is_some_and(has)
+    }
+
+    /// This process as one timeline counted from its earliest line. The
+    /// last lines of a process that already exited are waited for (see
+    /// [`settle`]).
+    pub fn report(&self) -> String {
+        freeze(&[(self.name.as_deref().unwrap_or("this process"), self)]).render()
+    }
+
+    /// First line containing `needle`, polling until it appears.
+    pub fn wait_for(&self, needle: &str, timeout: std::time::Duration) -> String {
+        self.wait_for_stream(Stream::Stdout, needle, timeout, &[])
+    }
+
+    /// [`Self::wait_for`], with `others`' output (stderr included) in the
+    /// timeout report too: a wait on one process often runs out because
+    /// of another (2026-11-20 review of batch Q: a Windows CI run timed
+    /// out waiting for the receiver's offer line, and the report held only
+    /// the receiver's side).
+    pub fn wait_for_reporting(
+        &self,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
+        self.wait_for_stream(Stream::Stdout, needle, timeout, others)
+    }
+
+    /// [`Self::wait_for`] on one stream of this process. The stream only
+    /// decides where the line is looked for; the report, when the wait
+    /// gives up, always comes from this process — both pipes, one exit
+    /// status — and from `others`, each process once. The wait stops as
+    /// soon as this process or one of `others` is over and did not end
+    /// well (Q-N3, 2026-11-27): the registry is still alive then, so its
+    /// log and a read-only snapshot of its database go into the report.
+    /// A line that was read after the deadline shows in that report and
+    /// does not count as the line having come in time.
+    pub fn wait_for_stream(
+        &self,
+        stream: Stream,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        let deadline_ms = since_origin_ms() + timeout.as_millis();
+        loop {
+            if let Some(line) = self
+                .lines_of(stream)
+                .into_iter()
+                .find(|line| line.at_ms <= deadline_ms && line.text.contains(needle))
+            {
+                return line.text;
+            }
+            let self_ended = self.ended_with_error();
+            let other_ended = others
+                .iter()
+                .find(|(_, other)| other.ended_with_error())
+                .map(|(name, _)| *name);
+            let now = Instant::now();
+            if now >= deadline || self_ended || other_ended.is_some() {
+                let mut who: Vec<String> = Vec::new();
+                if self_ended {
+                    who.push(self.name.as_deref().unwrap_or("this process").to_string());
+                }
+                if let Some(name) = other_ended {
+                    who.push(name.to_string());
+                }
+                let why = if who.is_empty() {
+                    format!("waited the full {timeout:?}")
+                } else {
+                    format!(
+                        "stopped early: {} had already ended without success",
+                        who.join(" and ")
+                    )
+                };
+                let stream = match stream {
+                    Stream::Stdout => "stdout",
+                    Stream::Stderr => "stderr",
+                };
+                let mut logs: Vec<(&str, &LineLog)> =
+                    vec![(self.name.as_deref().unwrap_or("this process"), self)];
+                logs.extend_from_slice(others);
+                panic!(
+                    "no line of the {stream} containing {needle:?} ({why}){}",
+                    freeze(&logs).render()
+                );
+            }
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+thread_local! {
+    /// The database of the registry this test thread started last, for the
+    /// snapshot in a failure report.
+    static REGISTRY_DB: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `scripts/t03_pairing_snapshot.py` on the registry database, or the reason
+/// it was not taken. The interpreter is `AK_T03_PYTHON` when set, else
+/// `python` / `python3` from the PATH.
+pub fn registry_snapshot() -> String {
+    let Some(db) = REGISTRY_DB.with(|slot| slot.borrow().clone()) else {
+        return "not taken: no registry database was registered on this thread".into();
+    };
+    let python: std::ffi::OsString = std::env::var_os("AK_T03_PYTHON").unwrap_or_else(|| {
+        if cfg!(windows) {
+            "python".into()
+        } else {
+            "python3".into()
+        }
+    });
+    let script = workspace_root()
+        .join("scripts")
+        .join("t03_pairing_snapshot.py");
+    let started = Instant::now();
+    match Command::new(&python)
+        .arg("-I")
+        .arg(&script)
+        .arg(&db)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => format!(
+            "not taken: exit status {} after {:?}; stderr: {}",
+            output.status,
+            started.elapsed(),
+            redact(&String::from_utf8_lossy(&output.stderr))
+        ),
+        Err(error) => format!("not taken: cannot start the interpreter ({error})"),
+    }
+}
+
+/// What every CLI child of a chain runs with (Q-N3, 2026-11-27): the
+/// endpoints' pairing trace on stderr (`AK_PAIR_DIAG` turns it on inside
+/// `ak-cli task`; `RUST_LOG` keeps everything else at warnings).
+pub const PAIR_DIAG_ENV: &[(&str, &str)] = &[
+    ("AK_PAIR_DIAG", "1"),
+    ("RUST_LOG", "warn,ak_pair_diag=info"),
+];
+
+/// A resident CLI child with captured stdout/stderr and a WRITABLE stdin
+/// (the receive consent prompt reads real terminal input). A watcher
+/// thread records its exit status, so a wait can tell "ended with status
+/// N" from "closed its pipes" (Q-N3).
+pub struct Proc {
+    /// Behind a lock: the watcher thread polls it, `kill` ends it.
+    pub child: Arc<Mutex<Child>>,
+    pub stdout: LineLog,
+    #[allow(dead_code)]
+    pub stderr: LineLog,
+    pub stdin: Option<ChildStdin>,
+}
+
+impl Proc {
+    pub fn spawn(tag: &str, args: &[String]) -> Proc {
+        Proc::spawn_with_env(tag, args, PAIR_DIAG_ENV)
+    }
+
+    /// [`Self::spawn`] with extra environment variables for the child.
+    pub fn spawn_with_env(tag: &str, args: &[String], env: &[(&str, &str)]) -> Proc {
+        let cli = cli_exe();
+        let mut command = Command::new(&cli);
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {tag} ({}): {err}", argv_summary(args)));
+        let child = Arc::new(Mutex::new(child));
+        let stderr = LineLog::spawn_reader(
+            child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stderr
+                .take()
+                .expect("stderr piped"),
+        )
+        .named(&format!("{tag} (stderr)"));
+        let exit: Arc<Mutex<Watched>> = Arc::new(Mutex::new(Watched::Running));
+        let stdout = LineLog::spawn_reader(
+            child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .stdout
+                .take()
+                .expect("stdout piped"),
+        )
+        .with_stderr(&stderr)
+        .named(tag)
+        .watched_by(&exit);
+        let stdin = child.lock().unwrap_or_else(|p| p.into_inner()).stdin.take();
+        let watched = Arc::clone(&child);
+        let tag = tag.to_string();
+        std::thread::spawn(move || loop {
+            let status = {
+                let mut child = watched.lock().unwrap_or_else(|p| p.into_inner());
+                child.try_wait()
+            };
+            match status {
+                Ok(Some(status)) => {
+                    *exit.lock().unwrap_or_else(|p| p.into_inner()) = Watched::Exited(status);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(error) => {
+                    eprintln!("t03: cannot poll the child {tag}: {error}");
+                    // The report says the end is unknown, not "still running".
+                    *exit.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Watched::Unwatched(error.to_string());
+                    break;
+                }
+            }
+        });
+        Proc {
+            child,
+            stdout,
+            stderr,
+            stdin,
+        }
+    }
+
+    /// The exit status once the watcher saw it.
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.stdout.exit()
+    }
+
+    /// Wait for a line of one stream of this process; the report, when
+    /// the wait gives up, is this process's (both pipes, one exit status)
+    /// and `others`'. See [`LineLog::wait_for_stream`].
+    pub fn wait_for_line(
+        &self,
+        stream: Stream,
+        needle: &str,
+        timeout: std::time::Duration,
+        others: &[(&str, &LineLog)],
+    ) -> String {
+        self.stdout.wait_for_stream(stream, needle, timeout, others)
+    }
+
+    /// This process's stdout and stderr as one timeline.
+    pub fn report(&self) -> String {
+        let mut text = format!("{}:", self.stdout.name.as_deref().unwrap_or("process"));
+        for line in self.stdout.report().split('\n') {
+            text.push('\n');
+            text.push_str(line);
+        }
+        text
+    }
+
+    /// Answer the consent prompt. The prompt itself is a `print!` without
+    /// a newline (so it never forms a readable line) and the CLI DISCARDS
+    /// input older than the question — so feed a fresh `y` every 100 ms
+    /// from the moment the (newline-terminated) offer line appeared until
+    /// the receiver moves on; a `y` that lands after the question started
+    /// is genuinely fresh and accepts.
+    pub fn consent_yes(&mut self, done_needles: &[&str], budget: std::time::Duration) {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if let Some(stdin) = self.stdin.as_mut() {
+                if writeln!(stdin, "y").and_then(|_| stdin.flush()).is_err() {
+                    break; // the child is gone
+                }
+            }
+            let log = self.stdout.snapshot().join("\n");
+            if done_needles.iter().any(|needle| log.contains(needle)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Wait until the child exited, and it exited successfully. Its last
+    /// lines are read in first: they can still be in the pipes when the
+    /// exit is first seen, and the caller reads the log right after this.
+    pub fn wait_exit_ok(&mut self, timeout: std::time::Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.exit_status() {
+                settle(&[&self.stdout]);
+                assert!(
+                    status.success(),
+                    "cli child exited with {status}; {}",
+                    self.report()
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cli child did not exit within {timeout:?}; {}",
+                self.report()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    pub fn kill(&mut self) {
+        self.stdin.take();
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The real v2 registry as a subprocess (`ak-cli registry-server`), same
+/// shape as the invite-pairing itests.
+pub struct RegistryProc {
+    /// Owning the process keeps the registry alive (killed on drop).
+    #[allow(dead_code)]
+    pub proc: Proc,
+    pub addr: SocketAddr,
+    pub fp_hex: String,
+}
+
+impl RegistryProc {
+    pub fn spawn(tag: &str, server_dir: &std::path::Path, db: &std::path::Path) -> RegistryProc {
+        let args: Vec<String> = [
+            "registry-server",
+            "--port",
+            "0",
+            "--db-path",
+            &db.to_string_lossy(),
+            "--id-dir",
+            &server_dir.to_string_lossy(),
+        ]
+        .iter()
+        .map(|text| text.to_string())
+        .collect();
+        // Q-N3 (2026-11-27): the registry's DEBUG lines say which branch
+        // did what (a ghost redeem expiring, a delivery that went
+        // nowhere); everything else stays at INFO.
+        let proc = Proc::spawn_with_env(
+            tag,
+            &args,
+            &[("RUST_LOG", "info,ak_signal::server_v2=debug")],
+        );
+        REGISTRY_DB.with(|slot| *slot.borrow_mut() = Some(db.to_path_buf()));
+        let listening = proc.stdout.wait_for(
+            "v2 pairing registry on tls ",
+            std::time::Duration::from_secs(60),
+        );
+        let port = announced_registry_port(&listening);
+        let line = proc.stdout.wait_for(
+            "registry id (pin with --registry-fp): ",
+            std::time::Duration::from_secs(60),
+        );
+        let fp_hex = line
+            .rsplit(' ')
+            .next()
+            .expect("hex id is the last token")
+            .to_ascii_lowercase();
+        assert_eq!(
+            fp_hex.len(),
+            64,
+            "registry id line: {}",
+            redact(line.as_ref())
+        );
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        RegistryProc { proc, addr, fp_hex }
+    }
 }

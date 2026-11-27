@@ -484,7 +484,10 @@ pub async fn serve_v2_with_revision(
 
 fn sweep(shared: &Shared) {
     let now = now_ms();
-    let mut expired_ghosts: Vec<Ghost> = Vec::new();
+    // Each ghost leaves with its pairing id: the decision line names the
+    // pairing the joiner's pending answer gave it, so ghosts that expire at
+    // the same millisecond are still told apart (review 21).
+    let mut expired_ghosts: Vec<(PairingId, Ghost)> = Vec::new();
     {
         let mut inner = shared.lock();
         // CR-P1-03: idle accounting entries go back to nothing (see
@@ -498,7 +501,7 @@ fn sweep(shared: &Shared) {
             .collect();
         for id in due {
             if let Some(ghost) = inner.ghosts.remove(&id) {
-                expired_ghosts.push(ghost);
+                expired_ghosts.push((id, ghost));
             }
         }
         // Redeem replay records live only until deadline + grace.
@@ -519,19 +522,12 @@ fn sweep(shared: &Shared) {
             }
         }
     }
-    for ghost in expired_ghosts {
-        log::debug!(
-            "ghost redeem expired at its {} ms deadline",
-            ghost.deadline_ms
+    for (pairing_id, ghost) in expired_ghosts {
+        decision!(
+            "ghost redeem expired at its {} ms deadline (pairing {})",
+            ghost.deadline_ms,
+            util::hex_prefix(&pairing_id, 4)
         );
-        #[cfg(test)]
-        tests::DECISIONS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(format!(
-                "ghost redeem expired at its {} ms deadline",
-                ghost.deadline_ms
-            ));
         shared.deliver(
             &ghost.requester,
             pair_error(

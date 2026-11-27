@@ -2424,7 +2424,10 @@ async fn two_pending_redeems_racing_commit_yield_exactly_one() {
 // filters by the test's own pairing or device prefix: the sink is
 // process-wide and the tests run in parallel.
 
-/// Every decision line the handlers produced, in order.
+/// Every decision line the handlers produced, in the order they were
+/// written — which, for lines written outside the engine lock, is not the
+/// order of what they describe (the notices carry numbers for that; see
+/// `NOTICES`).
 pub(super) static DECISIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn sink_len() -> usize {
@@ -2603,7 +2606,10 @@ async fn sleep_until_after(deadline: u64) {
 
 /// A redeem for a code the registry does not have is a ghost: the joiner's
 /// `unavailable` comes at the deadline and is named as a ghost expiry —
-/// not as a sweep, and not as an abort.
+/// not as a sweep, and not as an abort. Review 21: two ghosts share their
+/// deadline to the millisecond, and each expiry line is matched by the
+/// pairing its own pending answer named, so the neighbour's line — the
+/// same up to the pairing — does not pass for it.
 #[tokio::test]
 async fn diagnostics_name_a_ghost_redeem_expiring_at_its_deadline() {
     let server = spawn_server().await;
@@ -2611,56 +2617,124 @@ async fn diagnostics_name_a_ghost_redeem_expiring_at_its_deadline() {
     let mut joiner =
         TestClient::connect(server.addr, &registry_id, DeviceKeyPair::generate(), "j").await;
     let since = sink_len();
-    let deadline = now_ms() + 300;
-    let redeem = signed_redeem(
-        &joiner.key,
-        &registry_id,
-        [0x9E; 32],
-        random_id16(),
-        deadline,
-    );
-    joiner
-        .send(&CtrlMessage::InviteRedeem(redeem.clone()))
-        .await;
-    match joiner.recv().await {
-        CtrlMessage::InviteRedeemPending { .. } => {}
-        other => panic!("expected the ghost's pending shape, got {other:?}"),
+    let deadline = now_ms() + 600;
+    let lookup: Digest32 = [0x9E; 32];
+    let mine = signed_redeem(&joiner.key, &registry_id, lookup, random_id16(), deadline);
+    let neighbour = signed_redeem(&joiner.key, &registry_id, lookup, random_id16(), deadline);
+    for redeem in [&mine, &neighbour] {
+        joiner
+            .send(&CtrlMessage::InviteRedeem(redeem.clone()))
+            .await;
     }
-    // The unified answer carries the all-zero object id and the request id.
-    match joiner.recv().await {
-        CtrlMessage::PairError {
-            request_id,
-            scope: crate::protocol_v2::ErrorScope::Pairing,
-            object_id,
-            code: crate::protocol_v2::PAIR_UNAVAILABLE,
-            ..
-        } => {
-            assert_eq!(request_id, redeem.request_id);
-            assert_eq!(object_id, [0u8; 16]);
+    // Each request's pending answer is real: it names the request, the
+    // deadline it was signed with, and the pairing the registry minted.
+    let mut pairings = Vec::new();
+    for _ in 0..2 {
+        match joiner.recv().await {
+            CtrlMessage::InviteRedeemPending {
+                request_id,
+                pairing_id,
+                deadline_ms,
+            } => {
+                assert_eq!(deadline_ms, deadline, "the pending answer's deadline");
+                let redeem = [&mine, &neighbour]
+                    .into_iter()
+                    .find(|redeem| redeem.request_id == request_id)
+                    .expect("the pending answer names one of the two requests");
+                pairings.push((redeem.request_id, pairing_id));
+            }
+            other => panic!("expected the ghost's pending shape, got {other:?}"),
         }
-        other => panic!("expected the ghost's `unavailable`, got {other:?}"),
     }
-    let about_joiner = decisions_since(since, &prefix(&joiner.key.public_key()));
-    assert!(
-        about_joiner
+    assert_ne!(pairings[0].1, pairings[1].1, "two requests, two pairings");
+    // Both unified answers — pairing scope, the all-zero object id — each
+    // carrying the id of the request it answers.
+    let mut answered = Vec::new();
+    for _ in 0..2 {
+        match joiner.recv().await {
+            CtrlMessage::PairError {
+                request_id,
+                scope: crate::protocol_v2::ErrorScope::Pairing,
+                object_id,
+                code: crate::protocol_v2::PAIR_UNAVAILABLE,
+                ..
+            } => {
+                assert_eq!(object_id, [0u8; 16]);
+                answered.push(request_id);
+            }
+            other => panic!("expected a ghost's `unavailable`, got {other:?}"),
+        }
+    }
+    answered.sort();
+    let mut wanted: Vec<RequestId> = pairings.iter().map(|(request, _)| *request).collect();
+    wanted.sort();
+    assert_eq!(answered, wanted, "one `unavailable` per request, by its id");
+
+    // What the registry recorded about each pairing, once both expiries
+    // are in (one sweep tick takes both).
+    let until = tokio::time::Instant::now() + OBSERVE;
+    let per_pairing = settle(until, "the two ghost expiry decisions", || {
+        let per_pairing: Vec<(PairingId, Vec<String>)> = pairings
             .iter()
-            .any(|line| line.contains("recorded as a ghost")
-                && line.contains("self-redeem: false")),
-        "{about_joiner:?}"
-    );
-    assert!(
-        about_joiner
+            .map(|(_, pairing_id)| (*pairing_id, decisions_since(since, &prefix(pairing_id))))
+            .collect();
+        if per_pairing
             .iter()
-            .all(|line| !line.contains("begun under code revision")),
-        "{about_joiner:?}"
-    );
-    let expired = decisions_since(since, "ghost redeem expired");
-    assert!(
-        expired
+            .all(|(_, about)| stating(about, "ghost redeem expired") == 1)
+        {
+            Ok(per_pairing)
+        } else {
+            Err(format!("{per_pairing:?}"))
+        }
+    })
+    .await;
+    for (index, (pairing_id, about)) in per_pairing.iter().enumerate() {
+        let (_, (_, other)) = pairings
             .iter()
-            .any(|line| line.contains(&format!("at its {deadline} ms deadline"))),
-        "{expired:?}"
-    );
+            .enumerate()
+            .find(|(at, _)| *at != index)
+            .expect("the other ghost");
+        // Recorded as a ghost, never as a redeem under a live code.
+        assert!(
+            stating(about, "recorded as a ghost") == 1 && stating(about, "self-redeem: false") == 1,
+            "{about:?}"
+        );
+        assert_eq!(stating(about, "begun under code revision"), 0, "{about:?}");
+        // Its expiry, exactly once, by its own pairing — the neighbour
+        // expires at the same millisecond and its line differs in nothing
+        // else.
+        let expired = about
+            .iter()
+            .find(|line| line.contains("ghost redeem expired"))
+            .expect("counted above");
+        assert!(
+            expired.contains(&format!("at its {deadline} ms deadline"))
+                && expired.ends_with(&format!("(pairing {})", prefix(pairing_id))),
+            "{about:?}"
+        );
+        assert!(
+            !expired.contains(&prefix(other)),
+            "the expiry line names the neighbour's pairing: {about:?}"
+        );
+        // A ghost is no transaction: nothing swept or aborted it.
+        assert!(
+            stating(about, SWEEP_ENDED) == 0 && stating(about, ABORT_ENDED) == 0,
+            "{about:?}"
+        );
+    }
+    // Nothing else claims this deadline either: a second line per ghost in
+    // another shape would not be seen by matching pairings (the test-only
+    // string this round removed named none).
+    let of_this_deadline = decisions_since(since, &format!("at its {deadline} ms deadline"));
+    for line in &of_this_deadline {
+        assert!(
+            pairings
+                .iter()
+                .any(|(_, pairing_id)| line.ends_with(&format!("(pairing {})", prefix(pairing_id)))),
+            "an expiry line of this deadline that names neither ghost: {line:?}"
+        );
+    }
+    assert_eq!(of_this_deadline.len(), 2, "{of_this_deadline:?}");
     server.stop().await;
 }
 
@@ -2741,14 +2815,20 @@ async fn diagnostics_name_an_owner_aborting_before_the_deadline() {
 }
 
 /// A Prepared that reaches the registry after the deadline is answered
-/// `unavailable`, and the line says which of the two exits took it: the
-/// late-Prepared check itself, or the sweep that got there first (the
-/// sweeper runs every 200 ms, so both orders happen).
+/// `unavailable`, and the pairing is swept as well: the owner gets both
+/// errors and the joiner the sweep's (the sweeper runs every 200 ms, so
+/// either may come first). The three are one frame — pairing scope, this
+/// pairing, a zero request id — so nothing in them says which exit sent
+/// the owner its first one; the numbers of its two notices do (review 21).
+/// All three frames, both decisions and the three notice records are
+/// waited for first: a frame reaching a client does not say that its line
+/// and record are written yet.
 #[tokio::test]
 async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
     let server = spawn_server().await;
     let registry_id = server.registry_id();
     let since = sink_len();
+    let from = notices_len();
     let pending = pending_redeem(&server, || now_ms() + 700).await;
     let PendingRedeem {
         mut owner,
@@ -2772,63 +2852,108 @@ async fn diagnostics_name_a_prepared_arriving_after_the_deadline() {
     )
     .await;
     sleep_until_after(deadline).await;
-    owner
-        .send(&CtrlMessage::PairPrepared {
-            pairing_id,
-            transcript_digest: digest,
-            signature: owner
-                .key
-                .sign(&hello2::prepared_message(&pairing_id, &digest)),
-        })
-        .await;
-    // The owner's first error is its own answer (the all-zero object id)
-    // or, when the sweep got there first, the sweep's notification.
-    match owner.recv().await {
-        CtrlMessage::PairError {
-            code: crate::protocol_v2::PAIR_UNAVAILABLE,
-            ..
-        } => {}
-        other => panic!("expected the registry's `unavailable`, got {other:?}"),
-    }
-    let about = decisions_since(since, &prefix(&pairing_id));
-    let late_check = about.iter().any(|line| {
-        line.contains(
-            "answered unavailable: not a participant: false, transcript digest differs: false, ",
-        )
-    });
-    let swept_first = about
-        .iter()
-        .any(|line| line.contains("is past its deadline and is aborted"));
-    assert!(
-        late_check || swept_first,
-        "neither exit is named for the late Prepared: {about:?}"
+    let until = tokio::time::Instant::now() + OBSERVE;
+    send_prepared(&mut owner, pairing_id, digest).await;
+    let shared = engine_of(&server).await;
+    let to_owner = NoticeKey::current(&shared, "owner", pairing_id, &owner.key.public_key());
+    let to_redeemer = NoticeKey::current(&shared, "redeemer", pairing_id, &joiner.key.public_key());
+
+    // The owner's two — the sweep's and the late Prepared's answer — and
+    // the joiner's one, the sweep's: each checked against the frame to the
+    // byte, though it is the same frame for all three and says which exit
+    // sent none of them.
+    expect_unavailable_before(
+        &mut owner,
+        pairing_id,
+        until,
+        "the owner's first `unavailable`",
+    )
+    .await;
+    expect_unavailable_before(
+        &mut joiner,
+        pairing_id,
+        until,
+        "the sweep's `unavailable` to the redeemer",
+    )
+    .await;
+    expect_unavailable_before(
+        &mut owner,
+        pairing_id,
+        until,
+        "the owner's second `unavailable`",
+    )
+    .await;
+
+    // Both decisions, once each, and all three notices on record.
+    settle(
+        until,
+        "the late Prepared's and the sweep's decisions and notices",
+        || {
+            let about = decisions_since(since, &prefix(&pairing_id));
+            let records = notices_since(from);
+            let late = stating(&about, LATE_PREPARED_ANSWERED);
+            let swept = stating(&about, SWEEP_ENDED);
+            let owner_notices = notices(&records, &to_owner);
+            let redeemer_notices = notices(&records, &to_redeemer);
+            match (&owner_notices, &redeemer_notices) {
+                (Ok(owner), Ok(redeemer))
+                    if late == 1 && swept == 1 && owner.len() == 2 && redeemer.len() == 1 =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "decisions about the pairing (late Prepared: {late}, sweep: {swept}): \
+                     {about:?}; to the owner: {}; to the redeemer: {}",
+                    described(&owner_notices),
+                    described(&redeemer_notices)
+                )),
+            }
+        },
+    )
+    .await;
+    let records = notices_since(from);
+    // The owner's two by number: one from each exit, whichever was first —
+    // number 1 is the error it read first.
+    let sweep_first = expect_notices(
+        &records,
+        &to_owner,
+        &[(1, FROM_SWEEP), (2, FROM_LATE_PREPARED)],
     );
-    // The joiner's `unavailable` comes from the sweep in either order.
-    expect_unavailable(&mut joiner, pairing_id).await;
-    // Review 20: both notices are on record for the owner — the sweep's
-    // and the late Prepared's answer — numbered in the order its
-    // connection took them; that order is the one the frames arrived in.
-    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
-    assert_eq!(to_owner.len(), 2, "{to_owner:?}");
-    let late_first = to_owner[0].contains("prepared past the deadline");
-    let sweep_first = to_owner[0].contains("sweep:");
-    assert!(late_first || sweep_first, "{to_owner:?}");
-    assert!(
-        to_owner[0].contains("notice 1 ") && to_owner[1].contains("notice 2 "),
-        "{to_owner:?}"
+    let late_first = expect_notices(
+        &records,
+        &to_owner,
+        &[(1, FROM_LATE_PREPARED), (2, FROM_SWEEP)],
     );
     assert!(
-        to_owner[1].contains(if late_first {
-            "sweep:"
-        } else {
-            "prepared past the deadline"
-        }),
-        "{to_owner:?}"
+        sweep_first.is_ok() || late_first.is_ok(),
+        "the owner's two notices are not one from the sweep and one from the late Prepared: \
+         {sweep_first:?} / {late_first:?}"
     );
+    // The joiner's one is the sweep's.
+    expect_notices(&records, &to_redeemer, &[(1, FROM_SWEEP)])
+        .unwrap_or_else(|found| panic!("the redeemer's notice: {found}"));
+    // Nothing follows: two for the owner, one for the joiner.
+    expect_silence(
+        &mut owner,
+        "a third frame for the pairing after the owner's two",
+    )
+    .await;
+    expect_silence(
+        &mut joiner,
+        "a second frame for the pairing after the sweep's",
+    )
+    .await;
     server.stop().await;
 }
 
 // ---- review 20: the order of two identical errors -----------------------------
+//
+// A sweep's notification and a late Prepared's answer are the same frame to
+// the same participant — pairing scope, this pairing, a zero request id —
+// so nothing in the frames says which exit the first one came from. The
+// engine numbers the notices of a connection in the order its outbox takes
+// them (review 20); the cases read that order off the engine's sinks as
+// records, never off the order lines were written in (review 21).
 
 /// Every engine this process serves, by registry id, weakly (a stopped
 /// server is not kept alive). `serve_v2_with_revision` registers its engine
@@ -2842,14 +2967,11 @@ pub(super) fn register_shared(shared: &Arc<Shared>) {
         .push((shared.registry_id, Arc::downgrade(shared)));
 }
 
-/// Stop the serve loop from sweeping `server`'s engine and hand back the
-/// state to run `sweep` from: the test then decides whether the sweep or a
-/// handler comes first, instead of racing the 200 ms tick. The engine
-/// registers itself when its serve task starts, which can be after the
-/// test gets here: that is waited for.
-async fn hold_the_sweeper(server: &TestServer) -> Arc<Shared> {
+/// The engine `server` serves from. It registers itself when its serve
+/// task starts, which can be after the test gets here: that is waited for.
+async fn engine_of(server: &TestServer) -> Arc<Shared> {
     let registry_id = server.registry_id();
-    let shared = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let found = SHARED
                 .lock()
@@ -2864,7 +2986,14 @@ async fn hold_the_sweeper(server: &TestServer) -> Arc<Shared> {
         }
     })
     .await
-    .expect("the engine registers its shared state when it starts serving");
+    .expect("the engine registers its shared state when it starts serving")
+}
+
+/// Stop the serve loop from sweeping `server`'s engine and hand back the
+/// state to run `sweep` from: the test then decides whether the sweep or a
+/// handler comes first, instead of racing the 200 ms tick.
+async fn hold_the_sweeper(server: &TestServer) -> Arc<Shared> {
+    let shared = engine_of(server).await;
     shared
         .sweep_held
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2931,27 +3060,367 @@ async fn send_prepared(client: &mut TestClient, pairing_id: PairingId, digest: D
         .await;
 }
 
-/// The registry's notice lines to one participant of a pairing, in the
-/// sink's order.
-fn notices(since: usize, pairing_id: &PairingId, role: &str, device: &DeviceId) -> Vec<String> {
-    let to = format!("to the {role} {}", prefix(device));
-    DECISIONS
+// ---- review 21: what a case waits for, and the notices as records ------------
+
+/// How long a case watches for everything its own steps must have produced
+/// — frames, decision lines, notice records — before it calls it missing.
+const OBSERVE: Duration = Duration::from_secs(5);
+
+/// Once every step of a case has provably run, how long a participant is
+/// watched for a frame that must not come. It proves nothing by itself: it
+/// only follows a step's own evidence that the step ran.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Parts of the engine's own texts that say where something came from.
+/// The reason of a notice:
+const FROM_SWEEP: &str = "sweep: the pairing is past its deadline and was aborted";
+const FROM_LATE_PREPARED: &str = "prepared past the deadline";
+const FROM_ABORT: &str = "explicit abort by the other participant";
+/// A decision line that ends a pairing:
+const SWEEP_ENDED: &str = "is past its deadline and is aborted";
+const ABORT_ENDED: &str = "aborted by an explicit request from";
+/// The decision line of a Prepared refused only for being past the
+/// deadline (a participant with the right transcript).
+const LATE_PREPARED_ANSWERED: &str =
+    "answered unavailable: not a participant: false, transcript digest differs: false, ";
+
+impl TestClient {
+    /// The next frame before `until` (a case's observation deadline),
+    /// naming what was expected when it does not come — or when the
+    /// registry closes the connection instead of sending it.
+    async fn recv_before(&mut self, until: tokio::time::Instant, expecting: &str) -> CtrlMessage {
+        let bytes = match tokio::time::timeout_at(until, read_frame(&mut self.stream)).await {
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => panic!(
+                "{}: the registry closed the connection; {expecting} was expected",
+                self.label
+            ),
+            Ok(Err(e)) => panic!("{}: reading {expecting}: {e}", self.label),
+            Err(_) => panic!(
+                "{}: {expecting} did not arrive within the observation window",
+                self.label
+            ),
+        };
+        CtrlFrame::decode_as(&bytes, Role::Client).unwrap().message
+    }
+}
+
+/// A pairing's `unavailable` as both the sweep and a late Prepared's answer
+/// carry it: pairing scope, the pairing, the all-zero request id.
+fn unavailable_frame(pairing_id: PairingId) -> CtrlMessage {
+    CtrlMessage::PairError {
+        request_id: [0u8; 16],
+        scope: crate::protocol_v2::ErrorScope::Pairing,
+        object_id: pairing_id,
+        code: crate::protocol_v2::PAIR_UNAVAILABLE,
+        retry_after_ms: 0,
+    }
+}
+
+/// The pairing's `unavailable` before `until`, to the byte.
+async fn expect_unavailable_before(
+    client: &mut TestClient,
+    pairing_id: PairingId,
+    until: tokio::time::Instant,
+    expecting: &str,
+) {
+    let found = client.recv_before(until, expecting).await;
+    assert_eq!(found, unavailable_frame(pairing_id), "{expecting}");
+}
+
+/// A Ping on the connection, and the frames that came before its Pong. One
+/// connection is handled by a single task, one frame at a time, so the Pong
+/// is queued only once the handler is done with everything sent ahead of
+/// the Ping — the decision line and the notice record of a frame it
+/// answered included, which a client can have received before they are
+/// written (both are written outside the engine lock). `client` is left
+/// right after the Pong.
+async fn ping_after(client: &mut TestClient, until: tokio::time::Instant) -> Vec<CtrlMessage> {
+    let nonce = random_id16();
+    client.send(&CtrlMessage::Ping { nonce }).await;
+    let mut before = Vec::new();
+    loop {
+        match client.recv_before(until, "the Pong").await {
+            CtrlMessage::Pong { nonce: answered } => {
+                assert_eq!(answered, nonce, "the Pong answers this Ping");
+                return before;
+            }
+            other => before.push(other),
+        }
+    }
+}
+
+/// Watch `client` for a frame that must not come. No further frame is
+/// read from `client` afterwards (the watch drops a read in progress).
+async fn expect_silence(client: &mut TestClient, what: &str) {
+    match tokio::time::timeout(QUIET, client.recv()).await {
+        Err(_elapsed) => {}
+        Ok(other) => panic!("{what}: {other:?}"),
+    }
+}
+
+/// Wait, until `until`, for `check` to pass; at the deadline fail with what
+/// `check` had against it last.
+async fn settle<T>(
+    until: tokio::time::Instant,
+    what: &str,
+    mut check: impl FnMut() -> Result<T, String>,
+) -> T {
+    let mut last = String::new();
+    let found = tokio::time::timeout_at(until, async {
+        loop {
+            match check() {
+                Ok(found) => break found,
+                Err(evidence) => last = evidence,
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    found
+        .unwrap_or_else(|_| panic!("{what} did not complete within the observation window: {last}"))
+}
+
+/// How many of `lines` state `what`.
+fn stating(lines: &[String], what: &str) -> usize {
+    lines.iter().filter(|line| line.contains(what)).count()
+}
+
+// Besides its line, every notice `Shared::deliver_noted` and
+// `Shared::answer_noted` issue lands in the sink below as a record: the
+// participant, its connection generation, the number and what became of
+// the frame — all sampled under the engine lock, the delivery itself
+// included. Records arrive in the order the lines were written, outside
+// that lock, so notice 2 can land before notice 1: a case compares numbers,
+// never positions. A record is written after its line, so once a record is
+// in, its line is too.
+
+/// One pairing notice as the engine issued it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NoticeRecord {
+    /// The engine that issued it, by its registry id.
+    pub(super) instance: RegistryId,
+    /// The connection generation it was numbered on, when it was.
+    pub(super) conn: Option<u64>,
+    /// The participant's role in the pairing, as the line names it.
+    pub(super) role: &'static str,
+    pub(super) pairing_id: PairingId,
+    pub(super) device: DeviceId,
+    /// The reason, as the line states it.
+    pub(super) note: &'static str,
+    /// The notice's number on the connection, when it has one.
+    pub(super) number: Option<u64>,
+    pub(super) outcome: NoticeOutcome,
+    /// An answer kept on the connection it came in on after a newer Hello
+    /// replaced that connection.
+    pub(super) replaced: bool,
+}
+
+impl NoticeRecord {
+    /// Numbered on `key`'s connection generation of `key`'s engine —
+    /// whatever pairing or participant it was for, and whether or not it
+    /// was queued.
+    fn is_on(&self, key: &NoticeKey) -> bool {
+        self.instance == key.instance && self.conn == Some(key.conn)
+    }
+
+    /// `key`'s participant's part in `key`'s pairing.
+    fn is_part_in(&self, key: &NoticeKey) -> bool {
+        self.role == key.role && self.pairing_id == key.pairing_id && self.device == key.device
+    }
+}
+
+/// Every notice the engines issued, in arrival order.
+pub(super) static NOTICES: Mutex<Vec<NoticeRecord>> = Mutex::new(Vec::new());
+
+pub(super) fn record_notice(instance: RegistryId, notice: &Notice) {
+    NOTICES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(NoticeRecord {
+            instance,
+            conn: notice.conn_id,
+            role: notice.role,
+            pairing_id: notice.pairing_id,
+            device: notice.device,
+            note: notice.note,
+            number: notice.number,
+            outcome: notice.outcome,
+            replaced: notice.replaced,
+        });
+}
+
+fn notices_len() -> usize {
+    NOTICES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+/// Every notice recorded since `since`.
+fn notices_since(since: usize) -> Vec<NoticeRecord> {
+    NOTICES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .skip(since)
-        .filter(|line| line.contains(&prefix(pairing_id)) && line.contains(&to))
-        .cloned()
+        .copied()
         .collect()
+}
+
+/// The connection a case asks the notices of: one participant's part in
+/// one pairing, on one engine instance and — by generation, not merely by
+/// device — one connection.
+#[derive(Clone, Copy)]
+struct NoticeKey {
+    instance: RegistryId,
+    conn: u64,
+    role: &'static str,
+    pairing_id: PairingId,
+    device: DeviceId,
+}
+
+impl NoticeKey {
+    /// The key for `device`'s current connection on `shared`'s engine.
+    fn current(
+        shared: &Shared,
+        role: &'static str,
+        pairing_id: PairingId,
+        device: &DeviceId,
+    ) -> Self {
+        let conn = shared
+            .lock()
+            .conns
+            .get(device)
+            .map(|entry| entry.conn_id)
+            .expect("the device is connected");
+        NoticeKey {
+            instance: shared.registry_id,
+            conn,
+            role,
+            pairing_id,
+            device: *device,
+        }
+    }
+}
+
+/// The notices `records` holds for `key` — its participant's part in its
+/// pairing, on its connection generation of its engine — that were
+/// enqueued, by number: the order the connection's outbox took them.
+///
+/// `Err` when the numbering of that connection cannot be relied on: one
+/// number issued twice on it, whatever pairing it was for and whether or
+/// not the frame was queued, leaves every comparison on it meaningless.
+fn notices<'a>(
+    records: &'a [NoticeRecord],
+    key: &NoticeKey,
+) -> Result<Vec<&'a NoticeRecord>, String> {
+    let mut numbered: Vec<u64> = records
+        .iter()
+        .filter(|record| record.is_on(key))
+        .filter_map(|record| record.number)
+        .collect();
+    numbered.sort_unstable();
+    if let Some(twice) = numbered
+        .windows(2)
+        .find(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+    {
+        return Err(format!(
+            "notice {twice} was issued twice on connection {} of one engine",
+            key.conn
+        ));
+    }
+    let mut mine: Vec<&NoticeRecord> = records
+        .iter()
+        .filter(|record| {
+            record.is_on(key) && record.is_part_in(key) && record.outcome == NoticeOutcome::Enqueued
+        })
+        .collect();
+    mine.sort_by_key(|record| record.number);
+    Ok(mine)
+}
+
+/// [`notices`] against what the case expects: each enqueued notice's
+/// number and the part of its reason that names its source, in the order
+/// the outbox took them.
+fn expect_notices(
+    records: &[NoticeRecord],
+    key: &NoticeKey,
+    expected: &[(u64, &str)],
+) -> Result<(), String> {
+    let found = notices(records, key)?;
+    let found: Vec<(u64, &str)> = found
+        .iter()
+        .map(|record| {
+            (
+                record
+                    .number
+                    .expect("an enqueued notice was numbered when it was queued"),
+                record.note,
+            )
+        })
+        .collect();
+    let same = found.len() == expected.len()
+        && found.iter().copied().zip(expected.iter().copied()).all(
+            |((number, note), (want_number, want))| number == want_number && note.contains(want),
+        );
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "connection {} of the {} {} for pairing {} got {found:?}, expected {expected:?}",
+            key.conn,
+            key.role,
+            prefix(&key.device),
+            prefix(&key.pairing_id)
+        ))
+    }
+}
+
+/// A [`notices`] result on one line, for a failure message: each notice's
+/// number and reason, or why the list cannot be relied on.
+fn described(notices: &Result<Vec<&NoticeRecord>, String>) -> String {
+    match notices {
+        Ok(notices) => format!(
+            "[{}]",
+            notices
+                .iter()
+                .map(|record| {
+                    format!(
+                        "({}, {:?})",
+                        record
+                            .number
+                            .map_or_else(|| "?".to_string(), |n| n.to_string()),
+                        record.note
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Err(why) => format!("not comparable: {why}"),
+    }
+}
+
+/// Both decisions about a pairing that a late Prepared and a sweep both
+/// answered are on record, once each.
+fn expect_both_decisions(since: usize, pairing_id: &PairingId) {
+    let about = decisions_since(since, &prefix(pairing_id));
+    assert_eq!(stating(&about, LATE_PREPARED_ANSWERED), 1, "{about:?}");
+    assert_eq!(stating(&about, SWEEP_ENDED), 1, "{about:?}");
 }
 
 /// The sweep and a late Prepared answer the redeemer with the same frame.
 /// Sweep first: the redeemer's first `unavailable` is the sweep's, notice 1
-/// on its connection; the late Prepared's answer is notice 2.
+/// on its connection; the late Prepared's answer is notice 2. The order is
+/// the case's own: the sweep is run by hand, and a Ping queued behind the
+/// Prepared comes back only after the handler has written the answer's
+/// line and record.
 #[tokio::test]
 async fn diagnostics_order_a_sweep_before_a_late_prepared() {
     let server = spawn_server().await;
     let since = sink_len();
+    let from = notices_len();
     let HeldPairing {
         shared,
         mut owner,
@@ -2959,48 +3428,61 @@ async fn diagnostics_order_a_sweep_before_a_late_prepared() {
         pairing_id,
         digest,
     } = held_pairing_past_its_deadline(&server).await;
+    let until = tokio::time::Instant::now() + OBSERVE;
     sweep_now(&shared);
-    expect_unavailable(&mut joiner, pairing_id).await;
-    expect_unavailable(&mut owner, pairing_id).await;
+    expect_unavailable_before(
+        &mut joiner,
+        pairing_id,
+        until,
+        "the sweep's `unavailable` to the redeemer",
+    )
+    .await;
+    expect_unavailable_before(
+        &mut owner,
+        pairing_id,
+        until,
+        "the sweep's `unavailable` to the owner",
+    )
+    .await;
     send_prepared(&mut joiner, pairing_id, digest).await;
-    expect_unavailable(&mut joiner, pairing_id).await;
+    let before_pong = ping_after(&mut joiner, until).await;
+    assert_eq!(
+        before_pong,
+        [unavailable_frame(pairing_id)],
+        "between the late Prepared and its Pong comes its answer, and nothing else"
+    );
 
-    let to_redeemer = notices(since, &pairing_id, "redeemer", &joiner.key.public_key());
-    assert_eq!(to_redeemer.len(), 2, "{to_redeemer:?}");
-    assert!(
-        to_redeemer[0].contains("notice 1 to the redeemer")
-            && to_redeemer[0].contains("sweep:")
-            && to_redeemer[0].ends_with("enqueued"),
-        "{to_redeemer:?}"
-    );
-    assert!(
-        to_redeemer[1].contains("notice 2 to the redeemer")
-            && to_redeemer[1].contains("prepared past the deadline")
-            && to_redeemer[1].ends_with("enqueued"),
-        "{to_redeemer:?}"
-    );
-    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
-    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
-    assert!(
-        to_owner[0].contains("notice 1 to the owner")
-            && to_owner[0].contains("sweep:")
-            && to_owner[0].ends_with("enqueued"),
-        "{to_owner:?}"
-    );
+    expect_both_decisions(since, &pairing_id);
+    let records = notices_since(from);
+    let to_redeemer = NoticeKey::current(&shared, "redeemer", pairing_id, &joiner.key.public_key());
+    let to_owner = NoticeKey::current(&shared, "owner", pairing_id, &owner.key.public_key());
+    expect_notices(
+        &records,
+        &to_redeemer,
+        &[(1, FROM_SWEEP), (2, FROM_LATE_PREPARED)],
+    )
+    .unwrap_or_else(|found| panic!("the redeemer's notices: {found}"));
+    expect_notices(&records, &to_owner, &[(1, FROM_SWEEP)])
+        .unwrap_or_else(|found| panic!("the owner's notices: {found}"));
     // Nothing follows the two.
-    match tokio::time::timeout(Duration::from_millis(300), joiner.recv()).await {
-        Err(_elapsed) => {}
-        Ok(other) => panic!("a third frame for the pairing: {other:?}"),
-    }
+    expect_silence(&mut joiner, "a third frame for the pairing after the two").await;
+    expect_silence(
+        &mut owner,
+        "a second frame for the pairing after the sweep's",
+    )
+    .await;
     server.stop().await;
 }
 
 /// The other order: the late Prepared's answer is notice 1 and the
-/// redeemer's first `unavailable`; the sweep's is notice 2.
+/// redeemer's first `unavailable`; the sweep's is notice 2. The Prepared's
+/// handler has provably finished (its Pong came back) before the sweep is
+/// run by hand.
 #[tokio::test]
 async fn diagnostics_order_a_late_prepared_before_the_sweep() {
     let server = spawn_server().await;
     let since = sink_len();
+    let from = notices_len();
     let HeldPairing {
         shared,
         mut owner,
@@ -3008,47 +3490,59 @@ async fn diagnostics_order_a_late_prepared_before_the_sweep() {
         pairing_id,
         digest,
     } = held_pairing_past_its_deadline(&server).await;
+    let until = tokio::time::Instant::now() + OBSERVE;
     send_prepared(&mut joiner, pairing_id, digest).await;
-    expect_unavailable(&mut joiner, pairing_id).await;
+    let before_pong = ping_after(&mut joiner, until).await;
+    assert_eq!(
+        before_pong,
+        [unavailable_frame(pairing_id)],
+        "between the late Prepared and its Pong comes its answer, and nothing else"
+    );
     sweep_now(&shared);
-    expect_unavailable(&mut joiner, pairing_id).await;
-    expect_unavailable(&mut owner, pairing_id).await;
+    expect_unavailable_before(
+        &mut joiner,
+        pairing_id,
+        until,
+        "the sweep's `unavailable` to the redeemer",
+    )
+    .await;
+    expect_unavailable_before(
+        &mut owner,
+        pairing_id,
+        until,
+        "the sweep's `unavailable` to the owner",
+    )
+    .await;
 
-    let to_redeemer = notices(since, &pairing_id, "redeemer", &joiner.key.public_key());
-    assert_eq!(to_redeemer.len(), 2, "{to_redeemer:?}");
-    assert!(
-        to_redeemer[0].contains("notice 1 to the redeemer")
-            && to_redeemer[0].contains("prepared past the deadline")
-            && to_redeemer[0].ends_with("enqueued"),
-        "{to_redeemer:?}"
-    );
-    assert!(
-        to_redeemer[1].contains("notice 2 to the redeemer")
-            && to_redeemer[1].contains("sweep:")
-            && to_redeemer[1].ends_with("enqueued"),
-        "{to_redeemer:?}"
-    );
-    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
-    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
-    assert!(
-        to_owner[0].contains("notice 1 to the owner")
-            && to_owner[0].contains("sweep:")
-            && to_owner[0].ends_with("enqueued"),
-        "{to_owner:?}"
-    );
-    match tokio::time::timeout(Duration::from_millis(300), joiner.recv()).await {
-        Err(_elapsed) => {}
-        Ok(other) => panic!("a third frame for the pairing: {other:?}"),
-    }
+    expect_both_decisions(since, &pairing_id);
+    let records = notices_since(from);
+    let to_redeemer = NoticeKey::current(&shared, "redeemer", pairing_id, &joiner.key.public_key());
+    let to_owner = NoticeKey::current(&shared, "owner", pairing_id, &owner.key.public_key());
+    expect_notices(
+        &records,
+        &to_redeemer,
+        &[(1, FROM_LATE_PREPARED), (2, FROM_SWEEP)],
+    )
+    .unwrap_or_else(|found| panic!("the redeemer's notices: {found}"));
+    expect_notices(&records, &to_owner, &[(1, FROM_SWEEP)])
+        .unwrap_or_else(|found| panic!("the owner's notices: {found}"));
+    expect_silence(&mut joiner, "a third frame for the pairing after the two").await;
+    expect_silence(
+        &mut owner,
+        "a second frame for the pairing after the sweep's",
+    )
+    .await;
     server.stop().await;
 }
 
 /// A participant that went offline before the sweep: nothing is queued for
-/// it and its line says so; the owner's notice is number 1 as usual.
+/// it, its record says so and has no number or connection, and its line
+/// says the same; the owner's notice is number 1 as usual.
 #[tokio::test]
 async fn diagnostics_name_a_notice_dropped_for_an_offline_participant() {
     let server = spawn_server().await;
     let since = sink_len();
+    let from = notices_len();
     let HeldPairing {
         shared,
         mut owner,
@@ -3069,72 +3563,316 @@ async fn diagnostics_name_a_notice_dropped_for_an_offline_participant() {
     sweep_now(&shared);
     expect_unavailable(&mut owner, pairing_id).await;
 
-    let to_redeemer = notices(since, &pairing_id, "redeemer", &redeemer_id);
+    let records = notices_since(from);
+    let to_redeemer: Vec<NoticeRecord> = records
+        .iter()
+        .copied()
+        .filter(|record| {
+            record.instance == server.registry_id()
+                && record.pairing_id == pairing_id
+                && record.device == redeemer_id
+        })
+        .collect();
     assert_eq!(to_redeemer.len(), 1, "{to_redeemer:?}");
-    assert!(
-        to_redeemer[0].contains("sweep:")
-            && to_redeemer[0].ends_with("dropped: the device is offline"),
-        "{to_redeemer:?}"
+    assert_eq!(to_redeemer[0].note, FROM_SWEEP);
+    assert_eq!(to_redeemer[0].outcome, NoticeOutcome::Offline);
+    assert_eq!(
+        (to_redeemer[0].conn, to_redeemer[0].number),
+        (None, None),
+        "an offline notice is numbered on no connection"
     );
-    let to_owner = notices(since, &pairing_id, "owner", &owner.key.public_key());
-    assert_eq!(to_owner.len(), 1, "{to_owner:?}");
+    let to_redeemer_line = decisions_since(since, &prefix(&pairing_id))
+        .into_iter()
+        .find(|line| line.contains(&format!("to the redeemer {}", prefix(&redeemer_id))))
+        .expect("the redeemer's line");
     assert!(
-        to_owner[0].contains("notice 1 to the owner")
-            && to_owner[0].contains("sweep:")
-            && to_owner[0].ends_with("enqueued"),
-        "{to_owner:?}"
+        to_redeemer_line.ends_with("dropped: the device is offline"),
+        "{to_redeemer_line:?}"
     );
+    let to_owner = NoticeKey::current(&shared, "owner", pairing_id, &owner.key.public_key());
+    expect_notices(&records, &to_owner, &[(1, FROM_SWEEP)])
+        .unwrap_or_else(|found| panic!("the owner's notices: {found}"));
     server.stop().await;
 }
 
-/// The owner aborts right after the deadline, where the sweep may already
-/// have run: the joiner gets exactly one `unavailable`, and the lines say
-/// which exit produced it.
-#[tokio::test]
-async fn diagnostics_say_which_of_a_sweep_and_a_late_abort_came_first() {
+/// Which of the sweep and the owner's late abort a case lets go first.
+#[derive(Clone, Copy)]
+enum First {
+    Sweep,
+    Abort,
+}
+
+/// A pairing past its deadline whose owner aborts it, on an engine whose
+/// sweeper the case runs. Exactly one of the sweep and the abort ends the
+/// pairing: one decision line, and the redeemer's one `unavailable` is the
+/// winner's notice, number 1. Each step is known to have run by its own
+/// evidence — the sweep by returning, the abort handler by the Pong queued
+/// behind the abort — never by a fixed wait. Returns the exit that ended
+/// the pairing by the decision lines.
+async fn late_abort_against_the_sweep(first: First) -> &'static str {
     let server = spawn_server().await;
+    let shared = hold_the_sweeper(&server).await;
     let since = sink_len();
-    let pending = pending_redeem(&server, || now_ms() + 300).await;
+    let from = notices_len();
     let PendingRedeem {
         mut owner,
         mut joiner,
         pairing_id,
-        code_id: _,
-        request_id: _,
-        redeemer_nonce: _,
         deadline_ms: deadline,
-    } = pending;
+        ..
+    } = pending_redeem(&server, || now_ms() + 700).await;
     sleep_until_after(deadline).await;
-    owner
-        .send(&CtrlMessage::PairAbort {
-            request_id: random_id16(),
-            pairing_id,
-            reason: crate::protocol_v2::AbortReason::User,
-        })
-        .await;
-    expect_unavailable(&mut joiner, pairing_id).await;
-    // A second sweep tick (200 ms) has had time to record its part.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let about = decisions_since(since, &prefix(&pairing_id));
-    let aborted = about
-        .iter()
-        .position(|line| line.contains("aborted by an explicit request from"));
-    let swept = about
-        .iter()
-        .position(|line| line.contains("is past its deadline and is aborted"));
-    let first = match (swept, aborted) {
-        (None, None) => panic!("neither exit is named for the joiner's `unavailable`: {about:?}"),
-        (Some(s), Some(a)) if s < a => "sweep",
-        (Some(_), _) => "sweep",
-        (None, Some(_)) => "abort",
+    let until = tokio::time::Instant::now() + OBSERVE;
+    let abort_request = random_id16();
+    let abort = CtrlMessage::PairAbort {
+        request_id: abort_request,
+        pairing_id,
+        reason: crate::protocol_v2::AbortReason::User,
     };
-    // No second `unavailable` for the pairing: whichever exit won ended it.
-    match tokio::time::timeout(Duration::from_millis(400), joiner.recv()).await {
-        Err(_elapsed) => {}
-        Ok(CtrlMessage::PairError { object_id, .. }) if object_id == pairing_id => {
-            panic!("a second `unavailable` for the pairing after the {first}")
+    let refused = CtrlMessage::PairError {
+        request_id: abort_request,
+        scope: crate::protocol_v2::ErrorScope::Pairing,
+        object_id: pairing_id,
+        code: crate::protocol_v2::REVISION_CONFLICT,
+        retry_after_ms: 0,
+    };
+    let winner = match first {
+        // The sweep ended the pairing. The abort that follows is refused;
+        // the refusal reaching the owner proves the abort handler ran. Up
+        // to the Pong behind the abort the owner has read exactly its
+        // notice of the sweep, still unread, and then the refusal.
+        First::Sweep => {
+            sweep_now(&shared);
+            expect_unavailable_before(
+                &mut joiner,
+                pairing_id,
+                until,
+                "the sweep's `unavailable` to the redeemer",
+            )
+            .await;
+            owner.send(&abort).await;
+            let before_pong = ping_after(&mut owner, until).await;
+            assert_eq!(
+                before_pong,
+                [unavailable_frame(pairing_id), refused],
+                "up to the Pong behind the late abort: the sweep's notice, then the refusal"
+            );
+            "sweep"
         }
-        Ok(other) => panic!("unexpected frame after the {first}: {other:?}"),
-    }
+        // The abort ended the pairing; the sweep that follows finds nothing
+        // pending and records nothing. The redeemer's notice reaching it
+        // proves the abort handler ran.
+        First::Abort => {
+            owner.send(&abort).await;
+            expect_unavailable_before(
+                &mut joiner,
+                pairing_id,
+                until,
+                "the abort's `unavailable` to the redeemer",
+            )
+            .await;
+            let before_pong = ping_after(&mut owner, until).await;
+            assert!(
+                before_pong.is_empty(),
+                "the aborter is answered with silence, got {before_pong:?}"
+            );
+            sweep_now(&shared);
+            "abort"
+        }
+    };
+
+    // Exactly one of the two exits claims to have ended the pairing: none
+    // leaves the redeemer's `unavailable` unexplained, two is a defect
+    // whichever is read off the lines.
+    let about = decisions_since(since, &prefix(&pairing_id));
+    let sweeps = stating(&about, SWEEP_ENDED);
+    let aborts = stating(&about, ABORT_ENDED);
+    assert_eq!(
+        sweeps + aborts,
+        1,
+        "exactly one exit may end the pairing ({sweeps} sweep, {aborts} abort): {about:?}"
+    );
+    let ended = if sweeps == 1 { "sweep" } else { "abort" };
+    assert_eq!(
+        ended, winner,
+        "the exit that ended the pairing is the one the case let go first"
+    );
+
+    // The redeemer's one notice is the winner's; the owner has the sweep's,
+    // or nothing from an abort it asked for.
+    let records = notices_since(from);
+    let to_redeemer = NoticeKey::current(&shared, "redeemer", pairing_id, &joiner.key.public_key());
+    let to_owner = NoticeKey::current(&shared, "owner", pairing_id, &owner.key.public_key());
+    let source = if ended == "sweep" {
+        FROM_SWEEP
+    } else {
+        FROM_ABORT
+    };
+    expect_notices(&records, &to_redeemer, &[(1, source)])
+        .unwrap_or_else(|found| panic!("the redeemer's notices after the {ended}: {found}"));
+    let owner_expected: &[(u64, &str)] = if ended == "sweep" {
+        &[(1, FROM_SWEEP)]
+    } else {
+        &[]
+    };
+    expect_notices(&records, &to_owner, owner_expected)
+        .unwrap_or_else(|found| panic!("the owner's notices after the {ended}: {found}"));
+    // One `unavailable` for the pairing: whichever exit won ended it.
+    expect_silence(
+        &mut joiner,
+        &format!("a second `unavailable` for the pairing after the {ended}"),
+    )
+    .await;
+    expect_silence(
+        &mut owner,
+        &format!("a frame for the pairing after the {ended}, beyond what was read"),
+    )
+    .await;
     server.stop().await;
+    ended
+}
+
+/// The owner aborts right after the deadline, where the sweep may already
+/// have run: the joiner gets exactly one `unavailable`, and exactly one exit
+/// — the sweep or the abort — is on record as having ended the pairing.
+/// Review 21: both orders are forced on the case's own engine instead of
+/// raced against the sweep tick, so neither "no exit named" nor "both
+/// named" can pass, and the second step is never assumed to have run
+/// because time passed.
+#[tokio::test]
+async fn diagnostics_say_which_of_a_sweep_and_a_late_abort_came_first() {
+    assert_eq!(late_abort_against_the_sweep(First::Sweep).await, "sweep");
+    assert_eq!(late_abort_against_the_sweep(First::Abort).await, "abort");
+}
+
+/// The notice filter reads numbers, not the order records arrived in, and
+/// refuses what would make numbers meaningless or a case's expectation
+/// unmet: a number issued twice on one connection, records of another
+/// connection generation or another engine, a missing or an extra notice,
+/// the same source twice, or an enqueued notice not where a dropped attempt
+/// left the numbering.
+#[test]
+fn notice_records_are_compared_by_number_and_checked_for_defects() {
+    let key = NoticeKey {
+        instance: [0xA1; 32],
+        conn: 7,
+        role: "owner",
+        pairing_id: [0xC1; 16],
+        device: [0xB1; 32],
+    };
+    let enqueued = |conn: u64, number: u64, note: &'static str| NoticeRecord {
+        instance: key.instance,
+        conn: Some(conn),
+        role: "owner",
+        pairing_id: key.pairing_id,
+        device: key.device,
+        note,
+        number: Some(number),
+        outcome: NoticeOutcome::Enqueued,
+        replaced: false,
+    };
+    let both = [(1, FROM_LATE_PREPARED), (2, FROM_SWEEP)];
+    // In order, and in reverse: notice 2 written before notice 1.
+    assert_eq!(
+        expect_notices(
+            &[
+                enqueued(7, 1, FROM_LATE_PREPARED),
+                enqueued(7, 2, FROM_SWEEP)
+            ],
+            &key,
+            &both
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        expect_notices(
+            &[
+                enqueued(7, 2, FROM_SWEEP),
+                enqueued(7, 1, FROM_LATE_PREPARED)
+            ],
+            &key,
+            &both
+        ),
+        Ok(())
+    );
+    // One number twice on the connection — also when the other one is for
+    // another pairing, or was dropped.
+    let mut other_pairing = enqueued(7, 1, FROM_SWEEP);
+    other_pairing.pairing_id = [0xC2; 16];
+    let mut dropped = enqueued(7, 1, FROM_SWEEP);
+    dropped.outcome = NoticeOutcome::Full;
+    for twice in [
+        [
+            enqueued(7, 1, FROM_LATE_PREPARED),
+            enqueued(7, 1, FROM_SWEEP),
+        ],
+        [enqueued(7, 1, FROM_LATE_PREPARED), other_pairing],
+        [dropped, enqueued(7, 1, FROM_LATE_PREPARED)],
+    ] {
+        let found = expect_notices(&twice, &key, &both).unwrap_err();
+        assert!(found.contains("twice"), "{found}");
+    }
+    // Another connection generation of the same device — a replacement,
+    // counting from 1 again — is not this one's: were it taken for this
+    // one's, it would be exactly the notice expected here ...
+    let newer_connection = [enqueued(8, 1, FROM_LATE_PREPARED)];
+    let would_fit =
+        |records: &[NoticeRecord]| expect_notices(records, &key, &[(1, FROM_LATE_PREPARED)]);
+    assert!(
+        would_fit(&newer_connection).is_err(),
+        "a notice numbered on a newer connection passed for this one's"
+    );
+    // ... and on its own key it is notice 1: a new connection counts anew.
+    let newer = NoticeKey { conn: 8, ..key };
+    assert_eq!(
+        expect_notices(&newer_connection, &newer, &[(1, FROM_LATE_PREPARED)]),
+        Ok(())
+    );
+    // Nor is another engine's connection 7 this engine's, another
+    // participant's its participant's, or another direction's its
+    // direction's — each would otherwise fit as well.
+    let mut elsewhere = enqueued(7, 1, FROM_LATE_PREPARED);
+    elsewhere.instance = [0xA2; 32];
+    let mut other_participant = enqueued(7, 1, FROM_LATE_PREPARED);
+    other_participant.device = [0xB2; 32];
+    let mut other_direction = enqueued(7, 1, FROM_LATE_PREPARED);
+    other_direction.role = "redeemer";
+    for foreign in [[elsewhere], [other_participant], [other_direction]] {
+        assert!(
+            would_fit(&foreign).is_err(),
+            "a notice for someone else passed for this one's: {foreign:?}"
+        );
+    }
+    // Missing, extra, and the same source twice.
+    assert!(expect_notices(&[enqueued(7, 1, FROM_LATE_PREPARED)], &key, &both).is_err());
+    assert!(expect_notices(
+        &[
+            enqueued(7, 1, FROM_LATE_PREPARED),
+            enqueued(7, 2, FROM_SWEEP)
+        ],
+        &key,
+        &[(1, FROM_LATE_PREPARED)]
+    )
+    .is_err());
+    assert!(expect_notices(
+        &[enqueued(7, 1, FROM_SWEEP), enqueued(7, 2, FROM_SWEEP)],
+        &key,
+        &both
+    )
+    .is_err());
+    // A dropped attempt keeps its number: the first enqueued notice is
+    // number 2. An offline notice has none and is never enqueued.
+    let mut full = enqueued(7, 1, FROM_SWEEP);
+    full.outcome = NoticeOutcome::Full;
+    let after_a_full_queue = [full, enqueued(7, 2, FROM_SWEEP)];
+    assert!(expect_notices(&after_a_full_queue, &key, &[(1, FROM_SWEEP)]).is_err());
+    assert_eq!(
+        expect_notices(&after_a_full_queue, &key, &[(2, FROM_SWEEP)]),
+        Ok(())
+    );
+    let mut offline = enqueued(7, 0, FROM_SWEEP);
+    offline.conn = None;
+    offline.number = None;
+    offline.outcome = NoticeOutcome::Offline;
+    assert_eq!(expect_notices(&[offline], &key, &[]), Ok(()));
 }

@@ -18,9 +18,10 @@ pub(super) struct ConnEntry {
     pub(super) close: Arc<watch::Sender<bool>>,
     pub(super) candidates: Vec<SocketAddr>,
     pub(super) peer_ip: IpAddr,
-    /// The pairing notices queued to this connection so far (Q-N3, review
+    /// The pairing notices this connection was given so far (Q-N3, review
     /// 20): their numbers are the order in which the connection's outbox
-    /// took them. Restarts with a replacement connection, as the outbox does.
+    /// took them — or found itself full or closed, which takes a number
+    /// too. Restarts with a replacement connection, as the outbox does.
     pub(super) notices: u64,
 }
 
@@ -449,6 +450,88 @@ impl RedeemReplay {
             && self.redeemer_nonce == redeem.redeemer_nonce
             && self.request_mac == redeem.request_mac
             && self.deadline_ms == redeem.deadline_ms
+    }
+}
+
+/// What became of a pairing notice's delivery attempt (Q-N3, review 20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NoticeOutcome {
+    /// The connection's outbox took the frame.
+    Enqueued,
+    /// The device has no connection: nothing was queued and no number
+    /// was taken.
+    Offline,
+    /// The outbox is full: the frame is dropped, and the attempt keeps
+    /// its number.
+    Full,
+    /// The outbox is closed: the frame is dropped, and the attempt keeps
+    /// its number.
+    Closed,
+}
+
+impl NoticeOutcome {
+    /// The line's verdict, after the `; `.
+    fn as_str(self) -> &'static str {
+        match self {
+            NoticeOutcome::Enqueued => "enqueued",
+            NoticeOutcome::Offline => "dropped: the device is offline",
+            NoticeOutcome::Full => "dropped: the outbound queue is full",
+            NoticeOutcome::Closed => "dropped: the outbound queue is closed",
+        }
+    }
+}
+
+/// One pairing notice to a participant, with everything its line says
+/// (Q-N3, review 20). The fields are the delivery as sampled under the
+/// engine lock — the connection check, the number, the `try_send` and its
+/// result together, so the numbers are the order the outboxes took the
+/// notices in; the text is built and written after the lock (review 21).
+pub(super) struct Notice {
+    pub(super) pairing_id: PairingId,
+    pub(super) device: DeviceId,
+    pub(super) role: &'static str,
+    pub(super) note: &'static str,
+    /// The connection generation the notice was numbered on. `None` when
+    /// the device is offline, and for an answer kept on a connection that
+    /// a newer Hello replaced.
+    pub(super) conn_id: Option<u64>,
+    /// The notice's number on that connection. A full or closed queue
+    /// takes one all the same; offline and replaced deliveries have none.
+    pub(super) number: Option<u64>,
+    pub(super) outcome: NoticeOutcome,
+    /// An answer queued on the connection the request came in on, which a
+    /// newer Hello has since replaced.
+    pub(super) replaced: bool,
+}
+
+impl std::fmt::Display for Notice {
+    /// The notice line. Everything up to the outcome is a fixed shape
+    /// that other tooling parses (`pairing <id> notice <n> to the <role>
+    /// <device>: <reason>; <outcome>`); anything added goes after it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pairing {} notice ",
+            util::hex_prefix(&self.pairing_id, 4)
+        )?;
+        if let Some(number) = self.number {
+            write!(f, "{number} ")?;
+        }
+        write!(
+            f,
+            "to the {} {}: {}; {}",
+            self.role,
+            util::hex_prefix(&self.device, 4),
+            self.note,
+            self.outcome.as_str()
+        )?;
+        if let Some(conn_id) = self.conn_id {
+            write!(f, " (connection {conn_id})")?;
+        }
+        if self.replaced {
+            f.write_str(" (on a connection that a newer one replaced)")?;
+        }
+        Ok(())
     }
 }
 
@@ -945,6 +1028,54 @@ impl Inner {
         }
         (false, window.retry_after_ms(now))
     }
+
+    /// The delivery of one notice to the device's current connection, the
+    /// whole attempt under the lock the caller holds: the connection
+    /// generation, the notice's number on it, and what became of the
+    /// frame. Offline leaves all of that empty: nothing is queued and no
+    /// number is taken (Q-N3, review 20).
+    pub(super) fn queue_on_current(
+        &mut self,
+        device: &DeviceId,
+        frame: CtrlFrame,
+    ) -> (Option<u64>, Option<u64>, NoticeOutcome) {
+        match self.conns.get_mut(device) {
+            None => (None, None, NoticeOutcome::Offline),
+            Some(entry) => {
+                entry.notices += 1;
+                (
+                    Some(entry.conn_id),
+                    Some(entry.notices),
+                    queue_notice(&entry.out, frame),
+                )
+            }
+        }
+    }
+
+    /// The same for a handler's answer, which is queued on the connection
+    /// the request came in on (`out`) whatever the device's current
+    /// connection is. While `out` still is that connection the answer is
+    /// numbered with the notices; once a newer Hello has replaced it the
+    /// answer is queued unnumbered, and the last element says so.
+    pub(super) fn queue_on_requester(
+        &mut self,
+        device: &DeviceId,
+        out: &mpsc::Sender<CtrlFrame>,
+        frame: CtrlFrame,
+    ) -> (Option<u64>, Option<u64>, NoticeOutcome, bool) {
+        match self.conns.get_mut(device) {
+            Some(entry) if entry.out.same_channel(out) => {
+                entry.notices += 1;
+                (
+                    Some(entry.conn_id),
+                    Some(entry.notices),
+                    queue_notice(out, frame),
+                    false,
+                )
+            }
+            _ => (None, None, queue_notice(out, frame), true),
+        }
+    }
 }
 
 impl Shared {
@@ -981,32 +1112,28 @@ impl Shared {
     pub(super) fn deliver_noted(
         &self,
         device: &DeviceId,
-        role: &str,
+        role: &'static str,
         pairing_id: PairingId,
-        note: &str,
+        note: &'static str,
         frame: impl Into<CtrlFrame>,
     ) {
-        let line = {
+        // Only the delivery is under the lock, as one step; the line is
+        // made from what it handed out (review 21).
+        let notice = {
             let mut inner = self.lock();
-            match inner.conns.get_mut(device) {
-                None => format!(
-                    "pairing {} notice to the {role} {}: {note}; dropped: the device is offline",
-                    util::hex_prefix(&pairing_id, 4),
-                    util::hex_prefix(device, 4)
-                ),
-                Some(entry) => {
-                    entry.notices += 1;
-                    let outcome = queue_notice(&entry.out, frame.into());
-                    format!(
-                        "pairing {} notice {} to the {role} {}: {note}; {outcome}",
-                        util::hex_prefix(&pairing_id, 4),
-                        entry.notices,
-                        util::hex_prefix(device, 4)
-                    )
-                }
+            let (conn_id, number, outcome) = inner.queue_on_current(device, frame.into());
+            Notice {
+                pairing_id,
+                device: *device,
+                role,
+                note,
+                conn_id,
+                number,
+                outcome,
+                replaced: false,
             }
         };
-        decision!("{line}");
+        self.note(notice);
     }
 
     /// A handler's answer to the sender of a request, on the connection the
@@ -1018,35 +1145,35 @@ impl Shared {
         &self,
         out: &mpsc::Sender<CtrlFrame>,
         device: &DeviceId,
-        role: &str,
+        role: &'static str,
         pairing_id: PairingId,
-        note: &str,
+        note: &'static str,
         frame: impl Into<CtrlFrame>,
     ) {
-        let line = {
+        let notice = {
             let mut inner = self.lock();
-            match inner.conns.get_mut(device) {
-                Some(entry) if entry.out.same_channel(out) => {
-                    entry.notices += 1;
-                    let outcome = queue_notice(out, frame.into());
-                    format!(
-                        "pairing {} notice {} to the {role} {}: {note}; {outcome}",
-                        util::hex_prefix(&pairing_id, 4),
-                        entry.notices,
-                        util::hex_prefix(device, 4)
-                    )
-                }
-                _ => {
-                    let outcome = queue_notice(out, frame.into());
-                    format!(
-                        "pairing {} notice to the {role} {}: {note}; {outcome} (on a connection that a newer one replaced)",
-                        util::hex_prefix(&pairing_id, 4),
-                        util::hex_prefix(device, 4)
-                    )
-                }
+            let (conn_id, number, outcome, replaced) =
+                inner.queue_on_requester(device, out, frame.into());
+            Notice {
+                pairing_id,
+                device: *device,
+                role,
+                note,
+                conn_id,
+                number,
+                outcome,
+                replaced,
             }
         };
-        decision!("{line}");
+        self.note(notice);
+    }
+
+    /// Write a notice's line: the DEBUG log of every build and, in this
+    /// crate's tests, the record the controlled cases compare by number.
+    fn note(&self, notice: Notice) {
+        decision!("{notice}");
+        #[cfg(test)]
+        tests::record_notice(self.registry_id, &notice);
     }
 
     /// Whether the serve loop leaves the sweep to a test.
@@ -1080,13 +1207,13 @@ pub(super) fn deliver<F: Into<CtrlFrame>>(tx: &mpsc::Sender<CtrlFrame>, frame: F
     }
 }
 
-/// Queue one pairing notice on a connection's outbox and say what became
-/// of it (Q-N3, review 20).
-fn queue_notice(tx: &mpsc::Sender<CtrlFrame>, frame: CtrlFrame) -> &'static str {
+/// Queue one pairing notice on a connection's outbox and say what became of
+/// it (Q-N3, review 20).
+fn queue_notice(tx: &mpsc::Sender<CtrlFrame>, frame: CtrlFrame) -> NoticeOutcome {
     match tx.try_send(frame) {
-        Ok(()) => "enqueued",
-        Err(mpsc::error::TrySendError::Full(_)) => "dropped: the outbound queue is full",
-        Err(mpsc::error::TrySendError::Closed(_)) => "dropped: the outbound queue is closed",
+        Ok(()) => NoticeOutcome::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => NoticeOutcome::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => NoticeOutcome::Closed,
     }
 }
 

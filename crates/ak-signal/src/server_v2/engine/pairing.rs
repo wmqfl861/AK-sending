@@ -520,12 +520,22 @@ pub(super) fn handle_prepared(
     signature: Signature64,
 ) {
     let now = now_ms();
+    // Q-N3 recurrence (2026-11-27): every exit below answers the sender
+    // with `unavailable` and had no line of its own; each now says why, and
+    // counts signed milliseconds from the deadline (negative: before it).
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
-        Ok(None) | Err(_) => {
-            // Q-N3 recurrence (2026-11-27): a silent `unavailable`; say why.
+        Ok(None) => {
             log::debug!(
                 "prepared from {} answered unavailable: no transaction to prepare",
+                util::hex_prefix(&me, 4)
+            );
+            deliver_msg(out, unavailable([0u8; 16], pairing_id));
+            return;
+        }
+        Err(error) => {
+            log::debug!(
+                "prepared from {} answered unavailable: the transaction lookup failed ({error})",
                 util::hex_prefix(&me, 4)
             );
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
@@ -536,14 +546,12 @@ pub(super) fn handle_prepared(
         || snapshot.transcript_digest != Some(transcript_digest)
         || now > snapshot.deadline_ms
     {
-        // Q-N3 recurrence (2026-11-27): a silent `unavailable`; say which
-        // condition ruled the Prepared out (a late one has no INFO line).
         log::debug!(
-            "prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms past the deadline",
+            "prepared from {} answered unavailable: not a participant: {}, transcript digest differs: {}, {} ms from the deadline",
             util::hex_prefix(&me, 4),
             snapshot.owner != me && snapshot.redeemer != me,
             snapshot.transcript_digest != Some(transcript_digest),
-            now.saturating_sub(snapshot.deadline_ms)
+            now as i64 - snapshot.deadline_ms as i64
         );
         deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
@@ -566,9 +574,9 @@ pub(super) fn handle_prepared(
     );
     // Q-N3 recurrence (2026-11-27): how this Prepared landed.
     log::debug!(
-        "prepared from {} at {} ms past the deadline: {}",
+        "prepared from {} at {} ms from the deadline: {}",
         util::hex_prefix(&me, 4),
-        now.saturating_sub(snapshot.deadline_ms),
+        now as i64 - snapshot.deadline_ms as i64,
         prepared_outcome(&decision)
     );
     match decision {
@@ -662,9 +670,15 @@ pub(super) fn handle_applied(
     signature: Signature64,
 ) {
     let now = now_ms();
+    // Q-N3 recurrence (2026-11-27): the exits that only answer
+    // `unavailable` now say why (the signature exit already had a line).
     let snapshot = match shared.store.pairing_snapshot(&pairing_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => {
+            log::debug!(
+                "applied from {} answered unavailable: no transaction to apply, or the lookup failed",
+                util::hex_prefix(&me, 4)
+            );
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
             return;
         }
@@ -676,6 +690,16 @@ pub(super) fn handle_applied(
             PairingState::Committed | PairingState::Applied | PairingState::Ready
         )
     {
+        log::debug!(
+            "applied from {} answered unavailable: not a participant: {}, transcript digest differs: {}, state not committed/applied/ready: {}",
+            util::hex_prefix(&me, 4),
+            snapshot.owner != me && snapshot.redeemer != me,
+            snapshot.transcript_digest != Some(transcript_digest),
+            !matches!(
+                snapshot.state,
+                PairingState::Committed | PairingState::Applied | PairingState::Ready
+            )
+        );
         deliver_msg(out, unavailable([0u8; 16], pairing_id));
         return;
     }
@@ -719,6 +743,10 @@ pub(super) fn handle_applied(
             );
         }
         Ok(AppliedDecision::NotFound) => {
+            log::debug!(
+                "applied from {} answered unavailable: the store no longer has the transaction",
+                util::hex_prefix(&me, 4)
+            );
             deliver_msg(out, unavailable([0u8; 16], pairing_id));
         }
         Err(e) => {
@@ -831,10 +859,12 @@ pub(super) fn handle_abort(
     }
     match shared.store.abort_pairing(&pairing_id, now_ms()) {
         Ok(AbortDecision::Aborted(aborted)) => {
-            // Q-N3 recurrence (2026-11-27): an owner or redeemer giving up
-            // is otherwise visible only as the other side's `unavailable`.
+            // Q-N3 recurrence (2026-11-27): a participant giving up is
+            // otherwise visible only as the other side's `unavailable`.
+            // This line is the decision; whether the notification below
+            // reached the other participant is logged by the delivery.
             log::debug!(
-                "pairing {} aborted by an explicit request from {}; the other participant is told it is unavailable",
+                "pairing {} aborted by an explicit request from {}",
                 util::hex_prefix(&pairing_id, 4),
                 util::hex_prefix(&me, 4)
             );

@@ -262,13 +262,18 @@ impl std::fmt::Display for TaskCancelled {
 
 impl std::error::Error for TaskCancelled {}
 
+/// `AK_PAIR_DIAG` set to a non-empty value: the pairing trace is on (the
+/// T03 integration test does that; no other run of the CLI sets it).
+fn pair_diag_on() -> bool {
+    std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty())
+}
+
 /// The pairing trace of the T03 integration test (Q-N3 recurrence,
-/// 2026-11-27) reaches stderr only when `AK_PAIR_DIAG` is set on the
-/// process; no other run of `ak-cli task` installs a logger here, and the
-/// levels come from `RUST_LOG`.
+/// 2026-11-27) reaches stderr only when `AK_PAIR_DIAG` is set to a
+/// non-empty value; no other run of `ak-cli task` installs a logger here,
+/// and the levels come from `RUST_LOG`.
 fn init_pair_diag_logger() {
-    // The same rule as the trace itself: a non-empty `AK_PAIR_DIAG`.
-    if !std::env::var_os("AK_PAIR_DIAG").is_some_and(|value| !value.is_empty()) {
+    if !pair_diag_on() {
         return;
     }
     let _ = env_logger::builder()
@@ -1071,7 +1076,31 @@ async fn run_task_receiver(
                         PUNCH_INTERVAL.as_millis(),
                         PUNCH_WINDOW.as_secs(),
                     );
-                    punch_candidates(punch_socket, &candidates, &punch_stop_loop, |_| {}).await;
+                    // Q-N3 (2026-11-27): with the pairing trace on, say what
+                    // the loop actually did once it ends — "no packet sent"
+                    // and "sent, but nothing arrived" look the same from the
+                    // target's side. Loopback ports only, never an address.
+                    let diag = pair_diag_on();
+                    punch_candidates(punch_socket, &candidates, &punch_stop_loop, |report| {
+                        if !diag {
+                            return;
+                        }
+                        let loopback_ports: Vec<u16> = candidates
+                            .iter()
+                            .filter(|candidate| candidate.ip().is_loopback())
+                            .map(|candidate| candidate.port())
+                            .collect();
+                        eprintln!(
+                            "[pair-diag] receiver punch loop ended: {} candidate(s), loopback candidate ports {loopback_ports:?}; {} packet(s) sent ({} low-TTL), {} tick(s), stopped early: {}, start delayed: {}",
+                            candidates.len(),
+                            report.packets_sent,
+                            report.low_ttl_packets,
+                            report.ticks,
+                            report.stopped_early,
+                            report.start_delayed
+                        );
+                    })
+                    .await;
                     return;
                 }
                 if punch_link_rx.changed().await.is_err() {

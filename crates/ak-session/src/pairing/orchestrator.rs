@@ -553,6 +553,28 @@ impl PairingOrchestrator {
         plane: &mut mpsc::Receiver<CtrlMessage>,
         endpoint: Option<ak_signal::protocol_v2::EndpointBlob>,
     ) -> Result<CommittedPairing, PairFlowError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .redeem_to_commit_on_inner(code_str, plane, endpoint)
+            .await;
+        if let Err(error) = &result {
+            // Q-N3: the last step is in the lines above; this is where the
+            // joiner's flow stopped and how long it took.
+            pair_diag!(
+                "redeemer: flow stopped with `{error}` {} ms after it began, at {} ms on the clock",
+                started.elapsed().as_millis(),
+                now_unix_ms()
+            );
+        }
+        result
+    }
+
+    async fn redeem_to_commit_on_inner(
+        &self,
+        code_str: &str,
+        plane: &mut mpsc::Receiver<CtrlMessage>,
+        endpoint: Option<ak_signal::protocol_v2::EndpointBlob>,
+    ) -> Result<CommittedPairing, PairFlowError> {
         let code = InviteCode::parse(code_str)?;
         let auth_key = code.auth_key();
         let registry = self.client.registry_id();
@@ -889,6 +911,35 @@ impl PairingOrchestrator {
     /// Owner side of one transaction (see the module docs). Public for
     /// embedding; [`PairingOrchestrator::spawn_owner_loop`] drives it.
     pub async fn owner_answer_offer(
+        &self,
+        code_id: [u8; 16],
+        code_revision: u64,
+        pairing_id: [u8; 16],
+        redeemer_device_id: [u8; 32],
+        redeem: ak_signal::protocol_v2::RedeemRequest,
+    ) -> Result<VerifiedPairing, PairFlowError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .owner_answer_offer_inner(
+                code_id,
+                code_revision,
+                pairing_id,
+                redeemer_device_id,
+                redeem,
+            )
+            .await;
+        if let Err(error) = &result {
+            // Q-N3: where the owner's flow stopped and how long it took.
+            pair_diag!(
+                "owner: flow stopped with `{error}` {} ms after the offer, at {} ms on the clock",
+                started.elapsed().as_millis(),
+                now_unix_ms()
+            );
+        }
+        result
+    }
+
+    async fn owner_answer_offer_inner(
         &self,
         code_id: [u8; 16],
         code_revision: u64,
@@ -1728,6 +1779,14 @@ where
             if *scope == ak_signal::protocol_v2::ErrorScope::Pairing
                 && (*object_id == pairing_id || *object_id == [0u8; 16])
             {
+                // Q-N3: the error frame that ends this flow — the registry
+                // logs its own decision; this line says when it was taken
+                // and for which round (the all-zero id is any round's).
+                pair_diag!(
+                    "pairing error frame taken: code 0x{code:04x}, correlation {}, at {} ms on the clock",
+                    if *object_id == pairing_id { "this round" } else { "all-zero" },
+                    now_unix_ms()
+                );
                 return Err(PairFlowError::from_pair_code(*code));
             }
             if *scope == ak_signal::protocol_v2::ErrorScope::Code

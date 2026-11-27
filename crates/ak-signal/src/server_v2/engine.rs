@@ -517,11 +517,12 @@ fn sweep(shared: &Shared) {
             return;
         }
     };
-    // Q-N3 recurrence (2026-11-27): a deadline sweep is otherwise visible
-    // only as the `unavailable` both participants receive.
+    // Q-N3 recurrence (2026-11-27): the decision comes first; whether each
+    // notification below reached its participant is logged by the delivery
+    // itself (a dropped message has its own DEBUG line).
     if !report.aborted.is_empty() {
         log::debug!(
-            "sweep aborted {} pending pairing(s) past their deadline and told both sides",
+            "sweep: {} pending pairing(s) are past their deadline and are now aborted; notifying both sides of each",
             report.aborted.len()
         );
     }

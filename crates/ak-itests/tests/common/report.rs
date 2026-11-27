@@ -1338,8 +1338,10 @@ pub fn live_report() -> String {
 }
 
 /// `scripts/t03_pairing_snapshot.py` on the registry database, or the reason
-/// it was not taken. The interpreter is `AK_T03_PYTHON` when set, else
-/// `python` / `python3` from the PATH.
+/// it was not taken. The interpreter is `AK_T03_PYTHON` when set; else the
+/// usual names are tried from the PATH in turn (`python`, `python3`, `py -3`
+/// on Windows; `python3`, `python` elsewhere) and the first that starts is
+/// used.
 pub fn registry_snapshot() -> String {
     run_snapshot(REGISTRY_DB.with(|slot| slot.borrow().clone()), &[])
 }
@@ -1394,31 +1396,48 @@ fn run_snapshot(db: Option<PathBuf>, extra: &[&str]) -> String {
     let Some(db) = db else {
         return "not taken: no registry database was registered on this thread".into();
     };
-    let python: std::ffi::OsString = std::env::var_os("AK_T03_PYTHON").unwrap_or_else(|| {
-        if cfg!(windows) {
-            "python".into()
-        } else {
-            "python3".into()
-        }
-    });
     let script = workspace_root()
         .join("scripts")
         .join("t03_pairing_snapshot.py");
-    let started = Instant::now();
-    let mut command = Command::new(&python);
-    command.arg("-I").arg(&script).arg(&db).args(extra);
-    match command.output() {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+    // Without an explicit interpreter the usual names are tried in turn: a
+    // machine may have `python` only, `python3` only, or just the Windows
+    // `py` launcher. The first one that starts is the one reported, also
+    // when the script then fails.
+    let candidates: Vec<Vec<std::ffi::OsString>> = match std::env::var_os("AK_T03_PYTHON") {
+        Some(python) => vec![vec![python]],
+        None if cfg!(windows) => vec![
+            vec!["python".into()],
+            vec!["python3".into()],
+            vec!["py".into(), "-3".into()],
+        ],
+        None => vec![vec!["python3".into()], vec!["python".into()]],
+    };
+    let mut outcome = String::from("not taken: no interpreter was tried");
+    for candidate in candidates {
+        let started = Instant::now();
+        let mut command = Command::new(&candidate[0]);
+        command
+            .args(&candidate[1..])
+            .arg("-I")
+            .arg(&script)
+            .arg(&db)
+            .args(extra);
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+            Ok(output) => {
+                return format!(
+                    "not taken: exit status {} after {:?}; stderr: {}",
+                    output.status,
+                    started.elapsed(),
+                    redact(&String::from_utf8_lossy(&output.stderr))
+                );
+            }
+            Err(error) => outcome = format!("not taken: cannot start the interpreter ({error})"),
         }
-        Ok(output) => format!(
-            "not taken: exit status {} after {:?}; stderr: {}",
-            output.status,
-            started.elapsed(),
-            redact(&String::from_utf8_lossy(&output.stderr))
-        ),
-        Err(error) => format!("not taken: cannot start the interpreter ({error})"),
     }
+    outcome
 }
 
 /// What every CLI child of a chain runs with (Q-N3, 2026-11-27): the

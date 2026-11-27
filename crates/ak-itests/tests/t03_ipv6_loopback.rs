@@ -1333,7 +1333,8 @@ impl Proc {
                 .stderr
                 .take()
                 .expect("stderr piped"),
-        );
+        )
+        .named(&format!("{tag} (stderr)"));
         let exit: Arc<Mutex<Watched>> = Arc::new(Mutex::new(Watched::Running));
         let stdout = LineLog::spawn_reader(
             child
@@ -1414,10 +1415,14 @@ impl Proc {
         }
     }
 
+    /// Wait until the child exited, and it exited successfully. Its last
+    /// lines are read in first: they can still be in the pipes when the
+    /// exit is first seen, and the caller reads the log right after this.
     fn wait_exit_ok(&mut self, timeout: std::time::Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.exit_status() {
+                settle(&[&self.stdout]);
                 assert!(
                     status.success(),
                     "cli child exited with {status}; {}",
@@ -2858,6 +2863,21 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         failure_report(&chain)
     );
 
+    // The receiver's punch loop ends with the first connection or with its
+    // window, whichever comes first; its line is taken before the transfer
+    // goes on. On a fast machine the receiver can otherwise finish and exit
+    // inside one tick of the loop, and the detached loop's report is never
+    // written (CI run 46054926242 failed exactly there, on both platforms).
+    recv.stderr.wait_for_reporting(
+        "[pair-diag] receiver punch loop ended: ",
+        std::time::Duration::from_secs(10),
+        &[
+            ("receiver", &recv.stdout),
+            ("sender", &sender.stdout),
+            ("registry", &registry.proc.stdout),
+        ],
+    );
+
     // The transfer still completes (the junk candidate costs the sender
     // nothing — it dials the RECEIVER's list, not its own).
     recv.stdout.wait_for_reporting(
@@ -2881,7 +2901,8 @@ fn receiver_punch_reaches_the_sender_advertised_reflexive_port() {
         redact(&recv_log)
     );
     // The receiver's own record agrees with the socket: the watched port
-    // was one of its selected targets, and it sent to that target.
+    // was one of its selected targets, and it sent to that target (the
+    // line was waited for above, so it is on hand).
     let record = punch_loop_record(&recv.stderr.snapshot().join("\n"), punch_addr.port());
     assert!(
         record.contains("first sent on tick "),
